@@ -120,7 +120,7 @@ package actor ProviderToolResultRecoveryStore {
         turnId: String?,
         originalResultClass: ChatToolOutcome.ExactResultClass,
         sectionBudget: Int = ToolResultSections.pageBudget
-    ) -> Receipt? {
+    ) throws -> Receipt? {
         guard let scope = Scope(sessionId: sessionId, turnId: turnId) else { return nil }
         cleanupExpired(now: Date())
 
@@ -155,6 +155,7 @@ package actor ProviderToolResultRecoveryStore {
             pageByteOffsets.append(byteOffset)
         }
 
+        let sections = try ToolResultSections.projection(content: content, value: parsed, budget: sectionBudget)
         let fields = parsed?.objectValue ?? [:]
         let receipt = if case .string(let id)? = fields["dispatch_receipt_id"] { UUID(uuidString: id) } else { nil as UUID? }
         let source = if case .string(let source)? = fields["dispatch_receipt_source"] { source } else { "" }
@@ -184,7 +185,7 @@ package actor ProviderToolResultRecoveryStore {
             sectionBudget: sectionBudget,
             version: version,
             createdAt: now,
-            sectionProjection: ToolResultSections.projection(content: content, value: parsed, budget: sectionBudget)
+            sectionProjection: sections
         )
         entries[handle] = entry
         totalBytes += data.count

@@ -21,11 +21,11 @@ import TrustCenter
 import Senses
 import PersonaEngine
 import Desk
-// Blueprint: | `AppDoorReading.swift` | Home, page, item, version and find readings through the app door |
+// Blueprint: | `AppDoorReading.swift` | Home, page, item, version and find readings through the app door; read-only census exposes static call fit independently of admission/proof errors |
 extension AppToolExecutor {
     /// The page's own actions; the ones on every page are named once, on `{}`, except setting.set where the page has settings to set.
-    static func doorPageActions(_ page: String, hasSettings: Bool, dataRoot: URL) async -> [AppAction] {
-        AppActions.on(page: page, dataRoot: dataRoot)
+    static func doorPageActions(_ page: String, hasSettings: Bool, dataRoot: URL) async throws -> [AppAction] {
+        try AppActions.on(page: page, dataRoot: dataRoot)
             .filter { $0.page != "*" || ($0.id == "setting.set" && hasSettings) }
     }
     /// Home first: open agent windows, what is in progress, what waits and what arrived (`home`, which sorts first), then a line per page. A page read lists its actions.
@@ -33,12 +33,12 @@ extension AppToolExecutor {
     func doorIndex(_ input: [String: JSONValue]) async throws -> JSONValue {
         let posture = await Self.freshQuietPosture()
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let everyPage = AppActions.all.filter { $0.page == "*" }.map(\.id)
+        let everyPage = try AppActions.all.filter { $0.page == "*" }.map(\.id)
         // pages_version: the lines and every registered action (senses' corners included), so a changed index tells from a repeat.
         let inventory = try await AppActions.inventory(dataRoot: root)
         var shape = inventory.actions.map { $0.page + "/" + $0.id + "/" + $0.scope }.sorted()
         var pages: [JSONValue] = []
-        for page in doorPages {
+        for page in try doorPages {
             // The title only when it says more than the id ("inbox: Inbox." is dead weight — Agent 10-10).
             let title = page.title.lowercased() == page.id.lowercased() ? "" : "\(page.title). "
             let line = "\(page.id): \(title)\(page.summary)"
@@ -99,37 +99,36 @@ extension AppToolExecutor {
                 let digest = doorText(descriptor["program"]?.objectValue?["version"])
                 let status = doorText(record["status"])
                 var blocks: [JSONValue] = []
-                var validated = native || guidance, admitted = native || guidance, sourceChecked = false
-                if file.kind == .sense, !native, descriptor.isEmpty {
+                var callFit: JSONValue = .null
+                var validated = native || guidance, admitted = native || guidance
+                if !native && !guidance && file.kind != .turn {
                     do {
-                        record["uses"] = record["uses"] ?? .int(0); record["corrections"] = record["corrections"] ?? .int(0)
-                        let sense = try JSONDecoder().decode(SenseRecord.self, from: JSONValue.object(record).serializedData(pretty: false))
-                        let sources = try senses.sourceFiles(sense)
-                        guard let entry = sense.entry, sources[entry] == Data(file.body.utf8) else {
-                            throw ToolFailureError("The migrated sense's selected source does not match its ability file.", effects: .none,
-                                owner: file.id, nextCall: ToolFailureError.call("app", ["action": .string("sense.versions"),
-                                    "args": .object(["sense_id": .string(file.id)])]), code: "sense_source_mismatch",
-                                instruction: "Read this sense's versions and correct its selected source before conversion.", recovery: .inspect)
+                        let candidate = try programs.load(id: file.id, digest: digest)
+                        // Compatibility is observable even when proof/admission
+                        // is missing. An earlier integrity failure cannot hide it.
+                        var callsFit = true
+                        do {
+                            let shapes = try OwnedProgramInvocation.$host.withValue(host) {
+                                try Parts(root: root).checkDependencies(candidate)
+                            }
+                            let unavailable = candidate.program.dependencies.filter { shapes.objectValue?[$0] == .null }
+                            callFit = .object(["status": .string(unavailable.isEmpty ? "static_calls_fit" : "contracts_unavailable"),
+                                "runtime": .string("computed arguments and unavailable contracts are checked when called"),
+                                "unavailable": .array(unavailable.map(JSONValue.string))])
+                        } catch {
+                            callsFit = false
+                            let failure = ownedFailure(error, code: "census_evidence_unreadable", owner: file.id,
+                                instruction: "Correct the named call with ability.save and keep the reviewed version.",
+                                next: ["action": .string("ability.read"), "args": .object(["id": .string(file.id)])], effects: .none)
+                            callFit = failure; blocks.append(failure)
                         }
-                        validated = true; admitted = true; sourceChecked = true
-                    } catch { blocks.append(ownedFailure(error, code: "census_evidence_unreadable", owner: file.id,
-                        instruction: "Read this ability's retained source and resolve the reported evidence failure before conversion.",
-                        next: ["action": .string("ability.read"), "args": .object(["id": .string(file.id)])], effects: .none)) }
-                } else if !native && !guidance && file.kind != .turn {
-                    do {
                         guard !digest.isEmpty, let key else {
                             throw ToolFailureError("The exact JS version has no sealed validation proof.", effects: .none, owner: file.id,
                                 nextCall: ToolFailureError.call("app", ["action": .string("ability.read"), "args": .object(["id": .string(file.id)])]),
                                 code: "validation_proof_missing", instruction: "Read the exact source, then save and validate that version before conversion.", recovery: .inspect)
                         }
-                        let candidate = try programs.load(id: file.id, digest: digest)
                         _ = try programs.proof(candidate, key: key)
-                        guard candidate.program.dependencies.allSatisfy({ host.dependencyMatches($0, candidate.dependencyShapes.objectValue?[$0]) }) else {
-                            throw ToolFailureError("An app-action dependency is unavailable or changed; save it against its current shape.", effects: .none,
-                                owner: file.id, nextCall: ToolFailureError.call("app", ["action": .string("ability.read"), "args": .object(["id": .string(file.id)])]),
-                                code: "dependency_changed", instruction: "Read the ability's dependencies; save its code against their current shapes.", recovery: .inspect)
-                        }
-                        validated = true
+                        validated = callsFit
                         if slot != .next {
                             if file.kind == .part {
                                 if status == "active" {
@@ -149,20 +148,25 @@ extension AppToolExecutor {
                                            "args": .object([file.kind == .sense ? "sense_id" : "id": .string(file.id)])]))
                             }
                         }
-                    } catch { blocks.append(ownedFailure(error, code: "census_evidence_unreadable", owner: file.id,
-                        instruction: "Read this ability's retained source and resolve the reported evidence failure before conversion.",
-                        next: ["action": .string("ability.read"), "args": .object(["id": .string(file.id)])], effects: .none)) }
+                    } catch {
+                        let failure = ownedFailure(error, code: "census_evidence_unreadable", owner: file.id,
+                            instruction: "Read this ability's retained source and resolve the reported evidence failure before conversion.",
+                            next: ["action": .string("ability.read"), "args": .object(["id": .string(file.id)])], effects: .none)
+                        if callFit == .null { callFit = failure }
+                        blocks.append(failure)
+                    }
                 }
                 let version = record["codeFingerprint"] ?? record["candidateDigest"] ?? record["version"] ?? .null
                 rows.append(["kind": .string(file.kind.rawValue), "id": .string(file.id),
+                    "call_fit": callFit,
                     "name": record["name"] ?? .string(file.id),
-                    "role": .string(slot == .current ? "registered" : slot == .previous ? "rollback" : "proposed"),
+                    "role": .string(slot == .current ? "registered" : slot == .previous ? "previous" : "proposed"),
                     "language": .string(native ? "native" : guidance ? "guidance" : record["language"] == .string("swift") ? "Swift" : "JS"), "status": .string(status),
                     "source": .string(try abilities.path(id: file.id, slot: slot, pathExtension: file.pathExtension).path),
                     "source_digest": .string(file.bodyDigest), "selected_version": version,
                     "pending_version": slot == .next ? .string(digest) : .null,
                     // Her turn is run by the stem every turn; it has no admission of its own.
-                    "validation": .string(file.kind == .turn ? "run_by_stem" : sourceChecked ? "source_checked"
+                    "validation": .string(file.kind == .turn ? "run_by_stem"
                         : admitted && validated ? "accepted" : validated ? "validated" : "unvalidated"),
                     "counterpart": validated && !digest.isEmpty ? .object(["id": .string(file.id), "version": .string(digest),
                         "status": .string(admitted ? "accepted" : "validated")]) : .null,
@@ -173,12 +177,13 @@ extension AppToolExecutor {
         }
         for skill in try InstalledSkillInventory.entries(dataRoot: root) {
             let path = skill.bodyPath ?? ""
-            let body = try Data(contentsOf: URL(fileURLWithPath: path))
             let header = try AbilityStore.File(id: skill.id, kind: .part, metadata: try AbilityStore.partHeader([:]), body: "", pathExtension: "md")
             rows.append(["kind": .string("skill"), "id": .string(skill.id), "name": .string(skill.name),
                 "role": .string("built_in"), "language": .string("guidance"), "status": skill.status.map(JSONValue.string) ?? .null,
-                "source": .string(path), "source_digest": .string(SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()),
-                "validation": .string("bundled"), "counterpart": .null, "blocks_cutover": .array([]), "part": .string(header.partLine)]
+                "source": .string(path), "source_digest": skill.bodyRevision.map(JSONValue.string) ?? .null,
+                "description": .string(skill.description),
+                "validation": .string(skill.status == "unavailable" ? "unavailable" : "bundled"),
+                "counterpart": .null, "blocks_cutover": .array([]), "part": .string(header.partLine)]
                 .merging(header.part) { _, value in value })
         }
         for sense in try await senses.allChecked() where !files.contains(where: { $0.id == sense.id }) {
@@ -197,8 +202,8 @@ extension AppToolExecutor {
         let blocked = rows.count { !($0["blocks_cutover"]?.arrayValue ?? []).isEmpty }
         var census: [String: JSONValue] = ["status": .string("ok"), "page": .string("tools"), "item": .string("census"),
             "complete": .bool(blocked == 0), "blocked": .int(Int64(blocked)), "entries": .array(rows.map(JSONValue.object)),
-            "note": .string("Read-only ability files and bundled defaults. Candidate JS: sealed proof, current dependencies and admission; migrated senses: checked source. Unavailable previous versions do not block working current versions.")]
-        census["version"] = .string(doorVersion(page: "tools", item: "census", ["content": .object(census)]))
+            "note": .string("Read-only ability files and bundled defaults. Candidate JS requires sealed proof, current dependencies and admission. Unavailable previous versions do not block working current versions.")]
+        census["version"] = .string(try doorVersion(page: "tools", item: "census", ["content": .object(census)]))
         return .object(census)
     }
     /// What the page or item shows now, read in process; a name the page
@@ -209,10 +214,13 @@ extension AppToolExecutor {
     func doorRead(page: QuietToolPage, item: String, offset: Int = 0) async throws -> JSONValue {
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         do {
+            if page.id == "pairing", item == "phone-senses" {
+                return try PhoneSensesGuide.read(dataRoot: root)
+            }
             // An action's guide, before any page reads its items as its own names.
             if item.hasPrefix("guide:"),
-               let action = await Self.doorPageActions(page.id, hasSettings: false, dataRoot: root).first(where: { "guide:" + $0.id == item }),
-               let guide = AppActions.about(action) {
+               let action = try await Self.doorPageActions(page.id, hasSettings: false, dataRoot: root).first(where: { "guide:" + $0.id == item }),
+               let guide = try AppActions.about(action) {
                 return .object(["status": .string("ok"), "page": .string(page.id), "item": .string(item),
                                 "guide": .object([action.id: .string(guide)])])
             }
@@ -237,6 +245,7 @@ extension AppToolExecutor {
             if page.id == "skills" {
                 let items = try InstalledSkillInventory.entries(dataRoot: root).map { entry in
                     JSONValue.object(["id": .string(entry.id), "name": .string(entry.name), "description": .string(entry.description),
+                        "status": entry.status.map(JSONValue.string) ?? .null,
                         "next_call": .object(["action": .string("ability.read"), "args": .object(["id": .string(entry.id)])])])
                 }
                 return .object(["status": .string("ok"), "page": .string(page.id), "title": .string(page.title), "items": .array(items),
@@ -305,14 +314,14 @@ extension AppToolExecutor {
             return ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none)
         }
     }
-    static func doorVersion(page: String, item: String, _ read: [String: JSONValue]) -> String {
+    static func doorVersion(page: String, item: String, _ read: [String: JSONValue]) throws -> String {
         var fields = read.filter { ["content", "settings", "items", "item", "count", "entries", "complete", "blocked"].contains($0.key) }
         if page == "chat", !item.isEmpty, case .object(let composer)? = fields["item"] {
             // Turn progress and context usage do not edit the draft.
             fields["item"] = .object(composer.filter { ["conversation", "draft", "attachments", "provider", "model", "think", "fast", "persona"].contains($0.key) })
         }
         let shown = JSONValue.object(fields)
-        let digest = SHA256.hash(data: (try? shown.serializedData(pretty: false)) ?? Data())
+        let digest = SHA256.hash(data: try shown.serializedData(pretty: false))
         return (item.isEmpty ? page : page + "/" + item) + "@"
             + digest.prefix(6).map { String(format: "%02x", $0) }.joined()
     }
@@ -329,32 +338,32 @@ extension AppToolExecutor {
         let item = parts.count > 1 ? parts[1] : ""
         guard case .object(let read) = try await doorRead(page: page, item: item),
               read["status"] == .string("ok") else { return nil }
-        return read["version"]?.scalarText ?? Self.doorVersion(page: page.id, item: item, read)
+        return try read["version"]?.scalarText ?? Self.doorVersion(page: page.id, item: item, read)
     }
     @MainActor
     func doorFind(_ query: String) async throws -> JSONValue {
         let asked = AppActions.intentWords(query)
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let permissions = try? await MacIntegrationPermissionStore(dataRoot: root).readinessChecked()
-        if let action = (await AppActions.resolvedAction(query, dataRoot: root))?.action,
+        let permissions = try await MacIntegrationPermissionStore(dataRoot: root).readinessChecked()
+        if let action = (try await AppActions.resolvedAction(query, dataRoot: root))?.action,
            action.id.lowercased() == query.lowercased() {
             let blocker = MacIntegrationGates.byTool[action.tool].flatMap {
-                permissions?.refusal(integration: $0.integration, mode: $0.mode)
+                permissions.refusal(integration: $0.integration, mode: $0.mode)
             }
             return .object(["status": .string("ok"), "find": .string(query),
                 "matched_actions": .int(1), "shown_actions": .int(1),
-                "actions": .array([AppActions.discovery(action, blocker: blocker, dataRoot: root)]),
+                "actions": .array([try AppActions.discovery(action, blocker: blocker, dataRoot: root)]),
                 "pages": .array([]), "read_next": .array([]), "effects": .string("none")])
         }
-        let (ranked, degraded, namedPages) = try await AppActions.ranked(query, pages: doorPageIndex, dataRoot: root, memory: actionIndex)
+        let (ranked, namedPages, gaps) = try await AppActions.ranked(query, pages: doorPageIndex, dataRoot: root, memory: actionIndex)
         let matches = ranked.prefix(5)
         let actions = matches.filter { !$0.isItemRead }
         let named = AppActions.named(query)
         let items: [JSONValue] = matches.filter(\.isItemRead).map {
             .object($0.input.merging(["description": .string($0.label)]) { _, value in value })
         }
-        let pages = doorPages.map { page in
-            (page, AppActions.hits(Set(AppActions.intentWords(page.id + " " + page.title + " " + page.summary)), asked))
+        let pages = try doorPages.map { page in
+            (page, AppActions.hits(AppActions.wordSet(page.id + " " + page.title + " " + page.summary), asked))
         }.filter { $0.1 > 0 }.sorted {
             let leftNamed = namedPages.contains($0.0.id), rightNamed = namedPages.contains($1.0.id)
             if leftNamed != rightNamed { return leftNamed }
@@ -362,17 +371,17 @@ extension AppToolExecutor {
         }.prefix(3)
         let disabled = try AppActions.disabledTools(asked, dataRoot: root).prefix(2)
         var found: [String: JSONValue] = [
-            "status": .string(matches.isEmpty && pages.isEmpty && disabled.isEmpty ? "not_found" : "ok"),
+            "status": .string(matches.isEmpty && pages.isEmpty && disabled.isEmpty && gaps.isEmpty ? "not_found" : "ok"),
             "find": .string(query),
             "matched_actions": .int(Int64(AppActions.matchedActions(ranked).count)), "shown_actions": .int(Int64(actions.count)),
             // The best match and actions named by id carry their whole contract.
-            "actions": .array(actions.enumerated().map { offset, action in
+            "actions": .array(try actions.enumerated().map { offset, action in
                 let permissionBlocker = MacIntegrationGates.byTool[action.tool].flatMap {
-                    permissions?.refusal(integration: $0.integration, mode: $0.mode)
+                    permissions.refusal(integration: $0.integration, mode: $0.mode)
                 }
                 let blocker = permissionBlocker
                 guard offset == 0 || named.contains(action.id) else { return .string(action.line + (blocker.map { " Unavailable: " + $0 } ?? "")) }
-                return AppActions.discovery(action, blocker: blocker, dataRoot: root)
+                return try AppActions.discovery(action, blocker: blocker, dataRoot: root)
             }),
             "pages": .array(pages.map { .string("\($0.0.id): \($0.0.title). \($0.0.summary)") }),
             "read_next": .array(items),
@@ -384,8 +393,11 @@ extension AppToolExecutor {
             found["reason"] = .string("no_match")
             found["message"] = .string("Nothing matches \"\(query)\": no action, page or item.")
         }
+        if !gaps.isEmpty {
+            let detail = gaps.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: "; ")
+            found["message"] = .string("Action search is incomplete: these actions could not be embedded and were excluded. \(detail). Usable actions were searched; this is not evidence that an excluded action does not match. Read its page or name its exact id while repairing the model output.")
+        }
         if !disabled.isEmpty { found["disabled"] = .array(Array(disabled)) }
-        if let degraded { found["ranking_degraded"] = .string("Ranked by words only: " + degraded) }
         found["ranking_basis"] = .string("Exact action ids first, then a named page's own actions in page order (registered page ids, titles, door aliases and integration ids); the rest use token overlap and semantic suggestions that clear the attention chance bar against this retrieval epoch's inventory. Assumes most actions are irrelevant and a light-tailed background. Language coverage and natural-language constraints depend on the embedding model. Use -<exact action id> for an explicit exclusion; no language-specific clauses are rewritten.")
         return .object(found)
     }

@@ -76,9 +76,7 @@ public actor SwiftNativeTrustCenter {
         let path = trustPolicyPath
         let defaults = defaultTrustPolicy()
         let merged = try await SwiftNativePersistenceCore.withFileLock(path) {
-            // Validate both Workshop spellings before folding to the wire key.
-            let current = WorkshopPolicyBlockVocabulary.foldToWireKey(
-                try Self.loadRawPolicyChecked(at: path, defaults: defaults))
+            let current = try Self.loadRawPolicyChecked(at: path, defaults: defaults)
             // Fresh exactly as the canonical read defines it: no file, or a
             // file with nothing in it (setup writes `{}`). Keying this off
             // file existence alone let the first settings write land on that
@@ -88,7 +86,7 @@ public actor SwiftNativeTrustCenter {
             let bootstrapWrite = current.isEmpty
             try guardedByLockedPolicy?(current)
             try Self.validateKnownAuthorityPolicyTypes(patch, against: defaults)
-            var patch = WorkshopPolicyBlockVocabulary.foldToWireKey(patch)
+            var patch = patch
             // The first write on a fresh root persists what that root already
             // reads (Self.freshInstallTrustPolicyAdditions); without this the
             // fresh-install grant would silently disappear on the first save.

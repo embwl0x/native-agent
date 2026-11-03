@@ -20,6 +20,7 @@ public enum PhonePlaceHistory {
         let file = url(dataRoot)
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(events).write(to: file, options: .atomic)
+        NotificationCenter.default.post(name: PhoneSenseHistory.changed, object: dataRoot)
     }
 }
 
@@ -73,6 +74,12 @@ public struct JSONLReadReport: Sendable, Equatable {
 // MARK: - SwiftNative implementation
 
 /// Stateless file operations; async entry points retain their executor boundary.
+extension CocoaError {
+    /// The file is absent. FileHandle reports that as fileNoSuchFile (4) while
+    /// Data and FileManager report fileReadNoSuchFile (260); both mean absent.
+    public var isFileAbsent: Bool { code == .fileNoSuchFile || code == .fileReadNoSuchFile }
+}
+
 public enum SwiftNativePersistenceCore {
 
     /// Malformed JSON attempts a private quarantine copy before throwing;
@@ -174,9 +181,8 @@ public enum SwiftNativePersistenceCore {
 
     /// Append a pre-serialized JSON line (no re-encode) with 0o666 create-mode
     /// (umask-derived 0644) and no chmod on an existing file.
-    /// Used when the caller has already produced byte-exact output via
-    /// `serializeOrderedObjectPython` and must NOT have it re-sorted by the
-    /// `serialize` path. A trailing newline is appended (one row per line). The
+    /// The caller supplies the current serialized receipt. A trailing newline
+    /// is appended (one row per line). The
     /// caller is responsible for holding `withFileLock` around this when the
     /// file has multiple writers.
     public static func appendAuditLineRaw(_ jsonLine: String, to path: URL) async throws {
@@ -187,13 +193,18 @@ public enum SwiftNativePersistenceCore {
     }
 
     public static func readJSONL(_ path: URL) async throws -> [JSONValue] {
-        try await readJSONLReporting(path).rows
+        let read = try await readJSONLReporting(path)
+        guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine else {
+            throw PersistenceCoreError.ioFailure("JSONL evidence is incomplete at \(path.path): \(read.report.malformedLineCount) malformed row(s), trailingPartial=\(read.report.trailingPartialLine). Repair the feed or use the reporting reader to retain its integrity receipt.")
+        }
+        return read.rows
     }
 
     /// Read rows with the shared physical framing and integrity report.
     public static func readJSONLReporting(_ path: URL) async throws -> (rows: [JSONValue], report: JSONLReadReport) {
-        guard FileManager.default.fileExists(atPath: path.path) else { return ([], .clean) }
-        let data = try Data(contentsOf: path)
+        let data: Data
+        do { data = try Data(contentsOf: path) }
+        catch CocoaError.fileReadNoSuchFile { return ([], .clean) }
         return Self.decodeJSONL(data) { value, _ in value }
     }
 
@@ -265,6 +276,9 @@ public enum SwiftNativePersistenceCore {
 
     public static func tailJSONL(_ path: URL, limit: Int, maxBytes: Int?) async throws -> [JSONValue] {
         let receipt = try await tailJSONLReadReceipt(path, limit: limit, maxBytes: maxBytes)
+        guard receipt.malformedJSONRowCount == 0 else {
+            throw PersistenceCoreError.ioFailure("JSONL tail evidence is incomplete at \(path.path): \(receipt.malformedJSONRowCount) malformed row(s). Repair the feed or use the receipt reader to disclose the source gap.")
+        }
         return receipt.rows
     }
 
@@ -308,7 +322,7 @@ public enum SwiftNativePersistenceCore {
         }
         let handle: FileHandle
         do { handle = try FileHandle(forReadingFrom: path) }
-        catch CocoaError.fileReadNoSuchFile { return nil }
+        catch let error as CocoaError where error.isFileAbsent { return nil }
         defer { try? handle.close() }
         // Size and bytes must belong to the same inode if a writer rotates it.
         let size = Int(try handle.seekToEnd())
@@ -385,17 +399,25 @@ public enum SwiftNativePersistenceCore {
         }
         // Terminate a torn trailing line before appending, isolating it from the new record.
         var payload = data
-        if let size = (try? FileManager.default.attributesOfItem(atPath: path.path))
-            .flatMap({ ($0[.size] as? NSNumber)?.intValue }), size > 0 {
-            let probeFD = open(path.path, O_RDONLY)
-            if probeFD >= 0 {
+        let probeFD = open(path.path, O_RDONLY)
+        if probeFD >= 0 {
+            defer { _ = Darwin.close(probeFD) }
+            var info = stat()
+            guard fstat(probeFD, &info) == 0 else {
+                throw PersistenceCoreError.ioFailure("Cannot inspect append framing at \(path.path): \(String(cString: strerror(errno)))")
+            }
+            if info.st_size > 0 {
                 var lastByte: UInt8 = 0
-                let read = pread(probeFD, &lastByte, 1, off_t(size - 1))
-                _ = Darwin.close(probeFD)
-                if read == 1 && lastByte != 0x0A {
+                let count = pread(probeFD, &lastByte, 1, info.st_size - 1)
+                guard count == 1 else {
+                    throw PersistenceCoreError.ioFailure("Cannot read append framing at \(path.path): \(count < 0 ? String(cString: strerror(errno)) : "source changed during inspection")")
+                }
+                if lastByte != 0x0A {
                     payload = Data([0x0A]) + data
                 }
             }
+        } else if errno != ENOENT {
+            throw PersistenceCoreError.ioFailure("Cannot open append framing at \(path.path): \(String(cString: strerror(errno)))")
         }
         let fd = open(path.path, O_WRONLY | O_CREAT | O_APPEND, createMode)
         if fd < 0 {
@@ -426,10 +448,6 @@ public enum SwiftNativePersistenceCore {
         }
     }
 
-    /// Filesystem unsupported-operation errnos; a set accepts Darwin's aliased values.
-    private static let fullFsyncUnsupportedErrnos: Set<Int32> =
-        [ENOTSUP, EOPNOTSUPP, ENOTTY, EINVAL, ENOSYS, ENODEV]
-
     /// Durable flush and close failures throw; non-durable close failures are logged.
     static func flushAndClose(
         fd: Int32,
@@ -439,7 +457,7 @@ public enum SwiftNativePersistenceCore {
         var flushError: PersistenceCoreError?
         if durable {
             do {
-                try fullSync(fd: fd, path: path)
+                try syncDescriptor(fd: fd, path: path, driveCache: true)
             } catch let error as PersistenceCoreError {
                 flushError = error
             }
@@ -454,39 +472,26 @@ public enum SwiftNativePersistenceCore {
         }
     }
 
-    /// Retry interrupted F_FULLFSYNC; use checked fsync only for unsupported-operation errnos.
-    /// Any other flush failure, or exhausted retries, leaves durability unproven and throws.
-    private static func fullSync(fd: Int32, path: URL) throws {
-        var lastErrno: Int32 = 0
+    /// Durable regular files require a drive-cache flush. Directories persist
+    /// namespace changes with fsync, selected by kind before any operation.
+    /// Unsupported guarantees fail; no weaker mechanism runs after failure.
+    private static func syncDescriptor(fd: Int32, path: URL, driveCache: Bool) throws {
+        var code: Int32 = 0
         for _ in 0..<8 {
-            lastErrno = Darwin.fcntl(fd, F_FULLFSYNC) == -1 ? errno : 0
-            if lastErrno == 0 { return }
-            if lastErrno != EINTR { break }
+            let result = driveCache ? Darwin.fcntl(fd, F_FULLFSYNC) : Darwin.fsync(fd)
+            code = result == -1 ? errno : 0
+            if code == 0 { return }
+            if code != EINTR { break }
         }
-        if lastErrno == EINTR {
-            throw PersistenceCoreError.ioFailure(
-                "F_FULLFSYNC(\(path.lastPathComponent)) kept returning EINTR — durability unproven"
-            )
-        }
-        guard fullFsyncUnsupportedErrnos.contains(lastErrno) else {
-            throw PersistenceCoreError.ioFailure(
-                "F_FULLFSYNC(\(path.lastPathComponent)) failed: \(String(cString: strerror(lastErrno)))"
-            )
-        }
-        var fsyncErrno: Int32 = 0
-        for _ in 0..<8 {
-            fsyncErrno = Darwin.fsync(fd) == -1 ? errno : 0
-            if fsyncErrno == 0 { return }
-            if fsyncErrno != EINTR { break }
-        }
+        let operation = driveCache ? "F_FULLFSYNC" : "fsync"
         throw PersistenceCoreError.ioFailure(
-            "F_FULLFSYNC unsupported (\(String(cString: strerror(lastErrno)))) and "
-            + "fsync(\(path.lastPathComponent)) failed: \(String(cString: strerror(fsyncErrno)))"
+            "\(operation)(\(path.lastPathComponent)) failed: \(String(cString: strerror(code))) — durability unproven"
         )
     }
 
     /// Replace relative to a borrowed parent descriptor, or open the pathname's parent.
-    /// The private 0600 temp and parent use drive-cache syncs when fullFlush is true.
+    /// The private 0600 temp uses a drive-cache flush when fullFlush is true;
+    /// its parent always uses a checked namespace fsync.
     package static func atomicWrite(_ data: Data, to path: URL, parentFD: Int32? = nil, fullFlush: Bool = false) throws {
         let dir = path.deletingLastPathComponent()
         let name = path.lastPathComponent
@@ -534,7 +539,7 @@ public enum SwiftNativePersistenceCore {
         _ = fchmod(fd, 0o600)
         // Sync and close the temp file before rename; either failure preserves the target.
         if fullFlush {
-            try fullSync(fd: fd, path: tmpPath)
+            try syncDescriptor(fd: fd, path: tmpPath, driveCache: true)
         } else if fsync(fd) != 0 {
             let err = String(cString: strerror(errno))
             throw PersistenceCoreError.ioFailure("fsync(tmp) failed: \(err)")
@@ -549,16 +554,12 @@ public enum SwiftNativePersistenceCore {
             throw PersistenceCoreError.ioFailure("rename failed: \(String(cString: strerror(errno)))")
         }
         didRename = true
-        // Sync the parent to persist the rename; failure leaves an uncertain commit to re-read.
-        if fullFlush {
-            try fullSync(fd: directoryFD, path: dir)
-        } else if fsync(directoryFD) != 0 {
-            throw PersistenceCoreError.ioFailure("fsync(parent directory) failed: \(String(cString: strerror(errno)))")
-        }
+        // Rename may already have committed if this namespace sync fails.
+        try syncDescriptor(fd: directoryFD, path: dir, driveCache: false)
     }
 
     /// Persist directory-entry changes before a transaction advances.
-    public static func syncDirectory(_ dir: URL, fullFlush: Bool = true) throws {
+    public static func syncDirectory(_ dir: URL) throws {
         let directoryFD = open(dir.path, O_RDONLY)
         if directoryFD < 0 {
             throw PersistenceCoreError.ioFailure(
@@ -566,12 +567,7 @@ public enum SwiftNativePersistenceCore {
             )
         }
         defer { _ = close(directoryFD) }
-        if fullFlush {
-            try fullSync(fd: directoryFD, path: dir)
-        } else if fsync(directoryFD) != 0 {
-            throw PersistenceCoreError.ioFailure(
-                "fsync(parent directory) failed: \(String(cString: strerror(errno)))"
-            )
-        }
+        // Directories have namespace durability, never a drive-cache contract.
+        try syncDescriptor(fd: directoryFD, path: dir, driveCache: false)
     }
 }

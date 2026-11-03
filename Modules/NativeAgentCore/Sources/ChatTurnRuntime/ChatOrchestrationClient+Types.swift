@@ -59,7 +59,7 @@ public struct ChatResponse: Sendable, Codable, Equatable {
     /// waiting for one. The approval record stays canonical about whether it
     /// still is.
     public var pendingApprovalID: String? = nil
-    /// Leading characters of `output` that are pre-tool working commentary
+    /// Leading characters of `output` spoken before tool rounds; kept on person-facing surfaces
     /// (see `TurnEngineResult.workingCommentaryCharacters`).
     public var workingCommentaryCharacters: Int? = nil
 

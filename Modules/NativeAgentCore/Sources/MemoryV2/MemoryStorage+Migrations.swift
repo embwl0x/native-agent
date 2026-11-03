@@ -291,6 +291,86 @@ extension MemoryStorage {
                 );
                 """)
         }
+        // Width is committed with the provider epoch, including an empty
+        // corpus. Existing epochs must undergo checked activation to earn it.
+        m.registerMigration("v17_embedding_dimensions") { db in
+            try db.execute(sql: "ALTER TABLE memory_embedding_state ADD COLUMN dimensions INTEGER")
+        }
+        m.registerMigration("v18_embedding_failures") { db in
+            try db.execute(sql: """
+                CREATE TABLE memory_embedding_failures (
+                    kind TEXT NOT NULL,
+                    row_id TEXT NOT NULL,
+                    content BLOB NOT NULL,
+                    epoch TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    PRIMARY KEY (kind, row_id)
+                );
+                """)
+        }
+        m.registerMigration("v19_action_embedding_failures") { db in
+            try db.execute(sql: """
+                CREATE TABLE action_embedding_failures (
+                    epoch TEXT NOT NULL,
+                    text_hash TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    PRIMARY KEY (epoch, text_hash)
+                );
+                """)
+        }
+        m.registerMigration("v20_embedding_activation_failure") { db in
+            try db.execute(sql: """
+                ALTER TABLE memory_embedding_state ADD COLUMN refused_epoch TEXT;
+                ALTER TABLE memory_embedding_state ADD COLUMN refusal_reason TEXT;
+                ALTER TABLE memory_embedding_state ADD COLUMN refused_at TEXT;
+                """)
+        }
+        m.registerMigration("v21_correction_occurrences") { db in
+            // Older previews discarded occurrence identities. Do not backfill
+            // them into a record that claims to be complete.
+            let existing = try Int.fetchOne(db, sql: "SELECT (SELECT COUNT(*) FROM memories) + (SELECT COUNT(*) FROM proposals)")
+            guard let existing else {
+                throw MemoryStorageError.databaseUnavailable("correction ledger: memory inventory unavailable")
+            }
+            try db.execute(sql: """
+                CREATE TABLE correction_ledger_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    complete_since REAL NOT NULL
+                );
+                CREATE TABLE correction_occurrences (
+                    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                    origin_id TEXT NOT NULL,
+                    at TEXT NOT NULL,
+                    occurred_at REAL NOT NULL,
+                    session_id TEXT,
+                    history TEXT,
+                    PRIMARY KEY (memory_id, origin_id)
+                );
+                CREATE INDEX correction_occurrences_time ON correction_occurrences(occurred_at);
+                CREATE TABLE correction_proposal_occurrences (
+                    proposal_id TEXT NOT NULL REFERENCES proposals(id) ON DELETE CASCADE,
+                    origin_id TEXT NOT NULL,
+                    at TEXT NOT NULL,
+                    occurred_at REAL NOT NULL,
+                    session_id TEXT,
+                    history TEXT,
+                    PRIMARY KEY (proposal_id, origin_id)
+                );
+                """)
+            try db.execute(sql: "INSERT INTO correction_ledger_state VALUES (1, ?)",
+                           arguments: [existing == 0 ? 0 : Date().timeIntervalSince1970])
+        }
+        // The retained repair uses the schema owner too. Adopt the cursor and
+        // index already created by older launches without resetting progress.
+        m.registerMigration("v22_proposal_repair_schema") { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS proposal_repair_cursor (singleton INTEGER PRIMARY KEY, stamp TEXT NOT NULL, id TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS proposals_repair_order ON proposals
+                (COALESCE(json_extract(metadata_json, '$.supersededAt'), resolved_at, staged_at), id);
+                """)
+        }
         return m
     }
 

@@ -9,18 +9,18 @@ struct PersonaWriteReceiptRow: View {
     let outcome: String
     let meta: String
 
-    /// Only the first conversation's successful write with its exact exempted title qualifies.
+    /// Only the first conversation's successful write with its exact progression title qualifies.
     static func receipt(
         for message: ChatMessage,
-        exemptTitle: String?
+        progressionTitle: String?
     ) -> (outcome: String, meta: String)? {
-        guard let exemptTitle, !exemptTitle.isEmpty,
+        guard let progressionTitle, !progressionTitle.isEmpty,
               message.metadata?.toolName == "persona_append_section" || message.metadata?.toolName == "app" else { return nil }
         guard let receipt = ChatShellToolSummary.personaReceipt(
             toolName: message.metadata?.toolName,
             inputJSON: message.metadata?.inputJSON,
             resultSummary: message.metadata?.resultSummary,
-            requiredTitle: exemptTitle
+            requiredTitle: progressionTitle
         ) else { return nil }
         return receipt
     }

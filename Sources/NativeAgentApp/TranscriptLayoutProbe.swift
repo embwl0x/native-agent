@@ -55,6 +55,12 @@ final class TranscriptLayoutLedger: @unchecked Sendable {
 
     func record(rowID: String, kind: String, nanos: UInt64) {
         lock.lock()
+        // An unseen row at capacity must still advance an expired window.
+        if Date().timeIntervalSince(lastFlushedAt) >= Self.flushInterval {
+            lock.unlock()
+            flush()
+            lock.lock()
+        }
         if rows[rowID] == nil, rows.count >= Self.maximumRowsPerWindow {
             lock.unlock()
             return
@@ -64,9 +70,7 @@ final class TranscriptLayoutLedger: @unchecked Sendable {
         cost.totalNanos &+= nanos
         cost.maxNanos = max(cost.maxNanos, nanos)
         rows[rowID] = cost
-        let shouldFlush = Date().timeIntervalSince(lastFlushedAt) >= Self.flushInterval
         lock.unlock()
-        if shouldFlush { flush() }
     }
 
     /// Logs the ranked window and clears the counters. Called from the

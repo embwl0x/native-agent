@@ -13,7 +13,7 @@ import CoreFoundation
 import ProviderRouting
 import CryptoKit
 import SQLite3
-// Blueprint: | `AgentContactTaskValues.swift` | A2A task, event and turn result vocabulary |
+// Blueprint: | `AgentContactTaskValues.swift` | Retained inbound task, event and turn vocabulary; canonical execution state stays separate from typed payload-recovery debt and builder's selected input bindings |
 public enum AgentContactTaskState: String, Codable, Sendable {
     case submitted, working, inputRequired = "input-required", completed, failed, canceled, stopped
     public var terminal: Bool { self == .completed || self == .failed || self == .canceled || self == .stopped }
@@ -31,11 +31,15 @@ public struct AgentContactTask: Codable, Sendable {
     public var updated = Date()
     public var canonicalSession: String?
     public var canonicalRunID: String?
+    /// Builder routing/provenance only; transcript owns its accepted words and files.
+    public var bridgeInput: AgentContactBridgeInput?
     public var acceptedOutputModes: [String]?
     public var toolResult: JSONValue?
     public var delegatedCompletions: [String: AgentContactPart]?
     public var approvalIDs: Set<String>?
     public var replyPayloadExpired: Bool?
+    /// Execution can be terminal while its saved payload still needs repair.
+    public var replyRecovery: AgentContactReplyRecovery?
     public var delegatedCompletionDigests: [String: String]?
     /// Its registered callbacks, by config id: durable before acceptance.
     public var callbacks: [String: AgentContactCallback]?
@@ -43,13 +47,16 @@ public struct AgentContactTask: Codable, Sendable {
         callbacks?.values.contains { $0.delivered != state.rawValue } == true
     }
     var needsReplyRecovery: Bool {
-        // Older receipts conflated file recovery with the canonical turn outcome.
-        !state.terminal || (state == .failed && detail == "The saved reply's files could not be fully recovered. Do not resend automatically.")
+        !state.terminal || replyRecovery != nil
     }
     var hasReplyPayload: Bool {
         !text.isEmpty || !parts.isEmpty || toolResult != nil || failure != nil
             || delegatedCompletions?.isEmpty == false
     }
+}
+public struct AgentContactReplyRecovery: Codable, Sendable {
+    public let source: String
+    public let detail: String
 }
 public enum AgentContactEvent: Sendable {
     case snapshot(AgentContactTask)
@@ -65,6 +72,7 @@ struct AgentContactTurn: Sendable {
     var bindRun: @Sendable (String, String) async throws -> Void = { _, _ in }
     /// Its input already saved in the conversation: a restart left it queued.
     var accepted: EnqueuedUserMessage? = nil
+    var bridgeInput: AgentContactBridgeInput? = nil
 }
 enum AgentContactProgress: Sendable {
     case working
@@ -77,4 +85,6 @@ struct AgentContactOutcome: Sendable {
     var parts: [AgentContactPart]
     var detail: String? = nil
     var failure: ProviderFailure.Report? = nil
+    var replyRecovery: AgentContactReplyRecovery? = nil
+    var toolResult: JSONValue? = nil
 }

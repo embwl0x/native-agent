@@ -14,7 +14,8 @@ import NativeAgentCore
 import PersistenceCore
 import Privacy
 import MacControl
-// Blueprint: | `ClaudeBridgeRuntime.swift` | Authenticated HTTP/contact routes and generation-ordered contact lifecycle; stop closes admission before passive cleanup, preserving accepted turns/tools; the 64-request ceiling inherited from connection admission now holds workers/actual tool dispatches until exit, beyond response deadlines; the shared human-pausable tool ceiling returns unknown on timeout without prematurely settling the tool receipt; one recovery per listener generation owns concurrent Codex/OMP children through exit, including ProcessExecution-owned helper reaping; live payload publication, retained clients and event transport |
+import TrustCenter
+// Blueprint: | `ClaudeBridgeRuntime.swift` | Authenticated HTTP/contact routes and generation-ordered contact lifecycle; stop closes admission before passive cleanup, preserving accepted turns/tools; the 64-request ceiling holds workers/actual tool dispatches until exit, beyond response deadlines; the shared human-pausable tool ceiling returns unknown on timeout without prematurely settling the tool receipt; listener readiness retains the Codex queue/reply supervisor and concurrent OMP recovery through exit, with failure-only reattachment and ProcessExecution-owned helper reaping; live payload publication, retained clients and event transport |
 
 /// Factories and app observations bound at launch; ingress and retained delivery stay with the agent runtime.
 public protocol ClaudeBridgeRuntimePort: ClaudeBridgeMessagePort {
@@ -91,10 +92,18 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         label: "ClaudeBridge"
     )
     /// Doctor's "Local bridges" row: which port this bridge got, or why it has none.
-    public var listenerHealth: NativeLoopbackListener.Health { bridgeListener.health }
+    public var listenerHealth: (port: UInt16, boundPort: UInt16?, isActive: Bool, failure: String?) {
+        let listener = bridgeListener.health
+        return stateLock.withLock {
+            (listener.port, _activePort == 0 ? nil : listener.boundPort,
+             listener.isActive && discoveryPublicationFailure == nil,
+             discoveryPublicationFailure ?? listener.failure)
+        }
+    }
     private let stateLock = NSLock()
     private var _token: String = ""
     private var _activePort: UInt16 = 0
+    private var discoveryPublicationFailure: String?
     private var replyRecoveryTask: Task<Void, Never>?
     private var replyRecoveryToken: String?
     private var contactLifecycleRevision: UInt64 = 0
@@ -223,9 +232,8 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     }
 
     /// Canonical SSE framing for both a live fan-out and a reconnect backfill. Keeping this at the route owner prevents a valid bridge event from being silently emitted in one format and replayed in another.
-    static func eventStreamFrame(for event: BridgeEvent) -> Data {
-        let json = (try? JSONSerialization.data(withJSONObject: event.asJSON))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    static func eventStreamFrame(for event: BridgeEvent) throws -> Data {
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: event.asJSON), as: UTF8.self)
         return Data("data: \(json)\n\n".utf8)
     }
 
@@ -286,9 +294,18 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         configDir.appendingPathComponent("bridge.json")
     }
 
-    private func writeDiscoveryFiles(token: String, port: UInt16) {
-        try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: configDir.path)
+    private func writeDiscoveryFiles(token: String, port: UInt16) throws {
+        func checked(_ url: URL, _ operation: () throws -> Void) throws {
+            do { try operation() }
+            catch {
+                throw NSError(domain: "NativeAgent.BridgeDiscovery", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "\(url.path): \(error.localizedDescription)", NSUnderlyingErrorKey: error])
+            }
+        }
+        try checked(configDir) {
+            try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: configDir.path)
+        }
         let payload: [String: Any] = [
             "schemaVersion": 1,
             "host": "127.0.0.1",
@@ -298,19 +315,18 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
             "processIdentifier": ProcessInfo.processInfo.processIdentifier,
             "writtenAt": NativeTimestampFormat.plainZulu(Date()),
         ]
-        guard let descriptor = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) else {
-            return
-        }
-        _ = NativePrivateFile.write(Data(token.utf8), to: tokenFileURL)
-        _ = NativePrivateFile.write(descriptor, to: descriptorFileURL)
+        let descriptor = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted])
+        try checked(tokenFileURL) { try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(token.utf8), to: tokenFileURL) }
+        try checked(descriptorFileURL) { try SwiftNativePersistenceCore.writeDataAtomicDurable(descriptor, to: descriptorFileURL) }
         // Peers receive only the address and authenticate with their own contact secret.
         let peerDir = AgentHostDirectory.peerDescriptorDirectory(dataRoot: host.dataRoot)
-        try? FileManager.default.createDirectory(at: peerDir, withIntermediateDirectories: true)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: peerDir.path)
-        if let peerDescriptor = try? JSONSerialization.data(
-            withJSONObject: ["schemaVersion": 1, "url": "http://127.0.0.1:\(port)"], options: [.prettyPrinted]) {
-            _ = NativePrivateFile.write(peerDescriptor, to: peerDescriptorFileURL)
+        try checked(peerDir) {
+            try FileManager.default.createDirectory(at: peerDir, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: peerDir.path)
         }
+        let peerDescriptor = try JSONSerialization.data(
+            withJSONObject: ["schemaVersion": 1, "url": "http://127.0.0.1:\(port)"], options: [.prettyPrinted])
+        try checked(peerDescriptorFileURL) { try SwiftNativePersistenceCore.writeDataAtomicDurable(peerDescriptor, to: peerDescriptorFileURL) }
     }
 
     private var peerDescriptorFileURL: URL {
@@ -325,7 +341,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
 
     // MARK: - Lifecycle
 
-    /// Start the bridge on its preferred port, advancing deterministically on collisions and publishing the selected endpoint once it is ready.
+    /// Bind the install's fixed port; admit work only after its checked descriptors are published.
     public func startServer() async {
         await Task.detached(priority: .background) { [weak self] in
             self?.startSync()
@@ -392,7 +408,8 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         }
         _token = tk
         _activePort = 0
-        updateContactLifecycleLocked(active: true)
+        discoveryPublicationFailure = nil
+        updateContactLifecycleLocked(active: false)
         removeDiscoveryFiles()
         let started = bridgeListener.start(
             onReady: { [weak self] port in
@@ -421,10 +438,24 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
             stateLock.unlock()
             return
         }
+        // Hold the lifecycle lock over the tiny atomic publications so stop() cannot remove them and then lose a race to a stale ready callback.
+        do { try writeDiscoveryFiles(token: token, port: port) }
+        catch {
+            let detail = "Bridge discovery publication failed at \(configDir.path): \(error.localizedDescription). Repair the named file error and start the bridge again."
+            discoveryPublicationFailure = detail
+            _activePort = 0
+            updateContactLifecycleLocked(active: false)
+            removeDiscoveryFiles()
+            stateLock.unlock()
+            nativeLog("[ClaudeBridge] %@", detail)
+            bridgeListener.stop()
+            teardown(token: token)
+            return
+        }
+        discoveryPublicationFailure = nil
         _activePort = port
         startedAt = Date()
-        // Hold the lifecycle lock over the tiny atomic publications so stop() cannot remove them and then lose a race to a stale ready callback.
-        writeDiscoveryFiles(token: token, port: port)
+        updateContactLifecycleLocked(active: true)
         startReplyRecoveryLocked(token: token)
         stateLock.unlock()
 
@@ -452,7 +483,8 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         }
     }
 
-    /// Relaunch repair for durable Codex reply jobs. The Node helper performs a single locked scan and gives every job its own delivery lock; it does not install a poller or another scheduler.
+    /// One retained, event-backed queue/reply owner for this listener. A helper
+    /// exit ends that process, never the accepted work's observation lifetime.
     private func startCodexReplyJobRecovery(token: String) async {
         let environment = ProcessInfo.processInfo.environment
         if ["1", "true", "yes"].contains(
@@ -460,7 +492,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         ) {
             return
         }
-        let dataRoot = PersistenceCore.defaultDataRoot()
+        let dataRoot = host.dataRoot
         let repoRoot = dataRoot.deletingLastPathComponent()
         guard let helper = AgentBridgeRuntime.codexHelperURL(dataRoot: dataRoot) else {
             nativeLog(
@@ -476,23 +508,29 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         }
         var childEnvironment = processEnvironment
         childEnvironment["NATIVE_AGENT_DATA_ROOT"] = dataRoot.path
+        let configRoot = InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
+        childEnvironment.merge(InstallPaths.current.bridgeEnvironment(configRoot: configRoot)) { existing, _ in existing }
         if childEnvironment["CODEX_BIN"] == nil,
            let codex = AgentBridgeRuntime.executableURL(named: "codex", environment: processEnvironment) {
             childEnvironment["CODEX_BIN"] = codex.path
         }
-        guard !Task.isCancelled, self.token == token else { return }
-        do {
-            // The existing process owner retains/reaps the helper and its descendants on cancellation; this recovery task awaits exit.
-            let result = try await ProcessExecution().run(executable: node.path,
-                arguments: [helper.path, "--recover-reply-jobs"], currentDirectory: repoRoot,
-                environment: childEnvironment, standardInput: nil, timeoutSeconds: nil, outputByteLimit: 0)
-            if result.exitCode != 0, !Task.isCancelled {
-                nativeLog("[ClaudeBridge] Codex reply-job recovery exited %d", Int(result.exitCode))
+        while !Task.isCancelled, self.token == token {
+            do {
+                // This task retains/reaps the supervisor and its children on cancellation.
+                let result = try await ProcessExecution().run(executable: node.path,
+                    arguments: [helper.path, "--recover-wakes"], currentDirectory: repoRoot,
+                    environment: childEnvironment, standardInput: nil, timeoutSeconds: nil, outputByteLimit: 0)
+                if !Task.isCancelled {
+                    nativeLog("[ClaudeBridge] Codex wake owner exited %d; reattaching retained work", Int(result.exitCode))
+                }
+            } catch {
+                if !Task.isCancelled {
+                    nativeLog("[ClaudeBridge] Codex wake owner unavailable: %@", String(describing: error))
+                }
             }
-        } catch {
-            if !Task.isCancelled {
-                nativeLog("[ClaudeBridge] could not start Codex reply-job recovery: %@", String(describing: error))
-            }
+            guard !Task.isCancelled, self.token == token else { return }
+            // Failure-only backoff; healthy observation is driven by owner events.
+            do { try await Task.sleep(for: .seconds(30)) } catch { return }
         }
     }
 
@@ -632,7 +670,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
             let tasks = self.tasks
             Task {
                 let reply = await AgentContactRoutes.retainedReply(requestID: request, sessionID: session,
-                    taskID: "na3.\(session).\(request)", receiptSessionID: session, offset: offset, maxChars: maxChars,
+                    taskID: AgentContactRoutes.taskID(requestID: request, sessionID: session, principal: principal), receiptSessionID: session, offset: offset, maxChars: maxChars,
                     principal: principal, tasks: tasks)
                 if reply.task == nil, reply.receipt["status"] as? String != "ok" {
                     if reply.receipt["evidence"] as? String == "canonical_task_unreadable" {
@@ -644,9 +682,23 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                     }
                     return
                 }
-                writeJSON(conn, status: 200, obj: reply.receipt, onSent: { [task = reply.task] in
-                    if let task, !task.text.isEmpty { Task { await tasks.recordReplyFetch(task) } }
-                })
+                writeJSON(conn, status: 200, obj: reply.receipt,
+                    onSent: AgentContactRoutes.fetched(reply.receipt, task: reply.task, tasks: tasks))
+            }
+        case "/launch":
+            // A queued Codex launch asks when it launches: the Mac's ceiling now, never a stamp.
+            guard method == "GET", lane == "codex" else {
+                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
+                return
+            }
+            let dataRoot = host.dataRoot
+            Task {
+                let ceiling = await SwiftNativeSecurityCenter(dataRoot: dataRoot).drivenAgentLaunchCeiling()
+                if case .denied(let reason) = ceiling {
+                    writeJSON(conn, status: 200, obj: ["status": "denied", "reason": reason])
+                } else {
+                    writeJSON(conn, status: 200, obj: ["status": "ok", "sandbox": ceiling.codexSandbox, "approvalPolicy": ceiling.codexApprovalPolicy])
+                }
             }
         case "/organism/debug":
             guard method == "POST" else {
@@ -691,7 +743,13 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         let subs = Array(eventSubscribers.values)
         if !subs.isEmpty {
             eventDeliveryQueue.async {
-                let chunk = Self.eventStreamFrame(for: event)
+                let chunk: Data
+                do { chunk = try Self.eventStreamFrame(for: event) }
+                catch {
+                    nativeLog("Bridge event %@ could not be encoded: %@", event.kind, error.localizedDescription)
+                    for sub in subs { sub.cancel() }
+                    return
+                }
                 for sub in subs {
                     sub.send(content: chunk, completion: .contentProcessed { _ in })
                 }
@@ -718,7 +776,8 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         eventDeliveryQueue.async {
             conn.send(content: initial, completion: .contentProcessed { _ in })
             for event in backfill {
-                conn.send(content: Self.eventStreamFrame(for: event), completion: .contentProcessed { _ in })
+                do { conn.send(content: try Self.eventStreamFrame(for: event), completion: .contentProcessed { _ in }) }
+                catch { nativeLog("Bridge event backfill could not be encoded: %@", error.localizedDescription); conn.cancel(); return }
             }
         }
         stateLock.unlock()
@@ -812,10 +871,10 @@ extension ClaudeBridgeRuntime {
 }
 
 public extension ClaudeBridgeRuntimePort {
-    func activeSessionID(dataRoot: URL) -> String? {
-        ClaudeBridgeReadout.readBridgeActiveSession(dataRoot: dataRoot, preferred: { self.preferredSessionID }).id
+    func activeSessionID(dataRoot: URL) throws -> String? {
+        try ClaudeBridgeReadout.readBridgeActiveSession(dataRoot: dataRoot, preferred: { self.preferredSessionID }).id
     }
-    func activePersona(dataRoot: URL) -> String? {
-        ClaudeBridgeReadout.readActivePersona(dataRoot: dataRoot, preferred: preferredPersona)
+    func activePersona(dataRoot: URL) throws -> String? {
+        try ClaudeBridgeReadout.readActivePersona(dataRoot: dataRoot, preferred: preferredPersona)
     }
 }

@@ -288,7 +288,8 @@ public enum MacPerceptionCompiler {
                         depth: depth,
                         path: node.path,
                         frame: attributes.frame,
-                        labelJSON: label.map { redacted($0, of: node, under: nil) }
+                        labelJSON: label.map { redacted($0, of: node, under: nil) },
+                        enabled: attributes.enabled
                     ))
                 }
             } else if let subrole = attributes.subrole,
@@ -303,7 +304,8 @@ public enum MacPerceptionCompiler {
                     depth: depth,
                     path: node.path,
                     frame: attributes.frame,
-                    labelJSON: label.map { redacted($0, of: node, under: nil) }
+                    labelJSON: label.map { redacted($0, of: node, under: nil) },
+                    enabled: attributes.enabled
                 ))
             }
             // Modal? The ROOT is never a modal — it is the window itself.
@@ -344,7 +346,10 @@ public enum MacPerceptionCompiler {
             let value = cleaned(attributes.value)
             let label: String
             let labelSource: String
-            if let title {
+            if attributes.labelUnreadable {
+                label = ""
+                labelSource = "unreadable"
+            } else if let title {
                 label = title
                 labelSource = "title"
             } else if let value {
@@ -366,7 +371,7 @@ public enum MacPerceptionCompiler {
                 labelSource = "unlabeled"
                 unlabeled[attributes.role, default: 0] += 1
             }
-            if labelSource != "unlabeled" { labeledCount += 1 }
+            if labelSource != "unlabeled", labelSource != "unreadable" { labeledCount += 1 }
             // NO CAP HERE: the cap is applied AFTER ranking, so
             // "the 60 rows we kept" are the 60 most useful rows and not the
             // first 60 in document order (Finder's filenames, every time).
@@ -464,7 +469,8 @@ public enum MacPerceptionCompiler {
                 // fell back to the value, the node has no title to caption it,
                 // so its secure role and the surrounding context decide.
                 labelJSON: label.map { redacted($0, of: node, under: nil, isValue: title == nil) },
-                selectionRange: node.attributes.selectionRange
+                selectionRange: node.attributes.selectionRange,
+                enabled: node.attributes.enabled
             )
         }
         let rootNode = byPath[[]]
@@ -555,6 +561,7 @@ public enum MacPerceptionCompiler {
             truncated: snapshot.truncated,
             truncationReasons: snapshot.truncationReasons,
             skippedAtLeast: snapshot.skippedAtLeast,
+            readFailures: snapshot.readFailures,
             windowTitleJSON: title.map { text in
                 rootNode.map { redacted(text, of: $0, under: nil) }
                     ?? MacScreenViewTextRedaction.redactedLegendString(text, valueChars: affordanceValueChars)

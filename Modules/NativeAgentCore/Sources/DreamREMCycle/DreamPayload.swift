@@ -1,5 +1,25 @@
 import Foundation
-// Blueprint: | `DreamPayload.swift` | `DreamPayload` and `DreamClaim`: the dream's per-claim gentleness and owner-relevance judgments travel with its admitted quote/source provenance; older claims remain unknown for Reach |
+import PersistenceCore
+import CognitiveSubstrate
+// Blueprint: | `DreamPayload.swift` | `DreamPayload`, `DreamClaim` and `DreamLesson`: checked per-claim provenance and bounded optional learning; malformed present sections fail decoding rather than disappear |
+
+struct DreamLesson: Sendable, Codable {
+    let lesson: String
+    let from: String
+    let kind: String
+
+    init?(_ value: JSONValue) {
+        guard let fields = value.objectValue,
+              let lesson = fields["lesson"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let from = fields["from"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let kind = fields["kind"]?.stringValue,
+              !lesson.isEmpty, lesson.count <= 500, !from.isEmpty, from.count <= 500,
+              ["how", "fact"].contains(kind) else { return nil }
+        self.lesson = lesson
+        self.from = from
+        self.kind = kind
+    }
+}
 
 /// Meaning judged by the dream that produced the claim, never by a lexical
 /// filter in a later reader. Nil is unknown and grants no outreach eligibility.
@@ -25,7 +45,7 @@ public struct DreamClaim: Sendable, Codable {
     }
 
     /// Older claims retain unknown judgments; only trailing section blocks count.
-    public static func read(in content: String) -> [Self] {
+    public static func read(in content: String) -> [DreamClaimSection<Self>] {
         DreamEntryProvenance.readClaims(in: content, as: Self.self)
     }
 }
@@ -40,6 +60,14 @@ struct DreamPayload: Decodable {
     let claims: [DreamClaim]
     /// Optional `settled: <key>: <how>` / `let go: <key>` lines about her open cares.
     let cares: [String]
+    let lessons: [DreamLesson]
+    let careMerges: [CognitiveCareMerge]
+    /// Merge entries she wrote that could not be read, so a drop is visible.
+    let careMergesMalformed: Int
+    let careStanceChanges: [CognitiveCareStanceChange]
+    let traits: [CognitiveSelfKnowledge.Trait]
+    let story: [CognitiveSelfKnowledge.Story]
+    let people: [CognitiveSelfKnowledge.Person]
 
     private enum CodingKeys: String, CodingKey {
         case title
@@ -50,6 +78,10 @@ struct DreamPayload: Decodable {
         case surprisingMoments = "surprising_moments"
         case claims
         case cares
+        case lessons
+        case careMerges = "merge"
+        case careStanceChanges = "stance_changes"
+        case traits, story, people
     }
 
     init(from decoder: Decoder) throws {
@@ -66,6 +98,57 @@ struct DreamPayload: Decodable {
         surprisingMoments = try container.decode([String].self, forKey: .surprisingMoments)
         claims = try container.decode([DreamClaim].self, forKey: .claims)
         cares = try container.decodeIfPresent([String].self, forKey: .cares) ?? []
+        func checked<T>(_ key: CodingKeys, maximum: Int,
+                        transform: (JSONValue) -> T?) throws -> [T] {
+            let values = try container.decodeIfPresent([JSONValue].self, forKey: key) ?? []
+            guard values.count <= maximum else {
+                throw DecodingError.dataCorruptedError(forKey: key, in: container,
+                    debugDescription: "\(key.stringValue) exceeds its \(maximum)-entry bound")
+            }
+            return try values.enumerated().map { index, value in
+                guard let decoded = transform(value) else {
+                    throw DecodingError.dataCorruptedError(forKey: key, in: container,
+                        debugDescription: "\(key.stringValue)[\(index)] is malformed; learning was not applied")
+                }
+                return decoded
+            }
+        }
+        lessons = try checked(.lessons, maximum: 5, transform: DreamLesson.init)
+        careMerges = try checked(.careMerges, maximum: 6) { value -> CognitiveCareMerge? in
+            guard let fields = value.objectValue,
+                  let rawIDs = fields["into_it"]?.arrayValue, !rawIDs.isEmpty, rawIDs.count <= 6,
+                  let why = fields["why"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !why.isEmpty, why.count <= 500 else { return nil }
+            let ids = rawIDs.compactMap { $0.stringValue.flatMap(UUID.init(uuidString:)) }
+            guard ids.count == rawIDs.count, Set(ids).count == ids.count else { return nil }
+            var keep: UUID?
+            if let raw = fields["keep"], raw != .null {
+                guard let parsed = raw.stringValue.flatMap(UUID.init(uuidString:)) else { return nil }
+                keep = parsed
+            }
+            return CognitiveCareMerge(keep: keep, intoIt: ids, why: why)
+        }
+        careMergesMalformed = 0
+        careStanceChanges = try checked(.careStanceChanges, maximum: .max) { value -> CognitiveCareStanceChange? in
+            guard let fields = value.objectValue,
+                  let id = fields["care"]?.stringValue.flatMap(UUID.init(uuidString:)),
+                  let rawPressure = fields["pressure"]?.arrayValue, !rawPressure.isEmpty,
+                  let stance = fields["stance"]?.objectValue,
+                  let text = stance["text"]?.stringValue, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let because = stance["because"]?.stringValue, let unless = stance["unless"]?.stringValue,
+                  [text, because, unless].allSatisfy({ $0.count <= CognitiveCare.stanceCharacters }) else { return nil }
+            let pressure = rawPressure.compactMap { entry -> Int? in
+                guard let number = entry.exactIntegerValue, number > 0 else { return nil }
+                return number
+            }
+            guard pressure.count == rawPressure.count, Set(pressure).count == pressure.count else { return nil }
+            return CognitiveCareStanceChange(care: id, pressure: pressure,
+                stance: .init(text: text, because: because, wouldChangeMind: unless))
+        }
+        traits = try checked(.traits, maximum: 5, transform: CognitiveSelfKnowledge.Trait.init)
+        story = try checked(.story, maximum: 5, transform: CognitiveSelfKnowledge.Story.init)
+        people = try checked(.people, maximum: CognitiveSelfKnowledge.maximumPeople,
+            transform: CognitiveSelfKnowledge.Person.init)
 
         guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw DecodingError.dataCorruptedError(

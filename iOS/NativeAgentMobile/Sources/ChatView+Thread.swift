@@ -2,7 +2,7 @@ import SwiftUI
 import UIKit
 import NativeAgentShared
 import UniformTypeIdentifiers
-// Blueprint: | `ChatView+Thread.swift` | Transcript rendering, scrolling and SwiftUI hooks on ChatView |
+// Blueprint: | `ChatView+Thread.swift` | Transcript rendering, scrolling and SwiftUI hooks; other-room excerpts match the Mac’s compact title/reply preview and open their ID-resolved conversation |
 
 extension ChatView {
     private var otherRoomRows: [String: [OtherRoomExchange]] {
@@ -17,11 +17,8 @@ extension ChatView {
 
     private func exchangeRows(_ events: [OtherRoomExchange]) -> some View {
         ForEach(events) { event in
-            NavigationLink { MobileAgentThreadView(id: event.contactID) } label: {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(event.title)
-                    Text(event.subtitle).foregroundStyle(.secondary)
-                }.font(.callout).lineLimit(1)
+            Button { openedAgentContactID = event.contactID } label: {
+                OtherRoomExchangePreview(exchange: event).foregroundStyle(AlivePalette.text)
             }.buttonStyle(.plain).id("other-room:" + event.id)
         }
     }
@@ -372,6 +369,18 @@ extension ChatView {
             .sheet(isPresented: $showsChatSetup) {
                 PairingView(onSkip: { showsChatSetup = false }, onPaired: { showsChatSetup = false })
             }
+            .sheet(isPresented: Binding(get: { openedAgentContactID != nil }, set: { if !$0 { openedAgentContactID = nil } })) {
+                if let id = openedAgentContactID {
+                    NavigationStack {
+                        MobileAgentThreadView(id: id)
+                            .toolbar {
+                                ToolbarItem(placement: .cancellationAction) {
+                                    Button("Done") { openedAgentContactID = nil }
+                                }
+                            }
+                    }
+                }
+            }
             .sheet(isPresented: $showsSyncConnection) {
                 NavigationStack { SettingsViewFull(opensConnection: true) }
             }
@@ -439,8 +448,18 @@ extension ChatView {
 
     /// What the agent is doing, in the Mac's words.
     private var agentDoing: (text: String, dot: AliveStatusDot.State) {
+        if store.pendingExchanges.values.contains(where: {
+            $0.sessionID == ChatStore.cleanSessionID(store.selectedSessionID) && $0.deliveryUnconfirmed
+        }) {
+            return ("Couldn't confirm it arrived", .waiting)
+        }
         if let heard = store.activeTurnHeardByMac ?? (isChatSample && visibleMessages.last?.isStreaming == true ? true : nil) {
-            guard heard else { return ("Sending…", .working) }
+            guard heard else {
+                let accepted = store.pendingExchanges.values.contains {
+                    $0.sessionID == ChatStore.cleanSessionID(store.selectedSessionID) && $0.deliveryAccepted
+                }
+                return accepted ? ("Sent · waiting for Mac", .waiting) : ("Sending…", .working)
+            }
             let replying = visibleMessages.last.map { $0.role == .assistant && $0.isStreaming && !$0.text.isEmpty } ?? false
             return (replying ? "Replying…" : "Received by Mac", replying ? .working : .waiting)
         }

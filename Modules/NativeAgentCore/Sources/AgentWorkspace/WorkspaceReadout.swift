@@ -70,7 +70,7 @@ enum WorkspaceReadout {
             .init(label: label, action: .open(.record(tool: tool, input: input, title: title ?? label)))
         }
         actions["create"] = .init(label: "create", action: .configure(tool: "bot_create", input: [:], title: "create"))
-        actions["replies"] = read("replies","shelf_read",["limit": .int(16),"include_read": .bool(true),"newest_first": .bool(true)])
+        actions["replies"] = read("replies","shelf_read",["limit": .int(16),"include_read": .bool(true),"sort": .string("newest_first")])
         actions["all"] = read("all","bot_list")
         for (index,value) in rows.enumerated() {
             let row = value.objectValue ?? [:], key = "bot:" + String(index)

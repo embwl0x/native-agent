@@ -2,7 +2,7 @@
 import SwiftUI
 import UserNotifications
 import NativeAgentShared
-// Blueprint: | `WorkshopView.swift` | Shared task rows, engine-projected actionable approval state and ID-resolved details; local submission/loading state |
+// Blueprint: | `WorkshopView.swift` | Shared task rows, readable request summaries and raw-request disclosure, engine-projected actionable approval state and ID-resolved details; local submission/loading state |
 
 // MARK: - WorkshopView (full parity)
 
@@ -167,7 +167,7 @@ struct WorkshopView: View {
                             .foregroundStyle(AlivePalette.text)
                             .multilineTextAlignment(.leading)
                             .fixedSize(horizontal: false, vertical: true)
-                        Text(task.summary ?? task.objective)
+                        Text(RunDetailPromptPresentation.summary(task.summary ?? task.objective) ?? "Request not recorded")
                             .font(.subheadline)
                             .foregroundStyle(AlivePalette.secondary)
                             .lineLimit(2)
@@ -277,14 +277,13 @@ final class WorkshopStore: ObservableObject {
         title: String, objective: String,
         submission: InboxAction? = nil,
         intentionalNewRequest: Bool = false,
-        onReplacement: ((InboxAction) -> Void)? = nil,
         onRefusal: (() -> Void)? = nil
     ) async -> Bool {
         do {
             try await iCloudSyncEngine.shared.submitWorkshopTask(
                 title: title, objective: objective, submission: submission,
                 intentionalNewRequest: intentionalNewRequest,
-                onReplacement: onReplacement, onRefusal: onRefusal
+                onRefusal: onRefusal
             )
             await refresh()
             return true
@@ -325,31 +324,41 @@ final class WorkshopCompletionNotificationTracker {
 
     private var hasBaseline = false
     private var knownCompletedIDs = Set<String>()
-    private let notify: @MainActor (WorkshopTaskRecord) -> Void
+    private var notifyingIDs = Set<String>()
+    private let notify: @MainActor (WorkshopTaskRecord) async throws -> Void
 
-    init(notify: (@MainActor (WorkshopTaskRecord) -> Void)? = nil) {
+    init(notify: (@MainActor (WorkshopTaskRecord) async throws -> Void)? = nil) {
         self.notify = notify ?? { task in
-            WorkshopCompletionNotificationTracker.post(task)
+            try await WorkshopCompletionNotificationTracker.post(task)
         }
     }
 
     func apply(_ next: [WorkshopTaskRecord]) {
         let completed = next.filter { ["done", "completed"].contains($0.status.lowercased()) }
         let completedIDs = Set(completed.map(\.id))
-        defer {
-            knownCompletedIDs.formUnion(completedIDs)
+        guard hasBaseline else {
+            knownCompletedIDs = completedIDs
             hasBaseline = true
+            return
         }
-        guard hasBaseline else { return }
-        for task in completed where !knownCompletedIDs.contains(task.id) {
-            notify(task)
+        for task in completed where !knownCompletedIDs.contains(task.id) && !notifyingIDs.contains(task.id) {
+            notifyingIDs.insert(task.id)
+            Task {
+                defer { notifyingIDs.remove(task.id) }
+                do {
+                    try await notify(task)
+                    knownCompletedIDs.insert(task.id)
+                } catch {
+                    iCloudSyncEngine.shared.syncError = "Desk completion notification: \(error.localizedDescription)"
+                    NSLog("[NativeAgentMobile] Desk completion notification failed: %@", error.localizedDescription)
+                }
+            }
         }
     }
 
-    private static func post(_ task: WorkshopTaskRecord) {
-        Task.detached {
+    private static func post(_ task: WorkshopTaskRecord) async throws {
             let center = UNUserNotificationCenter.current()
-            _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
+            try await NativeAgentNotificationEventGate.requireAuthorization(center: center)
             let content = UNMutableNotificationContent()
             content.title = "Desk task completed"
             content.body = task.title
@@ -361,10 +370,9 @@ final class WorkshopCompletionNotificationTracker {
             let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
             userInfo["eventId"] = eventID
             content.userInfo = userInfo
-            _ = try? await NativeAgentNotificationEventGate.add(
+            _ = try await NativeAgentNotificationEventGate.add(
                 content: content, eventID: eventID, trigger: nil, center: center
             )
-        }
     }
 }
 
@@ -396,14 +404,14 @@ struct WorkshopTaskRow: View {
                     .foregroundStyle(AlivePalette.text)
                     .multilineTextAlignment(.leading)
                     .fixedSize(horizontal: false, vertical: true)
-                Text(task.objective)
+                Text(RunDetailPromptPresentation.summary(task.objective) ?? "Request not recorded")
                     .font(.subheadline)
                     .foregroundStyle(AlivePalette.secondary)
                     .lineLimit(3)
                     .multilineTextAlignment(.leading)
             }
             if let summary = task.summary, !summary.isEmpty {
-                Text(summary)
+                Text(RunDetailPromptPresentation.summary(summary) ?? "Summary not recorded")
                     .font(.footnote)
                     .foregroundStyle(AlivePalette.secondary)
                     .multilineTextAlignment(.leading)
@@ -454,22 +462,28 @@ struct WorkshopTaskDetailSheet: View {
                 }
 
                 AliveSection("What it's for") {
-                    Text(task.objective)
+                    Text(RunDetailPromptPresentation.summary(task.objective) ?? "Request not recorded")
                         .font(.body)
                         .lineSpacing(3)
                         .foregroundStyle(AlivePalette.text)
                         .fixedSize(horizontal: false, vertical: true)
                         .aliveRow()
+                    DisclosureGroup("Raw request") {
+                        Text(task.objective).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    }.aliveRow()
                 }
 
                 if let summary = task.summary, !summary.isEmpty {
                     AliveSection("Where it's got to") {
-                        Text(summary)
+                        Text(RunDetailPromptPresentation.summary(summary) ?? "Summary not recorded")
                             .font(.body)
                             .lineSpacing(3)
                             .foregroundStyle(AlivePalette.text)
                             .fixedSize(horizontal: false, vertical: true)
                             .aliveRow()
+                        DisclosureGroup("Raw summary") {
+                            Text(summary).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        }.aliveRow()
                     }
                 }
 
@@ -540,7 +554,6 @@ struct NewWorkshopTaskSheet: View {
                         if await store.submitWorkshopTask(
                             title: title, objective: objective, submission: submission,
                             intentionalNewRequest: intentionalNewRequest,
-                            onReplacement: { submission = $0 },
                             onRefusal: { submission = nil }
                         ) { dismiss() }
                         isSubmitting = false

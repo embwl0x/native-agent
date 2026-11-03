@@ -13,7 +13,7 @@ import Senses
 import os
 import CoreText
 import ScreenCaptureKit
-// Blueprint: | `MacSemanticExecution.swift` | MacFourVerbs supplemental semantic/native-hand execution and input grammar under the same driver and act lifetime |
+// Blueprint: | `MacSemanticExecution.swift` | Shared semantic/physical execution under driver authority; unreadable delivered text retains unverified status and offers a pixel look |
 extension MacFourVerbs {
     static func frontChangedWords(_ reply: MacFourVerbsReply, verbName: String) -> MacFourVerbsReply {
         guard string(reply.detail["error"]) == "front_changed" else { return reply }
@@ -169,6 +169,11 @@ extension MacFourVerbs {
         if let holding { body["holding"] = .string(holding) }
         if let button { body["button"] = .string(button) }
         switch verb {
+        case .doubleClick: body["gesture"] = .string("double_click")
+        case .rightClick:
+            body["gesture"] = .string("click")
+            body["button"] = .string("right")
+        case .hover: body["gesture"] = .string("hover")
         case .focus:
             return MacFourVerbsReply(ok: false, text: "This thing has no accessibility focus target; no input was sent.",
                 detail: ["error": .string("focus_requires_accessibility")])
@@ -207,7 +212,7 @@ extension MacFourVerbs {
                 detail: ["error": .string("native_surface_changed")])
         }
         let frontPid = Self.nativeSurfaceApp != nil ? before.pid : Self.requiredFrontPid
-        let reply = await Self.$requiredFrontPid.withValue(frontPid) {
+        let reply = await MacAppActGate.$looking.withValue(verb == .scroll) { await Self.$requiredFrontPid.withValue(frontPid) {
             // A press on a named control takes the one pointer tail: clear of
             // anything covering the window, at the safe aim, the observed pid.
             if let pressed, let aim {
@@ -229,6 +234,7 @@ extension MacFourVerbs {
                 afterPart: candidate.physicalOnly ? "visual surface" : nil
             )
         }
+        }
         var detail = reply.detail
         detail["verb"] = .string(verb.rawValue)
         if let button { detail["button"] = .string(button) }
@@ -236,6 +242,9 @@ extension MacFourVerbs {
         detail["matched"] = .string(Self.name(candidate))
         let physicalRoute: String
         switch verb {
+        case .doubleClick: physicalRoute = "double_click"
+        case .rightClick: physicalRoute = "right_click"
+        case .hover: physicalRoute = "hover"
         case .focus: physicalRoute = "none"
         case .click, .select, .toggle, .dismiss: physicalRoute = "click"
         case .open: physicalRoute = "double_click"
@@ -351,11 +360,21 @@ extension MacFourVerbs {
                 detail: Self.operationDetail(result, app: before?.appName).merging(["error": .string(result.error ?? "refused")]) { current, _ in current }
             )
         }
-        guard confirm else {
-            return MacFourVerbsReply(ok: Self.object(result.output)["status"] != .string("acted_mismatch"),
-                text: description, detail: Self.operationDetail(result))
+        func offerTextLook(_ reply: MacFourVerbsReply) -> MacFourVerbsReply {
+            guard body["text"] != nil, Self.object(result.output)["status"] == .string("acted_unobserved") else { return reply }
+            var args: [String: JSONValue] = ["pixels": .bool(true)]
+            if let app = before?.bundleIdentifier ?? before?.appName { args["app"] = .string(app) }
+            var detail = reply.detail
+            detail["next_call"] = .object(["tool": .string("app"), "input": .object([
+                "action": .string("mac.look"), "args": .object(args)])])
+            return MacFourVerbsReply(ok: reply.ok,
+                text: reply.text + "\nText delivery is unverified; use next_call for a pixel look before typing again.", detail: detail)
         }
-        return await observedReply(
+        guard confirm else {
+            return offerTextLook(MacFourVerbsReply(ok: Self.object(result.output)["status"] != .string("acted_mismatch"),
+                text: description, detail: Self.operationDetail(result)))
+        }
+        return offerTextLook(await observedReply(
             result: result,
             description: description,
             unverifiedDescription: unverifiedDescription,
@@ -363,14 +382,14 @@ extension MacFourVerbs {
             afterPart: afterPart,
             pointerTarget: pointerTarget,
             pressed: pressed
-        )
+        ))
     }
     /// An act verb this hand has, or the short answer listing them.
     static func unknownVerb(_ rawVerb: String, target: String) -> MacFourVerbsReply? {
         var name = parseVerb(rawVerb).0
         if name == "press" { name = pressMeansKey(target) ? "key" : "click" }
         guard MacActVerb(rawValue: name) == nil, PhysicalVerb(rawValue: name) == nil else { return nil }
-        let verbs = (MacActVerb.allCases.map(\.rawValue) + PhysicalVerb.allCases.map(\.rawValue) + ["press"])
+        let verbs = Self.actionVerbs
         return MacFourVerbsReply(
             ok: false,
             text: "No \"\(rawVerb.trimmingCharacters(in: .whitespacesAndNewlines))\" verb. Use: "

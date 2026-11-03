@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `TurnInspectorPresentation.swift` | Inspector statuses, titles, rows, cards and redacted details, including memory-promotion prediction, deferral and unlabelled evidence |
+// Blueprint: | `TurnInspectorPresentation.swift` | Inspector statuses, titles, rows, cards and redacted details; token titles use shared checked current measurements and name absent counts unavailable; includes memory-promotion prediction, deferral and unlabelled evidence |
 
 /// Rendered status for one row's status dot / chip color. Derived from the
 /// event's payload (`status` / `phase` fields), never from raw content.
@@ -104,9 +104,15 @@ public enum TurnInspectorGrouping {
     /// Caller-supplied turn/position ids preserve SwiftUI identity; omitted ids use a UUID.
     public static func makeRow(_ ev: TurnTraceEvent, id: String = UUID().uuidString, measurementError: String? = nil) -> InspectorEventRow {
         let p = (ev.payload.objectValue ?? [:])
+        var measurementError = measurementError
+        let title: String
+        do { title = try rowTitle(kind: ev.kind, payload: p) }
+        catch {
+            title = "Token measurements unavailable"
+            measurementError = error.localizedDescription
+        }
         let status = measurementError == nil ? rowStatus(kind: ev.kind, payload: p) : .failed
         let duration = p["durationMs"]?.integerValue.flatMap(Int.init(exactly:))
-        let title = rowTitle(kind: ev.kind, payload: p)
         var details = detailLines(kind: ev.kind, payload: p)
         if let measurementError { details.append(.init(label: "Measurement error", value: measurementError)) }
         // Payloads with projected details (including memory-promotion shadow
@@ -142,7 +148,7 @@ public enum TurnInspectorGrouping {
         }
     }
 
-    private static func rowTitle(kind: String, payload p: [String: JSONValue]) -> String {
+    private static func rowTitle(kind: String, payload p: [String: JSONValue]) throws -> String {
         switch kind {
         case "tool.dispatch":
             let name = p["name"]?.stringValue ?? p["tool"]?.stringValue ?? "tool"
@@ -154,11 +160,10 @@ public enum TurnInspectorGrouping {
             let count = p["pathCount"]?.integerValue.flatMap(Int.init(exactly:)).map { " · \($0) path\($0 == 1 ? "" : "s")" } ?? ""
             return tool + mode + count
         case "llm.call":
-            if let tokens = p["inputTokens"]?.integerValue.flatMap(Int.init(exactly:)) ?? p["input_tokens"]?.integerValue.flatMap(Int.init(exactly:)) {
-                let out = p["outputTokens"]?.integerValue.flatMap(Int.init(exactly:)) ?? p["output_tokens"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0
-                return "\(tokens) in · \(out) out"
-            }
-            return p["model"]?.stringValue ?? "llm.call"
+            let tokens = try TraceMeasurement.tokens(p)
+            let input = tokens.input.map { String($0) } ?? "unavailable"
+            let output = tokens.output.map { String($0) } ?? "unavailable"
+            return "\(input) in · \(output) out"
         case "assembly.stage":
             let total = p["systemTotalChars"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0
             let recalled = p["recalledCount"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0

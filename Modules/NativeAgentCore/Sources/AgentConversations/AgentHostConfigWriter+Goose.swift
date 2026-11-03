@@ -92,7 +92,7 @@ enum GooseEntrySplice {
             guard let range = lines[index].range(of: "{}") else { throw refused() }
             lines[index].removeSubrange(range)
         } else {
-            // Yams 5.1's mapping style comes from the ending event, so use
+            // Yams' mapping style comes from the ending event, so use
             // source positions to recognize the documented block form.
             guard let colon = lines[index].firstIndex(of: ":"),
                   let firstMark = servers.first?.key.mark, firstMark.line > sectionMark.line else { throw refused() }

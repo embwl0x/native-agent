@@ -1,7 +1,7 @@
 import Foundation
 import NaturalLanguage
 import PersistenceCore
-// Blueprint: | `StudioWorkingShelf.swift` | `StudioWorkingShelf` struct; `decodeSlots`, `selections` |
+// Blueprint: | `StudioWorkingShelf.swift` | Explicit shelf selections; reads carry correction-history availability independently of known sentence supersession, including unavailable quote paths |
 
 /// Explicit selections beside the additive journal. No cached artifacts or usage state.
 public struct StudioWorkingShelf: Sendable {
@@ -194,8 +194,13 @@ public struct StudioWorkingShelf: Sendable {
         let entries = try await store.journalEntriesIncludingArchive()
         var cards: [JSONValue] = []
         for slot in slots {
-            guard let entry = entry(slot.entryID, in: entries), let source = quoteSource(slot, entry: entry) else {
+            guard let entry = entry(slot.entryID, in: entries) else {
                 cards.append(.object(["entry_id": .string(slot.entryID), "entry_availability": .string("entry unavailable")]))
+                continue
+            }
+            guard let source = quoteSource(slot, entry: entry) else {
+                cards.append(.object(["entry_id": .string(slot.entryID), "entry_availability": .string("selected sentence unavailable"),
+                    "corrections_unreadable": .bool(entry.correctionsUnreadable)]))
                 continue
             }
             var refs: [JSONValue] = []
@@ -230,15 +235,21 @@ public struct StudioWorkingShelf: Sendable {
                 card["correction"] = .string(amendment.correction)
                 card["corrected_on"] = .string(amendment.amendedOn)
                 card["correction_reason"] = .string(amendment.reason)
-            } else if entry.correctionsUnreadable {
-                card["selected_sentence_status"] = .string("corrections unreadable")
-                card["corrections_note"] = .string(
-                    "journal/amendments.jsonl is damaged — this sentence may already have been corrected")
             } else if !entry.amendments.isEmpty {
                 card["selected_sentence_status"] = .string("current")
                 if let corrected = entry.responseAsCorrected {
                     card["entry_response_as_corrected"] = .string(corrected)
                 }
+            }
+            // Known supersession and completeness of the correction history
+            // are independent facts. Carry both, even on superseded sentences.
+            card["corrections_unreadable"] = .bool(entry.correctionsUnreadable)
+            if entry.correctionsUnreadable {
+                if card["selected_sentence_status"] == nil {
+                    card["selected_sentence_status"] = .string("corrections unreadable")
+                }
+                card["corrections_note"] = .string(
+                    "journal/amendments.jsonl is damaged — this sentence may already have been corrected")
             }
             card["work_refs"] = .array(refs)
             if consultUnavailable { card["consult_availability"] = .string("unavailable") }

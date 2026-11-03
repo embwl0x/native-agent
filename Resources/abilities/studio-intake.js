@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id":"studio-intake","kind":"tool","version":1,
+{"id":"studio-intake","kind":"ability","version":1,
  "reach":{"capabilities":["app_data_read"]},
  "record":{"description":"Order unanswered artifact consults from complete corrected history, and phrase invitations to work already in reach.","actions":["studio.intake.read"],"inputSchema":{"type":"object","required":["operation"]}}}
 */
@@ -10,7 +10,6 @@ function run(input) {
             if (candidate.creator) head += " — " + candidate.creator;
             if (candidate.source === "named") return head + " is on the table, unanswered. [studio_consult_read consult_id: " + candidate.id + "]";
             if (candidate.source === "unjournaledWork") return head + " is in the graph with nothing written about it.";
-            if (candidate.source === "crossedTheScreen") return head + " crossed the screen and went unremarked.";
             throw new Error("Unknown Studio encounter source.");
         });
     }

@@ -25,9 +25,9 @@ extension SwiftToolDispatcher {
     static func recordHostConnectionOutcome(store: AgentPeerStore, contact: AgentPeerContact,
                                              ran: Bool, replied: Bool, probe: Bool,
                                              probeNonce: String? = nil,
-                                             executable: String, workspace: String, recipe: AgentRecipeStore.Recipe?) -> Bool {
-        let arrived = probe && probeNonce.map {
-            store.finishConnectionProbe(peerID: contact.id, nonce: $0, ran: ran, workspace: workspace, recipe: recipe)
+                                             executable: String, workspace: String, recipe: AgentRecipeStore.Recipe?) throws -> Bool {
+        let arrived = try probe && probeNonce.map {
+            try store.finishConnectionProbe(peerID: contact.id, nonce: $0, ran: ran, workspace: workspace, recipe: recipe)
         } == true
         store.recordProof(peerID: contact.id, outbound: replied || arrived)
         // Launch alone proves neither delivery nor a broken connection. Only
@@ -71,7 +71,7 @@ extension SwiftToolDispatcher {
     /// conversation and goes out in the result of the host's next call through
     /// its entry (`held_messages`, AgentConversationStore.held); held is not
     /// sent, and the receipt says which. It never reaches for a window.
-    static func hostPull(row: AgentHostRow?, contact: AgentPeerContact, text: String?, peers: [AgentPeerContact] = []) -> JSONValue {
+    static func hostPull(row: AgentHostRow?, contact: AgentPeerContact, text: String?, peers: [AgentPeerContact] = []) throws -> JSONValue {
         let name = row?.displayName ?? contact.name
         var result: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("mcpHost"),
             "host": .string(row?.id ?? ""), "completed": .bool(false)]
@@ -81,7 +81,7 @@ extension SwiftToolDispatcher {
             result["detail"] = .string("\(name)'s answers arrive as its own messages; this conversation's exchanges say which of yours are held and which were delivered, and when. " + presence)
             return .object(result)
         }
-        if currentPeerState(contact, peers: peers) == .unavailable {
+        if try currentPeerState(contact, peers: peers) == .unavailable {
             result["status"] = .string("unavailable"); result["sent"] = .bool(false)
             result["detail"] = .string(AgentPeerCredentials.unavailableDetail + " Nothing was held: \(name) cannot call in without its key.")
             result["remedy"] = Repair.remedy(owner: "Keychain peer:" + contact.id, nextCall: .object([
@@ -132,8 +132,8 @@ extension SwiftToolDispatcher {
             return .object(projection)
         }
     }
-    static func currentPeerState(_ peer: AgentPeerContact, peers: [AgentPeerContact]) -> AgentPeerContactState {
-        AgentPeerCredentials.isAvailable(peer, peers: peers) ? peer.state : .unavailable
+    static func currentPeerState(_ peer: AgentPeerContact, peers: [AgentPeerContact]) throws -> AgentPeerContactState {
+        try AgentPeerCredentials.availability(peer, peers: peers).get() ? peer.state : .unavailable
     }
     /// "hermes-agent", "hermes-acp" and "Hermes" name one agent: letters and
     /// digits only, without a trailing agent / acp / cli / bot.
@@ -152,14 +152,20 @@ extension SwiftToolDispatcher {
         guard case .object(let row) = value else { return value }
         // Workspace Message buttons use these declarations, even on the
         // compact listing; a missing declaration cannot imply permission.
-        let keys: Set<String> = ["agent", "name", "state", "last_answered", "capabilities", "can_start_turn"]
+        let keys: Set<String> = ["agent", "name", "state", "last_answered", "capabilities", "can_start_turn", "state_failure"]
         return .object(row.filter { keys.contains($0.key) })
     }
     static func peerProjection(_ peer: AgentPeerContact, peers: [AgentPeerContact] = [],
                                        readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> JSONValue {
         guard case .object(var value) = peerHistoryProjection(peer) else { return .null }
         if let ability = peer.ability { value["ability"] = .string(ability) }
-        if !AgentPeerCredentials.isAvailable(peer, peers: peers, readCredential: readCredential) {
+        let availability = AgentPeerCredentials.availability(peer, peers: peers, readCredential: readCredential)
+        if case .failure(let failure) = availability {
+            value["state"] = .string("unavailable")
+            value["state_detail"] = .string(failure.localizedDescription)
+            value["state_failure"] = ChatToolOutcome.failure(error: failure)
+            value["readiness"] = .string("unavailable")
+        } else if case .success(false) = availability {
             value["state"] = .string("unavailable")
             value["state_detail"] = .string(AgentPeerCredentials.unavailableDetail)
             value["readiness"] = .string("unavailable")

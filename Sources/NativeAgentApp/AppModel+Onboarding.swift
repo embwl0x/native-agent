@@ -41,6 +41,11 @@ extension AppModel: FirstRunWelcomePort {
     @discardableResult
     func maybeSendFirstRunGreeting() async -> FirstRunGreetingOutcome {
         let outcome = await firstRunWelcomeTransaction.maybeSendFirstRunGreeting(port: self)
+        // ChatView's later provider/session triggers do not inspect the
+        // returned outcome. Keep a rejected preparation visible there too.
+        if case .rejected = outcome, let message = outcome.routeFailureMessage {
+            statusText = message
+        }
         // `.delivered` means the greeting turn has finished, whichever trigger
         // started it — only now may macOS post its "Login Item Added" banner.
         if case .delivered = outcome { AppDelegate.registerLoginItemInBackground() }
@@ -55,7 +60,7 @@ extension AppModel: FirstRunWelcomePort {
     /// The person's own name, as the persona documents know it — the only
     /// source for the exact section title the write must use.
     var firstConversationPersonName: String {
-        engine.transcripts.firstConversationPersonName
+        get throws { try engine.transcripts.firstConversationPersonName }
     }
 
     /// Production requires a fresh successful provider read. An old cached

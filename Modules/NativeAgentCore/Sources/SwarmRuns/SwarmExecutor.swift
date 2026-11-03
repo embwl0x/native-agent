@@ -7,7 +7,13 @@ import Privacy
 import ProviderRouting
 import NativeAgentShared
 import ChatTurnContracts
-// Blueprint: | `SwarmExecutor.swift` | `SwiftNativeAgentSwarmExecutor`: admission, worker execution, provider/model/tool access, concurrency, deadlines, cancellation, character-safe retention and partial outcomes; progress, terminal receipts and removal delegate to the shared runs owner. The originating app door calls `Resources/abilities/crew-instructions.js` through L0 `Parts.call` for briefs, synthesis messages and digest policy; preparation failure is explicit and settlement uses the prepared digest without starting JS after Stop |
+// Blueprint: | `SwarmExecutor.swift` | `SwiftNativeAgentSwarmExecutor`: admission, worker execution, provider/model/tool access, concurrency, deadlines, cancellation, character-safe retention and partial outcomes; `AgentSwarmSynthesisStatus` is shared by synthesis writers and receipt admission; progress, terminal receipts and removal delegate to the shared runs owner. The originating app door calls `Resources/abilities/crew-instructions.js` through L0 `Parts.call` for briefs, synthesis messages and digest policy; preparation failure is explicit and settlement uses the prepared digest without starting JS after Stop |
+
+/// The synthesis receipt vocabulary, including recovery's unconfirmed outcome.
+public enum AgentSwarmSynthesisStatus: String, Sendable {
+    case completed, failed, cancelled, skipped
+    case unknown
+}
 
 public struct SwiftNativeAgentSwarmExecutor: Sendable {
     public let llm: any LLMClient
@@ -80,9 +86,9 @@ public struct SwiftNativeAgentSwarmExecutor: Sendable {
             cancelled: workerResults.filter { $0.status == "cancelled" }.count
         )
         // Complete requires all workers and applicable synthesis; cancellation wins, otherwise mixed success/failure is partial.
-        let synthesisFailed = synthesis.map { $0.status != "completed" } ?? false
+        let synthesisFailed = synthesis.map { $0.status != .completed } ?? false
         let runStatus: String
-        if Task.isCancelled || summary.cancelled > 0 || synthesis?.status == "cancelled" {
+        if Task.isCancelled || summary.cancelled > 0 || synthesis?.status == .cancelled {
             runStatus = "cancelled"
         } else if summary.completed == 0 {
             runStatus = "failed"
@@ -246,6 +252,7 @@ public struct SwiftNativeAgentSwarmExecutor: Sendable {
     ) async -> AgentSwarmWorkerResult {
         let started = Date()
         let workerId = SwiftNativeSwarmRunsReader.workerReportID(runID: runId, index: index)
+        let partialOutput = PartialReplyOutput()
         var result = AgentSwarmWorkerResult(
             id: workerId,
             index: index + 1,
@@ -282,7 +289,7 @@ public struct SwiftNativeAgentSwarmExecutor: Sendable {
                         surface: request.requestedBy
                     )
                 }
-                return try await withPromptCallTrace(runId: runId, reportId: workerId, traceId: workerId, request: request) {
+                return try await withPromptCallTrace(runId: runId, reportId: workerId, traceId: workerId, request: request, partialOutput: partialOutput) {
                     try await routing.withModelContext(model: worker.model, reasoningEffort: worker.reasoningEffort) {
                         try await llm.complete(
                             prompt: brief.prompt,
@@ -305,11 +312,13 @@ public struct SwiftNativeAgentSwarmExecutor: Sendable {
                 : nil
         } catch {
             let incomplete = error as? EphemeralToolTurnIncomplete
-            let retained = Self.bound(incomplete?.output ?? "", maxChars: request.maxOutputChars)
-            result.status = Task.isCancelled || error is CancellationError ? "cancelled" : "failed"
+            let partial = await partialOutput.output
+            let retained = Self.bound(incomplete?.output ?? partial, maxChars: request.maxOutputChars)
+            let cancelled = Task.isCancelled || error is CancellationError
+            result.status = cancelled ? "cancelled" : "failed"
             result.output = retained.text
             result.outputTruncated = retained.truncated
-            result.error = Task.isCancelled || error is CancellationError
+            result.error = cancelled
                 ? "worker cancelled; any effects already attempted remain unverified"
                 : incomplete?.reason ?? Self.errorMessage(error)
         }
@@ -322,6 +331,7 @@ public struct SwiftNativeAgentSwarmExecutor: Sendable {
     /// Link IDs only: never prompts, output, or paths. Tool workers own their trace.
     private func withPromptCallTrace<T: Sendable>(
         runId: String, reportId: String, traceId: String, request: AgentSwarmRunRequest,
+        partialOutput: PartialReplyOutput,
         operation: () async throws -> T
     ) async rethrows -> T {
         let parentTurnId = TurnTraceContext.turnId
@@ -334,7 +344,9 @@ public struct SwiftNativeAgentSwarmExecutor: Sendable {
                     TurnTraceBus.fireFromContext(kind: "swarm.report.started", sessionId: request.originSessionId,
                                                  surface: "swarms", payload: .object(payload), on: bus)
                 }
-                return try await operation()
+                return try await LLMCallContext.$partialReply.withValue({ await partialOutput.retain($0) }) {
+                    try await operation()
+                }
             }
         }
     }
@@ -351,7 +363,7 @@ public struct SwiftNativeAgentSwarmExecutor: Sendable {
               workerResults.contains(where: { $0.status == "completed" }) else {
             return AgentSwarmSynthesis(
                 model: request.synthesisModel,
-                status: "skipped",
+                status: .skipped,
                 output: "",
                 outputTruncated: false,
                 error: Task.isCancelled
@@ -371,7 +383,7 @@ public struct SwiftNativeAgentSwarmExecutor: Sendable {
             return await synthesize(brief: brief, request: request, runId: runId, started: started)
         } catch {
             return AgentSwarmSynthesis(model: request.synthesisModel,
-                status: Task.isCancelled || error is CancellationError ? "cancelled" : "failed",
+                status: Task.isCancelled || error is CancellationError ? .cancelled : .failed,
                 output: "", outputTruncated: false, error: Self.errorMessage(error),
                 durationSeconds: Date().timeIntervalSince(started))
         }
@@ -379,9 +391,10 @@ public struct SwiftNativeAgentSwarmExecutor: Sendable {
 
     private func synthesize(brief: PreparedMessage, request: AgentSwarmRunRequest,
         runId: String, started: Date) async -> AgentSwarmSynthesis {
+        let partialOutput = PartialReplyOutput()
         do {
             let output = try await withTimeout(seconds: request.timeoutSeconds, reportID: "\(runId)-synthesis") {
-                try await withPromptCallTrace(runId: runId, reportId: "synthesis", traceId: "\(runId)-synthesis", request: request) {
+                try await withPromptCallTrace(runId: runId, reportId: "synthesis", traceId: "\(runId)-synthesis", request: request, partialOutput: partialOutput) {
                     try await routing.withModelContext(model: request.synthesisModel, reasoningEffort: request.reasoningEffort) {
                         try await llm.complete(
                             prompt: brief.prompt,
@@ -399,7 +412,7 @@ public struct SwiftNativeAgentSwarmExecutor: Sendable {
             let digested = brief.digest(bounded.text)
             return AgentSwarmSynthesis(
                 model: request.synthesisModel,
-                status: Task.isCancelled ? "cancelled" : "completed",
+                status: Task.isCancelled ? .cancelled : .completed,
                 output: digested.text,
                 outputTruncated: bounded.truncated || digested.truncated,
                 error: Task.isCancelled ? "synthesis returned after cancellation" : nil,
@@ -407,17 +420,24 @@ public struct SwiftNativeAgentSwarmExecutor: Sendable {
             )
         } catch {
             let incomplete = error as? EphemeralToolTurnIncomplete
-            let bounded = Self.bound(incomplete?.output ?? "", maxChars: request.maxOutputChars)
+            let partial = await partialOutput.output
+            let bounded = Self.bound(incomplete?.output ?? partial, maxChars: request.maxOutputChars)
             let digested = brief.digest(bounded.text)
             return AgentSwarmSynthesis(
                 model: request.synthesisModel,
-                status: Task.isCancelled || error is CancellationError ? "cancelled" : "failed",
+                status: Task.isCancelled || error is CancellationError ? .cancelled : .failed,
                 output: digested.text,
                 outputTruncated: bounded.truncated || digested.truncated,
                 error: incomplete?.reason ?? Self.errorMessage(error),
                 durationSeconds: Date().timeIntervalSince(started)
             )
         }
+    }
+
+    /// One prompt call's evidence, separate from the error being propagated.
+    private actor PartialReplyOutput {
+        var output = ""
+        func retain(_ text: String) { output = text }
     }
 
     private enum DeadlineEvent: Sendable {
@@ -465,13 +485,15 @@ public struct SwiftNativeAgentSwarmExecutor: Sendable {
                     group.cancelAll()
                 case .result(let result):
                     if expired {
-                        let output: String
                         switch result {
-                        case .success(let text): output = text
-                        case .failure(let error): output = (error as? EphemeralToolTurnIncomplete)?.output ?? ""
+                        case .success(let text):
+                            throw EphemeralToolTurnIncomplete(output: text,
+                                reason: "deadline exceeded (\(seconds)s); cancellation requested and worker settlement awaited; late output is evidence, not verified completion")
+                        case .failure(let error):
+                            // The deadline owns its trace, not the error's type.
+                            // Prompt partials already reached their caller's sink.
+                            throw error
                         }
-                        throw EphemeralToolTurnIncomplete(output: output,
-                            reason: "deadline exceeded (\(seconds)s); cancellation requested and worker settlement awaited; late output is evidence, not verified completion")
                     }
                     return try result.get()
                 }

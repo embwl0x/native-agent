@@ -9,7 +9,7 @@ import TrustCenter
 import Darwin
 import Darwin
 #endif
-// Blueprint: | `FileActionContext.swift` | File source, path authority and authenticated connector context |
+// Blueprint: | `FileActionContext.swift` | File source, path authority and authenticated connector context; outgoing attachments use the existing Trust fence, one bounded verified descriptor and shared secret-content inspection |
 let connectorReadFileDefaultMaxBytes = 200_000
 /// Compact default for long handoff markdown files, unless max_bytes is explicit.
 let connectorReadFileHandoffDefaultMaxBytes = 12_000
@@ -134,6 +134,48 @@ public func connectorPathIsSensitiveData(_ path: URL, dataRoot: URL) -> Bool {
     )
 }
 extension SwiftNativeSecurityCenter {
+    /// One admitted descriptor supplies the exact bytes sent, never a second
+    /// pathname read after inspecting the content. No partial-file sends.
+    package static func outgoingAttachment(_ raw: String, dataRoot: URL, maximumBytes: Int) async throws -> (file: URL, bytes: Data) {
+        let file: URL
+        switch await fencedAttachment(raw, dataRoot: dataRoot) {
+        case .success(let admitted): file = admitted
+        case .failure(let refusal):
+            throw ToolFailureError(refusal.detail, argumentPath: "files", effects: .none)
+        }
+        let handle: FileHandle
+        do { handle = try FileSystemActions.openRegularReadHandle(file) }
+        catch { throw ToolFailureError("The attachment could not be opened as a regular file. Nothing was sent.", argumentPath: "files", effects: .none) }
+        defer { try? handle.close() }
+        var bytes = Data()
+        do {
+            while true {
+                try Task.checkCancellation()
+                let chunk = try handle.read(upToCount: min(65536, maximumBytes - bytes.count + 1)) ?? Data()
+                if chunk.isEmpty { break }
+                guard chunk.count <= maximumBytes - bytes.count else {
+                    throw ToolFailureError("Attachments exceed the 8 MiB total limit. Nothing was sent.", argumentPath: "files", effects: .none)
+                }
+                bytes.append(chunk)
+            }
+        } catch let failure as ToolFailureError { throw failure }
+        catch is CancellationError { throw CancellationError() }
+        catch { throw ToolFailureError("The attachment could not be read completely. Nothing was sent.", argumentPath: "files", effects: .none) }
+        guard !bytes.isEmpty else {
+            throw ToolFailureError("An attachment is empty (possibly still being written). Nothing was sent; wait for the completed file.", argumentPath: "files", effects: .none)
+        }
+        // Only complete, NUL-free UTF-8 is text. Binary still receives literal
+        // credential inspection, but incidental %HH bytes are not URL encoding.
+        let text = bytes.contains(0) ? nil : String(data: bytes, encoding: .utf8)
+        let unsafeContent = text.map { ContextSecretContentPolicy.redactedFragment($0) != $0 }
+            ?? ContextSecretContentPolicy.containsLiteralSecretLikeContent(String(decoding: bytes, as: UTF8.self))
+        guard !unsafeContent,
+              ContextSecretContentPolicy.redactedFragment(file.lastPathComponent) == file.lastPathComponent else {
+            throw ToolFailureError("An attachment contains credential-shaped content or a secret-bearing filename. Nothing was sent; create a safe export without secrets.", argumentPath: "files", effects: .none)
+        }
+        return (file, bytes)
+    }
+
     public struct AttachmentRefusal: Error { public let reason: String; public let detail: String }
     /// The fence `read_file` keeps, for a regular file the agent attaches: never a
     /// sensitive store, in any posture; and inside a Trust workspace root

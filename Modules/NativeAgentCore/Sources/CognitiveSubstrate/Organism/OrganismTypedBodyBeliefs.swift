@@ -6,19 +6,23 @@ public enum PeerPresenceCategory: String, Codable, Sendable, Equatable {
     case present
     case stale
     case unobserved
+    case unavailable
 }
 
 public struct PeerPresenceBelief: Codable, Sendable, Equatable {
     public let category: PeerPresenceCategory
     public let metrics: BodyBeliefMetrics
+    public let sourceUnavailable: String?
 
     public var compatibilityReachable: Bool { category == .present }
 
     public init(
         generatedAt: Date,
         evidence: [BodyEvidenceReference],
-        staleAfter: TimeInterval = 36 * 60 * 60
+        staleAfter: TimeInterval = 36 * 60 * 60,
+        sourceUnavailable: String? = nil
     ) {
+        self.sourceUnavailable = sourceUnavailable
         let boundedStale = staleAfter.isFinite ? max(1, staleAfter) : 36 * 60 * 60
         let bounded = BodyBeliefMetrics.boundedEvidence(
             evidence.filter { $0.evidenceClass == .signedPeerContact },
@@ -41,13 +45,15 @@ public struct PeerPresenceBelief: Codable, Sendable, Equatable {
             evidence: bounded,
             nextMeaningfulExpiry: receivedAt?.addingTimeInterval(boundedStale)
         )
-        self.category = Self.derive(metrics: metrics)
+        self.category = sourceUnavailable == nil ? Self.derive(metrics: metrics) : .unavailable
     }
 
-    private enum CodingKeys: String, CodingKey { case category, metrics }
+    private enum CodingKeys: String, CodingKey { case category, metrics, sourceUnavailable }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let sourceUnavailable = try container.decodeIfPresent(String.self, forKey: .sourceUnavailable)
+        self.sourceUnavailable = sourceUnavailable
         let decoded = try container.decode(BodyBeliefMetrics.self, forKey: .metrics)
         let metrics = BodyBeliefMetrics(
             generatedAt: decoded.generatedAt,
@@ -58,7 +64,7 @@ public struct PeerPresenceBelief: Codable, Sendable, Equatable {
             nextMeaningfulExpiry: decoded.nextMeaningfulExpiry
         )
         self.metrics = metrics
-        self.category = Self.derive(metrics: metrics)
+        self.category = sourceUnavailable == nil ? Self.derive(metrics: metrics) : .unavailable
     }
 
     private static func derive(metrics: BodyBeliefMetrics) -> PeerPresenceCategory {
@@ -81,6 +87,7 @@ public enum NotificationDeliveryCategory: String, Codable, Sendable, Equatable {
 public struct NotificationDeliveryBelief: Codable, Sendable, Equatable {
     public let category: NotificationDeliveryCategory
     public let metrics: BodyBeliefMetrics
+    public let sourceUnavailable: String?
     public let transportConfigured: Bool
     public let transportAccepted: Bool
     public let deviceReceived: Bool
@@ -89,7 +96,7 @@ public struct NotificationDeliveryBelief: Codable, Sendable, Equatable {
     public let transportFailed: Bool
 
     public var compatibilityPathHealthy: Bool? {
-        if !transportConfigured { return true }
+        if sourceUnavailable != nil { return nil }
         if transportFailed { return false }
         if deviceReceived && metrics.freshness > 0 { return true }
         return nil
@@ -104,8 +111,10 @@ public struct NotificationDeliveryBelief: Codable, Sendable, Equatable {
         userSeen: Bool = false,
         transportFailed: Bool = false,
         evidence: [BodyEvidenceReference] = [],
-        staleAfter: TimeInterval = 36 * 60 * 60
+        staleAfter: TimeInterval = 36 * 60 * 60,
+        sourceUnavailable: String? = nil
     ) {
+        self.sourceUnavailable = sourceUnavailable
         let bounded = BodyBeliefMetrics.boundedEvidence(evidence, generatedAt: generatedAt)
         let classes = Set(bounded.map(\.evidenceClass))
         let supportedAccepted = transportAccepted && classes.contains(.apnsAcceptance)
@@ -141,7 +150,10 @@ public struct NotificationDeliveryBelief: Codable, Sendable, Equatable {
         )
         let estimate: Double
         let uncertainty: Double
-        if supportedFailure {
+        if sourceUnavailable != nil {
+            estimate = 0.5
+            uncertainty = 1
+        } else if supportedFailure {
             estimate = 0
             uncertainty = 0
         } else if supportedSeen || supportedDisplayed || supportedReceived {
@@ -161,11 +173,11 @@ public struct NotificationDeliveryBelief: Codable, Sendable, Equatable {
             generatedAt: generatedAt,
             estimate: estimate,
             uncertainty: uncertainty,
-            freshness: freshness,
+            freshness: sourceUnavailable == nil ? freshness : 0,
             evidence: bounded,
             nextMeaningfulExpiry: receivedAt?.addingTimeInterval(staleAfter)
         )
-        self.category = Self.derive(
+        self.category = sourceUnavailable == nil ? Self.derive(
             transportConfigured: transportConfigured,
             transportAccepted: supportedAccepted,
             deviceReceived: supportedReceived,
@@ -173,17 +185,19 @@ public struct NotificationDeliveryBelief: Codable, Sendable, Equatable {
             userSeen: supportedSeen,
             transportFailed: supportedFailure,
             metrics: metrics
-        )
+        ) : .unknown
     }
 
     private enum CodingKeys: String, CodingKey {
         case category, metrics, transportConfigured, transportAccepted
-        case deviceReceived, displayed, userSeen, transportFailed
+        case deviceReceived, displayed, userSeen, transportFailed, sourceUnavailable
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let metrics = try container.decode(BodyBeliefMetrics.self, forKey: .metrics)
+        let sourceUnavailable = try container.decodeIfPresent(String.self, forKey: .sourceUnavailable)
+        self.sourceUnavailable = sourceUnavailable
         let configured = try container.decode(Bool.self, forKey: .transportConfigured)
         let classes = Set(metrics.evidence.map(\.evidenceClass))
         let accepted = try container.decode(Bool.self, forKey: .transportAccepted)
@@ -203,7 +217,7 @@ public struct NotificationDeliveryBelief: Codable, Sendable, Equatable {
         self.displayed = displayed
         self.userSeen = seen
         self.transportFailed = failed
-        self.category = Self.derive(
+        self.category = sourceUnavailable == nil ? Self.derive(
             transportConfigured: configured,
             transportAccepted: accepted,
             deviceReceived: received,
@@ -211,7 +225,7 @@ public struct NotificationDeliveryBelief: Codable, Sendable, Equatable {
             userSeen: seen,
             transportFailed: failed,
             metrics: metrics
-        )
+        ) : .unknown
     }
 
     private static func derive(
@@ -367,19 +381,22 @@ public enum ToolCapabilityCategory: String, Codable, Sendable, Equatable {
 public struct ToolCapabilityReading: Codable, Sendable, Equatable {
     public let category: ToolCapabilityCategory
     public let metrics: BodyBeliefMetrics
+    public let sourceUnavailable: String?
     public let configured: Bool
     public let liveCapabilityObserved: Bool
 
     public var compatibilityAvailable: Bool? {
-        category == .unknown ? nil : category != .unavailable
+        sourceUnavailable != nil || category == .unknown ? nil : category != .unavailable
     }
 
     public init(
         generatedAt: Date,
         configured: Bool,
         liveCapabilityObserved: Bool,
-        evidence: [BodyEvidenceReference]
+        evidence: [BodyEvidenceReference],
+        sourceUnavailable: String? = nil
     ) {
+        self.sourceUnavailable = sourceUnavailable
         self.configured = configured
         self.liveCapabilityObserved = liveCapabilityObserved
         let liveReceivedAt = evidence
@@ -394,28 +411,30 @@ public struct ToolCapabilityReading: Codable, Sendable, Equatable {
         )
         self.metrics = BodyBeliefMetrics(
             generatedAt: generatedAt,
-            estimate: liveCapabilityObserved ? 1 : (configured ? 0.6 : 0),
-            uncertainty: liveCapabilityObserved ? 0 : (configured ? 0.5 : 0),
-            freshness: liveCapabilityObserved ? liveFreshness : (evidence.isEmpty ? 0 : 1),
+            estimate: sourceUnavailable == nil ? (liveCapabilityObserved ? 1 : (configured ? 0.6 : 0)) : 0.5,
+            uncertainty: sourceUnavailable == nil ? (liveCapabilityObserved ? 0 : (configured ? 0.5 : 0)) : 1,
+            freshness: sourceUnavailable == nil ? (liveCapabilityObserved ? liveFreshness : (evidence.isEmpty ? 0 : 1)) : 0,
             evidence: evidence,
             nextMeaningfulExpiry: liveCapabilityObserved
                 ? liveReceivedAt?.addingTimeInterval(6 * 60 * 60)
                 : nil
         )
-        self.category = Self.derive(
+        self.category = sourceUnavailable == nil ? Self.derive(
             configured: configured,
             liveCapabilityObserved: liveCapabilityObserved,
             metrics: metrics
-        )
+        ) : .unknown
     }
 
     private enum CodingKeys: String, CodingKey {
-        case category, metrics, configured, liveCapabilityObserved
+        case category, metrics, configured, liveCapabilityObserved, sourceUnavailable
     }
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let metrics = try container.decode(BodyBeliefMetrics.self, forKey: .metrics)
         let classes = Set(metrics.evidence.map(\.evidenceClass))
+        let sourceUnavailable = try container.decodeIfPresent(String.self, forKey: .sourceUnavailable)
+        self.sourceUnavailable = sourceUnavailable
         let live = try container.decode(Bool.self, forKey: .liveCapabilityObserved)
             && classes.contains(.liveToolCapability)
         let configured = try container.decode(Bool.self, forKey: .configured)
@@ -423,7 +442,7 @@ public struct ToolCapabilityReading: Codable, Sendable, Equatable {
         self.metrics = metrics
         self.configured = configured
         self.liveCapabilityObserved = live
-        self.category = Self.derive(configured: configured, liveCapabilityObserved: live, metrics: metrics)
+        self.category = sourceUnavailable == nil ? Self.derive(configured: configured, liveCapabilityObserved: live, metrics: metrics) : .unknown
     }
 
     private static func derive(

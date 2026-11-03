@@ -5,7 +5,7 @@ import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import ChatSessionWork
-// Blueprint: | `TelegramPollLoop+ChatProgress.swift` | `TelegramPollLoop`: `makeTurnProgressCard`, `makeAssistantDelivery`, `makeProgressSink` |
+// Blueprint: | `TelegramPollLoop+ChatProgress.swift` | `TelegramPollLoop`: `makeTurnProgressCard`, `makeAssistantDelivery`, `makeProgressSink`; one notification policy covers final text and generated images |
 
 private actor TelegramTypingHeartbeat {
     let start: @Sendable () -> Task<Void, Never>
@@ -97,15 +97,18 @@ extension TelegramPollLoop {
         update: TelegramUpdate?,
         message: TelegramMessage?,
         text: String?,
-        approvalId: String? = nil,
-        silent: Bool = false
+        silent: Bool = false,
+        savedDelivery: TelegramAssistantDeliveryState? = nil
     ) -> TelegramAssistantDeliveryDriver {
         return TelegramAssistantDeliveryDriver(
             token: token,
             destination: destination,
             turnId: turnId,
+            savedDelivery: savedDelivery,
             sendRichDraft: Self.defaultSendRichMessageDraft,
             sendRichFinal: silent ? Self.defaultSendSilentRichMessage : Self.defaultSendRichMessage,
+            editRichMessage: Self.defaultEditRichMessage,
+            deleteMessage: Self.defaultDeleteMessage,
             recordFailure: { redactedError in
                 await recordError(
                     context: errorContext,
@@ -120,11 +123,6 @@ extension TelegramPollLoop {
                     try await TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot).recordAssistantDelivery(
                         updateId: update.updateId, delivery: delivery
                     )
-                } else if let approvalId {
-                    guard try await approvalInbox.annotateChatContinuation(
-                        approvalId, done: false,
-                        assistantDelivery: JSONValue.parse(JSONEncoder().encode(delivery))
-                    ) else { throw TelegramBotError.underlying("Approval answer delivery could not be recorded.") }
                 } else {
                     throw TelegramBotError.underlying("Assistant answer has no durable delivery owner.")
                 }
@@ -137,15 +135,6 @@ extension TelegramPollLoop {
                     if claim.phase == .stopped { return true }
                     session = claim.assistantSessionId
                     run = claim.assistantRunId
-                } else if let approvalId {
-                    let approval = try await approvalInbox.get(approvalId)
-                    guard case .object(let state)? = approval.chatContinuation, let raw = state["delivery"] else {
-                        throw TelegramBotError.underlying("Approval answer has no retained conversation.")
-                    }
-                    if state["status"] == .string("stopped") { return true }
-                    session = try JSONDecoder().decode(TelegramPendingApprovalContinuation.self,
-                        from: raw.serializedData(pretty: false)).sessionId
-                    run = nil
                 } else { throw TelegramBotError.underlying("Assistant answer has no durable delivery owner.") }
                 return try !CodexCompletionReadout.permitsDelivery(sessionId: session, runId: run,
                     configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
@@ -156,7 +145,8 @@ extension TelegramPollLoop {
                 catch {
                     FileHandle.standardError.write(Data("TelegramPollLoop: upload_photo action failed: \(TurnSecretRedactor.redactText(String(describing: error)))\n".utf8))
                 }
-                try await Self.defaultSendPhoto(token, destination, path, bytes, nil)
+                try await Self.sendPhoto(token: token, destination: destination, imagePath: path,
+                    imageData: bytes, caption: nil, silent: silent)
             }
         )
     }
@@ -165,7 +155,7 @@ extension TelegramPollLoop {
         delivery: TelegramAssistantDeliveryDriver? = nil,
         card: TelegramTurnProgressCardDriver
     ) -> TelegramChatProgressSink {
-        return { event in
+        return SessionTurnDelivery.presentingTools { event in
             if case .delta(let chunk) = event {
                 await delivery?.onDelta(chunk)
             }
@@ -182,6 +172,10 @@ extension TelegramPollLoop {
                 TelegramRichMessageRenderer.stripBoldMarkers(response.output)), imagePaths: Self.replyImagePaths(response))
         }
         var delivery = claim.assistantDelivery ?? saved
+        if delivery?.previewPending == true, let saved {
+            delivery?.reply = saved.reply
+            delivery?.previewPending = false
+        }
         if delivery?.imagePaths == nil { delivery?.imagePaths = saved?.imagePaths }
         guard delivery != nil else { return nil }
         // No wire attempt can precede the delivery row. This canonical reply
@@ -251,6 +245,10 @@ extension TelegramPollLoop {
         progress: @escaping TelegramChatProgressSink,
         context: TelegramChatAttemptContext
     ) async throws -> (reply: String, imagePaths: [String]) {
+        let sessionID: String
+        if let pinned = context.sessionId { sessionID = pinned }
+        else { sessionID = try await TelegramSessionStore(dataRoot: dataRoot).activeSessionId(destination: destination) }
+        guard let runID = context.runId else { throw TelegramBotError.invalidRequest }
         let typing = await startTypingHeartbeat(destination: destination)
         let displayProgress: TelegramChatProgressSink = { event in
             if case .replyTextSettled(let settled) = event {
@@ -260,11 +258,14 @@ extension TelegramPollLoop {
             }
             await progress(event)
         }
+        let lease = SessionTurnDelivery.mount(dataRoot: dataRoot, sessionID: sessionID, runID: runID,
+            recipient: .init(progress: displayProgress))
+        defer { SessionTurnDelivery.unmount(dataRoot: dataRoot, sessionID: sessionID, runID: runID, lease: lease) }
         return try await withTaskCancellationHandler {
             do {
                 let reply = try await invokeChatHandler(
                     destination: destination, text: text, attachments: attachments,
-                    progress: displayProgress, context: context
+                    context: context
                 )
                 await typing.stop()
                 return reply
@@ -281,11 +282,10 @@ extension TelegramPollLoop {
         destination: TelegramDestination,
         text: String,
         attachments: [TelegramMediaAttachment],
-        progress: @escaping TelegramChatProgressSink,
         context: TelegramChatAttemptContext
     ) async throws -> (reply: String, imagePaths: [String]) {
         if let attachmentChatHandler {
-            return try await attachmentChatHandler(destination.chatId, text, attachments, progress, context)
+            return try await attachmentChatHandler(destination.chatId, text, attachments, context)
         }
         if !attachments.isEmpty {
             await emitAttachmentDroppedTrace(

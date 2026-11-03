@@ -4,6 +4,11 @@ One law for every Stop, cancel, quit and timeout in NativeAgent.
 
 **Stop cancels the work, never its settlement.**
 
+Stop-marker writes merge under the marker's lock using a checked UTF-8 read.
+Only confirmed file absence starts a new marker. Unreadable existing bytes are
+preserved and the Stop request reports the read failure; a named Stop never
+erases earlier run identities or an existing empty stop-all marker.
+
 Work in flight has two parts:
 
 - **Its effect** is what it does in the world: send a message, write a file,
@@ -21,12 +26,63 @@ Workshop's ordinary and approved steps share one outcome commit: produced
 output and its receipt are saved before the status transition, cancellation
 wins, and traversal skips steps with durable completed outcomes.
 
+Inbound contact and builder tasks settle returned text and files even when
+Stop arrives at the return boundary. Cancellation selects the terminal state
+independently of produced output; a throwing cancellation recovers committed
+parts from the exact saved run. Output retention precedes checkpoint removal.
+A payload-recovery failure remains a named repair debt alongside the canonical
+execution state, rather than converting known execution into failure or expiry.
+HTTP enqueue/reply deadlines end the wait and leave the accepted task alive.
+
 Ephemeral workers and tool-capable part thoughts join the same answer/heard
 settlement on every exit. Their answer keeps produced prose and artifacts from
 completed dispatches, including when the loop throws. Interrupted calls retain
 that prose in `TurnEngineError.streamInterrupted` or `streamCancelled`; the
 latter remains distinguishable as Stop. An incomplete engine result keeps its
 existing `EphemeralToolTurnIncomplete` output carrier.
+
+Whole provider replies collect outside the caller's cancellation, with one
+sticky stop handle bound before stream creation. Stop cancels HTTP producers
+or requests process termination for Codex; it leaves collection and pipe
+forwarding alive through actual producer exit and drain. The caller joins that
+work through `settle`, then receives Stop with the drained partial in its
+existing partial-reply sink and `llm.reply.partial` trace. Deadline watches stop
+with the work so they cannot cut off its shutdown drain. A missing exit remains
+pending settlement, never a terminal receipt: the process owner's bounded
+termination and drain mechanisms must finish or report their actual failure.
+Stop also cancels the guard coordinator's network-return and retry-backoff
+waits, including redial admission on an already-online path. Its active wire
+forwarder stays alive while the transport stops, and the coordinator joins it
+before reporting cancellation.
+
+Owned programs stop their helper immediately, cancel the in-flight host call
+and await its actual terminal result before forming the final receipt. A
+result arriving after Stop keeps its real effects and handles in the journal;
+the stopped program cannot continue, and completed writes are never replayed.
+
+An admitted authored fetch owns its network request separately from the calling
+program's response wait. Stop, caller expiry and run close end that wait without
+cancelling the request. Its own wall-clock transport ceiling cancels and joins
+actual transport exit; `settle` saves its one redacted receipt and settles its
+experience's `finish` obligation. The timeout names that experience for later
+inspection; no response means unknown effects, never permission to resend.
+The [authored fetch contract](skill_manifest_spec.md#secret-insertion-and-redaction)
+owns the wait/transport limits and receipt path.
+
+An admitted `codex.invoke` likewise owns its execution separately from the
+caller's observation. Caller Stop and observation expiry end only the wait;
+the exact returned `run_id` with `abort:true`, or its independent execution
+ceiling, stops that subprocess. Actual exit still joins `settle` and retains
+captured output and its terminal audit. Missing owner or audit evidence is
+unknown, never permission to repeat the work. The invocation bounds and
+inspection contract live in [Codex bridge](CODEX_BRIDGE_DIAGNOSTICS.md#direct-invocation-owns-its-execution).
+
+A resident wake waiting for another call's busy slot parks through `ScopedWaiter`.
+Cancelling that wake releases and removes only its own parker, without stopping
+the active resident call or waking sibling parkers. Slot release, completed
+retirement and pool closure resolve the remaining waits. Without cancellation
+or an inherited deadline, a still-busy slot remains pending; waking alone is
+never evidence that it is vacant, so the caller rechecks admission.
 
 Every unit of work has **one owner** that holds its record. The record moves
 from running to exactly one terminal state, written at settlement:
@@ -86,15 +142,18 @@ and universal turn/cognition admission still require their owning APIs; new
 requests through those doors are not fenced by this ordering alone.
 OtherDoorTurns' stop receipt joins its retained consumer, including an in-flight
 transcript refresh, subscription cleanup through `settle` and exit bookkeeping.
-ActivityWatch's stop task does not yet join all its cancelled owner bodies;
-awaiting that receipt alone does not establish the complete producer barrier
-required by this law.
-ActivityWatch retains one termination task joining startup, policy, event and
-retention bodies plus the capture thread's drained store pump, including a stop
-already underway. Its handoff deadline reports degraded state without releasing
-that join; the quit owner owns the unfinished bound. OtherDoorTurns still returns
-a stop task that does not join every cancelled owner body; that receipt alone
-does not establish the complete producer barrier required by this law.
+ActivityWatch's controller retains one termination task joining startup, policy,
+policy/cadence observation and retention bodies. The watcher's `requestStop()`
+has two phases: a bounded request (at most five seconds for capture-thread
+handoff and five for thread/pump settlement) returns `settled` or
+`settlementPending`, alongside the existing pump's eventual settlement task.
+The controller retains and joins that task even when stopping was already
+underway. A pending outcome reports degraded state without releasing live
+capture ownership or cancelling the pump; a wedged thread can leave this join
+pending until process exit. The quit owner owns the outer wait bound. A
+policy-disable handoff alone is not the controller's full termination barrier. The quit producer
+settlement joins both the OtherDoorTurns and ActivityWatch handles before the
+final mind save, subject to the bounded-quit/process-exit outcome above.
 The next launch reconciles retained journal work and committed
 dream cutoffs; the quit result must never claim an unfinished snapshot landed.
 
@@ -131,8 +190,30 @@ unit allowed to write to it has settled.
 An act restores its temporarily raised app and releases enhanced Accessibility
 through `settle` under the original driver's settlement binding. Stop cannot
 cancel that release; takeover, handback and shutdown still revoke its generation.
-A returned SSH result becomes its remote-effect receipt through `settle`;
-Stop still cancels unfinished execution, but cannot erase returned output or status.
+An owned repeated-act attention session is released once by its captured session
+identity through the same settlement binding. A replaced session is untouched;
+this input-free release needs no renewed work admission, and release failures
+stay in the act receipt. An expired/stopped observation returns
+the attention owner's current status, never its earlier active snapshot.
+Mac tool-call deadlines bound the reporting caller and its work waiters, never
+detached settlement. A reporting timeout or Stop without the body's result is
+an unknown effect, not proof of cancellation acknowledgement; the in-flight
+body alone writes its terminal settlement. Reporting uncertainty has no
+`terminalAt`; actual exit replaces it with the body's real result. The registry
+keeps the newest 32 settled results in memory for matching-operation retrieval,
+including output if lifecycle settlement failed; it never reruns an action to
+retrieve a result. The lifecycle file remains payload-free. After result eviction
+or restart, a lifecycle-only replay says `result_available:false`; interrupted
+unsettled bodies become terminal unknown effects at startup. A body that never
+returns remains owned and uncertain, without holding its caller's response.
+See [turn resilience](TURN_RESILIENCE.md#3-tool-dispatch-deadline).
+A returned SSH result, including `ProcessRunCancellation.result`, becomes its
+`node.run` remote-effect receipt through `settle`, retaining bounded stdout,
+stderr, exit code, timeout and truncation evidence. Stop ends local SSH, never
+proves the remote command stopped: the receipt says cancelled with effects
+unknown. If Stop won dispatch's first terminal outcome, that cancelled outcome
+keeps the joined body's returned receipt as settlement evidence; it cannot
+erase output or become a late success.
 
 Background shutdown closes the managed execution gates and cancels their
 physical workers, then joins their bodies and accounting. Physiology tasks
@@ -140,15 +221,22 @@ replaced before quit remain retained until exit and join the same shutdown;
 cancelling or freeing an active slot is never proof of settlement.
 Helper scheduler shutdown permanently closes that scheduler's admission,
 cancels its retained runs and joins their shelf, claim and deadline settlement.
-Telegram voice Stop/deadline cancels audio export and recognition, then joins
-the owning body and its temporary-file cleanup before releasing the turn.
+Telegram voice Stop/deadline cancels the selected ffmpeg conversion and
+recognition, then joins the owning body and its temporary-file cleanup before
+releasing the turn.
 Context Flow stop also cancels and joins admitted query-embedding bodies before
 releasing their memory runtime; failing a waiting ticket does not end its body.
 Transcript aging joins both its retained bodies and their cancellation
 deadlines. Part wakes also retain replaced file/trust watchers through exit.
 
-A returned dream is saved with its consumed cutoff through `settle`, even
-when Stop raced the model response. A returned weekly analysis and its terminal
+A returned dream's exact publication, consumed cutoff and pending effects are
+saved in its one durable work record through `settle`, even when Stop raced the
+model response. Publication recovers by the section's immutable diary identity.
+Lessons, reflection, care and dated mood delivery checkpoint that record only
+after their checked durable effects land; diary evidence stays byte-stable.
+Refused or failed reflection and care/self persistence remain owed for the next
+real run, including older and archived dates; scheduling alone clears nothing.
+A returned weekly analysis and its terminal
 outcome are saved in its digest through `settle`; Stop prevents subsequent mood
 changes, proposal staging and practice. Interpretation and reflection follow
 the same law: returned meaning is settlement, never new work.
@@ -164,14 +252,16 @@ final saves. Closing admission prevents another recent-life provider call;
 judgments already returned finish their settlement.
 
 A tool dispatch owns its actual body across the deadline/Stop race. The first
-terminal outcome stays selected, but the turn joins that body's settlement
-before closing its dispatch checkpoint; an ability save and its trace cannot
-outlive the keep turn that issued them. Its body is created inside the active
-deadline scope, so progress and human waits still renew and pause that clock.
-A deadline bounds the effect, not the time needed to record what it produced.
-Practice keep turns, tool dispatch and Workshop sessions use `TurnBodyLifetime`
-to admit one body inside its deadline scope and cancel and join its actual
-result through `settle`; `TurnDeadline` selects the response verdict.
+response stays selected. Its response deadline ends only the wait: it never
+cancels a write or joins a body that has not returned. The original body keeps
+its checkpoint until actual exit, records the real receipt through `settle`,
+and emits `tool.dispatch.settled` with the invocation/call IDs. A late receipt
+is evidence, not a replacement response or another dispatch. Missing completion
+stays unknown; Stop requests cancellation without asserting effects stopped.
+The active-work response clock still renews on progress and pauses for human
+waits, but supplies no downstream effect budget. Practice keep turns and
+Workshop sessions retain their `TurnBodyLifetime` cancellation/join behavior;
+`TurnDeadline` owns their response verdict separately.
 
 Local Calendar and Reminders check cancellation at their EventKit save/remove
 boundary, including writes whose selection awaited an EventKit read.
@@ -186,7 +276,8 @@ reads that canonical cancellation before claiming work and admitting each step;
 an in-flight step observes Desk changes, stops cooperatively, and saves its
 returned output and receipt before the execution settles as canceled.
 Workshop step deadlines likewise join the operation and retain its returned
-receipt in the failed timeout outcome; they admit no following step.
+receipt. An effect's timeout fails and admits no following step; a read's
+timeout records unavailable coverage and continues without requiring `optional`.
 Workshop sessions retain and join their worker after deadline or Stop, then
 close artifact collection and write their one terminal receipt through `settle`.
 Returned and partial text stays in the durable session result and receipt feed.

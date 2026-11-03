@@ -4,7 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 
-// Blueprint: | `main.swift` | `TaskLedgerCLI`: explicit ledger append/claim/list commands, option parsing and shared or explicitly overridden data-root resolution |
+// Blueprint: | `main.swift` | `TaskLedgerCLI`: explicit ledger append/claim/list commands, one strict option parser before ledger access and shared or explicitly overridden data-root resolution |
 
 @main
 struct TaskLedgerCLI {
@@ -25,40 +25,50 @@ struct TaskLedgerCLI {
     }
 
     static func run(_ rawArgs: [String]) async throws -> Int {
-        var args = rawArgs
-        let dataRoot = resolveDataRoot(extractOption("--data-root", from: &args))
-        guard let command = args.first else {
+        if rawArgs == ["--help"] || rawArgs == ["-h"] { usage(); return 0 }
+        let parsed: ParsedOptions
+        do { parsed = try parseOptions(rawArgs) }
+        catch { fputs("error: \(error.localizedDescription)\n", stderr); return 64 }
+        guard let command = parsed.positionals.first else {
             usage()
             return 64
         }
-        let commandArgs = Array(args.dropFirst())
+        guard parsed.positionals.count == 1 else {
+            fputs("error: unexpected positional argument '\(parsed.positionals[1])'\n", stderr)
+            return 64
+        }
+        let allowed: Set<String>
         switch command {
-        case "append", "claim":
-            return try await write(commandArgs, dataRoot: dataRoot, command: command)
-        case "list":
-            return try await list(commandArgs, dataRoot: dataRoot)
-        case "help", "--help", "-h":
-            usage()
-            return 0
+        case "append": allowed = ["data-root", "actor", "kind", "task-id", "title", "note", "ref"]
+        case "claim": allowed = ["data-root", "actor", "task-id", "title", "note", "ref", "force"]
+        case "list": allowed = ["data-root", "task-id", "include-done", "pretty"]
+        case "help": usage(); return 0
         default:
             fputs("error: unknown command '\(command)'\n", stderr)
             usage()
             return 64
         }
-    }
-
-    static func write(_ args: [String], dataRoot: URL, command: String) async throws -> Int {
-        let claiming = command == "claim"
-        let parsed = parseOptions(
-            args,
-            single: claiming ? ["actor", "task-id", "title", "note"] : ["actor", "kind", "task-id", "title", "note"],
-            repeated: ["ref"],
-            flags: claiming ? ["force"] : []
-        )
-        guard parsed.positionals.isEmpty else {
-            fputs("error: \(command) received unexpected positional argument '\(parsed.positionals[0])'\n", stderr)
+        let supplied = Set(parsed.options.keys).union(parsed.repeated.keys).union(parsed.flags)
+        guard supplied.isSubset(of: allowed) else {
+            fputs("error: \(command) does not accept \(supplied.subtracting(allowed).sorted().map { "--" + $0 }.joined(separator: ", "))\n", stderr)
             return 64
         }
+        if let root = parsed.options["data-root"], root.isEmpty {
+            fputs("error: --data-root requires a non-empty path\n", stderr)
+            return 64
+        }
+        let dataRoot = resolveDataRoot(parsed.options["data-root"])
+        switch command {
+        case "append", "claim":
+            return try await write(parsed, dataRoot: dataRoot, command: command)
+        case "list":
+            return try await list(parsed, dataRoot: dataRoot)
+        default: preconditionFailure("Command validated above")
+        }
+    }
+
+    static func write(_ parsed: ParsedOptions, dataRoot: URL, command: String) async throws -> Int {
+        let claiming = command == "claim"
         let kindRaw = claiming ? "claimed" : parsed.options["kind"] ?? "created"
         guard let kind = TaskLedgerKind(rawValue: kindRaw) else {
             fputs("error: unknown kind '\(kindRaw)' (expected one of \(kindList()))\n", stderr)
@@ -101,16 +111,7 @@ struct TaskLedgerCLI {
         return 0
     }
 
-    static func list(_ args: [String], dataRoot: URL) async throws -> Int {
-        let parsed = parseOptions(
-            args,
-            single: ["task-id"],
-            flags: ["include-done", "pretty"]
-        )
-        guard parsed.positionals.isEmpty else {
-            fputs("error: list received unexpected positional argument '\(parsed.positionals[0])'\n", stderr)
-            return 64
-        }
+    static func list(_ parsed: ParsedOptions, dataRoot: URL) async throws -> Int {
         let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
         let pretty = parsed.flags.contains("pretty")
         if let taskId = parsed.options["task-id"], !taskId.isEmpty {
@@ -161,57 +162,60 @@ struct TaskLedgerCLI {
         return PersistenceCore.defaultDataRoot()
     }
 
-    static func extractOption(_ name: String, from args: inout [String]) -> String? {
-        var out: String?
-        var kept: [String] = []
-        var i = 0
-        while i < args.count {
-            if args[i] == name, i + 1 < args.count {
-                out = args[i + 1]
-                i += 2
-            } else {
-                kept.append(args[i])
-                i += 1
-            }
-        }
-        args = kept
-        return out
+    struct OptionError: Error, LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
     }
 
-    static func parseOptions(
-        _ args: [String],
-        single: Set<String> = [],
-        repeated: Set<String> = [],
-        flags: Set<String> = []
-    ) -> (options: [String: String], repeated: [String: [String]], flags: Set<String>, positionals: [String]) {
+    struct ParsedOptions {
         var options: [String: String] = [:]
-        var repeatedValues: [String: [String]] = [:]
-        var flagValues: Set<String> = []
+        var repeated: [String: [String]] = [:]
+        var flags: Set<String> = []
         var positionals: [String] = []
+    }
+
+    static func parseOptions(_ args: [String]) throws -> ParsedOptions {
+        let single: Set<String> = ["data-root", "actor", "kind", "task-id", "title", "note"]
+        let repeated: Set<String> = ["ref"]
+        let flags: Set<String> = ["force", "include-done", "pretty"]
+        var parsed = ParsedOptions()
         var i = 0
         while i < args.count {
             let arg = args[i]
             guard arg.hasPrefix("--") else {
-                positionals.append(arg)
+                parsed.positionals.append(arg)
                 i += 1
                 continue
             }
-            let key = String(arg.dropFirst(2))
+            let pieces = arg.dropFirst(2).split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            let key = String(pieces[0])
             if flags.contains(key) {
-                flagValues.insert(key)
+                guard pieces.count == 1 else { throw OptionError(message: "--\(key) does not take a value") }
+                parsed.flags.insert(key)
                 i += 1
-            } else if single.contains(key), i + 1 < args.count {
-                options[key] = args[i + 1]
-                i += 2
-            } else if repeated.contains(key), i + 1 < args.count {
-                repeatedValues[key, default: []].append(args[i + 1])
-                i += 2
             } else {
-                positionals.append(arg)
-                i += 1
+                guard single.contains(key) || repeated.contains(key) else {
+                    throw OptionError(message: "unknown option --\(key)")
+                }
+                let value: String
+                if pieces.count == 2 {
+                    value = String(pieces[1])
+                    i += 1
+                } else {
+                    guard i + 1 < args.count, !args[i + 1].hasPrefix("--") else {
+                        throw OptionError(message: "--\(key) requires a value; for literal text beginning with -- use --\(key)='--text'")
+                    }
+                    value = args[i + 1]
+                    i += 2
+                }
+                if repeated.contains(key) { parsed.repeated[key, default: []].append(value) }
+                else {
+                    guard parsed.options[key] == nil else { throw OptionError(message: "--\(key) may be supplied only once") }
+                    parsed.options[key] = value
+                }
             }
         }
-        return (options, repeatedValues, flagValues, positionals)
+        return parsed
     }
 
     static func printJSON(_ value: JSONValue, pretty: Bool = false) {
@@ -234,6 +238,7 @@ struct TaskLedgerCLI {
 
         actors: claude, assistant, codex, user
         kinds:  created, claimed, update, blocked, done, cancelled
+        option values beginning with -- require equals, e.g. --note='--literal text'
         default data root: $NATIVE_AGENT_DATA_ROOT or NativeAgent's application data root
         """, stderr)
     }

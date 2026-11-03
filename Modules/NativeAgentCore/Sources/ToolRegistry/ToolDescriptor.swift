@@ -99,9 +99,11 @@ public struct AppActionBinding: Sendable {
     public let toolClass: ToolClass
     public let reach: ToolReach
     public let capabilities: Set<String>
+    /// The args that name what it acts on: one act per subject, so a success settles only its own debt.
+    public let subject: [String]
 
     public init(isHis: Bool, irreversible: Bool, read: Bool, secretArgs: [String], readWhen: [String: JSONValue] = [:],
-                lifecycle: CapabilityLifecycle.Action? = nil,
+                lifecycle: CapabilityLifecycle.Action? = nil, subject: [String] = [],
                 tool: String = "", fixedInput: [String: JSONValue] = [:], rename: [String: String] = [:],
                 folded: Bool = false, descriptor: ToolDescriptor? = nil, toolClass: ToolClass = .write,
                 reach: ToolReach = .hers, capabilities: Set<String>? = nil) {
@@ -109,10 +111,18 @@ public struct AppActionBinding: Sendable {
         self.isHis = isHis; self.irreversible = irreversible; self.read = read
         self.secretArgs = secretArgs; self.readWhen = readWhen
         self.lifecycle = lifecycle
+        self.subject = subject
         self.toolClass = toolClass
         self.reach = reach
         // A door action writes the app's own data unless it says otherwise.
         self.capabilities = capabilities ?? (toolClass == .read ? toolClass.baseCapabilities : toolClass.baseCapabilities.union(["app_data_write"]))
+    }
+
+    /// Repair identity: the act and what it acted on, by its declared subject (door names, or the host's renamed keys).
+    public static func repairOperation(_ action: String, _ args: [String: JSONValue]) -> String {
+        let binding = declaredBinding(action)
+        let subject = (binding?.subject ?? []).compactMap { (args[$0] ?? binding?.rename[$0].flatMap { args[$0] })?.stringValue }
+        return ([action] + subject).joined(separator: ":")
     }
 
     public func readOnly(args: [String: JSONValue]) -> Bool {
@@ -123,10 +133,10 @@ public struct AppActionBinding: Sendable {
     /// accumulate reabstraction thunks around them.
     private final class Resolvers: Sendable {
         let authorableToolName: @Sendable (String) -> Bool
-        let part: @Sendable (String) -> AppActionBinding?
-        let catalog: @Sendable () -> [String: AppActionBinding]
-        init(authorableToolName: @escaping @Sendable (String) -> Bool, part: @escaping @Sendable (String) -> AppActionBinding?,
-             catalog: @escaping @Sendable () -> [String: AppActionBinding]) {
+        let part: @Sendable (String) throws -> AppActionBinding?
+        let catalog: @Sendable () throws -> [String: AppActionBinding]
+        init(authorableToolName: @escaping @Sendable (String) -> Bool, part: @escaping @Sendable (String) throws -> AppActionBinding?,
+             catalog: @escaping @Sendable () throws -> [String: AppActionBinding]) {
             self.authorableToolName = authorableToolName
             self.part = part
             self.catalog = catalog
@@ -139,8 +149,8 @@ public struct AppActionBinding: Sendable {
         actions: [String: AppActionBinding](), tools: [String: ToolDescriptor](),
         resolvers: Resolvers(authorableToolName: { _ in false }, part: { _ in nil }, catalog: { [:] })))
 
-    public static func register(_ actions: [String: AppActionBinding], tools: [ToolDescriptor], authorableToolName: @escaping @Sendable (String) -> Bool, partPolicy: @escaping @Sendable (String) -> AppActionBinding?,
-                                policyCatalog: @escaping @Sendable () -> [String: AppActionBinding] = { [:] }) {
+    public static func register(_ actions: [String: AppActionBinding], tools: [ToolDescriptor], authorableToolName: @escaping @Sendable (String) -> Bool, partPolicy: @escaping @Sendable (String) throws -> AppActionBinding?,
+                                policyCatalog: @escaping @Sendable () throws -> [String: AppActionBinding] = { [:] }) {
         registerTools(tools)
         let resolvers = Resolvers(authorableToolName: authorableToolName, part: partPolicy, catalog: policyCatalog)
         registry.withLock { $0 = (actions, $0.tools, resolvers) }
@@ -149,7 +159,7 @@ public struct AppActionBinding: Sendable {
     @TaskLocal private static var catalog: [String: AppActionBinding]?
 
     /// One synchronous, bounded projection operation, including misses.
-    package static func withCatalog<T>(_ body: () throws -> T) rethrows -> T {
+    package static func withCatalog<T>(_ body: () throws -> T) throws -> T {
         try $catalog.withValue(registry.withLock { $0.resolvers }.catalog(), operation: body)
     }
 
@@ -189,17 +199,24 @@ public struct AppActionBinding: Sendable {
         registry.withLock { $0.tools[ToolNameAliases.canonical(tool)]?.bucket }
     }
 
+    /// Whether a declared door action executes through this tool: its arguments
+    /// have that action's current contract.
+    public static func bindsTool(_ tool: String) -> Bool {
+        let name = tool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return registry.withLock { $0.actions.values.contains { $0.tool.lowercased() == name } }
+    }
+
     public static func authorableToolName(_ tool: String) -> Bool {
         registry.withLock { $0.resolvers }.authorableToolName(tool)
     }
 
-    public static func action(tool: String = "app", input: [String: JSONValue]) -> AppActionBinding? {
+    public static func action(tool: String = "app", input: [String: JSONValue]) throws -> AppActionBinding? {
         let id: String
         if tool == "app", case .string(let action)? = input["action"] { id = action }
         else if let action = ToolNameAliases.appAction(tool, input: input) { id = action }
         else { return nil }
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard var policy = binding(key) else { return nil }
+        guard var policy = try binding(key) else { return nil }
         let args: [String: JSONValue] = if tool == "app", case .object(let args)? = input["args"] { args } else { input }
         policy.read = policy.readOnly(args: args)
         return policy
@@ -211,13 +228,19 @@ public struct AppActionBinding: Sendable {
         return call.merging(fixedInput) { _, fixed in fixed }
     }
 
-    public static func binding(_ id: String) -> AppActionBinding? {
+    /// Pure declaration lookup for name/receipt projection. Runtime admission
+    /// uses `binding`, which also checks the authored owner and can fail.
+    public static func declaredBinding(_ id: String) -> AppActionBinding? {
+        registry.withLock { $0.actions[id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] }
+    }
+
+    public static func binding(_ id: String) throws -> AppActionBinding? {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !key.isEmpty else { return nil }
         let (saved, resolvers) = registry.withLock { ($0.actions[key], $0.resolvers) }
         if let saved { return saved }
         if let catalog { return catalog[key] }
-        return resolvers.part(key)
+        return try resolvers.part(key)
     }
 
     static func actionID(tool: String, input: [String: JSONValue]) -> String? {

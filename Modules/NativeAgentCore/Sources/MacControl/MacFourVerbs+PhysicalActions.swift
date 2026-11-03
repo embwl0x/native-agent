@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacFourVerbs+PhysicalActions.swift` | `MacFourVerbs`: `performPhysical`, `performPointer`, `performAtPlace` |
+// Blueprint: | `MacFourVerbs+PhysicalActions.swift` | `MacFourVerbs`: one physical tail for names and image points; point type clicks then types through focused-editor admission while preserving image/window identity |
 
 extension MacFourVerbs {
     enum PhysicalVerb: String, CaseIterable {
@@ -16,6 +16,7 @@ extension MacFourVerbs {
 
     static let physicalScrollKinds: Set<String> = [
         "web area", "scroll area", "scroll bar", "table", "outline", "list", "collection",
+        "webarea", "scrollarea",
     ]
 
     func performPhysical(
@@ -107,8 +108,9 @@ extension MacFourVerbs {
         case .ambiguous(let candidates):
             return ambiguousPhysical(target, candidates: candidates, screen: before.render)
         }
-        guard source.enabled else {
-            return MacFourVerbsReply(ok: false, text: "\(Self.name(source)) is disabled.\n" + before.render)
+        guard source.enabled == true else {
+            return MacFourVerbsReply(ok: false, text: "\(Self.name(source)) "
+                + (source.enabled == false ? "is disabled." : "has no readable enabled state. Read the app again before acting.") + "\n" + before.render)
         }
         // These are explicitly physical gestures, so a visible region is a
         // valid pointer-hold target just as it is a drag target. Semantic
@@ -209,7 +211,8 @@ extension MacFourVerbs {
         saying source: String, destination: String?, before: Sighting, excluding excluded: [MacAXFrame] = [],
         seconds: Double?, holding: String?, button: String?, attention: BurstAttention?,
         physicalOnly: Bool = false, pointerTarget: String? = nil, receipt: [String: JSONValue] = [:],
-        secrets: [MacAXFrame]? = nil, confirm: Bool = true, pressed: ActTarget? = nil, described: String? = nil
+        secrets: [MacAXFrame]? = nil, confirm: Bool = true, pressed: ActTarget? = nil, described: String? = nil,
+        imageFrame: String? = nil, text: String? = nil
     ) async -> MacFourVerbsReply {
         // A refusal carries the receipt too: what already happened (a raise)
         // stays on record when the pointer itself sends nothing.
@@ -232,12 +235,15 @@ extension MacFourVerbs {
             "x": .double(start.x),
             "y": .double(start.y),
         ]
+        if let imageFrame { body["image_frame"] = .string(imageFrame) }
+        if let text { body["text"] = .string(text) }
         if let end {
             body["to_x"] = .double(end.x)
             body["to_y"] = .double(end.y)
         }
         if gesture == PhysicalVerb.drag.rawValue {
-            body["travel_seconds"] = .double(seconds ?? 0)
+            // A named drag always travels; 0 or an unstated pace is a quarter second (the declared shape).
+            body["travel_seconds"] = .double(seconds.flatMap { $0 > 0 ? $0 : nil } ?? 0.24)
         } else if let seconds { body["seconds"] = .double(seconds) }
         if let holding { body["holding"] = .string(holding) }
         if let button { body["button"] = .string(button) }
@@ -268,22 +274,24 @@ extension MacFourVerbs {
     }
 
     /// A place on an image she was handed: the image's own frame turns its
-    /// pixels into screen points, which must lie in the window in front; then
+    /// pixels into screen points, which must lie in the window in front; the hand
+    /// rechecks their capture identity at emission, then
     /// the same physical tail as a named act. The receipt names the image and
     /// the screen points used.
     func performAtPlace(
-        _ place: MacImagePlace, verb: String, seconds: Double?, holding: String?, button: String?,
+        _ place: MacImagePlace, verb: String, text: String? = nil, seconds: Double?, holding: String?, button: String?,
         before carried: Sighting?, attention: BurstAttention?
     ) async -> MacFourVerbsReply {
         func refused(_ words: String, _ error: String, screen: String? = nil) -> MacFourVerbsReply {
             MacFourVerbsReply(ok: false, text: words + " Nothing was sent." + (screen.map { "\n" + $0 } ?? ""),
-                              detail: ["error": .string(error)])
+                              detail: ["error": .string(error), "requested_events_emitted": .int(0)])
         }
-        guard verb == "click" || PhysicalVerb(rawValue: verb).map({ $0 != .key }) == true,
+        guard verb == "click" || verb == "type" || PhysicalVerb(rawValue: verb).map({ $0 != .key }) == true,
               (place.to != nil) == (verb == PhysicalVerb.drag.rawValue) else {
-            return refused("A point takes click, double_click, right_click, hover, hold or move with at:{x,y}, or drag with from:{x,y} and to:{x,y}.",
+            return refused("A point takes click, type, double_click, right_click, hover, hold or move with at:{x,y}, or drag with from:{x,y} and to:{x,y}.",
                            "invalid_point_act")
         }
+        if verb == "type", (text ?? "").isEmpty { return refused("Give the text to type at that point.", "missing_text") }
         guard let frame = MacImageFrames.frame(place.image) else {
             return refused(place.image.map { "I don't hold image \($0) (only this session's last few are kept); look again with screen pixels and point into that." }
                 ?? "No image has been handed to me in this session yet; take screen with pixels:true first and point into it.", "unknown_image")
@@ -294,6 +302,17 @@ extension MacFourVerbs {
             return refused("That point is outside image \(frame.id), which is \(geometry.pixelWidth)×\(geometry.pixelHeight) px.", "point_outside_image")
         }
         let end = place.to.flatMap { geometry.screenPoint(imageX: $0.x, imageY: $0.y) }
+        guard let capture = geometry.capture else {
+            return refused("That image has no capture identity; look again with pixels:true before pointing.",
+                           MacLookFrameStore.ResolveFailure.staleFrame.rawValue)
+        }
+        // Check before a new sight or containment refusal can hide the old
+        // image's drift. The hand checks again after all suspending work.
+        for point in [start] + (end.map { [$0] } ?? []) {
+            if let failure = capture.refusal(at: point, now: Date()) {
+                return refused(failure.reason, failure.code)
+            }
+        }
         func spoken(_ point: MacPointerPosition) -> String { "screen point (\(Int(point.x.rounded())), \(Int(point.y.rounded())))" }
         let before: Sighting
         if let carried { before = carried } else {
@@ -312,8 +331,10 @@ extension MacFourVerbs {
         var receipt: [String: JSONValue] = ["image": .string(frame.id), "screen_point": start.json]
         receipt["screen_to"] = end?.json
         return await performPointer(
-            verb, at: start, to: end, saying: spoken(start) + " of " + frame.id, destination: end.map(spoken),
-            before: before, seconds: seconds, holding: holding, button: button, attention: attention, receipt: receipt
+            verb == "type" ? "click_type" : verb, at: start, to: end, saying: spoken(start) + " of " + frame.id, destination: end.map(spoken),
+            before: before, seconds: seconds, holding: holding, button: button, attention: attention, receipt: receipt,
+            described: verb == "type" ? "Clicked \(spoken(start)) and sent text to the editor that took focus." : nil,
+            imageFrame: frame.id, text: text
         )
     }
 }

@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id":"make-generated","kind":"tool","version":1,
+{"id":"make-generated","kind":"ability","version":1,
  "reach":{"capabilities":[]},
  "record":{"description":"Compose raw generated images with make.add, preserving their prompt, model and requested ref, and report each registration failure.","actions":["make.add"],"inputSchema":{"type":"object","required":["generated","prompt","ref"]}}}
 */

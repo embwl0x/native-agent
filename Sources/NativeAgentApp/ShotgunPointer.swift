@@ -4,7 +4,7 @@ import AppToolRuntime
 import NativeAgentCore
 import SwiftUI
 
-// Blueprint: | `ShotgunPointer.swift` | `AgentPointerOverlay`: noninteractive agent pointer presentation and fade lifecycle, excluded from agent captures |
+// Blueprint: | `ShotgunPointer.swift` | `AgentPointerOverlay`: noninteractive agent pointer presentation and fade lifecycle through Shotgun's nonisolated completion adapter, excluded from agent captures |
 
 // AgentPointerHold restores the person's cursor; this separate named pointer
 // glides to agent actions, pulses on clicks, and fades after inactivity or the
@@ -55,16 +55,14 @@ final class AgentPointerOverlay {
         fadeTask?.cancel()
         fadeTask = nil
         guard let panel, panel.isVisible else { return }
-        NSAnimationContext.runAnimationGroup { context in
+        NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.3
             panel.animator().alphaValue = 0
-        } completionHandler: {
-            Task { @MainActor in
-                guard panel.alphaValue < 0.01 else { return }
-                panel.orderOut(nil)
-                PersonOnlyWindows.setOverlay(number: nil)
-            }
-        }
+        }, completionHandler: ShotgunController.animationCompletion {
+            guard panel.alphaValue < 0.01 else { return }
+            panel.orderOut(nil)
+            PersonOnlyWindows.setOverlay(number: nil)
+        })
     }
 
     private func makePanel() -> NSPanel {

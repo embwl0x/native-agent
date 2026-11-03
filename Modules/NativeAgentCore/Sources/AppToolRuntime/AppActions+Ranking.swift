@@ -24,7 +24,7 @@ import ChatTurnContracts
 import ChromeControl
 import TurnTrace
 import Studio
-// Blueprint: | `AppActions+Ranking.swift` | AppActions find ranking; exact IDs precede named pages in declaration order, then semantic and exact-token matches with retrieval-epoch attention evidence |
+// Blueprint: | `AppActions+Ranking.swift` | AppActions find ranking; exact IDs precede named pages, then checked semantic/token matches; unembeddable actions have named trace gaps while siblings rank, shared failures stop discovery; counts-only timings |
 
 extension AppActions {
     /// Exact identities remain intact, regardless of the query's language. A leading + names an id; -<exact id> excludes that action
@@ -39,6 +39,20 @@ extension AppActions {
     }
 
     static func intentWords(_ text: String) -> [String] { Array(Set(words(text))).sorted() }
+
+    /// The same words as a set, kept per exact text: every turn ranks the same few
+    /// hundred action texts, and re-splitting them was most of ranking's time.
+    static func wordSet(_ text: String) -> Set<String> {
+        wordSetLock.withLock {
+            if let known = wordSets[text] { return known }
+            let set = Set(words(text))
+            if wordSets.count >= 4096 { wordSets.removeAll(keepingCapacity: true) }
+            wordSets[text] = set
+            return set
+        }
+    }
+    private static let wordSetLock = NSLock()
+    nonisolated(unsafe) private static var wordSets: [String: Set<String>] = [:]
 
     /// Page names are whole token sequences, including the door's existing aliases and integration ids. Prefer a longer name at the same
     /// position so "Mac Integration" names that page, rather than also naming "Mac".
@@ -68,12 +82,12 @@ extension AppActions {
         return result
     }
 
-    /// `degraded` says why the ranking fell back to words alone; nil when the embedder ranked it.
+    /// Ranking requires a checked catalog and one usable embedding epoch.
     static func ranked(_ query: String, pages: [String: QuietToolPage], dataRoot: URL, memory: SwiftNativeMemoryV2,
                        inventory snapshot: (actions: [AppAction], authored: [AppAction])? = nil)
-        async throws -> (actions: [AppAction], degraded: String?, namedPages: Set<String>) {
-        let contacts = (try? AgentPeerStore(dataRoot: dataRoot).list())?.map(\.name) ?? []
-        let helpers = (try? BotDefinitionStore(dataRoot: dataRoot).list())?.map(\.name) ?? []
+        async throws -> (actions: [AppAction], namedPages: Set<String>, gaps: [String: String]) {
+        let contacts = try AgentPeerStore(dataRoot: dataRoot).list().map(\.name)
+        let helpers = try BotDefinitionStore(dataRoot: dataRoot).list().map(\.name)
         let checked: (actions: [AppAction], authored: [AppAction])
         if let snapshot { checked = snapshot } else { checked = try await inventory(dataRoot: dataRoot) }
         let actions = checked.actions
@@ -86,43 +100,68 @@ extension AppActions {
         }.joined(separator: " ")
         let asked = intentWords(positive)
         let pagesNamed = namedPages(positive, actions: actions, pages: pages)
-        // No embedder (or it changed mid-read): rank by words alone, and say so.
-        func rankingFailure(_ detail: String) -> String {
-            AgentWorkspacePorts.readFailure(ToolFailureError(detail, effects: .none, code: "action_ranking_unavailable"),
-                reason: "action_ranking_unavailable", remedy: Repair.reconcile(
-                    instruction: "Use the lexical matches. Read settings for memory search model status and repair the reported model or action-index fault before relying on semantic ranking.",
-                    nextCall: .object(["tool": .string("app"), "input": .object(["page": .string("settings")])])))
+        // Semantic ranking is one checked operation. A failed index is not a
+        // successful word-only search.
+        func rankingFailure(_ detail: String) -> ToolFailureError {
+            ToolFailureError(detail, effects: .none, owner: "action discovery",
+                nextCall: ToolFailureError.call("app", ["page": .string("settings")]), code: "action_ranking_unavailable",
+                instruction: "Read settings for memory search model status and repair the reported model or action-index fault, then repeat discovery.", recovery: .repair)
         }
-        var embedding: (asked: [[Float]], actions: [[Float]])?
-        var degraded: String?
+        let embedding: (asked: [Float], actions: [Int: [Float]])
+        var actionGaps: [String: String] = [:]
+        var timings: [String: JSONValue] = [:]
+        defer { TurnTraceBus.fireFromContext(kind: "context.ranking.summary", payload: .object(["stageMs": .object(timings)])) }
         do {
+            let indexStart = DispatchTime.now().uptimeNanoseconds
             let indexed = try await memory.indexedActionVectors(texts)
+            timings["index_read"] = .int(Int64((DispatchTime.now().uptimeNanoseconds - indexStart) / 1_000_000))
             // What the index lacks (this turn's own actions) is embedded with the ask, in its space.
-            let missing = indexed.vectors.indices.filter { indexed.vectors[$0] == nil }
-            let embedded = try await memory.embedForDerivedContextWithEpoch([positive] + missing.map { texts[$0] })
-            let ask = Array(embedded.vectors.prefix(1))
-            var vectors = indexed.vectors
-            for (offset, vector) in zip(missing, embedded.vectors.dropFirst(1)) { vectors[offset] = vector }
-            let actionVectors = vectors.compactMap { $0 }
-            if embedded.epoch == indexed.epoch, embedded.vectors.count == 1 + missing.count,
-               actionVectors.count == actions.count,
-               (ask + actionVectors).allSatisfy({
-                   $0.count == ask[0].count && !$0.isEmpty
-                       && $0.allSatisfy(\.isFinite) && $0.contains(where: { $0 != 0 })
-               }) {
-                embedding = (ask, actionVectors)
-            } else {
+            let missing = indexed.vectors.indices.filter { indexed.vectors[$0] == nil && indexed.unembeddable[$0] == nil }
+            let embeddingStart = DispatchTime.now().uptimeNanoseconds
+            let embedded = try await memory.embedForDerivedContextItemsWithEpoch([positive] + missing.map { texts[$0] })
+            timings["embedding"] = .int(Int64((DispatchTime.now().uptimeNanoseconds - embeddingStart) / 1_000_000))
+            guard embedded.epoch == indexed.epoch, embedded.items.count == 1 + missing.count else {
                 await memory.requestActionIndexUpdate()
-                degraded = rankingFailure("Action-index and query epochs differ or vectors are unusable. An index update was requested.")
+                throw rankingFailure("Action-index and query epochs differ or prediction outcomes are missing. An index update was requested.")
             }
-        } catch { degraded = rankingFailure(error.localizedDescription) }
+            guard case .vector(let ask) = embedded.items[0] else {
+                throw rankingFailure("The action search query is unembeddable: \(embedded.items[0]).")
+            }
+            var vectors = indexed.vectors
+            var gaps = indexed.unembeddable
+            for (offset, item) in zip(missing, embedded.items.dropFirst(1)) {
+                switch item {
+                case .vector(let vector): vectors[offset] = vector
+                case .unembeddable(let reason): gaps[offset] = reason
+                }
+            }
+            try VectorMath.requireUsable(ask)
+            var actionVectors: [Int: [Float]] = [:]
+            for offset in vectors.indices {
+                if let reason = gaps[offset] {
+                    actionGaps[actions[offset].id] = reason
+                    TurnTraceBus.fireFromContext(kind: "context.ranking.gap", payload: .object([
+                        "action": .string(actions[offset].id), "reason": .string(reason),
+                        "epoch": .string(indexed.epoch.rawValue)
+                    ]))
+                    continue
+                }
+                guard let vector = vectors[offset] else {
+                    throw rankingFailure("Action search has no prediction outcome for \(actions[offset].id).")
+                }
+                try VectorMath.requireUsable(vector, dimensions: ask.count)
+                actionVectors[offset] = vector
+            }
+            embedding = (ask, actionVectors)
+        } catch let failure as ToolFailureError where failure.failureCode == "action_ranking_unavailable" { throw failure }
+        catch { throw rankingFailure(error.localizedDescription) }
         // Assume most inventory actions are irrelevant with a light-tailed cosine tail in this retrieval epoch.
         // Semantic matches must clear the shared attention chance bar; small/flat inventories provide no evidence.
         // Exact tokens and identities stand independently; multilingual coverage belongs to the embedder.
-        let similarities = embedding.map { vectors in
-            vectors.actions.map { VectorMath.cosine(vectors.asked.first, $0) }
-        }
-        let standings = VectorMath.standout(similarities ?? [])
+        let offsets = embedding.actions.keys.sorted()
+        let similarities = offsets.map { VectorMath.cosine(embedding.asked, embedding.actions[$0]) }
+        let similarityByOffset = Dictionary(uniqueKeysWithValues: zip(offsets, similarities))
+        let standings = Dictionary(uniqueKeysWithValues: zip(offsets, VectorMath.standout(similarities)))
         // Two deviations above the inventory, as a memory needs: what the ask
         // brings to mind. (10-29: the chance bar over ~420 actions sat near 4.5
         // deviations, meaning almost never counted and find fell back to shared
@@ -130,10 +169,10 @@ extension AppActions {
         let bar = ContextSelectionConfiguration.memoryStandoutDeviations
         var ranked: [(offset: Int, action: AppAction, semantic: Bool, similarity: Double, own: Int, lexical: Int)] = []
         for (offset, action) in actions.enumerated() where !excluded.contains(action.id) {
-            let lexical = hits(Set(intentWords(texts[offset])), asked)
+            guard let similarity = similarityByOffset[offset] else { continue }
+            let lexical = hits(wordSet(texts[offset]), asked)
             let own = hits(ownWords(action), asked)
-            let similarity = similarities?[offset] ?? 0
-            let semantic = !standings.isEmpty && (standings[offset].map { $0 >= bar } ?? false)
+            let semantic = standings[offset].flatMap { $0 }.map { $0 >= bar } == true
             if named.contains(action.id.lowercased()) || (pagesNamed.contains(action.page) && !action.isItemRead) || lexical > 0 || semantic {
                 ranked.append((offset, action, semantic, similarity, own, lexical))
             }
@@ -145,17 +184,22 @@ extension AppActions {
             let leftPage = pagesNamed.contains($0.action.page) && !$0.action.isItemRead
             let rightPage = pagesNamed.contains($1.action.page) && !$1.action.isItemRead
             if leftPage != rightPage { return leftPage }
-            if leftPage { return $0.offset < $1.offset }
+            // On a page the words named, its own words still order it: "disable
+            // my ability" names the abilities page and wants ability.disable first.
+            if leftPage { return $0.own != $1.own ? $0.own > $1.own : $0.offset < $1.offset }
             if $0.semantic != $1.semantic { return $0.semantic }
-            // Closeness of meaning orders word matches too, not only standouts.
-            if $0.similarity != $1.similarity { return $0.similarity > $1.similarity }
+            // An action whose own name and title carry the asked words comes
+            // before a vaguer closeness (10-30: "disable my ability" ranked
+            // ability.read over ability.disable); closeness of meaning then
+            // orders the rest, not only standouts.
             if $0.own != $1.own { return $0.own > $1.own }
+            if $0.similarity != $1.similarity { return $0.similarity > $1.similarity }
             if $0.lexical != $1.lexical { return $0.lexical > $1.lexical }
             return $0.offset < $1.offset
         }.map(\.action).reduce(into: (seen: Set<String>(), kept: [AppAction]())) { result, action in
             // One action once: the same id registered under two labels is one route.
             if result.seen.insert(action.id).inserted { result.kept.append(action) }
-        }.kept, degraded, pagesNamed)
+        }.kept, pagesNamed, actionGaps)
     }
 
     /// The same exact text feeds launch/change indexing and query ranking.
@@ -179,7 +223,7 @@ extension AppActions {
     }
 
     /// An action's own identity and authored label, without stemming or aliases.
-    static func ownWords(_ action: AppAction) -> Set<String> { Set(intentWords(action.id + " " + action.label)) }
+    static func ownWords(_ action: AppAction) -> Set<String> { wordSet(action.id + " " + action.label) }
 
     /// Exact normalized tokens only; morphology belongs to semantic retrieval.
     static func hits(_ own: Set<String>, _ asked: [String]) -> Int {

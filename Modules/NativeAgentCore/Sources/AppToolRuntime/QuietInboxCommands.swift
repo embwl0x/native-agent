@@ -9,12 +9,12 @@ import NativeAgentShared
 import NotificationInbox
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `QuietInboxCommands.swift` | `QuietInboxHost`: inbox fences and commands |
+// Blueprint: | `QuietInboxCommands.swift` | `QuietInboxHost`: inbox fences and commands; completed mutations retain done across unknown readback; full REM note reads include the linked approval's retained review, with missing/unreadable links explicit |
 
 @MainActor public protocol QuietInboxHost: QuietToolHost {
     var inboxDataRoot: URL { get }
     var interactionSource: String { get }
-    func interactionForInboxItem(_ id: String, dataRoot: URL) async -> InlineInteraction?
+    func interactionForInboxItem(_ id: String, dataRoot: URL) async throws -> InlineInteraction?
     func readInbox() async throws -> [InboxItemRecord]
     func inboxPresentation(_ item: InboxItemRecord) -> (hidden: Bool, linkedApproval: Bool, actions: [InboxActionRecord])
     func performInboxAction(_ id: String, action: String, metadata: [String: JSONValue], quiet: Bool, dataRootOverride: URL?) async throws
@@ -124,7 +124,7 @@ extension QuietInboxHost {
             let requested = verb == "repair" ? "repair" : verb == "not_now" ? "reject" : text("action").lowercased()
             if verb == "act", item.source == self.interactionSource, ["reject", "deny"].contains(requested) {
                 return refuse(AppToolExecutor.failure("use_not_now",
-                    "A card's Not now is its own action: \(AppActions.action("inbox.not_now")?.line ?? "inbox.not_now"). "
+                    "A card's Not now is its own action: inbox.not_now. "
                     + "Nothing was done.", extra: ["actions": .array(shown.map { .string($0) })]))
             }
             let action = requested.isEmpty
@@ -177,7 +177,10 @@ extension QuietInboxHost {
                         extra: ["remedy": Repair.why(owner: "workflows/approvals/requests.json card \(record.id)",
                             tap: "Today > \(record.title) > Approve")]))
                 }
-                if install || PermissionLaw.humanDecides(action: record.action, payload: record.payload) {
+                let ownerOnly: Bool
+                do { ownerOnly = try install || PermissionLaw.humanDecides(action: record.action, payload: record.payload) }
+                catch { return refuse(ChatToolOutcome.failure(error: error, tool: "app")) }
+                if ownerOnly {
                     return refuse(AppToolExecutor.failure("owners_call",
                         "That's the owner's even under Full Mac: " + (install
                             ? "approving installs the script as theirs."
@@ -211,7 +214,27 @@ extension QuietInboxHost {
 
         switch verb {
         case "read":
-            return .object(["status": .string("ok"), "notes": .array(selected.map { inboxRow($0.item, full: true) })])
+            var notes: [JSONValue] = []
+            for (_, item) in selected {
+                var row = inboxRow(item, full: true)
+                if item.source == "rem_cycle", case .object(var fields) = row {
+                    do {
+                        guard let id = item.related_approval_id else {
+                            throw ToolFailureError("The linked REM approval is unavailable.", effects: .none)
+                        }
+                        let record = try await SwiftNativeApprovalInbox(root: dataRootOverride ?? inboxDataRoot).get(id)
+                        guard record.action == "rem.proposal" else {
+                            throw ToolFailureError("The linked approval is not a REM proposal.", effects: .none)
+                        }
+                        fields["proposal_review"] = .string(record.payloadPreview)
+                    } catch {
+                        fields["proposal_review_unavailable"] = .string(error.localizedDescription)
+                    }
+                    row = .object(fields)
+                }
+                notes.append(row)
+            }
+            return .object(["status": .string("ok"), "notes": .array(notes)])
         case "archive", "dismiss", "mark_read":
             let reason = String(Self.inboxText(input, "reason").prefix(280))
             let action = verb == "mark_read" ? "read" : verb
@@ -236,15 +259,29 @@ extension QuietInboxHost {
                 }
             }
             await self.refreshInboxSurfaces()
-            // Read back what the inbox shows now: a producer can re-file a
-            // card the moment it is settled, and ok must mean it stuck.
+            // A committed action stays done even when its readback is unavailable.
             let expected = action == "read" ? "read" : action == "archive" ? "archived" : "dismissed"
-            let after = (try? await self.readInbox()) ?? []
+            let after: [InboxItemRecord]
+            do { after = try await self.readInbox() }
+            catch {
+                return .object([
+                    "status": .string("ok"), "verb": .string(verb), "effects": .string(done.isEmpty ? "none" : "occurred"),
+                    "verification": .string("unknown"), "readback_error": .string(error.localizedDescription),
+                    "reason_given": .string(reason), "done": .array(done),
+                    "skipped_already_settled": .array(skipped),
+                    "detail": .string("The actions in done completed. Their current state could not be read; do not repeat them on that evidence."),
+                ])
+            }
             var unstuck: [String] = []
+            var unobserved: [String] = []
             done = done.map { row in
                 guard case .object(var fields) = row, case .string(let id)? = fields["id"] else { return row }
                 // Newest first, so the first row is the card on screen.
-                let now = after.first { $0.id == id }?.status ?? "unreadable"
+                guard let now = after.first(where: { $0.id == id })?.status else {
+                    fields["verification"] = .string("unknown")
+                    unobserved.append(id)
+                    return .object(fields)
+                }
                 fields["now"] = .string(now)
                 if now != expected { unstuck.append(id) }
                 return .object(fields)
@@ -252,13 +289,16 @@ extension QuietInboxHost {
             var receipt: [String: JSONValue] = [
                 "status": .string(unstuck.isEmpty ? "ok" : "did_not_stick"), "verb": .string(verb),
                 "reason_given": .string(reason), "done": .array(done), "skipped_already_settled": .array(skipped),
+                "verification": .string(unobserved.isEmpty ? "observed" : "unknown"),
             ]
+            if !unobserved.isEmpty {
+                receipt["unobserved_ids"] = .array(unobserved.map(JSONValue.string))
+                receipt["detail"] = .string("Completed actions remain in done; cards absent from this live read have unknown verification and may have moved to the archive.")
+            }
             if !unstuck.isEmpty {
                 receipt["ok"] = .bool(false)
                 receipt["effects"] = .string("occurred")
-                receipt["detail"] = .string("Written, but \(unstuck.joined(separator: ", ")) read back as not \(expected): "
-                    + "the app re-filed the card as new right after (its producer raised it again), or the write "
-                    + "missed the row on screen. See now on each; reading it again shows what is current.")
+                receipt["detail"] = .string("Written, but \(unstuck.joined(separator: ", ")) now read as not \(expected). See now on each; the readback does not establish why the state changed.")
             }
             return .object(receipt)
         case "withdraw":
@@ -351,7 +391,10 @@ extension QuietInboxHost {
         }
         // "Not now" withdraws her own ask; it grants nothing.
         if action == "reject" { return nil }
-        guard let card = await self.interactionForInboxItem(item.id, dataRoot: dataRoot) else {
+        let found: InlineInteraction?
+        do { found = try await self.interactionForInboxItem(item.id, dataRoot: dataRoot) }
+        catch { return "its card is unavailable: " + TurnSecretRedactor.redactText(error.localizedDescription) }
+        guard let card = found else {
             return "its card no longer reads, so what it would grant is unknown"
         }
         switch card.kind {

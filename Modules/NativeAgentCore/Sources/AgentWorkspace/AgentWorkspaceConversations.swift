@@ -34,10 +34,12 @@ struct AgentWorkSession {
     /// The sender of the session's first user row when the bridge wrote it:
     /// built-in lanes by their persisted origin agent, contacts by their
     /// verified envelope user id. Titles and message labels are display only.
-    private static func bridgeSender(sessionID: String, dataRoot: URL) -> (sender: String, topic: String)? {
+    private static func bridgeSender(sessionID: String, dataRoot: URL) throws -> (sender: String, topic: String)? {
         guard NativeAgentChatSessionID.normalizedPathComponent(sessionID) != nil else { return nil }
         let url = dataRoot.appendingPathComponent("chat/messages/\(sessionID).jsonl")
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        let handle: FileHandle
+        do { handle = try FileHandle(forReadingFrom: url) }
+        catch let error as CocoaError where error.isFileAbsent { return nil }
         defer { try? handle.close() }
         // Read toward the first user row in 16 KiB steps, capped at 512 KiB.
         let cap = 512 * 1024
@@ -47,17 +49,15 @@ struct AgentWorkSession {
             if let newline = head[lineStart...].firstIndex(of: UInt8(ascii: "\n")) {
                 line = head[lineStart..<newline]; lineStart = newline + 1
             } else if !atEnd {
-                let more: Data?
-                do { more = head.count < cap ? try handle.read(upToCount: min(16 * 1024, cap - head.count)) : nil }
-                catch { return nil }
+                guard head.count < cap else { throw ToolFailureError("The first speaker was not found within the bounded transcript head.", effects: .none,
+                    owner: url.path, instruction: "Inspect the transcript's first complete user row before classifying this conversation.", recovery: .inspect) }
+                let more = try handle.read(upToCount: min(16 * 1024, cap - head.count))
                 if let more, !more.isEmpty { head.append(more) } else { atEnd = true }
                 continue
-            } else if lineStart < head.count {
-                line = head[lineStart...]; lineStart = head.count
             } else {
                 return nil
             }
-            guard case .object(let row)? = try? JSONValue.parse(Data(line)) else { continue }
+            guard case .object(let row) = try JSONValue.parse(Data(line)) else { throw CocoaError(.fileReadCorruptFile) }
             let speech = ContactThread.Line(row)
             guard speech.role == "user" else { continue }
             let origin = (speech.metadata["origin"]?.objectValue ?? [:])
@@ -70,16 +70,16 @@ struct AgentWorkSession {
     }
 
     /// Newest first, verified independently of display titles or preview consumption.
-    static func verified(dataRoot: URL) -> [(id: String, sender: String, topic: String, row: [String: JSONValue])] {
-        ((try? HumanConversationIndex.rows(dataRoot: dataRoot)) ?? []).compactMap { row in
-            guard let id = row["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }), let sender = bridgeSender(sessionID: id, dataRoot: dataRoot) else { return nil }
+    static func verified(dataRoot: URL) throws -> [(id: String, sender: String, topic: String, row: [String: JSONValue])] {
+        try HumanConversationIndex.rows(dataRoot: dataRoot).compactMap { row in
+            guard let id = row["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }), let sender = try bridgeSender(sessionID: id, dataRoot: dataRoot) else { return nil }
             return (id, sender.sender, sender.topic, row)
         }
     }
 
-    static func all(dataRoot: URL) -> [Self] {
+    static func all(dataRoot: URL) throws -> [Self] {
         let agentName = ChatCompactionDistiller.configuredAgentName(dataRoot: dataRoot)
-        var found: [Self] = verified(dataRoot: dataRoot).map { session in
+        var found: [Self] = try verified(dataRoot: dataRoot).map { session in
             let row = session.row
             let preview = HumanConversationIndex.shownPreview(row) ?? ""
             return .init(sessionID: session.id, sender: session.sender, topic: session.topic,
@@ -94,8 +94,8 @@ struct AgentWorkSession {
         return found
     }
 
-    static func people(dataRoot: URL) -> [(agent: String, name: String)] {
-        HerScreen.contacts(identity: AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot)).map { ($0.id, $0.name) }
+    static func people(dataRoot: URL) throws -> [(agent: String, name: String)] {
+        try HerScreen.contacts(identity: AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot)).map { ($0.id, $0.name) }
     }
 
     /// The one person this sender is, or nil when none or several match.
@@ -105,10 +105,10 @@ struct AgentWorkSession {
         return matches.count == 1 ? matches[0] : nil
     }
 
-    static func sessions(with agent: String, dataRoot: URL) -> [Self] {
-        let people = people(dataRoot: dataRoot)
-        let identity = AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot)
-        return all(dataRoot: dataRoot).filter { identity.canonical($0.sender) == identity.canonical(agent)
+    static func sessions(with agent: String, dataRoot: URL) throws -> [Self] {
+        let people = try people(dataRoot: dataRoot)
+        let identity = try AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot)
+        return try all(dataRoot: dataRoot).filter { identity.canonical($0.sender) == identity.canonical(agent)
             && people.contains(where: { identity.canonical($0.agent) == identity.canonical(agent) }) }
     }
 }

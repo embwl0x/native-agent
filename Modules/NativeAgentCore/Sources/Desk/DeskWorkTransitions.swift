@@ -4,7 +4,7 @@ import Foundation
 import PersistenceCore
 import NativeAgentCore
 import Synchronization
-// Blueprint: | `DeskWorkTransitions.swift` | Durable work creation, reservations, receipts and transitions |
+// Blueprint: | `DeskWorkTransitions.swift` | Durable work creation, reservations, receipts and transitions; interrupted first scheduler migration reuses live retired job identity, refusing divergent open imports; queue updates check the named step's unchanged revision under the existing write lock, preserve origin and leave bound/dropped habit notes; idempotent notes can retain author and a delivery-snapshot boundary so identical later occurrences still leave their own note |
 extension SwiftNativeDeskStore {
     /// Create an item. Generates a stable handle and assigns the next monotonic
     /// alias among the parent's siblings — done UNDER THE FLOCK so two
@@ -32,8 +32,8 @@ extension SwiftNativeDeskStore {
     }
     /// Idempotent owner-create path for conversational tools. Equivalence is
     /// checked under the same flock as alias allocation and append, so two
-    /// agents asking for the same live top-level intent cannot race into two
-    /// owners. Terminal history never blocks a new item; callers may explicitly
+    /// agents asking for the same live sibling intent and kind cannot race into
+    /// two owners. Terminal history never blocks a new item; callers may explicitly
     /// choose `createItem` when a same-named sibling is intentional.
     public func createOrReuseEquivalentItem(
         kind: DeskKind,
@@ -80,25 +80,43 @@ extension SwiftNativeDeskStore {
         )
     }
     /// Queue lookup, provenance and budget checks share the write transaction.
-    func addQueueStep(_ incoming: DeskStep) async throws -> (entry: MyQueue.Entry, change: MyQueue.Change) {
+    func addQueueStep(_ incoming: DeskStep, replacing: MyQueue.Entry? = nil) async throws -> (entry: MyQueue.Entry, change: MyQueue.Change) {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             var feed = try await readFeedUnlocked()
             var state = Self.compact(base: feed.base, feed.ops)
+            // Only interrupted first-migration filing retries reach this identity.
+            // Pending imports cannot be archived before that migration commits.
+            if replacing == nil, let id = incoming.scheduledJobID,
+               let item = state.items.first(where: { $0.step?.scheduledJobID == id }), let step = item.step {
+                if !item.status.isTerminal,
+                   step.words != incoming.words || step.when != incoming.when || step.rhythm != incoming.rhythm
+                    || step.until != incoming.until || step.say != incoming.say || step.clockStart != incoming.clockStart
+                    || step.status != incoming.status {
+                    throw ToolFailureError("Scheduled intention \(id) changed before its migration committed. Reconcile its Desk step and source job before relaunching; no scheduler work was retired.", effects: .none)
+                }
+                return (MyQueue.Entry(item: item, step: step), .reused)
+            }
             let open = MyQueue.entries(state)
             let words = Self.equivalentDeskText(incoming.words)
-            let same = open.first { Self.equivalentDeskText($0.step.words) == words }
+            let same: MyQueue.Entry?
+            if let replacing {
+                guard let current = open.first(where: { $0.item.handle == replacing.item.handle }),
+                      current.item.updatedAt == replacing.item.updatedAt else { throw MyQueue.Superseded() }
+                same = current
+            } else { same = incoming.scheduledJobID == nil
+                ? open.first { Self.equivalentDeskText($0.step.words) == words } : nil }
             var step = incoming
             step.lifeID = try DataRootLife.current(in: dataRoot)
             if let same {
-                if incoming.source != nil { step = same.step }
+                if incoming.source != nil, replacing == nil { step = same.step }
                 step.peers = incoming.peers
                 step.elevated = incoming.elevated
                 step.preserveOrigin(of: same.step)
-                if incoming.source == nil, case .userWrites? = MyQueue.When(step.when, card: step.card) {
+                if incoming.source == nil, replacing == nil, case .userWrites? = MyQueue.When(step.when, card: step.card) {
                     step.filedAt = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
                 }
                 if step == same.step { return (same, .reused) }
-                if step.when != same.step.when || step.card != same.step.card {
+                if step.when != same.step.when || step.card != same.step.card || step.rhythm != same.step.rhythm {
                     step.filedAt = DeskClock.commitStamp(notBefore: feed.maxCommittedTs)
                 }
             } else {
@@ -118,6 +136,10 @@ extension SwiftNativeDeskStore {
                     parent: nil, summary: nil, assignee: nil, laneOf: nil, origin: .agent, pursuit: nil))
             }
             bodies.append(.addRef(ref: DeskRef(kind: .step(step))))
+            if step.action != same?.step.action {
+                let note = try step.action.map { "Habit bound: " + (try $0.serialize(pretty: false)) } ?? "Habit dropped."
+                bodies.append(.appendNote(text: note, author: "agent"))
+            }
             if let same, same.item.title != title { bodies.append(.updateTitle(title: title, summary: nil)) }
             if same == nil {
                 bodies.append(.setStatus(status: .todo, blockedReason: nil, waitingOn: nil,
@@ -176,6 +198,7 @@ extension SwiftNativeDeskStore {
             if reuseEquivalent,
                let existing = priorState.items.first(where: {
                    !$0.status.isTerminal
+                       && $0.kind == kind
                        && $0.parent == parent
                        && $0.laneOf == laneOf
                        && Self.equivalentDeskText($0.assignee) == Self.equivalentDeskText(assignee)
@@ -410,8 +433,8 @@ extension SwiftNativeDeskStore {
         }
     }
     /// appendWorkReceipt — desk_work_log's store method. Append a plain work
-    /// receipt note to a pursuit (no reservation needed — Agent logging progress
-    /// from chat). REFUSES a non-pursuit target so work receipts stay pursuit-scoped.
+    /// receipt to a pursuit, or an ordinary item's note. The item's kind selects
+    /// the operation under the same store lock; an error never selects a second tool.
     @discardableResult
     public func appendWorkReceipt(_ handle: String, receipt: String) async throws -> DeskOp {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
@@ -420,12 +443,13 @@ extension SwiftNativeDeskStore {
             guard let item = state.items.first(where: { $0.handle == handle }) else {
                 throw DeskError.unknownHandle(handle)
             }
-            guard item.isPursuit else { throw DeskError.notAPursuit(handle: handle) }
             let op = DeskOp(
                 ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                 handle: handle,
-                body: .workLog(receipt: receipt)
+                body: item.isPursuit ? .workLog(receipt: receipt) : .appendNote(text: receipt, author: "agent")
             )
+            try Self.validateHierarchyTransition(op, in: state)
+            try Self.validatePursuitInvariants(op, in: state, viaGenericPath: false)
             _ = try await appendAndRecompactUnlocked(op, feed: feed)
             return op
         }
@@ -543,16 +567,23 @@ extension SwiftNativeDeskStore {
     /// the same flock transaction. Callers supply a stable machine marker at
     /// the start of the note; retries after a crash or concurrent wakeup are a
     /// durable no-op instead of duplicating user-visible history.
+    /// `after` limits deduplication to notes newer than that delivery snapshot.
     @discardableResult
     public func appendNoteIfAbsent(
         _ handle: String,
         marker: String,
-        text: String
+        text: String,
+        author: String = "system",
+        after: String? = nil
     ) async throws -> DeskOp? {
         let normalizedMarker = marker.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedMarker.isEmpty, normalizedText.hasPrefix(normalizedMarker) else {
             throw DeskError.liveActivityMetadataEmpty(field: "idempotent note marker/text")
+        }
+        let cutoff = after.flatMap(DeskClock.parseISO)
+        guard after == nil || cutoff != nil else {
+            throw DeskError.liveActivityMetadataEmpty(field: "idempotent note boundary")
         }
         return try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
@@ -560,13 +591,19 @@ extension SwiftNativeDeskStore {
             guard let item = state.items.first(where: { $0.handle == handle }) else {
                 throw DeskError.unknownHandle(handle)
             }
-            guard !item.notes.contains(where: { $0.text.hasPrefix(normalizedMarker) }) else {
+            guard !item.notes.contains(where: { note in
+                guard note.text.hasPrefix(normalizedMarker) else { return false }
+                // The same daily result is a new note; only a note kept after
+                // this delivery's snapshot can settle this occurrence.
+                if let cutoff { return DeskClock.parseISO(note.ts).map { $0 > cutoff } ?? false }
+                return true
+            }) else {
                 return nil
             }
             let op = DeskOp(
                 ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs),
                 handle: handle,
-                body: .appendNote(text: normalizedText)
+                body: .appendNote(text: normalizedText, author: author)
             )
             _ = try await appendAndRecompactUnlocked(op, feed: feed)
             return op

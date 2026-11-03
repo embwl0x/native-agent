@@ -9,7 +9,8 @@ import ApprovalInbox
 import ChatTurnContracts
 import Experiences
 import TurnTrace
-// Blueprint: | `AgentConversationRelease.swift` | Conversation release and experience settlement; pending drains remain under one claim |
+import MacControl
+// Blueprint: | `AgentConversationRelease.swift` | Conversation release and experience settlement; positive MacPersonInput away evidence and a permitted fresh driver unhold pre-Return desktop sends in the existing queue under the same drain claim; every open send closes from its row's exchange when superseded, all unsettled keys release on failure, and seen rows for removed contacts abandon their debts; pending drains remain under one claim |
 
 extension AgentConversationStore {
     private static let releasingNow = OSAllocatedUnfairLock(initialState: (draining: false, pending: false))
@@ -51,6 +52,36 @@ extension AgentConversationStore {
 
     private static func drainReleasing(dataRoot: URL) async {
         let store = AgentConversationStore(dataRoot: dataRoot)
+        // Positive presence evidence only. Startup and a presence/driver edge
+        // enter this same drain claim; absence never releases a waiting send.
+        if MacPersonInput.presence()?.here == false,
+           let waiting = try? store.recordsUnlocked(),
+           waiting.contains(where: { $0.queued?.contains(where: { $0.waitingForMac == true }) == true }) {
+            do {
+                let driver = try await MacAttentionSessionStore.shared.bindDriver()
+                if driver.allowsEmission {
+                    do {
+                        try store.locked {
+                            var rows = try store.load()
+                            guard driver.allowsEmission, MacPersonInput.presence()?.here == false else { return }
+                            var changed = false
+                            for i in rows.indices {
+                                for j in rows[i].queued?.indices ?? 0..<0 where rows[i].queued?[j].waitingForMac == true {
+                                    rows[i].queued?[j].waitingForMac = nil
+                                    rows[i].queued?[j].held = nil
+                                    changed = true
+                                }
+                            }
+                            if changed { try store.save(rows) }
+                        }
+                    } catch { nativeLog("AgentConversationStore: waiting Mac sends stay queued: %@", error.localizedDescription) }
+                }
+            } catch {
+                // Driver authority is required only to unhold Mac sends, not
+                // to settle peer sends whose outcome is already recorded.
+                nativeLog("AgentConversationStore: waiting sends remain queued; driver authority unavailable: %@", error.localizedDescription)
+            }
+        }
         guard let rows = try? store.recordsUnlocked() else { return }
         var written: Set<String> = []
         for row in rows where row.agent.hasPrefix("peer:") {
@@ -100,17 +131,27 @@ extension AgentConversationStore {
         }
         // Every row's in one write, ordered with this owner's other writes.
         ExperienceStore.record(root, "agent-conversations") { store in
+            let open = try await store.open()
+            let contacts = Set(try AgentPeerStore(dataRoot: root).list().map { "peer:" + $0.id })
             for row in rows {
-                var settled = row.settledObligations ?? [:]
-                if dropped || row.stop?.detail == DataRootLife.stoppedReason {
-                    for (id, key) in [(row.operationID, "answer"), (row.operationID, "accept")] + (row.queued ?? []).flatMap({ item in ["deliver", "accept", "answer"].map { (item.id, $0) } }) {
-                        var obligation = Experience.Obligation(to: "conversation:" + row.id)
-                        obligation.phase = .letGo
-                        obligation.reason = .abandoned
-                        settled[id, default: [:]][key] = obligation
-                    }
+                let evidence = Experience.Ref(source: "agents/conversations", id: row.id)
+                let abandoned = dropped || row.stop?.detail == DataRootLife.stoppedReason
+                    || (!row.agent.hasPrefix("peer:") && !row.agent.hasPrefix("bot:"))
+                    // An empty or unreadable-as-empty list proves no contact was removed.
+                    || (row.agent.hasPrefix("peer:") && !contacts.isEmpty && !contacts.contains(row.agent))
+                let queued = Set((row.queued ?? []).map(\.id))
+                // The row owns every send it began, not just its current operation.
+                // Once it moves on, its own exchange says what ended; a missing
+                // exchange supplies no acceptance evidence and is let go.
+                for experience in open where experience.evidence.contains(evidence) {
+                    guard abandoned || (experience.id != row.operationID && !queued.contains(experience.id)) else { continue }
+                    let exchange = row.exchanges?.last { $0.id == experience.id }
+                    let accepted = !abandoned && (exchange?.reply != nil
+                        || (!row.awaitsReply && ["delivered", "read"].contains(exchange?.status ?? "")))
+                    try await Self.settleExperience(experience, in: store, accepted: accepted, evidence: evidence)
                 }
-                for (id, obligations) in settled {
+                if abandoned { continue }
+                for (id, obligations) in row.settledObligations ?? [:] {
                     guard let experience = try await store.experience(id) else { continue }
                     for (key, obligation) in obligations where experience.owes[key]?.phase.isSettled == false {
                         let change: ExperienceStore.Change = if let reason = obligation.reason {
@@ -118,16 +159,6 @@ extension AgentConversationStore {
                         } else { .obligation(key: key, phase: obligation.phase, evidence: obligation.evidence) }
                         try await store.append([change], to: id)
                     }
-                }
-                if dropped { continue }
-                if !row.agent.hasPrefix("peer:"), !row.agent.hasPrefix("bot:") {
-                    for id in [row.operationID] + (row.queued ?? []).map(\.id) {
-                        guard let old = try await store.experience(id) else { continue }
-                        for (key, obligation) in old.owes where !obligation.phase.isSettled {
-                            try await store.append([.letGo(key: key, reason: .abandoned)], to: old.id)
-                        }
-                    }
-                    continue
                 }
                 let destination = "agent:" + row.agent
                 for item in row.queued ?? [] {
@@ -139,26 +170,41 @@ extension AgentConversationStore {
                     try await store.append([.face(.init(words: TurnSecretRedactor.redactText(words), artifacts: []))], to: item.id)
                 }
                 let exchange = row.exchanges?.last { $0.id == row.operationID }
-                guard exchange != nil || ["sending", "waiting"].contains(row.phase) else { continue }
+                let current = try await store.experience(row.operationID)
+                guard current != nil || exchange != nil || ["sending", "waiting"].contains(row.phase) else { continue }
                 let experience = Experience(id: row.operationID, kind: .message,
                     evidence: [.init(source: "agents/conversations", id: row.id)],
                     addressedTo: [destination], owes: ["accept": .init(to: destination), "answer": .init(to: destination)])
-                if try await store.experience(experience.id) == nil { try await store.begin(experience) }
+                if current == nil { try await store.begin(experience) }
+                let delivery = AgentConversationDelivery.of(row, read: false)
+                if [.failed, .notDelivered, .unanswered].contains(delivery) {
+                    if let current = try await store.experience(experience.id) {
+                        try await Self.settleExperience(current, in: store, accepted: false, evidence: evidence,
+                                                        reason: delivery == .unanswered ? .expired : .failed)
+                    }
+                }
                 if row.phase != "sending", AgentConversationDelivery.accepted(row), try await store.experience(experience.id)?.owes["accept"]?.phase.isSettled == false {
                     try await store.append([.obligation(key: "accept", phase: .accepted,
                         evidence: .init(source: "agents/conversations", id: row.id))], to: experience.id)
                 }
                 try await store.append([.face(.init(words: TurnSecretRedactor.redactText(exchange?.reply ?? exchange?.prompt ?? ""),
                     artifacts: []))], to: experience.id)
-                let delivery = AgentConversationDelivery.of(row, read: false)
                 guard try await store.experience(experience.id)?.owes["answer"]?.phase.isSettled == false else { continue }
                 if delivery == .answered || (!row.awaitsReply && [.delivered, .read].contains(delivery)) {
                     try await store.append([.obligation(key: "answer", phase: .accepted,
                         evidence: .init(source: "agents/conversations", id: row.id))], to: experience.id)
-                } else if [.failed, .notDelivered].contains(delivery) {
-                    try await store.append([.letGo(key: "answer", reason: .failed)], to: experience.id)
                 }
             }
         }
+    }
+
+    /// Only unsettled keys move; a send's earlier settlements remain its history.
+    private static func settleExperience(_ experience: Experience, in store: ExperienceStore, accepted: Bool,
+                                         evidence: Experience.Ref, reason: ObligationPhase.LetGo = .abandoned) async throws {
+        let changes: [ExperienceStore.Change] = experience.owes.compactMap { key, obligation in
+            guard !obligation.phase.isSettled else { return nil }
+            return accepted ? .obligation(key: key, phase: .accepted, evidence: evidence) : .letGo(key: key, reason: reason)
+        }
+        if !changes.isEmpty { try await store.append(changes, to: experience.id) }
     }
 }

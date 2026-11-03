@@ -28,11 +28,23 @@ extension CognitiveSubstrate {
         defersPersistenceToMicrocycle: Bool
     ) async -> (accepted: Bool, semanticMetadata: [String: JSONValue]) {
         guard configuration.enabled, !field.hasSeenEvent(event) else { return (false, [:]) }
+        let helper: Bool
+        do { helper = try SessionConversation.checkedIsHelper(event.sessionId, dataRoot: conversationDataRoot, includingArchived: true) }
+        catch {
+            nativeLog("Cognitive event ownership unavailable; interpretation withheld: %@", error.localizedDescription)
+            return (false, [:])
+        }
         let aboutness = event.kind == .organismResolutionFelt
             ? "\(event.summary) \(event.subject.id) \(event.subject.label ?? "")"
             : event.summary
-        let touchedCares = event.turnKind.contributesToLivedState
-            ? await appraisalCares(in: aboutness) : []
+        let touchedCares: [CognitiveCare]
+        do {
+            if event.turnKind.contributesToLivedState { touchedCares = try await appraisalCares(in: aboutness) }
+            else { touchedCares = [] }
+        } catch {
+            oweCareEmbedding(error)
+            return (false, ["appraisalUnavailable": .string(error.localizedDescription)])
+        }
         // Only a caller that commits inline must not interleave with the
         // maintenance commit. Resident admission marks the state dirty, which
         // tells a suspended maintenance pass not to revert over it, and the
@@ -69,7 +81,7 @@ extension CognitiveSubstrate {
         let buildsAffectBundle = configuration.enabled
             && event.turnKind.contributesToLivedState
         let defersInterpretation = buildsAffectBundle && Self.isUserAuthored(event.kind)
-            && event.sessionId != nil && !SessionConversation.isHelper(event.sessionId, dataRoot: conversationDataRoot, includingArchived: true)
+            && event.sessionId != nil && !helper
         let userAppraisal = AffectAppraisal()
         // Semantic relationship stake reads warmth for every lived event;
         // affect consumes it only for user turns. A peer carries half User's reach.
@@ -159,7 +171,9 @@ extension CognitiveSubstrate {
         var semanticMetadata: [String: JSONValue] = [:]
         if contributesToLivedState && configuration.enabled && !defersInterpretation {
             semanticMetadata = Self.foldReaction(event: event, completion: pendingCompletion,
-                outcome: ingestOutcome, now: now, valence: userAppraisal.valence)
+                outcome: ingestOutcome, now: now, appraisal: userAppraisal,
+                target: pendingCompletion.flatMap { field.node(forKey: $0.nodeKey)?.summary },
+                incoming: event.summary)
             if let pending = pendingCompletion {
                 let age = now.timeIntervalSince(pending.recordedAt)
                 let expired = age < 0 || age > Self.pendingCompletionMaxAge

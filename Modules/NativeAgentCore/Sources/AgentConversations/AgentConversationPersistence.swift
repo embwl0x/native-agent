@@ -21,9 +21,9 @@ extension AgentConversationStore {
         }
         // Older sends in the ledger wait on their own cards; a decision made after the record moved on settles them too.
         let ledgerHeld = rows.indices.filter { rows[$0].exchanges?.contains { $0.approvalId != nil && AgentConversationRecord.approvalWaits($0.status) } == true }
-        guard !held.isEmpty || !ledgerHeld.isEmpty,
-              let decisions = try? SwiftNativeApprovalInbox.loadApprovalRowsChecked(
-                at: fileURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("workflows/approvals/requests.json")) else { return false }
+        guard !held.isEmpty || !ledgerHeld.isEmpty else { return false }
+        let decisions = try SwiftNativeApprovalInbox.loadApprovalRowsChecked(
+            at: fileURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("workflows/approvals/requests.json"))
         var changed = false
         func decided(_ card: String) -> String? {
             guard let decision = decisions.first(where: { if case .object(let value) = $0 { value["id"] == .string(card) } else { false } }),
@@ -85,12 +85,18 @@ extension AgentConversationStore {
               rows.allSatisfy({ UUID(uuidString: $0.id) != nil && UUID(uuidString: $0.operationID) != nil && !$0.scopeSessionID.isEmpty }) else {
             throw Failure(message: "Saved conversations are unavailable; existing records were preserved.")
         }
-        for row in rows { try AgentConversationExchange.validate(row.exchanges, file: fileURL) }
+        for row in rows {
+            guard row.operationStartedAt != nil else {
+                throw Failure(message: "Conversation \(row.id) has no operation start time. Repair its retained evidence in \(fileURL.path); existing bytes were preserved.")
+            }
+            try AgentConversationExchange.validate(row.exchanges, file: fileURL)
+        }
         let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
         let life = try DataRootLife.current(in: root)
         for i in rows.indices {
             for j in rows[i].queued?.indices ?? 0..<0 where DataRootLife.life(of: rows[i].queued?[j].lifeID) != life {
                 rows[i].queued?[j].held = DataRootLife.stoppedReason
+                rows[i].queued?[j].waitingForMac = nil
                 if rows[i].queueReservation == rows[i].queued?[j].id { rows[i].queueReservation = nil }
             }
             for j in rows[i].exchanges?.indices ?? 0..<0 where ["held", "delivering"].contains(rows[i].exchanges?[j].status ?? "") && DataRootLife.life(of: rows[i].exchanges?[j].lifeID) != life {
@@ -111,56 +117,31 @@ extension AgentConversationStore {
             receipt["reason"] = .string(DataRootLife.stoppedReason)
             rows[i].receipt = .object(receipt)
         }
-        guard let peers = try? AgentPeerStore(dataRoot: root).list() else { return rows }
-        for index in rows.indices where AgentConversationDelivery.inbox(agent: rows[index].agent,
-            bridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root)) != nil {
-            let owners = peers.filter { ($0.handles ?? []).contains(rows[index].agent) }
-            if owners.count == 1, let who = owners.first {
-                rows[index].agent = "peer:" + who.id
-                rows[index].name = who.name
-                rows[index].peerRouteFingerprint = Self.routeFingerprint(who)
-                rows[index].readInput?["agent"] = .string("peer:" + who.id)
-            } else {
-                rows[index].phase = "attention"
-                let lane = rows[index].agent
-                rows[index].deliveryState = "\(lane) had no reader on this Mac; this saved message is owed to no one. Its record is preserved."
-            }
-        }
+        let peers = try AgentPeerStore(dataRoot: root).list()
         for index in rows.indices where rows[index].phase == "waiting" && AgentConversationDelivery.claudeInbox(rows[index]) {
             guard case .object(var receipt)? = rows[index].receipt, receipt["read"] != .bool(true),
                   case .string(let path)? = receipt["filePath"], case .string(let message)? = rows[index].readInput?["message_id"],
                   let peer = peers.first(where: { "peer:" + $0.id == rows[index].agent }) else { continue }
-            guard let door = (peer.handles ?? []).compactMap({ AgentConversationDelivery.door(for: $0, dataRoot: root) })
+            guard let door = (peer.handles ?? []).compactMap({ AgentConversationDelivery.door(for: $0, dataRoot: root, contacts: peers) })
                 .first(where: { $0.inbox.path == path }) else { continue }
             receipt["remedy"] = door.remedy()
-            if DelegationStatusProjector.requestRecords(inbox: door.inbox, ids: [message])[message]?["read"] == "true" { receipt["read"] = .bool(true) }
+            if try DelegationStatusProjector.requestRecords(inbox: door.inbox, ids: [message])[message]?["read"] == "true" { receipt["read"] = .bool(true) }
             AgentConversationSession.absorb(.object(receipt), into: &rows[index])
             try Self.absorbExchange(into: &rows[index], file: fileURL)
         }
-        // Derive old inconsistent snapshots from their receipt without a migration write. History and home see the same failed send now.
-        for i in rows.indices where rows[i].phase != "sending" && rows[i].sendFailed {
-            var row = rows[i]
-            row.phase = "attention"
-            let status = row.sendStatus, operation = row.operationID, updatedAt = row.updatedAt
-            if let j = row.exchanges?.firstIndex(where: { $0.id == operation }) {
-                row.exchanges?[j].phase = "attention"
-                row.exchanges?[j].status = status
-                if row.exchanges?[j].settledAt == nil { row.exchanges?[j].settledAt = updatedAt }
-            }
-            rows[i] = row
-        }
-        return try reconcilingExpiredReplies(rows)
+        return try reconcilingExpiredReplies(rows, peers: peers)
     }
 
-    func reconcilingExpiredReplies(_ records: [AgentConversationRecord]) throws -> [AgentConversationRecord] {
+    func reconcilingExpiredReplies(_ records: [AgentConversationRecord], peers: [AgentPeerContact]) throws -> [AgentConversationRecord] {
         var rows = records
         let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
         let requests = GrokRequestStore(dataRoot: root)
         for i in rows.indices where ["sending", "waiting", "attention"].contains(rows[i].phase) {
             // A send retains the previous receipt until dispatch settles.
             var receipt = rows[i].phase == "sending" ? .object([:]) : rows[i].receipt ?? .object([:])
-            if rows[i].agent.hasPrefix("peer:"), case .object(let fields) = receipt, fields["reply_deadline"] == nil,
-               case .string(let id) = rows[i].readInput?["message_id"] ?? .string(rows[i].operationID),
+            if peers.contains(where: { "peer:" + $0.id == rows[i].agent && $0.transport == .grokBot }),
+               case .object(let fields) = receipt, fields["reply_deadline"] == nil,
+               let id = rows[i].exchanges?.first(where: { $0.id == rows[i].operationID }).map({ GrokBotRoute.messageID(for: $0) }),
                FileManager.default.fileExists(atPath: requests.root.appendingPathComponent(id + ".json").path) {
                 receipt = GrokBotRoute.projection(try requests.read(id, peer: String(rows[i].agent.dropFirst(5))))
             }
@@ -186,11 +167,8 @@ extension AgentConversationStore {
                 settled[id, default: [:]][key] = obligation
                 rows[index].settledObligations = settled
             }
-            if old.operationID != rows[index].operationID {
-                settle(old.operationID, key: "answer", accepted: false, reason: .abandoned)
-            }
             for item in old.queued ?? [] where rows[index].queued?.contains(where: { $0.id == item.id }) != true {
-                let promoted = old.queueReservation == item.id && old.operationID != rows[index].operationID
+                let promoted = old.queueReservation == item.id && rows[index].operationID == item.id && rows[index].phase == "sending"
                 settle(item.id, key: "deliver", accepted: promoted, reason: .cancelled)
                 if !promoted {
                     for key in ["accept", "answer"] { settle(item.id, key: key, accepted: false, reason: .cancelled) }

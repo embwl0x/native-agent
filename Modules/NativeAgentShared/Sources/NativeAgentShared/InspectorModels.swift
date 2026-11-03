@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `InspectorModels.swift` | Shared content-free Inspector turn summaries and mobile tool catalog rows with compatible summary decoding |
+// Blueprint: | `InspectorModels.swift` | Shared checked content-free Inspector turn summaries and mobile tool catalog rows |
 
 public struct TurnSummaryRecord: Identifiable, Codable, Hashable, Sendable {
     public var id: String              // turnId
@@ -27,11 +27,11 @@ public struct TurnSummaryRecord: Identifiable, Codable, Hashable, Sendable {
         sessionId = try c.decodeIfPresent(String.self, forKey: .sessionId)
         startedAt = try c.decode(Date.self, forKey: .startedAt)
         lastAt = try c.decode(Date.self, forKey: .lastAt)
-        eventCount = try c.decodeIfPresent(Int.self, forKey: .eventCount) ?? 0
-        wallMs = try c.decodeIfPresent(Int.self, forKey: .wallMs) ?? 0
+        eventCount = try c.decode(Int.self, forKey: .eventCount)
+        wallMs = try c.decode(Int.self, forKey: .wallMs)
         llmTokens = try c.decodeIfPresent(Int.self, forKey: .llmTokens)
         ttftMs = try c.decodeIfPresent(Int.self, forKey: .ttftMs)
-        kinds = try c.decodeIfPresent([String: Int].self, forKey: .kinds) ?? [:]
+        kinds = try c.decode([String: Int].self, forKey: .kinds)
     }
 }
 
@@ -50,9 +50,9 @@ public struct TurnSummaryFile: Codable, Hashable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        summaries = try c.decodeIfPresent([TurnSummaryRecord].self, forKey: .summaries) ?? []
-        truncated = try c.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
-        totalTurnsSeen = try c.decodeIfPresent(Int.self, forKey: .totalTurnsSeen) ?? summaries.count
+        summaries = try c.decode([TurnSummaryRecord].self, forKey: .summaries)
+        truncated = try c.decode(Bool.self, forKey: .truncated)
+        totalTurnsSeen = try c.decode(Int.self, forKey: .totalTurnsSeen)
         generatedAt = try c.decodeIfPresent(Date.self, forKey: .generatedAt)
     }
 }

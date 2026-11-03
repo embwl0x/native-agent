@@ -17,8 +17,6 @@ struct BubbleView: View, Equatable {
     var cardsAvailable = true
     @State private var images: [(summary: ChatAttachmentSummary, image: UIImage)] = []
     @State private var attachmentCountWithoutPreview = 0
-    @State private var audioPreview: URL?
-    @State private var audioError: String?
     /// How much of the text the paced reveal had caught up with when it last
     /// rested; nil when this bubble never paced (a reply loaded settled).
     @State private var revealedBytes: Int?
@@ -42,28 +40,21 @@ struct BubbleView: View, Equatable {
                 ForEach(images, id: \.summary.id) { attachment in
                     AttachmentImagePreview(summary: attachment.summary, image: attachment.image)
                 }
-                ForEach(message.attachments.filter {
-                    $0.type == "audio" && ($0.base64 != nil || $0.utterance?.audioReference == "iphone-recording:\($0.id)")
-                }) { attachment in
-                    Button("Play recording", systemImage: "waveform") {
-                        Task {
-                            do {
-                                audioPreview = try await Task.detached(priority: .utility) {
-                                    if let raw = attachment.base64 {
-                                        let recording = MultimodalAttachment(id: attachment.id, type: "audio", base64: raw,
-                                            mime: attachment.mime ?? "audio/x-caf")
-                                        return try MobileLocalStorage.retainRecording(recording)
-                                    }
-                                    let url = try MobileLocalStorage.recordingURL(id: attachment.id)
-                                    _ = try url.checkResourceIsReachable()
-                                    return url
-                                }.value
-                                audioError = nil
-                            } catch { audioError = error.localizedDescription }
-                        }
+                ForEach(message.attachments.filter { $0.type == "audio" }) { attachment in
+                    VoiceNoteBubble(id: attachment.id,
+                        transcript: attachment.utterance?.correctedText ?? attachment.utterance?.text ?? message.text,
+                        isOwn: isUser, speaker: iCloudSyncEngine.shared.agentDisplayName) {
+                        try await Task.detached(priority: .utility) {
+                            if let raw = attachment.base64, !raw.isEmpty {
+                                return try MobileLocalStorage.retainRecording(MultimodalAttachment(
+                                    id: attachment.id, type: "audio", base64: raw, mime: attachment.mime ?? "audio/x-caf"))
+                            }
+                            let url = try MobileLocalStorage.recordingURL(id: attachment.id, mime: attachment.mime)
+                            _ = try url.checkResourceIsReachable()
+                            return url
+                        }.value
                     }
                 }
-                if let audioError { Text(audioError).foregroundStyle(.secondary) }
                 if attachmentCountWithoutPreview > 0 {
                     HStack(spacing: 6) {
                         Image(systemName: "photo.fill")
@@ -72,7 +63,7 @@ struct BubbleView: View, Equatable {
                     .font(.footnote)
                     .foregroundStyle(AlivePalette.secondary)
                 }
-                if message.interaction == nil && (!message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || message.attachments.isEmpty) {
+                if !message.attachments.contains(where: { $0.type == "audio" }), message.interaction == nil && (!message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || message.attachments.isEmpty) {
                     // One view from the wait to the settled reply: the hint
                     // crossfades to the first paced words, and the streamed
                     // text crossfades to markdown. The stack takes the
@@ -108,12 +99,11 @@ struct BubbleView: View, Equatable {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.trailing, isUser && !dynamicTypeSize.isAccessibilitySize ? 24 : 0)
-        .quickLookPreview($audioPreview)
         .task(id: message.attachments) {
             let prepared = await ChatAttachmentPresentation.shared.images(in: message.attachments)
             guard !Task.isCancelled else { return }
             images = prepared
-            attachmentCountWithoutPreview = message.attachments.count - prepared.count
+            attachmentCountWithoutPreview = message.attachments.filter { $0.type != "audio" }.count - prepared.count
         }
     }
 
@@ -389,23 +379,13 @@ struct InlineChatApprovalCard: View {
 
 /// iOS counterpart to the Mac `ToolCallGroup`. While she's working, `isLive`
 /// shows ONE box that flips through tools as they fire. When done, it collapses
-/// to "N tools used" / "N skills used" rows, each tappable to expand the names.
+/// to one tool summary, tappable to expand the names.
 struct ToolActivityView: View {
     let events: [ToolEvent]
     let isLive: Bool
     @State private var toolsExpanded = false
-    @State private var skillsExpanded = false
-
-    // Skill use is a shared remote-surface presentation taxonomy. The Mac
-    // dispatcher catalog remains executable authority; its parity eval keeps
-    // this compact iOS projection in lockstep as names evolve.
-    private func isSkill(_ e: ToolEvent) -> Bool {
-        ToolActivityPresentation.isSkillReaderTool(named: e.name)
-    }
-
     private var ordered: [ToolEvent] { events.sorted { $0.seq < $1.seq } }
-    private var skills: [ToolEvent] { ordered.filter(isSkill) }
-    private var tools: [ToolEvent] { ordered.filter { !isSkill($0) } }
+    private var tools: [ToolEvent] { ordered }
     private var latest: ToolEvent? { events.max(by: { $0.seq < $1.seq }) }
 
     var body: some View {
@@ -439,10 +419,6 @@ struct ToolActivityView: View {
             if !tools.isEmpty {
                 summaryRow(items: tools, noun: "tool",
                            icon: "wrench.and.screwdriver", expanded: $toolsExpanded)
-            }
-            if !skills.isEmpty {
-                summaryRow(items: skills, noun: "skill",
-                           icon: "text.book.closed", expanded: $skillsExpanded)
             }
         }
     }

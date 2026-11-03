@@ -4,7 +4,7 @@ import NativeAgentShared
 import Foundation
 import PersistenceCore
 import SwarmRuns
-// Blueprint: | `SwiftToolDispatcher+DelegationTools.swift` | `SwiftToolDispatcher`: `impl_delegation_status`, `delegationStatusLimit`, `delegationStatusOffset` |
+// Blueprint: | `SwiftToolDispatcher+DelegationTools.swift` | `SwiftToolDispatcher`: `impl_delegation_status`, `delegationStatusLimit`, `delegationStatusOffset`; exact and agent-filtered reads retain shared lifecycle coverage gaps |
 
 // Local read of delegated job stores through app actions: no writes, processes or network.
 
@@ -58,8 +58,9 @@ extension SwiftToolDispatcher {
         // Not answered yet: her inbox says whether her live session read it.
         // An answer reads below, in full, as every exact read does.
         if let messageID, let inbox,
+           snapshot.sources.allSatisfy({ $0.status == "available" || $0.status == "absent" }),
            snapshot.jobs.allSatisfy({ ($0.runStatus ?? $0.status) == "delivered_live" && $0.agentReplyTextHead == nil }) {
-            let record = DelegationStatusProjector.requestRecords(inbox: inbox.url, ids: [messageID])[messageID]
+            let record = try DelegationStatusProjector.requestRecords(inbox: inbox.url, ids: [messageID])[messageID]
             if inbox.retained || record?["id"] != nil {
                 let read = record?["read"] == "true"
                 return .object(["status": .string(read ? "read" : "queued"), "message_id": .string(messageID),
@@ -69,9 +70,10 @@ extension SwiftToolDispatcher {
         }
 
         let matchedCount = snapshot.matchedCount
-        // Contact names only decorate retained evidence; an unreadable address book never hides it.
-        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
-        let sources = snapshot.sources.filter { source in (agentFilter == nil || source.agent == agentFilter)
+        // Source inclusion and contact identity depend on the checked address book.
+        let peers = try AgentPeerStore(dataRoot: dataRoot).list()
+        // Lifecycle origin gaps have no known principal; a contact filter cannot establish that they belong elsewhere.
+        let sources = snapshot.sources.filter { source in (agentFilter == nil || source.agent == agentFilter || source.agent == "self")
             && (source.status != "absent" || peers.contains(where: { ($0.handles ?? []).contains(source.agent) })) }
         let evidenceStatus: String
         if sources.allSatisfy({ $0.status == "absent" }) {
@@ -85,7 +87,8 @@ extension SwiftToolDispatcher {
         let jobs = snapshot.jobs
 
         let stalled = jobs.filter { $0.stalled }
-        let open = jobs.filter { $0.completedAt == nil }
+        // Settlement is the projector's evidence, independent of a recorded execution completion time.
+        let open = jobs.filter { $0.completedAt == nil && $0.stallBasis != .terminal }
         let runtimeRevision: String? = {
             guard let raw = Bundle.main.object(forInfoDictionaryKey: "NativeAgentSourceRevision") as? String else {
                 return nil
@@ -237,7 +240,7 @@ extension SwiftToolDispatcher {
         if normalized.isEmpty || normalized == "all" { return nil }
         let named = try AgentConversationRouting.namingSavedContact("agent_read", ["agent": .string(normalized)], dataRoot: dataRoot)
         let target: String = if case .string(let target)? = named["agent"] { target } else { normalized }
-        if let lane = AgentConversationDelivery.lane(for: target, dataRoot: dataRoot) { return lane == "claude" ? "claude" : lane }
+        if let lane = try AgentConversationDelivery.lane(for: target, dataRoot: dataRoot) { return lane == "claude" ? "claude" : lane }
         if AgentConversationDelivery.inbox(agent: normalized, bridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)) != nil {
             return normalized == "claude" ? "claude" : normalized
         }

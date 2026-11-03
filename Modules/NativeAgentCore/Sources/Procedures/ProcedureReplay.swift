@@ -1,15 +1,25 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `ProcedureReplay.swift` | replay status/count and manual dry-run eligibility; canonical executor retains dispatch |
+// Blueprint: | `ProcedureReplay.swift` | reasoned replay status/count and manual dry-run eligibility/refusal; canonical executor alone dispatches |
 
 public enum ProcedureReplayStatus: String, Codable, Sendable, Equatable {
     case matched
-    case fallback
+    case refused
     case abstained
+}
+
+public enum ProcedureReplayReason: String, Codable, Sendable, Equatable {
+    case exactReplay = "exact_replay"
+    case novelInput = "novel_input"
+    case authorityDiverged = "authority_diverged"
+    case externalSendIneligible = "external_send_ineligible"
+    case transitionCountDiverged = "transition_count_diverged"
+    case transitionDiverged = "transition_diverged"
 }
 
 public struct ProcedureReplayResult: Sendable, Equatable {
     public let status: ProcedureReplayStatus
+    public let reason: ProcedureReplayReason
     public let matchedStepCount: Int
 }
 
@@ -57,7 +67,7 @@ public enum ProcedureDryRunStatus: String, Codable, Sendable, Equatable {
     case wouldAdvance = "would_advance"
     case wouldComplete = "would_complete"
     case abstained
-    case fallback
+    case refused
     case cancelled
 }
 
@@ -78,7 +88,6 @@ public struct ProcedureDryRunResult: Sendable, Equatable {
     public let status: ProcedureDryRunStatus
     public let reason: ProcedureDryRunReason
     public let proposedRule: ProcedureTransitionRule?
-    public let fallback: ProcedureFallbackRoute
 }
 
 public enum ProcedureReplayEngine {
@@ -88,10 +97,12 @@ public enum ProcedureReplayEngine {
     ) -> ProcedureReplayResult {
         func result(
             _ status: ProcedureReplayStatus,
+            _ reason: ProcedureReplayReason,
             matched: Int
         ) -> ProcedureReplayResult {
             ProcedureReplayResult(
                 status: status,
+                reason: reason,
                 matchedStepCount: matched
             )
         }
@@ -99,15 +110,15 @@ public enum ProcedureReplayEngine {
               artifact.inputContract.inputClass == trajectory.inputClass,
               artifact.inputContract.acceptedParameterSchemaIdentities.contains(
                 trajectory.parameterSchemaIdentity
-              ) else { return result(.abstained, matched: 0) }
+              ) else { return result(.abstained, .novelInput, matched: 0) }
         guard artifact.authorityClass == trajectory.authorityClass else {
-            return result(.fallback, matched: 0)
+            return result(.refused, .authorityDiverged, matched: 0)
         }
         guard !trajectory.externalEffectClasses.contains("external_send") else {
-            return result(.abstained, matched: 0)
+            return result(.abstained, .externalSendIneligible, matched: 0)
         }
         guard artifact.transitionTable.count == trajectory.steps.count else {
-            return result(.fallback, matched: 0)
+            return result(.refused, .transitionCountDiverged, matched: 0)
         }
         var matched = 0
         for (index, pair) in zip(artifact.transitionTable, trajectory.steps).enumerated() {
@@ -124,11 +135,11 @@ public enum ProcedureReplayEngine {
                   rule.afterState == step.afterState,
                   rule.verificationClass == step.verificationClass,
                   rule.terminalClass == step.terminalClass else {
-                return result(.fallback, matched: matched)
+                return result(.refused, .transitionDiverged, matched: matched)
             }
             matched += 1
         }
-        return result(.matched, matched: matched)
+        return result(.matched, .exactReplay, matched: matched)
     }
 
     /// Pure current-state eligibility check. It returns a declarative rule and
@@ -145,8 +156,7 @@ public enum ProcedureReplayEngine {
             ProcedureDryRunResult(
                 status: status,
                 reason: reason,
-                proposedRule: rule,
-                fallback: artifact.deterministicFallback
+                proposedRule: rule
             )
         }
         if context.cancellationRequested {
@@ -161,29 +171,29 @@ public enum ProcedureReplayEngine {
                 context.parameterSchemaIdentity
               ) else { return result(.abstained, .novelInput) }
         guard context.authorityClass == artifact.authorityClass else {
-            return result(.fallback, .authorityDiverged)
+            return result(.refused, .authorityDiverged)
         }
         guard context.requestedExternalEffectClass != "external_send",
               artifact.inputContract.allowedExternalEffectClasses.contains(
                 context.requestedExternalEffectClass
               ) else { return result(.abstained, .externalSendIneligible) }
-        guard context.trustCenterAllowed else { return result(.fallback, .trustCenterDenied) }
+        guard context.trustCenterAllowed else { return result(.refused, .trustCenterDenied) }
         guard artifact.safety.requiredPreconditions.allSatisfy({
             context.preconditionResults[$0] == true
-        }) else { return result(.fallback, .preconditionFailed) }
+        }) else { return result(.refused, .preconditionFailed) }
         if artifact.safety.canonicalApprovalOwner != nil,
            !context.canonicalApprovalOwnerRechecked {
-            return result(.fallback, .approvalOwnerNotRechecked)
+            return result(.refused, .approvalOwnerNotRechecked)
         }
         guard artifact.transitionTable.indices.contains(context.nextRuleIndex) else {
-            return result(.fallback, .stateDiverged)
+            return result(.refused, .stateDiverged)
         }
         let rule = artifact.transitionTable[context.nextRuleIndex]
         guard rule.beforeState == context.currentState else {
-            return result(.fallback, .stateDiverged)
+            return result(.refused, .stateDiverged)
         }
         guard rule.externalEffectClass == context.requestedExternalEffectClass else {
-            return result(.fallback, .stateDiverged)
+            return result(.refused, .stateDiverged)
         }
         return result(
             rule.terminalClass == nil ? .wouldAdvance : .wouldComplete,

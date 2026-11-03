@@ -102,7 +102,7 @@ public enum OrganismChemistry {
             next.urgency = lower(next.urgency, by: 0.08 * i)
         case .deskItemCancelled:
             break
-        case .memoryCommitted, .memoryHygieneCompleted:
+        case .memoryCommitted:
             body.memoryIntegrityReading = nil
             body.memoryHealthy = true
             next.coherence = raise(next.coherence, by: 0.06 * i)
@@ -121,15 +121,14 @@ public enum OrganismChemistry {
         case .iPhoneReachable:
             body.peerPresenceBelief = nil
             body.iPhoneReachable = true
-            body.notificationPathHealthy = true
             next.coherence = raise(next.coherence, by: 0.02 * i)
         case .iPhoneStale:
             body.peerPresenceBelief = nil
-            body.notificationPathHealthy = false
             body.iPhoneReachable = false
             next.vigilance = raise(next.vigilance, by: 0.04 * i)
         case .phoneDeliveryStarted:
             body.notificationDeliveryBelief = nil
+            body.notificationPathHealthy = nil
         case .phoneDeliveryReceived:
             body.notificationDeliveryBelief = nil
             body.iPhoneReachable = true
@@ -331,7 +330,7 @@ public enum OrganismChemistry {
         if !bodySchema.approvalChannelsOpen {
             return "- Body: approval path feels closed; avoid irreversible moves."
         }
-        if !bodySchema.notificationPathHealthy {
+        if bodySchema.notificationPathHealthy == false {
             return "- Body: phone path feels stale; verify delivery before assuming it was seen."
         }
         if observedMemoryHealth(bodySchema) == false {
@@ -591,9 +590,6 @@ public enum OrganismChemistry {
 
 // The local clock colors projected chemistry; stored state is untouched.
 public enum OrganismCircadian {
-    /// Where the night bottoms out when the user declared no quiet window.
-    /// 4 AM local — the human circadian trough, and the hour nobody schedules.
-    public static let defaultTroughHour = 4.0
     /// Hard cap on the arousal lean the curve publishes. ≤ 0.15 by contract.
     public static let arousalAmplitude = 0.12
     /// Hard cap on the curiosity lean the curve applies. ≤ 0.15 by contract.
@@ -611,11 +607,9 @@ public enum OrganismCircadian {
     }
 
     /// The hour the body bottoms out: the midpoint of the declared quiet window
-    /// (wrap-aware — 23→7 gives 3 AM), else the shipped default.
+    /// (wrap-aware — 23→7 gives 3 AM).
     static func troughHour(_ clock: OrganismDiurnalClock) -> Double {
-        guard let start = clock.quietStartHour, let end = clock.quietEndHour else {
-            return defaultTroughHour
-        }
+        let start = clock.quietStartHour, end = clock.quietEndHour
         let span = start < end ? Double(end - start) : Double(24 - start + end)
         return (Double(start) + span / 2).truncatingRemainder(dividingBy: 24)
     }

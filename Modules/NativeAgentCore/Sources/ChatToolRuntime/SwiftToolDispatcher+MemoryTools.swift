@@ -426,13 +426,6 @@ extension SwiftToolDispatcher {
         return Self.memoryHitTemporalData(MemoryRecallHit(score: 0, preview: "", extras: .object(extras)))
     }
 
-    /// Only correction, instruction, preference, note and unclaimed kinds may carry context scope.
-    func kindAcceptsContextTopics(_ kind: String?) -> Bool {
-        guard let kind else { return true }
-        return ["correction", "instruction", "preference", MemoryKindStamp.genericCommitKind].contains(
-            kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-    }
-
     /// MemoryV2 owns the durable write, duplicate policy and metadata kind stamping.
     func impl_commit_memory(input: [String: JSONValue]) async throws -> JSONValue {
         // Collect all argument faults into one refusal.
@@ -449,12 +442,13 @@ extension SwiftToolDispatcher {
             }
         }
 
-        // Missing/unknown kinds use the store default and backfill; explicit `instruction` preserves agreement lookup.
-        let requestedKind = optionalString(input, "kind")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-            .flatMap { $0.isEmpty ? nil : $0 }
-        let kind = requestedKind.flatMap {
-            MemoryKindStamp.writerKinds.contains($0) || $0 == "instruction" ? $0 : nil
+        var kind: String?
+        if let supplied = input["kind"], supplied != .null {
+            if case .string(let value) = supplied, MemoryKindStamp.commitKinds.contains(value) {
+                kind = value
+            } else {
+                problems.append("'kind' must be one of: " + MemoryKindStamp.commitKinds.joined(separator: ", ") + "; omit it when none fits")
+            }
         }
 
         var text = ""
@@ -468,21 +462,22 @@ extension SwiftToolDispatcher {
             problems.append("'text' is required and must be a string")
         }
 
-        // Scope hints never reject a memory; accepted kinds keep up to eight valid phrases.
         var validatedTopics: [JSONValue]?
-        if kindAcceptsContextTopics(kind), case .array(let values)? = input["context_topics"] {
-            // Empty optional arrays are omission; never store an empty scope.
-            let topics: [JSONValue] = values
-                .compactMap { value in
-                    guard case .string(let raw) = value else { return nil }
-                    let topic = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !topic.isEmpty, topic.count <= 120 else { return nil }
-                    return JSONValue.string(topic)
-                }
-                .prefix(8)
-                .map { $0 }
-            if !topics.isEmpty { validatedTopics = topics }
+        if let supplied = input["context_topics"], supplied != .null {
+            do { validatedTopics = try MemoryCommitArguments.contextTopics(supplied, kind: kind) }
+            catch { problems.append(error.localizedDescription) }
         }
+        func numeric(_ key: String, omitted: Double) -> Double {
+            guard let supplied = input[key], supplied != .null else { return omitted }
+            guard let value = supplied.numberValue(coercingStrings: false, finiteOnly: true),
+                  (0...1).contains(value) else {
+                problems.append("'\(key)' must be a finite number in 0...1")
+                return omitted // Used only to collect faults; the guard below refuses the write.
+            }
+            return value
+        }
+        let confidence = numeric("confidence", omitted: 0.8)
+        let importance = numeric("importance", omitted: 0.5)
 
         guard problems.isEmpty else {
             throw AutonomyGateError.toolDenied(
@@ -492,8 +487,6 @@ extension SwiftToolDispatcher {
             )
         }
         let tags = Self.stringArray(input["tags"])
-        let confidence = input["confidence"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0.8
-        let importance = input["importance"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0.5
 
         // Build metadata. kind rides metadata.kind (the convention
         // MemoryKindStamp / MemoryRecallScoring.kind(of:) read); store() honors
@@ -512,10 +505,10 @@ extension SwiftToolDispatcher {
         }
         // The turn it was kept in, stamped the way moments are: a correction
         // knows the exchange that caused it (the miss ledger links it).
-        meta.merge(MemoryMoments.turnMetadata(turnId: TurnTraceContext.turnId, origin: AfterTurnSource.origin)) { current, _ in current }
+        meta.merge(MemoryDataProvenance.turnMetadata(turnId: TurnTraceContext.turnId, origin: AfterTurnSource.origin)) { current, _ in current }
         // Her own save: the turn that saved it is its source, and its time.
         let origin = AfterTurnSource.origin
-        meta.merge(MemoryMoments.sourceMetadata(sessionId: origin?.sessionId, messageId: origin?.messageId,
+        meta.merge(MemoryDataProvenance.sourceMetadata(sessionId: origin?.sessionId, messageId: origin?.messageId,
             turnId: TurnTraceContext.turnId, at: origin?.occurredAt ?? Date(), speaker: "self", words: nil)) { current, _ in current }
         if let validatedTopics {
             meta["context_topics"] = .array(validatedTopics)
@@ -592,7 +585,8 @@ extension SwiftToolDispatcher {
                     // report it as what it is, never as a benign miss.
                     correctionField = .object([
                         "corrected_id": .string(corrects),
-                        "applied": .bool(false),
+                        "applied": .null,
+                        "read_error": .string(String(describing: error)),
                         "note": .string("The save completed; reading its correction outcome failed (\(error)). Inspect the canonical records before retrying."),
                     ])
                 }
@@ -606,7 +600,6 @@ extension SwiftToolDispatcher {
             // Report the stored kind independently of its storage layer.
             "kind": .string(record.memoryKind ?? kind ?? MemoryKindStamp.defaultKind),
         ]
-        if let requestedKind, requestedKind != kind { payload["kind_requested"] = .string(requestedKind) }
         if case .object = correctionField { payload["correction"] = correctionField }
         if !supersedes.isEmpty {
             payload[admitted ? "superseded" : "supersedes_once_admitted"] = .array(supersedes.map(JSONValue.string))
@@ -624,13 +617,7 @@ extension SwiftToolDispatcher {
                           disclosure.permits(surface: ChatTurnRuntimeContext.current?.surface ?? "chat", personaID: record.personaId)
                     else { return false }
                     let rowTopics = Set(Self.stringArray(Self.memoryMetadataValue(row.extras, key: "context_topics")).map { $0.lowercased() })
-                    let rowKind = row.memoryKind ?? MemoryRecallScoring.kind(of: row.extras)
-                    if !rowTopics.isEmpty { return rowTopics == topics }
-                    // Legacy agreements may have declared their subject only
-                    // as tags. Exact labels are evidence; similarity is not.
-                    guard rowKind == "instruction" || rowKind == "correction" else { return false }
-                    return topics.isDisjoint(with: MemoryRecoveryReadout.genericSubjects)
-                        && topics.isSubset(of: Set((row.tags ?? []).map { $0.lowercased() }))
+                    return !rowTopics.isEmpty && rowTopics == topics
                 }.sorted {
                     let left = MemoryRecallScoring.parseTimestamp($0.updatedAt ?? $0.createdAt) ?? .distantPast
                     let right = MemoryRecallScoring.parseTimestamp($1.updatedAt ?? $1.createdAt) ?? .distantPast

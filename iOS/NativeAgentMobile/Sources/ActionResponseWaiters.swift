@@ -1,9 +1,9 @@
 import Foundation
+import NativeAgentShared
 
 /// One MainActor-isolated rendezvous between the transport drain that persists
 /// `responses/<correlationID>.json` and the task waiting on that response.
-/// Single-resume is guaranteed structurally: a continuation is removed from the
-/// table before it is resumed, so timeout, signal, and cancellation race safely.
+/// ScopedWaiter owns parking; this actor records the first outcome before waking it.
 @MainActor
 final class ActionResponseWaiters {
     static let shared = ActionResponseWaiters()
@@ -11,7 +11,8 @@ final class ActionResponseWaiters {
     /// Backstop cadence for transport drains when no push arrives.
     static let backstopInterval: TimeInterval = 5
 
-    private var waiters: [String: [UUID: CheckedContinuation<Bool, Never>]] = [:]
+    private var waiters: [String: [UUID: ScopedWaiter]] = [:]
+    private var results: [UUID: Bool] = [:]
     private var arrived: Set<String> = []
     private var armed: Set<String> = []
     private var timeoutTasks: [UUID: Task<Void, Never>] = [:]
@@ -61,35 +62,25 @@ final class ActionResponseWaiters {
         guard timeout.isFinite, timeout >= 0,
               let delay = UInt64(exactly: (timeout * 1_000_000_000).rounded(.towardZero)) else { return false }
         let token = UUID()
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-                if arrived.contains(correlationID) {
-                    continuation.resume(returning: true)
-                    return
-                }
-                if Task.isCancelled {
-                    continuation.resume(returning: false)
-                    return
-                }
-                waiters[correlationID, default: [:]][token] = continuation
-                timeoutTasks[token] = Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: delay)
-                    self?.resume(correlationID: correlationID, token: token, signalled: false)
-                }
-            }
-        } onCancel: {
-            Task { @MainActor [weak self] in
-                self?.resume(correlationID: correlationID, token: token, signalled: false)
-            }
+        guard !Task.isCancelled else { return false }
+        let done = ScopedWaiter()
+        waiters[correlationID, default: [:]][token] = done
+        timeoutTasks[token] = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            self?.resume(correlationID: correlationID, token: token, signalled: false)
         }
+        await done.park()
+        resume(correlationID: correlationID, token: token, signalled: false)
+        return results.removeValue(forKey: token)!
     }
 
     private func resume(correlationID: String, token: UUID, signalled: Bool) {
         timeoutTasks.removeValue(forKey: token)?.cancel()
-        guard let continuation = waiters[correlationID]?.removeValue(forKey: token) else { return }
+        guard let done = waiters[correlationID]?.removeValue(forKey: token) else { return }
         if waiters[correlationID]?.isEmpty == true {
             waiters.removeValue(forKey: correlationID)
         }
-        continuation.resume(returning: signalled)
+        results[token] = signalled
+        done.resume()
     }
 }

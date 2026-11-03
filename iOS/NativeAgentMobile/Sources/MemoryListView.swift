@@ -127,7 +127,7 @@ struct MemoryListView: View {
         .task(id: MobileSearchInput(rows: sourceMemories, query: searchQuery)) {
             let input = MobileSearchInput(rows: sourceMemories, query: MemorySearchPresentation.normalizedQuery(searchQuery))
             let result = await searchIndex.search(input, maximum: input.rows.count,
-                fields: { [$0.text.lowercased(), $0.layer.lowercased()] + ($0.tags ?? []).map { $0.lowercased() } },
+                fields: { [$0.text.lowercased()] + [$0.layer].compactMap { $0?.lowercased() } + ($0.tags ?? []).map { $0.lowercased() } },
                 matches: { $0.contains($1) })
             guard !Task.isCancelled else { return }
             searchResults = result

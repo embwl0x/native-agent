@@ -41,6 +41,8 @@ struct ReachLedger: Codable, Equatable {
         var session: String?
         /// A push went out with it: an interruption.
         var knocked: Bool?
+        /// Speech may have landed while its separate notification failed.
+        var knockFailure: String?
         /// He took a turn within a day after it (true) or did not (false).
         var answered: Bool?
         /// The first verified owner turn in the window, kept at its event

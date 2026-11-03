@@ -278,7 +278,7 @@ public extension BodySchema {
     }
 
     var notificationRequiresReceipt: Bool {
-        guard let belief = notificationDeliveryBelief else { return !notificationPathHealthy }
+        guard let belief = notificationDeliveryBelief else { return notificationPathHealthy != true }
         switch belief.category {
         case .unconfigured:
             // An absent transport has no delivery to acknowledge and never goes stale.

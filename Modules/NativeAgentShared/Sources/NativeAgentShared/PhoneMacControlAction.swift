@@ -1,4 +1,4 @@
-// Blueprint: | `PhoneMacControlAction.swift` | Executable phone Mac-control methods and native paths shared by mobile senders and Mac dispatch; preserves the volume wire envelope |
+// Blueprint: | `PhoneMacControlAction.swift` | Executable phone Mac-control methods and native paths shared by mobile senders and Mac dispatch, including the current system-volume envelope |
 
 /// Route support, independent of Trust admission. Only methods with a native
 /// executor belong here; saving a policy switch cannot supply an executor.
@@ -41,7 +41,7 @@ public enum PhoneMacControlAction: String, Sendable {
     public func payload(_ arguments: [String: String]) -> [String: String] {
         var payload = arguments
         payload["method"] = rawValue
-        // Keep queued envelopes and older paired Macs wire-compatible.
+        // `system` names the operation family; `volume` names its action.
         if self == .volume { payload["action"] = "volume" }
         return payload
     }

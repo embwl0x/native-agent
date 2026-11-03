@@ -2,23 +2,26 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `LiveNotificationInbox.swift` | Single physical-line reader and writer for inbox cards; actor mutations and caller-owned row edits share retention and archive-before-rewrite under the inbox flock |
+// Blueprint: | `LiveNotificationInbox.swift` | Checked canonical cards and source revisions under the inbox flock; background intent admission binds current content, retention reads outstanding delivery ledger rows, and independent scans preserve named gaps |
 
 /// Single file owner for the live macOS notification inbox.
 ///
 /// The log stays interoperable JSONL, but reads reuse a parsed snapshot until
 /// the file identity changes and every mutation is serialized by the canonical
 /// PersistenceCore flock. Retention protects active cards first and uses the
-/// remaining budget for recent history; malformed physical lines are carried
-/// through byte-for-byte and count against the same hard bound.
+/// remaining budget for recent history. Every physical line must read as a
+/// current card before a complete snapshot or whole-feed mutation is usable;
+/// a damaged line reports its position/cause and leaves the saved bytes alone.
 ///
 /// Every write applies age and row bounds:
 ///   * terminal (`archived`/`dismissed`) rows finished with (`read_at`, else
 ///     `created_at`) more than `terminalRetentionSeconds` ago are pruned,
 ///     oldest first;
-///   * whatever survives is held to `rowLimit`, newest-active-first.
-/// Active/unread cards are never age-pruned — only the hard cap can reach them,
-/// and only once the active set alone exceeds it. Each pass evicts at most
+///   * rows with outstanding `held_delivery` destinations are exempt from both
+///     limits until their delivery owner settles them;
+///   * other survivors converge to `rowLimit`, newest-active-first.
+/// Active/unread cards are never age-pruned — only the row budget can reach them,
+/// and only once the unheld active set alone exceeds it. Each pass evicts at most
 /// `maxPrunedRowsPerPass` lines, so a backlog converges over several writes
 /// instead of one unbounded scan-rewrite.
 ///
@@ -29,7 +32,8 @@ import PersistenceCore
 /// File policy: inbox and overflow shelf are excluded from local backup/export;
 /// the phone receives live-card projections. PrivacyMap: Notifications.
 public actor LiveNotificationInbox {
-    /// Hard bound on physical lines in the live feed.
+    /// Target for unheld physical lines, reached over bounded mutation passes.
+    /// Held deliveries are additional rows and can exceed this target indefinitely.
     public static let rowLimit = 500
     /// How long finished history stays on the live feed, measured from when the
     /// row became terminal (`read_at`), not from when it was raised. Active
@@ -58,7 +62,7 @@ public actor LiveNotificationInbox {
                             id: String = "held:" + UUID().uuidString.lowercased(), fields: [String: JSONValue] = [:]) async throws {
         var row: [String: JSONValue] = ["id": .string(id), "source": .string("resident_wake"),
             "created_at": .string(NotificationInboxClock.nowISO()), "severity": .string("info"), "status": .string("unread"),
-            "title": .string(String(title.prefix(160))), "summary": .string(String(body.prefix(500))),
+            "title": .string(String(title.prefix(160))), "summary": .string(String(body.prefix(500))), "actions": .array([]),
             "held_delivery": .array(ways.map(JSONValue.string)), "held_title": .string(title), "held_body": .string(body)]
         row.merge(fields) { _, value in value }
         if let approvalID { row["approval_id"] = .string(approvalID) }
@@ -91,33 +95,24 @@ public actor LiveNotificationInbox {
 
         var isActive: Bool {
             guard case .object(let object)? = row else { return false }
-            let status: String
-            if case .string(let value)? = object["status"] { status = value }
-            else { status = "unread" }
+            guard case .string(let status)? = object["status"] else { return false }
             return status != "archived" && status != "dismissed"
         }
 
         /// A parsed row the user has finished with. Defined as the complement of
         /// `isActive` over parsed rows, so the two can never disagree about a
-        /// status string. A malformed physical line is neither: corrupt bytes
-        /// are carried through, never aged out.
+        /// status string. Retention only receives checked cards.
         var isTerminal: Bool {
             guard case .object? = row else { return false }
             return !isActive
-        }
-
-        var hasHeldDelivery: Bool {
-            guard case .object(let object)? = row,
-                  case .array(let ways)? = object["held_delivery"] else { return false }
-            return !ways.isEmpty
         }
 
         /// When this row's retention clock started. For a terminal row that is
         /// when the user finished with it (`read_at`), NOT when it was created:
         /// a card raised in June and archived today is fresh history, and
         /// pruning it the instant it was archived would make the archive button
-        /// look like a delete button.  Falls back to `created_at` for the older
-        /// rows written before archive/dismiss stamped a time.
+        /// look like a delete button. A card with no disposition time uses its
+        /// creation time; both timestamps are checked at the card boundary.
         var retentionStamp: Date? {
             guard case .object(let object)? = row else { return nil }
             if case .string(let readAt)? = object["read_at"], !readAt.isEmpty,
@@ -136,7 +131,7 @@ public actor LiveNotificationInbox {
         let evicted: [Line]
     }
 
-    public let path: URL
+    public nonisolated let path: URL
     private var cachedStamp: SnapshotTailOpLog.FileStamp?
     private var cachedRows: [JSONValue]?
 
@@ -159,8 +154,8 @@ public actor LiveNotificationInbox {
         }
     }
 
-    /// Parsed rows in file order. A non-empty file containing no valid row is
-    /// corruption, not an empty inbox, and is surfaced to the caller.
+    /// Complete checked rows in file order. One unreadable physical line/card
+    /// makes completeness unavailable, never a healthy shorter or empty inbox.
     public func rows() throws -> [JSONValue] {
         guard let stamp = SnapshotTailOpLog.fileStamp(path) else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: path.path])
@@ -168,15 +163,52 @@ public actor LiveNotificationInbox {
         if stamp == cachedStamp, let cachedRows { return cachedRows }
         let lines = try Self.readLines(path)
         let parsed = lines.compactMap(\.row)
-        if case .present(_, _, let size, _, _, _, _) = stamp, size > 0, parsed.isEmpty {
-            throw NSError(domain: "NotificationInbox", code: 1, userInfo: [
-                NSLocalizedDescriptionKey:
-                    "The notification inbox contains bytes but no valid JSON rows."
-            ])
-        }
         cachedStamp = stamp
         cachedRows = parsed
         return parsed
+    }
+
+    /// Addressed reads do not require a complete feed. Decode the named card
+    /// strictly; a sibling's schema damage cannot disable this card.
+    public func item(id: String) throws -> InboxItemRecord? {
+        guard let row = try row(id: id) else { return nil }
+        return try InboxItemRecord(row: row)
+    }
+
+    /// Retains owner-only delivery fields alongside the strictly checked card.
+    public func row(id: String) throws -> JSONValue? {
+        let lines = try Self.physicalLines(path)
+        var unreadable: Error?
+        for (index, raw) in lines.enumerated().reversed() {
+            let row: JSONValue
+            do { row = try JSONValue.parse(raw) }
+            catch { unreadable = Self.unreadableLine(index, path: path, cause: error); continue }
+            guard row.objectValue?["id"] == .string(id) else { continue }
+            do { _ = try InboxItemRecord(row: row); return row }
+            catch { throw Self.unreadableLine(index, path: path, cause: error) }
+        }
+        // A line whose identity cannot be read may be the requested card.
+        if let unreadable { throw unreadable }
+        return nil
+    }
+
+    /// A scan whose items are independent, with a named failure for each gap.
+    /// Unlike rows(), this never claims a complete healthy snapshot.
+    public func cardReads() throws -> [Result<InboxItemRecord, Error>] {
+        try Self.physicalLines(path).enumerated().map { index, raw in
+            do { return .success(try InboxItemRecord(row: JSONValue.parse(raw))) }
+            catch { return .failure(Self.unreadableLine(index, path: path, cause: error)) }
+        }
+    }
+
+    private static func physicalLines(_ path: URL) throws -> [Data] {
+        let data: Data
+        do { data = try Data(contentsOf: path) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
+        guard !data.isEmpty else { return [] }
+        var lines = data.split(separator: 0x0A, omittingEmptySubsequences: false).map { Data($0) }
+        if lines.last?.isEmpty == true { lines.removeLast() }
+        return lines
     }
 
     /// Append once by stable id. The scan and append happen under one flock, so
@@ -198,6 +230,7 @@ public actor LiveNotificationInbox {
         _ row: JSONValue,
         duplicateID: @escaping @Sendable ([JSONValue]) -> String?
     ) async throws -> String? {
+        _ = try InboxItemRecord(row: row)
         let now = Date()
         let existing = try await SwiftNativePersistenceCore.withFileLock(path) { () async throws -> String? in
             var lines = try Self.readLines(path)
@@ -230,6 +263,7 @@ public actor LiveNotificationInbox {
             var lines = try Self.readLines(path)
             let index = lines.lastIndex(where: { Self.id(of: $0.row) == id })
             let result = try update(index.flatMap { lines[$0].row })
+            _ = try InboxItemRecord(row: result.row)
             let raw = Data(try result.row.serialize(pretty: false).utf8)
             let line = Line(raw: raw, row: result.row)
             if let index {
@@ -279,6 +313,7 @@ public actor LiveNotificationInbox {
         rollupKey: String,
         occurrenceID: String? = nil
     ) async throws -> InformationalRollupResult {
+        _ = try InboxItemRecord(row: row)
         let key = rollupKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let occurrence: String? = {
             guard let trimmed = occurrenceID?
@@ -428,7 +463,9 @@ public actor LiveNotificationInbox {
             guard let index = lines.lastIndex(where: { Self.id(of: $0.row) == id }),
                   case .object(var object)? = lines[index].row else { return false }
             if let unlessPresent, let held = object[unlessPresent], held != .null { return false }
+            let previous = object
             for (key, value) in fields { object[key] = value == .null ? nil : value }
+            guard object != previous else { return false }
             let row = JSONValue.object(object)
             lines[index] = Line(raw: Data(try row.serialize(pretty: false).utf8), row: row)
             try Self.write(retaining: lines, to: path, now: now)
@@ -438,21 +475,40 @@ public actor LiveNotificationInbox {
         return changed
     }
 
-    /// Accepting one way out must not erase another held transport.
-    public func settleHeldDelivery(id: String, way: String) async throws {
-        let now = Date()
-        try await SwiftNativePersistenceCore.withFileLock(path) {
-            var lines = try Self.readLines(self.path)
+    /// Commit a background knock on the current canonical card BEFORE any
+    /// transport admission. Return its committed revision for admission; the
+    /// producer's notification words may differ from the card's summary.
+    public func retainAttentionIntent(id: String, title: String, body: String, reason: String,
+                                      importance: String, userInfo: [String: String], honorsQuietHours: Bool) async throws -> String {
+        let result = try await SwiftNativePersistenceCore.withFileLock(path, waitingAtMost: 5) { () async throws -> (written: Bool, revision: String) in
+            var lines = try Self.readLines(path)
             guard let index = lines.lastIndex(where: { Self.id(of: $0.row) == id }),
-                  case .object(var object)? = lines[index].row,
-                  case .array(let ways)? = object["held_delivery"], ways.contains(.string(way)) else { return }
-            let remaining = ways.filter { $0 != .string(way) }
-            object["held_delivery"] = remaining.isEmpty ? nil : .array(remaining)
-            let row = JSONValue.object(object)
-            lines[index] = Line(raw: Data(try row.serialize(pretty: false).utf8), row: row)
-            try Self.write(retaining: lines, to: self.path, now: now)
+                  var row = lines[index].row?.objectValue,
+                  row["status"] != .string("archived"), row["status"] != .string("dismissed") else {
+                throw ToolFailureError("Notification source card is settled or unavailable; the knock was not admitted.", effects: .none, owner: path.path)
+            }
+            let previous = row
+            row["held_delivery"] = .array([.string("phone")])
+            row["held_event_id"] = .string("inbox:" + id)
+            row["held_title"] = .string(title); row["held_body"] = .string(body)
+            row["held_reason"] = .string(reason); row["held_importance"] = .string(importance)
+            row["held_honors_quiet_hours"] = .bool(honorsQuietHours)
+            row["held_user_info"] = .object(userInfo.mapValues(JSONValue.string))
+            guard row != previous else {
+                return (written: false, revision: try Self.notificationRevision(.object(row)))
+            }
+            let value = JSONValue.object(row)
+            lines[index] = Line(raw: try value.serializedData(pretty: false), row: value)
+            try Self.write(retaining: lines, to: path, now: Date())
+            // The source writer stamps the revision. Read that exact committed
+            // identity while still holding its lock, never infer it from words.
+            guard let committed = try Self.readLines(path).last(where: { Self.id(of: $0.row) == id })?.row else {
+                throw ToolFailureError("Notification intent was not retained on its source card; nothing was sent.", effects: .none, owner: path.path)
+            }
+            return (written: true, revision: try Self.notificationRevision(committed))
         }
-        invalidate()
+        if result.written { invalidate() }
+        return result.revision
     }
 
     /// `metadata` lands on the row with the status (who settled it and why).
@@ -622,31 +678,27 @@ public actor LiveNotificationInbox {
     }
 
     /// The two retention bounds, in order: age out finished history, then hold
-    /// the survivors to the hard cap. Pure — the caller performs the IO.
-    private static func retention(_ lines: [Line], now: Date) -> RetentionPlan {
+    /// the unheld survivors toward the row target. Pure — the caller performs the IO.
+    private static func retention(_ lines: [Line], now: Date, held: Set<Int>) -> RetentionPlan {
         var evicted = Set<Int>()
         var budget = maxPrunedRowsPerPass
 
         // 1. Terminal rows past the age cutoff, oldest first (file order is
-        //    append order). Active cards and malformed lines are never eligible,
-        //    and neither is a row whose timestamps will not parse — an
-        //    unreadable stamp is not evidence of age.
+        //    append order). Active cards and held deliveries are never eligible.
         let cutoff = now.addingTimeInterval(-terminalRetentionSeconds)
         for index in lines.indices {
             guard budget > 0 else { break }
-            guard !lines[index].hasHeldDelivery, lines[index].isTerminal,
+            guard !held.contains(index), lines[index].isTerminal,
                   let finished = lines[index].retentionStamp,
                   finished < cutoff else { continue }
             evicted.insert(index)
             budget -= 1
         }
 
-        // 2. The hard cap over what is left. Newest active/actionable cards take
-        //    the budget first; the rest goes to newest terminal history and
-        //    malformed physical lines, which are never silently "cleaned up" —
-        //    they land on the shelf like anything else.
+        // 2. The row target over unheld survivors. Newest active cards take
+        //    the budget first; the rest goes to newest terminal history.
         // Outstanding deliveries must stay live for their release owner.
-        let survivors = lines.indices.filter { !evicted.contains($0) && !lines[$0].hasHeldDelivery }
+        let survivors = lines.indices.filter { !evicted.contains($0) && !held.contains($0) }
         if survivors.count > rowLimit {
             var kept = Set<Int>()
             for index in survivors.reversed() where lines[index].isActive {
@@ -669,16 +721,6 @@ public actor LiveNotificationInbox {
 
         guard !evicted.isEmpty else { return RetentionPlan(kept: lines, evicted: []) }
 
-        // `rows()` fails closed on a file that holds bytes but no parseable row,
-        // because that shape means corruption, not an empty inbox. Retention
-        // must never manufacture it: on a feed of malformed lines plus aged
-        // history, keep the newest parsed row so the reader still has one.
-        if lines.contains(where: { $0.row != nil }),
-           !lines.indices.contains(where: { !evicted.contains($0) && lines[$0].row != nil }),
-           let newestParsed = lines.indices.reversed().first(where: { lines[$0].row != nil }) {
-            evicted.remove(newestParsed)
-        }
-
         return RetentionPlan(
             kept: lines.indices.compactMap { evicted.contains($0) ? nil : lines[$0] },
             evicted: lines.indices.compactMap { evicted.contains($0) ? lines[$0] : nil }
@@ -689,12 +731,65 @@ public actor LiveNotificationInbox {
     /// FIRST and is allowed to throw: a shelf that cannot be written is a reason
     /// to abandon the write, never a reason to drop the rows anyway.
     private static func write(retaining lines: [Line], to path: URL, now: Date) throws {
-        try validateCounts(lines)
-        let plan = retention(lines, now: now)
+        try validateCards(lines, path: path)
+        let ledger = try NotificationDeliveryLedger(dataRoot: path.deletingLastPathComponent().deletingLastPathComponent()).read()
+        let byCard = Dictionary(grouping: ledger.entries.values.filter { $0.occurrence.cardID != nil }, by: { $0.occurrence.cardID! })
+        var held = Set<Int>()
+        for (index, line) in lines.enumerated() {
+            guard let row = line.row?.objectValue else { continue }
+            if let id = row["notification_occurrence_id"]?.stringValue {
+                if let entry = ledger.entries[id] {
+                    if entry.supersededBy == nil && entry.rows.values.contains(where: { !$0.outcome.settled }) { held.insert(index) }
+                } else { held.insert(index) } // Missing evidence never releases an intent.
+            } else if row["held_delivery"]?.arrayValue?.isEmpty == false, let id = row["id"]?.stringValue {
+                let revision = try notificationRevision(.object(row))
+                let matches = (byCard[id] ?? []).filter { $0.occurrence.sourceRevision == revision }
+                if matches.isEmpty || matches.contains(where: { $0.supersededBy == nil && $0.rows.values.contains { !$0.outcome.settled } }) { held.insert(index) }
+            }
+        }
+        let plan = retention(lines, now: now, held: held)
         if !plan.evicted.isEmpty {
             try appendToArchive(plan.evicted, forInbox: path)
         }
-        try writeRaw(plan.kept, to: path)
+        // Revision belongs to the card's source owner, not a delivery snapshot.
+        // Disposition-only writes retain it; A → B → A receives a fresh revision.
+        let prior = try readLines(path)
+        var previous: [String: [String: JSONValue]] = [:]
+        for line in prior {
+            if let row = line.row?.objectValue, let id = row["id"]?.stringValue { previous[id] = row }
+        }
+        let stamped = try plan.kept.map { line -> Line in
+            guard var row = line.row?.objectValue, let id = row["id"]?.stringValue else { return line }
+            let old = previous[id]
+            let revision: String
+            if let old, notificationContent(old) == notificationContent(row) {
+                revision = try notificationRevision(.object(old))
+            } else { revision = UUID().uuidString.lowercased() }
+            row["notification_revision"] = .string(revision)
+            let value = JSONValue.object(row)
+            return Line(raw: try value.serializedData(pretty: false), row: value)
+        }
+        try writeRaw(stamped, to: path)
+    }
+
+    /// Retained unstamped cards use their exact content identity until their
+    /// next source mutation stamps it. An unrelated write cannot invent a new
+    /// occurrence for an already consumed intent.
+    public nonisolated static func notificationRevision(_ value: JSONValue) throws -> String {
+        guard let row = value.objectValue else { throw CocoaError(.fileReadCorruptFile) }
+        if let saved = row["notification_revision"] {
+            guard let revision = saved.stringValue, !revision.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
+            return revision
+        }
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        return NotificationOccurrence.digest(try encoder.encode(notificationContent(row)))
+    }
+
+    private static func notificationContent(_ row: [String: JSONValue]) -> [String: JSONValue] {
+        row.filter { key, _ in
+            key != "notification_revision" && key != "status" && key != "read_at" && key != "actions" && key != "created_at"
+                && key != "held_mac_dispatch"
+        }
     }
 
     /// Append evicted physical lines to the uncapped shelf, byte-for-byte. Runs
@@ -742,31 +837,38 @@ public actor LiveNotificationInbox {
     }
 
     public static func readLines(_ path: URL) throws -> [Line] {
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-        let data = try Data(contentsOf: path)
-        guard !data.isEmpty else { return [] }
-        var parts = data.split(separator: 0x0A, omittingEmptySubsequences: false)
-            .map { Data($0) }
-        if parts.last?.isEmpty == true { parts.removeLast() }
-        let lines = parts.map { Line(raw: $0, row: try? JSONValue.parse($0)) }
-        try validateCounts(lines)
+        let parts = try physicalLines(path)
+        let lines = try parts.enumerated().map { index, raw in
+            do { return Line(raw: raw, row: try JSONValue.parse(raw)) }
+            catch { throw unreadableLine(index, path: path, cause: error) }
+        }
+        try validateCards(lines, path: path)
         return lines
     }
 
-    private static func validateCounts(_ lines: [Line]) throws {
+    private static func validateCards(_ lines: [Line], path: URL) throws {
         for (index, line) in lines.enumerated() {
-            guard case .object(let fields)? = line.row, let raw = fields["occurrence_count"] else { continue }
-            guard case .int(let count) = raw, count > 0, count < Int.max else {
-                throw NSError(domain: "NotificationInbox", code: 1, userInfo: [NSLocalizedDescriptionKey:
-                    "Inbox row \(index) has an invalid occurrence_count; saved bytes preserved."])
+            do {
+                guard let row = line.row else { throw JSONRow.Malformed.notAnObject }
+                _ = try InboxItemRecord(row: row)
+            } catch {
+                throw unreadableLine(index, path: path, cause: error)
             }
         }
+    }
+
+    private static func unreadableLine(_ index: Int, path: URL, cause: Error) -> NSError {
+        NSError(domain: "NotificationInbox", code: 1, userInfo: [
+            NSFilePathErrorKey: path.path, NSUnderlyingErrorKey: cause,
+            NSLocalizedDescriptionKey: "Inbox \(path.lastPathComponent) line \(index + 1) is unreadable: \(cause.localizedDescription). "
+                + "The complete inbox is unavailable; saved bytes preserved. Repair this row before using a complete read or rewriting the feed."
+        ])
     }
 
     /// Whole-file callers hold the inbox flock and preserve untouched physical
     /// lines. They use the same retention/archive boundary as actor mutations.
     public static func write(_ lines: [Data], to path: URL) throws {
-        try write(retaining: lines.map { Line(raw: $0, row: try? JSONValue.parse($0)) },
+        try write(retaining: lines.map { Line(raw: $0, row: try JSONValue.parse($0)) },
                   to: path, now: Date())
     }
 

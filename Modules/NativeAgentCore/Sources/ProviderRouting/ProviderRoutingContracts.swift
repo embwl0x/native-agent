@@ -17,7 +17,7 @@ extension ProviderSurfaceGroups {
 }
 
 /// Bots carry an explicit provider/model/effort tuple that is validated without downstream reselection.
-/// Route-supplied catalogs precede shipped rows; routes without either accept any model ID.
+/// Route-supplied catalogs precede shipped rows; absent control evidence is unavailable.
 public enum ProviderModelChoice {
     /// nil when the tuple is usable, else a sentence naming what is wrong.
     public static func rejection(
@@ -25,28 +25,44 @@ public enum ProviderModelChoice {
         model: String?,
         reasoningEffort: String?,
         accountModels: [CodexAccountModelCatalog.Model]? = nil,
-        moonshotModels: [ProviderModelInfo]? = nil
+        moonshotModels: [ProviderModelInfo]? = nil,
+        openRouterModels: [ProviderModelInfo]? = nil
     ) -> String? {
         let route = provider?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let id = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let effort = reasoningEffort?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         guard !route.isEmpty else { return "Choose the account this runs on." }
         guard !id.isEmpty else { return "Choose a model on that account." }
+        if ProviderFamilyIdentity.normalize(route) == "openrouter" {
+            guard let row = openRouterModels?.first(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame }),
+                  let supported = row.supported_reasoning_efforts else {
+                return "OpenRouter's reasoning capabilities for \(id) are unavailable. Refresh its model catalog in Providers before choosing a Think level."
+            }
+            if supported.isEmpty {
+                return effort.isEmpty || effort == "default" ? nil
+                    : "\(id) has no Think selector. Choose provider default in Providers."
+            }
+            return supported.contains(effort) ? nil
+                : "\(id) does not support Think \(effort); it supports " + supported.joined(separator: ", ") + "."
+        }
         guard !effort.isEmpty else { return "Choose a Think level for that model." }
         guard REASONING_EFFORT_OPTIONS.contains(effort) else {
             return "\(effort) is not a Think level."
         }
         let moonshot = ProviderFamilyIdentity.normalize(route) == "moonshot" ? moonshotModels : nil
+        let openRouter = ProviderFamilyIdentity.normalize(route) == "openrouter" ? openRouterModels : nil
         guard moonshot.map({ $0.contains { $0.id.lowercased() == id.lowercased() } })
             ?? accountModels.map({ $0.contains { $0.id.lowercased() == id.lowercased() } })
             ?? FirstPartyModelCatalog.routeCarries(id, providerID: route) else {
             return "\(route) does not serve \(id). Pick a model that account offers."
         }
-        if let supported = moonshot.map({ _ in MoonshotModelCatalog.supportedReasoningEfforts(for: id) })
+        guard let supported = openRouter?.first(where: { $0.id == id })?.supported_reasoning_efforts
+            ?? moonshot.flatMap({ _ in MoonshotModelCatalog.supportedReasoningEfforts(for: id) })
             ?? accountModels?.first(where: { $0.id.lowercased() == id.lowercased() })?.supportedReasoningEfforts
-            ?? FirstPartyModelCatalog.routeSupportedEfforts(id, providerID: route),
-           !supported.isEmpty,
-           !supported.contains(effort) {
+            ?? FirstPartyModelCatalog.routeSupportedEfforts(id, providerID: route), !supported.isEmpty else {
+            return "Think controls for \(id) on \(route) are unknown. Refresh its model catalog in Providers."
+        }
+        if !supported.contains(effort) {
             return "\(id) does not support Think \(effort); it supports "
                 + supported.joined(separator: ", ") + "."
         }
@@ -74,17 +90,8 @@ public enum ProviderModelChoice {
 // whole routing engine; it is the provider state/config surface used by the UI
 // and by that Swift chat pipeline.
 //
-// Legacy route vocabulary kept for compatibility with app/UI callers:
-//   GET  /v1/providers                    - list provider records
-//   GET  /v1/providers/<id>               - one provider
-//   POST /v1/providers/<id>/configure     - set credentials/auth mode
-//   POST /v1/providers/<id>/test          - connectivity probe
-//   GET  /v1/config                       - modelRouting preferences
-//   POST /v1/config/model                 - save surface/model/effort choice
-//
-// There is intentionally no dedicated model-preferences route; the app keeps
-// reading/writing the established `modelRouting` envelope so existing UI/state
-// decoding remains stable.
+// In-process configuration uses the `modelRouting` envelope shared by the UI
+// and the provider store.
 
 // MARK: - Provider
 
@@ -128,16 +135,16 @@ public struct Provider: Sendable, Codable, Equatable {
     }
 
     private static let knownKeys: Set<String> = [
-        "id", "provider_id", "providerId",
-        "displayName", "display_name",
-        "kind", "type",
+        "id",
+        "displayName",
+        "kind",
         "configured",
         "active",
         "surface",
-        "modelCatalog", "models",
-        "oauthStatus", "auth_status", "authStatus",
-        "lastTestedAt", "last_tested_at",
-        "lastError", "last_error",
+        "modelCatalog",
+        "oauthStatus",
+        "lastTestedAt",
+        "lastError",
         "extras",
     ]
 
@@ -163,24 +170,24 @@ public struct Provider: Sendable, Codable, Equatable {
         }
         func jv(_ keys: String...) throws -> JSONValue? {
             for k in keys {
-                if let v = (try? c.decodeIfPresent(JSONValue.self, forKey: JSONKey(k))) ?? nil {
+                if let v = try c.decodeIfPresent(JSONValue.self, forKey: JSONKey(k)) {
                     return v
                 }
             }
             return nil
         }
 
-        let idVal = try str("id", "provider_id", "providerId") ?? ""
+        let idVal = try c.decode(String.self, forKey: JSONKey("id"))
         self.id = idVal
-        self.displayName = try str("displayName", "display_name")
-        self.kind = try str("kind", "type")
+        self.displayName = try str("displayName")
+        self.kind = try str("kind")
         self.configured = try bool("configured")
         self.active = try bool("active")
         self.surface = try str("surface")
-        self.modelCatalog = try jv("modelCatalog", "models")
-        self.oauthStatus = try jv("oauthStatus", "auth_status", "authStatus")
-        self.lastTestedAt = try str("lastTestedAt", "last_tested_at")
-        self.lastError = try str("lastError", "last_error")
+        self.modelCatalog = try jv("modelCatalog")
+        self.oauthStatus = try jv("oauthStatus")
+        self.lastTestedAt = try str("lastTestedAt")
+        self.lastError = try str("lastError")
 
         var unknown = c.unknownFields(excluding: Self.knownKeys)
         if let explicit = try jv("extras"), case .object(let obj) = explicit {
@@ -288,27 +295,23 @@ public enum ProviderRoutingError: Error, LocalizedError {
 /// One surface's resolved preference from the in-process ProviderRouting owner.
 /// Chat members share Chat's tuple; Work and Memory and mind share their
 /// unanimous group override, or inherit Chat's model/account with independent
-/// effort. ProviderRouting owns the catalog
-/// too; `modelKnown` is optional catalog metadata, not a routing choice.
+/// effort/tier. Partial or conflicting saved overrides are unavailable.
 public struct SurfacePreference: Sendable, Codable, Equatable {
     public var surface: String
     public var model: String
     public var reasoningEffort: String
     public var serviceTier: String
-    public var modelKnown: Bool?
 
     public init(
         surface: String,
         model: String,
         reasoningEffort: String,
-        serviceTier: String = "default",
-        modelKnown: Bool? = nil
+        serviceTier: String = "default"
     ) {
         self.surface = surface
         self.model = model
         self.reasoningEffort = reasoningEffort
         self.serviceTier = serviceTier
-        self.modelKnown = modelKnown
     }
 }
 
@@ -320,7 +323,11 @@ public struct ProviderGroupWriteResult: Sendable {
 
 public struct ProviderGroupWriteFailure: LocalizedError, Sendable {
     public let detail: String
-    public let surfacesRolledBack: [String]
+    public let forwardIntent: JSONValue
+    public let intentStatus: String
+    public let projectionsCommitted: [String]
+    public let projectionsPending: [String]
+    public let projectionsUnknown: [String]
     public let surfacesPendingRecovery: [String]
     public var errorDescription: String? { detail }
 }
@@ -377,29 +384,17 @@ public struct ProviderRoutingSnapshot: Sendable, Equatable {
 /// Every in-process LLM consumer routes through one of these surfaces.
 /// `ProviderSurfaceGroups` owns the inventory in Chat, Work, then Memory and mind order.
 /// Members share their group's model, account, effort and service tier; Work
-/// and Memory and mind inherit Chat's model/account until a unanimous override
-/// is saved; setting effort alone preserves that inheritance.
+/// and Memory and mind inherit Chat's model/account only with no saved
+/// override; partial/conflicting overrides are unavailable. Setting effort or
+/// tier alone preserves model/account inheritance.
 /// A provider-only override uses that account's default and requires a model
-/// selection when no usable default exists. Legacy `missions` keys fold to
-/// `workshop` at the checked read and write boundaries.
+/// selection when no usable default exists.
 public let MODEL_SURFACES: [String] = ProviderSurfaceGroups.all.flatMap(\.surfaces)
 
-/// Persisted picker keys that deliberately no longer have a routed surface.
-/// Keep the retirement date and reason beside the key so a missing Provider
-/// Settings row is an intentional compatibility decision, never a silent
-/// omission. Entries leave this allowlist only after their saved keys have
-/// been migrated away from real installations.
-public let RETIRED_MODEL_SURFACE_KEYS: [String: String] = [
-    "cognition_cue": "retired 2026-08-24: cue authoring no longer has a routed LLM consumer",
-]
-
-/// One auditable answer to the Provider Settings row-set question. The picker
-/// renders `visibleSurfaces`; persisted keys outside it must be named either by
-/// the dated retirement allowlist or by `unsupportedStoredKeys`, which the UI
-/// renders as an adverse configuration state.
+/// The current picker rows and any unsupported saved keys, named as an
+/// adverse configuration state rather than silently hidden.
 public struct ProviderSurfaceRowSet: Sendable, Equatable {
     public let visibleSurfaces: [String]
-    public let retiredStoredKeys: [String]
     public let unsupportedStoredKeys: [String]
 
     public init(
@@ -410,25 +405,21 @@ public struct ProviderSurfaceRowSet: Sendable, Equatable {
             .union(activeProviderKeys)
             .map(canonicalRoutingSurface))
         let visible = Set(MODEL_SURFACES)
-        let retired = Set(RETIRED_MODEL_SURFACE_KEYS.keys)
         self.visibleSurfaces = MODEL_SURFACES
-        self.retiredStoredKeys = stored.intersection(retired).sorted()
         self.unsupportedStoredKeys = stored
             .subtracting(visible)
-            .subtracting(retired)
             .sorted()
     }
 }
 
-/// The ONE bridge every routing entry point runs its `surface` argument
-/// through. Callers on 0.3.x wire vocabulary (`missions`) and callers on the
-/// new one (`workshop`) resolve to the same preference, pin, and provider hint.
+/// Current surface names share whitespace/case normalization; retired names
+/// are rejected by each routing admission boundary.
 public func canonicalRoutingSurface(_ surface: String) -> String {
-    WorkshopSurfaceVocabulary.canonicalSurface(surface)
+    surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 }
 
 /// Reasoning controls normalized by the in-process routing owner.
-public let REASONING_EFFORT_OPTIONS: [String] = ["none", "low", "medium", "high", "xhigh", "max", "ultra"]
+public let REASONING_EFFORT_OPTIONS: [String] = ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
 
 public let SERVICE_TIER_OPTIONS: [String] = ["default", "priority"]
 
@@ -437,8 +428,8 @@ public let DEFAULT_REASONING_EFFORT: String = "high"
 
 extension SwiftNativeProviderRouting {
     /// Independent model lookup for sizing or an explicitly injected routing choice.
-    public func modelStringForSurface(_ surface: String) async -> String? {
-        guard let prefs = try? await computeModelPreferences() else { return nil }
+    public func modelStringForSurface(_ surface: String) async throws -> String? {
+        let prefs = try await computeModelPreferences()
         if let m = ProviderRoutingSurfaceLookup.value(prefs, surface)?.model, !m.isEmpty {
             return m
         }
@@ -446,13 +437,10 @@ extension SwiftNativeProviderRouting {
     }
 }
 
-/// Surface maps accept either vocabulary, checking the canonical key before its persisted alias.
+/// Surface maps read the current normalized name only.
 public enum ProviderRoutingSurfaceLookup {
     public static func value<V>(_ map: [String: V], _ surface: String) -> V? {
-        let canonical = WorkshopSurfaceVocabulary.canonicalSurface(surface)
-        if let hit = map[canonical] { return hit }
-        guard canonical == WorkshopSurfaceVocabulary.canonical else { return nil }
-        return map[WorkshopSurfaceVocabulary.legacy]
+        map[canonicalRoutingSurface(surface)]
     }
 }
 
@@ -500,6 +488,11 @@ extension ProviderRoutingSnapshot {
             return TurnRouteAdmission(routingSurface: routingSurface, modelId: choice.model,
                 reasoningEffort: choice.reasoningEffort, providerId: choice.provider,
                 serviceTier: choice.fast ? "priority" : "default")
+        }
+        // A supplied/requested model cannot make a broken saved group borrow
+        // Chat's account. An already bound call retains its own admission.
+        if inheritedModel.isEmpty, let fault = unusablePickNotice(for: routingSurface) {
+            throw LLMError.providerError(message: fault)
         }
         let preference = ProviderRoutingSurfaceLookup.value(self.preferences, routingSurface)
             ?? (inheritChat ? self.preferences["chat"] : nil)

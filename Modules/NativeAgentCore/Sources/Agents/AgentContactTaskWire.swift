@@ -47,15 +47,22 @@ extension NativeAgentA2AWire {
     private static func status(_ task: AgentContactTask) -> [String: Any] {
         var status: [String: Any] = ["state": task.state == .stopped ? "canceled" : task.state.rawValue,
             "timestamp": NativeTimestampFormat.plainZulu(task.updated)]
-        if let detail = task.detail {
+        let detail = [task.detail, task.replyRecovery?.detail].compactMap { $0 }.joined(separator: "\n")
+        if !detail.isEmpty {
             status["message"] = ["kind": "message", "role": "agent", "messageId": task.id + "-status",
                 "taskId": task.id, "contextId": task.context, "parts": [["kind": "text", "text": detail]]]
+        }
+        if let recovery = task.replyRecovery, var message = status["message"] as? [String: Any] {
+            message["metadata"] = ["reply_recovery": ["source": recovery.source, "detail": recovery.detail]]
+            status["message"] = message
         }
         if let failure = task.failure,
            let data = try? JSONEncoder().encode(failure),
            let value = try? JSONSerialization.jsonObject(with: data) {
             var message = status["message"] as? [String: Any] ?? [:]
-            message["metadata"] = ["provider_failure": value]
+            var metadata = message["metadata"] as? [String: Any] ?? [:]
+            metadata["provider_failure"] = value
+            message["metadata"] = metadata
             status["message"] = message
         }
         return status

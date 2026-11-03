@@ -9,8 +9,20 @@ import TrustCenter
 import Darwin
 import Darwin
 #endif
-// Blueprint: | `FileReading.swift` | Descriptor-bound file windows, matching and excerpts |
+// Blueprint: | `FileReading.swift` | Descriptor-bound strict UTF-8 text windows/excerpts and explicitly requested exact raw bytes; folder matching; checked ENOENT alone establishes missing paths; metadata-only sense watches admit directory paths under the same root and sensitive-path checks without reading file contents |
 extension FileSystemActions {
+    /// Only ENOENT establishes absence. Permission and I/O failures must not
+    /// become a missing-file verdict for a source watch.
+    private static func readPathIsDirectory(_ path: URL) throws -> Bool? {
+        var info = stat()
+        guard lstat(path.path, &info) == 0 else {
+            let code = errno
+            if code == ENOENT { return nil }
+            throw FileReadFailure(message: "Could not inspect \(path.path) (errno \(code)).", code: "read_failed")
+        }
+        return info.st_mode & S_IFMT == S_IFDIR
+    }
+
     struct FileReadFailure: Error {
         let message: String
         let code: String
@@ -103,13 +115,15 @@ extension FileSystemActions {
                   version(after) == observedVersion else {
                 throw FileReadFailure(message: "File changed during the read. Restart at offset 0 without version.", code: "file_changed")
             }
-            // Keep complete source scalars together across windows. Invalid
-            // source bytes still use replacement decoding; an EOF fragment is
-            // malformed source, whereas a window-edge fragment is not.
+            // Trim only a scalar split by the requested window. Invalid source
+            // bytes (including an EOF fragment) are never replacement-decoded.
             var slice = offset + data.count < totalBytes ? completeUTF8Prefix(data) : data
             if preserveInvalidUTF8 { slice = data }
             if byteLimit > 0 && slice.isEmpty && !data.isEmpty {
                 throw FileReadFailure(message: "max_bytes cannot hold the next UTF-8 character. Use at least 4 bytes.", code: "window_too_small")
+            }
+            if !preserveInvalidUTF8, String(data: slice, encoding: .utf8) == nil {
+                throw FileReadFailure(message: "This text window contains invalid UTF-8. Request files.read with raw:true to read the exact bytes as base64.", code: "invalid_utf8")
             }
             return (slice, totalBytes, observedVersion, byteLimit)
         }
@@ -180,11 +194,16 @@ extension FileSystemActions {
         if isSensitiveDataPath(resolved, ctx) {
             return errResult(sensitiveReadRefusal(resolved), code: "path_not_allowed")
         }
-        var isDir: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir)
-        if !exists { return errResult("File not found: \(resolved.path)", code: "file_not_found", path: resolved, pathKind: "missing") }
-        if isDir.boolValue {
-            if FileReadSourceMaterial.metadataOnly, ["pages", "numbers", "key", "rtfd"].contains(resolved.pathExtension.lowercased()) {
+        let isDirectory: Bool
+        do {
+            guard let kind = try readPathIsDirectory(resolved) else {
+                return errResult("File not found: \(resolved.path)", code: "file_not_found", path: resolved, pathKind: "missing")
+            }
+            isDirectory = kind
+        } catch let failure as FileReadFailure { return errResult(failure.message, code: failure.code) }
+        catch { return errResult(error.localizedDescription, code: "read_failed") }
+        if isDirectory {
+            if FileReadSourceMaterial.metadataOnly {
                 return .object(["ok": .bool(true), "path": .string(resolved.path), "bytes": .int(0)])
             }
             let pattern = input["match"]?.stringValue ?? ""
@@ -204,15 +223,14 @@ extension FileSystemActions {
         // Decode from the bytes THIS verified descriptor produces. Reopening the
         // path to decode would validate one
         // file and render another after a swap.
-        // Exact bytes only for an explicitly raw read of a binary file; text
-        // files keep their windows and errors unchanged.
+        // Explicit raw reads preserve exact bytes regardless of the sniffed prefix.
         let binary: Bool
         do {
             if FileReadSourceMaterial.metadataOnly { binary = false }
             else { binary = try FileReadSourceMaterial.isBinary(handle: handle) }
         }
         catch { return errResult("could not classify file: \(error.localizedDescription)", code: "read_failed") }
-        let explicitlyRaw = input["raw"] == .bool(true) && binary
+        let explicitlyRaw = input["raw"] == .bool(true)
         if !explicitlyRaw && VerifiedImageRead.isImagePath(resolved) {
             guard offset == 0 && expectedVersion.isEmpty else {
                 return errResult("Image reads return pixels, not byte windows. Omit offset and version.", code: "bad_input")
@@ -252,6 +270,14 @@ extension FileSystemActions {
         }
         let nextOffset = offset + window.data.count
         let hasMore = nextOffset < window.totalBytes
+        let content: String
+        if explicitlyRaw { content = window.data.base64EncodedString() }
+        else {
+            guard let decoded = String(data: window.data, encoding: .utf8) else {
+                return errResult("This text window contains invalid UTF-8. Request files.read with raw:true for exact bytes as base64.", code: "invalid_utf8")
+            }
+            content = decoded
+        }
         var result: [String: JSONValue] = [
             "ok": .bool(true),
             "path": .string(resolved.path),
@@ -263,10 +289,9 @@ extension FileSystemActions {
             "returned_bytes": .int(Int64(window.data.count)),
             "truncated": .bool(hasMore),
             "has_more": .bool(hasMore),
-            "content": .string(decodeUTF8Replacing(window.data)),
+            "content": .string(content),
         ]
         if explicitlyRaw {
-            result["content"] = .string(window.data.base64EncodedString())
             result["encoding"] = .string("base64")
         }
         // A whole-file read carries the hash a guarded replacement checks
@@ -287,9 +312,9 @@ extension FileSystemActions {
         }
         return .object(result)
     }
-    /// Exact bytes only for an explicitly raw read of a binary file.
+    /// An explicit byte request bypasses text/sense interpretation.
     static func rawBytes(_ input: [String: JSONValue], _ path: String) -> Bool {
-        input["raw"] == .bool(true) && FileReadSourceMaterial.isBinary(path: path)
+        input["raw"] == .bool(true)
     }
     /// read_file on a folder with a glob: the first eight matching files by
     /// name in one call, each through the ordinary single-file read (same
@@ -373,10 +398,13 @@ extension FileSystemActions {
         if isSensitiveDataPath(resolved, ctx) {
             return errResult("Path '\(resolved.path)' is under a sensitive data sub-tree.", code: "path_not_allowed")
         }
-        var isDir: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir)
-        if !exists { return errResult("File not found: \(resolved.path)", code: "file_not_found", path: resolved, pathKind: "missing") }
-        if isDir.boolValue { return errResult("Not a file: \(resolved.path)", code: "wrong_path_kind", path: resolved, pathKind: "directory") }
+        do {
+            guard let isDirectory = try readPathIsDirectory(resolved) else {
+                return errResult("File not found: \(resolved.path)", code: "file_not_found", path: resolved, pathKind: "missing")
+            }
+            if isDirectory { return errResult("Not a file: \(resolved.path)", code: "wrong_path_kind", path: resolved, pathKind: "directory") }
+        } catch let failure as FileReadFailure { return errResult(failure.message, code: failure.code) }
+        catch { return errResult(error.localizedDescription, code: "read_failed") }
         let window: (total: Int, lines: [(number: Int, text: String)], bytes: Int, version: String, matches: Int, next: Int?)
         do {
             let handle = try openRegularReadHandle(resolved)
@@ -475,13 +503,11 @@ extension FileSystemActions {
                 handle: handle, path: path, maxBytes: 65_536, useCompactDefault: false,
                 offset: offset, expectedVersion: version
             )
-            let text: String
-            if terms.isEmpty { text = decodeUTF8Replacing(chunk.data) }
-            else {
-                guard !chunk.data.contains(0), let decoded = String(data: chunk.data, encoding: .utf8) else {
-                    throw FileReadFailure(message: "query searches plain text only; omit it to read image or binary material.", code: "binary_file")
-                }
-                text = decoded
+            guard let text = String(data: chunk.data, encoding: .utf8) else {
+                throw FileReadFailure(message: "This excerpt contains invalid UTF-8. Request files.read with raw:true for exact bytes as base64.", code: "invalid_utf8")
+            }
+            if !terms.isEmpty, chunk.data.contains(0) {
+                throw FileReadFailure(message: "query searches plain text only. Request files.read with raw:true for exact bytes as base64.", code: "binary_file")
             }
             version = chunk.version
             for scalar in text.unicodeScalars {

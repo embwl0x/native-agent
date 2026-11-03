@@ -17,6 +17,7 @@ public struct AfterTurnOrigin: Sendable {
     /// What her turn took, one plain line from the stem when it used tools:
     /// part of what happened, read beside the exchange.
     public var took: String?
+    public var careWakes: [CognitiveCareWake]?
 
     public init(sessionId: String, runId: String?, messageId: String,
                 occurredAt: Date?, userMessage: String) {
@@ -30,14 +31,18 @@ public struct AfterTurnOrigin: Sendable {
 
 public enum AfterTurnSource {
     @TaskLocal public static var origin: AfterTurnOrigin?
+    @TaskLocal public static var careWakes: [CognitiveCareWake] = []
 }
 
 public struct AfterTurnContext: Sendable {
+    /// Read from the recorded completion's field node, never inferred from mood.
+    public var beliefReactionTarget: String?
     public let event: CognitiveEvent
     public let caring: CaringAppraisalRequest?
     public let generation: UInt64
     /// The cares the call is shown for this exchange; empty asks nothing about cares.
     public let cares: [CognitiveCareLine]
+    public let careWakes: [CognitiveCareWake]
     /// The forgetting epochs the moment was admitted under (stamped at ingest).
     /// A part whose domain has been forgotten since refuses the moment:
     /// `mindEpoch` for affect, tags and cares, `bodyEpoch` for the body.
@@ -45,11 +50,13 @@ public struct AfterTurnContext: Sendable {
     public let bodyEpoch: UInt64
 
     public init(event: CognitiveEvent, caring: CaringAppraisalRequest?, generation: UInt64,
-                cares: [CognitiveCareLine] = [], mindEpoch: UInt64 = 0, bodyEpoch: UInt64 = 0) {
+                cares: [CognitiveCareLine] = [], mindEpoch: UInt64 = 0, bodyEpoch: UInt64 = 0,
+                careWakes: [CognitiveCareWake] = []) {
         self.event = event
         self.caring = caring
         self.generation = generation
         self.cares = cares
+        self.careWakes = careWakes
         self.mindEpoch = mindEpoch
         self.bodyEpoch = bodyEpoch
     }
@@ -174,11 +181,16 @@ extension CognitiveSubstrate {
         guard !session.isEmpty, !turn.isEmpty else { return nil }
         // A helper's standing brief and her own work are not encounters.
         // Read their recorded owners/kinds; peer conversations remain eligible.
-        guard !SessionConversation.isHelper(session, dataRoot: conversationDataRoot, includingArchived: true),
-              SessionConversation.kind(session, dataRoot: conversationDataRoot, includingArchived: true)?.isOwnWork != true else { return nil }
+        do {
+            guard try !SessionConversation.checkedIsHelper(session, dataRoot: conversationDataRoot, includingArchived: true),
+                  try SessionConversation.checkedKind(session, dataRoot: conversationDataRoot, includingArchived: true)?.isOwnWork != true else { return nil }
+        } catch {
+            nativeLog("Caring event ownership unavailable; appraisal withheld: %@", error.localizedDescription)
+            return nil
+        }
         let text = event.summary.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
-        let name = dependencies.userName().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let name = checkedUserName() else { return nil }
         return CaringAppraisalRequest(
             userMessage: text,
             // Encounter windows use the originating turn's clock, never verdict arrival time.
@@ -244,7 +256,16 @@ extension CognitiveSubstrate {
 
     /// New judgments read current cares and relay evidence; a recorded meaning
     /// reads its saved caring request and needs no care-selection work.
-    public func afterTurnContext(record: CognitiveDeferredTurnRecord, exchange: String? = nil) async -> AfterTurnContext {
+    public func afterTurnContext(record: CognitiveDeferredTurnRecord, exchange: String? = nil,
+                                 careWakes: [CognitiveCareWake] = []) async throws -> AfterTurnContext {
+        if !careWakes.isEmpty {
+            let ids = Set(careWakes.compactMap { CognitiveCare.survivorID(for: $0.careID, among: cares) })
+            let shown = ids.sorted { $0.uuidString < $1.uuidString }.compactMap { cares[$0] }
+                .enumerated().map { CognitiveCareLine(key: "c\($0.offset + 1)", id: $0.element.id,
+                                                     text: Self.careLineText($0.element)) }
+            return AfterTurnContext(event: record.event, caring: nil, generation: caringAppraisalGeneration,
+                cares: shown, mindEpoch: record.mindEpoch, bodyEpoch: record.bodyEpoch, careWakes: careWakes)
+        }
         var caring = record.caring
         if exchange != nil, let request = caring, request.relayed {
             caring = CaringAppraisalRequest(userMessage: request.userMessage, at: request.at,
@@ -252,10 +273,12 @@ extension CognitiveSubstrate {
                 recentEncounters: recentCaringEncounters.filter { $0.at <= request.at },
                 personName: request.personName, session: request.session, turn: request.turn)
         }
-        let cares = if let exchange, record.mindEpoch == mindEpoch { await caresShown(for: exchange) }
+        let cares = if let exchange, record.mindEpoch == mindEpoch { try await caresShown(for: exchange) }
             else { [CognitiveCareLine]() }
-        return AfterTurnContext(event: record.event, caring: caring, generation: caringAppraisalGeneration,
+        var context = AfterTurnContext(event: record.event, caring: caring, generation: caringAppraisalGeneration,
                                 cares: cares, mindEpoch: record.mindEpoch, bodyEpoch: record.bodyEpoch)
+        context.beliefReactionTarget = record.completionNodeKey.flatMap { field.node(forKey: $0)?.summary }
+        return context
     }
 
     /// What the mind's share of one lived moment did, and what it hands the
@@ -284,9 +307,11 @@ extension CognitiveSubstrate {
     /// they are durable.
     ///
     /// It reads the RECORDED deferred-turn entry (`record`), never RAM state
-    /// that a relaunch would have lost.
+    /// that a relaunch would have lost. `incoming` is the same moment's full
+    /// recorded `turn.asked`, supplied by the journal owner for evidence checks.
     public func foldTurn(
         _ context: AfterTurnContext, record: CognitiveDeferredTurnRecord,
+        incoming: String?,
         appraisal: AffectAppraisal?, caring verdict: CaringAppraisalVerdict?,
         cares judgments: [CognitiveCareJudgment], appAuthored: Bool,
         seq: UInt64, momentID: String
@@ -295,7 +320,15 @@ extension CognitiveSubstrate {
         var fold = MindFold(saved: true, reaction: [:], caring: nil,
                             caringWindow: OrganismCaringEvent.encounterWindow, caringWhy: "",
                             event: event)
-        let touchedCares = await appraisalCares(in: event.summary)
+        if !context.careWakes.isEmpty {
+            do {
+                try await foldCareWake(context, judgments: judgments, seq: seq, momentID: momentID)
+            } catch { fold.saved = false }
+            return fold
+        }
+        let touchedCares: [CognitiveCare]
+        do { touchedCares = try await appraisalCares(in: event.summary) }
+        catch { oweCareEmbedding(error); fold.saved = false; return fold }
         await waitForMaintenanceTransition()
         let entry = record
         guard configuration.enabled, context.mindEpoch == mindEpoch else { return fold }
@@ -336,7 +369,9 @@ extension CognitiveSubstrate {
                 touchedMind = true
             }
             fold.reaction = Self.foldReaction(event: event, completion: entry.completion,
-                outcome: entry.outcome, now: event.occurredAt, valence: weighted.valence)
+                outcome: entry.outcome, now: event.occurredAt, appraisal: weighted,
+                target: entry.completionNodeKey.flatMap { field.node(forKey: $0)?.summary },
+                incoming: incoming)
             if let completion = entry.completion, !has(completion.nodeKey) {
                 if !fold.reaction.isEmpty {
                     reconsolidateCompletion(completion, outcome: entry.outcome,
@@ -382,16 +417,22 @@ extension CognitiveSubstrate {
 
     /// One accepted user turn answers a same-session completion inside its
     /// window. The caller supplies admission time or the recorded event time.
+    /// Journal folds validate against the recorded incoming words the model
+    /// judged, not the event's clipped summary. Missing words give no verdict.
     static func foldReaction(event: CognitiveEvent, completion: PendingCompletion?,
                              outcome: ContinuityField.IngestOutcome?, now: Date,
-                             valence: Double) -> [String: JSONValue] {
+                             appraisal: AffectAppraisal, target: String?,
+                             incoming: String?) -> [String: JSONValue] {
         guard isUserAuthored(event.kind), outcome != nil,
               let completion, let session = event.sessionId,
               completion.sessionId == session else { return [:] }
         let age = now.timeIntervalSince(completion.recordedAt)
         guard age >= 0, age <= pendingCompletionMaxAge else { return [:] }
+        guard let incoming,
+              let label = semanticReactionLabel(appraisal: appraisal, target: target,
+                                               incoming: incoming) else { return [:] }
         return [OrganismSemanticExpectation.reactionMetadataKey: .object([
-            OrganismSemanticExpectation.reactionField: .string(semanticReactionLabel(fromValence: valence)),
+            OrganismSemanticExpectation.reactionField: .string(label),
             OrganismSemanticExpectation.sessionField: .string(session),
             OrganismSemanticExpectation.turnField: .string(completion.nodeKey),
         ])]

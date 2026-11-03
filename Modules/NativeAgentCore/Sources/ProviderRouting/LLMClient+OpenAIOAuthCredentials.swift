@@ -2,7 +2,7 @@ import Foundation
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `LLMClient+OpenAIOAuthCredentials.swift` | `ChatGPTTransport.preferredAuthPath`: the single ChatGPT/Codex credential-path resolver for readiness, all adapters, maintenance, child execution and explicit CLI inspection; app-owned writes and root-consented CLI adoption share this owner; child homes derive from an already-selected credential; hasAccessToken checks presence only, not execution readiness |
+// Blueprint: | `LLMClient+OpenAIOAuthCredentials.swift` | `ChatGPTTransport.preferredAuthPath`: the single ChatGPT/Codex credential-path resolver for readiness, all adapters, maintenance, child execution and explicit CLI inspection; selection preserves present unreadable credentials for the checked reader; app-owned writes and root-consented CLI adoption share this owner; child homes derive from an already-selected credential; hasAccessToken is a checked token-presence read, not execution readiness |
 
 extension ChatGPTTransport {
     /// Inspection of the independently signed-in Codex program is distinct
@@ -22,8 +22,6 @@ extension ChatGPTTransport {
     public static func preferredAuthPath(
         dataRoot: URL? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        currentDirectoryPath: String = FileManager.default.currentDirectoryPath,
-        appSupportRoot: URL = libraryAppSupportFallback(),
         userCodexHome: URL = defaultUserCodexHome(),
         allowSharedFallbacks: Bool = true,
         defaultRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -48,33 +46,15 @@ extension ChatGPTTransport {
         func boundRootPath(_ root: URL) -> URL {
             let owned = ownedPath(root)
             if !credentialFileExists(at: owned), cliAdoptionConsent(dataRoot: root) == .allowed,
-               hasAccessToken(at: shared) { return shared }
+               credentialFileExists(at: shared) { return shared }
             return owned
         }
         if !allowSharedFallbacks {
             return ownedPath(dataRoot ?? defaultRoot)
         }
-        if let dataRoot,
-           dataRoot.standardizedFileURL != defaultRoot.standardizedFileURL {
-            return boundRootPath(dataRoot)
-        }
-        if let commandCLI { return commandCLI }
-        if !(environment["NATIVE_AGENT_DATA_ROOT"] ?? "").isEmpty {
-            return boundRootPath(PersistenceCore.defaultDataRoot(environment: environment))
-        }
-        let repoRoot = URL(fileURLWithPath: currentDirectoryPath).appendingPathComponent("data", isDirectory: true)
-        var candidates = [ownedPath(repoRoot), ownedPath(appSupportRoot)]
-        if let dataRoot { candidates.append(ownedPath(dataRoot)) }
-        candidates.append(ownedPath(defaultRoot))
-        // All app-owned sign-ins outrank an adopted CLI session. Process
-        // overrides above are exact, and alternate roots never scan this list.
-        if cliAdoptionConsent(dataRoot: dataRoot) == .allowed { candidates.append(shared) }
-        // Existing credentials own this route even when unreadable or malformed.
-        // Let the adapter report that damage; never select another account.
-        for candidate in candidates where Self.credentialFileExists(at: candidate) {
-            return candidate
-        }
-        return ownedPath(appSupportRoot)
+        let root = dataRoot ?? (!(environment["NATIVE_AGENT_DATA_ROOT"] ?? "").isEmpty
+            ? PersistenceCore.defaultDataRoot(environment: environment) : defaultRoot)
+        return boundRootPath(root)
     }
 
     private static func credentialFileExists(at url: URL) -> Bool {
@@ -85,17 +65,11 @@ extension ChatGPTTransport {
         return errno != ENOENT
     }
 
-    /// True iff the file at `url` parses and has a non-empty
-    /// tokens.access_token. This is a presence projection, not path selection.
-    public static func hasAccessToken(at url: URL) -> Bool {
-        guard let data = try? Data(contentsOf: url),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tokens = obj["tokens"] as? [String: Any],
-              let access = tokens["access_token"] as? String,
-              !access.isEmpty else {
-            return false
-        }
-        return true
+    /// Checked token presence, not path selection or execution readiness.
+    /// An absent access token (including CLI API-key mode) is false;
+    /// malformed/unreadable saved bytes throw.
+    public static func hasAccessToken(at url: URL) throws -> Bool {
+        try storedAccessToken(at: url) != nil
     }
 
     public static func defaultUserCodexHome() -> URL {
@@ -234,23 +208,37 @@ extension ChatGPTTransport {
         return backup
     }
 
-    /// Load the auth blob from disk. Returns `nil` when the file is missing
-    /// or unparseable — mirroring Python's `_load_codex_auth` which returns
-    /// `{}` in both cases. We use `nil` here so the "needs OAuth" path is a
-    /// clean `.notConfigured` throw at the caller.
-    func loadAuthBlob() -> [String: Any]? {
-        Self.loadAuthBlob(at: resolveAuthPath())
+    /// Load only this selected credential. Confirmed absence is nil;
+    /// present unreadable or invalid bytes retain the owning read failure.
+    func loadAuthBlob() throws -> [String: Any]? {
+        try Self.loadAuthBlob(at: resolveAuthPath())
     }
 
     /// Read only the already-resolved path so a concurrent sign-out cannot switch credential sources.
-    static func loadAuthBlob(at path: URL) -> [String: Any]? {
-        guard let data = try? Data(contentsOf: path) else { return nil }
-        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    static func loadAuthBlob(at path: URL) throws -> [String: Any]? {
+        do {
+            guard let data = try ProviderStateValidation.dataIfPresent(at: path) else { return nil }
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            try ProviderStateValidation.credential(object)
+            // Codex also writes API-key sessions with no ChatGPT token set.
+            // Valid metadata without access_token is absence, not corruption.
+            if let tokens = object["tokens"] as? [String: Any],
+               let access = tokens["access_token"] as? String,
+               access.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            return object
+        } catch {
+            throw ProviderFailure.Diagnostic(cause: .routingUnavailable,
+                detail: "ChatGPT credential \(path.path) could not be read: \(error.localizedDescription). Repair the saved credential before reconnecting.")
+        }
     }
 
-    /// The stored access token at ONE already-resolved path, or nil.
-    static func storedAccessToken(at path: URL) -> String? {
-        guard let blob = loadAuthBlob(at: path),
+    /// A valid file without an access token has no ChatGPT session to adopt.
+    static func storedAccessToken(at path: URL) throws -> String? {
+        guard let blob = try loadAuthBlob(at: path),
               let tokens = blob["tokens"] as? [String: Any],
               let access = tokens["access_token"] as? String,
               !access.isEmpty else { return nil }
@@ -265,7 +253,7 @@ extension ChatGPTTransport {
         }
         let parent = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path.resolvingSymlinksInPath())
     }
 
     // MARK: - Codex child home
@@ -389,7 +377,7 @@ extension ChatGPTTransport {
     /// The account header must belong to the token this request will send.
     func currentAccountID(accessToken: String) throws -> String? {
         if let account = Self.extractAccountIDFromJWT(accessToken) { return account }
-        guard let blob = loadAuthBlob() else { return nil }
+        guard let blob = try loadAuthBlob() else { return nil }
         let tokens = (blob["tokens"] as? [String: Any]) ?? [:]
         guard tokens["access_token"] as? String == accessToken else {
             throw OAuthRequestAccount.changed("openai_oauth_direct")

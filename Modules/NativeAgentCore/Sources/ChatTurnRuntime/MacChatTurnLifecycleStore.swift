@@ -87,7 +87,7 @@ public actor MacChatTurnLifecycleStore {
     private let maximumRecords: Int
     private var loadedState: Envelope?
     private var mutationInProgress = false
-    private var mutationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var mutationWaiters: [ScopedWaiter] = []
 
     public init(fileURL: URL = MacChatTurnLifecycleStore.liveFileURL, maximumRecords: Int = 64) {
         self.fileURL = fileURL
@@ -239,9 +239,9 @@ public actor MacChatTurnLifecycleStore {
             mutationInProgress = true
             return
         }
-        await withCheckedContinuation { continuation in
-            mutationWaiters.append(continuation)
-        }
+        let done = ScopedWaiter()
+        mutationWaiters.append(done)
+        await Task { await done.park() }.value
     }
 
     private func releaseMutation() {

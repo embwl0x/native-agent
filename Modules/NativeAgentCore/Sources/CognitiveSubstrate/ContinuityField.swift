@@ -559,7 +559,7 @@ struct ContinuityField: Sendable {
         if source.subjectReference.type == target.subjectReference.type {
             weight += 0.12
         }
-        let sharedMetadataKeys = ["sessionId", "runId", "missionId", "toolName", "surface"]
+        let sharedMetadataKeys = ["sessionId", "runId", "executionId", "toolName", "surface"]
         for key in sharedMetadataKeys {
             if let lhs = event.metadata[key], let rhs = target.metadata[key], lhs == rhs {
                 weight += 0.22
@@ -578,7 +578,7 @@ struct ContinuityField: Sendable {
         if from.subjectReference.type == to.subjectReference.type {
             reasons.append("subject-type")
         }
-        for key in ["sessionId", "runId", "missionId", "toolName", "surface"] {
+        for key in ["sessionId", "runId", "executionId", "toolName", "surface"] {
             if from.metadata[key] == to.metadata[key], from.metadata[key] != nil {
                 reasons.append(key)
             }

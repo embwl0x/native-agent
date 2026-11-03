@@ -6,8 +6,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
     /// Store one REM GROWTH eviction in the authoritative SQLite graph.
     ///
     /// This is deliberately an operation on the existing KnowledgeGraph owner,
-    /// not a Dream/REM-side graph store. The one-time legacy JSON import is
-    /// completed before the write, and a stable caller-supplied id makes a
+    /// not a Dream/REM-side graph store. A stable caller-supplied id makes a
     /// retry after a partial GROWTH-file commit an idempotent upsert.
     /// Does a distilled GROWTH-eviction node with this id stand in the graph?
     /// The eviction history uses it as the corroborating witness for an
@@ -32,8 +31,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         id: String,
         summary: String,
         sourceLines: Int,
-        createdAt: String,
-        legacyJSONPath: URL?
+        createdAt: String
     ) async throws {
         let boundedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         // The distillation bounds its summary and keeps its locator whole after it.
@@ -49,8 +47,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
 
         let dbPool = try await KnowledgeGraphStore.withPreparedPool(
-            memoryDir: sqlitePath.deletingLastPathComponent(),
-            jsonImportPath: legacyJSONPath
+            memoryDir: sqlitePath.deletingLastPathComponent()
         ) { $0 }
         let name = String(boundedSummary.prefix(80))
         let lineCount = max(0, sourceLines)

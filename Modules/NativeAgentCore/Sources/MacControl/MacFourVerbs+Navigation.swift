@@ -83,33 +83,9 @@ extension MacFourVerbs {
                         : "\(trimmed) is already running; its windows were left as they were."
                     settlesAsynchronously = true
                 } else {
-                    // Search folders only when no such app exists. An app that
-                    // was found but slow to come forward is not a folder, and the
-                    // search can raise a Desktop prompt that holds the whole turn.
-                    var appMissing = false
-                    if case .object(let out) = appResult.output, out["status"] == .string("failed"),
-                       appResult.error?.contains("app_not_found:") == true { appMissing = true }
-                    switch !appMissing ? NamedFolderResolution.none : Self.namedFolder(trimmed, under: namedLocationRoots) {
-                    case .unique(let folder):
-                        result = try await host.dispatch(action: "open_target", body: opening(folder))
-                        moved = "The Mac accepted the request to open \(folder.path)."
-                        verificationDestination = folder.path
-                        settlesAsynchronously = true
-                    case .ambiguous(let parents):
-                        let places = parents.joined(separator: " and ")
-                        return await landingFailure(
-                            "More than one common folder is named \"\(trimmed)\" (in \(places)). Which one? I haven't opened any of them.",
-                            detail: ["error": .string("named_location_ambiguous")]
-                        )
-                    case .none:
-                        // Say why the switch failed (e.g. the person took the Mac back), not just "unconfirmed".
-                        if let why = appResult.error, !why.isEmpty, !why.contains("app_not_found") {
-                            return MacFourVerbsReply(ok: false, text: "I couldn't switch to \(trimmed): \(why)",
-                                                     detail: Self.operationDetail(appResult))
-                        }
-                        result = appResult
-                        moved = "Switched to \(trimmed)."
-                    }
+                    return MacFourVerbsReply(ok: false,
+                        text: "I couldn't open \(trimmed): \(appResult.error ?? "the app could not be resolved"). Use an exact installed app name, bundle identifier or .app path; address a folder by its path.",
+                        detail: Self.operationDetail(appResult))
                 }
             } catch {
                 return Self.unknownActionReply(error, operation: "opening \(trimmed)", app: trimmed)
@@ -149,12 +125,12 @@ extension MacFourVerbs {
                 : "I couldn't complete the request to go to \(trimmed).",
                 detail: opened ? openedDetail(Self.operationDetail(result)) : Self.operationDetail(result))
         }
-        let windowless: JSONValue = .string(landingApp == nil ? "no_frontmost_window" : "no_window_in_app")
         var landing = await sight(part: nil, app: landingApp)
         let needsSettlement: Bool
         switch landing {
         case .seen(let first): needsSettlement = Self.destination(verificationDestination, matches: first) != true
-        case .blind(let reply): needsSettlement = landingApp != nil || reply.detail["error"] == windowless
+        case .blind(let reply): needsSettlement = landingApp != nil || Self.windowlessApp(reply.detail)
+            || reply.detail["error"] == .string("no_frontmost_window")
         }
         if settlesAsynchronously, needsSettlement {
             await clock.sleep(seconds: 0.5)
@@ -217,7 +193,7 @@ extension MacFourVerbs {
     //
     // Three shapes, tested in order, with no app-name branch anywhere: a URL
     // with a web scheme, a path or common home folder, then an app NAME
-    // (running first, then installed). Other folder names use the bounded search.
+    // (running first, then installed). Other folders require their path.
 
     static func webURL(_ text: String) -> URL? {
         guard let url = URL(string: text), let scheme = url.scheme?.lowercased() else { return nil }
@@ -241,50 +217,6 @@ extension MacFourVerbs {
         let path = NativeAgentWorkspaceRoot.fileSpelling(text)
         guard path.hasPrefix("/") else { return nil }
         return URL(fileURLWithPath: path)
-    }
-
-    private enum NamedFolderResolution {
-        case none
-        case unique(URL)
-        case ambiguous([String])
-    }
-
-    /// A bare destination name gets one small, predictable filesystem fallback
-    /// after app activation says it is not an app. Search only direct children
-    /// of the familiar home folders; never recurse, fuzzy-match, or pick the
-    /// first duplicate. The roots are injected so tests do not inspect the
-    /// developer's home directory.
-    private static func namedFolder(_ name: String, under roots: [URL]) -> NamedFolderResolution {
-        let manager = FileManager.default
-        var matches: [URL] = []
-        var seenPaths: Set<String> = []
-
-        for root in roots {
-            var isDirectory: ObjCBool = false
-            guard manager.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-                continue
-            }
-            guard let children = try? manager.contentsOfDirectory(
-                at: root,
-                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-                options: [.skipsHiddenFiles]
-            ) else {
-                continue
-            }
-            for child in children where child.lastPathComponent.localizedCaseInsensitiveCompare(name) == .orderedSame {
-                guard let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
-                      values.isDirectory == true,
-                      values.isSymbolicLink != true else {
-                    continue
-                }
-                let path = child.standardizedFileURL.path
-                if seenPaths.insert(path).inserted { matches.append(child.standardizedFileURL) }
-            }
-        }
-
-        if matches.isEmpty { return .none }
-        if matches.count == 1 { return .unique(matches[0]) }
-        return .ambiguous(matches.map { $0.deletingLastPathComponent().lastPathComponent })
     }
 
     static func commonHomeLocationRoots() -> [URL] {
@@ -312,23 +244,4 @@ extension MacFourVerbs {
         return app == wanted
     }
 
-    private func landingFailure(
-        _ line: String,
-        detail: [String: JSONValue] = [:]
-    ) async -> MacFourVerbsReply {
-        switch await sight(part: nil) {
-        case .blind:
-            return MacFourVerbsReply(
-                ok: false,
-                text: line,
-                detail: detail.merging(["error": .string("go_failed")]) { current, _ in current }
-            )
-        case .seen(let hit):
-            return MacFourVerbsReply(
-                ok: false,
-                text: line + " Still looking at " + hit.place + ".\n" + hit.render,
-                detail: detail.merging(["error": .string("go_failed")]) { current, _ in current }
-            )
-        }
-    }
 }

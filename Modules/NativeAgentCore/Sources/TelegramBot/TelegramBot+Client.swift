@@ -106,46 +106,50 @@ public actor SwiftNativeTelegramBot {
     }
 
     public func getStatus() async throws -> TelegramStatus {
-        let read = await Self.readTransportStatus(dataRoot: dataRoot, manager: backgroundLoopsManager, includeDisconnected: false)
+        let read = await Self.readTransportStatus(dataRoot: dataRoot, manager: backgroundLoopsManager)
         if let error = read.stateError { throw error }
         var status = read.status
-        if case .failure = read.configuration {
-            status.lastError = "Saved Telegram settings are invalid or unreadable. Repair or remove telegram/config.json before setting up Telegram again."
-        } else if try read.configuration.get() == nil, status.lastError == "No bot token saved — paste one to enable." {
+        let configuration = try read.configuration.get()
+        if configuration == nil, status.lastError == "No bot token saved — paste one to enable." {
             status.lastError = "No bot token saved - paste one to enable."
         }
         let telegramDir = dataRoot.appendingPathComponent("telegram", isDirectory: true)
-        async let receipts = (try? SwiftNativePersistenceCore.tailJSONL(
+        async let receipts = SwiftNativePersistenceCore.tailJSONL(
             telegramDir.appendingPathComponent("receipts.jsonl"),
             limit: 25,
             maxBytes: 1_048_576
-        )) ?? []
-        async let blocked = (try? SwiftNativePersistenceCore.tailJSONL(
+        )
+        async let blocked = SwiftNativePersistenceCore.tailJSONL(
             telegramDir.appendingPathComponent("blocked.jsonl"),
             limit: 25,
             maxBytes: 1_048_576
-        )) ?? []
-        async let errors = (try? SwiftNativePersistenceCore.tailJSONL(
+        )
+        async let errors = SwiftNativePersistenceCore.tailJSONL(
             telegramDir.appendingPathComponent("errors.jsonl"),
             limit: 25,
             maxBytes: 1_048_576
-        )) ?? []
+        )
         var extras = status.extras?.objectValue ?? [:]
-        extras["receipts"] = .array(await receipts)
-        extras["blocked"] = .array(await blocked)
-        extras["errors"] = .array(await errors)
+        extras["receipts"] = .array(try await receipts)
+        extras["blocked"] = .array(try await blocked)
+        extras["errors"] = .array(try await errors)
         status.extras = .object(extras)
         return status
     }
 
     /// One checked transport read; callers decide how to present unavailable settings or state.
     public nonisolated static func readTransportStatus(
-        dataRoot: URL, manager: BackgroundLoopLifetimes, resolveCredential: Bool = true, includeDisconnected: Bool = true
+        dataRoot: URL, manager: BackgroundLoopLifetimes
     ) async -> (status: TelegramStatus, configuration: Result<TelegramConfig?, Error>, stateError: Error?,
-                pollBackoffFailures: Int?, lastDiagnosticsClearedAt: String?, voiceTranscription: TelegramVoiceTranscriptionStatus) {
-        let configuration = Result { try TelegramConfig.loadSavedConfiguration(
-            dataRoot: dataRoot, includeDisconnected: includeDisconnected, resolveCredential: resolveCredential) }
-        let cfg = try? configuration.get()
+                credentialError: Error?, pollBackoffFailures: Int?, lastDiagnosticsClearedAt: String?, voiceTranscription: TelegramVoiceTranscriptionStatus) {
+        let checked = TelegramConfig.readConfigurationStatus(dataRoot: dataRoot)
+        let configuration = checked.configuration
+        let cfg: TelegramConfig?
+        let configurationError: Error?
+        switch configuration {
+        case .success(let value): cfg = value; configurationError = nil
+        case .failure(let error): cfg = nil; configurationError = error
+        }
         var stateObj: [String: JSONValue] = [:]
         var stateError: Error?
         do { stateObj = try await TelegramPollLoop.readState(dataRoot: dataRoot) }
@@ -168,8 +172,6 @@ public actor SwiftNativeTelegramBot {
             "allowedChatIds": .array((cfg?.allowedChatIds.sorted() ?? []).map { .string(String($0)) }),
             "allowedUserIds": .array((cfg?.allowedUserIds.sorted() ?? []).map { .string(String($0)) }),
             "requireMention": .bool(cfg?.requireMention ?? false),
-            "model": cfg?.model.map { .string($0) } ?? .null,
-            "reasoningEffort": cfg?.reasoningEffort.map { .string($0) } ?? .null,
             "lastPollAt": stateObj["lastPollAt"] ?? .null,
             "commandMenu": commandMenu,
             "voiceTranscription": .object([
@@ -189,19 +191,19 @@ public actor SwiftNativeTelegramBot {
             enabled: cfg?.enabled ?? false,
             tokenConfigured: cfg?.tokenConfigured ?? false,
             pollerEnabled: pollerRunning,
-            lastSeenUpdateId: integer(stateObj["lastSeenUpdateId"]) ?? integer(stateObj["lastUpdateId"]),
+            lastSeenUpdateId: integer(stateObj["lastSeenUpdateId"]),
             lastSeenAt: stateObj["lastSeenAt"]?.stringValue,
             lastReplyAt: stateObj["lastReplyAt"]?.stringValue,
-            lastError: stateError?.localizedDescription ?? stateObj["lastError"]?.stringValue
+            lastError: configurationError?.localizedDescription ?? checked.credentialError?.localizedDescription ?? stateError?.localizedDescription ?? stateObj["lastError"]?.stringValue
                 ?? (cfg == nil ? "No bot token saved — paste one to enable." : nil),
             extras: .object(extras)
         )
-        return (status, configuration, stateError, integer(stateObj["pollBackoffFailures"]),
+        return (status, configuration, stateError, checked.credentialError, integer(stateObj["pollBackoffFailures"]),
                 stateObj["lastDiagnosticsClearedAt"]?.stringValue, voice)
     }
 
     public func sendTestMessage(message: String?, chatId: String?) async throws -> TelegramTestResult {
-        guard let cfg = TelegramConfig.loadFromDisk(dataRoot: dataRoot),
+        guard let cfg = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot),
               !cfg.botToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw TelegramBotError.notConfigured
         }

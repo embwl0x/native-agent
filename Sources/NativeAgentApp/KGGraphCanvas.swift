@@ -16,8 +16,8 @@ import MemoryV2
 // Selection is via DragGesture(minimumDistance:0) hit-test (Canvas has no
 // per-node tap hook) — `onEnded` checks the nearest node within hit radius.
 //
-// At >200 canonical nodes the parent view falls back to the list, and this
-// canvas independently refuses layout because the relaxation loop is
+// At >200 canonical nodes this canvas refuses layout with filters still
+// available in the parent, because the relaxation loop is
 // quadratic and the visual result gets meaningless.
 
 struct KGGraphCanvas: View {

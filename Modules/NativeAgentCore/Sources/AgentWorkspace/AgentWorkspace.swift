@@ -1,8 +1,9 @@
 import Foundation
 import ChatSessionWork
+import ChatToolParsing
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `AgentWorkspace.swift` | `AgentWorkspace` enum; `dispatch` validates workspace input and routes reads and effects through their owners |
+// Blueprint: | `AgentWorkspace.swift` | `AgentWorkspace` enum; `dispatch` validates workspace input and routes reads and effects through their owners; forms and records admit covered partial pages through shared read evidence |
 
 /// A workspace refusal: each is raised before anything runs.
 package struct AgentWorkspaceFailure: Error, LocalizedError {
@@ -122,8 +123,10 @@ package enum AgentWorkspace {
             if let dot = named.lastIndex(of: "."), Int(named[named.index(after: dot)...]) == nil,
                case .action(.window(.open(let place)))? = await resolve(String(named[..<dot])), case .area = place,
                HerNamed.shared.firstDraw(dataRoot, String(named[..<dot]), scope: scope) {
-                if await HerScreen.room(place, dataRoot: dataRoot, scope: scope) == nil,
-                   let projection = try? await AgentWorkspaceEnvironment.view(location: place, dataRoot: dataRoot, catalog: catalog, perform: perform) {
+                if await HerScreen.room(place, dataRoot: dataRoot, scope: scope) == nil {
+                    guard let projection = try await AgentWorkspaceEnvironment.view(location: place, dataRoot: dataRoot, catalog: catalog, perform: perform) else {
+                        throw AgentWorkspaceFailure(message: "That room has no current workspace view. Open home for the places available now; nothing was repeated.")
+                    }
                     let status = AgentWorkspaceEnvironment.outcome(projection.content)
                     if await HerScreen.lifeRoom(place, projection: projection, status: status, dataRoot: dataRoot, scope: scope) == nil,
                        let room = HerScreen.textRoomName(place) {
@@ -135,8 +138,8 @@ package enum AgentWorkspace {
             // Family DO names run argument-free reads; other calls require direct tool invocation.
             let call = raw.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: " {}", with: "")
             if HerScreen.families.contains(where: { $0.tools.contains { $0 == call || (($0.hasSuffix("_") || $0.hasSuffix(".")) && call.hasPrefix($0)) } }),
-               let schema = try? await AgentWorkspaceEnvironment.schema(call, catalog: catalog) {
-                guard AgentWorkspaceEnvironment.readTools.contains(call), ToolSignature.argumentNames(schema.parametersJSON).required.isEmpty else {
+               let schema = try await AgentWorkspaceEnvironment.optionalSchema(call, catalog: catalog) {
+                guard AgentWorkspaceEnvironment.readTools.contains(call), try ToolSignature.argumentNames(schema.parametersJSON).required.isEmpty else {
                     throw AgentWorkspaceFailure(message: "\(call) is a tool, not a workspace name: call \(call) directly with its arguments. Nothing was run.")
                 }
                 return .action(.open(.record(tool: call, input: [:], title: call)))
@@ -323,7 +326,14 @@ package enum AgentWorkspace {
                 if AgentWorkspaceEnvironment.readTools.contains(form.tool) {
                     do {
                         let read = try await perform(form.tool, args)
-                        if completedReadOutcome(read) {
+                        var readable = completedReadOutcome(read)
+                        if !readable, ChatToolOutcome.hasReadEvidence(read) {
+                            let readLocation = AgentWorkspaceLocation.record(tool: form.tool, input: args, title: form.title)
+                            let page = await WorkspacePage.project(location: readLocation, result: read, dataRoot: dataRoot,
+                                evidence: AgentWorkspaceDocument.evidence(location: readLocation, value: read))
+                            readable = readablePageOutcome(read, projection: page)
+                        }
+                        if readable {
                             await navigation.finishDraft(draft, key: key)
                             location = .record(tool: form.tool, input: args, title: form.title); result = read
                         } else {
@@ -506,7 +516,7 @@ package enum AgentWorkspace {
         if case .find(let query) = location {
             var projection = try await AgentWorkspaceFind.project(query: query, dataRoot: dataRoot, perform: perform)
             let exactName = query.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: "_")
-            if let schema = try? await AgentWorkspaceEnvironment.schema(exactName, catalog: catalog) {
+            if let schema = try await AgentWorkspaceEnvironment.optionalSchema(exactName, catalog: catalog) {
                 // Exact advertised action names open ordinary forms without inferring intent or executing actions.
                 projection.actions.insert(AgentWorkspaceApps.quickAction(tool: schema.name)
                     ?? .init(label: "Open " + AgentWorkspaceEnvironment.title(schema.name),
@@ -515,6 +525,7 @@ package enum AgentWorkspace {
             return await navigation.present(projection, key: key, outcome: AgentWorkspaceEnvironment.outcome(projection.content))
         }
         if case .arrivals = source {
+            await navigation.refreshArrivals(key: key, scope: scope, dataRoot: dataRoot, retryUnavailable: true)
             let projection = await navigation.arrivalProjection(key: key)
             return await shown(projection, at: location, key: key, outcome: .string("ok"))
         }
@@ -620,9 +631,10 @@ package enum AgentWorkspace {
         if case .record("chat_conversations", let args, let title) = location, args["conversation_session_id"] != nil,
            title != "Conversation with you" { recoveredProjection.title = title }
         await navigation.keepOpenedWorkSource(location, value: value, key: key)
-        // Rooms show the owner read's failure in their text.
+        // A partial page with usable rows keeps its siblings and navigation.
+        // Complete-read evidence is still required when no usable rows returned.
         let issue: String? = {
-            guard !completedReadOutcome(value) else { return nil }
+            if readablePageOutcome(value, projection: recoveredProjection) { return nil }
             return HerScreen.failureFace(value)
         }()
         if let room = await HerScreen.room(location, dataRoot: dataRoot, scope: scope, issue: issue, value: value, projection: recoveredProjection,
@@ -637,7 +649,7 @@ package enum AgentWorkspace {
         // Include chats in both directions only outside person rooms, which never display them or need transcript scans.
         if case .record("agent_read", let args, _) = location, case .string(let agent)? = args["agent"],
            ["details", "history_before", "history_exchange"].allSatisfy({ args[$0] == nil }) {
-            let sessions = AgentWorkSession.sessions(with: agent, dataRoot: dataRoot)
+            let sessions = try AgentWorkSession.sessions(with: agent, dataRoot: dataRoot)
             recoveredProjection.items += sessions.prefix(4).map(\.item)
             if sessions.count > 4, case .object(var content) = recoveredProjection.content {
                 content["work_sessions"] = .string("4 newest of \(sessions.count) shown; all of them are in Your conversations (open \"conversations\")")
@@ -653,6 +665,11 @@ package enum AgentWorkspace {
     /// Accept complete unwrapped reads without a write receipt; preserve explicit failures and incomplete evidence.
     private static func completedReadOutcome(_ value: JSONValue) -> Bool {
         ChatToolOutcome.hasReadEvidence(value, completeOnly: true)
+    }
+
+    /// Incomplete pages may expose their readable siblings without claiming a complete read.
+    private static func readablePageOutcome(_ value: JSONValue, projection: WorkspacePage) -> Bool {
+        completedReadOutcome(value) || (ChatToolOutcome.hasReadEvidence(value) && !projection.items.isEmpty)
     }
 
     private static func completedFormOutcome(_ value: JSONValue) -> Bool {

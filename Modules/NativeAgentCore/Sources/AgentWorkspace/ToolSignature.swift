@@ -1,23 +1,45 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ToolSignature.swift` | `ToolSignature` enum; `call`, `doorArgs` |
+// Blueprint: | `ToolSignature.swift` | Checked argument rendering for native object schemas, including required unconstrained names without properties; `call`, `doorArgs` and explicit open-object door shapes |
 
 /// A tool's arguments as one line a caller can copy from:
 /// `act(target*, verb*=click|open, app, front:bool, steps:[str|{verb*,target*,text}])`.
 /// Required first (`*`), then by name; auto-filled session fields are left out.
 public enum ToolSignature {
-    private static func properties(_ data: Data) -> (props: [String: [String: Any]], required: Set<String>)? {
-        guard let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let props = raw["properties"] as? [String: Any] else { return nil }
+    private static func properties(_ data: Data) throws -> (props: [String: [String: Any]], required: Set<String>) {
+        guard let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ToolFailureError("The tool's parameter schema is not an object. Repair its schema before reading its arguments or running it.", effects: .none, code: "tool_schema_unavailable")
+        }
+        // JSON Schema permits an object without named property declarations,
+        // including a required list whose values are otherwise unconstrained.
+        let props: [String: Any]
+        if let value = raw["properties"] {
+            guard let declared = value as? [String: Any] else {
+                throw ToolFailureError("The tool's parameter schema properties are not an object. Repair its schema before using it.", effects: .none, code: "tool_schema_unavailable")
+            }
+            props = declared
+        } else { props = [:] }
+        let required: Set<String>
+        if let value = raw["required"] {
+            guard let names = value as? [String] else {
+                throw ToolFailureError("The tool's required-argument schema is not a list of names. Repair its schema before using it.", effects: .none, code: "tool_schema_unavailable")
+            }
+            required = Set(names)
+        } else { required = [] }
         var visible: [String: [String: Any]] = [:]
         for (key, value) in props {
-            let property = value as? [String: Any] ?? [:]
+            guard let property = value as? [String: Any] else {
+                throw ToolFailureError("The tool's parameter schema property \(key) is not an object. Repair its schema before using it.", effects: .none, code: "tool_schema_unavailable")
+            }
             let about = (property["description"] as? String ?? "").lowercased()
             if key == "__session_id" || about.contains("auto-fill") || about.contains("supplied automatically") { continue }
             visible[key] = property
         }
-        return (visible, Set(raw["required"] as? [String] ?? []))
+        for key in required where props[key] == nil && key != "__session_id" {
+            visible[key] = [:] // A required name with no property schema accepts any value.
+        }
+        return (visible, required)
     }
 
     private static func ordered(_ props: [String: [String: Any]], _ required: Set<String>) -> [String] {
@@ -47,18 +69,20 @@ public enum ToolSignature {
             let items = property["items"] as? [String: Any] ?? [:]
             return "[" + (depth > 1 ? "…" : shape(items, depth: depth + 1)) + "]"
         case "object":
+            if (property["properties"] as? [String: Any])?.isEmpty != false,
+               property["additionalProperties"] as? Bool == true { return "object*" }
             guard depth <= 1, let props = property["properties"] as? [String: Any], !props.isEmpty else { return "{}" }
             let required = Set(property["required"] as? [String] ?? [])
             let keys = props.keys.sorted { a, b in required.contains(a) != required.contains(b) ? required.contains(a) : a < b }
             return "{" + keys.map { $0 + (required.contains($0) ? "*" : "") }.joined(separator: ",") + "}"
         default:
             if let values = property["enum"] as? [String], (1...8).contains(values.count) { return values.joined(separator: "|") }
-            return "str"
+            return type(property) == nil ? "any" : "str"
         }
     }
 
-    public static func call(_ name: String, _ parametersJSON: Data) -> String {
-        guard let (props, required) = properties(parametersJSON) else { return name + "()" }
+    public static func call(_ name: String, _ parametersJSON: Data) throws -> String {
+        let (props, required) = try properties(parametersJSON)
         let parts = ordered(props, required).map { key -> String in
             let property = props[key] ?? [:]
             let mark = required.contains(key) ? "*" : ""
@@ -72,8 +96,8 @@ public enum ToolSignature {
 
     /// The same arguments in the `app` door's form (`AppAction.args`): the
     /// name, `?` when it may be left out or null, then `:shape` unless a string.
-    public static func doorArgs(_ parametersJSON: Data) -> [String] {
-        guard let (props, required) = properties(parametersJSON) else { return [] }
+    public static func doorArgs(_ parametersJSON: Data) throws -> [String] {
+        let (props, required) = try properties(parametersJSON)
         return ordered(props, required).map { key in
             let property = props[key] ?? [:]
             let nullable = (property["type"] as? [String])?.contains("null") == true
@@ -86,6 +110,7 @@ public enum ToolSignature {
     public static func doorProperty(_ shape: String) -> JSONValue {
         if shape == "any" { return .object([:]) }
         if shape == "list" { return .object(["type": .string("array")]) }
+        if shape == "object*" { return .object(["type": .string("object"), "additionalProperties": .bool(true)]) }
         if shape.hasPrefix("["), shape.hasSuffix("]") {
             return .object(["type": .string("array"),
                 "items": doorProperty(String(shape.dropFirst().dropLast()))])
@@ -134,14 +159,14 @@ public enum ToolSignature {
 
     /// One short line per argument, same order: "steps: up to 12 acts in ONE call…".
     /// Argument names, required and optional, auto-filled ones left out.
-    public static func argumentNames(_ parametersJSON: Data) -> (required: [String], optional: [String]) {
-        guard let (props, required) = properties(parametersJSON) else { return ([], []) }
+    public static func argumentNames(_ parametersJSON: Data) throws -> (required: [String], optional: [String]) {
+        let (props, required) = try properties(parametersJSON)
         let all = ordered(props, required)
         return (all.filter(required.contains), all.filter { !required.contains($0) })
     }
 
-    public static func params(_ parametersJSON: Data, limit: Int = 90) -> [String] {
-        guard let (props, required) = properties(parametersJSON) else { return [] }
+    public static func params(_ parametersJSON: Data, limit: Int = 90) throws -> [String] {
+        let (props, required) = try properties(parametersJSON)
         return ordered(props, required).compactMap { key in
             guard let about = (props[key]?["description"] as? String)?
                 .replacingOccurrences(of: "\n", with: " ")

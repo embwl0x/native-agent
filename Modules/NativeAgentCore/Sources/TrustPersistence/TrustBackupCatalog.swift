@@ -5,7 +5,7 @@ import TrustCenter
 import MemoryV2
 import Privacy
 import SystemOps
-// Blueprint: | `TrustBackupCatalog.swift` | TrustBackupPersistence catalog publication and retention; writable index.json, read-only legacy registry.json, verified restore points, pins and staged dependencies |
+// Blueprint: | `TrustBackupCatalog.swift` | TrustBackupPersistence catalog publication and retention; one array catalog at index.json, verified restore points, pins and staged dependencies |
 
 extension TrustBackupPersistence {
     public static func diskStorageOwner(dataRoot root: URL) -> DiskStorageOwner {
@@ -36,10 +36,7 @@ extension TrustBackupPersistence {
                             let rows = JSONValue.array(catalog.rows.filter {
                                 !moved.contains($0.objectValue?["id"]?.stringValue ?? "")
                             })
-                            var value = catalog.raw
-                            if case .object(var wrapper) = value { wrapper["backups"] = rows; value = .object(wrapper) }
-                            else { value = rows }
-                            try await SwiftNativePersistenceCore.writeJSON(value, to: index)
+                            try await SwiftNativePersistenceCore.writeJSON(rows, to: index)
                         } catch {
                             outcomes.append(DiskStorageOwner.Outcome(relativePath: "backups/index.json",
                                 skippedReason: "bytes reached Trash, but catalog update failed: \(error.localizedDescription)"))
@@ -59,34 +56,33 @@ extension TrustBackupPersistence {
     private static func backupReclamationPlan(dataRoot root: URL) throws -> DiskStorageOwner.Plan {
         let keepCount = 2
         var plan = DiskStorageOwner.Plan(owner: "backups", roots: ["backups"],
-            policy: "Keep the newest two verified restore points, catalog pins and staged restore dependencies. Older registered restore points and legacy exports move to Trash; failed verification and unregistered branches stay.",
+            policy: "Keep the newest two verified restore points, catalog pins and staged restore dependencies. Older registered restore points move to Trash; failed verification and unregistered branches stay.",
             candidates: [:])
         let backupRoot = root.appendingPathComponent("backups")
         guard pathEntryExists(backupRoot) else { return plan }
         try requireRegularDirectory(backupRoot)
         var records: [String: (record: BackupRecord, date: Date)] = [:]
         var pinned: Set<String> = []
-        for name in ["registry.json", "index.json"] {
-            let catalog = try readBackupCatalogChecked(backupRoot.appendingPathComponent(name))
-            for row in catalog.rows {
-                guard let id = row.objectValue?["id"]?.stringValue, UUID(uuidString: id)?.uuidString.lowercased() == id,
-                      case .object(let object) = row else {
-                    throw backupError(code: 422, "Backup catalog has an invalid identity; backups were kept.")
-                }
-                if let pin = object["pinned"] {
-                    guard case .bool(let value) = pin else {
-                        throw backupError(code: 422, "Backup catalog pin is invalid; backups were kept.")
-                    }
-                    if value { pinned.insert(id) }
-                }
+        let catalog = try readBackupCatalogChecked(backupRoot.appendingPathComponent("index.json"))
+        for row in catalog.rows {
+            guard let id = row.objectValue?["id"]?.stringValue, UUID(uuidString: id)?.uuidString.lowercased() == id,
+                  case .object(let object) = row else {
+                throw backupError(code: 422, "Backup catalog has an invalid identity; backups were kept.")
             }
-            for record in catalog.records {
-                guard let date = NativeTimestampFormat.parseISO8601(record.createdAt) else {
-                    throw backupError(code: 422, "Backup catalog date is invalid; backups were kept.")
+            if let pin = object["pinned"] {
+                guard case .bool(let value) = pin else {
+                    throw backupError(code: 422, "Backup catalog pin is invalid; backups were kept.")
                 }
-                records[record.id] = (record, date)
+                if value { pinned.insert(id) }
             }
         }
+        for record in catalog.records {
+            guard let date = NativeTimestampFormat.parseISO8601(record.createdAt) else {
+                throw backupError(code: 422, "Backup catalog date is invalid; backups were kept.")
+            }
+            records[record.id] = (record, date)
+        }
+
         let intentPath = backupRestoreIntentPath(dataRoot: root)
         if pathEntryExists(intentPath) {
             let intent = try readRestoreIntent(at: intentPath)
@@ -129,7 +125,6 @@ extension TrustBackupPersistence {
     }
 
     static func appendBackupRecord(_ record: BackupRecord, backupRoot: URL) async throws {
-        // Only the index is published. The registry remains read-only legacy input.
         try await appendRegistryRow(Self.backupRecordJSON(record), path: backupRoot.appendingPathComponent("index.json"), id: record.id, maxRows: nil, isBackupCatalog: true)
     }
 
@@ -141,12 +136,9 @@ extension TrustBackupPersistence {
         try await SwiftNativePersistenceCore.withFileLock(path) {
             // Only absent registries bootstrap; unreadable or malformed existing bytes stay intact.
             let existing: [JSONValue]
-            // A backup catalog may wrap its rows ({backups, ...}): only its rows change.
-            var wrapper: [String: JSONValue]?
             if isBackupCatalog {
                 let catalog = try Self.readBackupCatalogChecked(path)
                 existing = catalog.rows
-                if case .object(let object) = catalog.raw { wrapper = object }
             } else {
                 do {
                     let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
@@ -172,44 +164,20 @@ extension TrustBackupPersistence {
             if let maxRows, rows.count > maxRows {
                 rows = Array(rows.suffix(maxRows))
             }
-            if var wrapper {
-                wrapper["backups"] = .array(rows)
-                try await SwiftNativePersistenceCore.writeJSON(.object(wrapper), to: path)
-            } else {
-                try await SwiftNativePersistenceCore.writeJSON(.array(rows), to: path)
-            }
+            try await SwiftNativePersistenceCore.writeJSON(.array(rows), to: path)
         }
     }
 
     public static func readBackupRecords(root: URL) throws -> [BackupRecord] {
-        let backupRoot = root.appendingPathComponent("backups", isDirectory: true)
-        var byId: [String: BackupRecord] = [:]
-        let fm = FileManager.default
-        for name in ["registry.json", "index.json"] {
-            let path = backupRoot.appendingPathComponent(name)
-            for record in try readBackupRecordsFile(path) {
-                var normalized = record
-                let localBackupDir = backupRoot.appendingPathComponent(record.id, isDirectory: true)
-                if path.lastPathComponent == "registry.json",
-                   !fm.fileExists(atPath: localBackupDir.path), !fm.fileExists(atPath: record.path) { continue }
-                if !fm.fileExists(atPath: record.path), fm.fileExists(atPath: localBackupDir.path) {
-                    normalized.path = localBackupDir.path
-                }
-                byId[normalized.id] = normalized
-            }
-        }
-        return byId.values.sorted { lhs, rhs in
+        let path = root.appendingPathComponent("backups/index.json")
+        return try Self.readBackupCatalogChecked(path).records.sorted { lhs, rhs in
             if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
             return lhs.id < rhs.id
         }
     }
 
-    private static func readBackupRecordsFile(_ path: URL) throws -> [BackupRecord] {
-        try Self.readBackupCatalogChecked(path).records
-    }
-
     private static func readBackupCatalogChecked(_ path: URL) throws
-        -> (rows: [JSONValue], records: [BackupRecord], raw: JSONValue)
+        -> (rows: [JSONValue], records: [BackupRecord])
     {
         do {
             let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
@@ -218,25 +186,17 @@ extension TrustBackupPersistence {
             }
         } catch let error as NSError where error.domain == NSCocoaErrorDomain
             && error.code == NSFileReadNoSuchFileError {
-            return ([], [], .array([]))
+            return ([], [])
         }
         let raw = try JSONValue.parse(Data(contentsOf: path))
-        let rows: [JSONValue]
-        switch raw {
-        case .array(let values): rows = values
-        case .object(let object):
-            guard case .array(let values)? = object["backups"] else {
-                throw Self.backupError(code: 422, "Backup catalog is malformed: \(path.lastPathComponent)")
-            }
-            rows = values
-        default:
-            throw Self.backupError(code: 422, "Backup catalog is malformed: \(path.lastPathComponent)")
+        guard case .array(let rows) = raw else {
+            throw Self.backupError(code: 422, "Backup catalog must contain the current array shape: \(path.lastPathComponent)")
         }
         let records = try JSONDecoder.nativeAgent.decode(
             [BackupRecord].self,
             from: JSONValue.array(rows).serializedData(pretty: false)
         )
-        return (rows, records, raw)
+        return (rows, records)
     }
 
     private static func backupRecordJSON(_ record: BackupRecord) -> JSONValue {

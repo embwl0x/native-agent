@@ -201,7 +201,7 @@ function read(request) {
         if (name || role) {
             if (seen.has(at)) K.fail("Canvas accessibility identity is ambiguous: " + at); seen.add(at);
             const value = secret ? "[redacted]" : string(node.value === undefined ? node.AXValue : node.value);
-            const detail = [role, value, node.selected === true ? "selected" : "", node.enabled === false ? "disabled" : "", !identifier ? "Address follows the accessibility path; reread after layout changes." : ""].filter(Boolean).join(" · ");
+            const detail = [role, value, node.selected === true ? "selected" : "", node.enabled === false ? "disabled" : node.enabled === true ? "" : "enabled state unavailable", !identifier ? "Address follows the accessibility path; reread after layout changes." : ""].filter(Boolean).join(" · ");
             const kind = /Outline|Row|Cell/i.test(role) ? "layer" : /Button/i.test(role) ? "button" : /Text/i.test(role) ? "text" : /Group|Canvas/i.test(role) ? "group" : "element";
             rows.push(K.thing(secret ? "Protected field" : name || role, kind, at, detail));
         }

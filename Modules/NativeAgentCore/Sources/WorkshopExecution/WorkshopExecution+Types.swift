@@ -80,7 +80,7 @@ public struct WorkshopExecutionSpec: Codable, Sendable, Equatable {
     }
 }
 
-/// One planned call. Optional reads may supply no evidence; effects remain required.
+/// One planned call. Reads may supply no evidence and continue; effects remain required.
 public struct WorkshopExecutionStep: Codable, Sendable, Equatable {
     public var id: String
     public var description: String
@@ -88,7 +88,7 @@ public struct WorkshopExecutionStep: Codable, Sendable, Equatable {
     public var args: JSONValue           // .object(...) keeps Python's flat dict shape
     public var autonomy: String          // "auto" | "needs_approval"
     public var argumentSchema: JSONValue? = nil
-    /// Nil on older plans means required. Read/effect class comes from the call's declaration.
+    /// Retained plan hint, not a read-continuation gate. Only declared reads may set it true.
     public var optional: Bool? = nil
 
     public init(
@@ -273,7 +273,7 @@ public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
     }
 }
 
-/// Submission status, execution identity and full record; executionId remains encoded as missionId.
+/// Submission status, execution identity and full record; current executionId wire field.
 public struct WorkshopExecutionEnqueueResult: Codable, Sendable, Equatable {
     public var status: String            // "queued" — terminal status of submit (NOT "fired")
     public var executionId: String
@@ -281,7 +281,7 @@ public struct WorkshopExecutionEnqueueResult: Codable, Sendable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case status, record
-        case executionId = "missionId" // compatibility wire ID
+        case executionId
     }
 
     public init(status: String, executionId: String, record: WorkshopExecutionRecord) {

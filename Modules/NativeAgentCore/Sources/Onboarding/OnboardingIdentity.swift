@@ -8,6 +8,17 @@ import PersistenceCore
 import PersonaEngine
 // Blueprint: | `OnboardingIdentity.swift` | Checked identity and shared manifest/byte writer; profile and USER publication use their domain owners |
 extension SwiftNativeOnboardingClient {
+    /// Creation and missing-profile repair require both identities explicitly.
+    static func nameRefusal(agent: String, user: String) -> OnboardingCompleteResult? {
+        if let message = NativeAgentIdentity.nameValidationMessage(agent) {
+            return OnboardingCompleteResult(ok: false,
+                error: agent.isEmpty ? "missing_agent_name" : "invalid_agent_name", detail: message)
+        }
+        if user.isEmpty {
+            return OnboardingCompleteResult(ok: false, error: "missing_user_name", detail: "Enter your name before saving.")
+        }
+        return nil
+    }
     static func canonicalPath(_ url: URL) -> String {
         // Keep the transaction identity stable even when the target directory
         // did not exist at preparation time. Resolving symlinks can change the
@@ -72,20 +83,6 @@ extension SwiftNativeOnboardingClient {
         }
         return remainder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .generatorProjection : .authored
     }
-    /// Proof that onboarding FINISHED on this Mac: the `.onboarded` sentinel,
-    /// or — for installs that predate it — the complete legacy document set.
-    /// USER.md alone and SOUL.md alone are partial state, never completion.
-    static func hasCompletionAnchor(
-        personaTargets targets: [String: URL],
-        fileManager fm: FileManager
-    ) -> Bool {
-        if fm.fileExists(atPath: targets["sentinel"]!.path) { return true }
-        return NativeAgentPublicSafety.hasLegacyCompletionAnchor(
-            personaRoot: targets["soul"]!.deletingLastPathComponent(),
-            profileURL: targets["profile"]!,
-            allowMissingProfile: true
-        )
-    }
     static func expectedTargetURLs(
         personaRoot: URL,
         profilePath: URL,
@@ -96,6 +93,7 @@ extension SwiftNativeOnboardingClient {
             "voice": personaRoot.appendingPathComponent("VOICE.md"),
             "user": personaRoot.appendingPathComponent("USER.md"),
             "growth": personaRoot.appendingPathComponent("GROWTH.md"),
+            "agents": personaRoot.appendingPathComponent("AGENTS.md"),
             "profile": profilePath,
             "sentinel": dataRoot.appendingPathComponent(".onboarded"),
         ]
@@ -196,21 +194,6 @@ extension SwiftNativeOnboardingClient {
                 profilePath: profilePath, agentName: agentName, personaType: personaType, userName: userName)
         } catch let PersonaWriteError.ioFailure(detail) {
             throw OnboardingError.ioFailure(detail)
-        }
-    }
-    /// `<dataRoot>/memory/profile.json` → `name`. No file or no name is empty; a file that cannot be
-    /// read or parsed throws, so the wizard shows why instead of a blank name.
-    static func readPersonaName(at path: URL) throws -> String {
-        guard FileManager.default.fileExists(atPath: path.path) else { return "" }
-        do {
-            guard let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: path)) as? [String: Any] else {
-                throw OnboardingError.ioFailure("\(path.path) is not a JSON object")
-            }
-            return obj["name"] as? String ?? ""
-        } catch let error as OnboardingError {
-            throw error
-        } catch {
-            throw OnboardingError.ioFailure("read \(path.path) failed: \(error.localizedDescription)")
         }
     }
 }

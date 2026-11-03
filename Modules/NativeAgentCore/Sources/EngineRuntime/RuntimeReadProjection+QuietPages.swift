@@ -24,17 +24,11 @@ import ProviderRouting
 import TrustCenter
 import TrustPersistence
 import ToolExecution
-// Blueprint: | `RuntimeReadProjection+QuietPages.swift` | Quiet page/item formatting and navigation over engine projections: Desk uses the complete retained `DeskFacade.page` and its prepared attention rows, helpers use `botsShelfRead` including followingModel, chat cards and heading use the checked transcript projection; unsupported card states share one person-directed defect naming the card; page indexing takes the live layout; Mac access/grants render `MacIntegrationFacade`; connector items expose secret names without values; shared Trust, provider, inbox and settings read formatting |
+// Blueprint: | `RuntimeReadProjection+QuietPages.swift` | Quiet page/item formatting and navigation over engine projections: Desk uses the complete retained `DeskFacade.page` and its prepared attention rows, helpers use `botsShelfRead` including followingModel, chat cards and heading use the checked transcript projection; unsupported card states share one person-directed defect naming the card; page indexing reads the shipped page set independently of layout; Mac access/grants render `MacIntegrationFacade`; connector items expose secret names without values; shared Trust, provider, inbox and settings read formatting |
 
 @MainActor
 extension RuntimeReadouts {
-    public static func quietPages(layout: SurfaceLayout, profile: String) -> [QuietToolPage] {
-        let hidden = Set(["rail", "places"].flatMap { surface in
-            (layout.surfaces[surface] ?? []).map(\.name)
-                .filter { !layout.isShown(surface, $0, profile: profile) }.map(AppDoorNames.resolve)
-        })
-        return QuietToolPage.all.filter { !hidden.contains($0.id) }
-    }
+    public static func quietPages() -> [QuietToolPage] { QuietToolPage.all }
 
     private static func bounded(_ raw: String) -> String {
         let collapsed = raw
@@ -141,7 +135,8 @@ extension RuntimeReadouts {
             "Only answers when mentioned in a group: \(status.requireMention ? "yes" : "no")",
             quietCountLine(status.allowedChatIds.count, "allowed chat", "allowed chats")
                 + ", " + quietCountLine(status.allowedUserIds.count, "allowed user", "allowed users"),
-            "Model: \(status.model ?? "same as Chat") · Think \(status.reasoningEffort ?? "default")",
+            status.routingIssue.map { "Routing unavailable: \($0)" }
+                ?? "Model: \(status.model ?? "unavailable") · Think \(status.reasoningEffort ?? "default")",
         ]
         if let at = status.lastReplyAt { lines.append("Last reply: \(at)") }
         var sections = [quietPageSection("Telegram", lines)]
@@ -191,12 +186,6 @@ extension RuntimeReadouts {
                 case "not_paired":
                     instruction = "The owner opens the companion app, checks the phone's code and chooses Pair on this Mac."
                     tap = "Connectors → iPhone → Paired devices → Pair"
-                case "not_configured":
-                    instruction = "The owner configures direct push on this Mac before sending phone notifications."
-                    tap = "NativeAgent data folder → config/apns.json"
-                case "needs_token":
-                    instruction = "The owner enables notifications for the companion app and connects it to this Mac."
-                    tap = "iPhone Settings → Notifications → NativeAgent"
                 default:
                     instruction = "Read Doctor's phone-notification check and the latest delivery evidence before sending another notification."
                     tap = nil
@@ -227,7 +216,11 @@ extension RuntimeReadouts {
     public static func quietMacAccess(_ mac: String, connectors: [ConnectorRecord], dataRoot: URL,
                                       permissions: Result<MacIntegrationPermissionStore.Snapshot, Error>,
                                       authority: FullMacYoloAuthorityAssessment, systemStatuses: [String: String], statusText: (ConnectorRecord) -> String) async -> JSONValue {
-        let routes = AppActions.integrationRoutes(mac).map { route -> JSONValue in
+        let catalogRoutes: [JSONValue]
+        do { catalogRoutes = try AppActions.integrationRoutes(mac) }
+        catch { return quietPageIssue("Mac access", reason: "action_catalog_unavailable",
+            detail: error.localizedDescription, instruction: "Repair the action catalog before reading supported routes.", error: error) }
+        let routes = catalogRoutes.map { route -> JSONValue in
             guard case .object(var row) = route else { return route }
             let ids = quietServicePages.values.filter { $0.mac == mac }.flatMap(\.connectors).map(ConnectorProofLedger.canonicalID)
             let words = connectors.filter { ids.contains(ConnectorProofLedger.canonicalID($0.id)) }.map {
@@ -276,23 +269,20 @@ extension RuntimeReadouts {
                 return .object(access)
             }
             let admitted = authority.admitted
-            let read = snapshot.allows(mac, mode: .read, fullMacAdmitted: admitted)
-            let write = snapshot.allows(mac, mode: .write, fullMacAdmitted: admitted)
+            let read = snapshot.allows(mac, mode: .read)
+            let write = snapshot.allows(mac, mode: .write)
             access["effective_permission"] = .object(["read": .bool(read), "write": .bool(write)])
             access["stored_permission"] = .object(["read": .bool(stored.read), "write": .bool(stored.write)])
             access["full_mac_admitted"] = .bool(admitted)
             access["permission_state"] = .string(read || write ? "allowed" : "off")
             let blockers = [MacIntegrationPermissionMode.read, .write].compactMap { readiness.refusal(integration: mac, mode: $0) }
             access["permission_blockers"] = .array(blockers.map(JSONValue.string))
-            // What is in effect leads, with why; the saved setting is named as
-            // what it is (the one used outside Full Mac), never as the truth.
+            // The owner's switches decide, Full Mac included; held-back reasons follow.
             func words(_ read: Bool, _ write: Bool) -> String {
                 read && write ? "read and write" : read ? "read-only" : write ? "write-only" : "off"
             }
-            let now = words(read, write), saved = words(stored.read, stored.write)
-            access["in_effect"] = .string((now == saved ? now + (admitted ? " under Full Mac" : ", your saved setting")
-                : admitted ? "\(now) under Full Mac; your saved setting is \(saved) and applies when Full Mac is off"
-                : "\(now); your saved setting is \(saved)")
+            access["in_effect"] = .string(words(read, write) + ", your switches"
+                + (admitted ? " (Full Mac does not change them)" : "")
                 + (blockers.isEmpty ? "" : "; held back by: " + blockers.joined(separator: "; ")))
         } catch {
             access["permission_state"] = .string("unavailable")
@@ -337,10 +327,14 @@ extension RuntimeReadouts {
         var content = content
         if ["settings", "providers"].contains(pageID) {
             let turn = ChatTurnRuntimeContext.current
-            let context = ChatSessionAutocompactionConfig.productionDefault().contextWindowReadout(
-                forModel: turn?.model ?? model, providerID: turn?.providerID ?? providerID,
-                dataRoot: dataRoot)
-            if case .string(let summary)? = context["summary"] { content.append(quietPageSection("Context window", [summary])) }
+            do {
+                let context = try await ChatSessionAutocompactionConfig.productionDefault().contextWindowReadout(
+                    forModel: turn?.model ?? model, providerID: turn?.providerID ?? providerID,
+                    dataRoot: dataRoot)
+                if case .string(let summary)? = context["summary"] { content.append(quietPageSection("Context window", [summary])) }
+            } catch {
+                content.append(quietPageSection("Context window", ["Unavailable: \(error.localizedDescription)"]))
+            }
         }
         let surfaces: [String] = switch pageID {
         case "chat": ["chat", "compaction"]
@@ -368,7 +362,10 @@ extension RuntimeReadouts {
 
     public static func quietVirtualPage(_ page: QuietToolPage) -> [JSONValue]? {
         guard let read = virtualPageReads[page.id] else { return nil }
-        let registered = AppActions.on(page: page.id).filter { $0.page == page.id }.map(\.id)
+        let registered: [String]
+        do { registered = try AppActions.on(page: page.id).filter { $0.page == page.id }.map(\.id) }
+        catch { return [quietPageIssue(page.title, reason: "action_catalog_unavailable",
+            detail: error.localizedDescription, instruction: "Repair the action catalog before reading registered actions.", error: error)] }
         return [quietPageSection(page.title, [page.summary, read,
             "This version covers this page's guidance and registered actions, not a file, command, tab, URL or screen."]),
             quietPageSection("Registered actions", registered)]
@@ -382,10 +379,11 @@ extension RuntimeReadouts {
         "mac": "Read the current screen with mac.look, or a document with mac.read. A page read captures no screen and moves no control.",
     ]
     public static func quietConnectors(_ owner: ConnectorReadiness,
-                                       workspaceCount: Int, statusText: (ConnectorRecord) -> String) async -> [JSONValue] {
+                                       statusText: (ConnectorRecord) -> String) async -> [JSONValue] {
         let connectors: [JSONValue]
         do {
-            connectors = quietConnectors(try await owner.refresh().get(), workspaceCount: workspaceCount, statusText: statusText)
+            connectors = quietConnectors(try await owner.refresh().get(), workspaceCount: owner.workspacesReadError == nil ? owner.workspaceSnapshot?.count : nil,
+                workspaceError: owner.workspacesReadError, statusText: statusText)
         } catch { connectors = [quietPageIssue("Connectors", reason: "connectors_read_failed", detail: error.localizedDescription,
             instruction: "Inspect Doctor's connector checks and resolve the reported read problem before changing connections.",
             next: ["action": .string("doctor.run")], error: error)] }
@@ -407,12 +405,18 @@ extension RuntimeReadouts {
         return connectors + [kept]
     }
 
-    public static func quietConnectors(_ connectors: [ConnectorRecord], workspaceCount: Int,
+    public static func quietConnectors(_ connectors: [ConnectorRecord], workspaceCount: Int?, workspaceError: String?,
                                        statusText: (ConnectorRecord) -> String) -> [JSONValue] {
         var sections = [quietPageSection("Connectors", [
             quietCountLine(connectors.count, "connector", "connectors"),
-            quietCountLine(workspaceCount, "workspace", "workspaces"),
         ])]
+        if let workspaceCount {
+            sections.append(quietPageSection("Workspaces", [quietCountLine(workspaceCount, "workspace", "workspaces")]))
+        } else {
+            sections.append(quietPageIssue("Workspaces", reason: "workspaces_unavailable",
+                detail: workspaceError ?? "Workspaces have not been read.",
+                instruction: "Repair the reported workspace read problem, then reload Connectors.", next: ["page": .string("connectors")]))
+        }
         sections.append(quietPageSection("Connector ids", connectors.isEmpty ? ["None."] : connectors.map {
             // The same word the Connectors page shows (Connected / Needs sign-in / Off …),
             // so she never has to open each connector to learn who needs a sign-in (10-10).
@@ -425,7 +429,6 @@ extension RuntimeReadouts {
 
     public static func quietMacIntegration(connectors owner: ConnectorReadiness,
                                            macIntegration: MacIntegrationFacade,
-                                           workspaceCount: Int,
                                            statusText: (ConnectorRecord) -> String) async -> [JSONValue] {
         let connectors: [ConnectorRecord]
         do { connectors = try await owner.refresh().get() }
@@ -448,7 +451,8 @@ extension RuntimeReadouts {
             "note": .string("Routes, permission, connection and macOS access are separate. Live OS status is read without prompting where supported; unverified means unknown. No app or content probe; no permission request.")]),
             .object(["heading": .string("macOS grants"), "grants": .array(quietMacOSGrants(systemStatuses)),
                 "note": .string("Read live from macOS at this page read, without prompting. A grant that is not granted names the one card that asks for it.")])]
-        overview += quietConnectors(connectors, workspaceCount: workspaceCount, statusText: statusText)
+        overview += quietConnectors(connectors, workspaceCount: owner.workspacesReadError == nil ? owner.workspaceSnapshot?.count : nil,
+            workspaceError: owner.workspacesReadError, statusText: statusText)
         return overview
     }
 
@@ -474,18 +478,37 @@ extension RuntimeReadouts {
         return grants
     }
 
-    public static func quietMemories(_ memory: MemoryFacade, keptLine: String, graphEntityCount: Int) -> [JSONValue] {
+    public static func quietMemories(_ memory: MemoryFacade, keptLine: String) -> [JSONValue] {
         let memories = memory.memories
         let shown = min(20, memories.count)
-        var head = [keptLine]
+        let memoriesAvailable = memory.hasLoadedMemories && memory.memoriesReadError == nil
+        let proposalsAvailable = memory.hasLoadedProposals && memory.proposalsReadError == nil
+        let statusAvailable = memory.statusRefresh?.isStale == false && memory.status != nil
+        var head: [String] = memoriesAvailable ? [keptLine] : []
         let slice = memory.totalCount.map { "\(shown) of \($0)" } ?? "\(shown) shown · total not loaded"
-        head.append(slice + ((memory.totalCount ?? memories.count) > shown
-            ? " · app {action:\"memory.list\",args:{offset:20,limit:20}}" : ""))
-        head.append(quietCountLine(memory.proposals.count, "proposal waiting", "proposals waiting"))
-        head.append(quietCountLine(graphEntityCount, "thing in the graph", "things in the graph"))
-        head.append(contentsOf: memory.status?.afterTurn?.lines ?? [])
+        if memoriesAvailable {
+            var line = statusAvailable ? slice : "\(shown) shown · total unavailable"
+            if statusAvailable, let total = memory.totalCount, total > shown {
+                line += " · app {action:\"memory.list\",args:{offset:20,limit:20}}"
+            }
+            head.append(line)
+        }
+        if proposalsAvailable { head.append(quietCountLine(memory.proposals.count, "proposal waiting", "proposals waiting")) }
+        if memory.graphSnapshot != nil, memory.graphLoadError == nil {
+            head.append(quietCountLine(memory.graphTotalEntities, "thing in the graph", "things in the graph"))
+        }
+        if statusAvailable { head.append(contentsOf: memory.status?.afterTurn?.lines ?? []) }
         var sections = [quietPageSection("Memories", head)]
-        if !memories.isEmpty {
+        for (title, issue) in [
+            ("Kept", memoriesAvailable ? nil : memory.memoriesReadError ?? "Kept memories have not been read."),
+            ("Waiting", proposalsAvailable ? nil : memory.proposalsReadError ?? "Memory proposals have not been read."),
+            ("Memory status", statusAvailable ? nil : memory.statusReadError ?? "Memory status has not been read."),
+            ("Graph", memory.graphLoadError ?? (memory.graphSnapshot == nil ? "The graph has not been read." : nil)),
+        ] {
+            if let issue { sections.append(quietPageIssue(title, reason: "memory_read_unavailable", detail: issue,
+                instruction: "Repair the reported memory-store read problem without replacing saved memories, then reload Memories.", next: ["page": .string("memories")])) }
+        }
+        if memoriesAvailable, !memories.isEmpty {
             sections.append(quietPageSection("Kept", memories.prefix(20).map { record in
                 let first = record.text.split(whereSeparator: \.isNewline)
                     .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -493,7 +516,7 @@ extension RuntimeReadouts {
                 return MemoryDataProvenance.presentation("\(record.layer ?? ""): \(first)", metadata: record.extras, dataRoot: memory.dataRoot)
             }))
         }
-        if !memory.proposals.isEmpty {
+        if proposalsAvailable, !memory.proposals.isEmpty {
             sections.append(quietPageSection("Waiting", memory.proposals.prefix(12).map(\.content)))
         }
         return sections
@@ -502,23 +525,31 @@ extension RuntimeReadouts {
     public static func quietPersonality(_ persona: PersonaFacade, currentPersona: String) async -> [JSONValue] {
         var head: [String] = []
         var selectionIssue: JSONValue?
-        if let name = persona.profile?.name { head.append("Name: \(name)") }
+        let name = persona.displayName
+        if !name.isEmpty { head.append("Name: \(name)") }
         let root = persona.personaRoot
         let documents = persona.documents
-        // The picker's word names a persona only when its directory holds one;
-        // otherwise the root SOUL.md is her, under the name the person chose.
+        // Selection describes a document directory, never a replacement identity.
         do {
             let id = try PersonaCompiler.selectedPersonaID(root: root, personaOverride: currentPersona)
             if id != "canonical" { head.append("Current persona name: \(id).") }
-            else if let name = persona.profile?.name { head.append("Current persona name: \(name) (the root persona).") }
             else { head.append("Current persona: the root persona.") }
         } catch {
             selectionIssue = quietPageIssue("Current persona", reason: "persona_selection_unavailable",
                 detail: error.localizedDescription, instruction: "Inspect the persona directory and resolve the reported selection problem without replacing persona documents.",
                 next: ["action": .string("files.list"), "args": .object(["path": .string(root.path)])], error: error)
         }
-        head.append(quietCountLine(documents.count, "document", "documents"))
+        if persona.documentsError == nil { head.append(quietCountLine(documents.count, "document", "documents")) }
         var sections = [quietPageSection("Personality", head)]
+        if let issue = persona.profileError {
+            sections.append(quietPageIssue("Identity", reason: "persona_identity_unavailable",
+                detail: issue, instruction: "Repair the saved profile through Setup before relying on the displayed identity.", tap: "Setup"))
+        }
+        if let issue = persona.documentsError {
+            sections.append(quietPageIssue("Documents", reason: "persona_documents_unavailable",
+                detail: issue, instruction: "Repair or restore the named canonical document, then reload Personality.",
+                next: ["page": .string("personality")]))
+        }
         if let selectionIssue { sections.append(selectionIssue) }
         do {
             let names = try PersonaCompiler.customPersonaNames(root: root)
@@ -533,7 +564,7 @@ extension RuntimeReadouts {
         } catch { sections.append(quietPageIssue("Consults", reason: "studio_consults_unavailable",
             detail: error.localizedDescription, instruction: "Resolve the reported consult-store read problem, preserving saved consults, then reload Personality.",
             next: ["page": .string("personality")], error: error)) }
-        if !documents.isEmpty {
+        if persona.documentsError == nil, !documents.isEmpty {
             sections.append(quietPageSection("Documents", documents.map { doc in
                 let first = doc.content.split(whereSeparator: \.isNewline)
                     .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -656,7 +687,7 @@ extension RuntimeReadouts {
 
     public static func quietDesk(desk: DeskFacade) async -> [JSONValue] {
         let snapshot = await desk.loadPage()
-        guard snapshot.loaded else {
+        guard snapshot.loaded, snapshot.deskUnavailable == nil, let state = snapshot.board?.deskState else {
             return [quietPageIssue("Desk", reason: "desk_unavailable",
                 detail: snapshot.deskUnavailable ?? "The board could not be read.",
                 instruction: "Inspect Doctor's Desk check and repair the reported board problem without discarding work.",
@@ -680,7 +711,7 @@ extension RuntimeReadouts {
             }
         }
         var sections = [quietPageSection("Desk", [
-            DeskState(items: items, generatedTs: snapshot.generatedTs ?? "").boardCountSummary,
+            state.boardCountSummary,
             quietCountLine(waiting.count, "item waiting on the owner", "items waiting on the owner"),
             quietCountLine(blocked.count, "item blocked", "items blocked"),
             "To wait on a person: desk.wait {handle, on:\"<person>\", note?}; on:\"owner\" waits on the owner.",
@@ -770,14 +801,24 @@ extension RuntimeReadouts {
         return sections
     }
 
-    public static func quietCapabilities(trust: TrustFacade, approvals: ApprovalsFacade, workflowCount: Int, actionCount: Int) -> [JSONValue] {
-        [quietPageSection("Capabilities", [
-            quietCountLine(trust.capabilitySummary?.records.count ?? 0, "capability", "capabilities"),
-            quietCountLine(workflowCount, "workflow", "workflows"),
-            quietCountLine(actionCount, "action", "actions"),
-            quietCountLine(approvals.records.filter { $0.status.lowercased() == "pending" }.count,
-                      "approval waiting", "approvals waiting"),
-        ])]
+    public static func quietCapabilities(trust: TrustFacade, approvals: ApprovalsFacade, desk: DeskFacade, actionCount: Int) -> [JSONValue] {
+        var lines = [quietCountLine(actionCount, "action", "actions")]
+        var issues: [JSONValue] = []
+        func issue(_ title: String, _ detail: String) {
+            issues.append(quietPageIssue(title, reason: "capabilities_read_unavailable", detail: detail,
+                instruction: "Repair the reported source read problem, then reload Capabilities.", next: ["page": .string("capabilities")]))
+        }
+        if let summary = trust.capabilitySummary, trust.capabilitySummaryError == nil {
+            lines.append(quietCountLine(summary.records.count, "capability", "capabilities"))
+        } else { issue("Capabilities", trust.capabilitySummaryError ?? "Capabilities have not been read.") }
+        if let failure = desk.workflowsReadError { issue("Workflows", failure) }
+        else if !desk.hasLoadedWorkflows { issue("Workflows", "Workflows have not been read.") }
+        else { lines.append(quietCountLine(desk.workflows.count, "workflow", "workflows")) }
+        if let failure = approvals.refreshErrorText { issue("Approvals", failure) }
+        else if !approvals.hasLoadedSnapshot { issue("Approvals", "Approvals have not been read.") }
+        else { lines.append(quietCountLine(approvals.records.filter { $0.status.lowercased() == "pending" }.count,
+            "approval waiting", "approvals waiting")) }
+        return [quietPageSection("Capabilities", lines)] + issues
     }
 
     public static func quietBots(engine: NativeAgentEngine) async -> [JSONValue] {

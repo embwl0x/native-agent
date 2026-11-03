@@ -211,10 +211,15 @@ extension ProvidersFacade {
         }
         // CLI adoption is declined by sign-out, so inspect the shared file
         // itself rather than the credential path chat would now use.
-        let detail = NativeOAuthFlow.sharedCodexCLISessionRemains(providerId: id)
-            ? "Shared Codex auth is still signed in. Sign out from Codex to remove it."
-            : "Credentials removed."
-        return (true, detail)
+        do {
+            let sharedRemains = try NativeOAuthFlow.sharedCodexCLISessionRemains(providerId: id)
+            return (true, sharedRemains
+                ? "Credentials removed. Shared Codex auth is still signed in. Sign out from Codex to remove it."
+                : "Credentials removed.")
+        } catch {
+            // The independent CLI read cannot undo the completed app sign-out.
+            return (true, "Credentials removed. Shared Codex session could not be checked: \(ProviderFailure.diagnosticDescription(error))")
+        }
     }
 
     public func list() async throws -> (providers: [ProviderInfo], routing: ProviderRoutingSnapshot) {
@@ -227,31 +232,62 @@ extension ProvidersFacade {
     /// Presentation conversion only. ProviderRouting owns discovery, readiness,
     /// saved bookkeeping and the provider-specific model catalog.
     public nonisolated static func connections(from snapshot: ProviderCatalogSnapshot) throws -> [ProviderInfo] {
-        snapshot.providers.compactMap { provider in
-            let extras: [String: JSONValue]
-            if case .object(let object)? = provider.extras { extras = object } else { extras = [:] }
-            let modes: [String]
-            if case .array(let values)? = extras["auth_modes"] {
-                modes = values.compactMap { if case .string(let value) = $0 { return value }; return nil }
-            } else { modes = [] }
-            func string(_ key: String) -> String? {
-                if case .string(let value)? = extras[key] { return value }
-                return nil
+        snapshot.providers.map { provider in
+            do {
+                let extras: [String: JSONValue]
+                if let saved = provider.extras {
+                    guard case .object(let object) = saved else {
+                        throw ProviderRoutingError.underlying("Provider \(provider.id) metadata is not an object; repair its catalog row.")
+                    }
+                    extras = object
+                } else { extras = [:] }
+                let modes: [String]
+                if let saved = extras["auth_modes"] {
+                    guard case .array(let values) = saved else {
+                        throw ProviderRoutingError.underlying("Provider \(provider.id) auth_modes is not an array; repair its catalog row.")
+                    }
+                    modes = try values.map {
+                        guard case .string(let value) = $0 else {
+                            throw ProviderRoutingError.underlying("Provider \(provider.id) auth_modes contains a non-string; repair its catalog row.")
+                        }
+                        return value
+                    }
+                } else { modes = [] }
+                func string(_ key: String) throws -> String? {
+                    guard let raw = extras[key], raw != .null else { return nil }
+                    guard case .string(let value) = raw else {
+                        throw ProviderRoutingError.underlying("Provider \(provider.id) \(key) is not a string; repair its catalog row.")
+                    }
+                    return value
+                }
+                var authStatus: ProviderAuthStatus
+                let models: [ProviderModelInfo]
+                do {
+                    authStatus = try JSONDecoder.nativeAgent.decode(
+                        ProviderAuthStatus.self, from: JSONEncoder().encode(provider.oauthStatus))
+                    models = try JSONDecoder.nativeAgent.decode(
+                        [ProviderModelInfo].self, from: JSONEncoder().encode(provider.modelCatalog))
+                } catch {
+                    throw ProviderRoutingError.underlying("Provider \(provider.id) authentication/model catalog could not be read: \(error.localizedDescription). Repair the reported catalog row before using its account list.")
+                }
+                // Eligibility is ProviderRouting's own answer; the state word only says how far it is proven.
+                guard let configured = provider.configured else {
+                    throw ProviderRoutingError.underlying("Provider \(provider.id) has no checked readiness result; refresh its provider catalog.")
+                }
+                authStatus.eligible = configured
+                return try ProviderInfo(
+                    provider_id: provider.id, display_name: provider.displayName ?? provider.id,
+                    auth_modes: modes, auth_status: authStatus, models: models,
+                    auth_mode: string("auth_mode"), default_model: string("default_model"),
+                    models_note: string("models_note")
+                )
+            } catch {
+                let detail = "\(provider.id)'s catalog is unavailable: \(error.localizedDescription)"
+                return ProviderInfo(provider_id: provider.id, display_name: provider.displayName ?? provider.id,
+                    auth_modes: [], auth_status: ProviderAuthStatus(provider_id: provider.id, state: "unavailable",
+                        detail: detail, user_info: nil, last_checked_at: nil, eligible: false),
+                    models: [], models_note: detail)
             }
-            guard var authStatus = try? JSONDecoder.nativeAgent.decode(
-                    ProviderAuthStatus.self, from: JSONEncoder().encode(provider.oauthStatus)
-                ),
-                let models = try? JSONDecoder.nativeAgent.decode(
-                    [ProviderModelInfo].self, from: JSONEncoder().encode(provider.modelCatalog)
-                ) else { return nil }
-            // Eligibility is ProviderRouting's own answer; the state word only says how far it is proven.
-            authStatus.eligible = provider.configured == true
-            return ProviderInfo(
-                provider_id: provider.id, display_name: provider.displayName ?? provider.id,
-                auth_modes: modes, auth_status: authStatus, models: models,
-                auth_mode: string("auth_mode"), default_model: string("default_model"),
-                models_note: string("models_note")
-            )
         }
     }
 
@@ -370,9 +406,9 @@ extension ProvidersFacade {
                     id: model.id,
                     displayName: model.name,
                     description: nil,
-                    defaultReasoningEffort: "medium",
-                    supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
-                    supportsFast: false,
+                    defaultReasoningEffort: model.default_reasoning_effort,
+                    supportedReasoningEfforts: model.supported_reasoning_efforts,
+                    supportsFast: model.supports_fast,
                     priority: 1_000 + index
                 )
             }
@@ -408,10 +444,19 @@ extension ProvidersFacade {
         let path = ChatGPTTransport.preferredAuthPath(
             dataRoot: dataRoot, environment: allowEnvironmentOverride ? environment : [:]
         )
-        let object = (try? Data(contentsOf: path)).flatMap {
-            (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]
+        let status: (usable: Bool, detail: String, health: OAuthCredentialHealth)
+        do {
+            status = try ChatGPTTransport.credentialStatus(at: path)
+        } catch {
+            // This readout is published by an optional configuration refresh.
+            // Keep the failure in the readout, rather than leave a prior signed-in
+            // snapshot behind when that caller discards a thrown refresh error.
+            return CodexAuthStatus(
+                active: "unavailable", appOwnedLoggedIn: false, sharedLoggedIn: false,
+                codexHome: path.deletingLastPathComponent().path,
+                detail: ProviderFailure.diagnosticDescription(error)
+            )
         }
-        let status = ChatGPTTransport.credentialStatus(object, path: path)
         let loggedIn = status.usable
         let appOwned = ChatGPTTransport.codexChildHome(mirroring: path) != nil
         return CodexAuthStatus(

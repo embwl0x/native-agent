@@ -3,7 +3,7 @@ import Foundation
 import CloudKit
 import CryptoKit
 import OSLog
-// Blueprint: | `CloudKitDeviceTransport+Pull.swift` | Cursor-paginated record pulls and retained traversal checkpoints |
+// Blueprint: | `CloudKitDeviceTransport+Pull.swift` | Paginated record pulls with call-local traversal cursors up to the durable server-date watermark |
 
 extension CloudKitDeviceTransport {
     // MARK: pull (cursor-paginated)
@@ -18,16 +18,6 @@ extension CloudKitDeviceTransport {
         NSPredicate(format: "direction == %@", inboundDirection)
     }
 
-    // Paging watermarks compare server modificationDate, including records whose client clocks precede the saved cursor.
-    func serverModDateSortAvailable(recordType: String) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return !serverModDateSortRejected.contains(recordType)
-    }
-
-    func markServerModDateSortRejected(recordType: String) {
-        lock.lock(); serverModDateSortRejected.insert(recordType); lock.unlock()
-    }
-
     func pull(
         recordType: String,
         since: Date?,
@@ -35,24 +25,10 @@ extension CloudKitDeviceTransport {
     ) async throws -> DeviceCKPullResult {
         do {
             return try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.pull", onFailure: accountFailureReporter) {
-                if self.serverModDateSortAvailable(recordType: recordType) {
-                    do {
-                        return try await self.pullPages(
-                            recordType: recordType,
-                            since: since,
-                            inboundDirection: inboundDirection,
-                            orderByServerModDate: true
-                        )
-                    } catch is DeviceCKUnsortableField {
-                        nativeLog("[ck-device] pull: %@ has no sortable ___modTime index; falling back to createdAt order", recordType)
-                        self.markServerModDateSortRejected(recordType: recordType)
-                    }
-                }
                 return try await self.pullPages(
                     recordType: recordType,
                     since: since,
-                    inboundDirection: inboundDirection,
-                    orderByServerModDate: false
+                    inboundDirection: inboundDirection
                 )
             }
         } catch is DeviceCKLandmineTimeout {
@@ -63,24 +39,20 @@ extension CloudKitDeviceTransport {
     private func pullPages(
         recordType: String,
         since: Date?,
-        inboundDirection: String,
-        orderByServerModDate: Bool
+        inboundDirection: String
     ) async throws -> DeviceCKPullResult {
         let query = CKQuery(
             recordType: recordType,
             predicate: Self.makePullPredicate(inboundDirection: inboundDirection)
         )
         query.sortDescriptors = [
-            NSSortDescriptor(key: orderByServerModDate ? "modificationDate" : "createdAt", ascending: false)
+            NSSortDescriptor(key: "modificationDate", ascending: false)
         ]
         let assetSecret = await loadAssetSecretProvider()?()
 
-        let checkpointKey = recordType + ":" + inboundDirection
-        let owner = UUID()
-        let checkpoint = orderByServerModDate ? nil : beginFallbackPull(checkpointKey, owner: owner)
-        var combined = checkpoint?.result ?? DeviceCKPullResult()
-        var nextCursor = checkpoint?.cursor
-        var firstPage = checkpoint == nil
+        var combined = DeviceCKPullResult()
+        var nextCursor: CKQueryOperation.Cursor?
+        var firstPage = true
 
         repeat {
             guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
@@ -98,7 +70,7 @@ extension CloudKitDeviceTransport {
             // The container cannot filter by the watermark, so every poll's
             // first page is fetched whole; a quiet poll's first page almost
             // always reaches it. Keep that page small; a burst pages on at 200.
-            op.resultsLimit = carriesSortDescriptor && orderByServerModDate ? 25 : 200
+            op.resultsLimit = carriesSortDescriptor ? 25 : 200
 
             let holder = DeviceCKPullPageHolder()
             op.recordMatchedBlock = { _, result in
@@ -144,18 +116,7 @@ extension CloudKitDeviceTransport {
                             cont.resume(throwing: Self.mapError(error))
                         }
                     case .failure(let err):
-                        if !orderByServerModDate,
-                           (err as? CKError)?.code == .invalidArguments {
-                            self.saveFallbackPull(nil, key: checkpointKey, owner: owner)
-                        }
-                        // A cursor rejection does not prove that the initial server-date sort was unsupported.
-                        if carriesSortDescriptor,
-                           orderByServerModDate,
-                           Self.rejectsServerModDateSort(err) {
-                            cont.resume(throwing: DeviceCKUnsortableField())
-                        } else {
-                            cont.resume(throwing: Self.mapError(err))
-                        }
+                        cont.resume(throwing: Self.mapError(err))
                     }
                 }
                 self.database.add(op)
@@ -164,39 +125,21 @@ extension CloudKitDeviceTransport {
             combined.records.append(contentsOf: page.records)
             combined.payloadError = combined.payloadError ?? page.payloadError
             let crossedWatermark = Self.pullPageCrossesWatermark(
-                orderByServerModDate: orderByServerModDate,
                 since: since,
                 modificationDates: page.modificationDates
             )
             nextCursor = crossedWatermark ? nil : page.cursor
-            if !orderByServerModDate {
-                saveFallbackPull(nextCursor.map {
-                    DeviceCKPullCheckpoint(result: combined, cursor: $0)
-                }, key: checkpointKey, owner: owner)
-            }
         } while nextCursor != nil
 
         return combined
     }
 
     static func pullPageCrossesWatermark(
-        orderByServerModDate: Bool, since: Date?, modificationDates: [Date?]
+        since: Date?, modificationDates: [Date?]
     ) -> Bool {
-        guard orderByServerModDate, let since else { return false }
+        guard let since else { return false }
         return modificationDates.contains { $0.map { $0 <= since } ?? false }
     }
 
-    private func beginFallbackPull(_ key: String, owner: UUID) -> DeviceCKPullCheckpoint? {
-        lock.lock(); defer { lock.unlock() }
-        fallbackPullOwners[key] = owner
-        return fallbackPullCheckpoints[key]
-    }
-
-    private func saveFallbackPull(_ checkpoint: DeviceCKPullCheckpoint?, key: String, owner: UUID) {
-        lock.lock(); defer { lock.unlock() }
-        // A timed-out or concurrent cancellation read cannot overwrite a newer pull.
-        guard fallbackPullOwners[key] == owner else { return }
-        fallbackPullCheckpoints[key] = checkpoint
-    }
 }
 #endif

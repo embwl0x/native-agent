@@ -3,17 +3,17 @@ import PersistenceCore
 import MacIntegration
 import Synchronization
 import NativeAgentShared
-// Blueprint: | `AgentWorkspacePorts.swift` | `AgentWorkspacePorts` enum; the parts ranking the app door registers, read by the turn glance; workspace row decisions and pure helper faces enter L0 through the caller's native tool port |
+// Blueprint: | `AgentWorkspacePorts.swift` | `AgentWorkspacePorts` enum; PreparedWorkspaceGlance carries text and an owner-stamp delivery callback; the parts ranking the app door registers, read by the turn glance; workspace row decisions and pure helper faces enter L0 through the caller's native tool port |
 
 /// Synchronous projections over the existing conversation owner. The lower
 /// target shares values, never the store, settlement, or send authority.
 package protocol AgentWorkspaceConversationPort: Sendable {
-    func liveHealth(dataRoot: URL) -> [String: AgentLocalHealth]
+    func liveHealth(dataRoot: URL) throws -> [String: AgentLocalHealth]
     func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord]
     func find(dataRoot: URL, scopeSessionID: String, agent: String, label: String?) throws -> AgentConversationRecord?
     func peers(dataRoot: URL) throws -> [AgentWorkspacePeer]
-    func identity(dataRoot: URL) -> AgentContactIdentity
-    func answeredRequests(dataRoot: URL) -> [(message: String?, run: String?, chat: String?, modified: Date)]
+    func identity(dataRoot: URL) throws -> AgentContactIdentity
+    func answeredRequests(dataRoot: URL) throws -> [(message: String?, run: String?, chat: String?, modified: Date)]
     func openHuman(sessionID: String, limit: Int?, dataRoot: URL) async throws -> JSONValue
     func presentation(_ row: AgentConversationRecord) -> JSONValue
     func liveHandOff(_ row: AgentConversationRecord) -> Bool
@@ -21,7 +21,7 @@ package protocol AgentWorkspaceConversationPort: Sendable {
     /// A room in chat `scope` showed her these replies of a contact's (send
     /// id: the words shown); the ones that chat asked for, shown exactly as
     /// saved, are hers there and not handed over again.
-    func shown(answers: [String: String], peer: String, scope: String, dataRoot: URL)
+    func shown(answers: [String: String], peer: String, scope: String, dataRoot: URL) throws
 }
 
 package struct AgentWorkspacePeer: Sendable {
@@ -42,7 +42,7 @@ package struct AgentWorkspacePeer: Sendable {
 package protocol AgentWorkspaceToolPort: Sendable {
     func readout(_ input: JSONValue, dataRoot: URL) async throws -> JSONValue
     func readoutFace(_ input: JSONValue, dataRoot: URL) async -> PartCallResult<PartFace>
-    func usableAgentLanes(dataRoot: URL) -> Set<String>
+    func usableAgentLanes(dataRoot: URL) throws -> Set<String>
     func modelVisibleCatalogToolNames(_ names: Set<String>) -> Set<String>
     /// The `app` action a tool folded into, nil for a tool of its own.
     func appAction(_ tool: String) -> String?
@@ -52,6 +52,19 @@ package protocol AgentWorkspaceToolPort: Sendable {
     func builderSourceRepoRoot(dataRoot: URL) -> URL?
     var listedPeerState: String { get }
     func builtAbilities(dataRoot: URL, now: Date) async -> String
+}
+
+/// Read-only words and their owner-stamp acknowledgement, carried with preparation.
+package struct PreparedWorkspaceGlance: Sendable {
+    package let text: String
+    /// The captured owner stamps, acknowledged only if their text was delivered.
+    /// Bookkeeping failures report repair without failing the accepted reply.
+    package let delivered: (@Sendable (String) -> Void)?
+
+    package init(_ text: String, delivered: (@Sendable (String) -> Void)? = nil) {
+        self.text = text
+        self.delivered = delivered
+    }
 }
 
 /// Bound by the chat entry points for the whole structured workspace operation.
@@ -79,12 +92,12 @@ package enum AgentWorkspacePorts {
 
     /// Her own parts against a message, ranked the way find ranks: the app
     /// door registers its ranking when it starts (`AppToolExecutor`).
-    private static let partsRanking = Mutex<(@Sendable (String, URL) async -> String)?>(nil)
-    package static func rankParts(_ rank: @escaping @Sendable (String, URL) async -> String) {
+    private static let partsRanking = Mutex<(@Sendable (String, URL) async -> PreparedWorkspaceGlance)?>(nil)
+    package static func rankParts(_ rank: @escaping @Sendable (String, URL) async -> PreparedWorkspaceGlance) {
         partsRanking.withLock { $0 = rank }
     }
-    package static func parts(for message: String, dataRoot: URL) async -> String {
-        guard let rank = partsRanking.withLock({ $0 }) else { return "Your own parts could not be read: the app door has not started." }
+    package static func parts(for message: String, dataRoot: URL) async -> PreparedWorkspaceGlance {
+        guard let rank = partsRanking.withLock({ $0 }) else { return PreparedWorkspaceGlance("Your own parts could not be read: the app door has not started.") }
         return await rank(message, dataRoot)
     }
 }

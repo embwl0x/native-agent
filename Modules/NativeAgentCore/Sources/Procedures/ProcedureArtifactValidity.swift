@@ -41,8 +41,7 @@ extension ProcedureArtifactStore {
         }
         let terminalCount = value.transitionTable.filter { $0.terminalClass != nil }.count
         let expectedAbandonConditions = Set(ProcedureCandidateCompiler.deterministicAbandonConditions)
-        return (value.schema == DeclarativeProcedureArtifact.schema
-                || value.schema == DeclarativeProcedureArtifact.legacySchema)
+        return value.schema == DeclarativeProcedureArtifact.schema
             && ProcedureTrajectoryExtractor.isOpaqueIdentity(value.id)
             && compilerIdentityMatches(value)
             && ProcedureTrajectoryExtractor.isOpaqueIdentity(value.procedureShapeIdentity)
@@ -73,7 +72,6 @@ extension ProcedureArtifactStore {
             && validAuthority
             && validApprovalOwner
             && value.canonicalOracle == expectedDomain.oracle
-            && value.deterministicFallback == expectedDomain.fallback
             && value.safety.trustCenterCapability == expectedDomain.capability
             && Set(value.safety.requiredPreconditions) == expectedPreconditions
             && value.safety.requiredPreconditions.count == expectedPreconditions.count
@@ -97,22 +95,12 @@ extension ProcedureArtifactStore {
             && validRules
             && terminalCount == 1
             && !value.inputContract.allowedExternalEffectClasses.contains("external_send")
-            && value.rollbackDeclaration == "delete_artifact_restore_fallback_no_data_migration"
     }
 
-    /// Verify the versioned compiler identity. Original v1 fingerprints admit
-    /// discovery only; execution also requires a full-digest revalidation receipt.
+    /// Only the current compiler identity admits discovery or invocation.
     private static func compilerIdentityMatches(_ value: DeclarativeProcedureArtifact) -> Bool {
         guard let identity = try? value.canonicalIdentity() else { return false }
-        switch value.schema {
-        case DeclarativeProcedureArtifact.schema:
-            return value.id == identity
-        case DeclarativeProcedureArtifact.legacySchema:
-            // Full-digest and original v1 identities both remain discoverable.
-            return value.id == identity || value.id == value.legacyIdentity()
-        default:
-            return false
-        }
+        return value.schema == DeclarativeProcedureArtifact.schema && value.id == identity
     }
 
     static func token(_ raw: String, maximum: Int) -> Bool {

@@ -7,6 +7,7 @@ public enum ContextEligibilityReason: String, Codable, Sendable {
     case deleted
     case tombstoned
     case sourceRemoved = "source_removed"
+    case sourceUnavailable = "source_unavailable"
     case originDenied = "origin_denied"
     case permissionDenied = "permission_denied"
     case surfaceDenied = "surface_denied"
@@ -16,7 +17,6 @@ public enum ContextEligibilityReason: String, Codable, Sendable {
     case expired
     case staleRuntime = "stale_runtime"
     case secretBearing = "secret_bearing"
-    case supersededByConflictResolution = "superseded_by_conflict_resolution"
 }
 public struct ContextEligibilityDecision: Codable, Equatable, Sendable {
     public let atomID: ContextAtomID
@@ -44,11 +44,10 @@ public struct ContextCandidateScoreFeatures: Codable, Equatable, Sendable {
     public let recency: Double
     public let usefulness: Double
     public let decay: Double
-    /// Share of current message tokens covered (0…1); a missing receipt key decodes as 0.
+    /// Share of current message tokens covered (0…1).
     public let messageCoverage: Double
     public internal(set) var diversityBonus: Double
     public internal(set) var redundancyPenalty: Double
-    public let conflictPenalty: Double
     public let characterCostPenalty: Double
     public internal(set) var total: Double
 }
@@ -65,10 +64,9 @@ extension ContextCandidateScoreFeatures {
         recency = try c.decode(Double.self, forKey: .recency)
         usefulness = try c.decode(Double.self, forKey: .usefulness)
         decay = try c.decode(Double.self, forKey: .decay)
-        messageCoverage = try c.decodeIfPresent(Double.self, forKey: .messageCoverage) ?? 0
+        messageCoverage = try c.decode(Double.self, forKey: .messageCoverage)
         diversityBonus = try c.decode(Double.self, forKey: .diversityBonus)
         redundancyPenalty = try c.decode(Double.self, forKey: .redundancyPenalty)
-        conflictPenalty = try c.decode(Double.self, forKey: .conflictPenalty)
         characterCostPenalty = try c.decode(Double.self, forKey: .characterCostPenalty)
         total = try c.decode(Double.self, forKey: .total)
     }

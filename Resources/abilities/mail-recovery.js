@@ -1,11 +1,12 @@
 /* NativeAgent ability
-{"id": "mail-recovery", "kind": "tool", "version": 1, "reach": {"capabilities": []}, "face": {"page": "mail"}, "record": {"description": "Recovery wording for structured mail failure reasons. No app access or effects.", "actions": [], "inputSchema": {"type": "object", "readOnly": true, "properties": {}, "additionalProperties": false}}}
+{"id": "mail-recovery", "kind": "ability", "version": 1, "reach": {"capabilities": []}, "face": {"page": "mail"}, "record": {"description": "Recovery wording for structured mail failure reasons. No app access or effects.", "actions": [], "inputSchema": {"type": "object", "readOnly": true, "properties": {}, "additionalProperties": false}}}
 */
 function run(input) {
     return {
         "missing_query": "Nothing to search for: give a word or phrase in query.",
         "missing_to": "Say who it goes to in to (an email address).",
-        "missing_subject": "Say which message: its message_id and expected_message_id from mail_list_recent, or its subject.",
+        "missing_compose_subject": "Give the new message's subject in subject.",
+        "missing_message_selector": "Say which message: its message_id and expected_message_id from mail_list_recent, or its subject.",
         "missing_body": "Nothing to send or save: put the text in body.",
         "invalid_message_locator": "message_id needs the expected_message_id from the same mail_list_recent row.",
         "message_not_in_inbox": "That message is no longer in the inbox; list it again with mail_list_recent and use the new message_id.",

@@ -32,6 +32,7 @@ struct ChatView: View {
     @State var showsConfiguration = false
     @State var inboxDetailID: String?
     @State var inboxGroup: InboxRelatedGroup?
+    @State var openedAgentContactID: String?
     @Environment(\.dynamicTypeSize) var dynamicTypeSize
     @ScaledMetric(relativeTo: .footnote) private var sessionTabWidth: CGFloat = 156
     @FocusState var composerIsFocused: Bool
@@ -41,9 +42,6 @@ struct ChatView: View {
     var showLatestButton: Bool { !autoFollowChat }
     @State var dismissedSyncError: String?
     @State var showsSyncConnection = false
-    @State var iCloudReplyObserverID: UUID?
-    @State var iCloudRejectionObserverID: UUID?
-    @State var iCloudResyncObserverID: UUID?
     @State var selectedPhotoItems: [PhotosPickerItem] = []
     @State var pendingPhotos: [PendingPhotoAttachment] = []
     @State var pendingFiles: [MultimodalAttachment] = []
@@ -263,6 +261,7 @@ struct ChatView: View {
 
     /// History is an explicit destination; main continuously follows the Mac.
     func adoptMainSessionFromSnapshots(afterClearingDraft: Bool = false) {
+        guard !TalkModeController.shared.isPresented else { return }
         let isInitialBinding = store.selectedSessionID == nil
             && MobileChatSelectionIntent.explicitlySelectedSessionID == nil
         guard !store.isSwitchingSession,
@@ -331,14 +330,7 @@ struct ChatView: View {
         Task { @MainActor in
             defer { closingPinnedSessionIDs.remove(sessionID) }
             do {
-                do {
-                    _ = try await sync.unpinChatSession(sessionId: sessionID)
-                } catch SyncError.responseUnconfirmed {
-                    // Unconfirmed, not failed: the Mac may not have picked it
-                    // up yet. The same request (same message ID) re-checks or
-                    // resends, and closing a tab twice is harmless.
-                    _ = try await sync.unpinChatSession(sessionId: sessionID)
-                }
+                _ = try await sync.unpinChatSession(sessionId: sessionID)
                 // Render the navigation published by the Mac owner after its receipt.
                 await sync.refreshChatSessionListSnapshot()
                 if store.selectedSessionID == sessionID {
@@ -349,11 +341,11 @@ struct ChatView: View {
                     )
                 }
             } catch SyncError.responseUnconfirmed {
-                // Still unconfirmed. The request stays queued for the Mac and
-                // the next pinned-list snapshot drops the tab once it lands;
-                // there is nothing for the person to do yet.
+                // The retained action and published navigation remain the
+                // owners. An expired wait never submits the unpin again.
+                store.errorBanner = "Closing this tab is unconfirmed. Waiting for your Mac's updated tabs."
             } catch {
-                store.errorBanner = "Couldn't close that tab — try again."
+                store.errorBanner = "Couldn't close that tab: \(error.localizedDescription)"
             }
         }
     }

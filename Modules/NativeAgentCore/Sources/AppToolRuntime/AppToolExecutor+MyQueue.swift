@@ -6,7 +6,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `AppToolExecutor+MyQueue.swift` | `AppToolExecutor`: `runMyQueue`, `runHouseFile`; filing receipts report the stored owner and explicitly say when a requested reassignment was not made |
+import TriggerScheduler
+// Blueprint: | `AppToolExecutor+MyQueue.swift` | `runMyQueue`: queue.add/update share system-read local moments and report rejected interpretations; queue.add accepts habit action/args or an action id; queue.update edits only named action/say/when/until fields with retained provenance, null drops the habit or fixed words; done/drop require exact Desk identity and retain committed closure receipts when checkpoint cleanup fails; `runHouseFile` receipts report actual owner and refused reassignment |
 
 extension AppToolExecutor {
     @MainActor
@@ -25,7 +26,11 @@ extension AppToolExecutor {
             // A plain string is a note; an object names its kind.
             refs = values.compactMap { value -> DeskRef? in
                 if case .string(let text) = value { return DeskRef(kind: .note(text: text)) }
-                return DeskRef.fromJSON(value)
+                guard case .object(var fields) = value else { return nil }
+                // Creation supplies the new ref's identity. The stored reader
+                // never invents an identity for an incomplete saved record.
+                if fields["refId"] == nil { fields["refId"] = .string(DeskClock.newRefId()) }
+                return DeskRef.fromJSON(.object(fields))
             }
             guard refs.count == values.count else {
                 return Self.doorRefusal("invalid_input", "Nothing was filed.", remedy: "fix_args",
@@ -54,32 +59,127 @@ extension AppToolExecutor {
             next: ["page": .string("desk")], effects: .unknown) }
     }
 
+    /// "in N minutes|hours|days" as seconds from now; nil for anything else.
+    static func relativeMoment(_ text: String) -> TimeInterval? {
+        let words = text.lowercased().split(separator: " ").map(String.init)
+        guard words.count == 3, words[0] == "in", let count = Double(words[1]), count > 0,
+              let unit = ["minute": 60.0, "minutes": 60, "min": 60, "mins": 60, "hour": 3_600, "hours": 3_600,
+                          "day": 86_400, "days": 86_400][words[2]] else { return nil }
+        return count * unit
+    }
+
     /// MY QUEUE's actions (Wave 2 #7): queue a step, or mark one done or
     /// dropped. Each answers with a receipt naming the item. A step queued on
     /// a peer-steered turn keeps that steer (`PeerDataTaint.carried`).
     @MainActor
     func runMyQueue(verb: String, input: [String: JSONValue], surface: String) async -> JSONValue {
         let store = SwiftNativeDeskStore(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+        let named = Set(input.keys)
+        var input = input
         func text(_ key: String) -> String? {
             input[key]?.scalarText.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
         }
         func receipt(_ entry: MyQueue.Entry, _ change: String) -> JSONValue {
-            .object(["status": .string("ok"), "id": .string(entry.name), "queue": .string(change), "owner": .string("hers"),
+            var fields: [String: JSONValue] = ["status": .string("ok"), "id": .string(entry.name), "queue": .string(change), "owner": .string("hers"),
                      "peerSteering": .object(["sources": .array(entry.step.peers.map(JSONValue.string)),
                                                "elevated": .array(entry.step.elevated.map(JSONValue.string))]),
                      "when": .string(entry.step.when + (entry.step.card.map { " " + $0 } ?? "")),
-                     "confirmation": .string("\(entry.name) \(change): \"\(entry.step.words)\"")])
+                     "confirmation": .string("\(entry.name) \(change): \"\(entry.step.words)\"")]
+            // What the clock heard, on the Mac's clock: the next times it comes back and when it ends.
+            if entry.step.rhythm != nil, change != "done", change != "dropped" {
+                var times: [JSONValue] = [], cursor = Date()
+                while times.count < 3, let next = IntentionClock.next(entry.step, after: cursor) {
+                    times.append(.string(ResidentWake.shown(next))); cursor = next
+                }
+                fields["next"] = .array(times)
+            }
+            // The ending in force, default included, so she can confirm what she set.
+            fields["until"] = .string({ switch MyQueue.until(entry) {
+                case .once: return "once"
+                case .standing: return "standing"
+                case .time(let date): return "at " + ResidentWake.shown(date)
+                case .words(let words): return words
+            } }())
+            if let say = entry.step.say { fields["say"] = .string(say) }
+            fields["habit"] = entry.step.action ?? .null
+            return .object(fields)
         }
         do {
-            if verb == "add" {
+            if verb == "add" || verb == "update" {
+                var editing: MyQueue.Entry?
+                if verb == "update" {
+                    guard let id = text("id") else {
+                        return Self.doorRefusal("invalid_input", "Nothing changed.", remedy: "fix_args", "Pass id: the step's desk.N.")
+                    }
+                    let alias = id.hasPrefix("desk.") ? String(id.dropFirst(5)) : id
+                    guard let entry = MyQueue.entries(try await store.liveState()).first(where: { $0.item.alias == alias || $0.item.handle == id }) else {
+                        return Self.doorRefusal("not_found", "No open step \(id).", remedy: "fix_args", "Read home for its desk.N.")
+                    }
+                    if let session = ChatToolSessionContext.verifiedSessionId,
+                       let by = try await store.hold(entry.item.handle, session: session) {
+                        return Self.doorRefusal("held_by", "\(entry.name) is held by \(by).", remedy: "none", "Leave it to that one.")
+                    }
+                    editing = entry
+                    // Parse the requested fields using add's grammar, keeping omitted fields exact below.
+                    input["text"] = .string(entry.step.words)
+                    if input["when"] == nil { input["when"] = entry.step.rhythm ?? .string(entry.step.when + (entry.step.card.map { " " + $0 } ?? "")) }
+                    if input["until"] == nil { input["until"] = entry.step.until.map(JSONValue.string) ?? .string("once") }
+                    if input["say"] == nil { input["say"] = entry.step.say.map(JSONValue.string) ?? .null }
+                    if input["action"] == nil { input["action"] = entry.step.action ?? .null }
+                }
+                let action = DeskStep.plannedAction(input["action"])
+                if let value = input["action"], value != .null, action == nil {
+                    return Self.doorRefusal("invalid_input", "Nothing changed.", remedy: "fix_args",
+                        "A habit is action:{action:\"authored.<id>\",args:{…}} (or an action id string); action:null drops it.")
+                }
+                if let value = input["say"], value != .null, value.stringValue == nil {
+                    return Self.doorRefusal("invalid_input", "Nothing changed.", remedy: "fix_args", "say is fixed words or null.")
+                }
                 guard let words = text("text") else {
                     return Self.doorRefusal("invalid_input", "Nothing was queued.", remedy: "fix_args", "Pass text: the step in your own words.")
                 }
-                guard let when = MyQueue.When(text("when")) else {
-                    return Self.doorRefusal("invalid_input", "Nothing was queued.", remedy: "fix_args",
-                        "when is next_turn, own_turn, when_user_messages with an optional door, after_card <approval id>, or at <ISO time>.")
+                // A rhythm (a schedule object, "every <5-field cron>", "every N hours") brings it back at each occurrence.
+                let rhythm = input["when"].flatMap { value -> JSONValue? in
+                    if case .string(let raw) = value, !["every", "cron"].contains(raw.split(separator: " ").first.map { $0.lowercased() } ?? "") { return nil }
+                    return SchedulerJobNormalizer.rhythm(value)
                 }
-                if let card = when.card {
+                // A single time given as an object ({at}, {type: once, at}) is an at moment, not a rhythm;
+                // "in 2 minutes" is the at moment that far from now.
+                var whenText = text("when")
+                if let relative = whenText.flatMap(Self.relativeMoment) {
+                    whenText = "at " + ISO8601DateFormatter().string(from: Date().addingTimeInterval(relative))
+                }
+                if rhythm == nil, case .object(let fields)? = input["when"],
+                   let at = (fields["at"] ?? fields["run_at"] ?? fields["runAt"])?.scalarText {
+                    whenText = "at " + at
+                } else if rhythm == nil, case .object? = input["when"] {
+                    return Self.doorRefusal("invalid_input", "Nothing was queued.", remedy: "fix_args",
+                        "A when object is a rhythm in the scheduler's grammar: {type: hourly|daily|weekly|monthly|cron|every, …}, e.g. {type:\"cron\", expression:\"0 9,16 * * *\"}. A single time is at <ISO time>.")
+                }
+                guard let when = rhythm == nil ? MyQueue.When(whenText) : .every else {
+                    let supplied = whenText ?? ""
+                    let moment = supplied.lowercased().hasPrefix("at ") ? String(supplied.dropFirst(3)) : supplied
+                    return Self.doorRefusal("invalid_input", "Nothing was queued.", remedy: "fix_args",
+                        "Read when \"\(supplied)\": \(MyQueue.When.timeReading(moment).interpretation). Use a complete local date/time (e.g. Sun Nov 1 at 06:00) or at <ISO time with offset>. Other moments: next_turn, own_turn, when_user_messages [door], when_user_here, when_user_away, on_news <words>, on <signal>, after_card <id>, in N minutes|hours|days, or a rhythm (every N hours, every <cron>, or a schedule object).")
+                }
+                var untilText = text("until")
+                if let relative = untilText.flatMap(Self.relativeMoment) {
+                    untilText = "at " + ISO8601DateFormatter().string(from: Date().addingTimeInterval(relative))
+                }
+                if case .object(let fields)? = input["until"],
+                   let at = (fields["at"] ?? fields["run_at"] ?? fields["runAt"])?.stringValue,
+                   let moment = MyQueue.When("at " + at), case .at = moment {
+                    untilText = "at " + at
+                } else if let value = input["until"], value != .null, value.stringValue == nil {
+                    return Self.doorRefusal("invalid_input", "Nothing was queued.", remedy: "fix_args",
+                        "until is a moment {at:\"<ISO time>\"}, at <ISO time>, in N minutes|hours|days, words for when it is done, or standing.")
+                }
+                let until = untilText.map { MyQueue.Until($0) } ?? (rhythm == nil ? .once : .standing)
+                if case .time(let ends) = until, ends <= Date(), editing == nil || named.contains("until") {
+                    return Self.doorRefusal("invalid_input", "Nothing was queued.", remedy: "fix_args",
+                        "until \(untilText ?? "") has already passed. Give a time ahead, words for when it is done, or standing.")
+                }
+                if let card = when.card, editing == nil || named.contains("when") {
                     do { _ = try await SwiftNativeApprovalInbox(root: store.dataRoot).get(card) } catch {
                         return Self.doorRefusal("not_found", "No card \(card); nothing was queued.", remedy: "fix_args",
                             "after_card takes the approvalId a carded call returned.")
@@ -87,24 +187,35 @@ extension AppToolExecutor {
                 }
                 let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                                   peerID: ChatToolSessionContext.envelope?.verifiedUserId)
-                let queued = try await MyQueue.add(DeskStep(words: words, when: when.stored, card: when.card, action: text("action"),
+                let proposed = DeskStep(words: words, when: when.stored, card: when.card, action: action,
                                                             peers: steer.sources, elevated: steer.elevated,
                                                             session: ChatToolSessionContext.verifiedSessionId,
                                                             origin: ChatPersistenceContext.originPrincipal,
-                                                            replyRoute: TurnEnvelope.current(surface: surface).persistedMetadata()), store: store)
+                                                            replyRoute: TurnEnvelope.current(surface: surface).persistedMetadata(),
+                                                            rhythm: rhythm, until: until.stored, say: text("say"))
+                if let editing {
+                    var step = editing.step
+                    if named.contains("action") { step.action = proposed.action }
+                    if named.contains("say") { step.say = proposed.say }
+                    if named.contains("when") { step.when = proposed.when; step.card = proposed.card; step.rhythm = proposed.rhythm; step.clockStart = nil }
+                    if named.contains("until") { step.until = input["until"] == .null ? nil : proposed.until }
+                    step.peers = steer.sources; step.elevated = steer.elevated
+                    return receipt(try await MyQueue.update(editing, step: step, store: store), "updated")
+                }
+                let queued = try await MyQueue.add(proposed, store: store)
                 return receipt(queued.entry, queued.change.rawValue)
             }
             guard let id = text("id") else {
                 return Self.doorRefusal("invalid_input", "Nothing changed.", remedy: "fix_args", "Pass id: the step's desk.N from home.")
             }
             let alias = id.lowercased().hasPrefix("desk.") ? String(id.dropFirst(5)) : id
-            guard let entry = MyQueue.entries(try await store.liveState())
-                .first(where: { $0.item.alias == alias || $0.item.handle == id }) else {
+            let open = MyQueue.entries(try await store.liveState())
+            guard let entry = open.first(where: { $0.item.alias == alias || $0.item.handle == id }) else {
                 return Self.doorRefusal("not_found", "\(id) is not an open MY QUEUE step; nothing changed.", remedy: "fix_args",
-                                        "Home's MY QUEUE lists the open steps by desk.N.")
+                                        "\"What I mean to do\" and home's MY QUEUE name each open step by desk.N.")
             }
             if let session = ChatToolSessionContext.verifiedSessionId,
-               let by = (try? await store.hold(entry.item.handle, session: session)) ?? nil {
+               let by = try await store.hold(entry.item.handle, session: session) {
                 return Self.doorRefusal("held_by", "\(entry.name) is held by \(by), which is working it; nothing changed.",
                                         remedy: "none", "Leave it to that one, or pick it up there.", extra: ["held_by": .string(by)])
             }
@@ -112,7 +223,11 @@ extension AppToolExecutor {
             try await MyQueue.finish(entry, dropped: dropped, why: text("reason") ?? (dropped ? "dropped" : "done"), store: store)
             // A stopped skill run's step, closed: the run is closed too, and lets go of what it held.
             if let run = MyQueue.skillRun(in: entry.step.words) {
-                PartRunStore.discard(run, root: store.dataRoot)
+                do { try PartRunStore.discard(run, root: store.dataRoot) }
+                catch {
+                    return .object(Self.partSettlementFailure(Self.partFields(receipt(entry, dropped ? "dropped" : "done")),
+                        error: error, operation: "ability.queue_checkpoint_cleanup", id: run, root: store.dataRoot))
+                }
             }
             return receipt(entry, dropped ? "dropped" : "done")
         } catch {

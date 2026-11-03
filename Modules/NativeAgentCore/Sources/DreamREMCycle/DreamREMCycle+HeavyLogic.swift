@@ -5,7 +5,7 @@ import PersonaEngine
 import NativeAgentCore
 import MemoryV2
 
-// Blueprint: | `DreamREMCycle+HeavyLogic.swift` | REM stateless helpers: persona reads and rendering, durable denial tombstones and old-diary archival; caller retains proposal persistence and approval gating |
+// Blueprint: | `DreamREMCycle+HeavyLogic.swift` | REM stateless helpers: checked persona reads and rendering; durable denial tombstones; archival shares the dream reservation and retains damaged claim sections for repair, preserving live UUID collision copies |
 
 // REM tombstones and diary archival retain their persisted formats.
 
@@ -19,9 +19,16 @@ func readDreamPersonaDocs(
     )
     let snapshot = try await compiler.contextSourceSnapshot(surface: surface)
     // USER carries the pinned core; dreams receive new memories separately.
-    let userCore = MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot)
-        ? await SwiftNativeMemoryV2.userCoreForBackground(dataRoot: dataRoot)
-        : []
+    let userCore: [String]?
+    if try !MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) {
+        userCore = []
+    } else if LLMCallContext.preview {
+        // A preview cannot call unreadable input an empty self-half. The
+        // admitted prompt is identical when the same canonical read succeeds.
+        userCore = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).userPromptCore(surface: "chat")
+    } else {
+        userCore = try await SwiftNativeMemoryV2.userCoreForBackground(dataRoot: dataRoot)
+    }
     var docs: [String: String] = [:]
     for id in ["SOUL", "VOICE", "GROWTH", "USER", "AGENTS"] {
         let raw = snapshot.packet.activeDocs[id] ?? ""
@@ -101,9 +108,8 @@ public actor REMTombstoneStore {
         self.path = dir.appendingPathComponent(".rem_tombstones.json")
     }
 
-    /// Read the fingerprint dictionary or complete legacy JSONL records, upgraded
-    /// on the next mutation. Missing or empty state means no tombstones. A nonempty state
-    /// that cannot be decoded in either supported format fails closed.
+    /// Read the current fingerprint dictionary. Only a missing file means no
+    /// tombstones; unreadable or malformed state preserves its rejection authority.
     public func loadAll() throws -> [String: REMTombstoneRecord] {
         guard fm.fileExists(atPath: path.path) else { return [:] }
         let data: Data
@@ -117,40 +123,8 @@ public actor REMTombstoneStore {
             }
             throw REMTombstoneStoreError.unreadable(path: path.path)
         }
-        guard !data.isEmpty else { return [:] }
-        // The canonical shape is a fingerprint dictionary.
-        if let dict = try? JSONDecoder().decode([String: REMTombstoneRecord].self, from: data) {
-            return dict
-        }
-        // Legacy normText is already lowercase and whitespace-collapsed; hash it unchanged.
-        struct LegacyEntry: Decodable {
-            let targetDoc: String
-            let normText: String
-            let reason: String
-            let recordedAt: String
-        }
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw REMTombstoneStoreError.malformed(path: path.path)
-        }
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
-        guard !lines.isEmpty else {
-            throw REMTombstoneStoreError.malformed(path: path.path)
-        }
-        var migrated: [String: REMTombstoneRecord] = [:]
-        for line in lines {
-            guard let legacy = try? JSONDecoder().decode(LegacyEntry.self, from: Data(line.utf8)) else {
-                throw REMTombstoneStoreError.malformed(path: path.path)
-            }
-            let normText = legacy.normText
-            let fp = _tombstone_fp(normText)
-            migrated[fp] = REMTombstoneRecord(
-                rejected_at: legacy.recordedAt,
-                target_doc: legacy.targetDoc,
-                reason: legacy.reason,
-                preview: String(normText.prefix(200))
-            )
-        }
-        return migrated
+        do { return try JSONDecoder().decode([String: REMTombstoneRecord].self, from: data) }
+        catch { throw REMTombstoneStoreError.malformed(path: path.path) }
     }
 
     private func saveAll(_ dict: [String: REMTombstoneRecord]) throws {
@@ -206,6 +180,11 @@ public actor DreamArchiver {
                 userInfo: [NSLocalizedDescriptionKey: "Dream archive age must be a representable nonnegative day count."])
         }
         let files = try FileBackedDreamDiary(dataRoot: dataRoot).discover(in: .active, matching: .dated)
+        guard !files.isEmpty else { return 0 }
+        guard let reservation = try DreamRunReservation.acquire(at: diary.appendingPathComponent(".dream_run.lock")) else {
+            throw DreamREMCycleError.underlying("dream settlement holds the diary; archival remains owed")
+        }
+        defer { reservation.release() }
         let dateFmt = ISO8601DateFormatter()
         dateFmt.formatOptions = [.withFullDate]
         var moved = 0
@@ -222,6 +201,9 @@ public actor DreamArchiver {
                 try fm.createDirectory(at: archiveDir, withIntermediateDirectories: true)
             }
             let src = diary.appendingPathComponent(name)
+            // Unavailable claim sections stay active until repaired, even past the age cutoff.
+            let content = try String(contentsOf: src, encoding: .utf8)
+            guard DreamClaim.read(in: content).allSatisfy({ $0.unavailable == nil }) else { continue }
             var dst = archiveDir.appendingPathComponent(name)
             if fm.fileExists(atPath: dst.path) {
                 if try Data(contentsOf: src) == Data(contentsOf: dst) {

@@ -40,12 +40,18 @@ extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
             guard case .string(let candidateID)? = object["id"], candidateID == runID else {
                 continue
             }
+            if object["status"] == .string("unavailable") {
+                throw PersistenceCoreError.ioFailure(object["error"]?.stringValue ?? "Browser run \(runID) unavailable")
+            }
             guard matching == nil else {
                 throw BrowserMotorReadModelError.duplicateActionIdentity
             }
             matching = object
         }
-        guard let run = matching else { return nil }
+        guard let run = matching else {
+            try Self.requireIdentifiableRuns(rows)
+            return nil
+        }
         guard case .string(let persistedStatus)? = run["status"] else {
             throw BrowserMotorReadModelError.invalidMatchingRun
         }
@@ -77,8 +83,8 @@ extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
                 verification = .satisfied
                 expectedEvidence = nil
             } else {
-                // Older/manual rows can say succeeded without the navigation
-                // observation. Preserve terminality but do not invent proof.
+                // A successful page effect is not a navigation observation.
+                // Preserve terminality without inventing navigation proof.
                 verification = .unverified
                 expectedEvidence = "browser_navigation_receipt"
             }
@@ -88,24 +94,13 @@ extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
             verification = .failed
             expectedEvidence = nil
             isCancellable = false
-        case "canceled", "cancelled", "denied":
+        case "canceled", "denied":
             phase = .cancelled
             verification = .notRequired
             expectedEvidence = nil
             isCancellable = false
-        case "dry_run":
-            // Browser's canonical cancel owner deliberately accepts dry-run
-            // rows. Do not manufacture terminality merely because a simulation
-            // receipt was emitted; the owner still exposes a real transition.
-            phase = .ready
-            verification = .notRequired
-            expectedEvidence = "browser_run_cancellation"
-            isCancellable = true
         default:
-            phase = .unknown
-            verification = .unknown
-            expectedEvidence = "domain_recovery"
-            isCancellable = false
+            throw BrowserMotorReadModelError.invalidStatusToken
         }
 
         let opaqueID = CausalTransitionEvidence.opaqueIdentity(runID)
@@ -135,31 +130,24 @@ extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
         )
     }
 
-    /// Returns only timestamps whose meaning is exact for the current owner
-    /// state. In particular, `createdAt` is not mislabeled as a terminal update
-    /// for succeeded/failed legacy rows that lack a completion timestamp.
-    private func canonicalMotorTimestamp(run: [String: JSONValue], status: String) throws -> String? {
-        func firstValidTimestamp(_ keys: [String]) throws -> String? {
-            for key in keys {
-                guard let raw = run[key] else { continue }
-                guard case .string(let value) = raw,
-                      Self.isBoundedISOTimestamp(value) else {
-                    throw BrowserMotorReadModelError.invalidTimestamp
-                }
-                return value
-            }
-            return nil
-        }
+    /// Each current state has one writer-owned timestamp; missing evidence is
+    /// an unavailable projection, never a substitute timestamp.
+    private func canonicalMotorTimestamp(run: [String: JSONValue], status: String) throws -> String {
+        let key: String
         switch status {
-        case "canceled", "cancelled":
-            return try firstValidTimestamp(["canceledAt", "updatedAt"])
+        case "canceled":
+            key = "canceledAt"
         case "denied":
-            return try firstValidTimestamp(["deniedAt", "updatedAt"])
+            key = "deniedAt"
         case "succeeded", "failed":
-            return try firstValidTimestamp(["completedAt", "updatedAt"])
+            key = "completedAt"
         default:
-            return try firstValidTimestamp(["updatedAt", "createdAt"])
+            key = "updatedAt"
         }
+        guard let value = run[key]?.stringValue, Self.isBoundedISOTimestamp(value) else {
+            throw BrowserMotorReadModelError.invalidTimestamp
+        }
+        return value
     }
 
     private static func isBoundedMotorToken(_ value: String) -> Bool {

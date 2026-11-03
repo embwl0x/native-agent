@@ -10,17 +10,17 @@ import ProviderRouting
 
 // MARK: - Swift-native planner LLM
 
-/// Shared planner catalog configured by EngineLaunch from the app's live schemas; unconfigured means synthesis-only.
+/// Shared checked planner catalog configured by EngineLaunch from the app's live schemas.
 public enum WorkshopPlannerCatalog {
-    private static let provider = OSAllocatedUnfairLock<@Sendable () async -> [JSONValue]>(initialState: { [] })
+    private static let provider = OSAllocatedUnfairLock<@Sendable () async throws -> [JSONValue]>(initialState: { throw ToolFailureError("Workshop tool catalog has not been configured.", effects: .none, owner: "Workshop catalog", instruction: "Repair catalog setup before planning a task.") })
 
-    public static func configure(_ p: @escaping @Sendable () async -> [JSONValue]) {
+    public static func configure(_ p: @escaping @Sendable () async throws -> [JSONValue]) {
         provider.withLock { $0 = p }
     }
 
-    public static func current() async -> [JSONValue] {
+    public static func current() async throws -> [JSONValue] {
         let current = provider.withLock { $0 }
-        return await current()
+        return try await current()
     }
 }
 
@@ -34,7 +34,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
     /// planner test never appends rows to the developer's live ledger.
     private let runLedgerDataRoot: URL?
     /// Injected tool schemas; the shared live catalog is the default and an empty menu permits synthesis only.
-    private let connectorActionsProvider: @Sendable () async -> [JSONValue]
+    private let connectorActionsProvider: @Sendable () async throws -> [JSONValue]
 
     /// A secondary data root is a separate runtime body. It may use the
     /// executable-search and locale portions of the parent process environment,
@@ -69,7 +69,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
     /// supplied root. This is the construction used by `makeWorkshopRunner`.
     public init(
         dataRoot: URL,
-        connectorActionsProvider: @escaping @Sendable () async -> [JSONValue] = { await WorkshopPlannerCatalog.current() },
+        connectorActionsProvider: @escaping @Sendable () async throws -> [JSONValue] = { try await WorkshopPlannerCatalog.current() },
         lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
     ) {
         let rootedRouter = SwiftNativeProviderRouting(dataRoot: dataRoot)
@@ -92,7 +92,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         llm: (any LLMClient)? = nil,
         router: SwiftNativeProviderRouting? = nil,
         // Every planner uses the app-configured catalog unless one is supplied.
-        connectorActionsProvider: @escaping @Sendable () async -> [JSONValue] = { await WorkshopPlannerCatalog.current() },
+        connectorActionsProvider: @escaping @Sendable () async throws -> [JSONValue] = { try await WorkshopPlannerCatalog.current() },
         lifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
         // Default ON at the real data root so every production construction
         // records runs without a call-site change. Tests that drive plan
@@ -132,19 +132,22 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         let workspaceDirectory = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot).path
 
         // Build tools_summary. Always include chat.synthesize.
-        let connectorActions = await connectorActionsProvider()
+        let connectorActions = try await connectorActionsProvider()
         try Task.checkCancellation()
         var availableTools: [(id: String, description: String)] = []
         var schemas: [String: JSONValue] = [:]
         for action in connectorActions {
             guard case .object(let obj) = action,
                   case .string(let aid) = obj["id"] ?? .null,
-                  !aid.isEmpty else { continue }
+                  !aid.isEmpty else { throw WorkshopExecutionError.plannerFailure("Workshop catalog action has no valid id.") }
             let desc: String = {
                 if case .string(let s) = obj["description"] ?? .null { return s }
                 return aid
             }()
-            if case .object? = obj["parameters"] { schemas[aid] = obj["parameters"] }
+            guard case .object? = obj["parameters"] else {
+                throw WorkshopExecutionError.plannerFailure("Workshop catalog action \(aid) has no object parameter schema.")
+            }
+            schemas[aid] = obj["parameters"]
             availableTools.append((id: aid, description: desc))
         }
         if !availableTools.contains(where: { $0.id == "chat.synthesize" }) {
@@ -154,8 +157,8 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             ))
         }
         // Include the tool menu up to the 200-tool prompt-size bound.
-        let toolsSummary = availableTools.prefix(200).map { t in
-            let schema = schemas[t.id].flatMap { try? $0.serialize(pretty: false) }
+        let toolsSummary = try availableTools.prefix(200).map { t in
+            let schema = try schemas[t.id].map { try $0.serialize(pretty: false) }
             return "  - \(t.id): \(t.description)" + (schema.map { " [schema=\($0)]" } ?? "")
         }.joined(separator: "\n")
 
@@ -335,7 +338,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             let optional: Bool
             switch sobj["optional"] {
             case .bool(let value)?: optional = value
-            case nil: optional = false // Existing callers without this extension remain required.
+            case nil: optional = false // Older plans omit this hint; reads still continue.
             default: throw WorkshopExecutionError.plannerFailure("step optional must be a boolean")
             }
             out.append(WorkshopExecutionStep(

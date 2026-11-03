@@ -85,8 +85,8 @@ final class DelegationDeliveryCache: @unchecked Sendable {
             }
             entry.offset += UInt64(completeEnd - data.startIndex)
             entry.visible = entry.committed
-            // Preserve legacy files with a final JSON object but no newline. This suffix is provisional: a later append re-reads it from the last complete-line offset, without double-counting malformed rows.
-            if completeEnd < data.endIndex { consume(Data(data[completeEnd...]), into: &entry.visible) }
+            // The unfinished append remains behind the committed cursor until
+            // its writer terminates the physical row with a newline.
             entry.visible.ordered = entry.visible.byID.values.sorted(by: DelegationStatusProjector.newestFirst)
             if entry.visible.availability.malformedRecords > 0 { entry.visible.availability.status = "partial" }
             entry.stamp = stamp

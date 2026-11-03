@@ -3,7 +3,7 @@ import GRDB
 import PersistenceCore
 import Experiences
 import NativeAgentShared
-// Blueprint: | `CognitiveSQLiteStore+LivedMoments.swift` | `CognitiveSQLiteStore`: the lived-moment journal (`lived_moments`, migration v8): record owed, save input and meaning, assign fold seq, settle lived or refused, prune settled payload-free rows; checked decoding refuses damaged rows individually with reason, preserves payloads and owes repair; reads legacy sealed requests and `folding` rows (as meant) |
+// Blueprint: | `CognitiveSQLiteStore+LivedMoments.swift` | `CognitiveSQLiteStore`: the current lived-moment journal (`lived_moments`): record owed, save input and meaning, assign fold seq, settle lived or refused, prune settled payload-free rows; checked decoding refuses damaged rows individually with reason, preserves payloads and owes repair |
 
 // THE JOURNAL (docs/SUBCONSCIOUS.md, "Lived moments"). One table in her own
 // cognition store, outside what `clear()` deletes and outside the restore
@@ -12,8 +12,7 @@ import NativeAgentShared
 // from `cognitive_epochs` (domain `fold_seq`) so Clear cannot reset it either.
 
 extension CognitiveSQLiteStore {
-    static func registerLivedMomentsMigration(_ migrator: inout DatabaseMigrator) {
-        migrator.registerMigration("v8_lived_moments") { db in
+    static func createLivedMomentsSchema(_ db: Database) throws {
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS lived_moments (
                     id TEXT PRIMARY KEY NOT NULL,
@@ -26,7 +25,6 @@ extension CognitiveSQLiteStore {
                     mind_epoch INTEGER NOT NULL,
                     body_epoch INTEGER NOT NULL,
                     input_json TEXT,
-                    sealed_json TEXT,
                     meaning_json TEXT,
                     parts_json TEXT NOT NULL DEFAULT '{}',
                     reason TEXT,
@@ -34,13 +32,6 @@ extension CognitiveSQLiteStore {
                 )
                 """)
             try db.execute(sql: "CREATE INDEX IF NOT EXISTS lived_moments_state ON lived_moments(state, accepted_at)")
-        }
-        // Each continuity node knows the last lived moment that stamped or
-        // reconsolidated its feeling. NULL (and every row an older binary
-        // writes) reads as none.
-        migrator.registerMigration("v9_node_lived_seq") { db in
-            try db.execute(sql: "ALTER TABLE cognitive_nodes ADD COLUMN lived_seq INTEGER")
-        }
     }
 
     private static func encoded<T: Encodable>(_ value: T?) throws -> String? {
@@ -61,16 +52,10 @@ extension CognitiveSQLiteStore {
         catch { throw MomentReadFailure.malformed("\(column): \(error)") }
     }
 
-    /// Older rows sealed a second request record. Only its caring evidence is
-    /// used by a refold; care judgments already name their targets in meaning.
-    private struct LegacyRequest: Decodable {
-        var caring: CaringAppraisalRequest?
-    }
 
     private static func moment(_ row: Row) throws -> CognitiveLivedMoment {
         let stateText: String = try row.decode(forColumn: "state")
-        // An older binary's `folding` is a meant row whose fold began.
-        guard let state = CognitiveMomentState(rawValue: stateText == "folding" ? "meant" : stateText) else {
+        guard let state = CognitiveMomentState(rawValue: stateText) else {
             throw MomentReadFailure.malformed("unknown moment state: \(stateText)")
         }
         let seq: Int64? = try row.decode(forColumn: "fold_seq")
@@ -81,6 +66,7 @@ extension CognitiveSQLiteStore {
         }
         let unsettled = state == .owed || state == .meant
         let kind: String = try row.decode(forColumn: "kind")
+        guard kind == "turn" else { throw MomentReadFailure.malformed("unsupported moment kind: " + kind) }
         var input: CognitiveMomentInput?
         var meaning: JSONValue?
         if unsettled {
@@ -95,10 +81,6 @@ extension CognitiveSQLiteStore {
             guard state != .meant || meaning != nil else {
                 throw MomentReadFailure.malformed("meaning_json: meant row has no meaning")
             }
-        }
-        if unsettled, let caring = try decoded(LegacyRequest.self,
-            row.decode(forColumn: "sealed_json"), column: "sealed_json")?.caring {
-            input?.deferred?.caring = caring
         }
         return try CognitiveLivedMoment(
             id: row.decode(forColumn: "id"), life: row.decode(forColumn: "life"), kind: kind,
@@ -145,7 +127,8 @@ extension CognitiveSQLiteStore {
     }
 
     private static func encodedMoment(_ moment: CognitiveLivedMoment) throws -> EncodedMoment {
-        EncodedMoment(moment: moment, input: try encoded(moment.input), meaning: try encoded(moment.meaning))
+        guard moment.kind == "turn" else { throw MomentReadFailure.malformed("unsupported moment kind: " + moment.kind) }
+        return EncodedMoment(moment: moment, input: try encoded(moment.input), meaning: try encoded(moment.meaning))
     }
 
     private static func insert(_ db: Database, _ row: EncodedMoment) throws -> Bool {
@@ -173,15 +156,6 @@ extension CognitiveSQLiteStore {
         return try await dbQueue.write { db -> Bool in try Self.insert(db, row) }
     }
 
-    /// Record several moments in ONE transaction: all land or none do (the
-    /// held-queue import's acknowledgement).
-    public func recordMoments(_ moments: [CognitiveLivedMoment]) async throws {
-        let rows = try moments.map(Self.encodedMoment)
-        try await dbQueue.write { db in
-            for row in rows { _ = try Self.insert(db, row) }
-        }
-    }
-
     public func loadMoment(_ id: String) async throws -> CognitiveLivedMoment? {
         let read = try await dbQueue.read { db -> MomentRead? in
             try Row.fetchOne(db, sql: "SELECT * FROM lived_moments WHERE id = ?", arguments: [id])
@@ -194,10 +168,10 @@ extension CognitiveSQLiteStore {
         return read?.moment
     }
 
-    /// Moments in these states (meant includes an older binary's `folding`),
+    /// Moments in these states,
     /// begun folds by fold seq first, the rest in the order they were accepted.
     public func loadMoments(states: [CognitiveMomentState]) async throws -> [CognitiveLivedMoment] {
-        let names = states.map(\.rawValue) + (states.contains(.meant) ? ["folding"] : [])
+        let names = states.map(\.rawValue)
         guard !names.isEmpty else { return [] }
         let marks = Array(repeating: "?", count: names.count).joined(separator: ",")
         let reads = try await dbQueue.read { db -> [MomentRead] in
@@ -221,7 +195,7 @@ extension CognitiveSQLiteStore {
         let meaning = try Self.encoded(moment.meaning)
         try await dbQueue.write { db in
             try db.execute(sql: """
-                UPDATE lived_moments SET state = ?, input_json = ?, sealed_json = NULL, meaning_json = ?, updated_at = ?
+                UPDATE lived_moments SET state = ?, input_json = ?, meaning_json = ?, updated_at = ?
                 WHERE id = ? AND state NOT IN (?, ?)
                 """, arguments: [moment.state.rawValue, input, meaning, Date().timeIntervalSince1970, moment.id,
                                  CognitiveMomentState.lived.rawValue, CognitiveMomentState.refused.rawValue])
@@ -233,7 +207,7 @@ extension CognitiveSQLiteStore {
     public func settleMoment(_ id: String, as state: CognitiveMomentState, reason: String? = nil) async throws {
         try await dbQueue.write { db in
             try db.execute(sql: """
-                UPDATE lived_moments SET state = ?, input_json = NULL, sealed_json = NULL, meaning_json = NULL,
+                UPDATE lived_moments SET state = ?, input_json = NULL, meaning_json = NULL,
                     reason = ?, updated_at = ?
                 WHERE id = ? AND state NOT IN (?, ?)
                 """, arguments: [state.rawValue, reason, Date().timeIntervalSince1970, id,
@@ -268,7 +242,7 @@ extension CognitiveSQLiteStore {
         try await dbQueue.write { db -> Int in
             try db.execute(sql: """
                 DELETE FROM lived_moments WHERE state IN (?, ?) AND updated_at < ?
-                AND input_json IS NULL AND sealed_json IS NULL AND meaning_json IS NULL
+                AND input_json IS NULL AND meaning_json IS NULL
                 """,
                            arguments: [CognitiveMomentState.lived.rawValue, CognitiveMomentState.refused.rawValue,
                                        date.timeIntervalSince1970])
@@ -279,7 +253,7 @@ extension CognitiveSQLiteStore {
     /// How many moments are not yet lived (owed or meant).
     public func unlivedMomentCount() async throws -> Int {
         try await dbQueue.read { db -> Int in
-            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM lived_moments WHERE kind = 'turn' AND state IN ('owed', 'meant', 'folding')") ?? 0
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM lived_moments WHERE kind = 'turn' AND state IN ('owed', 'meant')") ?? 0
         }
     }
 }

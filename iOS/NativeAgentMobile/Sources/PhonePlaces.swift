@@ -1,10 +1,49 @@
 import CoreLocation
+import Foundation
 import NativeAgentShared
 import SwiftUI
+import UIKit
+// Blueprint: | `PhonePlaces.swift` | Opt-in place monitoring and durable pairing-bound outbox; checked pairing retention, per-observation admission errors and receipt-driven delivery |
 
 @MainActor
 final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
     static let shared = PhonePlaces()
+    var settingControls: [PhoneLocalSetting] {
+        let inventory = PhoneLocalSetting(id: "phone.places", label: "Saved iPhone places", type: "list", read: {
+            try self.requireSettingsAvailable()
+            return self.state.places.map { "\($0.id.lowercased()): \($0.name)" }.joined(separator: "\n")
+        }, ownsChildSettings: true)
+        return [inventory] + state.places.flatMap { place in
+            [PhoneLocalSetting(id: "phone.places.\(place.id.lowercased()).enabled", label: "iPhone place: \(place.name)", type: "boolean",
+                read: {
+                    try self.requireSettingsAvailable()
+                    guard let saved = self.state.places.first(where: { $0.id == place.id }) else {
+                        throw PhoneLocalSetting.failure("This saved place is unavailable. Open iPhone NativeAgent Settings → Places.")
+                    }
+                    return saved.enabled ? "true" : "false"
+                }, write: { value in
+                    let wanted = try PhoneLocalSetting.boolean(value)
+                    if self.state.places.first(where: { $0.id == place.id })?.enabled == wanted { return }
+                    await self.setEnabled(place.id, wanted)
+                    guard self.state.places.first(where: { $0.id == place.id })?.enabled == wanted else {
+                        throw PhoneLocalSetting.failure(self.errorMessage ?? "The saved place switch did not change.")
+                    }
+                }, approval: { value in
+                    let wanted = try PhoneLocalSetting.boolean(value)
+                    try self.requireSettingsAvailable()
+                    guard let saved = self.state.places.first(where: { $0.id == place.id }) else {
+                        throw PhoneLocalSetting.failure("The place is unavailable. Open iPhone NativeAgent Settings → Places and read phone.settings again.")
+                    }
+                    return wanted && !saved.enabled
+                })]
+        }
+    }
+    private func requireSettingsAvailable() throws {
+        guard available else {
+            throw PhoneLocalSetting.failure((errorMessage ?? "Places storage is not ready.")
+                + " Repair phone-places.json in the iPhone app data, then reopen NativeAgent Settings → Places.")
+        }
+    }
     struct Place: Codable, Identifiable {
         var id = UUID().uuidString
         let name: String
@@ -45,6 +84,30 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
     private var reconcileAgain = false
     private var publishing = false
 
+    /// Setup is read from the place owner, never a mirrored enabled/permission latch.
+    var senseSetup: PhoneSenseEvent.Setup {
+        let status = location.authorizationStatus
+        let permission: String = switch status {
+        case .authorizedAlways: "always"
+        case .authorizedWhenInUse: "while-in-use"
+        case .denied: "denied"
+        case .restricted: "restricted"
+        case .notDetermined: "not determined"
+        @unknown default: "unrecognized iOS status"
+        }
+        let precise = location.accuracyAuthorization == .fullAccuracy
+        var missing: [String] = []
+        if !available { missing.append("Places storage not ready; open NativeAgent and check Places") }
+        else if state.places.isEmpty { missing.append("no place added yet") }
+        else if !state.places.contains(where: \.enabled) { missing.append("enable a saved place in NativeAgent Settings → Places") }
+        if status != .authorizedAlways { missing.append("choose Always location in iPhone Settings") }
+        if !precise { missing.append("turn on Precise Location in iPhone Settings") }
+        if !CLLocationManager.locationServicesEnabled() { missing.append("turn on Location Services in iPhone Settings → Privacy & Security") }
+        return .init(enabled: available ? state.places.contains(where: \.enabled) : nil,
+            required: "Location: Always and Precise Location", permission: "\(permission); precise \(precise ? "on" : "off")",
+            missing: missing, detail: available ? "\(state.places.count) saved; \(state.places.filter(\.enabled).count) enabled" : "saved places not yet readable")
+    }
+
     private override init() {
         super.init()
         location.delegate = self
@@ -54,8 +117,10 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         restorationTask = Task {
             do {
                 let restored = try await Task.detached(priority: .utility) {
-                    guard FileManager.default.fileExists(atPath: file.path) else { return State() }
-                    return try JSONDecoder().decode(State.self, from: Data(contentsOf: file))
+                    let data: Data
+                    do { data = try Data(contentsOf: file) }
+                    catch CocoaError.fileReadNoSuchFile { return State() }
+                    return try JSONDecoder().decode(State.self, from: data)
                 }.value
                 state = restored
                 places = restored.places
@@ -65,7 +130,7 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         }
     }
 
-    private func save(_ change: @escaping (inout State) -> Void) async throws {
+    private func save(_ change: @escaping (inout State) throws -> Void) async throws {
         guard available else { throw DeviceSyncError.underlying(message: "Places storage is unavailable.") }
         let previous = mutationTask
         let base = state
@@ -73,7 +138,7 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         let generation = mutationGeneration
         let task = Task {
             var next = try await previous?.value ?? base
-            change(&next)
+            try change(&next)
             try await storage.checkpoint(next, to: file)
             return next
         }
@@ -117,13 +182,15 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         }
         do {
             try await save { state in
-                guard let index = state.places.firstIndex(where: { $0.id == id }) else { return }
+                guard let index = state.places.firstIndex(where: { $0.id == id }) else { throw PhoneLocalSetting.failure("This place is no longer saved.") }
+                try PhoneSettingWrite.check(raising: enabled && !state.places[index].enabled)
                 state.places[index].enabled = enabled
                 state.places[index].inside = nil
                 state.places[index].pairing = enabled ? pairing : nil
                 if !enabled { state.pending.removeAll { $0.event.placeID == id } }
             }
             // Only this explicit enable action can ask for Always access.
+            try PhoneSettingWrite.check(raising: enabled)
             if enabled { location.requestAlwaysAuthorization() }
             resume()
         } catch { errorMessage = error.localizedDescription }
@@ -140,6 +207,8 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
     }
 
     func resume() {
+        // Setup must not wait for CLMonitor's async construction or reconciliation.
+        PhoneSenses.shared.wake()
         reconcileAgain = true
         guard available else { return }
         guard reconcileTask == nil else { return }
@@ -149,13 +218,15 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
                 reconcileAgain = false
                 await reconcile()
             }
+            PhoneSenses.shared.wake()
             await publish()
         }
     }
 
     private func reconcile() async {
-        let pairing = AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests)
         do {
+            guard let store = iCloudBridge.shared.pairingStore else { throw DeviceSyncError.notConfigured }
+            let pairing = try store.sensePairingIdentity()
             try await save { state in
                 for index in state.places.indices where state.places[index].enabled && state.places[index].pairing != pairing {
                     state.places[index].enabled = false
@@ -192,7 +263,11 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
             do {
                 for try await event in await monitor.events {
                     guard !Task.isCancelled, eventsGeneration == generation else { return }
-                    try await observed(event)
+                    // A refused new observation (including a full outbox) is
+                    // this event's error. It must not kill delivery or monitoring.
+                    do { try await observed(event) }
+                    catch { errorMessage = error.localizedDescription }
+                    PhoneSenses.shared.wake()
                     await publish()
                 }
             } catch { errorMessage = "Place monitoring stopped: \(error.localizedDescription)" }
@@ -215,10 +290,12 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
                   state.places[index].inside != inside else { return }
             let previousInside = state.places[index].inside
             state.places[index].inside = inside
-            // The first fix establishes a baseline, not a claimed journey.
-            if previousInside != nil {
+            // A first inside fix is an observation of being here, never a journey.
+            // First outside fixes cannot claim departure from a place never seen.
+            if previousInside != nil || inside {
                 let event = PhonePlaceEvent(id: "place-\(place.id)-\(event.date.timeIntervalSince1970)-\(inside)",
-                    placeID: place.id, name: place.name, transition: inside ? .arrived : .left, timestamp: event.date)
+                    placeID: place.id, name: place.name,
+                    transition: previousInside == nil ? .at : inside ? .arrived : .left, timestamp: event.date)
                 state.pending.append(Pending(event: event, pairing: pairing))
             }
         }
@@ -241,6 +318,7 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
                 _ = try await iCloudBridge.shared.sendChatMessage(id: pending.event.id,
                     text: String(decoding: try JSONEncoder().encode(pending.event), as: UTF8.self),
                     metadata: ["kind": PhonePlaceEvent.messageKind], preparedMessage: pending.envelope,
+                    expectedPairing: pending.pairing,
                     onPrepared: { message in
                         guard self.state.pending.contains(where: { $0.event.id == pending.event.id }),
                               pending.pairing == AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) else {
@@ -265,6 +343,7 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         guard ownsDelivery(id) else { return true }
         do {
             try await save { $0.pending.removeAll { $0.event.id == id } }
+            Task { await publish() }
             return true
         } catch {
             errorMessage = "Place acceptance could not be saved: \(error.localizedDescription)"
@@ -277,6 +356,7 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         if locating { requestFix() }
         // Launch wiring calls resume after binding the pairing store.
         if monitor != nil { resume() }
+        else if available { PhoneSenses.shared.wake() }
     }
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let name = newName else { return }
@@ -288,7 +368,10 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         }
         let latitude = fix.coordinate.latitude, longitude = fix.coordinate.longitude
         Task {
-            do { try await save { $0.places.append(Place(name: name, latitude: latitude, longitude: longitude)) } }
+            do {
+                try await save { $0.places.append(Place(name: name, latitude: latitude, longitude: longitude)) }
+                resume()
+            }
             catch { errorMessage = error.localizedDescription }
         }
     }
@@ -304,7 +387,7 @@ struct PhonePlacesSettings: View {
     var body: some View {
         AliveSection("Places") {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Let your agent know when this phone arrives or leaves. Save your current location, then enable the place.")
+                Text("Shares enabled place names and arrival/departure times through your paired iCloud connection to your Mac and the AI provider selected there. When you ask your agent to inspect phone settings, saved place names and switches are also shared, including disabled places; coordinates stay on this phone. Save your current location, then enable the place.")
                     .font(.footnote).foregroundStyle(AlivePalette.secondary)
                 ForEach(places.places) { place in
                     HStack {

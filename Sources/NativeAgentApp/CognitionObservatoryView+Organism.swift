@@ -200,7 +200,7 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
             .init(label: "Dreams", value: snapshot.bodySchema.dreamHealthy ? "healthy" : "attention"),
             .init(label: "Tools", value: snapshot.bodySchema.toolHandsAvailable ? "available" : "unavailable"),
             .init(label: "Approvals", value: snapshot.bodySchema.approvalChannelsOpen ? "open" : "closed"),
-            .init(label: "Notifications", value: snapshot.bodySchema.notificationPathHealthy ? "healthy" : "attention"),
+            .init(label: "Notifications", value: snapshot.bodySchema.notificationPathHealthy.map { $0 ? "healthy" : "attention" } ?? "unknown"),
             .init(label: "Resource pressure", value: snapshot.bodySchema.resourcePressure.rawValue),
         ]
     }

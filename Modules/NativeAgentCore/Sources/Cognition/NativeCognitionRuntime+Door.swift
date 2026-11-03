@@ -41,6 +41,9 @@ extension NativeCognitionRuntime {
         // door: no fold, Clear or Reset runs inside the opening.
         await enterDoor()
         do {
+            if let cognitiveStoreOpeningFailure {
+                throw PersistenceCoreError.ioFailure(cognitiveStoreOpeningFailure)
+            }
             try await substrate.restorePersistentState()
         } catch {
             bootstrapFailure = "cognitive restore failed: \(error.localizedDescription)"
@@ -84,16 +87,14 @@ extension NativeCognitionRuntime {
         guard !isFlushedForTermination, !Task.isCancelled else { return }
         await reconcilePendingApprovalExpectationsAtBootstrap()
         await restoreProviderLifecycleEvidence()
-        await retireProviderVitalsNotices()
         await host.archiveSupersededMorningBriefs(dataRoot: dataRoot)
+        await finishOwedCarriedSettlements()
         await startPursuitRefresh()
         await refreshOrganismBodySchema(reason: "bootstrap")
         await persistOrganismContinuity(reason: "bootstrap")
         await rescheduleResidualRepairDeadline()
         await rescheduleCognitionMaintenanceDeadline()
         publishRuntimeChange(reason: "bootstrap")
-        await readRecentLifeIntoCaresIfOwed()
-        guard !isFlushedForTermination, !Task.isCancelled else { return }
         await moveMomentsIntoCaresOnce()
         guard !isFlushedForTermination, !Task.isCancelled else { return }
         await liveOwedMomentsAtWake()
@@ -120,16 +121,19 @@ extension NativeCognitionRuntime {
         // Restore may finish during sleep, but cannot open new producers.
         await bootstrapTask?.value
         sourceWakes.cancelObservations()
-        let producers = [bootstrapChoresTask, recentLifeTask, studioWanderTask,
+        let producers = [rhythm.observation, rhythm.refresh, bootstrapChoresTask, studioWanderTask,
             reflectionEventTask, studioCanonTask, horizonRefreshTask, reachTask,
-            pursuitRefreshTask, pursuitObservationTask, carriedExperienceObservationTask,
+            pursuitRefreshTask, pursuitObservationTask, carriedExperienceObservationTask, turnIdleObservationTask,
             approvalLifecycleObservationTask, replayRetryTask,
             sourceWakes.canonObservation, sourceWakes.horizonObservation,
             sourceWakes.reachObservation, sourceWakes.clockObservation, sourceWakes.careObservation]
         for producer in producers { producer?.cancel() }
         for producer in producers { await producer?.value }
+        // Durable replay owns its exit. Sleep joins it without cancelling a commit.
+        await eventReplayTask?.value
+        await replayTask?.value
+        settleRhythmForSleep()
         bootstrapChoresTask = nil
-        recentLifeTask = nil
         studioCanonTask = nil
         horizonRefreshTask = nil
         reachTask = nil
@@ -140,6 +144,7 @@ extension NativeCognitionRuntime {
         pursuitRefreshQueued = false
         pursuitObservationTask = nil
         carriedExperienceObservationTask = nil
+        turnIdleObservationTask = nil
         pursuitRefreshTask = nil
         residualDeadline.invalidate()
         cognitionDeadline.invalidate()
@@ -173,10 +178,12 @@ extension NativeCognitionRuntime {
         var substrateResult = "saved"
         if bootstrapFailure == nil {
             await substrate.observe(sleepEvent)
-            await substrate.runMaintenance(reason: "app termination")
+            do { _ = try await substrate.runMaintenanceChecked(reason: "app termination") } catch {
+                substrateResult = "maintenance not saved: \(error)"
+            }
             // One checked final flush of affect AND nodes; the outcome is it.
             do { try await substrate.persistAffectAndNodes() } catch {
-                substrateResult = "not saved: \(error)"
+                substrateResult += "; checkpoint not saved: \(error)"
             }
         } else {
             substrateResult = "not saved: her substrate's restore failed this session"
@@ -213,7 +220,6 @@ extension NativeCognitionRuntime {
             lived: { [weak self] id in await self?.settleMoment(id, as: .lived) },
             refuse: { [weak self] id, reason in await self?.settleMoment(id, as: .refused, reason: reason) },
             unlived: { [weak self] in await self?.unlivedMoments() },
-            importHeld: { [weak self] turns in await self?.importHeldMoments(turns) ?? false },
             moment: { [weak self] id in
                 await self?.readMoment(id)
             }
@@ -237,8 +243,21 @@ extension NativeCognitionRuntime {
             return nil
         }
         var deferred: CognitiveDeferredTurnRecord?
-        if let origin = turn.origin { deferred = await substrate.deferredTurnRecord(origin: origin) }
+        let admission: CognitiveDeferredTurnRecord?
+        if let origin = turn.origin { admission = await substrate.deferredTurnRecord(origin: origin) }
+        else { admission = nil }
         let current = await substrate.forgettingEpochs()
+        if turn.isCareWake {
+            // A care wake's own admission is its captured arrival and reply;
+            // it owes care reading, not an ordinary incoming-word appraisal.
+            let event = CognitiveEvent(id: id, kind: .userMessageReceived,
+                subject: CognitiveSubjectReference(type: "turn", id: messageId),
+                sourceClass: .observed, occurredAt: turn.occurredAt ?? now(),
+                summary: turn.asked,
+                metadata: ["messageId": .string(messageId), "sessionId": .string(turn.sessionId)])
+            deferred = CognitiveDeferredTurnRecord(event: event, caring: nil,
+                mindEpoch: admission?.mindEpoch ?? current.mind, bodyEpoch: admission?.bodyEpoch ?? current.body)
+        } else { deferred = admission }
         let factsOnly = !(await substrate.configurationSnapshot()).enabled
         let livedAt = turn.occurredAt ?? deferred?.event.occurredAt ?? now()
         let moment = CognitiveLivedMoment(
@@ -247,7 +266,7 @@ extension NativeCognitionRuntime {
             input: CognitiveMomentInput(turn: turn, deferred: deferred, factsOnly: factsOnly ? true : nil))
         do {
             try await cognitiveStore.recordMoment(moment)
-            if let deferred { await substrate.releaseDeferredTurn(deferred) }
+            if let admission { await substrate.releaseDeferredTurn(admission) }
             return id
         } catch {
             await noteMomentUnrecorded(id, why: String(describing: error))
@@ -266,8 +285,18 @@ extension NativeCognitionRuntime {
             await noteMomentReadFailed(id, why: "ordinary turn context is unavailable")
             return nil
         }
-        let context = await substrate.afterTurnContext(record: record,
-            exchange: row.state == .owed ? origin.userMessage + "\n" + reply : nil)
+        let context: AfterTurnContext
+        do {
+            context = try await substrate.afterTurnContext(record: record,
+                exchange: row.state == .owed ? origin.userMessage + "\n" + reply : nil,
+                careWakes: row.input?.turn?.isCareWake == true ? row.input?.turn?.careWakes ?? [] : [])
+        } catch {
+            RepairOwed.owe(dataRoot, id: "moment-context:" + id, kind: .run,
+                operation: "cognition.moment.context:" + id, owner: "memory/embedding",
+                words: "This moment's care context is unavailable: \(error.localizedDescription)",
+                tap: "Repair the embedding owner in Settings → Memory. The moment remains owed.")
+            return nil
+        }
         if row.state == .owed {
             row.input?.deferred?.caring = context.caring
             do { try await cognitiveStore.saveMoment(row) } catch {
@@ -327,33 +356,6 @@ extension NativeCognitionRuntime {
         return live
     }
 
-    /// Held turns (the retired `memory/moments_held.json`) become owed moments,
-    /// all in one transaction. They were held for their facts only: with no
-    /// recorded deferred-turn entry they prepare no context and never fold.
-    func importHeldMoments(_ turns: [CognitiveMomentTurn]) async -> Bool {
-        await bootstrap()
-        guard let cognitiveStore, let life = try? DataRootLife.current(in: dataRoot) else { return false }
-        let epochs = await substrate.forgettingEpochs()
-        let accepted = now()
-        let moments = turns.map { turn -> CognitiveLivedMoment in
-            let stamp = String(format: "%.0f", (turn.occurredAt ?? accepted).timeIntervalSince1970.rounded(.towardZero) + 0)
-            let identity = CognitiveLivedMoment.turnID(
-                sessionId: turn.sessionId,
-                messageId: turn.messageId ?? "held:\(turn.turnId ?? "")@\(stamp)")
-            return CognitiveLivedMoment(
-                id: identity, life: life, kind: "turn", livedAt: turn.occurredAt ?? accepted,
-                acceptedAt: accepted, state: .owed, mindEpoch: epochs.mind, bodyEpoch: epochs.body,
-                input: CognitiveMomentInput(turn: turn, factsOnly: true))
-        }
-        do {
-            try await cognitiveStore.recordMoments(moments)
-            return true
-        } catch {
-            nativeLog("cognition: held turns not imported: %@", String(describing: error))
-            return false
-        }
-    }
-
     /// THE FOLD (docs/SUBCONSCIOUS.md, "Lived moments"): one moment, once, in
     /// the order the door folds it. The moment's fold seq is assigned (once; a
     /// refold keeps it), the mind's share is lived by the substrate and the
@@ -378,7 +380,8 @@ extension NativeCognitionRuntime {
     /// Enter the door: wait while a fold, Clear, Reset Body or restore holds it.
     func enterDoor() async {
         while doorHeld {
-            await withCheckedContinuation { doorWaiters.append($0) }
+            let done = doorDone
+            await Task { await done.park() }.value
         }
         doorHeld = true
     }
@@ -386,9 +389,8 @@ extension NativeCognitionRuntime {
     /// Leave the door; every waiter re-checks it.
     func leaveDoor() {
         doorHeld = false
-        let waiters = doorWaiters
-        doorWaiters.removeAll()
-        for waiter in waiters { waiter.resume() }
+        doorDone.resume()
+        doorDone = ScopedWaiter()
     }
 
     /// The fold itself, for a caller that already holds the door.
@@ -409,11 +411,11 @@ extension NativeCognitionRuntime {
         // The caring receipt is a projection of the first fold; a refold never
         // writes or relabels it.
         if row.foldSeq == nil, let request = context.caring {
-            await CaringReceiptLog.shared.record(request, model: interpretation.model,
+            await caringReceiptLog.record(request, model: interpretation.model,
                 surface: interpretation.surface, verdict: interpretation.caring)
         }
         let mind = await substrate.foldTurn(
-            context, record: record, appraisal: interpretation.affect,
+            context, record: record, incoming: row.input?.turn?.asked, appraisal: interpretation.affect,
             caring: interpretation.caring, cares: interpretation.cares,
             appAuthored: interpretation.appAuthored, seq: seq, momentID: momentID)
         await caresSourceChanged()
@@ -425,7 +427,7 @@ extension NativeCognitionRuntime {
         }
         // A retained correction from the person raises confidence according to
         // the recorded interpretation's correction decision.
-        let corrected = context.event.sourceClass != .imported && interpretation.memories.contains(where: {
+        let corrected = context.careWakes.isEmpty && context.event.sourceClass != .imported && interpretation.memories.contains(where: {
             $0.kind == "correction" && $0.action != .skip && $0.confidence >= MemoryManagerLane.confidenceFloor
         })
         let bodySaved = await foldBody(OrganismTurnFold(
@@ -452,13 +454,13 @@ extension NativeCognitionRuntime {
         switch outcome {
         case .refused:
             if let reading = fold.caring {
-                await CaringReceiptLog.shared.amendReceipt(session: reading.session, turn: reading.turn,
+                await caringReceiptLog.amendReceipt(session: reading.session, turn: reading.turn,
                                                        outcome: .refused, tendernessAfter: await tenderness())
             }
             return true
         case .forgotten:
             if let reading = fold.caring {
-                await CaringReceiptLog.shared.amendReceipt(session: reading.session, turn: reading.turn,
+                await caringReceiptLog.amendReceipt(session: reading.session, turn: reading.turn,
                                                        outcome: .forgotten, tendernessAfter: await tenderness())
             }
             return true
@@ -466,7 +468,7 @@ extension NativeCognitionRuntime {
             break
         case .lived(let caring):
             if let caring, let reading = fold.caring {
-                await CaringReceiptLog.shared.amendReceipt(session: reading.session, turn: reading.turn,
+                await caringReceiptLog.amendReceipt(session: reading.session, turn: reading.turn,
                                                        outcome: caring, tendernessAfter: await tenderness())
             }
         }
@@ -489,14 +491,22 @@ extension NativeCognitionRuntime {
         for row in rows where row.life == life && row.kind == "turn" && row.foldSeq != nil {
             guard let record = row.input?.deferred,
                   let meaning = row.meaning.flatMap(AdaptiveMemoryPromoter.decodedMeaning) else { continue }
-            let context = await substrate.afterTurnContext(record: record)
-            _ = await foldInsideDoor(context, interpretation: meaning, momentID: row.id)
+            do {
+                let context = try await substrate.afterTurnContext(record: record,
+                    careWakes: row.input?.turn?.isCareWake == true ? row.input?.turn?.careWakes ?? [] : [])
+                _ = await foldInsideDoor(context, interpretation: meaning, momentID: row.id)
+            } catch {
+                RepairOwed.owe(dataRoot, id: "moment-context:" + row.id, kind: .run,
+                    operation: "cognition.moment.context:" + row.id, owner: "memory/embedding",
+                    words: "This recorded moment's care context remains unavailable: \(error.localizedDescription)",
+                    tap: "Repair the embedding owner in Settings → Memory. Its completed shares will not be repeated.")
+            }
         }
     }
 
     /// How long a SETTLED moment's identity is kept: long past any
     /// re-delivery of the same message (a producer records at transcript
-    /// settlement, within seconds; the held file is emptied once imported),
+    /// settlement, within seconds),
     /// so the journal never grows forever. An unsettled row is kept however old.
     static let settledMomentRetention: TimeInterval = 30 * 24 * 60 * 60
 

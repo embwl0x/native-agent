@@ -14,6 +14,9 @@ import TurnTrace
 
 public final class ChatGPTTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
+    /// This transport sends no output-cap field.
+    public func requestOutputTokens(model: String) throws -> Int { 0 }
+
     public let providerId: String = "openai_oauth_direct"
 
     public static let productionSession: URLSession = makeProductionSession()
@@ -162,9 +165,8 @@ public final class ChatGPTTransport: LLMTransport {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        try await LLMMessageStreamEvent.reply(collecting:
-            streamMessages(messages: messages, system: system, model: model, tools: tools)
-        )
+        return try await LLMMessageStreamEvent.reply(collecting:
+            self.streamMessages(messages: messages, system: system, model: model, tools: tools), using: telemetry)
     }
     public func streamMessages(
         messages: [LLMMessage],
@@ -216,11 +218,13 @@ public final class ChatGPTTransport: LLMTransport {
                         }
                         var req = try responsesRequest(accessToken: access)
 
-                        let accountRow = accountModel(coercedModel)
+                        guard let accountRow = accountModel(coercedModel) else {
+                            throw LLMError.providerError(message: "The selected ChatGPT account's controls for \(coercedModel) are unavailable. Refresh its models in Providers.")
+                        }
                         let bodyDict = try Self.buildResponsesBodyFromMessages(
                             model: coercedModel, messages: messages, system: system, tools: tools,
-                            supportedEfforts: accountRow?.supportedReasoningEfforts,
-                            supportsFast: accountRow?.supportsFast
+                            supportedEfforts: accountRow.supportedReasoningEfforts,
+                            supportsFast: accountRow.supportsFast
                         )
                         do {
                             req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [.sortedKeys])
@@ -266,6 +270,7 @@ public final class ChatGPTTransport: LLMTransport {
                 }
                 continuation.finish(throwing: LLMError.notConfigured(provider: "openai_oauth_direct"))
             }
+            ProviderReplyWork.current?.own(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }

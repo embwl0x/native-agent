@@ -18,7 +18,8 @@ public struct ContextSelector: Sendable {
     public func select(
         _ need: NeedSignal,
         from generation: ContextStoredGeneration,
-        pinnedTo snapshot: ContextGenerationSnapshot? = nil
+        pinnedTo snapshot: ContextGenerationSnapshot? = nil,
+        sourceReadFailures: [ContextDegradedSourceNotice]
     ) throws -> ContextPacket {
         let selectionStarted = DispatchTime.now().uptimeNanoseconds
         guard need.characterBudget > 0 else { throw ContextSelectionError.invalidCharacterBudget }
@@ -40,14 +41,6 @@ public struct ContextSelector: Sendable {
             }
         }
 
-        let groups = try conflictGroups(for: need, generation: generation)
-        let resolutionLosers: [ContextAtomID: ContextEligibilityReason] = Dictionary(
-            groups.flatMap { group -> [(ContextAtomID, ContextEligibilityReason)] in
-            guard let resolved = group.resolvedAtomID else { return [] }
-            return group.memberAtomIDs.filter { $0 != resolved }.map {
-                ($0, ContextEligibilityReason.supersededByConflictResolution)
-            }
-        }, uniquingKeysWith: { first, _ in first })
         let sourceByID = Dictionary(generation.sources.map {
             ($0.descriptor.id, $0)
         }, uniquingKeysWith: { first, _ in first })
@@ -61,8 +54,7 @@ public struct ContextSelector: Sendable {
                 for: atom,
                 generationID: generation.generation.id,
                 source: sourceByID[atom.draft.sourceID],
-                need: need,
-                resolutionReason: resolutionLosers[atom.draft.id]
+                need: need
             )
             decisions.append(ContextEligibilityDecision(
                 atomID: atom.draft.id,
@@ -78,13 +70,6 @@ public struct ContextSelector: Sendable {
             $0.draft.injectionPolicy == .always
                 && !need.precoveredSourceIDs.contains($0.draft.sourceID)
         }.map(\.draft.id))
-        for group in groups where group.resolvedAtomID == nil
-            && !mandatoryIDs.isDisjoint(with: group.memberAtomIDs) {
-            mandatoryIDs.formUnion(group.memberAtomIDs.filter {
-                atomByID[$0]?.draft.injectionPolicy != .onDemand
-            })
-        }
-
         let eligibleIDs = Set(eligible.map(\.draft.id))
         let unavailableMandatory = mandatoryIDs.subtracting(eligibleIDs).sorted()
         guard unavailableMandatory.isEmpty else {
@@ -102,7 +87,6 @@ public struct ContextSelector: Sendable {
             )
         }
 
-        let conflictedIDs = Set(groups.filter { $0.resolvedAtomID == nil }.flatMap(\.memberAtomIDs))
         // Precovered sources are already present in the stable prompt. Keep
         // their eligibility receipts, but do not spend per-turn ranking work
         // on atoms that cannot become dynamic candidates. Explicit mandatory
@@ -126,8 +110,7 @@ public struct ContextSelector: Sendable {
                 need: need,
                 context: scoreContext,
                 lexicalEntry: lexicalIndex[atom.draft.id]
-                    ?? ContextSelectionIndexEntry(atom: atom.draft),
-                hasUnresolvedConflict: conflictedIDs.contains(atom.draft.id)
+                    ?? ContextSelectionIndexEntry(atom: atom.draft)
             )
         }
         let baseScores = scores
@@ -152,16 +135,16 @@ public struct ContextSelector: Sendable {
             .filter { !need.precoveredSourceIDs.contains($0.draft.sourceID) }
             .filter { relevance(of: scores[$0.draft.id]) >= configuration.minimumRelevance }
             .sorted { rankedBefore($0, $1, scores: scores) }
-        // Memories need touch past chance across all readings, then rank by relevance × reachability.
+        // Memories need touch past the fixed standout floor in any reading, then rank by relevance × reachability.
         // Recent service rests unless the message singles it out. Corrections share the rows;
-        // triggered scoped corrections are mandatory. Unresolved conflicts stay atomic below.
+        // triggered scoped corrections are mandatory.
         let memoryKinds: Set<ContextAtomKind> = [.memory, .correction]
         let memoryTouch = memoryRelevance(
             scorable.filter { memoryKinds.contains($0.draft.kind) }, need: need, scores: baseScores
         )
         let relevanceByAtom = memoryTouch.relevance
         let smallMemoryPopulation = relevanceByAtom.count < 3
-        // The chance bar counts every look: memories × readings of the message.
+        // The floor is fixed; receipt population does not adjust it.
         let relevanceFloor = memoryStandout
         let restFloor = memoryStandout + 1
         func touched(_ atom: ContextStoredAtom) -> Bool {
@@ -204,8 +187,7 @@ public struct ContextSelector: Sendable {
             }
         }
         let memoryPicks = memoryCandidates.filter {
-            memoryRank[$0.draft.id] != nil && $0.draft.injectionPolicy != .onDemand
-                && !conflictedIDs.contains($0.draft.id)
+            memoryRank[$0.draft.id] != nil
         }.sorted {
             let left = memoryRank[$0.draft.id] ?? 0, right = memoryRank[$1.draft.id] ?? 0
             if left != right { return left > right }
@@ -226,21 +208,12 @@ public struct ContextSelector: Sendable {
         let boundedCandidates = Array(rankedCandidates.prefix(configuration.maximumCandidates))
         let candidateIDs = Set(boundedCandidates.map(\.draft.id)).union(memoryPicks.map(\.draft.id))
 
-        // Admission, not candidacy: score/conflict receipts keep untouched
-        // memories, but conflict units cannot carry them back into the packet.
         let admittedCandidates = boundedCandidates.filter {
-            !flooredMemoryIDs.contains($0.draft.id)
+            !flooredMemoryIDs.contains($0.draft.id) && !memoryKinds.contains($0.draft.kind)
         }
-        var units = makeSelectionUnits(
-            candidates: admittedCandidates.filter {
-                $0.draft.injectionPolicy != .onDemand
-                    && (!memoryKinds.contains($0.draft.kind) || conflictedIDs.contains($0.draft.id))
-            },
-            groups: groups,
-            atomByID: atomByID,
-            candidateIDs: Set(admittedCandidates.map(\.draft.id)),
-            mandatoryIDs: mandatoryIDs
-        )
+        var units = admittedCandidates.map {
+            SelectionUnit(stableKey: "atom:\($0.draft.id.rawValue)", atoms: [$0])
+        }
         var selectedDynamicCount = 0
         var usedCharacters = mandatoryCharacters
         var sourceCounts: [ContextSourceID: Int] = [:]
@@ -248,7 +221,7 @@ public struct ContextSelector: Sendable {
         // The memory rows are taken BEFORE the ordinary lane runs, so ops
         // cannot crowd out what the message touched.
         for atom in memoryPicks where selectedDynamicCount < configuration.maximumDynamicAtoms {
-            let unit = SelectionUnit(stableKey: "atom:\(atom.draft.id.rawValue)", conflictID: nil, atoms: [atom])
+            let unit = SelectionUnit(stableKey: "atom:\(atom.draft.id.rawValue)", atoms: [atom])
             guard quotaAllows(
                 unit,
                 sourceCounts: sourceCounts,
@@ -267,7 +240,6 @@ public struct ContextSelector: Sendable {
             sourceCounts[item.pointer.sourceID, default: 0] += 1
             kindCounts[item.pointer.kind, default: 0] += 1
         }
-        var omittedConflictIDs = Set<String>()
         let selectedTokenSets = selectedItems.map { Self.tokens($0.text) }
         var redundancyByAtom = Dictionary(boundedCandidates.map { atom in
             (
@@ -325,7 +297,6 @@ public struct ContextSelector: Sendable {
                     generationID: generation.generation.id,
                     remainingCharacters: need.characterBudget - usedCharacters
                       ) else {
-                    if let conflictID = unit.conflictID { omittedConflictIDs.insert(conflictID) }
                     continue
                 }
                 selectedPlan = planned
@@ -368,24 +339,15 @@ public struct ContextSelector: Sendable {
             pointers.append(item.pointer)
         }
 
-        let conflicts = groups.map { group in
-            conflictSet(
-                group,
-                generationID: generation.generation.id,
-                atomByID: atomByID,
-                eligibleIDs: eligibleIDs,
-                candidateIDs: candidateIDs,
-                selectedIDs: selectedIDs,
-                omittedConflictIDs: omittedConflictIDs
-            )
-        }.sorted { $0.id < $1.id }
-        let degraded = generation.sources.filter { $0.health == .degraded }.map {
+        let storedDegraded = generation.sources.filter { $0.health == .degraded }.map {
             ContextDegradedSourceNotice(
                 sourceID: $0.descriptor.id,
-                reason: $0.lastError.map { "last known good source retained: \($0)" }
+                reason: $0.lastError.map { "source unavailable; its retained atoms are withheld: \($0)" }
                     ?? "last known good source retained"
             )
         }.sorted { $0.sourceID < $1.sourceID }
+        let degraded = Dictionary((storedDegraded + sourceReadFailures).map { ($0.sourceID, $0) },
+            uniquingKeysWith: { _, current in current }).values.sorted { $0.sourceID < $1.sourceID }
         let budget = ContextBudgetUsage(
             characterLimit: need.characterBudget,
             usedCharacters: usedCharacters,
@@ -426,7 +388,6 @@ public struct ContextSelector: Sendable {
             mandatoryCoverage: mandatoryIDList.isEmpty
                 ? 1
                 : Double(coveredMandatory.count) / Double(mandatoryIDList.count),
-            conflicts: conflicts,
             budget: budget,
             degradedSources: degraded,
             cacheState: need.cacheState,
@@ -442,7 +403,6 @@ public struct ContextSelector: Sendable {
             sourceFingerprint: generation.generation.sourceFingerprint,
             selectedItems: selectedItems,
             expandablePointers: Array(pointers),
-            conflictSets: conflicts,
             degradedSources: degraded,
             budget: budget,
             receipt: receipt
@@ -470,6 +430,7 @@ extension ContextSelector {
         if need.deletedAtomIDs.contains(id) { return (.deleted, .deleted(id)) }
         if need.tombstonedAtomIDs.contains(id) { return (.tombstoned, .tombstoned(id)) }
         if source.health == .removed { return (.sourceRemoved, .sourceRemoved(sourceID)) }
+        if source.health == .degraded { return (.sourceUnavailable, .sourceUnavailable(sourceID)) }
         if !need.authorization.allowedOrigins.contains(need.origin) { return (.originDenied, .originDenied(need.origin)) }
         if !need.authorization.allowedSourceIDs.contains(sourceID) { return (.permissionDenied, .sourcePermissionDenied(sourceID)) }
         if let allowed = need.authorization.allowedAtomIDs, !allowed.contains(id) { return (.permissionDenied, .atomPermissionDenied(id)) }
@@ -489,7 +450,6 @@ extension ContextSelector {
 private extension ContextSelector {
     struct SelectionUnit {
         let stableKey: String
-        let conflictID: String?
         let atoms: [ContextStoredAtom]
     }
 
@@ -497,8 +457,7 @@ private extension ContextSelector {
         for atom: ContextStoredAtom,
         generationID: Int64,
         source: ContextStoredSource?,
-        need: NeedSignal,
-        resolutionReason: ContextEligibilityReason?
+        need: NeedSignal
     ) -> ContextEligibilityReason? {
         guard let source else { return .missingSource }
         let failure = Self.commonEligibilityFailure(for: atom, generationID: generationID, source: source, need: need)
@@ -507,7 +466,7 @@ private extension ContextSelector {
                                           subjectEntities: need.extractedEntities) {
             return .outsideContextScope
         }
-        return failure?.reason ?? resolutionReason
+        return failure?.reason
     }
 
     func rankedBefore(
@@ -538,45 +497,12 @@ private extension ContextSelector {
         }
     }
 
-    func makeSelectionUnits(
-        candidates: [ContextStoredAtom],
-        groups: [ConflictGroup],
-        atomByID: [ContextAtomID: ContextStoredAtom],
-        candidateIDs: Set<ContextAtomID>,
-        mandatoryIDs: Set<ContextAtomID>
-    ) -> [SelectionUnit] {
-        var consumed = Set<ContextAtomID>()
-        var result: [SelectionUnit] = []
-        for group in groups where group.resolvedAtomID == nil {
-            let ids = group.memberAtomIDs
-                .intersection(candidateIDs)
-                .subtracting(mandatoryIDs)
-            guard ids.count == group.memberAtomIDs.subtracting(mandatoryIDs).count,
-                  ids.count > 1 else { continue }
-            let atoms = ids.compactMap { atomByID[$0] }.sorted { $0.draft.id < $1.draft.id }
-            guard atoms.allSatisfy({ $0.draft.injectionPolicy != .onDemand }) else { continue }
-            result.append(SelectionUnit(stableKey: "conflict:\(group.id)", conflictID: group.id, atoms: atoms))
-            consumed.formUnion(ids)
-        }
-        for atom in candidates where !consumed.contains(atom.draft.id) {
-            result.append(SelectionUnit(
-                stableKey: "atom:\(atom.draft.id.rawValue)",
-                conflictID: nil,
-                atoms: [atom]
-            ))
-        }
-        return result
-    }
-
     func quotaAllows(
         _ unit: SelectionUnit,
         sourceCounts: [ContextSourceID: Int],
         kindCounts: [ContextAtomKind: Int],
         memoryAtomRowLimit: Int?
     ) -> Bool {
-        // An unresolved conflict is atomic: completeness takes precedence over
-        // diversity caps, while the character and atom budgets still apply.
-        if unit.conflictID != nil { return true }
         for atom in unit.atoms {
             if sourceCounts[atom.draft.sourceID, default: 0] + 1
                 > configuration.maximumAtomsPerSource { return false }

@@ -132,8 +132,6 @@ public final class TurnsFacade {
     public var streamingBubbleIds: [String: String] = [:]
     // Keep the optimistic user turn while switching between in-flight sessions,
     // until the Swift turn runtime's durable transcript supplies it.
-    public var streamingUserTurnIds: [String: String] = [:]
-    public var streamingUserTurnTexts: [String: String] = [:]
     /// First instant each `streamingSessions` id was observed. Not observed,
     /// so reading it during a SwiftUI view update cannot invalidate that
     /// update.
@@ -216,7 +214,9 @@ public final class TurnsFacade {
         for id in current {
             let seenAt = streamingSeenAt[id] ?? now
             streamingSeenAt[id] = seenAt
-            if tasks[id] != nil || ceiling <= 0 || now.timeIntervalSince(seenAt) <= ceiling { live.insert(id) }
+            // An unavailable deadline cannot prove an orphan expired. Provider
+            // execution separately refuses the invalid configuration.
+            if tasks[id] != nil || !ceiling.isFinite || ceiling <= 0 || now.timeIntervalSince(seenAt) <= ceiling { live.insert(id) }
         }
         return live.filter { !isReplyTextSettled($0) }
     }
@@ -239,8 +239,6 @@ public final class TurnsFacade {
     public func clearStreamingBubbleState(_ sessionId: String) {
         streamingTexts[sessionId] = nil
         streamingBubbleIds[sessionId] = nil
-        streamingUserTurnIds[sessionId] = nil
-        streamingUserTurnTexts[sessionId] = nil
         replyingSessions.remove(sessionId)
     }
 
@@ -303,9 +301,8 @@ extension NativeAgentEngine {
     ) async throws -> ChatSessionCompactionOutcome {
         let trimmedModel = model?.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedModel = trimmedModel.flatMap { $0.isEmpty ? nil : $0 }
-        let routedModel = await providers.routing.modelStringForSurface("compaction")
         let outcome = try await client.compactSession(
-            sessionId: sessionId, model: resolvedModel ?? routedModel ?? "",
+            sessionId: sessionId, model: resolvedModel ?? "",
             surface: "compaction", runId: nil, providerID: providerID, force: force)
         if outcome.compacted {
             NotificationCenter.default.post(name: .chatTurnCompleted, object: outcome.sessionId)

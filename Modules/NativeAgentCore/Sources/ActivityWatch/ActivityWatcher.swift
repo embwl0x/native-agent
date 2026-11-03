@@ -4,7 +4,7 @@ import ApplicationServices
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `ActivityWatcher.swift` | `ActivityWatcher`: capture-thread lifetime, command handoff and ordered store pump; unexpected run-loop return degrades and retires capture; only the drained pump releases installation and pending restart ownership |
+// Blueprint: | `ActivityWatcher.swift` | `ActivityWatcher`: capture-thread lifetime, checked observation degradation/recovery and ordered store pump; bounded stop outcome exposes the retained settlement task; only the drained pump releases installation and pending restart ownership |
 
 /// Metadata-only capture drives `ActivitySpanEngine` and forwards its commands
 /// verbatim. One dedicated thread owns AX; callbacks never await the store.
@@ -36,6 +36,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     let idleThreshold = ActivityWatcher.defaultIdleThreshold
     let ownProcessID = ProcessInfo.processInfo.processIdentifier
     let lifecycleChanged: (@Sendable (LifecycleState) -> Void)?
+    let observationIssue: (@Sendable (String) -> Void)?
 
     // Cross-thread scalars. Guarded by `lock`.
     let lock = NSLock()
@@ -51,6 +52,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     /// engine owns the authoritative copy; `startBounded()` must decide whether
     /// to create the capture thread BEFORE there is one to ask.
     var _captureEnabled: Bool
+    var _policyAvailable = true
     /// The last policy actually pushed through `updatePolicy`. Compared against
     /// incoming policy changes so queued updates use the latest authority.
     var _lastKnownPolicy: ActivityPolicy
@@ -100,13 +102,15 @@ public final class ActivityWatcher: @unchecked Sendable {
     public init(
         store: ActivitySpanStore,
         policy: ActivityPolicy,
-        lifecycleChanged: (@Sendable (LifecycleState) -> Void)? = nil
+        lifecycleChanged: (@Sendable (LifecycleState) -> Void)? = nil,
+        observationIssue: (@Sendable (String) -> Void)? = nil
     ) {
         self.store = store
         self.engine = ActivitySpanEngine(policy: policy)
         self._captureEnabled = policy.captureEnabled
         self._lastKnownPolicy = policy
         self.lifecycleChanged = lifecycleChanged
+        self.observationIssue = observationIssue
     }
 
     // MARK: - Lifecycle
@@ -115,7 +119,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     public var isCaptureEnabled: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return _captureEnabled
+        return _captureEnabled && _policyAvailable
     }
 
     /// True only when the observers are actually installed and running — what
@@ -125,7 +129,7 @@ public final class ActivityWatcher: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return _installed && !_stopping && !_stopRequested
-            && _lifecycleState != .degraded
+            && _lifecycleState == .running
     }
 
     public var lifecycleState: LifecycleState {
@@ -134,18 +138,18 @@ public final class ActivityWatcher: @unchecked Sendable {
 
     /// App-facing startup that never parks the main actor on an AX/run-loop
     /// bootstrap. If the capture thread does not acknowledge readiness in time,
-    /// the partially installed observers and pump are rolled back.
+    /// its partial installation is retired through the same stop/settlement owner.
     @discardableResult
     public func startBounded(timeout: TimeInterval = 5) async -> Bool {
         let enabled = withLock { () -> Bool in
-            guard !Task.isCancelled, _captureEnabled else { return false }
+            guard !Task.isCancelled, _captureEnabled, _policyAvailable else { return false }
             if _stopping || _stopRequested {
                 _restartAfterStop = true
                 return false
             }
             return true
         }
-        guard enabled else { return !isCaptureEnabled }
+        guard enabled else { return withLock { _policyAvailable && !_captureEnabled } }
         guard let generation = beginStartInstalled() else {
             return lifecycleState == .running || lifecycleState == .starting
         }
@@ -183,7 +187,7 @@ public final class ActivityWatcher: @unchecked Sendable {
     @discardableResult
     private func beginStartInstalled() -> UInt64? {
         lock.lock()
-        guard !Task.isCancelled, _captureEnabled else {
+        guard !Task.isCancelled, _captureEnabled, _policyAvailable else {
             lock.unlock()
             return nil
         }
@@ -260,17 +264,26 @@ public final class ActivityWatcher: @unchecked Sendable {
         return generation
     }
 
-    /// Closes the open span cleanly, tears the observer down, stops the run
-    /// loop, and drains the pump. Never called from the capture thread.
-    public func stop() async {
+    public struct StopRequest: Sendable {
+        public enum Outcome: String, Sendable, Equatable { case settled, settlementPending }
+        public let outcome: Outcome
+        /// The existing store pump, retained through real thread exit and drain.
+        /// This join has no deadline; a wedged capture thread keeps it pending.
+        public let settlement: Task<Void, Never>?
+    }
+
+    /// Bounded request: at most five seconds for handoff and five for settlement.
+    /// A pending result does not release capture ownership. The lifecycle owner
+    /// retains/joins `settlement` separately under its own outer wait bound.
+    public func requestStop() async -> StopRequest {
         let (generation, pump) = withLock {
-            _stopRequested = true
+            _stopRequested = _installed
             _restartAfterStop = false
             return (_generation, pumpTask)
         }
         await stopInstalled(generation: generation)
-        // A stop already underway, or a degraded handoff, still owes actual exit.
-        await settle { await pump?.value }
+        let pending = withLock { _installed && _generation == generation }
+        return StopRequest(outcome: pending ? .settlementPending : .settled, settlement: pump)
     }
 
     func stopForPolicyDisable(generation: UInt64) async {
@@ -310,7 +323,7 @@ public final class ActivityWatcher: @unchecked Sendable {
 
         // Acknowledgment is not exit. The exit notification closes the stream;
         // only the pump's actual drain releases installation/restart ownership.
-        // A timeout returns degraded without creating an indefinite waiter.
+        // A timeout returns degraded; the retained pump remains the settlement handle.
         guard await waitForThreadExit(generation: generation, timeout: 5) else {
             let timedOut = withLock { () -> Bool in
                 guard _generation == generation, _installed, _stopping else { return false }
@@ -337,7 +350,7 @@ public final class ActivityWatcher: @unchecked Sendable {
             _stopping = false
             _stopRequested = false
             _lifecycleState = .stopped
-            let shouldRestart = _restartAfterStop && _captureEnabled
+            let shouldRestart = _restartAfterStop && _captureEnabled && _policyAvailable
             _restartAfterStop = false
             started.lock()
             isThreadReady = false
@@ -402,7 +415,32 @@ public final class ActivityWatcher: @unchecked Sendable {
     }
 
     var isStopping: Bool {
-        withLock { _stopping || _stopRequested || _lifecycleState == .degraded }
+        withLock { _stopping || _stopRequested }
+    }
+
+    /// Capture-thread observation availability is distinct from teardown. A
+    /// degraded observer keeps the existing timer/workspace sources for repair.
+    func observationUnavailable(_ detail: String) {
+        feed(.observationUnavailable)
+        detachObserver()
+        let changed = withLock { () -> Bool? in
+            guard !_stopping, !_stopRequested else { return nil }
+            guard _lifecycleState != .degraded else { return false }
+            _lifecycleState = .degraded
+            return true
+        }
+        guard let changed else { return }
+        if changed { lifecycleChanged?(.degraded) }
+        observationIssue?(detail + " Capture will recheck at the next foreground change or 60-second observation tick; until then no new spans are recorded.")
+    }
+
+    func observationAvailable() {
+        let recovered = withLock { () -> Bool in
+            guard !_stopping, !_stopRequested, _lifecycleState == .degraded else { return false }
+            _lifecycleState = .running
+            return true
+        }
+        if recovered { lifecycleChanged?(.running) }
     }
 
     private func transitionLifecycle(to state: LifecycleState) {
@@ -416,7 +454,7 @@ public final class ActivityWatcher: @unchecked Sendable {
 
     private func handleStoreFailure() {
         let generation = withLock { () -> UInt64? in
-            guard _installed, !_stopping, _lifecycleState != .degraded else { return nil }
+            guard _installed, !_stopping, !_stopRequested else { return nil }
             _stopRequested = true
             _restartAfterStop = false
             _lifecycleState = .degraded

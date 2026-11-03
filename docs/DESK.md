@@ -3,13 +3,46 @@
 The Desk is the agent's durable work. `ledger.list` reads the shared task
 ledger, a separate list; an empty ledger says nothing about the Desk.
 
+What they means to do later lives here as a MY QUEUE intention, filed with
+`queue.add {text, when, until?, say?, action?}`. Its `DeskStep` owns the words,
+moment or rhythm, ending, fixed words, habit and origin. `queue.update` changes
+named fields; `queue.done` and `queue.drop` settle it by its exact handle or
+number. Words never select a different step. A committed closure keeps its
+receipt if checkpoint cleanup fails, with the cleanup cause in
+`settlement_failures`. The scheduler owns body
+rhythms, not a second queue of reminders or turns. The [intention contract](INTENTIONS.md)
+owns the form, readiness, delivery and launch migration. Imported scheduler
+steps retain their job identity and first unconsumed occurrence, including
+calendar seconds; until the one-time migration commits,
+they are held and cannot be archived. Later restored scheduler jobs never
+reimport: they remain stopped records with one keyed system Desk notice asking
+their to use `queue.add` if still wanted. Existing intentions stay as they are;
+restore-specific archive identity lookup and retention are removed. Disabled
+legacy definitions retain words, timing and pause with their migration
+disposition. A stopped
+import names the evidence they must reconcile before refiling it.
+
 Each item's `workAttempts` ledger holds both pursuit and owner-cadence work.
-Historical reservation rows decode into that ledger; pursuit daily and lifetime
-accounting, retained goal evidence, and receipt handoff keep their existing limits.
+Only current attempt records enter that ledger; retired reservation formats
+require explicit retained-data conversion before admission. Pursuit daily and
+lifetime accounting, retained goal evidence, and receipt handoff keep their
+existing limits. Today's pursuit count is projected for the Mac's current
+calendar day from the canonical accounting and pursuit-lane attempts; it is
+never a persisted display counter.
+
+The journal admits every retained line or reports the named unavailable
+record with its cause and repair. It never skips a create, alias, finding or
+blocker. Every append validates the complete current serialized operation
+before writing. Materialized state requires version 2 and its actual work-slot
+ledger. Current origin values are `owner`, `agent` and `system`.
+`findingKey` alone owns a system finding's identity; notes remain ordinary
+text. Care evidence uses current `care` citations, with no retired
+standing-view or open-question bridge. Saved policies, conditions and
+provenance decode completely; invalid saved values never become new defaults,
+empty peers, or next-turn readiness.
 
 An item's name is `handle`. A stable handle, its permanent visible number, or
-`desk.<number>` addresses it. `id` is accepted as an alias for the item's
-handle. On `desk.add_ref`, an `id` supplied beside `handle` still identifies
+`desk.<number>` addresses it. On `desk.add_ref`, an `id` supplied beside `handle` identifies
 the linked approval or trace.
 
 `desk.read` lists all live board items, including parts and recently closed
@@ -20,7 +53,22 @@ and refs. Complete record text uses `detail_offset` and `detail_version`.
 `sort:"recent"` is the default; `sort:"stale"` orders oldest first. Sorting
 changes neither the matching items nor the fields each row returns: handle,
 status, summary when present, notes, refs, dates and sequencing evidence.
-`structured` remains accepted; rooms use returned `display_status` and continuations.
+Rooms use the canonical returned `display_status` and continuations.
+
+A committed mutation whose confirmation read fails reports the Desk read's
+cause with `effects:occurred`; read its handle before repeating the mutation.
+Equivalent creation and plan breakdown use the same locked store transaction,
+matching kind, parent, lane, assignee, project and title. Breakdown retains
+every returned handle, alias and reuse flag in `committed`, and completed
+sequencing operations in `committed_operations`, including when its final
+readback fails. A partial receipt does not depend on another successful read.
+`desk.blocked_on` requires its `blocked_on` string and `desk.defer` its `until`
+string; an explicit empty string clears, while absence or an invalid type
+refuses before mutation. Direct tools, the app door and part/ability calls
+judge the caller's original value; numeric values are never converted into
+valid blocker or defer strings.
+`desk.work_log` selects a pursuit receipt or an ordinary item's note under the
+Desk store's own lock, without retrying through another tool after a failure.
 
 With `include_archived:true`, `archives` contains its own paged `items`,
 `limit`, `offset`, `total`, `count`, and `has_more`. Its initial offset is the
@@ -30,10 +78,24 @@ returns `total`, `has_more`, and `next_offset` for summaries and an exact
 task's events (`next_offset` is null on the final page). The workspace offers
 **More shared work** and **More timeline events** from that continuation,
 preserving the task, page size, and finished-work filter.
+Archive and shared-ledger histories decode every record and link, or expose
+that history as unavailable with its cause and repair. The shared ledger's
+current actors are `claude`, `assistant`, `codex` and `user`; its compaction
+base requires its recorded operation count.
 
-`summary` is the word on both `desk.add` and `desk.close`. Close still accepts
-the previous summary spelling for existing callers. Conflicting spellings
-refuse the input.
+The `task-ledger` CLI parses every option, including `--data-root`, before
+accessing the ledger. A value option followed by another `--option` or the end
+of the command is refused; literal values beginning with `--` use equals,
+for example `--note='--literal text'`. Single-value options cannot repeat;
+`--ref` may repeat. Unknown options and options belonging to another command
+are refused before any ledger write.
+
+Bare defer days include the named day. Snooze choices therefore say
+**Through tomorrow** and **Through [date]**, resuming at the following local
+midnight; a full timestamp keeps its exact instant.
+
+`summary` is the word on both `desk.add` and `desk.close`; the previous
+`outcome_summary` spelling is refused. Wait explanations use `note`.
 
 `desk.wait {handle, on:"User", note?}` puts an item in **waiting on User** in
 one call. `on:"owner"` names the owner without needing their name.
@@ -71,9 +133,11 @@ For a four-call work record (using the handle returned by the first call):
 These are action argument shapes for `app {action:"desk.…", args:{…}}`.
 Recorded notes and summaries are records, not proof of external work.
 
-Workshop reads retain complete, partial, absent or unavailable evidence.
-Partial reads continue; absent or unavailable reads continue only when optional.
+Workshop reads retain complete, partial, absent or unavailable evidence and
+continue to the next step without requiring `optional`. A failed read does not
+satisfy required evidence; the next step decides from the retained receipt.
 The action's read contract applies even when Trust assigns a different permission class.
+Admission, Trust and approval gates still apply before a call runs.
 Cancellation, failed effects and unresolved effects stop traversal; outcome
 details name the resolved tool.
 

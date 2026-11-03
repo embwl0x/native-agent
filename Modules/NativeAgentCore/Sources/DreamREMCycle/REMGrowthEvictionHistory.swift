@@ -48,10 +48,9 @@ public struct REMGrowthEvictionRecord: Sendable, Codable, Equatable {
     /// The approved proposals whose text is in this passage: where the evicted
     /// growth came from, so the history expands into its own provenance.
     public var proposalRefs: [REMGrowthEvictionProposalRef]
-    /// `pending` while only the retention has happened; `committed` once the
-    /// GROWTH splice succeeded. Absent on rows written before this field
-    /// existed — fixed history, read as committed rather than rewritten.
-    public var state: REMGrowthEvictionState?
+    /// `pending` while only retention has happened; `committed` once the
+    /// GROWTH splice succeeded. Unknown state cannot certify a splice.
+    public var state: REMGrowthEvictionState
     /// Set on a `committed` row that was written by RECONCILIATION rather than
     /// by the pass that did the splice: the passage is demonstrably gone from
     /// GROWTH.md, but the process died before it could say so. Marks the row as
@@ -65,7 +64,7 @@ public struct REMGrowthEvictionRecord: Sendable, Codable, Equatable {
         passage: String,
         sourceLines: Int,
         proposalRefs: [REMGrowthEvictionProposalRef] = [],
-        state: REMGrowthEvictionState? = nil,
+        state: REMGrowthEvictionState,
         reconciled: Bool? = nil
     ) {
         self.id = id
@@ -78,9 +77,9 @@ public struct REMGrowthEvictionRecord: Sendable, Codable, Equatable {
         self.reconciled = reconciled
     }
 
-    /// True unless the row is explicitly `pending`. A pending row with no
+    /// True only for an observed or corroborated commit. A pending row with no
     /// committed row after it means the passage is RETAINED, NOT EVICTED.
-    public var isCommitted: Bool { state != .pending }
+    public var isCommitted: Bool { state == .committed }
 }
 
 /// The approval this stretch of GROWTH entered by.
@@ -142,24 +141,17 @@ public enum REMGrowthEvictionHistory {
         }
     }
 
-    /// Every retained passage, oldest first. Malformed lines are skipped rather
-    /// than failing the read — one bad line must not hide the rest of her past.
-    public static func loadAll(dataRoot: URL) -> [REMGrowthEvictionRecord] {
-        let url = fileURL(dataRoot: dataRoot)
-        guard let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) else { return [] }
-        let decoder = JSONDecoder()
-        return text.split(separator: "\n", omittingEmptySubsequences: true).compactMap {
-            guard let line = String($0).data(using: .utf8) else { return nil }
-            return try? decoder.decode(REMGrowthEvictionRecord.self, from: line)
-        }
+    /// Every retained passage, oldest first. Integrity failures block dependent
+    /// decisions and preserve all source bytes for repair.
+    public static func loadAll(dataRoot: URL) throws -> [REMGrowthEvictionRecord] {
+        try read(fileURL(dataRoot: dataRoot))
     }
 
     /// The passage behind one compressed node — what "expand" reads. Returns
     /// the row whatever its state: a retained-but-not-evicted passage is still
     /// the passage.
-    public static func record(id: String, dataRoot: URL) -> REMGrowthEvictionRecord? {
-        loadAll(dataRoot: dataRoot).last { $0.id == id }
+    public static func record(id: String, dataRoot: URL) throws -> REMGrowthEvictionRecord? {
+        try loadAll(dataRoot: dataRoot).last { $0.id == id }
     }
 
     /// REPAIR THE INTERRUPTED SPLICE. The passage leaves GROWTH.md before the
@@ -185,9 +177,9 @@ public enum REMGrowthEvictionHistory {
     public static func reconcilePending(
         growthBody: String,
         dataRoot: URL,
-        kgNodeExists: @Sendable (String) async -> Bool
-    ) async -> Int {
-        let rows = loadAll(dataRoot: dataRoot)
+        kgNodeExists: @Sendable (String) async throws -> Bool
+    ) async throws -> Int {
+        let rows = try loadAll(dataRoot: dataRoot)
         guard !rows.isEmpty else { return 0 }
         let committed = Set(rows.filter(\.isCommitted).map(\.id))
         var repaired = 0
@@ -199,41 +191,37 @@ public enum REMGrowthEvictionHistory {
             && !growthBody.contains(row.passage)
         {
             handled.insert(row.id)
-            guard await kgNodeExists(row.id) else { continue }
+            guard try await kgNodeExists(row.id) else { continue }
             var fixed = row
             fixed.state = .committed
             fixed.reconciled = true
-            do {
-                try await append(fixed, dataRoot: dataRoot)
-                repaired += 1
-            } catch {
-                // Nothing is destroyed by a failed repair: the pending row still
-                // stands and the next pass tries again.
-                continue
-            }
+            try await append(fixed, dataRoot: dataRoot)
+            repaired += 1
         }
         return repaired
     }
 
     private static func dedupeKey(_ record: REMGrowthEvictionRecord) -> String {
-        "\(record.id)|\(record.state?.rawValue ?? "legacy")"
+        "\(record.id)|\(record.state.rawValue)"
     }
 
     private static func existingKeys(url: URL) throws -> Set<String> {
-        guard FileManager.default.fileExists(atPath: url.path),
-              let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) else { return [] }
-        struct KeyOnly: Decodable {
-            let id: String
-            let state: REMGrowthEvictionState?
+        Set(try read(url).map(dedupeKey))
+    }
+
+    private static func read(_ url: URL) throws -> [REMGrowthEvictionRecord] {
+        let data: Data
+        do { data = try Data(contentsOf: url) }
+        catch CocoaError.fileReadNoSuchFile { return [] }
+        guard data.isEmpty || data.last == 0x0A else {
+            throw PersistenceCoreError.ioFailure("GROWTH eviction history has an unfinished row at \(url.path); preserve and repair the ledger before retrying")
         }
         let decoder = JSONDecoder()
-        var keys = Set<String>()
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard let d = String(line).data(using: .utf8),
-                  let row = try? decoder.decode(KeyOnly.self, from: d) else { continue }
-            keys.insert("\(row.id)|\(row.state?.rawValue ?? "legacy")")
+        return try data.split(separator: 0x0A).enumerated().map { index, line in
+            do { return try decoder.decode(REMGrowthEvictionRecord.self, from: Data(line)) }
+            catch {
+                throw PersistenceCoreError.ioFailure("GROWTH eviction history row \(index + 1) at \(url.path) is unreadable: \(error.localizedDescription). Preserve and repair the ledger before retrying")
+            }
         }
-        return keys
     }
 }

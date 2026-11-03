@@ -6,6 +6,9 @@ import Foundation
 public struct PhoneRequest: Codable, Sendable, Identifiable {
     public enum Kind: String, Codable, Sendable {
         case currentLocation = "location.current", pickPhoto = "photo.pick", capturePhoto = "photo.capture"
+        case settingsRead = "settings.read", settingsWrite = "settings.write"
+
+        public var isSettings: Bool { self == .settingsRead || self == .settingsWrite }
     }
     public static let messageKind = "phone_request"
     public let id: String

@@ -1,10 +1,18 @@
 import Experiences
 import Foundation
 import PersistenceCore
+import NativeAgentShared
 
-// Blueprint: | `MacFourVerbs+WorkspaceControl.swift` | `MacFourVerbs` workspace acts: fresh exact frame/app/window/handle checks; supplemental surfaces never raise background apps for physical input |
+// Blueprint: | `MacFourVerbs+WorkspaceControl.swift` | `MacFourVerbs`: schema and screen offers read the executing hand's verb inventory; exact frame/handle acts share admission and serial ownership with batches, including focus, double/right click and hover; validate selected app and retain the canonical effect verdict |
 
 extension MacFourVerbs {
+    public static let selectionVerbs = MacActVerb.allCases.map(\.rawValue) + ["press"]
+    /// The schema, screen offers and refusal help read the executing hand's vocabulary.
+    public static let actionVerbs = Array(Set(selectionVerbs + PhysicalVerb.allCases.map(\.rawValue))).sorted()
+
+    static func offeredVerbs(_ verbs: [String]) -> [String] {
+        verbs.filter { actionVerbs.contains($0) }
+    }
     @TaskLocal static var nativeSurfaceApp: String?
     @TaskLocal static var nativeSurfaceLabel: String?
 
@@ -24,23 +32,47 @@ extension MacFourVerbs {
     /// The action owner checks drift and ordinary admission before input;
     /// the structured selection receipt retains those references.
     public func actSelection(verb: String, handle: String, frameID: String,
-                             text: String? = nil, mode: MacTypeMode = .replace, direction: String? = nil) async -> MacFourVerbsReply {
-        guard await MacActSerial.shared.acquire() else {
-            return .init(ok: false, text: "The action was cancelled before it started.", detail: ["error": .string("cancelled")])
+                             text: String? = nil, mode: MacTypeMode = .replace, direction: String? = nil,
+                             app: String? = nil) async -> MacFourVerbsReply {
+        if TaskWaitDeadline.current == nil {
+            do {
+                return try await TaskWaitDeadline.withDeadline(
+                    seconds: Double(SwiftNativeMacControl.operationTimeoutSeconds(action: "act", body: [:]))
+                ) { await self.actSelection(verb: verb, handle: handle, frameID: frameID,
+                    text: text, mode: mode, direction: direction, app: app) }
+            } catch { return Self.interruptedActReply(error) }
         }
-        defer { Task { await MacActSerial.shared.release() } }
+        let ownsSerial = !Self.holdsActSerial
+        if ownsSerial {
+            guard await MacActSerial.shared.acquire() else {
+                return .init(ok: false, text: "The action was cancelled before it started.", detail: ["error": .string("cancelled")])
+            }
+        }
+        defer { if ownsSerial { Task { await MacActSerial.shared.release() } } }
         await MacActSerial.shared.ownInputs(MacDriverContext.binding)
         // An exact act moves the screen on too: a stopped batch in this chat is over.
-        if let root = flowRoot, let session = flowSession { Flow.dropped(root, scope: Self.actFlowScope(session)) }
+        if ownsSerial, let root = flowRoot, let session = flowSession { Flow.dropped(root, scope: Self.actFlowScope(session)) }
         // A screen page lists "press" among a control's verbs.
         let verb = verb == "press" ? "click" : verb
-        guard ["click", "open", "type", "focus", "select", "toggle", "scroll"].contains(verb),
-              MacActVerb(rawValue: verb) != nil,
-              !handle.isEmpty, !frameID.isEmpty else {
+        guard Self.selectionVerbs.contains(verb) else {
+            return .init(ok: false, text: "A handle cannot use \"\(verb)\". Allowed verbs: "
+                + Self.selectionVerbs.joined(separator: ", ") + ". Nothing was sent.",
+                detail: ["error": .string("unsupported_selection_verb"), "verb": .string(verb),
+                         "allowed_verbs": .array(Self.selectionVerbs.map(JSONValue.string))])
+        }
+        guard !handle.isEmpty, !frameID.isEmpty else {
             return .init(ok: false, text: "That selection is incomplete. Look again and select a current control.",
                          detail: ["error": .string("invalid_screen_selection")])
         }
         var body: [String: JSONValue] = ["verb": .string(verb), "handle": .string(handle), "frame_id": .string(frameID)]
+        if let app {
+            guard let frame = await MacLookFrameStore.shared.frame(frameId: frameID),
+                  [frame.appName, frame.bundleId].compactMap({ $0 }).contains(where: { $0.caseInsensitiveCompare(app) == .orderedSame }) else {
+                return .init(ok: false, text: "That handle does not identify the requested app. Nothing was sent; read its screen again.",
+                    detail: ["error": .string("selection_app_mismatch")])
+            }
+            body["background"] = .bool(true)
+        }
         if let text { body["text"] = .string(text) }
         body["mode"] = .string(mode.rawValue)
         if let direction { body["direction"] = .string(direction) }
@@ -53,6 +85,7 @@ extension MacFourVerbs {
             var detail = Self.operationDetail(result, app: postRead.walked?.read.app?.bundleIdentifier ?? postRead.walked?.read.app?.name)
             let output = Self.object(result.output)
             let effect = Self.effectWords(output: output)
+            let mismatch = effect.status == "acted_mismatch"
             let verified = result.ok && output["verified"] == .bool(true)
             // The owner's result is already redacted and distinguishes input
             // acceptance from an observed effect. Keep that evidence intact.
@@ -70,9 +103,10 @@ extension MacFourVerbs {
                     detail["selection_result"] = .object(receipt)
                 }
             }
-            return .init(ok: result.ok,
+            return .init(ok: result.ok && !mismatch,
                 text: (result.ok
-                    ? (verified ? "Verified: " : "The selected input was delivered. ") + effect.sentence
+                    ? (mismatch ? "The selected effect did not match. "
+                        : verified ? "Verified: " : "The selected input was delivered. ") + effect.sentence
                     : "The selected action is unverified: " + (Self.string(output["detail"]) ?? Self.string(output["guidance"]) ?? result.error ?? effect.sentence))
                     + "\n" + screen,
                 detail: detail)

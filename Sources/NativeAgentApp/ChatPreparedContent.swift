@@ -37,23 +37,23 @@ import MacControl
 import ChatToolParsing
 import UniformTypeIdentifiers
 import Desk
-// Blueprint: | `ChatPreparedContent.swift` | Settled rich text, list/table preparation and bounded Markdown/content caches |
+// Blueprint: | `ChatPreparedContent.swift` | Settled rich text, list/table preparation and bounded Markdown/content caches retaining shared parse outcomes |
 
 // Settled inline Markdown is shared with Copy and streaming paragraphs.
 final class ChatMarkdownCache: @unchecked Sendable {
     static let shared = ChatMarkdownCache()
-    private let cache = ChatContentCache<AttributedString>()
+    private let cache = ChatContentCache<ChatRichContentParser.InlineOutcome>()
 
-    static func attributed(_ content: String) -> AttributedString? {
-        shared._attributed(content)
+    static func inline(_ content: String) -> ChatRichContentParser.InlineOutcome {
+        shared._inline(content)
     }
 
-    private func _attributed(_ content: String) -> AttributedString? {
+    private func _inline(_ content: String) -> ChatRichContentParser.InlineOutcome {
         if let hit = cache.lookup(content) {
             return hit
         }
         RenderAudit.bump("markdown.parse")
-        guard let parsed = ChatRichContentParser.inline(content) else { return nil }
+        let parsed = ChatRichContentParser.inline(content)
         cache.insertIfAbsent(parsed, for: content)
         return parsed
     }
@@ -63,7 +63,7 @@ final class ChatMarkdownCache: @unchecked Sendable {
     static func plainText(_ content: String) -> String {
         ChatRichContentCache.blocks(content).map { block in
             switch block {
-            case .prose(let text): attributed(text).map { String($0.characters) } ?? text
+            case .prose(let text): String(inline(text).presentation.characters)
             case .code(_, let code): code
             }
         }.joined(separator: "\n\n")
@@ -226,7 +226,7 @@ struct ChatPreparedContent: View {
 
     nonisolated private static func segments(_ text: String, lineSpacing: CGFloat) -> [Segment] {
         func styled(_ source: String) -> AttributedString {
-            ChatParagraphGap.applied(ChatMarkdownCache.attributed(source) ?? AttributedString(source),
+            ChatParagraphGap.applied(ChatMarkdownCache.inline(source).presentation,
                                      content: source, lineSpacing: lineSpacing)
         }
         return ChatMarkdownTableParser.segments(text).map { segment in
@@ -234,7 +234,7 @@ struct ChatPreparedContent: View {
             case .table(let table):
                 let columns = table.columnCount
                 let cells = ([table.header] + table.rows).map { row in
-                    (0..<columns).map { ChatMarkdownCache.attributed(table.cell(row, $0)) ?? AttributedString(table.cell(row, $0)) }
+                    (0..<columns).map { ChatMarkdownCache.inline(table.cell(row, $0)).presentation }
                 }
                 return .table(table, cells)
             case .text(let text):

@@ -18,14 +18,33 @@ enum ContextStageName: String, CaseIterable, Sendable {
     case toolsSchemas = "tools.schemas"
     case promptRender = "prompt.render"
     case contextClockRuntime = "context.clock_runtime"
+    case factsClockNotes = "context.facts.clock_notes"
+    case factsContacts = "context.facts.contacts"
+    case factsGlance = "context.facts.glance"
+    case factsPlace = "context.facts.place"
+    case factsElsewhereRead = "context.facts.elsewhere_read"
+    case factsJoin = "context.facts.join"
+    case factsElsewhere = "context.facts.elsewhere"
+    case factsArrivals = "context.facts.arrivals"
+    case factsRuntime = "context.facts.runtime"
     case contextFlowAttentionActorAdmission = "contextFlow.attention.actorAdmission"
     case promptRead = "history.prompt_read"
-    case middleSample = "history.middle_sample"
     case recallQuery = "history.recall_query"
     case contextBase = "context.base"
     case digest = "history.digest"
     case prepare = "history.prepare"
     case render = "history.render"
+    case checkpoint = "turn.checkpoint"
+    case historyContext = "turn.history_context"
+    case cognitionJoin = "turn.cognition_join"
+    case cognitiveAppend = "turn.cognitive_append"
+    case turnPart = "turn.part_open"
+    case contextSnapshot = "turn.context_snapshot"
+    case toolCodec = "turn.tool_codec"
+    case prefixSeed = "turn.prefix_seed"
+    case sentContextPersist = "turn.sent_context_persist"
+    case prefixTelemetry = "turn.prefix_telemetry"
+    case dispatchRemainder = "turn.dispatch_remainder"
 }
 
 /// Closed vocabulary for the out-of-band `context.stage` feed. This feed is
@@ -301,7 +320,7 @@ struct ContextStageTrace: Sendable {
             payload["injectedMemoryIds"] = .array(injectedMemoryIDs.map(JSONValue.string))
         }
         if let memoryRecallOutcome {
-            // memory.recallHits counts resolved legacy ∪ packet hits reaching the turn; memory.recallHits.legacy counts only legacy.
+            // memory.recallHits counts direct ∪ packet hits reaching the turn; memory.recallHits.direct counts only direct reads.
             payload["memoryRecall"] = memoryRecallOutcome.payload(
                 injectedHitCount: Int(counts["memory.recallHits"] ?? 0)
             )

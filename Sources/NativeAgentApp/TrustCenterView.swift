@@ -131,7 +131,7 @@ enum TrustCenterPolicyStatusPresentation {
 enum TrustTab: String, CaseIterable {
     case access = "trust"
     case features
-    case macAndBrowser = "control"
+    case macAndBrowser = "mac"
     case advanced
 }
 
@@ -233,17 +233,9 @@ struct TrustCenterView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .navigationTitle("Trust")
-        .task { await appModel.engine.trust.observeSecurity() }
+        .liveTask { await appModel.engine.trust.observeSecurity() }
         .quietReadTask {
-            if let policy = appModel.engine.trust.policy {
-                applyPolicy(policy)
-            }
             if shows(.advanced) { await appModel.engine.trust.refreshPrivacyMap() }
-        }
-        .onChange(of: appModel.engine.trust.policy) { _, newPolicy in
-            if let newPolicy {
-                applyPolicy(newPolicy)
-            }
         }
         .alert(item: $pendingRestore) { backup in
             Alert(

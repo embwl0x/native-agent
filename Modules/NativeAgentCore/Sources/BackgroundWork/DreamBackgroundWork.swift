@@ -12,7 +12,8 @@ import TrustCenter
 import NotificationInbox
 import AgentWorkspace
 import Transcripts
-// Blueprint: | `DreamBackgroundWork.swift` | `DreamBackgroundWork` enum; `runDream` lives the day's owed moments (night batch drain) before the dream; `runREM` routes typed decode failures and healthy settlement to the shared finding sink; `stagePendingREMProposalsAtLaunch`, `makeREMProposalStager` |
+import TurnTrace
+// Blueprint: | `DreamBackgroundWork.swift` | `DreamBackgroundWork` enum; `runDream` lives the day's owed moments before the dream; shared providers and receipt sink carry self, felt and surprise learning, with `dream.lessons` counts also traced; `runREM` routes typed decode failures and healthy settlement to the finding sink; pending proposal staging |
 
 /// The app's notification delivery, after the Core-owned REM card is durable.
 public typealias REMProposalNotificationPort = BackgroundWorkNotificationPort
@@ -31,32 +32,53 @@ public enum DreamBackgroundWork {
         // The day's owed moments (deferred ones included) are judged and
         // lived before the dream reads her day.
         await AdaptiveMemoryPromoter.shared.drainOwedAtNight(dataRoot: dataRoot)
-        let result = try await cycle.runDream(force: force, trigger: trigger)
-        guard !Task.isCancelled, result.committed else { return result }
-        var metadata: [String: JSONValue] = [
-            "entriesWritten": .int(Int64(result.entriesWritten)),
-            "sessionsProcessed": .int(Int64(result.sessionsProcessed)),
-            "force": .bool(force),
-            "trigger": .string(trigger.rawValue),
-        ]
-        let feltSummary = try? await makeDreamFeltSummaryProvider(cognitionRuntime: cognitionRuntime)()
-        if let feltSummary, !feltSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            metadata["feltDaySummary"] = .string(feltSummary)
+        return try await cycle.runDream(force: force, trigger: trigger) { delivery in
+            switch delivery.effect {
+            case .reflectionJudgment(let material):
+                if let receipt = try await cognitionRuntime.produceDreamReflection(id: delivery.id, material: material) {
+                    return .reflection(receipt)
+                }
+                return .skipped("reflection disabled")
+            case .reflectionIntegration(let receipt):
+                do {
+                    if let reason = try await cognitionRuntime.integrateDreamReflection(receipt) { return .skipped(reason) }
+                } catch let error as CognitiveWriteDiscarded {
+                    if let epoch = receipt.integrationEpoch,
+                       await cognitionRuntime.substrateForIntegration().forgettingEpochs().mind != epoch {
+                        return .skipped("mind cleared after this reflection")
+                    }
+                    throw error
+                }
+                return .done
+            case .reflectionAcknowledgment(let id):
+                try await cognitionRuntime.substrateForIntegration().acknowledgeDreamReflection(id)
+                return .done
+            case .care(let night):
+                if !(await cognitionRuntime.substrateForIntegration().configurationSnapshot().enabled) {
+                    return .skipped("inner life off")
+                }
+                do {
+                    try await passCaresNight(night, dataRoot: dataRoot, cognitionRuntime: cognitionRuntime,
+                        notifications: notifications)
+                } catch let error as CognitiveWriteDiscarded {
+                    if let epoch = night.mindEpoch,
+                       await cognitionRuntime.substrateForIntegration().forgettingEpochs().mind != epoch {
+                        return .skipped("mind cleared after this care reading")
+                    }
+                    throw error
+                }
+                return .done
+            case .completion(let occurredAt, let feltSummary):
+                var metadata: [String: JSONValue] = [
+                    "entriesWritten": .int(1), "sessionsProcessed": .int(Int64(delivery.sessionsProcessed)),
+                    "force": .bool(delivery.force), "trigger": .string(delivery.trigger.rawValue),
+                ]
+                if let feltSummary { metadata["feltDaySummary"] = .string(feltSummary) }
+                let applied = try await cognitionRuntime.completeDreamSignal(id: delivery.id,
+                    occurredAt: occurredAt, metadata: metadata)
+                return applied ? .done : .skipped("body disabled")
+            }
         }
-        await cognitionRuntime.ingestOrganismSignal(
-            kind: .dreamCompleted,
-            sourceOrgan: "dream",
-            intensity: 0.62,
-            valence: 0.35,
-            arousal: 0.12,
-            metadata: metadata,
-            reflectionMaterial: result.reflectionMaterial
-        )
-        if !Task.isCancelled, let night = result.careNight {
-            await passCaresNight(night, dataRoot: dataRoot, cognitionRuntime: cognitionRuntime,
-                                 notifications: notifications)
-        }
-        return result
     }
 
     /// The night's pass over her cares, after the dream committed. An approved
@@ -66,22 +88,26 @@ public enum DreamBackgroundWork {
     static func passCaresNight(
         _ night: CognitiveCareNight, dataRoot: URL, cognitionRuntime: NativeCognitionRuntime,
         notifications: any REMProposalNotificationPort
-    ) async {
+    ) async throws {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let action = CognitiveSubstrate.careLifeApprovalAction
-        let cards: [ApprovalRecord]?
-        do { cards = try await inbox.list(filter: ApprovalFilter(action: action)) } catch {
-            nativeLog("[cares] life cards unreadable, none offered tonight: %@", error.localizedDescription)
-            cards = nil
+        let inventory: Result<[ApprovalRecord], Error>
+        do { inventory = .success(try await inbox.list(filter: ApprovalFilter(action: action))) }
+        catch { inventory = .failure(error) }
+        var failures: [String] = []
+        if case .success(let cards) = inventory {
+            for card in cards where card.decision == "approved" && card.executedAction == nil {
+                await cognitionRuntime.applyCareLifeApproval(card)
+            }
         }
-        for card in cards ?? [] where card.decision == "approved" && card.executedAction == nil {
-            await cognitionRuntime.applyCareLifeApproval(card)
-        }
-        let ready = await cognitionRuntime.substrateForIntegration().passCaresNight(night)
-        guard let cards else { return }
+        let ready = try await cognitionRuntime.substrateForIntegration().passCaresNight(night)
+        await cognitionRuntime.publishRuntimeChange(reason: "cares.night")
+        // An unreadable approval inventory cannot authorize new cards, but it
+        // does not withhold the independent care judgments already returned.
+        let cards = try inventory.get()
         for record in cards where record.status == "pending" {
             do { try await stageCareLifeCard(record, dataRoot: dataRoot, notifications: notifications) }
-            catch { nativeLog("[cares] pending life card %@ not staged; the next night retries: %@", record.id, error.localizedDescription) }
+            catch { failures.append("life card \(record.id) not staged: \(error)") }
         }
         let offered = Set(cards.compactMap(NativeCognitionRuntime.careLifeCardCareID))
         for care in ready where !offered.contains(care.id) {
@@ -98,10 +124,10 @@ public enum DreamBackgroundWork {
                 ]))
                 try await stageCareLifeCard(record, dataRoot: dataRoot, notifications: notifications)
             } catch {
-                nativeLog("[cares] life card for %@ not staged; the next night retries: %@",
-                          care.id.uuidString, error.localizedDescription)
+                failures.append("life card for \(care.id) not staged: \(error)")
             }
         }
+        if !failures.isEmpty { throw PersistenceCoreError.ioFailure(failures.joined(separator: "; ")) }
     }
 
     private static func stageCareLifeCard(
@@ -118,7 +144,7 @@ public enum DreamBackgroundWork {
             "title": .string("Part of who I am"),
             "summary": .string(words),
             "detail": .string("Approve and it is part of who I am (life depth); deny and it stays a season care."),
-            "related_mission_id": .null,
+            "related_execution_id": .null,
             "related_approval_id": .string(record.id),
             "related_paths": .array([]),
             "related_groups": .array([]),
@@ -178,6 +204,9 @@ public enum DreamBackgroundWork {
             ],
             reflectionMaterial: result.reflectionMaterial
         )
+        if let gaps = result.unavailableDreamSections, !gaps.isEmpty {
+            throw PersistenceCoreError.ioFailure("REM left unavailable dream sections pending: " + gaps.joined(separator: "; "))
+        }
         return result
     }
 
@@ -247,7 +276,6 @@ public enum DreamBackgroundWork {
                     experiences: experiences, notifications: notifications)
                 return existing.id
             }
-            let preview = remProposalPreview(row, experiences: experiences)
             let cardTitle = "REM growth lesson"
             let body: JSONValue = .object([
                 "title": .string(cardTitle),
@@ -264,6 +292,7 @@ public enum DreamBackgroundWork {
                         "evidenceDates": .array(row.evidenceDates.map { .string($0) }),
                         "confidence": .double(row.confidence),
                         "createdAt": .string(row.createdAt),
+                        "replaced": try row.replaced.map { try JSONValue.parse(JSONEncoder().encode($0)) } ?? .null,
                         // Preserve support evidence so repeated reflection stays distinct from recurrence.
                         "support": row.support.map { .string($0.rawValue) } ?? .null,
                         "livedDates": .array((row.livedDates ?? []).map { .string($0) }),
@@ -277,7 +306,9 @@ public enum DreamBackgroundWork {
                         }),
                     ]),
                 ]),
-                "payloadPreview": .string(preview),
+                // ApprovalRecord appends displaced content from this payload,
+                // including old cards that predate the field.
+                "payloadPreview": .string(remProposalPreview(row, experiences: experiences, includeReplacement: false)),
             ])
             let rec = try await inbox.create(body)
             try await ensureREMProposalInboxCard(
@@ -316,16 +347,19 @@ public enum DreamBackgroundWork {
     /// The preview every REM surface prints: the support label on its own line
     /// above her words, so the label travels with the proposal wherever the row
     /// is shown instead of living in one view's formatting.
-    public static func remProposalPreview(_ row: REMProposalRow, experiences: Int?) -> String {
+    public static func remProposalPreview(_ row: REMProposalRow, experiences: Int?, includeReplacement: Bool = true) -> String {
+        let lesson: String
         // A standing lesson says what it is before it quotes the line: the
         // card moves a correction into GROWTH, it is not a dream's lesson.
         if row.support == .standing {
-            return "Standing lesson, recalled in nearly every conversation. Approve to keep it in GROWTH "
+            lesson = "Standing lesson, recalled in nearly every conversation. Approve to keep it in GROWTH "
                 + "and retire the memory:\n“\(row.proposalText)”"
+        } else if let label = remSupportLabel(row, experiences: experiences) {
+            lesson = row.proposalText + "\n" + label
+        } else {
+            lesson = row.proposalText
         }
-        // Her words first: a card shows its first line, and the lesson is the point.
-        guard let label = remSupportLabel(row, experiences: experiences) else { return row.proposalText }
-        return row.proposalText + "\n" + label
+        return includeReplacement ? lesson + "\n\n" + REMReplacement.describe(row.replaced) : lesson
     }
 
     /// Card id == approval id: InboxView's approve/reject buttons route
@@ -351,8 +385,9 @@ public enum DreamBackgroundWork {
             "title": .string("REM growth lesson"),
             "summary": .string(String(preview.prefix(220))),
             "detail": .string(
-                "Approve to add this compact lesson to GROWTH.md; deny to tombstone it."),
-            "related_mission_id": .null,
+                "Approve to add this compact lesson to GROWTH.md; deny to tombstone it.\n\n"
+                    + REMReplacement.describe(row.replaced)),
+            "related_execution_id": .null,
             "related_approval_id": .string(approvalId),
             "related_paths": .array([
                 .string(dataRoot.appendingPathComponent("rem_proposals.jsonl").path),
@@ -490,21 +525,34 @@ public enum DreamBackgroundWork {
     ) -> DreamCareNightProvider {
         let runtime = cognitionRuntime
         return { @Sendable in
-            await runtime.substrateForIntegration().careNightMaterial()
+            try await runtime.substrateForIntegration().careNightMaterial()
         }
     }
 
     /// Receipt channel for the dream lane. DreamREMCycle holds no substrate
     /// reference by design, so the receipt it owns is handed out here to whoever
-    /// does — the substrate's own best-effort ledger write, which keeps every
-    /// existing gate (cognition/persistence off → silent no-op).
+    /// does. A checked ledger write lets the journal retain owed citations
+    /// when persistence is unavailable; trace publication follows that write.
     public static func makeDreamReceiptSink(
         cognitionRuntime: NativeCognitionRuntime
     ) -> DreamReceiptSink {
         let runtime = cognitionRuntime
         return { @Sendable kind, payload in
             let substrate = await runtime.substrateForIntegration()
-            await substrate.recordReceipt(kind: kind, payload: payload)
+            if kind == DreamCycleRunner.studioCitationReceiptKind {
+                guard let text = payload.objectValue?["dreamId"]?.stringValue, let id = UUID(uuidString: text) else {
+                    throw PersistenceCoreError.ioFailure("dream citation receipt has no saved dream identity")
+                }
+                try await substrate.recordReceiptChecked(kind: kind, payload: payload, id: id)
+            } else {
+                try await substrate.recordReceiptChecked(kind: kind, payload: payload)
+            }
+            if kind == "dream.lessons" {
+                let failed = payload.objectValue?["failed"]?.integerValue ?? 0
+                await TurnTraceBus.shared.deliver(TurnTraceEvent(
+                    kind: kind, title: "Learned from surprise", status: failed == 0 ? "ok" : "failed",
+                    payload: payload, createdAt: NativeTimestampFormat.fractionalZulu(Date())))
+            }
         }
     }
 
@@ -516,12 +564,16 @@ public enum DreamBackgroundWork {
         let runtime = cognitionRuntime
         return { @Sendable affect, dateKey in
             let substrate = await runtime.substrateForIntegration()
-            return await substrate.integrateDreamDisposition(
+            guard await substrate.configurationSnapshot().enabled else { return .skipped("inner life off") }
+            guard await substrate.integrateDreamDisposition(
                 tone: affect,
                 at: Date(),
                 // Claim residue per committed dream using the runner's date key.
                 dreamId: "dream:\(dateKey)"
-            )
+            ) else {
+                throw PersistenceCoreError.ioFailure("dream mood \(dateKey) did not persist; its judgment remains owed")
+            }
+            return .done
         }
     }
 }

@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import CryptoKit
-// Blueprint: | `StudioStore.swift` | Append-only journal and corrections, consult and honest-encounter truth; timestamps use NativeTimestampFormat directly; `encounterIntakePage` exposes bounded neutral consult/corrected-history facts with a shared content digest, refuses unreadable/incomplete history and changed pages; `namedEncounterIntake` validates editable `Resources/abilities/studio-intake.js` selection against native encounter truth, retaining no Swift ordering or invitation prose |
+// Blueprint: | `StudioStore.swift` | Append-only journal and corrections, consult and honest-encounter truth; timestamps use NativeTimestampFormat directly; `encounterIntakePage` exposes bounded neutral consult/corrected-history facts with a shared content digest, refuses unreadable/incomplete history and changed pages; `namedEncounterIntake` validates editable `Resources/abilities/studio-intake.js` selection against native encounter truth, retaining no Swift ordering or invitation prose; hot-journal reads carry usable entries and damaged/torn-line holes together |
 
 // Studio owns aesthetic history and consults under studio/, separately from factual MemoryV2. Storage is persona-independent; the agent supplies her own judgments.
 
@@ -261,9 +261,10 @@ public struct SwiftNativeStudioStore: Sendable {
               Self.logLabel, doomed.count, archive.lastPathComponent)
     }
 
-    /// Every entry in file (append) order. The journal is a curated life record — a few entries a week, not telemetry — so reading it whole is honest and cheap; `recall` is what bounds what a caller sees.
-    public func readJournal() async throws -> [StudioJournalEntry] {
-        await applyAmendments(try await rawJournalEntries(path: journalPath).entries)
+    /// Usable entries in append order, with the holes beside them. The journal is a curated life record — a few entries a week, not telemetry — so reading it whole is honest and cheap; `recall` is what bounds what a caller sees.
+    public func readJournal() async throws -> (entries: [StudioJournalEntry], holes: [String]) {
+        let read = try await rawJournalEntries(path: journalPath)
+        return (await applyAmendments(read.entries), read.holes)
     }
 
     /// Usable entries and the holes beside them: damaged lines and rows this build cannot decode are counted, never silently absent.

@@ -14,23 +14,17 @@ import NativeAgentShared
 public struct DeskNotifyRunner: EventDeadlineLoopRunner {
     private let propose: @Sendable (JSONValue) async throws -> DeskNotificationProposal
     private let attention: AttentionRouter
-    private let postNagNotification: @Sendable (String, String, String?) async -> Bool
     public init(interval: TimeInterval, dataRoot: URL,
                 attention: AttentionRouter,
-                propose: @escaping @Sendable (JSONValue) async throws -> DeskNotificationProposal,
-                postMacNotification: @escaping @Sendable (String, String, [String: String], String?) async -> Bool,
-                postNagNotification: @escaping @Sendable (String, String, String?) async -> Bool) {
+                propose: @escaping @Sendable (JSONValue) async throws -> DeskNotificationProposal) {
         self.propose = propose
         self.interval = interval
         self.dataRoot = dataRoot
         self.attention = attention
-        self.postMacNotification = postMacNotification
-        self.postNagNotification = postNagNotification
     }
 
     public let interval: TimeInterval
     let dataRoot: URL
-    let postMacNotification: @Sendable (String, String, [String: String], String?) async -> Bool
 
     public var loopId: String { "desk_notify" }
     public var tickTimeoutOverride: TimeInterval? { 30 }
@@ -49,9 +43,22 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
     }
 
     public func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        let held = await AttentionRouter.hasHeld(dataRoot: dataRoot)
-        let quietEnd = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot, at: now)
-            ? TurnQuietHoursWindow.read(dataRoot: dataRoot)?.end(after: now) : nil
+        let held: Bool
+        do { held = try await AttentionRouter.hasHeld(dataRoot: dataRoot) }
+        catch {
+            nativeLog("desk_notify: held delivery source unavailable: \(error)")
+            return nil // File/store invalidation retries when the source changes.
+        }
+        let quietEnd: Date?
+        do {
+            let window = try TurnQuietHoursWindow.checkedRead(dataRoot: dataRoot)
+            quietEnd = window?.contains(hour: Calendar.current.component(.hour, from: now)) == true
+                ? window?.end(after: now) : nil
+        } catch {
+            // The owner records repair owed; its watched preference event
+            // rearms scheduling. No guessed release deadline is booked.
+            return nil
+        }
         do {
             let read = try await DeskNotificationRead.read(dataRoot: dataRoot, now: now)
             let proposal = try await propose(read.input)
@@ -60,6 +67,10 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             return [proposal.deadline.map { Date(timeIntervalSince1970: $0) }, needsQuietEnd ? quietEnd : nil].compactMap { $0 }.min()
         } catch {
             nativeLog("desk_notify: deadline proposal failed: \(error)")
+            await settle {
+                await BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: loopId,
+                    outcome: .failed(error: "Desk notification deadline unavailable: \(error.localizedDescription). Repair the Desk or inbox source before retrying."))
+            }
             return held ? quietEnd : nil
         }
     }
@@ -82,19 +93,24 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         }
         // Already-committed inbox deliveries retain their native release path
         // when a new Desk proposal fails. Stop still prevents new delivery.
-        let released = quietHours || Task.isCancelled ? 0 : await AttentionRouter.releaseHeld(
-            dataRoot: dataRoot, router: attention, banner: postMacNotification)
+        var released = 0
+        var failures: [String] = []
+        if !quietHours && !Task.isCancelled {
+            do { released = try await AttentionRouter.releaseHeld(
+                dataRoot: dataRoot, router: attention) }
+            catch { failures.append("Held notification release: \(error.localizedDescription)") }
+        }
         let read: DeskNotificationRead
         let proposal: DeskNotificationProposal
         switch prepared {
         case .success(let value): (read, proposal) = value
         case .failure(let error):
             return .failed(error: "Desk notification proposal/commit: \(error)"
-                + (released > 0 ? "; released \(released) held notification(s)" : ""))
+                + (released > 0 ? "; released \(released) held notification(s)" : "")
+                + (failures.isEmpty ? "" : "; " + failures.joined(separator: "; ")))
         }
         let state = read.state
         let decisions = proposal.notifications
-        var failures: [String] = []
         var notified = 0
         let nagCount = quietHours ? 0 : await publishNags(proposal, read: read, failures: &failures)
         if decisions.isEmpty && nagCount == 0 && released == 0 && failures.isEmpty {
@@ -106,7 +122,6 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         for decision in decisions where !quietHours || decision.level == "urgent" {
             guard !Task.isCancelled else { break }
             // Dual delivery: retain a failed occurrence for the next pass.
-            let macOK = await postMacNotification(decision.title, decision.body, [:], nil)
             // Derive identity from the same immutable state evaluated
             // above, never from prose or a second read after delivery.
             let item = state.items.first { $0.handle == decision.handle }
@@ -117,15 +132,19 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             // return normally having chosen no channel at all. Read its own
             // projection instead.
             var outcome: AttentionOutcome?
-            if !Task.isCancelled { outcome = try? await attention.route(
+            if !Task.isCancelled {
+                do { outcome = try await attention.route(
                 eventId: "desk_notify:\(decision.handle):\(revision)",
                 importance: decision.level == "urgent" ? .adverse : .ownerWaiting,
                 title: decision.title,
                 body: decision.body,
-                userInfo: ["screen": "inbox", "source": "desk"]
-            ) }
+                userInfo: ["screen": "inbox", "source": "desk", NativeAgentNotificationRoute.deskHandleKey: decision.handle],
+                macBanner: true
+                ) } catch { failures.append("\(decision.handle) paired-device route: \(error.localizedDescription)") }
+            }
             let projection = outcome?.deliveryProjection ?? .failed
-            let mobileOK = projection.reachedAChannel || projection == .deferred || projection == .previouslyHandled
+            let mobileOK = outcome != nil // The immutable ledger owns every admitted intent, including retryable refusal.
+            let macOK = outcome?.destinationOutcomes["mac"]?.settled == true
             let mobileReached = projection.reachedAChannel
             // Log both channel outcomes so no failure is silent.
             if !macOK {
@@ -174,7 +193,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         if proposal.openWindow {
             if !proposal.digest.isEmpty {
                 if await deliverNag(title: proposal.digestTitle, body: proposal.digestBody,
-                    label: "unmute digest", failures: &failures) {
+                    label: "unmute digest:\(read.config.windowId)", failures: &failures) {
                     let error: String? = await settle {
                         do {
                             _ = try await read.commit(proposal, dataRoot: dataRoot, digestAccepted: true)
@@ -190,7 +209,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         var delivered = 0
         for nag in proposal.nags {
             guard !Task.isCancelled else { break }
-            if await deliverNag(title: nag.title, body: nag.body, label: nag.handle,
+            if await deliverNag(title: nag.title, body: nag.body, label: "\(nag.handle):\(read.config.windowId)",
                 deskHandle: nag.handle, failures: &failures) {
                 delivered += 1
                 let error: String? = await settle {
@@ -216,24 +235,20 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         // The banner carries the handle it is about, so a click lands on that
         // item instead of on the app's front page. The unmute digest is about
         // no single item and carries nothing.
-        let mobileOutcome = try? await attention.route(
+        let mobileOutcome: AttentionOutcome?
+        do { mobileOutcome = try await attention.route(
             eventId: "desk_nag:\(label)",
             importance: .ownerWaiting,
             title: title,
             body: body,
-            userInfo: ["screen": "inbox", "source": "desk"]
-        )
-        let projection = mobileOutcome?.deliveryProjection ?? .failed
-        let mobileOK = projection.reachedAChannel || projection == .deferred || projection == .previouslyHandled
-        // The banner obeys the router's quiet hours, like the push.
-        let macHeld = await AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
-        let macPosted = macHeld || Task.isCancelled
-            ? false
-            : await postNagNotification(title, body, deskHandle)
-        if !macPosted && !macHeld {
-            nativeLog("desk_notify: nag Mac banner failed for \(label)")
-            failures.append("\(label) nag Mac banner")
+            userInfo: ["screen": "inbox", "source": "desk", NativeAgentNotificationRoute.deskHandleKey: deskHandle ?? ""],
+            macBanner: true
+        ) } catch {
+            mobileOutcome = nil
+            failures.append("\(label) nag paired-device route: \(error.localizedDescription)")
         }
+        let mobileOK = mobileOutcome != nil // Accepted durable intent; the ledger now owns delivery.
+        let macPosted = mobileOutcome?.destinationOutcomes["mac"] == .delivered
         if !mobileOK {
             nativeLog("desk_notify: nag paired-device push failed for \(label)")
             failures.append("\(label) nag paired-device push")

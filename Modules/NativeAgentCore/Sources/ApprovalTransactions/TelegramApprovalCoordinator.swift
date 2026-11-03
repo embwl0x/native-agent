@@ -14,6 +14,7 @@ import Privacy
 import TurnTrace
 import TelegramBot
 import TrustCenter
+import Experiences
 // Blueprint: | `TelegramApprovalCoordinator.swift` | `TelegramApprovalFiler` actor; Stop closes prompt admission and drains accepted units through `settle`; approval and inline sends own their response and receipt, independently of transcript mirrors and cancelled callers; recovery covers pending prompts and delivered inline cards missing settlement receipts, honoring resident-wake quiet holds for new inline prompts; matching terminal taps reach the shared resolver for receipt-only repair after identity/routing checks; per-card edits retain their receipts; nonblocking filing leaves resolution and execution to the canonical inbox; expiry guidance names from PersonaEngine |
 
 public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHandling {
@@ -22,6 +23,123 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
     /// whose prompt never went out is prompted again. A duplicate caller awaits the delivery in flight
     /// and gets its result; durable receipts replace completed delivery tasks.
     private var promptDeliveries: [String: Task<Void, Error>] = [:]
+    private struct Delivery: Codable, Sendable {
+        enum State: String, Codable, Sendable { case dispatching, sent, settled }
+        var state: State
+        var receipt: [String: JSONValue]?
+    }
+    /// Returned sends survive failed local receipts. The durable dispatch row
+    /// fences the process-loss window: an unknown send is never sent again.
+    private var returnedDeliveries: [String: Delivery] = [:]
+
+    private var deliveriesPath: URL {
+        dataRoot.appendingPathComponent("workflows/approvals/telegram-deliveries.json")
+    }
+
+    private nonisolated static func readDeliveries(at path: URL) throws -> [String: Delivery] {
+        let data: Data
+        do { data = try Data(contentsOf: path) }
+        catch CocoaError.fileReadNoSuchFile { return [:] }
+        let rows = try JSONDecoder().decode([String: Delivery].self, from: data)
+        for (key, row) in rows where row.state != .dispatching && row.receipt == nil {
+            throw NSError(domain: "TelegramApprovalDelivery", code: 422, userInfo: [
+                NSLocalizedDescriptionKey: "Telegram delivery \(key) has no returned receipt; repair its delivery ledger before continuing."
+            ])
+        }
+        return rows
+    }
+
+    private func saveDelivery(_ row: Delivery, key: String) async throws {
+        let path = deliveriesPath
+        try await SwiftNativePersistenceCore.withFileLock(path) {
+            var rows = try Self.readDeliveries(at: path)
+            rows[key] = row
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(rows), to: path)
+        }
+    }
+
+    private func removeDelivery(key: String) async throws {
+        let path = deliveriesPath
+        try await SwiftNativePersistenceCore.withFileLock(path) {
+            var rows = try Self.readDeliveries(at: path)
+            rows.removeValue(forKey: key)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(rows), to: path)
+        }
+    }
+
+    /// Both prompt kinds use the same send/receipt transaction. Receipt
+    /// failures repair only the receipt, including after relaunch.
+    private func deliverOnce(key: String,
+        send: () async throws -> [String: JSONValue],
+        saveReceipt: ([String: JSONValue]) async throws -> Void
+    ) async throws {
+        do {
+        let saved: Delivery?
+        if let returned = returnedDeliveries[key] { saved = returned }
+        else { saved = try Self.readDeliveries(at: deliveriesPath)[key] }
+        let receipt: [String: JSONValue]
+        if let saved {
+            guard saved.state != .dispatching, let returned = saved.receipt else {
+                throw NSError(domain: "TelegramApprovalDelivery", code: 409, userInfo: [
+                    NSLocalizedDescriptionKey: "Telegram delivery \(key) was dispatched but its outcome is unknown. Check the destination before resolving this delivery; automatic resend is refused."
+                ])
+            }
+            if saved.state == .settled { return }
+            receipt = returned
+        } else {
+            try await saveDelivery(.init(state: .dispatching), key: key)
+            do { receipt = try await send() }
+            catch where TelegramAPIFailure.isKnownNotDelivered(error) {
+                // Nothing reached Telegram: the fence lifts and a later send may try again.
+                try await removeDelivery(key: key)
+                throw error
+            }
+            returnedDeliveries[key] = .init(state: .sent, receipt: receipt)
+        }
+        try await saveDelivery(.init(state: .sent, receipt: receipt), key: key)
+        try await saveReceipt(receipt)
+        try await saveDelivery(.init(state: .settled, receipt: receipt), key: key)
+        returnedDeliveries[key] = nil
+        await RepairOwed.settle(dataRoot, operation: "telegram.delivery:" + key,
+            evidence: .init(source: "workflows/approvals/telegram-deliveries.json", id: key)).value
+        } catch {
+            await RepairOwed.owe(dataRoot, id: "telegram.delivery:" + key, kind: .act,
+                operation: "telegram.delivery:" + key, owner: "TelegramApprovalFiler",
+                words: error.localizedDescription,
+                lever: "Repair delivery storage, then recover this send's receipt without resending. A dispatch without a returned result requires destination inspection.").value
+            throw error
+        }
+    }
+
+    private func saveInteractionReceipt(_ fields: [String: JSONValue], id: String, dataRoot: URL) async throws {
+        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
+        guard try await inbox.patch(id: "interaction:" + id, unlessPresent: "telegram_message_id", fields) else {
+            let note = try await ApprovalChatCards.mirrorNote(id, dataRoot: dataRoot)
+            guard note?["telegram_message_id"] == fields["telegram_message_id"],
+                  note?["telegram_chat_id"] == fields["telegram_chat_id"] else {
+                throw NSError(domain: "TelegramApprovalDelivery", code: 409, userInfo: [
+                    NSLocalizedDescriptionKey: "The Telegram send returned, but its mirrored card receipt could not be saved. Retry receipt settlement; do not resend."
+                ])
+            }
+            return
+        }
+    }
+
+    /// A performed send owns its identity even after the source card closes.
+    /// This path only consumes returned results; it cannot send a new prompt.
+    func recoverInteractionReceipt(id: String, dataRoot: URL) async throws {
+        var rows = try Self.readDeliveries(at: deliveriesPath)
+        rows.merge(returnedDeliveries) { _, returned in returned }
+        for (key, row) in rows where key.hasPrefix("interaction:" + id + ":") && row.state != .settled {
+            try await deliverOnce(key: key, send: {
+                throw NSError(domain: "TelegramApprovalDelivery", code: 409, userInfo: [
+                    NSLocalizedDescriptionKey: "Receipt recovery has no returned send result; no prompt was sent."
+                ])
+            }, saveReceipt: { fields in
+                try await self.saveInteractionReceipt(fields, id: id, dataRoot: dataRoot)
+            })
+        }
+    }
     private var promptFlights: [(id: UUID, metadata: JSONValue, task: Task<String, Error>)] = []
     private var acceptingPassiveDelivery = true
     private var recoveryStarted = false
@@ -159,17 +277,19 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
                                  text: String, title: String, chatId: Int, markup: JSONValue) async -> Result<Void, Error> {
         defer { promptDeliveries["interaction:" + id] = nil }
         do {
-            guard let note = await ApprovalChatCards.mirrorNote(id, dataRoot: dataRoot),
+            try await recoverInteractionReceipt(id: id, dataRoot: dataRoot)
+            guard let note = try await ApprovalChatCards.mirrorNote(id, dataRoot: dataRoot),
                   note["telegram_message_id"] == nil,
-                  let card = await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
+                  let card = try await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
                   card.state.isOpen else { return .success(()) }
             guard acceptingPassiveDelivery else { return .success(()) }
-            let messageID = try await cardSender(token, TelegramDestination(chatId: chatId, threadId: nil), text, markup)
-            let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
-            _ = try await inbox.patch(id: "interaction:" + id, unlessPresent: "telegram_message_id", [
-                "telegram_chat_id": .string(String(chatId)), "telegram_message_id": .string(String(messageID)),
-                "telegram_card_title": .string(title),
-            ])
+            try await deliverOnce(key: "interaction:\(id):\(chatId)", send: {
+                let messageID = try await self.cardSender(self.token, TelegramDestination(chatId: chatId, threadId: nil), text, markup)
+                return ["telegram_chat_id": .string(String(chatId)), "telegram_message_id": .string(String(messageID)),
+                        "telegram_card_title": .string(title)]
+            }, saveReceipt: { fields in
+                try await self.saveInteractionReceipt(fields, id: id, dataRoot: dataRoot)
+            })
             await enqueueInteractionSettlement(id: id, sessionID: sessionID, dataRoot: dataRoot).value
             return .success(())
         } catch { return .failure(error) }
@@ -386,20 +506,26 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
             let inbox = SwiftNativeApprovalInbox(root: dataRoot)
             let current = try await inbox.get(approval.id)
             let receipt = "telegram_prompt_delivered:\(chatId)"
+            let owner = try ApprovalChatCards.ownerDM(dataRoot: dataRoot)
             guard current.status == "pending" else { return .success(()) }
             if case .object(let card)? = current.chatCard,
                card[receipt] == .bool(true) || (card["telegramPromptedAt"] != nil
-                    && chatId == ApprovalChatCards.ownerDM(dataRoot: dataRoot)) { return .success(()) }
+                    && chatId == owner) { return .success(()) }
             guard acceptingPassiveDelivery else { return .success(()) }
             // Once dispatched, Stop ends further admission, never this send's
             // response or receipt.
-            try await promptSender(token, chatId, approval, toolName, payload)
             var mark: [String: JSONValue] = [receipt: .bool(true)]
-            if chatId == ApprovalChatCards.ownerDM(dataRoot: dataRoot) {
+            if chatId == owner {
                 mark["telegramPromptedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
                 if !approval.requiresExecutableReview { mark["telegramChatId"] = .string(String(chatId)) }
             }
-            try await inbox.markChatCard(approval.id, mark)
+            let receiptFields = mark
+            try await deliverOnce(key: "approval:\(approval.id):\(chatId)", send: {
+                try await self.promptSender(self.token, chatId, approval, toolName, payload)
+                return receiptFields
+            }, saveReceipt: { fields in
+                try await inbox.markChatCard(approval.id, fields)
+            })
             return .success(())
         } catch { return .failure(error) }
     }

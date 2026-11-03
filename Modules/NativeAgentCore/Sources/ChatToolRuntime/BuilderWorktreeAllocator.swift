@@ -28,7 +28,7 @@ actor BuilderWorktreeAllocator {
     }
     private struct Waiter {
         let id: UUID
-        let continuation: CheckedContinuation<Void, Error>
+        let done: ScopedWaiter
     }
     private var reservations: [Reservation: [Waiter]] = [:]
 
@@ -39,16 +39,12 @@ actor BuilderWorktreeAllocator {
             return
         }
         let id = UUID()
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                guard !Task.isCancelled else {
-                    continuation.resume(throwing: CancellationError())
-                    return
-                }
-                reservations[key, default: []].append(Waiter(id: id, continuation: continuation))
-            }
-        } onCancel: {
-            Task { await self.cancelWaiter(id, for: key) }
+        let done = ScopedWaiter()
+        reservations[key, default: []].append(Waiter(id: id, done: done))
+        await done.park()
+        if let index = reservations[key]?.firstIndex(where: { $0.id == id }) {
+            reservations[key]?.remove(at: index)
+            throw CancellationError()
         }
         // Release ownership if cancellation raced the successful handoff.
         if Task.isCancelled {
@@ -57,19 +53,11 @@ actor BuilderWorktreeAllocator {
         }
     }
 
-    private func cancelWaiter(_ id: UUID, for key: Reservation) {
-        guard var waiters = reservations[key],
-              let index = waiters.firstIndex(where: { $0.id == id }) else { return }
-        let waiter = waiters.remove(at: index)
-        reservations[key] = waiters
-        waiter.continuation.resume(throwing: CancellationError())
-    }
-
     private func release(_ key: Reservation) {
         if var waiters = reservations[key], !waiters.isEmpty {
             let next = waiters.removeFirst()
             reservations[key] = waiters
-            next.continuation.resume()
+            next.done.resume()
         } else {
             reservations[key] = nil
         }

@@ -106,7 +106,7 @@ extension CognitiveSubstrate {
     }
 
     func dateValue(_ value: JSONValue?) -> Date? {
-        guard let seconds = value?.numberValue(coercingStrings: false, finiteOnly: false) else { return nil }
+        guard let seconds = value?.numberValue(coercingStrings: false, finiteOnly: true) else { return nil }
         return Date(timeIntervalSince1970: seconds)
     }
 

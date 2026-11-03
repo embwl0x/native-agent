@@ -2,13 +2,15 @@ import ChatTurnRuntime
 import ApprovalTransactions
 import ChatTurnContracts
 import AgentConversations
+import AgentWorkspace
 import Foundation
+import NativeAgentCore
 import Agents
 import Cognition
 import ContextFlow
 import PersonaEngine
 import PersistenceCore
-// Blueprint: | `EngineContactCommands.swift` | Person-initiated sends, verified-session stop commands and held-message withdrawal through engine dispatch; Contact sends/stops and core bridge/A2A construction over the injected engine |
+// Blueprint: | `EngineContactCommands.swift` | Person-initiated sends and exact-record, original-scope Stop through engine dispatch; held-message withdrawal returns its checked canonical mutation; core bridge/A2A construction over the injected engine |
 
 /// The person's own message to a contact, from its thread: the same
 /// agent_message machinery the agent uses (peer resolution, transports,
@@ -45,13 +47,13 @@ extension NativeAgentEngine {
     /// The person's Stop on the reply in flight: `agent_cancel` through the
     /// same chain. Nil when the thread recorded the stop (stopping, stopped,
     /// released, cannot_stop or finished; shown from the record); otherwise why not.
-    public func stopContactMessage(agent: String, conversation: String, session: String, root: URL) async -> String? {
+    public func stopContactMessage(agent: String, record: String, session: String, root: URL) async -> String? {
         let tools = toolDispatchClient(enforceAppAutonomy: false)
         let chain = makeGatedToolDispatchClient(tools: tools, fileAccess: "auto", dataRoot: root, verifiedSessionId: session)
         do {
             let result = try await ChatToolSessionContext.$verifiedSessionId.withValue(session) {
                 try await chain.dispatch(tool: "agent_cancel",
-                    input: ["agent": .string(agent), "conversation": .string(conversation)], surface: "chat")
+                    input: ["agent": .string(agent), "conversation": .string(record)], surface: "chat")
             }
             guard case .object(let fields) = result else { return "Nothing came back from the stop." }
             if fields["stop_state"] != nil { return nil }
@@ -63,11 +65,17 @@ extension NativeAgentEngine {
     }
 
     /// Takes a held message off its thread once it has been sent again.
-    public func withdrawContactMessage(_ item: String, record: String, root: URL) async {
-        await Task.detached(priority: .userInitiated) {
+    @discardableResult
+    public func withdrawContactMessage(_ item: String, record: String, root: URL) async throws -> AgentConversationRecord {
+        try await Task.detached(priority: .userInitiated) {
             let store = AgentConversationStore(dataRoot: root)
-            guard let row = try? store.records().first(where: { $0.id == record }) else { return }
-            _ = try? store.update(id: record, operationID: row.operationID, touch: false) {
+            guard let row = try store.records().first(where: { $0.id == record }) else {
+                throw ToolFailureError("The held message's conversation is unavailable. Preserve its saved record and repair the conversation store.", effects: .none)
+            }
+            return try store.update(id: record, operationID: row.operationID, touch: false) {
+                if let queued = $0.queued?.first(where: { $0.id == item }), queued.held == nil {
+                    throw ToolFailureError("The old message is no longer held; its current state was preserved. Read the conversation before changing it.", effects: .none)
+                }
                 $0.queued?.removeAll { $0.id == item && $0.held != nil }
                 if $0.queued?.isEmpty == true { $0.queued = nil }
             }

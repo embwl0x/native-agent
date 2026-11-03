@@ -14,9 +14,12 @@ function nowISO() {
   return new Date().toISOString();
 }
 
-// Her first life; work queued before lives were stamped began in it (DataRootLife.first).
-const FIRST_LIFE = "00000000-0000-0000-0000-000000000000";
-function lifeOf(stamp) { return stamp || FIRST_LIFE; }
+function lifeOf(stamp, source = "wake record") {
+  if (typeof stamp !== "string" || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(stamp)) {
+    throw new Error(`Life identity unavailable at ${source}; preserve and reconcile this record before continuing.`);
+  }
+  return stamp;
+}
 
 // The Swift data-root owner creates this identity before admitting work.
 function dataRootLife() {
@@ -26,13 +29,14 @@ function dataRootLife() {
   return life;
 }
 
-// Preserve valid JSON values verbatim; callers own shape checks and the value
-// used when the file cannot be read or decoded.
-function readWakeJSON(file, fallback = null) {
+// Only proven absence admits the caller's genesis value. Existing unreadable
+// bytes must never become a new policy, conversation or execution record.
+function readWakeJSON(file, absent = null) {
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    return fallback;
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(file)));
+  } catch (error) {
+    if (error.code === "ENOENT") return absent;
+    throw new Error(`Wake JSON unavailable at ${file}: ${error.message}. Repair this file before retrying.`, { cause: error });
   }
 }
 
@@ -72,13 +76,29 @@ function processTreeOrder(rootPid, children) {
 
 // Keep parsing lazy: receipt recovery may await between rows, and delivery
 // confirmation stops at the first match. Callers retain malformed-row policy.
-function* readWakeJSONLines(raw, onMalformed = () => {}) {
+function* readWakeJSONLines(raw, onMalformed = null, source = "<input>") {
+  let row = 0;
   for (const line of raw.split("\n")) {
+    row += 1;
     if (!line.trim()) continue;
     let value;
-    try { value = JSON.parse(line); } catch { onMalformed(); continue; }
+    try { value = JSON.parse(line); } catch (error) {
+      if (!onMalformed) throw new Error(`Wake JSONL row ${row} at ${source} is unreadable: ${error.message}. Retained bytes were not rewritten.`, { cause: error });
+      onMalformed(row, error);
+      continue;
+    }
     yield { line, value };
   }
+}
+
+// Codex commits JSONL records with LF. Snapshot only those bytes, before UTF-8
+// decoding: an append may stop inside a JSON token or a multibyte scalar. The
+// next owner read sees the same tail when its writer publishes the boundary.
+function readRolloutRows(file) {
+  const bytes = fs.readFileSync(file);
+  const end = bytes.lastIndexOf(10);
+  const complete = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, end + 1));
+  return readWakeJSONLines(complete, null, file);
 }
 
 // Lock waiters may have no other pending work; this timer must stay ref'd.
@@ -145,34 +165,60 @@ function unicodePrefix(value, maxCodePoints) {
   return text.slice(0, end);
 }
 
-/// Whether a dir-lock's recorded owner is a live process (with a matching
-/// start identity when one was recorded — a reused PID is not the owner).
-/// Behavior-identical to the historical inline check in withDirLock: ANY
-/// error in the read/kill/identity chain resolves via the EPERM test, so an
-/// unreadable-but-permission-denied pid file conservatively reads as alive,
-/// while a missing or garbage pid file reads as dead.
-function dirLockOwnerAlive(lockDir, operations = {}) {
-  const signal = operations.kill || ((pid, name) => process.kill(pid, name));
-  const identity = operations.processStartIdentity || processStartIdentity;
-  let ownerAlive = false;
+// BSD flock belongs to this open file description, inherited as fd 3 by lockf.
+// The kernel releases it when the worker closes/exits, even during acquisition.
+// Keep sidecars in place: unlinking would create two independent lock owners.
+function acquireWakeLock(file) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const fd = fs.openSync(file, "a+", 0o600);
   try {
-    const ownerFields = fs.readFileSync(path.join(lockDir, "pid"), "utf8").split("\n");
-    const ownerPID = Number(ownerFields[0]);
-    if (Number.isInteger(ownerPID) && ownerPID > 0) {
-      signal(ownerPID, 0);
-      ownerAlive = true;
-      // A live process with a different start identity means the PID was
-      // reused after the original lock owner died. Legacy locks without an
-      // identity retain the conservative old behavior.
-      const recordedIdentity = ownerFields[2] || null;
-      if (recordedIdentity) {
-        ownerAlive = identity(ownerPID) === recordedIdentity;
-      }
+    const result = spawnSync("/usr/bin/lockf", ["-s", "-t", "0", "3"], {
+      stdio: ["ignore", "ignore", "pipe", fd], encoding: "utf8", timeout: 2000,
+    });
+    if (result.error || result.signal || ![0, 75].includes(result.status)) {
+      throw new Error(`Wake lock unavailable at ${file}: ${result.error?.message || result.stderr || result.signal || result.status}`);
     }
-  } catch (ownerError) {
-    ownerAlive = Boolean(ownerError && ownerError.code === "EPERM");
+    if (result.status === 75) { fs.closeSync(fd); return { acquired: false, release() {} }; }
+    const opened = fs.fstatSync(fd, { bigint: true });
+    const atPath = fs.statSync(file, { bigint: true });
+    if (opened.dev !== atPath.dev || opened.ino !== atPath.ino) throw new Error(`Wake lock sidecar replaced: ${file}`);
+    let held = true;
+    return { acquired: true, fd, release() { if (held) { held = false; fs.closeSync(fd); } } };
+  } catch (error) { fs.closeSync(fd); throw error; }
+}
+
+async function withWakeLock(file, fn, options = {}) {
+  const deadline = Date.now() + (options.waitMs == null ? 2000 : options.waitMs);
+  while (true) {
+    const lock = acquireWakeLock(file);
+    if (lock.acquired) {
+      try { return await fn(); } finally { lock.release(); }
+    }
+    if (Date.now() >= deadline) {
+      const error = new Error("lock_busy");
+      error.lockDir = file;
+      throw error;
+    }
+    await sleep(Math.min(50, Math.max(1, deadline - Date.now())));
   }
-  return ownerAlive;
+}
+
+function wakeLockHeld(file) {
+  const lock = acquireWakeLock(file);
+  if (!lock.acquired) return true;
+  lock.release();
+  return false;
+}
+
+function processOwnerAlive(pid, recordedIdentity, source) {
+  if (!Number.isInteger(pid) || pid <= 0 || typeof recordedIdentity !== "string" || !/^[0-9a-f]{64}$/.test(recordedIdentity)) {
+    throw new Error(`Process identity unavailable at ${source}; ownership remains unknown.`);
+  }
+  try { process.kill(pid, 0); }
+  catch (error) { if (error.code === "ESRCH") return false; throw error; }
+  const current = processStartIdentity(pid);
+  if (!current) throw new Error(`Process identity unreadable for ${source}; ownership remains unknown.`);
+  return current === recordedIdentity;
 }
 
 function ensureDir(dir) {
@@ -235,7 +281,11 @@ function createWakeEventWaiter(onClose = () => {}) {
   return {
     promise, cleanup, close, signal,
     get settled() { return settled; },
-    startTimeout(event, delay) { timer = setTimeout(() => signal(event), delay); },
+    startTimeout(event, delay) {
+      if (settled) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => signal(event), delay);
+    },
   };
 }
 
@@ -257,17 +307,6 @@ function safeFilePart(value, limit) {
   return String(value || "")
     .replace(/[^a-zA-Z0-9._-]/g, "_")
     .slice(0, limit) || crypto.randomUUID();
-}
-
-// Each worker retains its own lazy cache, including a cached null observation.
-function createProcessStartIdentityReader() {
-  let cachedCurrentProcessStartIdentity;
-  return function currentProcessStartIdentity() {
-    if (cachedCurrentProcessStartIdentity === undefined) {
-      cachedCurrentProcessStartIdentity = processStartIdentity(process.pid);
-    }
-    return cachedCurrentProcessStartIdentity;
-  };
 }
 
 // Callbacks preserve the worker's delivery classification and timeout ordering.
@@ -371,20 +410,33 @@ function postWakeCompletion(transport, requestOptions, token, body, sessionId, c
 /// Live progress for one wake, into the app's shared update stream
 /// (`POST /<lane>/live`, keyed by the accepted message id): started, the reply
 /// text so far (coalesced to one POST per interval), tool/progress notes, and
-/// finished. Display only: it never gates the run, the completion POST, or a
-/// receipt, and every failure is ignored. Off unless the app launched this
+/// finished. Display only: execution and completion keep their own outcomes;
+/// the progress owner returns its availability and reports each failure. Off unless the app launched this
 /// helper (NATIVE_AGENT_WAKE_LIVE=1), so tests and manual runs stay quiet.
 function createWakeLivePoster({ url, tokenPath, messageIds, intervalMs = 400 }) {
-  const noop = { started() {}, partial() {}, note() {}, activity() {}, finished() { return Promise.resolve(); } };
+  const disabled = { started() {}, partial() {}, note() {}, activity() {}, finished() { return Promise.resolve({ status: "not_requested" }); } };
   const ids = (Array.isArray(messageIds) ? messageIds : [messageIds]).filter((id) => typeof id === "string" && id);
-  if (process.env.NATIVE_AGENT_WAKE_LIVE !== "1" || !url || ids.length === 0) return noop;
+  if (process.env.NATIVE_AGENT_WAKE_LIVE !== "1") return disabled;
+  const state = { status: "available", errors: [] };
+  const unavailable = (error) => {
+    const detail = redactDiagnosticText(`Live progress unavailable: ${error.message || error}. Repair the bridge progress channel; execution and completion keep their own outcomes.`);
+    state.status = "unavailable";
+    if (!state.errors.includes(detail) && state.errors.length < 8) {
+      state.errors.push(detail);
+      process.stderr.write(`${detail}\n`);
+    }
+  };
   let target;
   let token;
   try {
+    if (!url || ids.length === 0) throw new Error("missing live endpoint or message identity");
     target = new URL(url);
     token = require("fs").readFileSync(tokenPath, "utf8").trim();
-  } catch { return noop; }
-  if (!token || !["http:", "https:"].includes(target.protocol)) return noop;
+    if (!token || !["http:", "https:"].includes(target.protocol)) throw new Error("invalid live endpoint or empty bridge token");
+  } catch (error) {
+    unavailable(error);
+    return { ...disabled, finished() { return Promise.resolve(state); } };
+  }
   const transport = target.protocol === "https:" ? require("https") : require("http");
   const queue = [];
   let draining = null;
@@ -397,15 +449,22 @@ function createWakeLivePoster({ url, tokenPath, messageIds, intervalMs = 400 }) 
       hostname: target.hostname, port: target.port, path: `${target.pathname}${target.search}`,
       method: "POST", timeout: 2000,
       headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
-    }, (res) => { res.resume(); res.on("end", resolve); res.on("error", resolve); });
-    req.on("timeout", () => { req.destroy(); resolve(); });
-    req.on("error", resolve);
+    }, (res) => {
+      res.resume();
+      res.on("end", () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) unavailable(new Error(`HTTP ${res.statusCode}`));
+        resolve();
+      });
+      res.on("error", (error) => { unavailable(error); resolve(); });
+    });
+    req.on("timeout", () => { unavailable(new Error("live POST timed out after 2000ms")); req.destroy(); resolve(); });
+    req.on("error", (error) => { unavailable(error); resolve(); });
     req.end(body);
   });
   const drain = async () => {
     while (queue.length) {
       const { event, fields } = queue.shift();
-      for (const id of ids) await post({ message_id: id, event, ...fields }).catch(() => {});
+      for (const id of ids) await post({ message_id: id, event, ...fields }).catch(unavailable);
     }
     draining = null;
   };
@@ -448,9 +507,10 @@ function createWakeLivePoster({ url, tokenPath, messageIds, intervalMs = 400 }) 
       lastActivity = Date.now();
       send("activity");
     },
-    finished(note) {
+    async finished(note) {
       flushText();
-      return send("finished", note ? { note: `Run ended: ${String(note).slice(0, 200)}` } : {});
+      await send("finished", note ? { note: `Run ended: ${String(note).slice(0, 200)}` } : {});
+      return state;
     },
   };
 }
@@ -467,8 +527,9 @@ module.exports = {
   dataRootLife,
   lifeOf,
   jsonOut, nowISO, redactDiagnosticText, processStartIdentity, unicodePrefix,
-  dirLockOwnerAlive, ensureDir, fsyncDirectorySync, safeFilePart,
-  createProcessStartIdentityReader, postBridgeRequest, postWakeCompletion, writeSyncedAndClose,
+  acquireWakeLock, withWakeLock, wakeLockHeld, processOwnerAlive, readRolloutRows,
+  ensureDir, fsyncDirectorySync, safeFilePart,
+  postBridgeRequest, postWakeCompletion, writeSyncedAndClose,
   copyWakeProducerIdentity, copyWakeCompletionOrigin, claimWakeJob, readWakeJSON, missingWakeCompletionOrigin,
   appendSyncedWakeLine, createWakeEventWaiter, readWakeJSONLines, sleep,
   readWakeBridgeToken, processTreeOrder, createWakeLivePoster,

@@ -128,7 +128,11 @@ struct ApprovalsView: View {
 
     @ViewBuilder
     private var approvalsList: some View {
-        if MobileDesignSamples.rows(store.approvals).isEmpty && store.bannerWarning == nil {
+        if store.approvals.isEmpty && !iCloudSyncEngine.shared.approvalsSnapshotLoaded && MobileDesignSamples.screen == nil {
+            AliveCalmState(title: "Approvals unavailable", line: "The Mac approval snapshot has not arrived. Keep NativeAgent open on the paired Mac and check again after reconnecting.", actionTitle: "Check again") {
+                Task { await store.refresh(pairingStore: pairingStore) }
+            }
+        } else if MobileDesignSamples.rows(store.approvals).isEmpty && store.bannerWarning == nil {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Nothing is waiting on you.")
                     .font(.system(.title3, design: .serif))

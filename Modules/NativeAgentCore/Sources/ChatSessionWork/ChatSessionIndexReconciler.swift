@@ -237,14 +237,11 @@ public actor ChatSessionIndexReconciler {
             }
             guard !objectRows.isEmpty else { continue }
 
-            guard let createdAt = Self.string(objectRows.first?["createdAt"])
-                    ?? Self.string(objectRows.first?["timestamp"]) else {
+            guard let createdAt = Self.string(objectRows.first?["createdAt"]) else {
                 report.corruptTranscripts += 1
                 continue
             }
-            let updatedAt = Self.string(objectRows.last?["createdAt"])
-                ?? Self.string(objectRows.last?["timestamp"])
-                ?? createdAt
+            let updatedAt = Self.string(objectRows.last?["createdAt"]) ?? createdAt
             let firstUserContent = objectRows.first(where: {
                 Self.string($0["role"])?.lowercased() == "user"
             }).flatMap { Self.content($0) }
@@ -276,6 +273,7 @@ public actor ChatSessionIndexReconciler {
                 recoveredRow[Self.transcriptStampKey] = .string(Self.iso8601(modified))
             }
             recoveredRow[ChatSessionIndexFile.acknowledgedTranscriptKey] = read.version
+            recoveredRow[ChatSessionIndexFile.transcriptGenerationKey] = .int(1)
             recovered.append(recoveredRow)
         }
         // PASS 2 — index lock RELEASED. Each tripped transcript is read under
@@ -429,8 +427,8 @@ public actor ChatSessionIndexReconciler {
             return StaleRead(bytes: bytes, rows: valid ? rows : nil,
                              version: ChatSessionIndexFile.transcriptVersion(at: transcript),
                              preview: spoken.last.map { (bounded(content($0) ?? "", to: 160), stamp($0)) },
-                             firstSpokenStamp: string(spoken.first?["createdAt"]) ?? string(spoken.first?["timestamp"]),
-                             lastSpokenStamp: string(spoken.last?["createdAt"]) ?? string(spoken.last?["timestamp"]))
+                             firstSpokenStamp: string(spoken.first?["createdAt"]),
+                             lastSpokenStamp: string(spoken.last?["createdAt"]))
         } ?? nil
     }
 
@@ -448,7 +446,7 @@ public actor ChatSessionIndexReconciler {
 
     /// The shape both passes demand of a transcript before an index row is
     /// written from it: every physical line a JSON object, every object
-    /// carrying string `role` and `content` or legacy `text`, and no object claiming a
+    /// carrying string `role` and `content`, and no object claiming a
     /// different session.
     private nonisolated static func rowsAreTrustworthy(
         _ objectRows: [[String: JSONValue]],
@@ -468,7 +466,6 @@ public actor ChatSessionIndexReconciler {
 
     private nonisolated static func contentValue(_ object: [String: JSONValue]) -> JSONValue? {
         if case .string? = object["content"] { return object["content"] }
-        if case .string? = object["text"] { return object["text"] }
         return nil
     }
 

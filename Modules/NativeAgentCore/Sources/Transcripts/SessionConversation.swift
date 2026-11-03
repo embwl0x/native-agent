@@ -13,7 +13,7 @@ public struct SessionConversation: Sendable {
 
     public init(sessions: [ChatSession]) {
         kinds = sessions.reduce(into: [:]) { $0[$1.id] = Self.kind($1) }
-        helperSessions = Set(sessions.filter { $0.helperID != nil || $0.source == "bot" }.map(\.id))
+        helperSessions = Set(sessions.filter { $0.helperID != nil }.map(\.id))
     }
 
     public init(dataRoot: URL, includingArchived: Bool = false) throws {
@@ -27,7 +27,7 @@ public struct SessionConversation: Sendable {
         let helpers = rows.reduce(into: [String: Bool]()) { result, row in
             guard case .string(let id)? = row["id"] else { return }
             let hasOwner: Bool = if case .string? = row["helperID"] { true } else { false }
-            result[id] = hasOwner || row["source"] == .string("bot")
+            result[id] = hasOwner
         }
         helperSessions = Set(helpers.filter { $0.value }.keys)
         kinds = rows.reduce(into: [:]) { result, row in
@@ -45,17 +45,27 @@ public struct SessionConversation: Sendable {
     }
 
     /// Helper-only policies need the specific owner, beyond the common agent
-    /// kind. The helper creator's recorded owner (or older bot provenance) identifies it; no ID
+    /// kind. The helper creator's recorded owner identifies it; no ID
     /// shape or new conversation kind is involved.
     public func isHelper(_ sessionID: String?) -> Bool {
         sessionID.map { helperSessions.contains($0) } ?? false
     }
 
-    public static func isHelper(_ sessionID: String?, dataRoot: URL = defaultDataRoot(), includingArchived: Bool = false) -> Bool {
-        guard let sessionID, let hot = hotIndex(dataRoot) else { return false }
+    /// Admission must distinguish a checked missing row from unavailable ownership.
+    public static func checkedIsHelper(_ sessionID: String?, dataRoot: URL = defaultDataRoot(), includingArchived: Bool = false) throws -> Bool {
+        guard let sessionID else { return false }
+        let hot = try Self(dataRoot: dataRoot)
         if hot.kind(sessionID) != nil { return hot.isHelper(sessionID) }
-        guard includingArchived, let cold = archivedIndex(dataRoot) else { return false }
-        return cold.isHelper(sessionID)
+        guard includingArchived else { return false }
+        return try Self(rows: ChatSessionRetention.archiveIndexRows(dataRoot: dataRoot)).isHelper(sessionID)
+    }
+
+    public static func checkedKind(_ sessionID: String?, dataRoot: URL = defaultDataRoot(), includingArchived: Bool = false) throws -> ChatThreadKind? {
+        guard let sessionID else { return nil }
+        let hot = try Self(dataRoot: dataRoot)
+        if let kind = hot.kind(sessionID) { return kind }
+        guard includingArchived else { return nil }
+        return try Self(rows: ChatSessionRetention.archiveIndexRows(dataRoot: dataRoot)).kind(sessionID)
     }
 
     public static func kind(_ session: ChatSession) -> ChatThreadKind {
@@ -117,7 +127,8 @@ public struct SessionConversation: Sendable {
                 rows.append(["id": .string(sessionID), "title": .string(title), "source": .string(source),
                              "threadKind": .string(kind.rawValue),
                              "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
-                             "archived": .bool(false), "messageCount": .int(0)])
+                             "archived": .bool(false), "messageCount": .int(0),
+                             ChatSessionIndexFile.transcriptGenerationKey: .int(0)])
             }
         }
     }

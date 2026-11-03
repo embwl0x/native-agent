@@ -166,7 +166,7 @@ extension SwiftToolDispatcher {
         let outcome = await raceAgainstTimeout(seconds: 1.5) { [self] in
             let readiness = try await macIntegrationPermissionStore.readinessChecked()
             let admitted = await fullMacYoloAdmitted(surface: surface)
-            guard await macIntegrationPermissionStore.allows(MacIntegrationID.mail, mode: .read, fullMacAdmitted: admitted) else {
+            guard try await macIntegrationPermissionStore.allows(MacIntegrationID.mail, mode: .read) else {
                 return JSONValue.object(["status": .string("unavailable"), "message": .string(
                     readiness.refusal(integration: MacIntegrationID.mail, mode: .read)
                     ?? "Mail Read is off or unavailable; Mail was not searched.")])

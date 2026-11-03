@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `Research.swift` | `SwiftNativeResearchClient` and research values: SearXNG discovery/search, fetched-source receipts, classified DNS/refused-connection/timeout causes and persisted lab run contracts |
+// Blueprint: | `Research.swift` | Research values validate current SearXNG fields, skip malformed result and engine-failure rows as named gaps before capping valid siblings, expose independent receipt-retention state and require complete saved Lab rows; required envelope failures and DNS/refused-connection/timeout causes remain explicit |
 
 // MARK: - Research
 //
@@ -26,7 +26,7 @@ public struct SearXNGCandidate: Sendable, Equatable {
 /// this result so an incidental discovery cannot replace the app-wide status
 /// message used by other mounted surfaces.
 public enum SearXNGAutodetectOutcome: Equatable, Sendable {
-    case found(String)
+    case found(String, gaps: [String])
     case notFound(String)
     case failed(String)
 }
@@ -34,6 +34,7 @@ public enum SearXNGAutodetectOutcome: Equatable, Sendable {
 public struct SearXNGAutodetectResult: Sendable, Equatable {
     public var outcome: SearXNGAutodetectOutcome {
         guard found else {
+            if !gaps.isEmpty { return .failed("Search discovery has unavailable candidates: " + gaps.joined(separator: "; ")) }
             let detail = error?.trimmingCharacters(in: .whitespacesAndNewlines)
             if let detail, !detail.isEmpty {
                 return .notFound(detail)
@@ -46,7 +47,7 @@ public struct SearXNGAutodetectResult: Sendable, Equatable {
         }
         do {
             let normalized = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(baseURL)
-            return .found(normalized)
+            return .found(normalized, gaps: gaps)
         } catch {
             return .failed("SearXNG detection returned an invalid URL: \(error.localizedDescription)")
         }
@@ -56,12 +57,15 @@ public struct SearXNGAutodetectResult: Sendable, Equatable {
     public let baseURL: String?
     public let source: String?     // "common-port" | "docker" | nil when none
     public let error: String?
+    /// Unavailable candidates, each named by address; independent of selection.
+    public let gaps: [String]
 
-    public init(found: Bool, baseURL: String?, source: String?, error: String?) {
+    public init(found: Bool, baseURL: String?, source: String?, error: String?, gaps: [String]) {
         self.found = found
         self.baseURL = baseURL
         self.source = source
         self.error = error
+        self.gaps = gaps
     }
 
     /// `baseURL`, `source` and `error` serialize as null when absent.
@@ -71,6 +75,7 @@ public struct SearXNGAutodetectResult: Sendable, Equatable {
         obj["baseURL"] = baseURL.map { .string($0) } ?? .null
         obj["source"] = source.map { .string($0) } ?? .null
         obj["error"] = error.map { .string($0) } ?? .null
+        obj["gaps"] = .array(gaps.map { .string($0) })
         return .object(obj)
     }
 }
@@ -89,8 +94,7 @@ public struct ResearchSearchResult: Identifiable, Sendable, Hashable, Codable {
         self.source = source
     }
 
-    /// `source` is comma-joined engine names when `engines` is an array,
-    /// otherwise the string `engine` or null.
+    /// `source` is the comma-joined recorded engine list, or null when absent.
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = [:]
         obj["title"] = .string(title)
@@ -105,10 +109,13 @@ public struct ResearchSearchResponse: Sendable, Equatable {
     public let results: [ResearchSearchResult]
     /// SearXNG engines that failed ("name: reason"), distinct from no matches.
     public let unresponsiveEngines: [String]
+    /// Unusable result rows, named by their position and failing field.
+    public let gaps: [String]
 
-    public init(results: [ResearchSearchResult], unresponsiveEngines: [String] = []) {
+    public init(results: [ResearchSearchResult], unresponsiveEngines: [String] = [], gaps: [String] = []) {
         self.results = results
         self.unresponsiveEngines = unresponsiveEngines
+        self.gaps = gaps
     }
 
     public var enginesFailed: Bool { results.isEmpty && !unresponsiveEngines.isEmpty }
@@ -120,29 +127,70 @@ public struct ResearchSearchResponse: Sendable, Equatable {
         guard case .object(let payload) = parsed else { throw ResearchClientError.malformedResponse("SearXNG body is not a JSON object") }
         guard case .array(let items)? = payload["results"] else { throw ResearchClientError.malformedResponse("SearXNG results is missing or is not an array") }
         var results: [ResearchSearchResult] = []
+        var gaps: [String] = []
         for (index, item) in items.enumerated() {
             try Task.checkCancellation()
-            guard case .object(let entry) = item else { throw ResearchClientError.malformedResponse("SearXNG results[\(index)] is not an object") }
-            guard index < 10 else { continue }
-            func string(_ key: String) -> String? { if case .string(let value)? = entry[key] { return value }; return nil }
-            func nonempty(_ key: String) -> String? { string(key).flatMap { $0.isEmpty ? nil : $0 } }
-            let source: String?
-            if case .array(let engines)? = entry["engines"] {
-                source = engines.compactMap { if case .string(let value) = $0 { return value }; return nil }.joined(separator: ",")
-            } else { source = string("engine") }
-            results.append(ResearchSearchResult(title: nonempty("title") ?? nonempty("url") ?? "Untitled",
-                url: nonempty("url") ?? "", snippet: string("content") ?? "", source: source))
+            do {
+                guard case .object(let entry) = item else { throw ResearchClientError.malformedResponse("SearXNG results[\(index)] is not an object") }
+                func string(_ key: String) throws -> String {
+                    guard case .string(let value)? = entry[key] else {
+                        throw ResearchClientError.malformedResponse("SearXNG results[\(index)].\(key) must be a string")
+                    }
+                    return value
+                }
+                let title = try string("title"), url = try string("url"), content = try string("content")
+                guard let link = URLComponents(string: url), let scheme = link.scheme, !scheme.isEmpty,
+                      link.url != nil,
+                      !["http", "https"].contains(scheme.lowercased()) || link.host?.isEmpty == false,
+                      !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw ResearchClientError.malformedResponse("SearXNG results[\(index)].url must be an absolute URL")
+                }
+                let source: String?
+                switch entry["engines"] {
+                case .array(let engines)?:
+                    let names = try engines.enumerated().map { engineIndex, engine -> String in
+                        guard case .string(let name) = engine, !name.isEmpty else {
+                            throw ResearchClientError.malformedResponse("SearXNG results[\(index)].engines[\(engineIndex)] must be an engine name")
+                        }
+                        return name
+                    }
+                    source = names.isEmpty ? nil : names.joined(separator: ",")
+                case nil: source = nil
+                default: throw ResearchClientError.malformedResponse("SearXNG results[\(index)].engines must be an array when present")
+                }
+                // engine is separate current evidence, never a substitute for engines.
+                if let engine = entry["engine"] {
+                    guard case .string = engine else {
+                        throw ResearchClientError.malformedResponse("SearXNG results[\(index)].engine must be a string when present")
+                    }
+                }
+                if results.count < 10 { results.append(ResearchSearchResult(title: title, url: url, snippet: content, source: source)) }
+            } catch let error as ResearchClientError {
+                gaps.append(error.localizedDescription)
+            }
         }
-        let engines: [JSONValue] = if case .array(let values)? = payload["unresponsive_engines"] { values } else { [] }
-        self.init(results: results, unresponsiveEngines: engines.compactMap {
-            guard case .array(let pair) = $0, case .string(let name)? = pair.first else { return nil }
-            if pair.count > 1, case .string(let reason) = pair[1] { return name + ": " + reason }
-            return name
-        })
+        let engines: [JSONValue]
+        switch payload["unresponsive_engines"] {
+        case .array(let values)?: engines = values
+        default: throw ResearchClientError.malformedResponse("SearXNG unresponsive_engines must be an array")
+        }
+        var failures: [String] = []
+        for (index, value) in engines.enumerated() {
+            try Task.checkCancellation()
+            guard case .array(let pair) = value, pair.count == 2,
+                  case .string(let name) = pair[0], !name.isEmpty,
+                  case .string(let reason) = pair[1] else {
+                gaps.append("SearXNG unresponsive_engines[\(index)] must contain an engine name and reason")
+                continue
+            }
+            failures.append(name + ": " + reason)
+        }
+        self.init(results: results, unresponsiveEngines: failures, gaps: gaps)
     }
 
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = ["results": .array(results.map { $0.toJSON() })]
+        obj["gaps"] = .array(gaps.map(JSONValue.string))
         if !unresponsiveEngines.isEmpty {
             obj["unresponsive_engines"] = .array(unresponsiveEngines.map(JSONValue.string))
         }
@@ -164,8 +212,9 @@ public struct ResearchFetchRecord: Sendable, Equatable {
     public let coverage: JSONValue?
     public let sourceReceipt: JSONValue?
     public let verdict: [String: JSONValue]
+    let retentionDirectory: URL
 
-    public init(id: String, url: String, text: String, createdAt: String, verdict: [String: JSONValue], coverage: JSONValue? = nil, sourceReceipt: JSONValue? = nil) {
+    public init(id: String, url: String, text: String, createdAt: String, verdict: [String: JSONValue], retentionDirectory: URL, coverage: JSONValue? = nil, sourceReceipt: JSONValue? = nil) {
         self.id = id
         self.url = url
         self.text = text
@@ -173,6 +222,7 @@ public struct ResearchFetchRecord: Sendable, Equatable {
         self.coverage = coverage
         self.sourceReceipt = sourceReceipt
         self.verdict = verdict
+        self.retentionDirectory = retentionDirectory
     }
 
     public func toJSON() -> JSONValue {
@@ -189,6 +239,7 @@ public struct ResearchFetchRecord: Sendable, Equatable {
         }
         if let sourceReceipt { fields["source_receipt"] = sourceReceipt }
         fields.merge(verdict) { _, verdict in verdict }
+        fields["receipt_retention"] = SwiftNativeResearchClient.receiptRetentionStatus(in: retentionDirectory)
         return .object(fields)
     }
 }
@@ -239,15 +290,15 @@ public struct ResearchLabRun: Identifiable, Sendable, Hashable {
 // MARK: - Stored rows
 
 extension ResearchSearchResult {
-    /// One stored source row: `title`, `url` and `snippet` are required;
-    /// a present field of the wrong type makes the row malformed.
+    /// One stored source row requires string title/url/snippet and nullable
+    /// source, exactly as written by toJSON.
     public init?(row: JSONValue) {
         guard case .object(let obj) = row,
               case .string(let title)? = obj["title"],
               case .string(let url)? = obj["url"],
               case .string(let snippet)? = obj["snippet"] else { return nil }
         switch obj["source"] {
-        case nil, .null?: self.init(title: title, url: url, snippet: snippet, source: nil)
+        case .null?: self.init(title: title, url: url, snippet: snippet, source: nil)
         case .string(let source)?: self.init(title: title, url: url, snippet: snippet, source: source)
         default: return nil
         }
@@ -255,35 +306,33 @@ extension ResearchSearchResult {
 }
 
 extension ResearchLabRun {
-    /// One stored `lab/runs.json` row: `id`, `objective`, `status` and every
-    /// source are required; an absent text field reads as empty, a present
-    /// field of the wrong type makes the run malformed.
+    /// The complete current saved shape. Unknown historical evidence cannot
+    /// become an empty query, brief, timestamp or connector.
     public init?(row: JSONValue) {
         guard case .object(let obj) = row,
               case .string(let id)? = obj["id"],
               case .string(let objective)? = obj["objective"],
               case .string(let status)? = obj["status"],
+              case .string(let query)? = obj["query"],
+              case .string(let brief)? = obj["brief"],
+              case .string(let createdAt)? = obj["createdAt"],
+              case .string(let connector)? = obj["connector"],
               case .array(let sourceRows)? = obj["sources"] else { return nil }
         var sources: [ResearchSearchResult] = []
         for sourceRow in sourceRows {
             guard let source = ResearchSearchResult(row: sourceRow) else { return nil }
             sources.append(source)
         }
-        var malformed = false
-        func text(_ key: String) -> String? {
-            switch obj[key] {
-            case nil, .null?: return nil
-            case .string(let value)?: return value
-            default: malformed = true; return nil
-            }
+        let error: String?
+        switch obj["error"] {
+        case .null?: error = nil
+        case .string(let value)?: error = value
+        default: return nil
         }
-        let query = text("query"), brief = text("brief"), connector = text("connector")
-        let error = text("error"), createdAt = text("createdAt")
-        guard !malformed else { return nil }
         self.init(
-            id: id, objective: objective, status: status, query: query ?? "",
-            sources: sources, brief: brief ?? "", createdAt: createdAt ?? "",
-            connector: connector ?? "", error: error
+            id: id, objective: objective, status: status, query: query,
+            sources: sources, brief: brief, createdAt: createdAt,
+            connector: connector, error: error
         )
     }
 }

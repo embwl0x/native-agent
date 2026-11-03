@@ -4,6 +4,7 @@ import ChatToolParsing
 import Foundation
 import CryptoKit
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import PersonaEngine
 import MemoryV2
@@ -40,7 +41,12 @@ extension SwiftToolDispatcher {
 
     public func dispatch(tool requestedTool: String, input rawInput: [String: JSONValue], surface: String) async throws -> JSONValue {
         ChatToolOutcome.normalizedFailure(try await withToolArguments(tool: requestedTool, input: rawInput) { input in
-            try await dispatchNormalized(tool: requestedTool, input: input, surface: surface)
+            try await MacAppActGate.withAdmission(
+                origin: SecurityOriginContext.currentTurn(verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface),
+                dataRoot: dataRoot
+            ) {
+                try await dispatchNormalized(tool: requestedTool, input: input, surface: surface)
+            }
         }, tool: CanonicalToolNameDispatcher.canonical(requestedTool))
     }
     private func dispatchNormalized(tool requestedTool: String, input rawInput: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -62,15 +68,13 @@ extension SwiftToolDispatcher {
                 "tool": .string(tool),
             ])
         }
-        // Four-verb cutover: a conversational call always carries session_id.
-        // Keep the mac_* organs callable by direct diagnostics (which do not)
-        // while refusing stale model calls from an old persisted loadout.
-        if Self.legacyMacModelToolNames.contains(tool),
+        // Internal Mac organs are unavailable at a conversational ingress.
+        if Self.internalMacToolNames.contains(tool),
            !ChatToolSessionInjection.explicitSessionId(in: input).isEmpty {
             return .object([
                 "status": .string("failed"),
                 "effects": .string("none"),
-                "reason": .string("legacy_mac_tool_internal_only"),
+                "reason": .string("internal_tool"),
                 "detail": .string("\(tool) is internal now, so nothing ran. Use one of \(Self.fourVerbToolNames.joined(separator: ", ")) instead."),
                 "tool": .string(tool),
                 "replacement": .array(Self.fourVerbToolNames.map { .string($0) }),
@@ -78,6 +82,9 @@ extension SwiftToolDispatcher {
         }
         var deskState: DeskState?
         if Self.deskItemTools.contains(tool) {
+            if tool == "desk_wait" {
+                try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["desk_wait"]).deskSchemas().compactMap { $0 }.first)
+            }
             let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
             deskState = state
             let handle = try resolveDeskHandle(input, in: state)
@@ -97,7 +104,7 @@ extension SwiftToolDispatcher {
             }
             return try await appTools.execute(tool: tool, input: input, surface: surface)
         }
-        if Self.fileAccessGatedToolNames.contains(tool), await !fullMacToolAccess(surface: surface).fileOpsAllowed {
+        if Self.fileAccessGatedToolNames.contains(tool), try await !fullMacToolAccess(surface: surface).fileOpsAllowed {
             return builderFullMacRequired(tool: tool, input: input)
         }
         switch tool {
@@ -115,12 +122,7 @@ extension SwiftToolDispatcher {
                 throw ToolFailureError("search needs query: the words to search for.", argumentPath: "query", effects: .none)
             }
             let reader = pageReader
-            let tools = appTools
-            var result = await WebSearchRoutes.search(query: query, categories: categories, timeRange: timeRange, chromeConnected: {
-                guard let tools, case .object(let status)? = try? await tools.execute(tool: "browser.chrome_status", input: [:], surface: surface)
-                else { return false }
-                return status["extension_connected"] == .bool(true)
-            }) {
+            var result = await WebSearchRoutes.search(query: query, categories: categories, timeRange: timeRange) {
                 try await reader.search(query: query, categories: categories.isEmpty ? nil : categories,
                                         timeRange: timeRange.isEmpty ? nil : timeRange)
             }
@@ -203,7 +205,7 @@ extension SwiftToolDispatcher {
             }
         case "list_dir", "file_info":
             if tool == "list_dir" { input = Self.listDirInput(input) }
-            if await fullMacToolAccess(surface: surface).fileOpsAllowed {
+            if try await fullMacToolAccess(surface: surface).fileOpsAllowed {
                 return tool == "list_dir" ? try await impl_full_mac_list_dir(input: input, surface: surface)
                     : try await impl_local_connector_tool(tool: tool, input: input, surface: surface)
             }
@@ -216,7 +218,7 @@ extension SwiftToolDispatcher {
                 return need
             }
         case "write_file", "move_file", "copy_file", "trash_file":
-            if await fullMacToolAccess(surface: surface).fileOpsAllowed {
+            if try await fullMacToolAccess(surface: surface).fileOpsAllowed {
                 return partWrote(try await impl_local_connector_tool(tool: tool, input: input, surface: surface))
             }
             do {
@@ -386,7 +388,8 @@ extension SwiftToolDispatcher {
             // The fix the Mac holds answers first, whatever the permission now.
             // Not yet asked: macOS's own prompt is the ask (the reader raises it);
             // the Settings-row card is for a denial with nothing held.
-            let held = await MacLocationReader.read()
+            let held = try await MacLocationReader.read()
+            guard !Task.isCancelled, !TaskWaitDeadline.expired else { throw TaskWaitDeadline.cancellationError }
             guard case .object(let fields) = held, fields["status"] != .string("ok"),
                   [.denied, .restricted].contains(SystemPermissionPreflight.status(.location)) else { return held }
             return await Self.requestedInteraction(input: [
@@ -435,8 +438,6 @@ extension SwiftToolDispatcher {
             }
             throw AutonomyGateError.toolDenied(
                 reason: "SwiftToolDispatcher: '\(tool)' is not in the dispatch table"
-                    + (ToolNameAliases.retiredAppTools.union(ToolNameAliases.mergedTools).contains(tool)
-                        ? ". " + ToolNameAliases.retiredAppToolHint : "")
             )
         }
     }

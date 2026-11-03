@@ -3,7 +3,7 @@ import MacControl
 import NativeAgentCore
 import PersistenceCore
 import Dispatcher
-// Blueprint: | `HerScreenRooms+Build.swift` | `HerScreen`: `buildRoom`, `buildTarget`, `buildRecordRoom`. Files distinguishes unavailable enumeration from empty results and labels metadata/enumeration failures as partial coverage. |
+// Blueprint: | `HerScreenRooms+Build.swift` | `HerScreen`: `buildRoom`, `buildTarget`, `buildRecordRoom`. Files distinguishes unavailable enumeration from empty results and labels metadata/enumeration failures as partial coverage; builder receipts preserve explicit owner failures including failed_pre_spawn without guessing an exit. |
 
 /// Bounded local file/source rooms and builder receipts, reached by name.
 /// Trusted source reads include external worktree metadata under Git's read-only fences.
@@ -297,31 +297,51 @@ extension HerScreen {
             [section("CHANGED", fields["ok"] == .bool(true) ? changed : [failureFace(status)]),
              section("COMMITS", commits), section("RUNS", runs(dataRoot: dataRoot, now: now))],
             verbs: [("code.diff", "the uncommitted changes"), ("code.log", "the last 10 commits"),
-                    ("code.run", "run a shell command in the checkout (text)"), ("app swift.build · swift.test", "build or test")])
+                    ("code.run", "run a shell command in the checkout (text)"),
+                    ("app {find:\"build install\"}", "build and install under the checkout's AGENTS.md; check the installed app")])
     }
 
     /// The builder's newest receipts (data/builder_audit), one line each.
     private static func runs(dataRoot: URL, now: Date) -> [String] {
+        do { return try checkedRuns(dataRoot: dataRoot, now: now) }
+        catch { return ["Builder receipts unavailable: " + error.localizedDescription + ". Repair builder_audit access or the named receipt; no empty census was established."] }
+    }
+
+    private static func checkedRuns(dataRoot: URL, now: Date) throws -> [String] {
         let dir = dataRoot.appendingPathComponent("builder_audit", isDirectory: true)
         let builder: Set<String> = ["shell", "bash", "git", "apply_patch", "swift_build", "swift_test", "install_app", "restart_app"]
-        let newest = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+        let files: [URL]
+        do { files = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { files = [] }
+        let newest = try files
             .filter { $0.pathExtension == "json" }
-            .map { ($0, (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) }
+            .map { url -> (URL, Date) in
+                guard let at = try url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate else { throw CocoaError(.fileReadUnknown) }
+                return (url, at)
+            }
             .sorted { $0.1 > $1.1 }.prefix(12)
-        let rows = newest.compactMap { url, at -> String? in
-            guard let data = try? Data(contentsOf: url), data.count < 2_000_000,
-                  let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let tool = row["toolName"] as? String, builder.contains(tool) else { return nil }
+        let rows = try newest.compactMap { url, at -> String? in
+            let data = try Data(contentsOf: url)
+            guard data.count < 2_000_000, let row = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tool = row["toolName"] as? String else { throw ToolFailureError("Builder receipt is malformed: " + url.path, effects: .none,
+                    owner: url.path, instruction: "Repair this receipt from retained execution evidence; do not rerun the build to manufacture it.", recovery: .repair) }
+            guard builder.contains(tool) else { return nil }
             let exit = row["exitCode"] as? Int ?? row["processExitCode"] as? Int
-            if row["timedOut"] as? Bool == true || exit != 0 {
+            let ownerFailure = ["failed", "failed_pre_spawn", "cancelled", "stopped", "timeout", "timed_out"].contains(row["status"] as? String ?? "")
+            if row["timedOut"] as? Bool == true || exit != 0 || ownerFailure {
                 var evidence = JSONValue(fromFoundation: row).objectValue ?? [:]
-                if evidence["status"] == nil {
-                    evidence["status"] = .string(row["reason"] as? String == "stopped" ? "cancelled" : row["timedOut"] as? Bool == true ? "timeout" : "failed")
+                if evidence["status"] == nil || (exit == nil && !ownerFailure) {
+                    evidence["status"] = .string(row["reason"] as? String == "stopped" ? "cancelled" : row["timedOut"] as? Bool == true ? "timeout" : exit == nil ? "unavailable" : "failed")
                 }
-                if evidence["reason"] == nil { evidence["reason"] = .string(exit == nil ? "builder_exit_unrecorded" : "builder_exit_nonzero") }
+                if evidence["reason"] == nil {
+                    evidence["reason"] = .string(ownerFailure ? "builder_owner_failure"
+                        : row["timedOut"] as? Bool == true ? "builder_timeout"
+                        : exit == nil ? "builder_exit_unrecorded" : "builder_exit_nonzero")
+                }
                 evidence["detail"] = .object(["exit_code": exit.map { .int(Int64($0)) } ?? .null,
                     "timed_out": evidence["timedOut"] ?? .null,
                     "stderr": evidence["stderr"] ?? .null, "stdout": evidence["stdout"] ?? .null])
+                evidence["receipt"] = JSONValue(fromFoundation: row)
                 if evidence["effects"] == nil { evidence["effects"] = .string("unknown") }
                 if evidence["remedy"] == nil {
                     evidence["remedy"] = Repair.reconcile(instruction: "Read the build receipt and fix its reported cause before another execution; effects are unverified.",

@@ -30,6 +30,6 @@ public protocol ConnectorActionPlatform: Sendable {
     func spotlight(input: [String: JSONValue]) async throws -> MacControlResult
     func postMessage(title: String, body: String) async -> [String: JSONValue]
     func macAssistantStatusClient() -> any MacAssistantStatusClient
-    func statusEvidence(actionID: String) async -> ConnectorActionStatusEvidence?
+    func statusEvidence(actionID: String) async throws -> ConnectorActionStatusEvidence?
     func runGit(_ arguments: [String], repoRoot: URL, timeout: TimeInterval) async throws -> (status: Int32, stdout: String, stderr: String)
 }

@@ -1,6 +1,37 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
+import PersistenceCore
 // Blueprint: | `ChatCompletionsMessageEncoding.swift` | `chatCompletionsMessages` |
+
+public extension LLMToolSchema {
+    func checkedParameters() throws -> JSONValue {
+        let value = try JSONDecoder().decode(JSONValue.self, from: parametersJSON)
+        guard case .object = value else {
+            throw LLMError.providerError(message: "Tool schema \(name) must be a JSON object. Repair its catalog declaration before using it.")
+        }
+        return value
+    }
+}
+
+/// Retained calls and catalog schemas must carry the object that was recorded.
+/// The provider codecs share this boundary rather than inventing empty objects.
+func checkedProviderJSONObject(_ data: Data, owner: String) throws -> [String: Any] {
+    guard String(data: data, encoding: .utf8) != nil,
+          let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw LLMError.providerError(message: "\(owner) is not a UTF-8 JSON object. Repair the recorded call or tool catalog before sending it.")
+    }
+    return object
+}
+
+func checkedProviderJSONText(_ data: Data, owner: String) throws -> String {
+    _ = try checkedProviderJSONObject(data, owner: owner)
+    // The checked object read above establishes UTF-8; keep the original bytes.
+    guard let text = String(data: data, encoding: .utf8) else {
+        throw LLMError.providerError(message: "\(owner) is not UTF-8")
+    }
+    return text
+}
 
 /// Chat Completions block encoding shared by OpenAI, OpenRouter, Moonshot,
 /// and xAI. Tool-use messages precede their tool results; image parts are
@@ -9,7 +40,7 @@ import NativeAgentCore
 func chatCompletionsMessages(
     from message: LLMMessage,
     reasoning: String? = nil
-) -> [[String: Any]] {
+) throws -> [[String: Any]] {
     let role = message.role.rawValue
     var textParts: [String] = []
     var contentParts: [[String: Any]] = []
@@ -31,7 +62,7 @@ func chatCompletionsMessages(
                 "type": "function",
                 "function": [
                     "name": name,
-                    "arguments": String(data: inputJSON, encoding: .utf8) ?? "{}",
+                    "arguments": try checkedProviderJSONText(inputJSON, owner: "Recorded tool call \(name) (\(id))"),
                 ],
             ])
         case .toolResult(let toolUseID, let content, _):

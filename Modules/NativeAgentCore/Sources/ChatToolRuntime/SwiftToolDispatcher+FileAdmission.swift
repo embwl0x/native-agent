@@ -22,54 +22,6 @@ import NativeAgentShared
 // Blueprint: | `SwiftToolDispatcher+FileAdmission.swift` | `SwiftToolDispatcher`: file-root admission, bundled document reads, Full Mac access projection, local connector execution and file-result errors; connector work preserves call-scoped image and source-material context |
 
 extension SwiftToolDispatcher {
-    /// Source-repository reads share one root and its top-level allowlist.
-    static let allowedTopLevels: Set<String> = ["workspace", "persona", "data", "script"]
-
-    /// Resolve a caller-supplied relative path under `rootForRead`,
-    /// enforcing:
-    ///   * no absolute paths,
-    ///   * no `..` escapes — verified by `.standardizedFileURL` (normalizes
-    ///     `.`/`..`) AND then re-resolved via `.resolvingSymlinksInPath` so
-    ///     a symlink inside the root that points outside is rejected,
-    ///   * the first path component is in `allowedTopLevels`.
-    /// Throws `AutonomyGateError.toolDenied` on any violation.
-    func resolveSandboxed(_ relativePath: String, followFinalLink: Bool = true) throws -> URL {
-        let trimmed = relativePath
-        guard !trimmed.isEmpty else {
-            throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: empty path")
-        }
-        guard !trimmed.hasPrefix("/") else {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: absolute paths are not allowed ('\(trimmed)')"
-            )
-        }
-
-        let root = rootForRead
-        let rootPath = root.resolvingSymlinksInPath().path
-        let candidate = root.appendingPathComponent(trimmed).standardizedFileURL
-        // .standardizedFileURL handles `.`/`..` but NOT symlinks. Resolve
-        // symlinks too so a workspace/link -> /etc can't escape the sandbox.
-        let candidateResolved = candidate.resolvingSymlinksInPath()
-        let candidatePath = candidateResolved.path
-
-        // Strict prefix: must be inside root (resolved). Equality alone is
-        // not enough — the caller asked for SOMETHING under the root.
-        guard let suffix = NativeAgentWorkspaceRoot.relativePath(candidatePath, under: rootPath) else {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: path escapes data root ('\(trimmed)')"
-            )
-        }
-        // Suffix (path after root/). First component must be allow-listed.
-        let firstComponent = suffix.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: true).first.map(String.init) ?? ""
-        guard Self.allowedTopLevels.contains(firstComponent) else {
-            let allowed = Self.allowedTopLevels.sorted().joined(separator: ", ")
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: '\(trimmed)' is not under an allowed subdir of data/ (one of: \(allowed))"
-            )
-        }
-        return followFinalLink ? candidateResolved : candidate
-    }
-
     static func stringArray(_ value: JSONValue?) -> [String] {
         guard case .array(let values)? = value else { return [] }
         return values.compactMap { value in
@@ -78,9 +30,9 @@ extension SwiftToolDispatcher {
             return trimmed.isEmpty ? nil : trimmed
         }
     }
-    func trustedWorkspaceRoots() async -> [URL] {
-        let policy = await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy()
-        return SwiftNativeSecurityCenter.trustedWorkspaceRoots(policy: policy,
+    func trustedWorkspaceRoots() async throws -> [URL] {
+        let policy = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked()
+        return SwiftNativeSecurityCenter.trustedWorkspaceRoots(
             filePolicy: policy["filePolicy"]?.objectValue ?? [:], dataRoot: dataRoot)
     }
 
@@ -121,7 +73,7 @@ extension SwiftToolDispatcher {
 
     package func resolveTrustedFilePath(
         _ rawPath: String,
-        includeRepoSandbox: Bool = true,
+        write: Bool = false,
         followFinalLink: Bool = true,
         trustedRoots: [URL]? = nil
     ) async throws -> URL {
@@ -134,11 +86,12 @@ extension SwiftToolDispatcher {
         }
         let workspaceRoot = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
         let workspaceAlias = NativeAgentWorkspaceRoot.normalizeWorkspaceAlias(path, workspaceRoot: workspaceRoot) != path
-        if includeRepoSandbox, !workspaceAlias {
-            if let bundled = Self.resolveBundledDocsPath(path) { return bundled }
-            if !path.hasPrefix("/"), let sandboxed = try? resolveSandboxed(path, followFinalLink: followFinalLink) {
-                return sandboxed
+        if !write, !workspaceAlias, path == "docs" || path.hasPrefix("docs/") {
+            guard let bundled = Self.resolveBundledDocsPath(path) else {
+                throw ToolFailureError("The bundled document '\(path)' is unavailable. Use an existing bundled document or an explicit workspace path.",
+                    effects: .none, code: "bundled_document_unavailable")
             }
+            return bundled
         }
         let candidate = NativeAgentWorkspaceRoot.fileCandidate(rawPath, relativeTo: workspaceRoot, workspaceRoot: workspaceRoot)
         if workspaceAlias || !path.hasPrefix("/") {
@@ -146,8 +99,8 @@ extension SwiftToolDispatcher {
                 throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: relative path escapes the canonical workspace")
             }
         } else {
-            let roots = if let trustedRoots { trustedRoots } else { await trustedWorkspaceRoots() }
-            guard AbilityStore.fileReachAllows(candidate, write: !includeRepoSandbox)
+            let roots = if let trustedRoots { trustedRoots } else { try await trustedWorkspaceRoots() }
+            guard AbilityStore.fileReachAllows(candidate, write: write)
                 || roots.contains(where: { SwiftNativeSecurityCenter.isSelfOrAncestor(root: $0, of: candidate) }) else {
                 let renderedRoots = roots.map(\.path).sorted().joined(separator: ", ")
                 throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: '\(rawPath)' is outside trusted workspace roots (\(renderedRoots))")
@@ -211,13 +164,11 @@ extension SwiftToolDispatcher {
             dataRoot: dataRoot, source: "swift_tool_dispatcher")
     }
 
-    func fullMacToolAccess(surface: String = "chat") async -> FullMacToolAccess {
-        let snapshot = try? await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
-        let policy = snapshot?.policy ?? [:]
-        let admitted = if let snapshot {
-            await ChatFullMacYoloAdmission.admitted(surface: surface,
-                dataRoot: dataRoot, source: "swift_tool_dispatcher", snapshot: snapshot)
-        } else { false }
+    func fullMacToolAccess(surface: String = "chat") async throws -> FullMacToolAccess {
+        let snapshot = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
+        let policy = snapshot.policy
+        let admitted = await ChatFullMacYoloAdmission.admitted(surface: surface,
+            dataRoot: dataRoot, source: "swift_tool_dispatcher", snapshot: snapshot)
         let macPolicy = MacControlGate.policyForAdmittedFullMac(
             MacControlPolicy.fromTrustPolicyObject(policy, dataRoot: dataRoot), admitted: admitted
         )
@@ -261,7 +212,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_local_connector_tool(tool: String, input: [String: JSONValue], surface: String, attachment: (filename: String, data: Data)? = nil) async throws -> JSONValue {
-        let access = await fullMacToolAccess(surface: surface)
+        let access = try await fullMacToolAccess(surface: surface)
         let category = categoryForLocalConnectorTool(tool)
         let allowed: Bool
         switch category {
@@ -285,16 +236,19 @@ extension SwiftToolDispatcher {
             )
         }
         let workspaceRoot = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
+        var input = input
+        if ["read_file", "list_dir", "file_info", "file_excerpt"].contains(tool),
+           let path = input["path"]?.stringValue, path == "docs" || path.hasPrefix("docs/") {
+            input["path"] = .string(try await resolveTrustedFilePath(path).path)
+        }
         if ["mac_volume", "mac_media"].contains(tool) {
             let impl = makeMacControl(
                 policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
                 auditAppendPath: dataRoot.appendingPathComponent("mac_control_audit.jsonl"))
             return try await impl.dispatch(action: tool == "mac_volume" ? "volume" : "media", body: input).toJSON()
         }
-        let operationalRoot = Self.builderSourceRepoRoot(dataRoot: dataRoot)
-            ?? workspaceRoot
         let ctx = ConnectorActionContext(
-            repoRoot: operationalRoot,
+            repoRoot: workspaceRoot,
             fileAccess: [
                 "mode": .string("full"),
                 "sandbox": .string("danger-full-access"),
@@ -312,11 +266,12 @@ extension SwiftToolDispatcher {
         let imageSink = LocalToolImage.sink
         let sourceMaterialOnly = FileReadSourceMaterial.metadataOnly
         if let attachment { return LocalConnectorActions.saveAttachment(attachment, input: input, ctx: ctx) }
+        let admittedInput = input
         let connectorResult: JSONValue? = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 let result = FileReadSourceMaterial.$metadataOnly.withValue(sourceMaterialOnly) {
                     LocalToolImage.$sink.withValue(imageSink) {
-                        LocalConnectorActions.fileSystemDefault.run(tool, input: input, ctx: ctx)
+                        LocalConnectorActions.fileSystemDefault.run(tool, input: admittedInput, ctx: ctx)
                     }
                 }
                 continuation.resume(returning: result)

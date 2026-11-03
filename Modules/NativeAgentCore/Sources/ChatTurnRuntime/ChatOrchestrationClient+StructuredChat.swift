@@ -23,11 +23,12 @@ import ToolRegistry
 import StandingBots
 import ChatToolParsing
 import NativeAgentShared
-// Blueprint: | `ChatOrchestrationClient+StructuredChat.swift` | Accepted turn ingress and execution with captured run identity, carried offers and prepared cognitive context; effect completion joins canonical turn settlement |
+// Blueprint: | `ChatOrchestrationClient+StructuredChat.swift` | Accepted turn ingress resolves session-owned delivery before preparation, independently of the caller's additional observer; captured run identity, carried offers and prepared cognitive context; effect completion joins canonical turn settlement and delivery retirement |
 
 extension SwiftNativeChatOrchestrationClient {
 
-    /// The one structured chat turn. Streaming surfaces consume `progress` live; chat() callers await the returned execution.
+    /// The one structured chat turn. Session delivery is mandatory to resolve;
+    /// `progress` only adds an observer, and callers await the saved execution.
     func executeStructuredChatStreaming(
         message: String,
         sessionId: String?,
@@ -38,8 +39,7 @@ extension SwiftNativeChatOrchestrationClient {
         persona: String?,
         surface: String,
         suppressUserAppend: Bool,
-        progress: TurnEventSink?,
-        noticeSink: @escaping @Sendable (String, String) async -> Void
+        progress: TurnEventSink?
     ) async throws -> StructuredChatExecution {
         let persona = PersonaSelection.current() ?? persona
         let fileAccess = FileAccessGatedDispatcher.sharedFileAccess(fileAccess)
@@ -56,11 +56,17 @@ extension SwiftNativeChatOrchestrationClient {
         let resolvedSession = try Self.resolveSessionId(sessionId)
         // Transport and enqueue pins keep the canonical transcript identity stable before work starts, whether or not the user row already exists.
         let runId = ChatPersistenceContext.pinnedTurnRunID ?? UUID().uuidString
+        let boundTurnId = TurnTraceContext.turnId ?? TurnTraceContext.mintTurnId()
+        return try await TurnTraceContext.$turnId.withValue(boundTurnId) {
+        return try await SessionTurnDelivery.withDelivery(dataRoot: dataRoot, sessionID: resolvedSession,
+            runID: runId, surface: surface, observer: progress) { progress in
+        let noticeSink: @Sendable (String, String) async -> Void = { kind, text in
+            await progress(.notice(kind: kind, text: text))
+        }
         ChatTurnExecution.current?.bindHistoryRunID(runId)
         var partialContext: TurnContext?
         var origin: AfterTurnOrigin?
         var steeringToken: UUID?
-        let boundTurnId = TurnTraceContext.turnId ?? TurnTraceContext.mintTurnId()
         let heardID = suppressUserAppend ? ChatToolSessionContext.envelope?.answerExperienceID ?? boundTurnId : boundTurnId
         let cancelFlagPath = ChatCancelFlag.accept(
             dataRoot: dataRoot, sessionId: resolvedSession, runId: runId, turnId: boundTurnId)
@@ -93,7 +99,7 @@ extension SwiftNativeChatOrchestrationClient {
         if queueUnavailable { modelMessage += "\n\n[MY QUEUE is unavailable; no queued step was admitted with this message.]" }
         if !carried.isEmpty {
             let items = carried.map { entry in
-                var arrival = ResidentWake.carriedArrival(entry.item, crossing: admittedAt)
+                var arrival = ResidentWake.carriedArrival(entry.item, crossing: admittedAt, dataRoot: dataRoot)
                 arrival.reason = "what you carry"
                 return arrival
             }
@@ -176,27 +182,12 @@ extension SwiftNativeChatOrchestrationClient {
             }
             }
         }
-        steeringToken = await ChatTurnSteering.shared.openTurn(
+        steeringToken = try await ChatTurnSteering.shared.openTurn(
             sessionId: resolvedSession, turnId: TurnTraceContext.turnId ?? runId, dataRoot: dataRoot,
             door: ChatToolSessionContext.replyRoute ?? TurnEnvelope.current(surface: surface).deliveryRoute, persist: steeringPersister)
-        // A turn whose history was compacted cannot also advance the window cursor.
-        var compactionRanThisTurn = false
-        var transcript: Data?
-        do {
-            (compactionRanThisTurn, transcript) = try await prepareSessionHistoryForTurn(
-                sessionId: resolvedSession,
-                model: model,
-                surface: surface,
-                runId: runId,
-                progress: progress
-            )
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            // A compaction that did not finish is this message's input: she answers from the history that is there and holds the lever.
-            modelMessage += "\n\n[This conversation's compaction did not finish: \(error.localizedDescription)"
-                + ((error as? ToolFailureError)?.nextCall.map { " Repair: \($0)" } ?? "") + "]"
-        }
+        // Resolve owed blocks now; fit the actual request after her part composes it.
+        let (_, transcript) = try await preparePendingSessionHistoryForTurn(
+            sessionId: resolvedSession, model: model, surface: surface, runId: runId, progress: progress)
 
         let gated = makeTracedGatedDispatcher(
             fileAccess: fileAccess, verifiedSessionId: resolvedSession
@@ -205,7 +196,8 @@ extension SwiftNativeChatOrchestrationClient {
             .split(whereSeparator: \.isNewline).first.map(String.init)?.prefix(96) ?? "".prefix(96))
         TurnTraceBus.fire(TurnTraceEvent(
             turnId: boundTurnId, kind: "work.identified", sessionId: resolvedSession,
-            surface: surface, payload: .object(["title": .string(workTitle)])
+            surface: surface, payload: .object(["title": .string(workTitle),
+                "workIdentity": ChatToolSessionContext.envelope?.workIdentity.map(JSONValue.string) ?? .null])
         ), on: turnTraceBus)
         TurnLifecycleTelemetry.emit(
             .turnAccepted,
@@ -215,6 +207,8 @@ extension SwiftNativeChatOrchestrationClient {
             turnId: boundTurnId,
             on: turnTraceBus
         )
+        var preparationTrace = ContextStageTrace()
+        let checkpointStart = DispatchTime.now().uptimeNanoseconds
         // Acceptance owns its checkpoint before any context is built: a relaunch from here on finds this turn and answers it. A checkpoint that could not be written is this turn's fact, never its end: she answers knowing a relaunch before
         // she finishes will not find it.
         if TurnCheckpointScope.resuming == nil, let root = engine.remPinsDataRoot {
@@ -225,7 +219,8 @@ extension SwiftNativeChatOrchestrationClient {
                 modelMessage += "\n\n[" + unwritten + "]"
             }
         }
-        async let cognitiveProjectionTask = prepareCognitiveTurnProjection(
+        preparationTrace.record(.checkpoint, since: checkpointStart)
+        async let cognitiveProjectionTask = try prepareCognitiveTurnProjection(
             surface: surface,
             userMessage: message,
             sessionId: resolvedSession,
@@ -233,9 +228,8 @@ extension SwiftNativeChatOrchestrationClient {
         )
 
         // Prebuilt context threads history into the engine; context-build failures are persisted and rethrown. Mint and bind one turn id across context building and execution so both retain their trace events.
-        let threadedCtx = try await HistoryWindowTurnFacts
-                .$compactionRanThisTurn.withValue(compactionRanThisTurn) {
-            try await TurnTraceContext.$bus.withValue(turnTraceBus) {
+        let historyStart = DispatchTime.now().uptimeNanoseconds
+        let threadedCtx = try await TurnTraceContext.$bus.withValue(turnTraceBus) {
             try await TurnTraceContext.$turnId.withValue(boundTurnId) {
                 try await engine.buildTurnContextWithHistory(
                     surface: surface,
@@ -253,14 +247,23 @@ extension SwiftNativeChatOrchestrationClient {
                 )
             }
             }
-            }
-        let cognitiveProjection = await cognitiveProjectionTask
+        preparationTrace.record(.historyContext, since: historyStart)
+        let cognitionJoinStart = DispatchTime.now().uptimeNanoseconds
+        let cognitiveProjection = try await cognitiveProjectionTask
+        preparationTrace.record(.cognitionJoin, since: cognitionJoinStart)
+        let appendStart = DispatchTime.now().uptimeNanoseconds
         let threadedCtxWithCognition = await Self.contextByAppendingCognitiveCapsule(
             to: threadedCtx,
             projection: cognitiveProjection?.projection
         )
         // `app` is her one tool (docs/TOOL_LOADING.md): the turn offers it alone.
         let providerCtx = Self.applyLazyToolFilter(to: threadedCtxWithCognition, activeTools: [])
+        preparationTrace.record(.cognitiveAppend, since: appendStart)
+        _ = TurnTraceContext.$bus.withValue(turnTraceBus) {
+            TurnTraceContext.$turnId.withValue(boundTurnId) {
+                preparationTrace.emit(kind: "turn.preparation.summary", surface: surface)
+            }
+        }
         partialContext = providerCtx
         Self.traceFinalToolContract(
             turnId: boundTurnId,
@@ -295,7 +298,7 @@ extension SwiftNativeChatOrchestrationClient {
             if case .delta(let text) = redactedEvent {
                 ChatLiveTap.emit(sessionId: resolvedSession, surface: surface, runId: runId, .delta(text))
             }
-            await progress?(redactedEvent)
+            await progress(redactedEvent)
         }
 
         let result: TurnEngineResult
@@ -375,15 +378,16 @@ extension SwiftNativeChatOrchestrationClient {
         return ProducedChatTurn(result: result, context: providerCtx, personaFingerprint: threadedCtx.personaFingerprint,
             attachments: ChatGeneratedImageArtifacts.attachments(
                 from: result.toolDispatches, chosen: replyChoices.paths, dataRoot: dataRoot),
-            answerID: TurnTraceContext.replyRow.flatMap {
-                $0.turnId == boundTurnId ? $0.messageId : nil
-            } ?? UUID().uuidString)
+            answerID: TurnTraceContext.replyRow?.messageId(turn: boundTurnId, session: resolvedSession) ?? UUID().uuidString)
         }
         var envelope = TurnEnvelope.current(surface: surface)
         envelope.answerExperienceID = heardID
         outcome = .success(try await ChatPersistenceContext.$pinnedTurnRunID.withValue(nil) {
             try await ChatToolSessionContext.$envelope.withValue(envelope) {
+                try await withSessionContextMeasurement(sessionId: resolvedSession, model: model,
+                    providerID: LLMCallContext.providerId, surface: surface, runId: runId, progress: progress) {
                 try await PeerDataTaint.$current.withValue(taint, operation: executeCarriedTurn)
+                }
             }
         })
         } catch {
@@ -406,14 +410,14 @@ extension SwiftNativeChatOrchestrationClient {
         let budget = LLMCallContext.turnTokenBudget
         let standingBot = StandingBotContinuity.currentBot
         let senseReads = SenseTurnReads.current
-        let conditionVerdict = BotRunner.conditionVerdict
         let admittedModel = LLMCallContext.admittedModel
         let providerId = LLMCallContext.providerId
         let closeSteering = TurnAdmission.token == nil
+        let replyRowID = TurnTraceContext.replyRow?.messageId(turn: boundTurnId, session: resolvedSession)
         let save: @Sendable () async -> Result<StructuredChatExecution, any Error> = { [self, partialContext, steeringToken] in
             let settled = await self.settleStructuredChatTurn(
                 outcome, observation: loopObservation, context: partialContext,
-                message: message, sessionId: resolvedSession, runId: runId, turnId: boundTurnId,
+                message: message, sessionId: resolvedSession, runId: runId, turnId: boundTurnId, replyRowID: replyRowID,
                 heardID: heardID, model: model, reasoningEffort: reasoningEffort, persona: persona,
                 surface: surface, suppressUserAppend: suppressUserAppend,
                 chosenPaths: replyChoices.paths,
@@ -448,15 +452,19 @@ extension SwiftNativeChatOrchestrationClient {
             await AfterTurnSource.$origin.withValue(origin) {
             await StandingBotContinuity.$currentBot.withValue(standingBot) {
             await SenseTurnReads.$current.withValue(senseReads) {
-            await BotRunner.$conditionVerdict.withValue(conditionVerdict) {
             await ToolNoticeBus.$emit.withValue(noticeSink, operation: withContext)
             }
             }
             }
             }
-            }
         }
-        return try settled.get()
+        let result = try settled.get()
+        if case .success = result.turn, let suffix = TurnSettle.takeStreamSuffix() {
+            await progress(.delta(suffix))
+        }
+        return result
+        }
+        }
         }
         }
     }
@@ -482,11 +490,11 @@ extension SwiftNativeChatOrchestrationClient {
         userMessage: String,
         sessionId: String,
         runId: String
-    ) async -> (request: CognitiveCapsuleRequest, projection: CognitionAtTurn)? {
+    ) async throws -> (request: CognitiveCapsuleRequest, projection: CognitionAtTurn)? {
         // Every verified owner turn stamps the time, whether or not cognition is wired.
         let fromUser = Self.isUsersTurn(surface: surface, sessionId: sessionId, dataRoot: dataRoot)
         if fromUser {
-            UserTurnStamp.record(dataRoot: dataRoot, key: runId)
+            UserTurnStamp.record(dataRoot: dataRoot, key: runId, door: surface)
         }
         guard let cognitiveRuntime else { return nil }
         let request = CognitiveCapsuleRequest(
@@ -495,7 +503,7 @@ extension SwiftNativeChatOrchestrationClient {
             sessionId: sessionId,
             mode: .inject,
             // The model window sizes the request; the substrate applies its own ceiling.
-            maximumCharacters: ContextBudgetPolicy.resolve(
+            maximumCharacters: try ContextBudgetPolicy.resolve(
                 model: LLMCallContext.admittedModel,
                 providerID: LLMCallContext.providerId,
                 dataRoot: dataRoot
@@ -546,9 +554,13 @@ extension SwiftNativeChatOrchestrationClient {
         let path = dataRoot.appendingPathComponent("telegram/config.json")
         guard let data = try? Data(contentsOf: path),
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
-        let ids = Set(["allowed_user_ids", "allowedUserIds"].flatMap { key in
+        let users = Set(["allowed_user_ids", "allowedUserIds"].flatMap { key in
             ((object[key] as? [Any]) ?? []).map { "\($0)".trimmingCharacters(in: .whitespacesAndNewlines) }
         }.filter { !$0.isEmpty })
+        // A sole private chat is its user's id, as TelegramBotConfig.ownerUserId defines.
+        let ids = users.isEmpty ? Set(["allowed_chat_ids", "allowedChatIds"].flatMap { key in
+            ((object[key] as? [Any]) ?? []).compactMap { Int64("\($0)") }.filter { $0 > 0 }.map(String.init)
+        }) : users
         return ids.count == 1 ? ids.first : nil
     }
 

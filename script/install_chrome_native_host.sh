@@ -58,6 +58,12 @@ fi
 [[ "$RELAY_PATH" == /* ]] || { echo "relay path must be absolute" >&2; exit 2; }
 [[ -f "$RELAY_PATH" && ! -L "$RELAY_PATH" && -x "$RELAY_PATH" ]] \
   || { echo "relay must be an executable regular file: $RELAY_PATH" >&2; exit 2; }
+[[ "$RELAY_PATH" == *.app/Contents/MacOS/NativeAgentChromeRelay ]] \
+  || { echo "relay must be inside an app's Contents/MacOS directory" >&2; exit 2; }
+RELAY_CONTENTS="${RELAY_PATH%/MacOS/NativeAgentChromeRelay}"
+OWNER_BUNDLE_ID="$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$RELAY_CONTENTS/Info.plist")"
+[[ "$OWNER_BUNDLE_ID" =~ ^[A-Za-z0-9._-]+$ ]] \
+  || { echo "relay app has no valid CFBundleIdentifier" >&2; exit 2; }
 
 if (( ${#EXTENSION_IDS[@]} == 0 )); then
   EXTENSION_IDS=("$DEVELOPMENT_EXTENSION_ID")
@@ -93,6 +99,7 @@ trap 'rm -f -- "$TEMP_MANIFEST"' EXIT
 /usr/bin/plutil -insert description -string "NativeAgent Chrome transport relay" "$TEMP_MANIFEST"
 /usr/bin/plutil -insert path -string "$RELAY_PATH" "$TEMP_MANIFEST"
 /usr/bin/plutil -insert type -string "stdio" "$TEMP_MANIFEST"
+/usr/bin/plutil -insert nativeagent_bundle_id -string "$OWNER_BUNDLE_ID" "$TEMP_MANIFEST"
 /usr/bin/plutil -insert allowed_origins -json '[]' "$TEMP_MANIFEST"
 
 origin_index=0

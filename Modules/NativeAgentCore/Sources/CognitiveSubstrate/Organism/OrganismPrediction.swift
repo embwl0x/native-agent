@@ -84,7 +84,7 @@ public enum OrganismPredictiveBody {
             )
         case .correctionReceived, .appWake, .appSleep, .horizonRefresh,
              .providerRecovered, .iPhoneReachable, .iPhoneStale,
-             .memoryCommitted, .memoryCorrected, .memoryHygieneCompleted,
+             .memoryCommitted, .memoryCorrected,
              .dreamCompleted, .remIntegrated, .resourcePressureChanged:
             break
         }
@@ -131,7 +131,7 @@ public enum OrganismPredictiveBody {
         }
     }
 
-    /// Live and restored rows share expiry; only non-horizon expiry is a miss.
+    /// Live and restored rows share expiry; silence about a belief is no miss.
     /// Callers own ledger effects: the live sweep stamps violation and chemistry,
     /// while restore avoids dosing a body already decayed through the gap.
     static func applyExpiryTransition(
@@ -140,7 +140,7 @@ public enum OrganismPredictiveBody {
     ) -> Bool {
         prediction.status = .expired
         prediction.lastUpdatedAt = date
-        guard prediction.horizon == nil else { return false }
+        guard prediction.horizon == nil, prediction.kind != .semanticExpectation else { return false }
         prediction.uncertainty = OrganismBodyConfidence.clamp(prediction.uncertainty + 0.12)
         prediction.confidence = OrganismBodyConfidence.clamp(prediction.confidence - 0.10)
         return true
@@ -151,7 +151,7 @@ public enum OrganismPredictiveBody {
         signal: SomaticSignal,
         in ledger: inout OrganismPredictionLedger
     ) {
-        let id = pendingID(kind: kind, signal: signal)
+        guard let id = pendingID(kind: kind, signal: signal) else { return }
         let dueAt = signal.occurredAt.addingTimeInterval(defaultHorizon(for: kind))
         if var existing = ledger.predictions[id] {
             // Correlated source evidence can arrive late. It may still inform
@@ -191,7 +191,7 @@ public enum OrganismPredictiveBody {
         ledger: inout OrganismPredictionLedger,
         chemicalState: inout ChemicalState
     ) {
-        let id = pendingID(kind: kind, signal: signal)
+        guard let id = pendingID(kind: kind, signal: signal) else { return }
         let existing = ledger.predictions[id]
         let status: OrganismPredictionStatus = satisfied ? .satisfied : .violated
         if let existing {
@@ -203,7 +203,7 @@ public enum OrganismPredictiveBody {
                signal.occurredAt == existing.lastUpdatedAt { return }
         }
         settlePrediction(
-            existing ?? terminalPrediction(kind, signal: signal),
+            existing ?? terminalPrediction(kind, id: id, signal: signal),
             satisfied: satisfied,
             anticipated: existing?.status == .pending,
             at: signal.occurredAt,
@@ -218,7 +218,7 @@ public enum OrganismPredictiveBody {
         signal: SomaticSignal,
         ledger: inout OrganismPredictionLedger
     ) {
-        let id = pendingID(kind: kind, signal: signal)
+        guard let id = pendingID(kind: kind, signal: signal) else { return }
         guard let prediction = ledger.predictions[id], prediction.status == .pending else { return }
         guard signal.occurredAt >= prediction.lastUpdatedAt else { return }
         ledger.predictions.removeValue(forKey: id)
@@ -227,10 +227,11 @@ public enum OrganismPredictiveBody {
 
     private static func terminalPrediction(
         _ kind: OrganismPredictionKind,
+        id: String,
         signal: SomaticSignal
     ) -> OrganismPrediction {
         OrganismPrediction(
-            id: pendingID(kind: kind, signal: signal),
+            id: id,
             kind: kind,
             sourceOrgan: OrganismToken.canonicalToken(signal.sourceOrgan),
             createdAt: signal.occurredAt,
@@ -310,7 +311,7 @@ public enum OrganismPredictiveBody {
             return Set(semanticPredictionsResolved(by: signal, in: ledger)?.ids ?? [])
         default: return []
         }
-        let id = pendingID(kind: kind, signal: signal)
+        guard let id = pendingID(kind: kind, signal: signal) else { return [] }
         guard let row = ledger.predictions[id], row.status == .pending,
               signal.occurredAt >= row.lastUpdatedAt else { return [] }
         return [id]
@@ -414,9 +415,9 @@ public enum OrganismPredictiveBody {
         at date: Date,
         ledger: inout OrganismPredictionLedger
     ) {
-        var all = ledger.outcomeCountsByKind ?? [:]
+        var all = ledger.outcomeCountsByKind
         var count = all[kind.rawValue] ?? OrganismPredictionOutcomeCounts()
-        var weights = count.effectiveWeights(at: date)
+        var weights = count.weights
         switch status {
         case .satisfied:
             count.satisfied = min(count.satisfied, Int.max - 1) + 1
@@ -446,20 +447,15 @@ public enum OrganismPredictiveBody {
         }
     }
 
-    private static func pendingID(kind: OrganismPredictionKind, signal: SomaticSignal) -> String {
-        predictionID(
+    private static func pendingID(kind: OrganismPredictionKind, signal: SomaticSignal) -> String? {
+        guard case .string(let raw)? = signal.metadata["predictionCorrelationId"] else { return nil }
+        let correlation = OrganismToken.canonicalToken(raw)
+        guard correlation != "unknown" else { return nil }
+        return predictionID(
             kind: kind,
             sourceOrgan: signal.sourceOrgan,
-            correlationID: predictionCorrelationID(signal)
+            correlationID: correlation
         )
-    }
-
-    private static func predictionCorrelationID(_ signal: SomaticSignal) -> String {
-        if case .string(let raw)? = signal.metadata["predictionCorrelationId"] {
-            let clean = OrganismToken.canonicalToken(raw)
-            if clean != "unknown" { return clean }
-        }
-        return "uncorrelated"
     }
 
     private static func raise(_ current: Double, by amount: Double) -> Double {

@@ -70,7 +70,9 @@ struct AgentContactPushConfig: Codable, Sendable {
 
     /// The callback a relaunched task resumes, read back from Keychain.
     static func restored(_ callback: AgentContactCallback, id: String, taskId: String) throws -> Self {
-        guard let data = try AgentPeerCredentials.readSecret(account: callback.account) else { throw AgentContactFailure.missing }
+        guard let data = try AgentPeerCredentials.readSecret(account: callback.account) else {
+            throw AgentContactFailure(code: -32603, message: "The callback's Keychain destination is missing.")
+        }
         let secret = try JSONDecoder().decode(Secret.self, from: data)
         return Self(id: id, taskId: taskId, url: secret.url, token: secret.token,
                     authentication: secret.scheme.map { Authentication(scheme: $0, credentials: secret.credentials) })

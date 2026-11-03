@@ -1,4 +1,4 @@
-import AuthoredCapabilities
+@_exported import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -9,7 +9,7 @@ import NativeAgentShared
 import TrustCenter
 import PersonaEngine
 import Privacy
-// Blueprint: | `Parts.swift` | Parts and PartError; one ability owner, shared store access and JSON values |
+// Blueprint: | `Parts.swift` | PartError and executable Parts access over the shared part reader; shared store access and JSON values |
 
 public enum PartError: Error, LocalizedError {
     case invalid(String)
@@ -27,12 +27,7 @@ public enum PartError: Error, LocalizedError {
     }
 }
 
-/// A part is a part (docs/AGENT_IS_THE_APP.md): what it can do is what it declares, never which door made it. One save, one keep, one run,
-/// one read and one lifecycle over the shared ability files, one signed admission re-verified on every run.
-public struct Parts: Sendable {
-    public typealias Outcome = (ok: Bool, text: String, fields: [String: JSONValue])
-    public let root: URL
-    public init(root: URL = PersistenceCore.defaultDataRoot()) { self.root = root }
+extension Parts {
     var store: OwnedProgramStore { OwnedProgramStore(root: root.appendingPathComponent("abilities")) }
     var abilities: AbilityStore { AbilityStore(dataRoot: root) }
 

@@ -2,33 +2,23 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import TriggerScheduler
-// Blueprint: | `MacSyncActionRouter+Scheduler.swift` | `MacSyncActionRouter`: `schedulerAction` |
+// Blueprint: | `MacSyncActionRouter+Scheduler.swift` | `MacSyncActionRouter`: `schedulerAction`; phone creates body rhythms through one supported-kind validation |
 
 extension MacSyncActionRouter {
     func schedulerAction(_ action: String, payload: [String: String]) async throws -> [String: String] {
-        if action == "create_scheduler_job", payload["kind"] == "improve" {
-            return ["status": "error", "message": "Code improvement jobs are no longer available."]
-        }
         let writer = makeSchedulerJobWriter()
         let jobID: String
         if action == "create_scheduler_job" {
             let name = (payload["name"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty, name.count <= 160,
-                  let kind = payload["kind"], ["notify", "dream", "rem"].contains(kind),
+                  let kind = payload["kind"], ["dream", "rem"].contains(kind),
                   let seconds = Int64(payload["interval_seconds"] ?? ""), seconds >= 60,
                   seconds <= 315_360_000 else {
                 return ["status": "error", "message": "Enter a name, a supported job kind, and an interval from 60 to 315360000 seconds."]
             }
-            var body: [String: JSONValue] = [
+            let body: [String: JSONValue] = [
                 "name": .string(name), "kind": .string(kind), "interval_seconds": .int(seconds)
             ]
-            if kind == "notify" {
-                let message = (payload["message"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !message.isEmpty, message.count <= 1000 else {
-                    return ["status": "error", "message": "Enter a notification message of 1 to 1000 characters."]
-                }
-                body["message"] = .string(message)
-            }
             let result = try await sync.host.schedulerCreateJob(input: body)
             guard case .object(let receipt) = result, let created = receipt["job"] else {
                 return ["status": "error", "message": "The Mac did not return a saved scheduler job."]

@@ -28,7 +28,7 @@ import DeviceSync
 import ChatTurnRuntime
 import Transcripts
 import TurnTrace
-// Blueprint: | `AppToolExecutor.swift` | `AppToolExecutor` class; shared immutable descriptors; `execute`; chat.post routes to the conversation anchor through Reach's existing speech claim/quota; `macPersonAway` callback; a part's home arrival wakes their only through the care crossing, otherwise it waits on the news board and its receipt says so; mobileNotify owns app/bridge notification defaults, verified session binding and previews, while AttentionRouter delivers |
+// Blueprint: | `AppToolExecutor.swift` | `AppToolExecutor` class; registered find uses the one doorFind reader; shared immutable descriptors; `execute`; chat.post routes to the conversation anchor through Reach's existing speech claim/quota; `macPersonAway` callback; a part's home arrival wakes their only through the care crossing, otherwise it waits on the news board and its receipt says so; mobileNotify owns app/bridge notification defaults, verified session binding and previews, while AttentionRouter delivers; mind owner preview status survives host outcome folding; mac.apps exposes per-row classification gaps as partial coverage beside the checked installed projection |
 
 /// Core policy and routing for tools backed by the app's platform ports.
 /// Descriptors enter the one lazy catalog through the engine; this executor
@@ -36,7 +36,7 @@ import TurnTrace
 public final class AppToolExecutor: ToolExecutor {
     @TaskLocal static var undoReceipt: JSONValue?
     /// The same Trust gate the wrapper uses, for reads the app makes on her
-    /// behalf after a page act (`chromeFollowUpAllowed`).
+    /// behalf after a page act (`chromeFollowUpCheck`).
     public let chrome: @Sendable () -> ChromeControlRuntime
     public let macPersonAway: @Sendable () -> Bool
     public let motorActionObserver: @Sendable (MotorActionReadModel) async -> Void
@@ -80,14 +80,32 @@ public final class AppToolExecutor: ToolExecutor {
         quietHost: @escaping @MainActor @Sendable () -> (any QuietToolHost)?,
         presentation: any QuietToolPresentationPort
     ) {
-        AppActionBinding.register(Dictionary(uniqueKeysWithValues: AppActions.all.map { ($0.id, $0.binding) }),
+        do {
+        AppActionBinding.register(Dictionary(uniqueKeysWithValues: try AppActions.seedActions.map { ($0.id, $0.binding) }),
                                  tools: Array(SwiftToolDispatcher.nativeToolDescriptors.values) + Self.sharedDescriptors,
                                  authorableToolName: SwiftToolDispatcher.isAuthorableToolName,
-                                 partPolicy: { id in AppActions.action(id, dataRoot: securityCenter.dataRoot)?.binding },
-                                 policyCatalog: { AppActions.policyCatalog(dataRoot: securityCenter.dataRoot) })
+                                 partPolicy: { id in try AppActions.action(id, dataRoot: securityCenter.dataRoot)?.binding },
+                                 policyCatalog: { try AppActions.policyCatalog(dataRoot: securityCenter.dataRoot) })
+        } catch {
+            // Preserve the assembly failure at the registry boundary. No
+            // action can be admitted against an empty invented catalog.
+            let failure = error
+            AppActionBinding.register([:], tools: Array(SwiftToolDispatcher.nativeToolDescriptors.values) + Self.sharedDescriptors,
+                authorableToolName: SwiftToolDispatcher.isAuthorableToolName,
+                partPolicy: { _ in throw failure }, policyCatalog: { throw failure })
+        }
         // Register a closure, not a static table dependency: app's schema
         // already reads AppActions during descriptor assembly below.
-        RunawayOutputDetector.registerAppReadOnlyCalls(Self.doorReadOnly)
+        RunawayOutputDetector.registerAppReadOnlyCalls { input in
+            do { return try Self.doorReadOnly(input) }
+            catch {
+                // Only a positive registry reading proves read-only. This
+                // classification neither runs nor decides the call's outcome;
+                // the checked app door still reports its actual source error.
+                nativeLog("App read-only classification unavailable: %@", error.localizedDescription)
+                return false
+            }
+        }
         self.securityCenter = securityCenter
         self.enforceAutonomySecurity = enforceAutonomySecurity
         self.browserActionRunner = browserActionRunner
@@ -108,13 +126,14 @@ public final class AppToolExecutor: ToolExecutor {
         let root = securityCenter.dataRoot
         let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
         self.actionIndex = memory
-        let pages: @Sendable () async -> [String: QuietToolPage] = {
-            await MainActor.run {
-                Dictionary(([Self.doorInbox] + presentation.pages).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let pages: @Sendable () async throws -> [String: QuietToolPage] = {
+            try await MainActor.run {
+                Dictionary(([Self.doorInbox] + (try presentation.pages)).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             }
         }
         AgentWorkspacePorts.rankParts { message, root in
-            await AppActions.parts(message, pages: await pages(), dataRoot: root, memory: memory)
+            do { return await AppActions.parts(message, pages: try await pages(), dataRoot: root, memory: memory) }
+            catch { return PreparedWorkspaceGlance("Parts could not be ranked: " + error.localizedDescription) }
         }
         Task {
             let paths = ["agents/peers.json", "config/embeddings.json", "ui/layout.json"]
@@ -125,7 +144,7 @@ public final class AppToolExecutor: ToolExecutor {
                     // The catalog, never the view of the session whose find asked
                     // for this fill: a turn's own actions are embedded with its ask.
                     try await ChatToolSessionContext.$verifiedSessionId.withValue(nil) {
-                        let pages = await pages()
+                        let pages = try await pages()
                         let inventory = try await AppActions.inventory(dataRoot: root)
                         return try AppActions.actionTexts(inventory.actions, pages: pages,
                             contacts: AgentPeerStore(dataRoot: root).list().map(\.name),
@@ -137,15 +156,15 @@ public final class AppToolExecutor: ToolExecutor {
 
     /// Whether an app call only reads: home, page/item reads, find, a read
     /// action, or a list of nothing else.
-    static func doorReadOnly(_ input: [String: JSONValue]) -> Bool {
+    static func doorReadOnly(_ input: [String: JSONValue]) throws -> Bool {
         guard input["script"] == nil || input["script"] == .null || input["script"] == .string("") else { return false }
         if case .array(let entries)? = input["actions"], !entries.isEmpty {
-            return entries.allSatisfy { if case .object(let call) = $0 { doorReadOnly(call) } else { false } }
+            return try entries.allSatisfy { if case .object(let call) = $0 { try doorReadOnly(call) } else { false } }
         }
         let action = doorText(input["action"])
         if !action.isEmpty {
             let args: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
-            return AppActions.action(action)?.readOnly(args: args) == true
+            return try AppActions.action(action)?.readOnly(args: args) == true
         }
         return !opensHomeItem(input)
     }
@@ -179,7 +198,7 @@ public final class AppToolExecutor: ToolExecutor {
             // Enforce the iPhone Notifications write gate before sending.
             let admission = await securityCenter.fullMacYoloAuthority(
                 origin: AppChatToolDispatcher.securityOrigin(surface: surface))
-            let allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMobile, mode: .write, fullMacAdmitted: admission.admitted)
+            let allowed = try await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMobile, mode: .write)
             guard allowed else {
                 return try await SwiftToolDispatcher.macIntegrationDeniedEnvelope(
                     integration: MacIntegrationID.notifyMobile, mode: .write, store: macIntegrationPermissionStore)
@@ -188,7 +207,7 @@ public final class AppToolExecutor: ToolExecutor {
         case "mac_notify":
             let admission = await securityCenter.fullMacYoloAuthority(
                 origin: AppChatToolDispatcher.securityOrigin(surface: surface))
-            let allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMac, mode: .write, fullMacAdmitted: admission.admitted)
+            let allowed = try await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMac, mode: .write)
             guard allowed else {
                 return try await SwiftToolDispatcher.macIntegrationDeniedEnvelope(
                     integration: MacIntegrationID.notifyMac, mode: .write, store: macIntegrationPermissionStore)
@@ -213,8 +232,8 @@ public final class AppToolExecutor: ToolExecutor {
     ) async throws -> MobileNotificationDeliveryReceipt {
             // Item 26: one exit, through the router. Owner-waiting (an
             // explicitly invoked notify IS Agent reaching for User), but PINNED
-            // to the phone: this tool's name is its contract, and a real APNS
-            // receipt is what the caller gets back. Payload unchanged.
+            // to the phone: the caller receives the signed bridge acceptance
+            // and APNS transport result. Neither proves visible presentation.
             let outcome = try await router.route(
                 eventId: userInfo["itemId"].flatMap { $0.isEmpty ? nil : $0 }
                     ?? "mobile_notify:\(AttentionRouter.stableDigest(title + "|" + body))",
@@ -341,6 +360,14 @@ public final class AppToolExecutor: ToolExecutor {
         try Task.checkCancellation()
         let verb = action.input["verb"]?.scalarText ?? ""
         switch action.tool {
+        case "app_find":
+            let what = Self.doorText(input["what"])
+            let query = what.isEmpty ? Self.doorText(input["query"]) : what
+            guard !query.isEmpty else {
+                return Self.doorRefusal("invalid_args", "Discovery needs words in args.what or args.query. Nothing was searched.",
+                    remedy: "correct_arguments", "Use app {find:\"what you want to do\"}.", next: ["find": .string("what you want to do")])
+            }
+            return try await doorFind(query)
         case "chat_post":
             let root = securityCenter.dataRoot
             guard let destination = ConversationAnchor.currentSessionId(dataRoot: root) else {
@@ -353,7 +380,10 @@ public final class AppToolExecutor: ToolExecutor {
             // Telling him is a message in HIS thread: stamped with that thread's own route, never the
             // conversation she is in when she says it (10-29: a post made from an agent conversation
             // carried the agent's envelope into User's chat and reached none of Mac, phone or Telegram).
-            let route = try? await HumanConversationReader.read(sessionID: destination, dataRoot: root).route
+            let route = try await HumanConversationReader.read(sessionID: destination, dataRoot: root).route
+            // Resolve notification provenance before producing the post. An unavailable
+            // route is not evidence that this conversation has no Telegram door.
+            let telegram = try await HumanConversationReader.read(sessionID: destination, dataRoot: root, surface: "telegram").route
             let result = try await ChatToolSessionContext.$envelope.withValue(route) {
                 try await ChatToolSessionContext.withReplyRoute(route?.replyRoute) {
                     try await proactiveSpeechClient(root).speakProactively(
@@ -367,7 +397,6 @@ public final class AppToolExecutor: ToolExecutor {
                 // And it knocks like any reach for him. His Telegram is this same thread, so the knock goes
                 // there whenever the thread has a Telegram door (User 10-29: "it should all go here"), else
                 // the router's own choice from where he last spoke.
-                let telegram = try? await HumanConversationReader.read(sessionID: session, dataRoot: root, surface: "telegram").route
                 let knock = try? await attention().route(
                     eventId: "chat.post:" + run, importance: .ownerWaiting, title: "NativeAgent", body: message,
                     userInfo: ["screen": "chat", "sessionId": session],
@@ -381,7 +410,8 @@ public final class AppToolExecutor: ToolExecutor {
             }
         case "mac_apps":
             let name = input["name"]?.scalarText ?? ""
-            let every = try await MacAppIndex.shared.apps().filter { name.isEmpty || $0.name.localizedCaseInsensitiveContains(name) }
+            let inventory = try await MacAppIndex.shared.inventory()
+            let every = inventory.apps.filter { name.isEmpty || $0.name.localizedCaseInsensitiveContains(name) }
             let all = input["all"] == .bool(true)
             let apps = all ? every : MacAppIndex.installed(every)
             let twice = MacAppIndex.collisions(apps)
@@ -405,11 +435,16 @@ public final class AppToolExecutor: ToolExecutor {
                 fields["name_collision"] = .bool(true)
                 return .object(fields)
             }
-            return .object(["status": .string("ok"), "apps": .array(rows), "count": .int(Int64(apps.count)),
-                            "other_copies_and_ios": .int(Int64(every.count - MacAppIndex.installed(every).count)),
+            let unclassified = every.filter { !$0.classificationFailures.isEmpty }
+            let complete = unclassified.isEmpty && inventory.directoryGaps.isEmpty
+            return .object(["status": .string(complete ? "ok" : "partial"), "apps": .array(rows), "count": .int(Int64(apps.count)),
+                            "classification_complete": .bool(complete),
+                            "classification_unavailable": .array(unclassified.map(\.json)),
+                            "directory_gaps": .array(inventory.directoryGaps.map(JSONValue.string)),
+                            "other_copies_and_ios": .int(Int64(every.filter { $0.kind == "copy" || $0.platform == "ios" }.count)),
                             "source": .string("the Mac's app index (Spotlight): the installed copy of each Mac app, as the Apps screen shows them"
                                 + (all ? ", plus every other copy (builds, backups) and iOS build the Mac indexes, tagged by kind and platform" : "; all:true lists other copies and iOS builds too")
-                                + "; an app on a volume Spotlight does not index is not listed")])
+                                + "; unavailable classification is reported separately and excluded from the installed projection; an app on a volume Spotlight does not index is not listed")])
         case "undo":
             return try await doorUndo(input: input)
         case "read_file" where action.id == "reply.attach":
@@ -530,8 +565,14 @@ public final class AppToolExecutor: ToolExecutor {
             case .untouched:
                 waits = "It touches none of your cares"
             }
-            await SenseNewsBoard.shared.keep(SenseNews(senseID: "part:" + part, version: 1, address: "home.arrive",
-                                                       summary: line, at: Date(), changeID: id))
+            guard await SenseNewsBoard.shared.keep(SenseNews(senseID: "part:" + part, version: 1, address: "home.arrive",
+                                                       summary: line, at: Date(), changeID: id)) else { return notKept }
+            guard ResidentWake.shared.request(dataRoot: root, reason: "what your parts noticed", items: [
+                .init(id: id, line: says, thread: "part:" + part, agent: taint)
+            ], waking: false) else {
+                return .object(["status": .string("failed"), "effects": .string("partial"), "reason": .string("identity_not_kept"),
+                    "detail": .string("The news was kept, but its arrival identity could not be saved. Home arrivals are unavailable; repair the ledger before offering this occurrence again.")])
+            }
             return .object(["status": .string("ok"), "effects": .string("occurred"),
                             "detail": .string(waits + ", so it waits for your next turn without waking you.")])
         case "workshop_reject":
@@ -589,7 +630,8 @@ public final class AppToolExecutor: ToolExecutor {
                 await host.managePart(verb: verb, input: input, steer: Self.skillSteer(surface: surface))
             }
             var body = outcome.fields
-            body["status"] = outcome.ok ? .string("ok") : body["status"] ?? .string("failed")
+            body["status"] = body["preview"] == .bool(true) ? .string("preview")
+                : outcome.ok ? .string("ok") : body["status"] ?? .string("failed")
             body["verb"] = .string(verb)
             body["detail"] = .string(outcome.detail)
             return .object(body)
@@ -636,6 +678,14 @@ public final class AppToolExecutor: ToolExecutor {
                 }
             }
         }
+        // A switch User turned off refuses the preview exactly as it refuses the act,
+        // whatever validator the calling chain bound.
+        if let gate = MacIntegrationGates.byTool[action.tool] {
+            do {
+                if let refusal = try await SwiftToolDispatcher.switchRefusal(integration: gate.integration,
+                    mode: gate.mode, store: macIntegrationPermissionStore) { return refusal }
+            } catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
+        }
         if action.isFold { return await AppDoorReentry.validate?(action.tool, input) }
         if action.isCard { return await cardRefusal(input: input, surface: surface) }
         if action.id == "setting.set" { return await settingRefusal(input: input) }
@@ -657,7 +707,7 @@ public final class AppToolExecutor: ToolExecutor {
             guard let host = quietHost() else { return Self.unattachedFailure() }
             return await host.upkeepFence(verb: action.input["verb"]?.scalarText ?? "", input: input)
         }
-        // Turning an ability on, back or back a version: whose it is turns
+        // Turning an ability on or restoring its off switch: whose it is turns
         // on the script's origin, the steer and Trust. The real call's own
         // checks, run as a preview, say whose it is and what it would leave
         // (status `would`, for the door to say).
@@ -685,7 +735,9 @@ public final class AppToolExecutor: ToolExecutor {
         case "chat_session":
             let root = host.dataRootOverride ?? PersistenceCore.defaultDataRoot()
             let fullMac = await Self.freshQuietPosture(dataRoot: root)?.name == Self.fullMacModeName
-            let reachesUser = await Self.reachesUser(surface: surface, fullMac: fullMac, dataRoot: root)
+            let reachesUser: Bool
+            do { reachesUser = try await Self.reachesUser(surface: surface, fullMac: fullMac, dataRoot: root) }
+            catch { return ChatToolOutcome.failure(error: error, tool: "chat_session", effects: ToolFailureError.Effects.none) }
             return host.chatSessionFence(verb: verb, input: input, reachesUser: reachesUser)
         default: return await composerRefusal(verb: verb, input: input, surface: surface, host: host)
         }

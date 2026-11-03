@@ -11,19 +11,30 @@ import TrustCenter
 
 // MARK: - Errors
 
-public enum ApprovalInboxError: Error, Equatable {
+public enum ApprovalInboxError: Error, Equatable, LocalizedError {
     /// Approval id was not found in the queue.
     case notFound(String)
     /// Tried to resolve an approval that's already in a terminal state.
     case alreadyResolved(id: String, status: String)
     /// JSON serialization or shape mismatch.
     case malformedResponse(String)
-    /// Legacy transport-level failure case retained for API compatibility.
+    /// Authoritative approval or effect-spend storage could not be read.
     case unavailable(underlying: String)
     /// The decision origin is not permitted to resolve this exact row.
     case resolutionNotAuthorized(id: String, reason: String)
     /// The row cap is exceeded and no settled terminal history can be evicted.
     case queueFull(pending: Int, cap: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .notFound(let id): "Approval \(id) was not found. Refresh the request before continuing."
+        case .alreadyResolved(let id, let status): "Approval \(id) is already \(status)."
+        case .malformedResponse(let detail): "Approval storage is malformed: \(detail). Repair the retained approval store before continuing."
+        case .unavailable(let detail): "Approval storage is unavailable: \(detail). Restore access to the approval store before continuing."
+        case .resolutionNotAuthorized(_, let reason): reason
+        case .queueFull(let pending, let cap): "Approval queue is full (\(pending) retained requests, limit \(cap)). Settle outstanding requests before filing another."
+        }
+    }
 }
 
 public extension SwiftNativeApprovalInbox {
@@ -57,7 +68,8 @@ public actor SwiftNativeApprovalInbox {
     // can build the durable spend marker against the same root/persistence.
     let root: URL
     /// These actions retain local-only flags regardless of caller input.
-    /// A verified paired iPhone may decide them; Telegram may not.
+    /// Paired iPhone and bound owner-DM decisions follow
+    /// `validateResolutionAuthority`; executable review still requires Mac/phone.
     nonisolated static let hardLocalOnlyActions: Set<String> = [
         "agent.acp.permission",
         "backup_restore",
@@ -68,18 +80,15 @@ public actor SwiftNativeApprovalInbox {
         "improvement.promote",
         "improvement.revert",
         "autonomy.promote",
-        "self_evolution.apply",
-        SwiftNativeApprovalInbox.procedureReviewApprovalAction,
         SwiftNativeApprovalInbox.procedureExactActivationApprovalAction,
     ]
-    /// Owner reviews always allow verified paired-phone decisions, never Telegram decisions.
+    /// Owner reviews allow paired-phone and bound owner-DM decisions, except
+    /// executable reviews. `validateResolutionAuthority` owns that rule.
     public nonisolated static let ownerReviewActions: Set<String> = [
         "self_improvement.apply",
-        "skill.proposal",
         "rem.proposal",
         // A care becoming part of who she is (life depth), from her night.
         "care.life",
-        "memory.repair",
         "memory.kind_backfill",
         // User's own Install of a skill script, bound to its exact digest.
         SwiftNativeApprovalInbox.skillScriptInstallAction,
@@ -101,6 +110,15 @@ public actor SwiftNativeApprovalInbox {
     }
     public nonisolated func recordsUnlocked() throws -> [ApprovalRecord] {
         try readContinuations(Self.loadApprovalRowsChecked(at: approvalsPath).compactMap(ApprovalRecord.init(json:)))
+    }
+    /// A conversation releases its wait only after a checked decision, and
+    /// an approved action's execution receipt. Missing identity is repair work.
+    public nonisolated func decisionSettledUnlocked(_ id: String) throws -> Bool {
+        guard let record = try recordsUnlocked().first(where: { $0.id == id }) else {
+            throw ApprovalInboxError.notFound(id)
+        }
+        guard record.status != "pending" else { return false }
+        return record.decision != "approved" || record.executedAction != nil
     }
     public func list(filter: ApprovalFilter) async throws -> [ApprovalRecord] {
         let items = try await SwiftNativePersistenceCore.withFileLock(approvalsPath) { [approvalsPath] in
@@ -258,7 +276,7 @@ public actor SwiftNativeApprovalInbox {
             return (touched, false, [])
         }
         let approval = try Self.makeApprovalRecord(body: body, now: now)
-        items.insert(approval.toJSON(), at: 0)
+        items.insert(approval.toJSON(forStorage: true), at: 0)
         let capped = try Self.cappedEvictingTerminalRows(items, cap: Self.storedApprovalCap, now: now, lifeID: lifeID)
         try await SwiftNativePersistenceCore.writeJSON(.array(capped), to: approvalsPath)
         return (approval, true, Self.expired(from: items, to: capped))
@@ -373,6 +391,10 @@ public actor SwiftNativeApprovalInbox {
             localOnly: localOnly
         )
         approval.cause = Experience.currentAct
+        guard !Self.strip(approval.action).isEmpty, !Self.strip(approval.title).isEmpty else {
+            throw ApprovalInboxError.malformedResponse("approval title and action must be nonblank")
+        }
+        try Self.validateApprovalRows([approval.toJSON(forStorage: true)])
         return approval
     }
     private static func _resolveImpl(

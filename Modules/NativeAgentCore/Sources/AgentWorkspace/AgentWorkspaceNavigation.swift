@@ -267,11 +267,13 @@ package actor AgentWorkspaceNavigation {
             case "screen": return "screen:" + (input["app"].flatMap { if case .string(let app) = $0 { return app }; return nil } ?? "frontmost")
             case "bot_list": target = "id"
             case "mac_calendar_list_upcoming":
-                return tool + ":" + (["day", "calendar_name", "calendar_id", "hours_ahead"].map { (try? input[$0]?.serialize(pretty: false)) ?? "" }.joined(separator: "\u{0}"))
+                do { return tool + ":" + (try ["day", "calendar_name", "calendar_id", "hours_ahead"].map { try (input[$0] ?? .null).serialize(pretty: false) }.joined(separator: "\u{0}")) }
+                catch { return nil }
             case "mac_reminders_list_due_today": return tool
             case "mac_reminders_read": target = "id"
             case "mac_reminders_query":
-                return tool + ":" + (["query", "list_name", "due_start", "due_end", "undated_only", "include_completed", "offset"].map { (try? input[$0]?.serialize(pretty: false)) ?? "" }.joined(separator: "\u{0}"))
+                do { return tool + ":" + (try ["query", "list_name", "due_start", "due_end", "undated_only", "include_completed", "offset"].map { try (input[$0] ?? .null).serialize(pretty: false) }.joined(separator: "\u{0}")) }
+                catch { return nil }
             case "mail_search": target = "query"
             case "messages_recent_threads": target = "thread_id"
             case "mail_list_recent":
@@ -286,7 +288,7 @@ package actor AgentWorkspaceNavigation {
             // One helper, whatever case its id was saved in: one window.
             if tool == "agent_read", value.lowercased().hasPrefix("bot:") { value = value.lowercased() }
             let conversation: String
-            if case .string(let value)? = input["conversation"] ?? input["session_id"] { conversation = value } else { conversation = "" }
+            if case .string(let value)? = input["conversation"] { conversation = value } else { conversation = "" }
             return tool + ":" + value + "\u{0}" + conversation
         default: return nil
         }

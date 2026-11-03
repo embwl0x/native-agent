@@ -1,5 +1,5 @@
 import ChatSessionWork
-// Blueprint: | `ConversationRoutes.swift` | Saved SidebarItem route vocabulary and aliases, shell tab homes, SkillsToolsSection and fixed conversation provenance labels |
+// Blueprint: | `ConversationRoutes.swift` | Current SidebarItem route vocabulary, shell tab homes, SkillsToolsSection and fixed conversation provenance labels |
 
 public enum SkillsToolsSection: String, CaseIterable, Identifiable, Sendable {
     case skills = "Skills"
@@ -24,42 +24,24 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     // ── Additional routes ───────────────────────────────────────────────
     case personality = "Personality"     // agent identity and voice
     case connectors = "Connectors"
-    case command = "Command Center"
     case capabilities = "Capabilities"
-    case autoImprovement = "Self-Improvement"
     case knowledge = "Knowledge Graph"
     case dreams = "Dreams"               // dream diary + REM consolidation controls (identity-adjacent)
     case cognition = "Cognition"
     case diagnostics = "Diagnostics"     // Doctor + Status + Runs Log
     case inboxPolicy = "Inbox Policy"
-    case panels = "Panels"
     case inspector = "Inspector"         // live per-turn readout and replay
 
     // ── Routed child surfaces (not listed as sidebar rows) ────────────────
     case telegram = "Telegram"           // Settings child + command route
     case tools = "Tools"                 // Skills & Tools child page + command route
 
-    // ── Legacy aliases (still parseable from saved state) ─────────────────
-    case memory = "Memory"               // alias → .memories
-    case settingsHub = "Settings (Hub)"  // alias → .settings
-    case approvals = "Approvals"         // alias → .activity
-    case workshop = "Workshop"           // retired presentation alias → .desk
-    case legacyWorkshop = "Executions"   // compatibility route alias → .desk
-    case work = "Work"                   // alias → .desk
-    case skillLifecycle = "Skill Lifecycle" // alias → .skills
     public var id: String { rawValue }
 
-    /// Map legacy aliases to their current home so saved state still routes correctly.
+    /// Child routes resolve to their current page home.
     public var normalized: SidebarItem {
         switch self {
-        case .memory: .memories
-        case .settingsHub: .settings
-        case .approvals: .activity
-        case .workshop, .legacyWorkshop, .work: .desk
-        case .skillLifecycle, .tools: .skills
-        case .autoImprovement: .activity   // Self-Improvement lives in Activity
-        case .panels: .diagnostics
-        case .command: .desk               // Create Task lives on the Desk
+        case .tools: .skills
         default: self
         }
     }
@@ -94,26 +76,15 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
         case .macIntegration: "gearshape.2"
         case .settings: "gearshape"
         // Advanced
-        case .command: "rectangle.3.group"
         case .capabilities: "shippingbox"
-        case .autoImprovement: "wand.and.stars"
         case .knowledge: "circle.hexagonpath"
         case .dreams: "moon.stars"
         case .cognition: "brain.head.profile"
         case .diagnostics: "stethoscope"
         case .telegram: "paperplane"
         case .inboxPolicy: "tray.and.arrow.down"
-        case .panels: "rectangle.grid.2x2"
         case .tools: "wrench.and.screwdriver"
         case .inspector: "waveform.path.ecg"
-        // Legacy aliases — use the normalized icon
-        case .memory: "brain"
-        case .settingsHub: "gearshape"
-        case .approvals: "tray.full"
-        case .workshop: "hammer"
-        case .legacyWorkshop: "target"
-        case .work: "hammer"
-        case .skillLifecycle: "puzzlepiece.extension"
         }
     }
 
@@ -152,10 +123,10 @@ public struct MacChatMessageProvenance: Sendable, Equatable {
     /// treatment; it is not a cryptographic claim about a named process.
     public let isAutomated: Bool
 
-    public static func make(role: String, source: String?, origin: ChatMessageOriginMetadata?) -> MacChatMessageProvenance? {
+    public static func make(role: String, source: String?, envelope: ChatMessageOriginMetadata?) -> MacChatMessageProvenance? {
         guard let provenance = SessionMessageProvenance.make(
-            role: role, source: source, hasOrigin: origin != nil,
-            surface: origin?.surface, agent: origin?.agent
+            role: role, source: source, hasEnvelope: envelope != nil,
+            surface: envelope?.surface, agent: envelope?.agent
         ) else { return nil }
         switch provenance {
         case .claude: return .init(label: "Claude - bridge", symbol: "arrow.triangle.branch", isAutomated: true)

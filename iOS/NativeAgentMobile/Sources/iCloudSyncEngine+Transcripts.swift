@@ -25,6 +25,13 @@ extension iCloudSyncEngine {
     /// Unfinished handoffs remain separate durable requests; settled rows are not cached.
     func adoptChatTranscripts(_ incoming: [String: PublishedTranscript], completeSnapshot: Bool = true) {
         for (session, var published) in incoming {
+            if let failure = published.readError {
+                if var current = chatTranscripts[session] {
+                    current.readError = failure
+                    chatTranscripts[session] = current
+                } else { chatTranscripts[session] = published }
+                continue
+            }
             guard !published.messages.isEmpty || published.generation != nil else { continue }
             if let current = chatTranscripts[session] {
                 if let applied = current.generation {
@@ -40,7 +47,7 @@ extension iCloudSyncEngine {
                     $0.sessionID == session && !$0.isExpired
                 }
                 let unfinishedIDs = Set(unfinished.flatMap {
-                    [$0.placeholderID, $0.request?.appendedUserId].compactMap { $0 }
+                    [$0.placeholderID, $0.request.appendedUserId].compactMap { $0 }
                 }).union(ChatStore.shared.queuedSends.filter { $0.sessionID == session }.flatMap {
                     [$0.id, $0.placeholderID, $0.userMessageID].compactMap { $0 }
                 })
@@ -118,14 +125,18 @@ extension iCloudSyncEngine {
             for row in rows {
                 let clean = row.sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !clean.isEmpty else { continue }
-                out[clean] = PublishedTranscript(
+                do { out[clean] = PublishedTranscript(
                     records: row.messages,
-                    messages: ChatMessage.projectChatRecords(row.messages),
+                    messages: try ChatMessage.projectChatRecords(row.messages),
                     otherRooms: row.otherRooms ?? [],
                     generation: row.transcriptGeneration,
                     hasOlder: row.hasOlder ?? false,
                     readError: row.readError
-                )
+                ) } catch {
+                    out[clean] = PublishedTranscript(records: [], messages: [],
+                        generation: row.transcriptGeneration,
+                        readError: "The Mac transcript projection could not be read: \(error.localizedDescription)")
+                }
             }
             return out
         }.value
@@ -139,12 +150,12 @@ extension iCloudSyncEngine {
         var payload = ["sessionId": sessionID, "limit": String(limit)]
         payload["beforeId"] = beforeID
         payload["throughId"] = throughID
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+        let result = try requireSuccessfulActionResponse(await sendActionAndWait(
             .make(action: "chat_history_page", payload: payload)))
         guard let raw = result["messages"] else { throw SyncError.persistence("The Mac did not return the messages.") }
         let (records, messages) = try await Task.detached(priority: .userInitiated) {
             let records = try JSONDecoder().decode([ChatMessageRecord].self, from: Data(raw.utf8))
-            return (records, ChatMessage.projectChatRecords(records))
+            return (records, try ChatMessage.projectChatRecords(records))
         }.value
         guard lifecycle == lifecycleGeneration else { throw CancellationError() }
         let generation = result["transcriptGeneration"].flatMap(Int.init)

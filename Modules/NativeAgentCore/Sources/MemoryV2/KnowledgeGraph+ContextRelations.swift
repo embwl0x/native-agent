@@ -1,7 +1,7 @@
 // The graph half of clause-6 reach: typed relations as SELECTABLE context.
 //
 // `KnowledgeGraph+RelatedEntities.swift` answers "what does this recalled
-// memory touch?" and only exists for the legacy recall lane's `related:`
+// memory touch?" for Context-off recall's `related:`
 // garnish. This file answers the question the resident index needs instead:
 // "what typed edges does the graph hold, ranked, so the selector can pull the
 // ones this message is actually about?" Nothing here injects anything; it hands
@@ -19,6 +19,7 @@
 import Foundation
 import GRDB
 import PersistenceCore
+import NativeAgentShared
 // Blueprint: | `KnowledgeGraph+ContextRelations.swift` | Bounded typed entity relations with disclosure and provenance evidence |
 
 /// One typed entity→entity edge, resolved to names.
@@ -30,9 +31,11 @@ public struct KnowledgeGraphContextRelation: Sendable, Equatable {
     public let object: String
     public let weight: Double
     public let mentionCount: Int
-    /// ISO-8601 `last_seen` of the fresher endpoint; nil when neither carries
-    /// one. Edges have no timestamp of their own.
+    /// ISO-8601 `last_seen` of the fresher endpoint after validating both;
+    /// nil when absent or unavailable. Edges have no timestamp of their own.
     public let lastSeen: String?
+    /// Canonical endpoint validation failure; no sibling date can conceal it.
+    public let sourceDateFailure: String?
     /// The edge's `provenance` column — who claims it. Memory-derived edges
     /// leave this nil; a studio edge says `studio-journal`.
     public let provenance: String?
@@ -56,6 +59,7 @@ public struct KnowledgeGraphContextRelation: Sendable, Equatable {
         weight: Double,
         mentionCount: Int,
         lastSeen: String?,
+        sourceDateFailure: String? = nil,
         provenance: String? = nil,
         journalEntryIDs: [String] = [],
         memoryID: String? = nil,
@@ -69,6 +73,7 @@ public struct KnowledgeGraphContextRelation: Sendable, Equatable {
         self.weight = weight
         self.mentionCount = mentionCount
         self.lastSeen = lastSeen
+        self.sourceDateFailure = sourceDateFailure
         self.provenance = provenance
         self.journalEntryIDs = journalEntryIDs
         self.memoryID = memoryID
@@ -104,6 +109,10 @@ extension SwiftNativeKnowledgeGraphIndexer {
             dbPool = try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
         } catch KnowledgeGraphPoolCache.PoolError.databaseMissing {
             return []
+        }
+        if try MemoryPolicyGate.knowledgeGraphEnabled(
+            dataRoot: sqlitePath.deletingLastPathComponent().deletingLastPathComponent()) {
+            _ = try await reconcileMemoryIndexFingerprints()
         }
         let prefix = Self.memoryFactIDPrefix
         // Read a bounded superset so the per-subject cap has something to
@@ -155,9 +164,20 @@ extension SwiftNativeKnowledgeGraphIndexer {
                       !subject.isEmpty, !object.isEmpty, !predicate.isEmpty else { continue }
                 guard perSubjectCount[subjectID, default: 0] < perSubject else { continue }
                 perSubjectCount[subjectID, default: 0] += 1
-                let seen = [Self.trimmed(row["from_seen"]), Self.trimmed(row["to_seen"])]
-                    .filter { !$0.isEmpty }
-                    .max()
+                var dates: [Date] = []
+                var dateFailures: [String] = []
+                for (id, column) in [(subjectID, "from_seen"), (objectID, "to_seen")] {
+                    let stored: DatabaseValue = row[column]
+                    if stored.isNull { continue }
+                    guard case .string(let raw) = stored.storage,
+                          let date = NativeTimestampFormat.parseISO8601FractionalFirst(raw) else {
+                        dateFailures.append("Graph entity \(id) has an invalid last_seen date; repair its canonical record.")
+                        continue
+                    }
+                    dates.append(date)
+                }
+                let dateFailure = dateFailures.isEmpty ? nil : dateFailures.joined(separator: " ")
+                let seen = dateFailure == nil ? dates.max().map(NativeTimestampFormat.fractionalZulu) : nil
                 result.append(KnowledgeGraphContextRelation(
                     subjectID: subjectID,
                     subject: subject,
@@ -167,11 +187,12 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     weight: (row["weight"] as Double?) ?? 0.5,
                     mentionCount: (row["mention_count"] as Int?) ?? 0,
                     lastSeen: seen,
+                    sourceDateFailure: dateFailure,
                     provenance: {
                         let value = Self.trimmed(row["provenance"])
                         return value.isEmpty ? nil : value
                     }(),
-                    journalEntryIDs: Array(Self.studioEntryIDs(row["studio_entry_ids"]).prefix(24)),
+                    journalEntryIDs: Array(try Self.studioParseEntryIDs(row["studio_entry_ids"]).sorted().prefix(24)),
                     memoryID: {
                         let value = Self.trimmed(row["memory_id"])
                         return value.isEmpty ? nil : value
@@ -187,16 +208,4 @@ extension SwiftNativeKnowledgeGraphIndexer {
         (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// `json_extract` hands back the raw JSON text of an array. A malformed or
-    /// absent value is an EMPTY provenance list, never an invented one.
-    private static func studioEntryIDs(_ raw: String?) -> [String] {
-        guard let raw, !raw.isEmpty, let data = raw.data(using: .utf8),
-              let parsed = try? JSONValue.parse(data),
-              case .array(let items) = parsed else { return [] }
-        return items.compactMap {
-            guard case .string(let value) = $0 else { return nil }
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }
-    }
 }

@@ -9,28 +9,28 @@ import DoctorChecks
 import DeviceSync
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `AppDelegate+BackgroundTasks.swift` | `AppDelegate`: `registerBackgroundTaskHandlers` |
+// Blueprint: | `AppDelegate+BackgroundTasks.swift` | Background task handlers and AppDoctorPort; BrowserIPC health reads one discovery-admitted listener snapshot from the browser owner |
 
 extension AppDelegate {
     static func registerBackgroundTaskHandlers() {
-        for loopId in BackgroundLoopLifetimes.retiredSystemBackgroundActivities {
-            NSBackgroundActivityScheduler(
-                identifier: NativeAgentICloudBridgeConstants.backgroundTaskIdentifier(loopId)).invalidate()
-        }
-        for entry in BackgroundLoopLifetimes.systemBackgroundActivities {
-            let activity = NSBackgroundActivityScheduler(
-                identifier: NativeAgentICloudBridgeConstants.backgroundTaskIdentifier(entry.loopId))
-            activity.interval = entry.interval
-            activity.tolerance = 12 * 60 * 60
-            activity.repeats = true
-            activity.qualityOfService = .utility
-            activity.schedule { completion in
-                Task.detached(priority: .utility) {
-                    let outcome = await BackgroundLoopLifetimes.shared.runTickIfDue(loopId: entry.loopId)
-                    if case .failed = outcome { completion(.deferred) }
-                    else { completion(.finished) }
+        do {
+            for entry in BackgroundLoopLifetimes.systemBackgroundActivities {
+                let activity = NSBackgroundActivityScheduler(
+                    identifier: try NativeAgentICloudBridgeConstants.backgroundTaskIdentifier(entry.loopId))
+                activity.interval = entry.interval
+                activity.tolerance = 12 * 60 * 60
+                activity.repeats = true
+                activity.qualityOfService = .utility
+                activity.schedule { completion in
+                    Task.detached(priority: .utility) {
+                        let outcome = await BackgroundLoopLifetimes.shared.runTickIfDue(loopId: entry.loopId)
+                        if case .failed = outcome { completion(.deferred) }
+                        else { completion(.finished) }
+                    }
                 }
             }
+        } catch {
+            NSLog("[BackgroundTasks] Registration refused: %@", error.localizedDescription)
         }
     }
 }
@@ -62,12 +62,12 @@ struct AppDoctorPort: EngineDoctorPlatformPort {
 
 
     func doctorBridgeSnapshots() async -> [DoctorBridgeSnapshot] {
-        let browserIPC = await BrowserWindowController.shared.ipcListenerHealth
-        let bridges: [(name: String, health: NativeLoopbackListener.Health, expected: Bool)] = [
-            ("ClaudeBridge", ClaudeBridgeRuntime.shared.listenerHealth, true),
+        let browserIPC = await BrowserWindowController.shared.ipcListenerSnapshot
+        let claude = ClaudeBridgeRuntime.shared.listenerHealth
+        return [
+            ("ClaudeBridge", (claude.failure, claude.boundPort, claude.isActive, claude.port), true),
             ("BrowserIPC", browserIPC, true),
         ]
-        return bridges.map { ($0.name, ($0.health.failure, $0.health.boundPort, $0.health.isActive, $0.health.port), $0.expected) }
     }
 
     func doctorInspectorCheck() async -> CheckResult {

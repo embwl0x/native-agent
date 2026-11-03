@@ -34,7 +34,7 @@ public struct HeartbeatLoop: EventDeadlineLoopRunner {
 
     /// Reads the `HEARTBEAT.md` checklist (persona dir). Returns nil when the
     /// file is absent — the honest no-op trigger.
-    private let loadChecklist: @Sendable () -> String?
+    private let loadChecklist: @Sendable () throws -> String?
     /// Gathers the compact live signal assessment (stuck
     /// Workshop executions / Full-Mac expiry / Doctor / error bursts).
     private let gatherAssessment: @Sendable () async -> HeartbeatAssessment
@@ -50,7 +50,7 @@ public struct HeartbeatLoop: EventDeadlineLoopRunner {
             EventDeadlinePhysiology.storeAndFileEvents(paths: [])
         },
         nextDeadline: @escaping @Sendable (Date) async -> Date? = { _ in nil },
-        loadChecklist: @escaping @Sendable () -> String?,
+        loadChecklist: @escaping @Sendable () throws -> String?,
         gatherAssessment: @escaping @Sendable () async -> HeartbeatAssessment,
         surfaceNotice: @escaping @Sendable (HeartbeatNotice) async throws -> Void
     ) {
@@ -68,7 +68,10 @@ public struct HeartbeatLoop: EventDeadlineLoopRunner {
 
     public func tickOutcome() async -> LoopTickOutcome {
         if let configurationError { return .failed(error: configurationError) }
-        guard let checklist = loadChecklist()?.trimmingCharacters(in: .whitespacesAndNewlines),
+        let loaded: String?
+        do { loaded = try loadChecklist() }
+        catch { return .failed(error: "Heartbeat checklist unavailable: \(error.localizedDescription). Repair HEARTBEAT.md before retrying.") }
+        guard let checklist = loaded?.trimmingCharacters(in: .whitespacesAndNewlines),
               !checklist.isEmpty else {
             // Missing (or empty) HEARTBEAT.md = honest no-op. We have nothing
             // to check against; asserting "healthy" here would be a fabricated

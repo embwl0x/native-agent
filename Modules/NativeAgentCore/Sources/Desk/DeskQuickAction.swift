@@ -20,7 +20,7 @@ public enum DeskQuickAction: Equatable, Sendable {
     case nagUnmute
 
     /// The default outcome summary for a one-keystroke close. `desk_close`
-    /// REFUSES an empty `outcome_summary`, and the honest thing to record is
+    /// REFUSES an empty `summary`, and the honest thing to record is
     /// where the close came from — not an invented outcome.
     public static let deskCloseOutcome = "Closed from the desk."
 
@@ -37,11 +37,11 @@ public enum DeskQuickAction: Equatable, Sendable {
     public var input: [String: JSONValue] {
         switch self {
         case let .close(handle, outcome):
-            return ["handle": .string(handle), "outcome_summary": .string(outcome)]
+            return ["handle": .string(handle), "summary": .string(outcome)]
         case let .closeIfCurrent(handle, outcome, expectedUpdatedAt):
             return [
                 "handle": .string(handle),
-                "outcome_summary": .string(outcome),
+                "summary": .string(outcome),
                 "expected_updated_at": .string(expectedUpdatedAt),
             ]
         case let .setStatus(handle, status):

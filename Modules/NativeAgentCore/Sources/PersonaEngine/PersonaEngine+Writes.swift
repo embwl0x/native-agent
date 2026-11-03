@@ -3,20 +3,20 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `PersonaEngine+Writes.swift` | `SwiftNativePersonaEngine`: profile schema preparation, including onboarding, and sole profile commit owner; fixed document specs and guarded writes; append reads current content under the write lock with the editor's cap and backup policy |
+import Experiences
+// Blueprint: | `PersonaEngine+Writes.swift` | `SwiftNativePersonaEngine`: shared name validation and sole profile commit owner; fixed document specs; checked existing mutations with private backups; compilation's named missing-only required-document genesis uses shared onboarding templates under completion/document locks |
 
 // MARK: - Persona writes
 //
 // Caller authorization still applies to profile and document mutations.
 // Mutations hold the target's shared cross-process file lock. USER.md remains
-// a MemoryV2 UserMDGenerator projection and cannot be saved or scaffolded here.
+// a MemoryV2 UserMDGenerator projection; only checked missing-document genesis
+// can scaffold it here, never ordinary edits.
 // Storage: persona Markdown/recovery copies and memory/profile.json are in local
 // and off-disk backups and the data export. Phone sync projects only the profile;
 // PrivacyMap lists persona documents under persona, profile.json under memory.
 
 public enum PersonaWriteError: Error, LocalizedError, Equatable {
-    /// Onboarding refusal with the caller-visible detail preserved.
-    case onboardingRequired(detail: String)
     case unknownDocument(String)
     /// IO failure during the atomic write / read-back.
     case ioFailure(String)
@@ -25,7 +25,6 @@ public enum PersonaWriteError: Error, LocalizedError, Equatable {
 
     public var errorDescription: String? {
         switch self {
-        case .onboardingRequired(let d): return d
         case .unknownDocument(let id):   return "Unknown personality document: \(id)"
         case .ioFailure(let m):          return m
         case .invalidInput(let m):       return m
@@ -44,36 +43,111 @@ extension SwiftNativePersonaEngine {
         ("AGENTS", "Operating Manual", "AGENTS.md"),
     ]
 
+    /// The single operating-manual seed, shared by onboarding and missing-only genesis.
+    package static func operatingManualGenesis(name: String) -> String {
+        "# \(name) Operating Manual\n"
+    }
+
+    /// Inspect the entry itself, including dangling links. A read failure is
+    /// never absence and must not authorize replacement or inherited content.
+    static func personaDocumentIsMissing(at path: URL) throws -> Bool {
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: path.path)
+            return false
+        } catch let error as CocoaError where error.isFileAbsent {
+            return true
+        } catch {
+            throw PersonaEngineError.rootUnreadable(reason: "cannot inspect \(path.path): \(error.localizedDescription). Restore access to this document; it has not been replaced.")
+        }
+    }
+
+    /// The compile owner requests genesis by document id before reading it.
+    /// Recheck absence, completion and identity while holding both locks.
+    @discardableResult
+    public func createMissingRequiredDocument(id: String) async throws -> Bool {
+        guard let spec = Self.personalityDocSpecsFixed.first(where: { $0.id == id }) else {
+            throw PersonaWriteError.unknownDocument(id)
+        }
+        let repairDataRoot = dataRootURL
+        let completionLock = repairDataRoot.appendingPathComponent("onboarding/pending-completion.json")
+        let path = personaRoot.appendingPathComponent(spec.filename)
+        guard try Self.personaDocumentIsMissing(at: path) else { return false }
+        return try await SwiftNativePersistenceCore.withFileLock(completionLock) { [self] in
+            try await SwiftNativePersistenceCore.withFileLock(path) { [self] in
+                guard try Self.personaDocumentIsMissing(at: path) else { return false }
+                guard NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: repairDataRoot) else { return false }
+                let profile = try PersonaCompiler.compileProfile(dataRoot: repairDataRoot)
+                let userName: String?
+                if id == "USER", let saved = profile.extras["userName"], saved != .null {
+                    guard let text = saved.stringValue else {
+                        throw PersonaWriteError.invalidInput("USER.md genesis cannot read memory/profile.json.userName as text. Repair that field before creating the document.")
+                    }
+                    userName = text
+                } else { userName = nil }
+                let docs = try PersonaTemplates.generate(name: profile.name,
+                    personaType: profile.personaKind, userName: userName)
+                let content: String
+                switch id {
+                case "SOUL": content = docs.soul
+                case "VOICE": content = docs.voice
+                case "USER": content = docs.user
+                case "GROWTH": content = docs.growth
+                case "AGENTS": content = docs.agents
+                default: throw PersonaWriteError.unknownDocument(id)
+                }
+                try Self.atomicWriteText(content, to: path)
+                await self.publishDerivedPersonaChange(path, reason: "persona_required_document_created")
+                do {
+                    guard try Self.readPersonaDocument(at: path) == content else {
+                        throw PersonaWriteError.ioFailure("created document does not match its committed seed")
+                    }
+                } catch {
+                    throw PersonaWriteError.ioFailure("\(spec.filename) was created at \(path.path), but verification failed: \(error.localizedDescription). Preserve and inspect the saved bytes before another repair.")
+                }
+                return true
+            }
+        }
+    }
+
     // MARK: - Profile writes
 
-    /// Normalize, merge partial fields (traits replace wholesale), stamp and persist under the profile lock.
+    /// Validate a submitted name through the shared identity rule, then validate the saved base,
+    /// merge partial fields (traits replace wholesale), stamp and persist under the profile lock.
     /// Unspecified fields and unknown keys survive; JSON uses two-space indentation and keys sorted by UTF-8 byte order.
     public func savePersonality(body: [String: JSONValue]) async throws -> CompiledPersonalityProfile {
+        let editable: Set<String> = ["name", "personaKind", "traits"]
+        guard Set(body.keys).isSubset(of: editable) else {
+            throw PersonaWriteError.invalidInput("Profile updates accept name, personaKind and traits only. Edit instructions through the canonical personality documents.")
+        }
+        if let supplied = body["name"] {
+            guard case .string(let name) = supplied else {
+                throw PersonaWriteError.invalidInput("The agent's name must be text.")
+            }
+            if let message = NativeAgentIdentity.nameValidationMessage(name) {
+                throw PersonaWriteError.invalidInput(message)
+            }
+        }
         let profileURL = dataRootURL
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("profile.json")
 
         return try await SwiftNativePersistenceCore.withFileLock(profileURL) {
             // Read raw under the lock so we merge over the latest on-disk state.
-            var existingRaw: [String: Any] = [:]
-            if FileManager.default.fileExists(atPath: profileURL.path) {
-                do {
-                    let data = try Data(contentsOf: profileURL)
-                    guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                        throw PersonaWriteError.ioFailure(
-                            "Cannot update profile.json because its top-level value is not an object."
-                        )
-                    }
-                    existingRaw = object
-                } catch let error as PersonaWriteError {
-                    throw error
-                } catch {
+            let existingRaw: [String: Any]
+            do {
+                let data = try Data(contentsOf: profileURL)
+                guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     throw PersonaWriteError.ioFailure(
-                        "Cannot update unreadable profile.json: \(error.localizedDescription)"
+                        "Cannot update profile.json because its top-level value is not an object."
                     )
                 }
+                existingRaw = object
+            } catch {
+                throw PersonaWriteError.ioFailure(
+                    "Cannot update unreadable profile.json: \(error.localizedDescription)"
+                )
             }
-            let existing = PersonaCompiler.normalize(raw: existingRaw, defaults: .defaults)
+            let existing = try PersonaCompiler.decodeProfile(raw: existingRaw)
             var merged = Self.profileToRawDict(existing)
 
             for (key, value) in body {
@@ -81,11 +155,12 @@ extension SwiftNativePersonaEngine {
             }
             merged["updatedAt"] = NativeTimestampFormat.fractionalZulu(Date())
 
-            let normalized = PersonaCompiler.normalize(raw: merged, defaults: .defaults)
+            let normalized = try PersonaCompiler.decodeProfile(raw: merged)
 
             let jv = JSONValue.object(Self.profileFields(normalized))
             let text = try jv.serialize(pretty: true)
             try Self.atomicWriteText(text, to: profileURL)
+            await self.publishDerivedPersonaChange(profileURL, reason: "persona_profile_saved")
 
             return normalized
         }
@@ -102,13 +177,11 @@ extension SwiftNativePersonaEngine {
     ) throws -> (content: String, baseSHA256: String?) {
         var raw: [String: Any] = [:]
         var baseSHA256: String?
-        if FileManager.default.fileExists(atPath: profilePath.path) {
-            let data: Data
-            do {
-                data = try Data(contentsOf: profilePath)
-            } catch {
-                throw PersonaWriteError.ioFailure("read existing profile.json failed: \(error.localizedDescription)")
-            }
+        let existingData: Data?
+        do { existingData = try Data(contentsOf: profilePath) }
+        catch CocoaError.fileReadNoSuchFile { existingData = nil }
+        catch { throw PersonaWriteError.ioFailure("read existing profile.json failed: \(error.localizedDescription)") }
+        if let data = existingData {
             baseSHA256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             let decoded: Any
             do {
@@ -121,27 +194,25 @@ extension SwiftNativePersonaEngine {
             }
             raw = object
         }
-        // First normalize to current canonical shape.
-        let current = PersonaCompiler.normalize(raw: raw, defaults: .defaults)
-
-        let kindMap: [String: String] = ["female": "Female", "male": "Male", "ai": "AI"]
-        let newKind = kindMap[personaType] ?? "AI"
-        let newVoice: String
+        let newKind: String
         switch personaType {
-        case "female": newVoice = "Warm, observational, judgment-forward."
-        case "male": newVoice = "Direct, dry, holds ground."
-        default: newVoice = "Precise, characterful, honest."
+        case "female": newKind = "Female"
+        case "male": newKind = "Male"
+        case "ai": newKind = "AI"
+        default: throw PersonaWriteError.invalidInput("Unknown persona type: \(personaType)")
         }
+        let current: CompiledPersonalityProfile
+        if baseSHA256 == nil { current = .genesis(name: agentName, personaKind: newKind) }
+        else { current = try PersonaCompiler.decodeProfile(raw: raw) }
 
-        // Apply onboarding values to the normalized profile, then normalize again.
+        // Apply onboarding values to the checked profile, then validate before publication.
         var merged = SwiftNativePersonaEngine.profileToRawDict(current)
         merged["name"] = agentName
         merged["personaKind"] = newKind
-        merged["voice"] = newVoice
         merged["updatedAt"] = NativeTimestampFormat.fractionalZulu(Date())
-        let renormalized = PersonaCompiler.normalize(raw: merged, defaults: .defaults)
+        let renormalized = try PersonaCompiler.decodeProfile(raw: merged)
         var finalDict = SwiftNativePersonaEngine.profileToRawDict(renormalized)
-        // Add the trimmed user's name after normalization; an empty name is omitted.
+        // Add the trimmed user's name after validation; an empty name is omitted.
         let trimmedUserName = userName.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedUserName.isEmpty {
             finalDict["userName"] = trimmedUserName
@@ -155,25 +226,12 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - Document writes
 
-    /// SOUL.md gates editing; onboarding alone initializes it. USER.md is MemoryV2-owned.
+    /// Edits require a checked existing document; onboarding/compile genesis initializes it. USER.md is MemoryV2-owned.
     /// Replacement caps at 30,000 Unicode scalars; append reads under the document lock and refuses overflow.
     /// Back up to `<file>.bak` and write durably under that lock; return saved content with the file's mtime.
     public func savePersonalityDoc(id: String, content: String, appending: Bool = false) async throws -> PersonaDocSpec {
         let docId = id.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
 
-        // ONBOARDING gate — SOUL.md existence is the sentinel.
-        let soulURL = personaRoot.appendingPathComponent("SOUL.md")
-        let soulInitialized = fileManagerForWrites.fileExists(atPath: soulURL.path)
-        if !soulInitialized && docId != "SOUL" {
-            throw PersonaWriteError.onboardingRequired(
-                detail: "Persona is not initialized. Complete first-run onboarding before editing personality docs."
-            )
-        }
-        if !soulInitialized && docId == "SOUL" {
-            throw PersonaWriteError.onboardingRequired(
-                detail: "Run /v1/onboarding/complete to initialize the persona; do not write SOUL.md directly."
-            )
-        }
         if docId == "USER" {
             throw PersonaWriteError.invalidInput(Self.memoryOwnedUserDocMessage)
         }
@@ -182,12 +240,15 @@ extension SwiftNativePersonaEngine {
             throw PersonaWriteError.unknownDocument(docId)
         }
         let path = personaRoot.appendingPathComponent(spec.filename)
+        let activityPath = activityEventsPath
+        let activityDataRoot = dataRootURL
 
-        // Lock order: document, then activity feed; activity append failures propagate.
+        // Lock order: document, then activity feed. Bookkeeping cannot undo a committed edit.
         let result: PersonaDocSpec = try await SwiftNativePersistenceCore.withFileLock(path) { [self] in
             // Setup contributes only its section, never a carried-forward SOUL.
-            // An unreadable append base throws before either backup or mutation.
-            let nextContent = appending ? try String(contentsOf: path, encoding: .utf8) + content : content
+            // Both replacement and append require the real prior document.
+            let existing = try Self.readPersonaDocumentForMutation(at: path)
+            let nextContent = appending ? existing.text + content : content
             guard !appending || nextContent.unicodeScalars.count <= 30_000 else {
                 throw PersonaWriteError.invalidInput("The combined document exceeds 30,000 code points. Nothing was appended; shorten the draft or edit the document explicitly.")
             }
@@ -195,20 +256,26 @@ extension SwiftNativePersonaEngine {
             let cappedContent = Self.capByCodePoints(nextContent, cap: 30000)
             // One pre-edit copy per doc (`SOUL.md.bak`), replaced each save, so
             // the last version before any edit is always one file away.
-            if FileManager.default.fileExists(atPath: path.path) {
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(
-                    Data(contentsOf: path),
-                    to: path.appendingPathExtension("bak")
-                )
-            }
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                existing.data,
+                to: path.appendingPathExtension("bak")
+            )
             try Self.atomicWriteText(cappedContent, to: path)
 
-            // Emit once after the write and before readback, while holding the document lock.
-            try await self.recordPersonaDocActivity(docId: docId)
+            // Invalidate the committed bytes even if subsequent metadata reads fail.
+            await self.publishDerivedPersonaChange(path, reason: "persona_document_saved")
 
-            let reread = (try? String(contentsOf: path, encoding: .utf8)) ?? cappedContent
-            let mtime = (try? path.resourceValues(forKeys: [.contentModificationDateKey]))?
-                .contentModificationDate ?? Date()
+            let reread: String
+            let mtime: Date
+            do {
+                reread = try Self.readPersonaDocument(at: path)
+                guard let date = try path.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate else {
+                    throw PersonaWriteError.ioFailure("The saved document has no readable modification time.")
+                }
+                mtime = date
+            } catch {
+                throw PersonaWriteError.ioFailure("\(docId).md was saved, but its readback is unavailable. Read the saved document before repeating an edit; repair access to \(path.path). \(error.localizedDescription)")
+            }
             let spec = PersonaDocSpec(
                 id: spec.id,
                 title: spec.title,
@@ -217,65 +284,21 @@ extension SwiftNativePersonaEngine {
                 content: reread,
                 updatedAt: NativeTimestampFormat.fractionalZulu(mtime)
             )
+            // Activity is a separate owed effect; never invite a second append for its failure.
+            do {
+                try await self.recordPersonaDocActivity(docId: docId)
+                RepairOwed.settle(activityDataRoot, operation: "persona.document_activity",
+                    evidence: .init(source: "persona", id: docId))
+            } catch {
+                RepairOwed.owe(activityDataRoot, id: "persona-activity:" + docId, kind: .act,
+                    evidence: [.init(source: "persona", id: docId)],
+                    operation: "persona.document_activity", owner: activityPath.path,
+                    words: "\(docId).md was saved; its activity recording failed: \(error.localizedDescription)")
+            }
             return spec
         }
 
-        await publishDerivedPersonaChange(path, reason: "persona_document_saved")
         return result
-    }
-
-    // MARK: - Missing-document scaffolding
-
-    /// After SOUL exists, create missing VOICE/GROWTH/AGENTS documents from
-    /// the profile defaults, atomically under each document's lock. SOUL is
-    /// onboarding-owned; USER is MemoryV2-owned. Publish invalidations for
-    /// created documents; unlike `savePersonalityDoc`, this emits no activity.
-    ///
-    /// - Returns: the ids actually written this call (empty if none / pre-onboarding).
-    @discardableResult
-    public func scaffoldMissingDocs() async throws -> [String] {
-        let soulURL = personaRoot.appendingPathComponent("SOUL.md")
-        guard fileManagerForWrites.fileExists(atPath: soulURL.path) else {
-            return []
-        }
-
-        let missing = Self.personalityDocSpecsFixed.filter {
-            $0.id != "SOUL" && $0.id != "USER"
-                && !fileManagerForWrites.fileExists(atPath: personaRoot.appendingPathComponent($0.filename).path)
-        }
-        guard !missing.isEmpty else { return [] }
-        let profile = PersonaCompiler.loadProfile(dataRoot: dataRootURL)
-        var written: [String] = []
-
-        for spec in missing {
-            let path = personaRoot.appendingPathComponent(spec.filename)
-
-            let body = SwiftNativePersonaEngine.defaultPersonalityDocContent(
-                id: spec.id,
-                profile: profile
-            )
-            // Share savePersonalityDoc's lock; recheck existence inside it
-            // so concurrent writers cannot replace a document that just arrived.
-            let didWrite: Bool = try await SwiftNativePersistenceCore.withFileLock(path) {
-                if FileManager.default.fileExists(atPath: path.path) { return false }
-                try Self.atomicWriteText(body, to: path)
-                return true
-            }
-            if didWrite { written.append(spec.id) }
-        }
-        if !written.isEmpty {
-            let changes = written.map { id in
-                DerivedSourceChange(
-                    namespace: "persona",
-                    stableID: id,
-                    operation: .changed,
-                    canonicalLocator: personaRoot.appendingPathComponent("\(id).md").path,
-                    reason: "persona_documents_scaffolded"
-                )
-            }
-            await DerivedStateInvalidationCenter.shared.publish(changes)
-        }
-        return written
     }
 
     // MARK: - Document-save activity
@@ -308,19 +331,13 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - helpers (write-side)
 
-    /// `FileManager` for write-side existence checks. The actor's stored
-    /// `fileManager` is private; expose the default here (the write path only
-    /// needs `fileExists`, which `.default` answers identically).
-    private var fileManagerForWrites: FileManager { .default }
-
-    /// Use the same typed fields for normalization and persistence, preserving
+    /// Use the same typed fields for projection and persistence, preserving
     /// Foundation's NSNumber leaves and unknown profile keys.
     package static func profileToRawDict(_ p: CompiledPersonalityProfile) -> [String: Any] {
         profileFields(p).mapValues { $0.foundationObject }
     }
 
-    /// Persist schemaVersion as an integer, traits as doubles, lists as string arrays
-    /// and surfaceOverrides as a string-to-string object.
+    /// Persist identity and live traits; opaque saved keys survive without becoming instruction fields.
     static func profileFields(_ p: CompiledPersonalityProfile) -> [String: JSONValue] {
         let traits: JSONValue = .object([
             "warmth": .double(p.traits.warmth),
@@ -337,15 +354,7 @@ extension SwiftNativePersonaEngine {
             "personaEngineVersion": .string(p.personaEngineVersion),
             "name": .string(p.name),
             "personaKind": .string(p.personaKind),
-            "essence": .string(p.essence),
-            "voice": .string(p.voice),
-            "customDirective": .string(p.customDirective),
             "traits": traits,
-            "examples": .array(p.examples.map { .string($0) }),
-            "forbiddenPatterns": .array(p.forbiddenPatterns.map { .string($0) }),
-            "instincts": .array(p.instincts.map { .string($0) }),
-            "boundaries": .array(p.boundaries.map { .string($0) }),
-            "surfaceOverrides": .object(p.surfaceOverrides.mapValues { JSONValue.string($0) }),
             "updatedAt": .string(p.updatedAt),
         ]
         // Unknown keys round-trip without replacing typed fields; serialization sorts them with the rest.
@@ -377,12 +386,9 @@ extension SwiftNativePersonaEngine {
 extension SwiftNativePersonaEngine {
     /// The Personality tab's full-profile save uses the same Foundation leaf types as JSON decoding.
     public func savePersonality(_ profile: PersonalityProfile) async throws -> CompiledPersonalityProfile {
-        var body: [String: Any] = [
+        let body: [String: Any] = [
             "name": profile.name,
             "personaKind": profile.personaKind,
-            "essence": profile.essence,
-            "voice": profile.voice,
-            "customDirective": profile.customDirective ?? "",
             "traits": [
                 "warmth": profile.traits.warmth,
                 "directness": profile.traits.directness,
@@ -394,21 +400,6 @@ extension SwiftNativePersonaEngine {
                 "brevity": profile.traits.brevity
             ]
         ]
-        if let instincts = profile.instincts {
-            body["instincts"] = instincts
-        }
-        if let boundaries = profile.boundaries {
-            body["boundaries"] = boundaries
-        }
-        if let examples = profile.examples {
-            body["examples"] = examples
-        }
-        if let forbiddenPatterns = profile.forbiddenPatterns {
-            body["forbiddenPatterns"] = forbiddenPatterns
-        }
-        if let surfaceOverrides = profile.surfaceOverrides {
-            body["surfaceOverrides"] = surfaceOverrides
-        }
         return try await savePersonality(body: NativeActionWire.jsonValueBody(body))
     }
 }
@@ -422,16 +413,9 @@ extension CompiledPersonalityProfile {
             personaEngineVersion: personaEngineVersion,
             name: name,
             personaKind: personaKind,
-            essence: essence,
-            voice: voice,
-            customDirective: customDirective.isEmpty ? nil : customDirective,
             traits: traits,
-            examples: examples,
-            forbiddenPatterns: forbiddenPatterns,
-            instincts: instincts,
-            boundaries: boundaries,
-            surfaceOverrides: surfaceOverrides,
-            updatedAt: updatedAt.isEmpty ? nil : updatedAt
+            updatedAt: updatedAt.isEmpty ? nil : updatedAt,
+            userName: extras["userName"]?.stringValue
         )
     }
 }
@@ -441,10 +425,6 @@ extension PersonaDocSpec: Identifiable {}
 extension SwiftNativePersonaEngine {
     public func saveName(_ rawName: String) async throws -> PersonalityProfile {
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { throw PersonaWriteError.invalidInput("Enter a name before saving.") }
-        guard !NativeAgentIdentity.displayName(name, fallback: "").isEmpty else {
-            throw PersonaWriteError.invalidInput("Choose a specific name instead of a generic persona label.")
-        }
         return try await savePersonality(body: ["name": .string(name)]).sharedProfile
     }
 }

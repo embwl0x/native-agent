@@ -6,7 +6,7 @@ import CryptoKit
 #if canImport(CloudKit) && !os(Linux)
 import CloudKit
 import OSLog
-// Blueprint: | `CloudKitDeviceTransport.swift` | `CloudKitDeviceTransport` class; `observeAccountFailures`, `observeIncoming` (returns subscription readiness), `isChatNotification`, `shouldPersistPullCursor`, `resignalMessage` (original signed envelope; existing query clock renewed) |
+// Blueprint: | `CloudKitDeviceTransport.swift` | `CloudKitDeviceTransport` class; account failures, incoming subscription readiness, chat/status push classification, cursor persistence and original-envelope re-signalling |
 
 let devicePushLog = Logger(subsystem: "NativeAgent.DeviceSync", category: "subscription")
 
@@ -17,18 +17,8 @@ enum DeviceCloudKitSubscriptionID {
     static let status = "NAStatus.changes"
 
     static let current = [chat, visibleNotifications, pairing, status]
-    static let legacy = [
-        "NAChatMessage.notifications.visible",
-        "NAChatMessage.incoming.mac",
-        "NAChatMessage.incoming.ios",
-        "NAPairingDevice.mac",
-        "NAPairingDevice.ios",
-        "NAStatus.mac",
-        "NAStatus.ios",
-    ]
-
     static func recognizes(_ id: String) -> Bool {
-        current.contains(id) || legacy.contains(id)
+        current.contains(id)
     }
 }
 
@@ -39,13 +29,6 @@ struct DeviceCKLandmineTimeout: LocalizedError, Sendable {
     let seconds: TimeInterval
     var errorDescription: String? {
         "CK call \(label) timed out after \(seconds)s; cloudd unhealthy?"
-    }
-}
-
-/// Requests one pull retry in client `createdAt` order when CloudKit cannot sort `modificationDate`.
-struct DeviceCKUnsortableField: LocalizedError, Sendable {
-    var errorDescription: String? {
-        "CloudKit rejected the modificationDate sort for this record type."
     }
 }
 
@@ -85,6 +68,7 @@ func withDeviceCKTimeoutThrowing<T: Sendable>(
     seconds: TimeInterval = 5,
     onFailure: (@Sendable (Error) async -> Void)? = nil,
     beforeDispatch: @Sendable () async throws -> Void = {},
+    cancelWorkOnTimeout: Bool = true,
     _ work: @Sendable @escaping () async throws -> T
 ) async throws -> T {
     try Task.checkCancellation()
@@ -100,7 +84,8 @@ func withDeviceCKTimeoutThrowing<T: Sendable>(
         catch { state.resume(.failure(error)) }
     }
 
-    switch await state.cloudKitRace(workTask: workTask, timeoutNanoseconds: timeoutNanoseconds, timeoutOnCancellation: true) {
+    switch await state.cloudKitRace(workTask: workTask, timeoutNanoseconds: timeoutNanoseconds, timeoutOnCancellation: true,
+                                    cancelWorkOnTimeout: cancelWorkOnTimeout) {
     case .success(let value): return value
     case .failure(let error):
         await onFailure?(error)
@@ -129,19 +114,11 @@ final class DeviceCKRecordNameHolder: @unchecked Sendable {
     }
 }
 
-/// One page of the retention sweep's query: the eligible record names, how many
-/// records the page actually returned, and the server-side resume position.
-/// `@unchecked Sendable` because a `CKQueryOperation.Cursor` is an opaque
-/// position we only ever hand back to CloudKit — never read, never mutated.
-final class DeviceCKSweepPage: @unchecked Sendable {
+/// One oldest-page retention query. Confirmed deletions advance the next sweep;
+/// no server traversal cursor is retained or resumed.
+struct DeviceCKSweepPage: Sendable {
     let names: [String]
     let fetched: Int
-    let cursor: CKQueryOperation.Cursor?
-    init(names: [String], fetched: Int, cursor: CKQueryOperation.Cursor?) {
-        self.names = names
-        self.fetched = fetched
-        self.cursor = cursor
-    }
 }
 
 /// What one record type's sweep achieved. `deleted` counts CONFIRMED deletions
@@ -185,11 +162,6 @@ struct DeviceCKPullResult: Sendable {
     var payloadError: DeviceSyncError?
 }
 
-struct DeviceCKPullCheckpoint {
-    var result: DeviceCKPullResult
-    var cursor: CKQueryOperation.Cursor
-}
-
 // MARK: - CloudKitDeviceTransport
 
 /// CloudKit-backed device transport. `@unchecked Sendable` with an internal
@@ -205,23 +177,18 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
     private var pairingHandler: (@Sendable (Data) async -> Bool)?
     var statusWrites: [String: Task<Void, Never>] = [:]
     var pendingStatusWrites: [String: (work: @Sendable () async throws -> Void, completion: CheckedContinuation<Void, Error>)] = [:]
-    private var statusHandlers: [String: @Sendable (String, Date?) async -> Bool] = [:]
+    private var statusHandlers: [String: DeviceStatusObserver] = [:]
     private var lastPullDate: Date?
     private var lastPullCursorPersistenceAt: Date?
-    // One drain owns claims and cursor advancement; overlapping callers queue another pass.
+    // One drain owns claims and cursor advancement; event callers queue another
+    // pass, while periodic callers can skip a busy slot without extending it.
     var drainInFlight = false
     var drainAgain = false
     // Status delivery is serialized so an older handler cannot overwrite a newer value.
     var statusDrainInFlight = false
     var statusDrainAgain = false
-    // Rejected server-date sorts are remembered per record type for this transport lifetime.
-    var serverModDateSortRejected: Set<String> = []
-    // Completed fallback pages survive a bounded pull. No records are returned
-    // or acknowledged until the traversal completes. A restart safely rescans.
-    var fallbackPullCheckpoints: [String: DeviceCKPullCheckpoint] = [:]
-    var fallbackPullOwners: [String: UUID] = [:]
-    // LWW/dedup cursors for the status singletons, one record per (peer role,
-    // key). We only re-dispatch when the server modificationDate advances, so a
+    // LWW/dedup cursors per (pairing, peer role, key).
+    // We only re-dispatch when the server modificationDate advances, so a
     // redraw triggered by a redundant push does not re-fire the same value.
     private var lastStatusModDates: [String: Date] = [:]
     // Retention cadence is in-memory; a relaunch permits another sweep.
@@ -230,17 +197,18 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
     // of the collection to walk; the next sweep then comes back in a minute
     // instead of an hour.
     var retentionBacklog = false
-    // The createdAt-order sweep advances past every examined page, restarting only when its cursor ends.
-    var retentionFallbackCursors: [String: CKQueryOperation.Cursor] = [:]
     // Insertion-ordered seen-id dedup, capped, mirroring iCloudBridge.
     private var seenMessageIDs: Set<String> = []
     private var seenMessageIDsOrdered: [String] = []
     private let seenMessageIDsCap = 2000
     private var accountFailureHandler: (@Sendable (DeviceSyncAccountFailure) async -> Void)?
     private var assetSecretProvider: (@Sendable () async -> Data?)?
-    // Set by `claimPairing`: another Mac on this Apple Account holds the
-    // account's Mac pairing record, so the phone is that Mac's.
-    var heldElsewhere = false
+    // Set by `claimPairing` and this transport's own pairing publication. A
+    // Mac reads and writes the phone's records only while it holds the
+    // account's Mac pairing record; one it has not read yet is not held
+    // (10-29: a second Mac whose claim read failed drained the phone's
+    // messages and answered them under its own key).
+    var pairingClaim: PairingClaim = .unread
     // Counts this transport's own pairing publications, so a claim whose read
     // began before one of them cannot undo it.
     var pairingPublications: UInt64 = 0
@@ -325,7 +293,7 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
     }
 
     /// Quiet successful pulls advance the in-memory high watermark on every
-    /// drain, but do not need to dirty preferences on every fallback tick.
+    /// drain, but do not need to dirty preferences on every repeated drain.
     static let emptyCursorPersistenceInterval: TimeInterval = 5 * 60
 
     static func shouldPersistPullCursor(
@@ -354,6 +322,10 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
 
     public static func isChatNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
         CKNotification(fromRemoteNotificationDictionary: userInfo)?.subscriptionID == DeviceCloudKitSubscriptionID.chat
+    }
+
+    public static func isStatusNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
+        CKNotification(fromRemoteNotificationDictionary: userInfo)?.subscriptionID == DeviceCloudKitSubscriptionID.status
     }
 
     // The database is reached only after entitlement preflight.
@@ -390,7 +362,7 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
         lock.lock(); pairingHandler = h; lock.unlock()
     }
 
-    func setStatusHandler(key: String, _ h: @escaping @Sendable (String, Date?) async -> Bool) {
+    func setStatusHandler(key: String, _ h: DeviceStatusObserver) {
         lock.lock(); statusHandlers[key] = h; lock.unlock()
     }
 
@@ -401,7 +373,7 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
 
     /// Snapshot copy of the status handlers so we never hold the lock across the
     /// awaits in drainStatus (matches the never-lock-across-await rule).
-    func loadStatusHandlers() -> [String: @Sendable (String, Date?) async -> Bool] {
+    func loadStatusHandlers() -> [String: DeviceStatusObserver] {
         lock.lock(); defer { lock.unlock() }
         return statusHandlers
     }
@@ -515,8 +487,8 @@ public final class CloudKitDeviceTransport: @unchecked Sendable {
         return out
     }
 
-    func performModifyRecords(_ op: CKModifyRecordsOperation) async throws {
-        op.configuration.timeoutIntervalForResource = 15
+    func performModifyRecords(_ op: CKModifyRecordsOperation, resourceTimeout: TimeInterval = 15) async throws {
+        op.configuration.timeoutIntervalForResource = resourceTimeout
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 op.modifyRecordsResultBlock = { result in
@@ -589,40 +561,27 @@ public extension DeviceSyncTransportResolver {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         hasEntitlement: () -> Bool = DeviceCloudKitPreflight.hasCloudKitEntitlement,
         grantsContainer: (String) -> Bool = DeviceCloudKitPreflight.entitlementGrantsContainer
-    ) -> CloudKitDeviceTransport? {
-        guard runsCloudKit(
-            containerIdentifier: containerIdentifier, environment: environment,
-            hasEntitlement: hasEntitlement, grantsContainer: grantsContainer
-        ) else { return nil }
-        return CloudKitDeviceTransport(
-            role: role, containerIdentifier: containerIdentifier)
-    }
-
-    /// The effective transport decision behind `makeCloudKitTransport`: true
-    /// only when CloudKit is selected AND entitled for this container; false
-    /// means the legacy KVS/ubiquity transport runs.
-    static func runsCloudKit(
-        containerIdentifier: String,
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        hasEntitlement: () -> Bool = DeviceCloudKitPreflight.hasCloudKitEntitlement,
-        grantsContainer: (String) -> Bool = DeviceCloudKitPreflight.entitlementGrantsContainer
-    ) -> Bool {
-        guard resolvedKind(environment: environment) == .cloudkit else { return false }
+    ) throws -> CloudKitDeviceTransport {
+        try requireCloudKitConfiguration(environment: environment)
         guard hasEntitlement() else {
-            nativeLog("[ck-device] NATIVE_AGENT_DEVICE_SYNC=cloudkit but the CloudKit entitlement is ABSENT — staying on the KVS/ubiquity transport (no CKContainer is touched).")
-            return false
+            throw DeviceSyncTransportConstructionFailure.missingEntitlement
         }
         guard grantsContainer(containerIdentifier) else {
-            nativeLog("[ck-device] CloudKit service is granted but the exact container '\(containerIdentifier)' is absent — refusing to construct CKContainer and staying on the legacy transport.")
-            return false
+            throw DeviceSyncTransportConstructionFailure.missingContainer(containerIdentifier)
         }
-        return true
+        return CloudKitDeviceTransport(role: role, containerIdentifier: containerIdentifier)
     }
 }
 
 /// Sendable value carriers for the pairing/status singleton drains (returned
 /// across the withDeviceCKTimeout race boundary).
 enum PairingSlot: Sendable { case empty, holds(Data) }
+/// Where a Mac stands on the account's Mac pairing record.
+enum PairingClaim: Sendable { case unread, held, elsewhere }
 struct PeerStatusHit: Sendable { let value: String; let modDate: Date? }
+struct DeviceStatusObserver: Sendable {
+    let pairingSecret: @Sendable () async -> Data?
+    let apply: @Sendable (String, Date?, Data) async -> Bool
+}
 
 #endif

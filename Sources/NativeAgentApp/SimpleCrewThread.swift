@@ -12,7 +12,7 @@ import StandingBots
 import ProviderRouting
 import AppKit
 import AppToolRuntime
-// Blueprint: | `SimpleCrewThread.swift` | Read-only crew progress, worker evidence, outcomes and synthesis |
+// Blueprint: | `SimpleCrewThread.swift` | Read-only crew progress, worker evidence, outcomes and synthesis; checked receipt gaps display unavailable evidence without inventing worker counts |
 
 /// A crew's run, read-only: each worker and what it has come back with so far,
 /// then the findings pulled together.
@@ -28,17 +28,19 @@ struct SimpleCrewThread: View {
         case "cancelled": return "Stopped"
         case "interrupted": return "Interrupted · completion time unknown"
         case "unknown": return "Liveness unknown"
+        case "unavailable": return "Receipt unavailable"
         case "failed": return "Didn't finish"
         default: return crew.live ? "Working now" : "Finished"
         }
     }
 
     var body: some View {
-        let count = crew.workers.count == 1 ? "1 worker" : "\(crew.workers.count) workers"
+        let count = crew.receiptUnavailable != nil ? "worker count unavailable"
+            : crew.workers.count == 1 ? "1 worker" : "\(crew.workers.count) workers"
         TranscriptScrollView(coordinator: reading) {
             VStack(alignment: .leading, spacing: 26) {
-                Text(crew.live ? "I sent \(count) on this. What each finds comes in here as they finish."
-                               : "I sent \(count) on this.")
+                Text(crew.receiptUnavailable ?? (crew.live ? "I sent \(count) on this. What each finds comes in here as they finish."
+                               : "I sent \(count) on this."))
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                 ForEach(crew.workers) { worker in

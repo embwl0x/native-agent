@@ -65,8 +65,13 @@ extension SwiftToolDispatcher {
                 result["reason"] = .string("Pending canon proposals could not be read: \(error.localizedDescription)")
                 return .object(result)
             }
-            result["pending_proposals"] = .array(pending.compactMap { record in
-                guard let draft = StudioCanonProposal.draft(of: record) else { return nil }
+            result["pending_proposals"] = .array(pending.map { record in
+                let draft: StudioCanonProposalDraft
+                do { draft = try StudioCanonProposal.draft(of: record) }
+                catch {
+                    return .object(["proposal_id": .string(record.id), "status": .string("unavailable"),
+                        "reason": .string(error.localizedDescription)])
+                }
                 var obj: [String: JSONValue] = [
                     "proposal_id": .string(record.id),
                     "action": .string(draft.action.rawValue),
@@ -155,6 +160,8 @@ extension SwiftToolDispatcher {
                 ),
             ])
         }
+        // Validate before the inbox decision commits, including a denial.
+        _ = try StudioCanonProposal.draft(of: record)
         let resolved: ApprovalRecord
         if record.status == "pending" {
             resolved = try await inbox.resolve(

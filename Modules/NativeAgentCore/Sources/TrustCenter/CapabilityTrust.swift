@@ -53,29 +53,6 @@ public struct CapabilityCatalogSource: Sendable, Codable, Hashable, Identifiable
     }
 }
 
-public struct CapabilityCatalogItem: Sendable, Codable, Hashable, Identifiable {
-    public var id: String
-    public var name: String
-    public var kind: String?
-    public var description: String?
-    public var status: String?
-    public var riskClass: String?
-    public var installed: Bool?
-    public var provenance: String?
-    public var installedAt: String?
-}
-
-public struct CapabilityPackInstall: Sendable, Codable, Hashable, Identifiable {
-    public var id: String
-    public var packId: String
-    public var name: String?
-    public var version: String?
-    public var status: String
-    public var signature: String?
-    public var installedAt: String?
-    public var rolledBackAt: String?
-}
-
 // Checked projections of the catalog owner's rows: a present field of the
 // wrong type makes the row malformed, and a malformed row fails the read.
 extension CapabilityCatalogSource {
@@ -90,25 +67,13 @@ extension CapabilityCatalogSource {
     }
 }
 
-extension CapabilityCatalogItem {
+extension CapabilityTrustRoot {
     public init(row: JSONValue) throws {
         let row = try JSONRow(row)
         self.init(
             id: try row.string("id"), name: try row.string("name"), kind: try row.optionalString("kind"),
-            description: try row.optionalString("description"), status: try row.optionalString("status"),
-            riskClass: try row.optionalString("riskClass"), installed: try row.optionalBool("installed"),
-            provenance: try row.optionalString("provenance"), installedAt: try row.optionalString("installedAt"))
-    }
-}
-
-extension CapabilityPackInstall {
-    public init(row: JSONValue) throws {
-        let row = try JSONRow(row)
-        self.init(
-            id: try row.string("id"), packId: try row.string("packId"), name: try row.optionalString("name"),
-            version: try row.optionalString("version"), status: try row.string("status"),
-            signature: try row.optionalString("signature"), installedAt: try row.optionalString("installedAt"),
-            rolledBackAt: try row.optionalString("rolledBackAt"))
+            fingerprint: try row.optionalString("fingerprint"), status: try row.optionalString("status"),
+            createdAt: try row.optionalString("createdAt"), updatedAt: try row.optionalString("updatedAt"))
     }
 }
 
@@ -195,7 +160,7 @@ public enum CapabilityTrustError: Error, LocalizedError {
 // MARK: - Pure scoring
 //
 // Base 0.45, +0.15 if
-// sourcePackId/provenance present, +0.20 if signature present, +0.10 if
+// provenance present, +0.20 if signature present, +0.10 if
 // status ∈ {active, installed, ready}, +0.10 if lastUsedAt/useCount present,
 // -0.20 if riskClass ∈ {risky_tool, external_write, external_send}. Clamp
 // to [0,1], round to 3 decimals.
@@ -217,7 +182,7 @@ public func scoreCapabilityRecord(_ record: [String: JSONValue]) -> CapabilityTr
         record[key]?.isTruthy == true
     }
 
-    if present("sourcePackId") || present("provenance") {
+    if present("provenance") {
         score += 0.15
         reasons.append("Has provenance metadata.")
     }
@@ -357,12 +322,12 @@ public actor SwiftNativeCapabilityTrust {
             ))
         }
 
-        let rootDicts = try CapabilityCatalogStoreReader.capabilityTrustRoots(dataRoot: dataRoot, clock: clock)
-        let sourceDicts = try CapabilityCatalogStoreReader.catalogSources(dataRoot: dataRoot, clock: clock)
+        let rootDicts = try CapabilityCatalogStoreReader.capabilityTrustRoots(dataRoot: dataRoot)
+        let sourceDicts = try CapabilityCatalogStoreReader.catalogSources(dataRoot: dataRoot)
 
         return CapabilityTrustNetwork(
             status: "ready",
-            roots: rootDicts.map(decodeTrustRoot),
+            roots: try rootDicts.map { try CapabilityTrustRoot(row: .object($0)) },
             sources: try sourceDicts.map { try CapabilityCatalogSource(row: .object($0)) },
             records: records,
             summary: CapabilityTrustSummary(
@@ -399,20 +364,6 @@ public actor SwiftNativeCapabilityTrust {
             createdAt: nowISO
         )
     }
-}
-
-// MARK: - JSONValue → struct decoders (file-local)
-
-private func decodeTrustRoot(_ dict: [String: JSONValue]) -> CapabilityTrustRoot {
-    CapabilityTrustRoot(
-        id: dict["id"]?.stringValue ?? "",
-        name: dict["name"]?.stringValue ?? "",
-        kind: dict["kind"]?.stringValue,
-        fingerprint: dict["fingerprint"]?.stringValue,
-        status: dict["status"]?.stringValue,
-        createdAt: dict["createdAt"]?.stringValue,
-        updatedAt: dict["updatedAt"]?.stringValue
-    )
 }
 
 extension CapabilityRecord {

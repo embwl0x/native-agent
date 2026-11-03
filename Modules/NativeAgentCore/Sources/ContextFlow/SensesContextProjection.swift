@@ -13,6 +13,7 @@ public struct UnreadSenseNews: ContextCompiledProjectionProvider, Sendable {
     public init() {}
     public var projectionIdentifier: String { Self.owner }
     public var invalidationNamespaces: Set<String> { ["sense-news"] }
+    public var invalidationSourceURL: URL? { nil }
 
     private static func sourceID(_ item: SenseNews) -> ContextSourceID {
         ContextStableID.source(owner: owner, locator: "senses/news/" + item.id.uuidString)

@@ -23,7 +23,6 @@ public final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
         preferredPort: UInt16,
         path: String,
         displayName: String,
-        allowsPortFallback: Bool,
         callbackPageMessage: @escaping @Sendable (URL) -> String = NativeOAuthFlow.callbackPageMessage
     ) throws {
         self.path = path
@@ -45,11 +44,7 @@ public final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
             )
             if !Self.bind(opened, port: preferredPort) {
                 let bindErrno = errno
-                guard allowsPortFallback,
-                      bindErrno == EADDRINUSE,
-                      Self.bind(opened, port: 0) else {
-                    throw OAuthLoopbackCallbackError.socket("bind() failed: \(String(cString: strerror(bindErrno)))")
-                }
+                throw OAuthLoopbackCallbackError.socket("bind() failed: \(String(cString: strerror(bindErrno)))")
             }
             guard Darwin.listen(opened, 1) == 0 else {
                 throw OAuthLoopbackCallbackError.socket("listen() failed: \(String(cString: strerror(errno)))")
@@ -80,7 +75,7 @@ public final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
         do {
             server = try NativeOAuthLoopbackCallbackServer(
                 preferredPort: port, path: NativeOAuthFlow.openAILoopbackPath,
-                displayName: "ChatGPT", allowsPortFallback: false
+                displayName: "ChatGPT"
             )
         } catch {
             throw NSError(domain: "NativeOAuthFlow", code: -20, userInfo: [

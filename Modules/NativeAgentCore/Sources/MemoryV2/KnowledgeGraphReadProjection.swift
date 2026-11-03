@@ -1,6 +1,21 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `KnowledgeGraphReadProjection.swift` | Checked complete graph projection, including typed canvas entities/edges and derived entity neighborhoods from the same snapshot; `canonicalAgentGraphProjection`, `canonicalKnowledgeGraphSnapshotData` |
+import NativeAgentShared
+// Blueprint: | `KnowledgeGraphReadProjection.swift` | Checked complete graph projection, typed canvas entities/edges with complete last-seen timestamp parsing, and derived neighborhoods from the same snapshot; `canonicalAgentGraphProjection`, `canonicalKnowledgeGraphSnapshotData` |
+
+extension KnowledgeGraphEntity {
+    /// Only a complete recorded timestamp establishes recency. Do not salvage
+    /// a date prefix or substitute creation time for missing last-seen evidence.
+    public var lastSeenDate: Date? {
+        lastSeen.flatMap(Self.parseLastSeen)
+    }
+
+    public static func parseLastSeen(_ timestamp: String) -> Date? {
+        guard timestamp.range(of: #"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})\z"#,
+                             options: .regularExpression) != nil else { return nil }
+        return NativeTimestampFormat.parseISO8601FractionalFirst(timestamp)
+    }
+}
 
 public struct CanonicalAgentGraphReadout: Sendable {
     public let entities: [GraphEntity]
@@ -24,10 +39,12 @@ public struct CanonicalAgentGraphReadout: Sendable {
 public enum AgentGraphReads {
     public static func canonicalAgentGraphProjection(
         graphPath: URL = SwiftNativeKnowledgeGraphReader.defaultPath(),
+        surface: String? = nil,
+        personaID: String? = nil,
         timestamp: (Date) -> String
     ) async throws -> CanonicalAgentGraphReadout {
         let reader = makeKnowledgeGraphReader(graphPath: graphPath)
-        let snapshot = try await reader.completeSnapshotChecked()
+        let snapshot = try await reader.completeSnapshotChecked(surface: surface, personaID: personaID)
         guard case .object(let envelope) = snapshot,
               case .array(let rawEntities)? = envelope["entities"],
               case .array(let rawEdges)? = envelope["edges"] else {
@@ -51,7 +68,7 @@ public enum AgentGraphReads {
                   !to.isEmpty,
                   validEntityIDs.contains(from),
                   validEntityIDs.contains(to) else { return nil }
-            let label = object["type"]?.stringValue ?? object["kind"]?.stringValue
+            let label = object["type"]?.stringValue
             let id = object["id"]?.stringValue
                 ?? "\(from)->\(to):\(label ?? "edge"):\(index)"
             return AgentGraphEdge(id: id, fromNode: from, toNode: to, label: label)
@@ -71,10 +88,12 @@ public enum AgentGraphReads {
     }
 
     public static func canonicalKnowledgeGraphSnapshotData(
-        graphPath: URL = SwiftNativeKnowledgeGraphReader.defaultPath()
+        graphPath: URL = SwiftNativeKnowledgeGraphReader.defaultPath(),
+        surface: String,
+        personaID: String? = nil
     ) async throws -> Data {
         let snapshot = try await makeKnowledgeGraphReader(graphPath: graphPath)
-            .completeSnapshotChecked()
+            .completeSnapshotChecked(surface: surface, personaID: personaID)
         return try snapshot.serializedData(pretty: false)
     }
 
@@ -99,11 +118,8 @@ public enum AgentGraphReads {
         }
         let memoryDirectory = graphPath.deletingLastPathComponent()
         let sqlitePath = memoryDirectory.appendingPathComponent("memory.sqlite")
-        let authoritativePath = FileManager.default.fileExists(atPath: sqlitePath.path)
-            ? sqlitePath
-            : graphPath
         guard let attributes = try? FileManager.default.attributesOfItem(
-            atPath: authoritativePath.path
+            atPath: sqlitePath.path
         ), let modified = attributes[.modificationDate] as? Date else {
             return nil
         }
@@ -161,18 +177,9 @@ public enum AgentGraphReads {
             id: id,
             name: object["name"]?.stringValue ?? id,
             aliases: graphStringArray(object["aliases"]).isEmpty ? nil : graphStringArray(object["aliases"]),
-            kind: object["type"]?.stringValue ?? object["kind"]?.stringValue,
+            kind: object["type"]?.stringValue,
             confidence: object["confidence"]?.numberValue(coercingStrings: true, finiteOnly: false),
-            mentions: {
-                let value = graphInt(object["mention_count"])
-                return value == 0 ? nil : value
-            }(),
-            sourceNodeIds: {
-                let snake = graphStringArray(object["source_node_ids"])
-                if !snake.isEmpty { return snake }
-                let camel = graphStringArray(object["sourceNodeIds"])
-                return camel.isEmpty ? nil : camel
-            }(),
+            mentions: object["mention_count"]?.exactIntegerValue,
             updatedAt: object["last_seen"]?.stringValue
         )
     }
@@ -182,13 +189,4 @@ public enum AgentGraphReads {
         return values.compactMap(\.stringValue)
     }
 
-    private static func graphInt(_ value: JSONValue?) -> Int {
-        guard let value else { return 0 }
-        switch value {
-        case .int(let int): return Int(int)
-        case .double(let double): return Int(exactly: double.rounded(.towardZero)) ?? 0
-        case .string(let string): return Int(string) ?? 0
-        default: return 0
-        }
-    }
 }

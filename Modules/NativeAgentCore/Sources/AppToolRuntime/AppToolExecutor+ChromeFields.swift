@@ -1,6 +1,8 @@
 import Foundation
 import NativeAgentCore
 import ChatTurnContracts
+import ChatToolRuntime
+import ChatToolParsing
 import AgentWorkspace
 import ChromeControl
 import MacControl
@@ -8,7 +10,7 @@ import PersistenceCore
 import ToolRegistry
 import Senses
 import Desk
-// Blueprint: | `AppToolExecutor+ChromeFields.swift` | `AppToolExecutor`: `resolveChromeTarget`, `chromeFields`, `runChromeFieldsCall` |
+// Blueprint: | `AppToolExecutor+ChromeFields.swift` | `AppToolExecutor`: `resolveChromeTarget`, `chromeFields`, `runChromeFieldsCall`; one attempt per observed field, retaining prior receipts and refusing further follow-ups after a Trust receipt failure; failed batches return without a replacement page |
 
 /// Chrome jobs in one call. A row can be named by its
 /// label, snapshot_id defaults to the last page read on the tab, and a form
@@ -27,8 +29,8 @@ extension AppToolExecutor {
     /// Which acts a verb can use on a row.
     private static let chromeWants: [String: Set<String>] = [
         "browser.chrome_click": ["click", "fill", "type"], "browser.chrome_double_click": ["double_click", "click", "fill", "type"],
-        "browser.chrome_fill": ["fill"], "browser.chrome_type": ["type", "fill"], "browser.chrome_select": ["select"],
-        "browser.chrome_keypress": ["keypress", "fill", "type", "click"], "browser.chrome_set_checked": ["set_checked"],
+        "browser.chrome_fill": ["fill"], "browser.chrome_type": ["type"], "browser.chrome_select": ["select"],
+        "browser.chrome_keypress": ["keypress"], "browser.chrome_set_checked": ["set_checked"],
         "browser.chrome_wait": ["wait"], "browser.chrome_drag": ["drag"], "browser.chrome_drop_target": ["drop"],
         "browser.chrome_scroll_target": ["scroll"],
     ]
@@ -218,13 +220,22 @@ extension AppToolExecutor {
             return .object(stop)
         }
         var seen = ChromePageMirror.page(tab: tab, dataRoot: securityCenter.dataRoot, session: session)
-        func read() async throws -> ChromePageMirror.Page? {
+        func read() async throws -> ChromePageMirror.Page {
             // The whole page: a field below the fold is still on the form.
             let snapshot = try await run("browser.chrome_snapshot", ["tab_id": tab.map(JSONValue.int) ?? .null, "max_nodes": .int(200), "scope": .string("page")])
-            guard case .object(let row) = snapshot, case .int(let id)? = row["tabId"] else { return nil }
+            guard case .object(let row) = snapshot, case .int(let id)? = row["tabId"],
+                  case .string(let snapshotID)? = row["snapshotId"], !snapshotID.isEmpty else {
+                throw ToolFailureError("Chrome page unavailable: " + (ChatToolOutcome.explanation(snapshot) ?? "The snapshot did not provide a tab and snapshot identity."),
+                    effects: .none, owner: "Chrome page snapshot", code: "chrome_page_unavailable")
+            }
             tab = id
             mirrorChromePage(snapshot, projection: ChromePageText.project(snapshot))
-            return ChromePageMirror.page(tab: id, dataRoot: securityCenter.dataRoot, session: session)
+            guard let page = ChromePageMirror.page(tab: id, dataRoot: securityCenter.dataRoot, session: session),
+                  page.snapshotID == snapshotID else {
+                throw ToolFailureError("Chrome's returned snapshot could not publish its matching page mirror. Read the tab after repairing its snapshot; do not repeat fields already sent.",
+                    effects: .none, owner: "Chrome page mirror", code: "chrome_page_unavailable")
+            }
+            return page
         }
         func tool(for row: ChromePageMirror.Row) -> String? {
             if row.acts.contains("select") { return "browser.chrome_select" }
@@ -233,7 +244,9 @@ extension AppToolExecutor {
             return row.acts.contains("type") ? "browser.chrome_type" : nil
         }
         let valueActs: Set<String> = ["fill", "type", "select", "set_checked"]
-        guard var page = try await read() else { return refused("The page could not be read, so nothing was filled.") }
+        var page: ChromePageMirror.Page
+        do { page = try await read() }
+        catch { return refused("The page could not be read, so nothing was filled: " + error.localizedDescription) }
         // Row numbers mean the page she saw (or, with none, this first read).
         if seen == nil { seen = page }
         // Find every field (and the button) first: a missing or ambiguous
@@ -263,45 +276,48 @@ extension AppToolExecutor {
         plan.sort { $0.index < $1.index }
         var lines: [String] = [], ok = true, last: String?, lastTool = actionId
         var takeover: [String: JSONValue]?
+        var followUpRefusal: JSONValue?
         func act(_ tool: String, target: String, wants: Set<String>, extra: [String: JSONValue], shown: String, submission: Bool = false) async -> Bool {
-            if tool != actionId,
-               let stop = await chromeFollowUpCheck(tool, surface: surface, enforceAutonomy: submission ? true : nil).stop {
-                lines.append("✗ " + shown + ": " + stop); return false
-            }
-            for attempt in 0..<2 {
-                let row: ChromePageMirror.Row
-                switch ChromePageMirror.find(target, wants: wants, in: page, seen: seen) {
-                case .row(let match): row = match
-                case .ambiguous(let rows): lines.append("✗ " + shown + ": the page changed and more than one row matches (" + ChromePageMirror.named(rows) + "); not sent"); return false
-                case .none: lines.append("✗ " + shown + ": no longer on the page"); return false
-                }
-                var call = extra
-                call["tab_id"] = .int(page.tab); call["snapshot_id"] = .string(page.snapshotID); call["node_id"] = .string(row.node)
-                call["expected_user_sequence"] = input["expected_user_sequence"]
-                do {
-                    let result = try await run(tool, call)
-                    receipts.append(result)
-                    let rowPlace = row.number.map { " (row " + $0 + ")" } ?? ""
-                    if case .object(let done) = result, done["status"] == .string("yielded_to_user") {
-                        takeover = done
-                    }
-                    if case .object(let done) = result, done["outcome"] == .string("succeeded") {
-                        lines.append("✓ " + shown + rowPlace); lastTool = tool; return true
-                    }
-                    let why: String = if case .object(let done) = result, case .string(let text)? = done["reason"] ?? done["error"] ?? done["outcome"] { text } else { "no clear outcome" }
-                    lines.append("✗ " + shown + rowPlace + ": " + ChromePageText.safe(why) + "; not retried"); return false
-                } catch {
-                    let text = error.localizedDescription
-                    // A stale page refuses before anything is sent: read again once.
-                    if attempt == 0, text.contains("snapshot_stale") || text.contains("node_stale"),
-                       let fresh = try? await read() { page = fresh; continue }
-                    lines.append("✗ " + shown + ": " + ChromePageText.safe(text)); return false
+            if tool != actionId {
+                let admission = await chromeFollowUpCheck(tool, surface: surface, enforceAutonomy: submission ? true : nil)
+                if let stop = admission.stop {
+                    followUpRefusal = admission.refusal
+                    lines.append("✗ " + shown + ": " + stop); return false
                 }
             }
-            return false
+            let row: ChromePageMirror.Row
+            switch ChromePageMirror.find(target, wants: wants, in: page, seen: seen) {
+            case .row(let match): row = match
+            case .ambiguous(let rows): lines.append("✗ " + shown + ": the page changed and more than one row matches (" + ChromePageMirror.named(rows) + "); not sent"); return false
+            case .none: lines.append("✗ " + shown + ": no longer on the page"); return false
+            }
+            var call = extra
+            call["tab_id"] = .int(page.tab); call["snapshot_id"] = .string(page.snapshotID); call["node_id"] = .string(row.node)
+            call["expected_user_sequence"] = input["expected_user_sequence"]
+            do {
+                let result = try await run(tool, call)
+                receipts.append(result)
+                let rowPlace = row.number.map { " (row " + $0 + ")" } ?? ""
+                if case .object(let done) = result, done["status"] == .string("yielded_to_user") {
+                    takeover = done
+                }
+                if case .object(let done) = result, done["outcome"] == .string("succeeded") {
+                    lines.append("✓ " + shown + rowPlace); lastTool = tool; return true
+                }
+                let why: String = if case .object(let done) = result, case .string(let text)? = done["reason"] ?? done["error"] ?? done["outcome"] { text } else { "no clear outcome" }
+                lines.append("✗ " + shown + rowPlace + ": " + ChromePageText.safe(why) + "; not retried"); return false
+            } catch {
+                receipts.append(ChatToolOutcome.failure(error: error, tool: tool))
+                lines.append("✗ " + shown + ": " + ChromePageText.safe(error.localizedDescription)
+                    + "; not retried. Read this tab again before continuing; do not repeat fields already sent.")
+                return false
+            }
         }
         for (index, item) in plan.enumerated() {
-            if index > 0, let fresh = try? await read() { page = fresh }
+            if index > 0 {
+                do { page = try await read() }
+                catch { lines.append("✗ Page refresh failed: " + ChromePageText.safe(error.localizedDescription) + "; remaining fields were not sent. Read this tab again before continuing."); ok = false; break }
+            }
             guard let row = ChromePageMirror.find(item.label, wants: valueActs, in: page, seen: seen).row, let tool = tool(for: row) else {
                 lines.append("✗ " + ChromePageText.safe(item.label) + ": no longer on the page, or no longer one row"); ok = false; break
             }
@@ -318,12 +334,13 @@ extension AppToolExecutor {
             last = item.label
         }
         if ok, let submit = fields.submit {
-            if let fresh = try? await read() { page = fresh }
-            if submit.lowercased() == "enter" || submit.lowercased() == "true" {
+            do { page = try await read() }
+            catch { lines.append("✗ Page refresh failed: " + ChromePageText.safe(error.localizedDescription) + "; submission was not sent. Read this tab again before continuing."); ok = false }
+            if ok, submit.lowercased() == "enter" || submit.lowercased() == "true" {
                 if let last {
-                    ok = await act("browser.chrome_keypress", target: last, wants: ["keypress", "fill", "type"], extra: ["key": .string("Enter")], shown: "Enter", submission: true)
+                    ok = await act("browser.chrome_keypress", target: last, wants: ["keypress"], extra: ["key": .string("Enter")], shown: "Enter", submission: true)
                 } else { lines.append("✗ Enter: no field was filled to press it in"); ok = false }
-            } else {
+            } else if ok {
                 ok = await act("browser.chrome_click", target: submit, wants: ["click"], extra: [:], shown: "click " + ChromePageText.safe(submit), submission: true)
             }
         }
@@ -338,11 +355,14 @@ extension AppToolExecutor {
         var result: [String: JSONValue] = [
             "ok": .bool(ok), "outcome": .string(ok ? "succeeded" : "failed"), "tabId": .int(page.tab),
             "fields": .string(summary), "tool": .string(actionId), "receipt": receipt,
-            "verification": .string(DeskContinuation.receiptIsUnresolved(receipt) ? "pending" : "satisfied"),
+            "verification": .string(ok ? (DeskContinuation.receiptIsUnresolved(receipt) ? "pending" : "satisfied") : "unavailable"),
         ]
-        if direct {
+        result["follow_up_refusal"] = followUpRefusal
+        if direct, ok {
             let fresh = await freshChromePage(after: lastTool, tab: page.tab, sequence: nil, input: input, surface: surface, run: run)
             result["text"] = .string((head + [summary, "", fresh.text]).joined(separator: "\n"))
+        } else if direct {
+            result["text"] = .string((head + [summary]).joined(separator: "\n"))
         }
         return .object(result)
     }

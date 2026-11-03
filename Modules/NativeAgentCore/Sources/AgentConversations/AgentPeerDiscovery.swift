@@ -6,7 +6,7 @@ import MacControl
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `AgentPeerDiscovery.swift` | `AgentPeerDiscovery` enum; `probe` discovers protocols, never names: loopback A2A cards, programs carrying ACP methods or advertising an ACP entry, and settings holding mcpServers, read from verified regular files. Recipes claim known finds; unknown finds carry a draft under an id of protocol and path. Only Agents and explicit discover probe; `Launch` admits bounded --help and initialize under the send's `agentProgramLaunch` rule (Full Mac as is, otherwise the builder sandbox, denied or locked down never). |
+// Blueprint: | `AgentPeerDiscovery.swift` | `AgentPeerDiscovery` enum; `probe` discovers protocols, never names: loopback A2A cards, programs carrying ACP methods or advertising an ACP entry, and settings holding mcpServers, read from verified regular files. Bundle programs/settings consume MacAppIndex's checked installed-Mac projection. Recipes claim known finds; unknown finds carry a draft under an id of protocol and path. Only Agents and explicit discover probe; `Launch` admits bounded --help and initialize under the send's `agentProgramLaunch` rule (Full Mac as is, otherwise the builder sandbox, denied or locked down never). |
 
 /// Bounded read-only discovery. A website, an HTTP success, or an unsupported
 /// protocol is not a connected agent. No contact or credential is written here.
@@ -27,10 +27,10 @@ package enum AgentPeerDiscovery {
               case .object(let card)? = response.json, card["name"] != nil,
               ["skills", "capabilities", "protocolVersion", "supportedInterfaces"].contains(where: { card[$0] != nil }) else { return nil }
         guard case .string(let name)? = card["name"], !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              name.utf8.count <= 480, case .object? = card["capabilities"], case .array? = card["skills"],
-              let selected = try? AgentA2AWire.selectInterface(card: .object(card), cardURL: url) else {
+              name.utf8.count <= 480, case .object? = card["capabilities"], case .array? = card["skills"] else {
             throw AgentCommunicationError.invalid("\(url.absoluteString) serves an agent card this app cannot use (name, capabilities, skills and a supported interface are required)")
         }
+        let selected = try AgentA2AWire.selectInterface(card: .object(card), cardURL: url)
         try AgentPeerHTTP.validateLoopbackCandidate(selected.endpoint)
         guard selected.endpoint.host == url.host, selected.endpoint.port == url.port else {
             throw AgentCommunicationError.invalid("\(url.absoluteString) advertised a different origin; no credential was forwarded")
@@ -118,8 +118,8 @@ package enum AgentPeerDiscovery {
     /// Probes only read unless an explicit discover's `launch` admits --help and initialize under the send's rule.
     /// Bounds: cards 0.6s, --help 1s, initialize 3s. Bonjour has no A2A service type and needs Local Network access;
     /// chat windows without a recipe label are not checked.
-    static func probe(_ bundles: [Bundle], launch: Launch?) async -> [AgentDiscoveryCandidate] {
-        async let programs = acpPrograms(bundles, launch: launch)
+    static func probe(_ bundles: [Bundle], launch: Launch?, dataRoot: URL) async -> [AgentDiscoveryCandidate] {
+        async let programs = acpPrograms(bundles, launch: launch, dataRoot: dataRoot)
         async let settings = mcpSettings(bundles)
         // One card per agent: the agent-card.json path wins when it serves both.
         var cards: [AgentDiscoveryCandidate] = []
@@ -215,7 +215,7 @@ package enum AgentPeerDiscovery {
     /// ACP candidates on the login PATH or inside apps carry its methods (in their bytes or beside a linked script)
     /// or advertise an ACP entry in their name/launcher. When `launch` admits it, initialize uses the transport's start
     /// and arguments from its recipe, name or --help. Clients carry the methods too; only an answer is connectable.
-    static func acpPrograms(_ bundles: [Bundle], launch: Launch?) async -> [AgentDiscoveryCandidate] {
+    static func acpPrograms(_ bundles: [Bundle], launch: Launch?, dataRoot: URL) async -> [AgentDiscoveryCandidate] {
         // Without the login PATH, its own row says why.
         guard case .success(let environment) = AgentHostCommandLines.loginEnvironment else { return [] }
         let fm = FileManager.default
@@ -234,7 +234,7 @@ package enum AgentPeerDiscovery {
                     && !file.lastPathComponent.hasPrefix(programs[file.path]!.lastPathComponent)) { programs[file.path] = link }
             }
         }
-        for app in bundles where app.kind == "installed" && !app.url.path.hasPrefix("/System/") {
+        for app in MacAppIndex.installed(bundles) where !app.url.path.hasPrefix("/System/") {
             let main = app.info?["CFBundleExecutable"] as? String
             for folder in ["Contents/MacOS", "Contents/Helpers", "Contents/Resources/bin"].map(app.url.appendingPathComponent) {
                 for name in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? [] where folder.lastPathComponent != "MacOS" || name != main {
@@ -320,7 +320,7 @@ package enum AgentPeerDiscovery {
                             // The transport's own start, and nothing after it.
                             let started = command(file, arguments)
                             do {
-                                if case .object(let result) = try await AgentACPClient().initialize(executable: started[0], arguments: Array(started.dropFirst()),
+                                if case .object(let result) = try await AgentACPClient(dataRoot: dataRoot).initialize(executable: started[0], arguments: Array(started.dropFirst()),
                                     directory: FileManager.default.temporaryDirectory, environment: environment,
                                     approvedExecutable: executable, timeout: .seconds(3)) { answer = result }
                                 seen.append("initialize: answered ACP 1")
@@ -389,7 +389,7 @@ package enum AgentPeerDiscovery {
     /// or bundle id is the program a connection is written for.
     static func mcpSettings(_ bundles: [Bundle]) -> [AgentDiscoveryCandidate] {
         let fm = FileManager.default, home = fm.homeDirectoryForCurrentUser.path
-        let apps = bundles.filter { $0.kind == "installed" && !$0.url.path.hasPrefix("/System/") && $0.bundleID?.hasPrefix("com.apple.") != true }
+        let apps = MacAppIndex.installed(bundles).filter { !$0.url.path.hasPrefix("/System/") && $0.bundleID?.hasPrefix("com.apple.") != true }
         // Application Support also holds what macOS guards (Contacts, Calendars):
         // only an installed app's own folder there is read.
         let owned = Set(apps.flatMap { [$0.bundleID, $0.name].compactMap { $0 } })

@@ -15,7 +15,7 @@ package enum ChatTranscriptEvidenceRendering {
         content: String,
         metadata: [String: JSONValue]?
     ) -> (text: String, fields: [String: JSONValue]?) {
-        let name = metadata?["toolName"]?.stringValue ?? metadata?["tool_name"]?.stringValue ?? "tool"
+        let name = metadata?["toolName"]?.stringValue ?? "tool"
         let input = metadata?["inputJSON"]?.stringValue.flatMap { try? JSONValue.parse(Data($0.utf8)) }
         let inputNote = input?.objectValue == nil ? " The arguments this call ran with were not saved readably; its effect is recorded, its inputs are unknown." : ""
         var call = name
@@ -30,7 +30,7 @@ package enum ChatTranscriptEvidenceRendering {
         let raw = body ?? metadata?["resultSummary"]?.stringValue ?? content
         let result = try? JSONValue.parse(Data(raw.utf8))
         let recordedStatus = recordedToolStatus(metadata) ?? metadata?["resultStatus"]?.stringValue
-        let fallbackStatus = metadata?["ok"] == .bool(true) ? "ok" : metadata?["ok"] == .bool(false) ? "failed" : "ran"
+        let fallbackStatus = "unknown"
         let saved = body == nil ? metadata?["receiptEvidence"]?.objectValue : nil
         var fields = saved ?? result.flatMap { receiptEvidence(call: call, result: $0).objectValue }
         if var evidence = fields {
@@ -98,7 +98,8 @@ package enum ChatTranscriptEvidenceRendering {
                         if let value = fields[key] { op[key] = value }
                     }
                     if let result = fields["result"] {
-                        op["result_bytes"] = .int(Int64((try? result.serializedData(pretty: false).count) ?? 0))
+                        do { op["result_bytes"] = .int(Int64(try result.serializedData(pretty: false).count)) }
+                        catch { op["result_bytes"] = .null; op["result_encoding_error"] = .string("Retained result cannot be encoded: \(error.localizedDescription)") }
                     }
                     // Only the ledger's result envelope supplies a returned id.
                     if case .object(let result)? = fields["result"],
@@ -221,13 +222,14 @@ package enum ChatTranscriptEvidenceRendering {
             let extras = message.extras?.objectValue
             let metadata = extras?["metadata"]?.objectValue
             guard message.role == "tool" || metadata?["kind"]?.stringValue == "tool_use",
-                  let id = extras?["id"]?.stringValue, !id.isEmpty else { continue }
+                  let id = extras?["id"]?.stringValue, !id.isEmpty,
+                  let identity = message.historyIdentity() else { continue }
             guard var fields = historicalReceipt(content: "", metadata: metadata).fields else { continue }
             fields["history"] = .string("history:" + id)
             let compact = boundedReceiptEvidence(fields, maximumCharacters: 1_200)
             if receiptValue(.array(receipts + [compact])).count > 5_000 { break }
             receipts.append(compact)
-            identities.insert(message.historyIdentity())
+            identities.insert(identity)
             if receipts.count == 8 { break }
         }
         guard !receipts.isEmpty else { return nil }
@@ -268,7 +270,8 @@ package enum ChatTranscriptEvidenceRendering {
 
     package static func receiptValue(_ value: JSONValue) -> String {
         if case .string(let text) = value { return text }
-        return (try? value.serialize(pretty: false)) ?? ""
+        do { return try value.serialize(pretty: false) }
+        catch { return "[Retained receipt unavailable: \(error.localizedDescription). Repair its saved result before using it as evidence.]" }
     }
 
     package static func toolResultProjection(call: String, status: String, effects: String?, returnedID: String?) -> String {

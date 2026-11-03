@@ -3,23 +3,13 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Desk
-// Blueprint: | `InboxItemRecord.swift` | Tolerant raw-row construction, declared source meaning and action/proactive interpretation on shared inbox values; latest stable-card identity and OwnerAttentionPolicy projection |
-
-/// The inbox reader deliberately keeps cards with a bad optional source rather
-/// than dropping the whole record. Preserve why the source is unavailable so
-/// the visible provenance badge does not turn a bad wire value into silence.
-public enum InboxSourceReadState: Hashable, Sendable {
-    case present
-    case missing
-    case malformed
-}
+// Blueprint: | `InboxItemRecord.swift` | Checked current-card schema and producer-declared actions; retained execution-link read, declared source meaning, latest stable-card identity and OwnerAttentionPolicy projection |
 
 /// What an inbox card means, declared by the producer that files it (the
 /// card's `presentation` field): its icon, badge, plain words and act-button
 /// label. The Mac's inbox renders it and the phone reads it from the
 /// snapshot. A card that declares nothing is shown as unclassified, never
-/// classified here; a missing or malformed source stays an explicit adverse
-/// state.
+/// classified here. The filing/read boundary requires its source field.
 extension InboxSourcePresentation {
     /// The field a producer puts on its card.
     public var row: JSONValue {
@@ -27,18 +17,13 @@ extension InboxSourcePresentation {
                  "act_label": actLabel.map(JSONValue.string) ?? .null])
     }
 
-    init(source: String, readState: InboxSourceReadState, hasLinkedApproval: Bool, declared: InboxSourcePresentation?) {
+    init(source: String, hasLinkedApproval: Bool, declared: InboxSourcePresentation?) {
         func unclassified(_ badge: String) -> Self { .init(icon: "bell.fill", badge: badge, words: "A note from me") }
         if hasLinkedApproval { self.init(icon: "checkmark.shield.fill", badge: "APPROVAL", words: "Asking first"); return }
         let normalized = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789_:-")
-        switch readState {
-        case .missing: self = unclassified("SOURCE MISSING")
-        case .malformed: self = unclassified("SOURCE INVALID")
-        case .present where normalized.isEmpty: self = unclassified("SOURCE UNKNOWN")
-        case .present where !normalized.unicodeScalars.allSatisfy(allowed.contains): self = unclassified("SOURCE INVALID")
-        case .present: self = declared ?? unclassified(Self.humanized(normalized))
-        }
+        self = normalized.unicodeScalars.allSatisfy(allowed.contains)
+            ? declared ?? unclassified(Self.humanized(normalized)) : unclassified("SOURCE INVALID")
     }
 
     private static func humanized(_ source: String) -> String {
@@ -60,140 +45,82 @@ extension InboxItemRecord {
     public var isProactiveCard: Bool { source.lowercased().hasPrefix("proactive_autonomy:") }
     public var isApprovalBacklogCard: Bool {
         let lowerSource = source.lowercased()
-        let lowerDetail = (detail ?? "").lowercased()
         return hasLinkedApproval
             || lowerSource.hasPrefix("proactive_autonomy:approval_backlog:")
-            || lowerDetail.contains("suggested action: approvals.triage")
-    }
-
-    public var fallbackPrimaryAction: InboxActionRecord? {
-        if isApprovalBacklogCard {
-            return InboxActionRecord(
-                id: "open_approvals",
-                label: "Open Approvals",
-                description: "Review pending approvals"
-            )
-        }
-        if isProactiveCard {
-            return nil
-        }
-        if severity.lowercased() == "actionable" || relatedWorkshopExecutionId != nil {
-            return InboxActionRecord(id: "act", label: "Act", description: "Take primary action")
-        }
-        return nil
-    }
-
-    public var effectiveActions: [InboxActionRecord] {
-        if !actions.isEmpty { return actions }
-        var fallback = [InboxActionRecord(id: "view", label: "View", description: "See full detail")]
-        if let primary = fallbackPrimaryAction {
-            fallback.append(primary)
-        }
-        fallback.append(contentsOf: [
-            InboxActionRecord(id: "archive", label: "Archive", description: "Archive this item"),
-            InboxActionRecord(id: "dismiss", label: "Dismiss", description: "Dismiss this item"),
-        ])
-        return fallback
     }
 
     public var actionIDs: Set<String> {
-        Set(effectiveActions.map(\.id))
+        Set(InboxActionVocabulary.actions(declared: actions, approvalLinked: hasLinkedApproval).map(\.id))
+    }
+
+    /// Proactive scanning uses this same checked link/action interpretation.
+    public var isAttentionWorthyBacklogItem: Bool {
+        guard normalizedStatus == "unread", !isProactiveCard else { return false }
+        if ["actionable", "critical"].contains(severity.lowercased()) { return true }
+        if hasLinkedApproval || relatedWorkshopExecutionId?.isEmpty == false { return true }
+        let passive: Set<String> = ["view", "read", "archive", "dismiss"]
+        return actions.contains { !passive.contains($0.id.lowercased()) }
     }
 
     public var isForYouLane: Bool { !isSystemLane }
 
-    /// A row without a string `id` is not a card. Every other field keeps the
-    /// card: a missing or mistyped value takes its default, and a list with
-    /// one unreadable element is read as absent (actions as none).
-    public init?(row: JSONValue) {
-        guard case .object(let o) = row, let id = Self.string(o["id"]) else { return nil }
-        let source: String
-        let sourceReadState: InboxSourceReadState
-        let created_at = Self.string(o["created_at"]) ?? ""
-        if o["source"] == nil {
-            source = ""
-            sourceReadState = .missing
-        } else if let decodedSource = Self.string(o["source"]) {
-            source = decodedSource
-            sourceReadState = .present
-        } else {
-            source = ""
-            sourceReadState = .malformed
+    /// The shared current wire decoder checks every required/optional field and
+    /// every action. No unreadable list becomes an executable default policy.
+    public init(row: JSONValue) throws {
+        let fields = try JSONRow(row)
+        let currentLink = try fields.optionalString(InboxExecutionLinkVocabulary.wireKey)
+        // DATA PRESENT: retained cards still carry this key. This is its one reader.
+        let retainedLink = try fields.optionalString(InboxExecutionLinkVocabulary.legacyKey)
+        var object = fields.fields
+        if currentLink == nil, let retainedLink {
+            object[InboxExecutionLinkVocabulary.wireKey] = .string(retainedLink)
         }
-        let severity = id.hasPrefix("delegation-outcome:") && id.hasSuffix(":adverse-rollup") && o["adverse_jobs"] == .array([])
-            ? "info" : Self.string(o["severity"]) ?? "info"
-        let title = Self.string(o["title"]) ?? ""
-        let summary = Self.string(o["summary"]) ?? ""
-        let detail = Self.string(o["detail"])
-        let relatedWorkshopExecutionId = Self.string(o[InboxExecutionLinkVocabulary.futureKey])
-            ?? Self.string(o[InboxExecutionLinkVocabulary.wireKey])
-        let related_approval_id = Self.string(o["related_approval_id"])
-        let related_paths = Self.strings(o["related_paths"])
-        let related_groups = Self.all(o["related_groups"], Self.group)
-        let actions = Self.all(o["actions"], Self.action) ?? []
-        let status = Self.string(o["status"]) ?? "unread"
-        let read_at = Self.string(o["read_at"])
-        let chat_session_id = Self.string(o["chat_session_id"])
-        let declaredPresentation = o["presentation"].flatMap { try? JSONDecoder().decode(InboxSourcePresentation.self, from: $0.serializedData(pretty: false)) }
-        self.init(id: id, created_at: created_at, source: source, severity: severity, title: title,
-                  summary: summary, detail: detail, relatedWorkshopExecutionId: relatedWorkshopExecutionId,
-                  related_approval_id: related_approval_id, related_paths: related_paths, related_groups: related_groups,
-                  actions: actions, status: status, read_at: read_at, chat_session_id: chat_session_id,
-                  presentation: InboxSourcePresentation(source: source, readState: sourceReadState,
-                      hasLinkedApproval: !(related_approval_id ?? "").isEmpty, declared: declaredPresentation),
-                  interaction_session_id: Self.string(o["interaction_session_id"]), interaction_id: Self.string(o["interaction_id"]))
+        self = try JSONDecoder().decode(Self.self, from: JSONValue.object(object).serializedData(pretty: false))
+        for (key, value) in [("id", id), ("source", source), ("severity", severity), ("title", title)] {
+            guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw JSONRow.Malformed.field(key) }
+        }
+        guard NativeTimestampFormat.parseISO8601FractionalFirst(created_at) != nil else {
+            throw JSONRow.Malformed.field("created_at")
+        }
+        guard ["unread", "active", "read", "archived", "dismissed"].contains(status) else {
+            throw JSONRow.Malformed.field("status")
+        }
+        if let read_at, NativeTimestampFormat.parseISO8601FractionalFirst(read_at) == nil {
+            throw JSONRow.Malformed.field("read_at")
+        }
+        var actionIDs = Set<String>()
+        for action in actions {
+            guard !action.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !action.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  actionIDs.insert(action.id).inserted else { throw JSONRow.Malformed.field("actions") }
+        }
+        if let related_groups, related_groups.contains(where: { $0.count < 0 }) {
+            throw JSONRow.Malformed.field("related_groups")
+        }
+        if let raw = fields.fields["occurrence_count"] {
+            guard case .int(let count) = raw, count > 0, count < Int.max else {
+                throw JSONRow.Malformed.field("occurrence_count")
+            }
+        }
+        presentation = InboxSourcePresentation(source: source,
+            hasLinkedApproval: hasLinkedApproval, declared: presentation)
     }
 
     /// A producer may re-file a settled card under its stable id. Its newest
     /// physical row owns the state, as LiveNotificationInbox.updateStatus does.
-    public static func latest(in rows: [JSONValue]) -> [InboxItemRecord] {
+    public static func latest(in rows: [JSONValue]) throws -> [InboxItemRecord] {
         var seen = Set<String>()
-        return rows.reversed().compactMap { row in
-            guard let item = InboxItemRecord(row: row), seen.insert(item.id).inserted else { return nil }
-            return item
+        var items: [InboxItemRecord] = []
+        for row in rows.reversed() {
+            let item = try InboxItemRecord(row: row)
+            if seen.insert(item.id).inserted { items.append(item) }
         }
-    }
-
-    // MARK: - Row fields
-
-    private static func string(_ value: JSONValue?) -> String? {
-        if case .string(let s)? = value { return s }
-        return nil
-    }
-
-    private static func strings(_ value: JSONValue?) -> [String]? {
-        all(value) { string($0) }
-    }
-
-    /// Every element read, or nil when the value is not an array or any
-    /// element is unreadable.
-    private static func all<T>(_ value: JSONValue?, _ read: (JSONValue) -> T?) -> [T]? {
-        guard case .array(let elements)? = value else { return nil }
-        var out: [T] = []
-        out.reserveCapacity(elements.count)
-        for element in elements {
-            guard let item = read(element) else { return nil }
-            out.append(item)
-        }
-        return out
-    }
-
-    private static func group(_ value: JSONValue) -> InboxRelatedGroup? {
-        guard let row = try? JSONRow(value), let count = try? row.optionalInt("count") else { return nil }
-        return try? InboxRelatedGroup(id: row.string("id"), title: row.string("title"), count: count,
-                                     item_ids: row.optionalStrings("item_ids"), source: row.optionalString("source"))
-    }
-
-    private static func action(_ value: JSONValue) -> InboxActionRecord? {
-        guard let row = try? JSONRow(value) else { return nil }
-        return try? InboxActionRecord(id: row.string("id"), label: row.string("label"),
-                                     description: row.optionalString("description"))
+        return items
     }
 }
 
 /// The only route from a persisted digest card to its Review Groups controls.
-/// New cards use the structured wire; prose remains compatibility for existing
-/// JSONL cards only.
+/// Cards use the producer's structured wire, never inferred presentation prose.
 extension InboxItemRecord {
     public var normalizedStatus: String {
         status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()

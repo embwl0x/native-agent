@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacControl+MenusAndClipboard.swift` | `SwiftNativeMacControl`: `handleMenu`, `handleMenuPress`, `handleClipboardRead`; surface menu commands await surface-transition notifications within the existing deadline before owned-window readback; Select All keeps its range readback |
+// Blueprint: | `MacControl+MenusAndClipboard.swift` | `SwiftNativeMacControl`: `handleMenu`, `handleMenuPress`, `handleClipboardRead`; menu discovery and press share displayed occurrence choices for unpublished duplicates; surface commands await transition notifications within the existing deadline before owned-window readback; Select All keeps its range readback |
 
 extension SwiftNativeMacControl {
     // MARK: - Menu bar
@@ -79,10 +79,14 @@ extension SwiftNativeMacControl {
         // remain ambiguous across menus.
         // A path ("Format › Make Plain Text") finds that item under that menu.
         // A bare name ("Find/Replace") is never split.
-        let wantedLevels = body["find"]?.stringValue.map {
-            (MacMenuBar.isPath($0) ? MacMenuBar.components($0) : [$0]).map(MacMenuBar.normalized)
+        let selected = body["find"]?.stringValue.map(MacMenuBar.selection)
+        let wantedLevels = selected.map {
+            (MacMenuBar.isPath($0.path) ? MacMenuBar.components($0.path) : [$0.path]).map(MacMenuBar.normalized)
         } ?? []
         let wanted = wantedLevels.last.flatMap { $0.isEmpty ? nil : $0 }
+        // The four-verb parser supplies its optional trailing-role grammar.
+        // Literal names win; both alternatives resolve against this one reading.
+        let roleName = body["role_name"]?.stringValue.map(MacMenuBar.normalized)
         func isWanted(_ item: MacMenuBar.Item) -> Bool {
             let levels = item.titlePath.map(MacMenuBar.normalized)
             guard levels.last == wanted else { return false }
@@ -104,12 +108,11 @@ extension SwiftNativeMacControl {
                   let chord = try? MacKeySyntax.parseChords(shortcut.chord).first else { return false }
             return chord.keyCode == wantedChord.keyCode && chord.modifiers == wantedChord.modifiers
         }
-        // A path walks its named menus whole, so an exact level can beat a
-        // prefix one ("Edit" over "Editor"); only a chord stops at the first.
+        // Walk the named menus whole: a later enabled duplicate or matching
+        // key equivalent must remain available to the one-command selector.
         let reading = MacMenuBar.read(
             source: accessibilitySource, pid: app.processIdentifier,
             top: wantedLevels.count > 1 ? wantedLevels.first : nil,
-            until: wanted == nil && wantedChord != nil ? hasChord : nil,
             depth: wanted == nil && wantedChord == nil ? MacMenuBar.maxPathDepth : MacMenuBar.findPathDepth
         )
         // A background app's menus report stale enabled states (File › Save
@@ -122,7 +125,7 @@ extension SwiftNativeMacControl {
             MacMenuBar.Reading(items: reading.items.filter { item in
                 let path = item.titlePath.joined(separator: " ").lowercased()
                 return words.allSatisfy(path.contains)
-            }, truncated: reading.truncated, unavailable: reading.unavailable)
+            }, truncated: reading.truncated, unavailable: reading.unavailable, attributeGaps: reading.attributeGaps)
         } ?? reading
         var output: [String: JSONValue] = [:]
         if case .object(let menuJSON) = MacMenuBar.json(listed, statesKnown: statesKnown,
@@ -138,9 +141,13 @@ extension SwiftNativeMacControl {
             func exact(_ item: MacMenuBar.Item) -> [Bool] {
                 zip(item.titlePath.map(MacMenuBar.normalized), wantedLevels).map { $0 == $1 }
             }
+            let literalHits = reading.items.filter(isWanted)
+            let nameHits = literalHits.isEmpty && wantedLevels.count == 1 && roleName != nil
+                ? reading.items.filter { $0.titlePath.last.map(MacMenuBar.normalized) == roleName }
+                : literalHits
             var hits = wanted == nil
-                ? reading.items.suffix(1).filter(hasChord)
-                : reading.items.filter(isWanted).enumerated().sorted {
+                ? reading.items.filter(hasChord)
+                : nameHits.enumerated().sorted {
                     exact($0.element) != exact($1.element)
                         ? exact($0.element).lexicographicallyPrecedes(exact($1.element)) { $0 && !$1 }
                         : $0.offset < $1.offset
@@ -149,13 +156,24 @@ extension SwiftNativeMacControl {
                 let best = exact(first)
                 hits = hits.filter { exact($0) == best }
             }
+            hits = MacMenuBar.uniqueCommands(hits, prefer: hasChord)
+            let choices = hits
+            if let occurrence = selected?.occurrence {
+                // An ordinal names an occurrence of ONE full path. Across
+                // different paths it remains ambiguous, never a global rank.
+                let paths = Set(hits.map { $0.titlePath.map(MacMenuBar.normalized) })
+                if paths.count == 1 {
+                    hits = hits.indices.contains(occurrence - 1) ? [hits[occurrence - 1]] : []
+                }
+            }
             output["found"] = .array(hits.prefix(3).map { item in
                 var row: [String: JSONValue] = [
                     "path": MacScreenViewTextRedaction.redactedLegendString(
-                        item.display, valueChars: MacMenuBar.pathChars(MacMenuBar.findPathDepth)
+                        MacMenuBar.choice(item, among: choices), valueChars: MacMenuBar.pathChars(MacMenuBar.findPathDepth) + 24
                     ),
                 ]
-                if statesKnown { row["enabled"] = .bool(item.enabled) }
+                if statesKnown { row["enabled"] = item.enabled.map(JSONValue.bool) ?? .null }
+                if !item.attributeGaps.isEmpty { row["attribute_gaps"] = .array(item.attributeGaps.map(JSONValue.string)) }
                 if let shortcut = shortcut(item) {
                     row["shortcut"] = .string(shortcut.glyphs)
                     row["chord"] = .string(shortcut.chord)
@@ -248,35 +266,68 @@ extension SwiftNativeMacControl {
         // Walk only the path's own top-level menu.
         let reading = MacMenuBar.read(
             source: accessibilitySource, pid: app.processIdentifier,
-            top: MacMenuBar.components(requested).first,
+            top: MacMenuBar.components(MacMenuBar.selection(requested).path).first,
+            matchingPath: MacMenuBar.components(MacMenuBar.selection(requested).path),
             depth: MacMenuBar.findPathDepth
         )
         if let unavailable = reading.unavailable {
             return refuse(
                 unavailable,
-                "\(app.name) publishes no menu bar I can press through."
+                "\(app.name)'s menu bar could not be read: \(unavailable). No command was pressed."
             )
+        }
+        guard !reading.truncated else {
+            return refuse("menu_coverage_incomplete", "The requested menu branch could not be read completely; command absence or uniqueness is unknown. No command was pressed. Read that branch before continuing.",
+                          ["attribute_gaps": .array(reading.attributeGaps.map(JSONValue.string))])
         }
         // A background app's enabled states are stale: let its own handler
         // decide instead of refusing on them. A front:true press (just raised)
         // judges enabled below, after the app has revalidated.
         let requireFront = body["require_front"] == .bool(true)
         let statesKnown = !requireFront && accessibilitySource.frontmostApp()?.processIdentifier == app.processIdentifier
-        let resolution = MacMenuBar.resolve(requested, among: statesKnown ? reading.items : reading.items.map {
-            MacMenuBar.Item(titlePath: $0.titlePath, path: $0.path, enabled: true, hasSubmenu: $0.hasSubmenu, commandKey: $0.commandKey)
-        })
+        let wantedChord = body["chord"]?.stringValue
+            .flatMap { try? MacKeySyntax.parseChords($0) }.flatMap { $0.count == 1 ? $0.first : nil }
+        func hasChord(_ item: MacMenuBar.Item) -> Bool {
+            guard let wantedChord,
+                  case .resolved(let element) = accessibilityActSource.resolve(menuPath: item.path, inAppPid: app.processIdentifier, titlePath: item.titlePath),
+                  let shortcut = accessibilityActSource.menuShortcut(element),
+                  let chord = try? MacKeySyntax.parseChords(shortcut.chord).first else { return false }
+            return chord.keyCode == wantedChord.keyCode && chord.modifiers == wantedChord.modifiers
+        }
+        // Rank using the app's published enabled states before temporarily
+        // admitting stale background states for the live revalidation below.
+        let commands = MacMenuBar.uniqueCommands(reading.items, prefer: hasChord)
+        let resolution = MacMenuBar.resolve(requested, among: statesKnown ? commands : commands.map {
+            MacMenuBar.Item(titlePath: $0.titlePath, path: $0.path, enabled: true, hasSubmenu: $0.hasSubmenu, commandKey: $0.commandKey, attributeGaps: $0.attributeGaps)
+        }, prefer: hasChord)
         guard case .matched(let item) = resolution else {
             let code: String = {
                 switch resolution {
                 case .disabled: return "menu_item_disabled"
+                case .unavailable: return "menu_item_state_unavailable"
                 case .ambiguous: return "menu_path_ambiguous"
                 default: return "menu_path_not_found"
                 }
             }()
+            var words = MacMenuBar.words(for: resolution, requested: requested)
+                ?? "I couldn't find \"\(requested)\" in \(app.name)'s menu bar."
+            if case .ambiguous = resolution {
+                let wanted = MacMenuBar.components(MacMenuBar.selection(requested).path).map(MacMenuBar.normalized)
+                let chords = commands.filter { $0.titlePath.map(MacMenuBar.normalized) == wanted }.compactMap { item -> String? in
+                    guard case .resolved(let element) = accessibilityActSource.resolve(
+                        menuPath: item.path, inAppPid: app.processIdentifier, titlePath: item.titlePath),
+                          let shortcut = accessibilityActSource.menuShortcut(element) else { return nil }
+                    let name = MacScreenViewTextRedaction.redactedLegendString(
+                        MacMenuBar.choice(item, among: commands), valueChars: MacMenuBar.pathChars(MacMenuBar.findPathDepth) + 24)
+                    return (name.stringValue ?? "[redacted]") + ": " + shortcut.chord
+                }
+                if !chords.isEmpty {
+                    words += " Key chords: " + chords.joined(separator: "; ") + ". Use mac.act with verb:key and target:the chord."
+                }
+            }
             return refuse(
                 code,
-                MacMenuBar.words(for: resolution, requested: requested)
-                    ?? "I couldn't find \"\(requested)\" in \(app.name)'s menu bar.",
+                words,
                 ["requested_path": .string(requested)]
             )
         }
@@ -291,6 +342,7 @@ extension SwiftNativeMacControl {
             menuPath: item.path,
             inAppPid: app.processIdentifier, titlePath: item.titlePath
         ) {
+        case .unavailable(let detail): return refuse("ax_evidence_unavailable", detail)
         case .resolved(let hit):
             target = hit
         case .menuPathDrifted: return driftRefusal()
@@ -357,7 +409,9 @@ extension SwiftNativeMacControl {
             return refuse("continuation_unavailable", refusal)
         }
         let pid = app.processIdentifier
-        let windowsBefore = accessibilityActSource.windows(pid: pid)
+        let windowsBefore: [MacAXWindowRef]
+        do { windowsBefore = try accessibilityActSource.windows(pid: pid) }
+        catch { return refuse("window_evidence_unavailable", error.localizedDescription) }
         let focusedBefore = accessibilityActSource.focusedElement(pid: pid)
         let shortcut = accessibilityActSource.menuShortcut(target)
             .flatMap { try? MacKeySyntax.parseChords($0.chord).first }
@@ -371,10 +425,23 @@ extension SwiftNativeMacControl {
         let performedAt = now()
         let outcome = accessibilityActSource.perform(target, action: "AXPress")
         guard outcome == .performed else {
+            var evidence = outcome.receipt
+            evidence["requested_path"] = .string(item.display)
+            evidence["pressed"] = outcome.emissionAttempted ? .null : .bool(false)
+            evidence["effects"] = .string(outcome.emissionAttempted ? "unknown" : "none")
+            evidence["effects_may_have_occurred"] = .bool(outcome.emissionAttempted)
+            evidence["verification"] = .string(MotorVerificationState.unverified.rawValue)
+            if outcome.emissionAttempted {
+                evidence["ax_readback"] = accessibilityActSource.reread(target).map {
+                    MacActReceiptRendering.actedElementJSON($0, redactingValue: true)
+                } ?? .null
+            }
             return refuse(
-                "menu_press_refused",
-                "\(app.name) refused the press on \"\(item.display)\" (\(outcome)); nothing happened.",
-                ["requested_path": .string(item.display)]
+                outcome.emissionAttempted ? "menu_press_outcome_unknown" : "menu_press_refused",
+                (outcome.emissionAttempted
+                    ? "The press on \"\(item.display)\" was attempted, but \(app.name)'s reply did not establish its result. Inspect the app before another action. "
+                    : "The press on \"\(item.display)\" was refused before emission. ")
+                    + (outcome.cause ?? outcome.rawValue), evidence
             )
         }
         let clock = now
@@ -386,10 +453,18 @@ extension SwiftNativeMacControl {
             waitMs: MacActClosedLoop.defaultWaitMs, startedAt: performedAt, clock: { clock() },
             until: surfaceCommand ? MacActClosedLoop.navigationNotificationKinds : [])
         observation?.stop()
+        let windowsAfter: [MacAXWindowRef]
+        do { windowsAfter = try accessibilityActSource.windows(pid: pid) }
+        catch {
+            return MacControlResult(ok: true, action: "menu_press", output: .object([
+                "pressed": .bool(true), "status": .string("acted_unobserved"),
+                "message": .string("The menu press was delivered, but its window readback failed: " + error.localizedDescription + " Inspect this app before another press.")
+            ]), error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000))
+        }
         let input = surfaceCommand ? nil : focusedBefore.flatMap { accessibilityActSource.textInput($0) }
         let verdict = MacActClosedLoop.verify(declaration,
             value: input?.value, selection: input?.selection,
-            surfaceChanged: accessibilityActSource.windows(pid: pid).contains { window in
+            surfaceChanged: windowsAfter.contains { window in
                 !windowsBefore.contains { $0.handle == window.handle && $0.identity.title == window.identity.title }
             } ? true : nil,
             dismissed: windowsBefore.contains { accessibilityActSource.windowPresence($0) == false } ? true : nil,

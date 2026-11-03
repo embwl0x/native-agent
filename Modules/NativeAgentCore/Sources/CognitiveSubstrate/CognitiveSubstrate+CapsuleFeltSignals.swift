@@ -209,9 +209,10 @@ extension CognitiveSubstrate {
             // claims. `min` rather than substitution: the live axis carries the
             // uncertainty cooling this node has no way to know about, so the cap
             // can only ever cool the counter, never warm it.
-            counter.warmth = min(
-                counter.warmth,
-                CognitiveSubstrate.feltPartnerWarmth(partner.emotionalWarmth, dynamics: dyn))
+            if let warmth = counter.warmth,
+               let partnerWarmth = CognitiveSubstrate.feltPartnerWarmth(partner.emotionalWarmth, dynamics: dyn) {
+                counter.warmth = min(warmth, partnerWarmth)
+            } else { counter.warmth = nil }
             second = CognitiveSubstrate.feltCounterWord(
                 counter,
                 excluding: Set(parts.words),
@@ -243,9 +244,10 @@ extension CognitiveSubstrate {
         from workspaceItems: [CognitiveWorkspaceItem],
         request: CognitiveCapsuleRequest,
         frozenRead read: CognitiveFrozenRead
-    ) -> FeltSignals {
+    ) -> FeltSignals? {
         let now = read.fixedAt
         let dyn = read.personalityDynamics
+        guard let warmthSpan = dyn.feltWarmthEarnedSpan else { return nil }
         let currentAffect = read.affect
         let mood = read.mood
         // Workspace tint weights recent felt moments more strongly than the slow mood background.
@@ -281,12 +283,12 @@ extension CognitiveSubstrate {
         }
         let chem = request.organismProjection?.chemicalState
         // Felt warmth includes the persona baseline and uncertainty cooling; valence reads raw socialWarmth.
-        let rawWarmth = chem?.warmth ?? currentAffect.socialWarmth
         // Warmth rests below tender; social warmth earns the upper range and uncertainty cools it.
-        let feltWarmth = (dyn.feltWarmthRest
-            + rawWarmth * dyn.feltWarmthEarnedSpan
-            - currentAffect.uncertainty * dyn.feltWarmthUncertaintyCooling).clamped01()
-        // Unknown dimensions stay absent; pure substrate proxies require evidence, and agency/confidence require the organism.
+        let feltWarmth = chem.map {
+            (dyn.feltWarmthRest + $0.warmth * warmthSpan
+                - currentAffect.uncertainty * dyn.feltWarmthUncertaintyCooling).clamped01()
+        }
+        // Affect keeps its own uncertainty and task pressure. Missing body readings stay absent.
         // Diurnal damping always applies; a positive offset requires existing arousal and never wakes a silent state.
         let diurnalArousal = request.organismProjection?.diurnal?.arousalOffset ?? 0
         let arousal = (diurnalArousal < 0 || currentAffect.arousal > 0)
@@ -297,10 +299,10 @@ extension CognitiveSubstrate {
             arousal: arousal,
             warmth: feltWarmth,
             tension: max(chem?.vigilance ?? 0, currentAffect.uncertainty),
-            pressure: chem?.urgency ?? currentAffect.taskPressure,
-            fatigue: chem?.fatigue ?? read.feltProxies.fatigue,
-            curiosity: chem?.curiosity ?? read.feltProxies.curiosity,
-            clarity: chem?.coherence ?? read.feltProxies.clarity,
+            pressure: chem?.urgency,
+            fatigue: chem?.fatigue,
+            curiosity: chem?.curiosity,
+            clarity: chem?.coherence,
             agency: chem?.agency,
             confidence: chem?.confidence,
             // Absent without a configured diurnal clock, which is what makes
@@ -310,109 +312,5 @@ extension CognitiveSubstrate {
         )
     }
 
-    // MARK: - Substrate-native proxies
-
-    /// Fatigue perception thresholds belong here; personality dynamics do not change the duration of an hour.
-    static let fatigueOnsetSeconds: TimeInterval = 45 * 60
-    static let fatigueSaturationSeconds: TimeInterval = 5 * 60 * 60
-    /// Turn-to-turn spacing at which cadence stops counting as sustained work.
-    static let fatigueRapidCadenceSeconds: TimeInterval = 4 * 60
-
-    /// FATIGUE ← how long she has been at this, and how hard.
-    ///
-    /// Two honest components over timestamps the substrate already stamps on
-    /// every node: SESSION LENGTH (first live conversational node in the current
-    /// 24h stretch → now) and CADENCE (a dense run of turns is more tiring than
-    /// the same span spent idle). Returns nil with fewer than two live turns —
-    /// one message is not a session, and guessing there is how a fresh install
-    /// would start out claiming to be tired.
-    ///
-    /// This is the dim the organism's chemistry models best, so chemistry always
-    /// wins when it is present; this is the floor under it, not a replacement.
-    func substrateFatigueProxy(at now: Date) -> Double? {
-        let turns = field.peekNodes()
-            .filter { node in
-                node.turnKind == .live
-                    && (node.kind == .conversationFocus || node.kind == .correction)
-            }
-            .map(\.createdAt)
-            .filter { now.timeIntervalSince($0) >= 0 && now.timeIntervalSince($0) <= 24 * 60 * 60 }
-            .sorted()
-        guard turns.count >= 2, let first = turns.first else { return nil }
-
-        let span = now.timeIntervalSince(first)
-        let lengthTerm = Self.smoothstep(
-            Self.fatigueOnsetSeconds, Self.fatigueSaturationSeconds, span)
-
-        // Mean spacing across the stretch. Tight spacing over a long span is
-        // sustained work; the same span with three messages in it is not.
-        let meanGap = span / Double(max(1, turns.count - 1))
-        let cadenceTerm = 1 - Self.smoothstep(
-            Self.fatigueRapidCadenceSeconds, Self.fatigueRapidCadenceSeconds * 6, meanGap)
-
-        // Length leads: a fast burst in the first ten minutes is energizing, not
-        // tiring, so cadence only amplifies a stretch that is already long.
-        return (lengthTerm * (0.65 + 0.35 * cadenceTerm)).clamped01()
-    }
-
-    /// CURIOSITY ← how much of what she is holding right now is NEW.
-    ///
-    /// Novelty of the current workspace subjects against the seven-day field: a
-    /// subject the field has never activated is new territory; one it has been
-    /// circling for a week is not. `peekDecayedNodes` is the existing pure read
-    /// (a snapshot would ADVANCE decay, and a felt read must never age her
-    /// memory — the same rule `derivedMood` and `feltDaySummary` follow).
-    ///
-    /// Returns nil when no held node has an identifiable topic: no topic means
-    /// no honest read on novelty, not "incurious".
-    func substrateCuriosityProxy(from workspaceItems: [CognitiveWorkspaceItem], at now: Date) -> Double? {
-        let held = workspaceItems.prefix(6).map(\.node)
-        let heldTopics = held.compactMap { node -> String? in
-            let key = Self.feltAboutnessKey(for: node)
-            return key.hasPrefix("topic|") ? key : nil
-        }
-        guard !heldTopics.isEmpty else { return nil }
-
-        // Use the same topic identity across turns; message IDs are unique even
-        // when ordinary chat returns to something familiar.
-        let heldIds = Set(held.map(\.id))
-        var seenSubjects: [String: Double] = [:]
-        for node in field.peekDecayedNodes(at: now) where !heldIds.contains(node.id) {
-            let key = Self.feltAboutnessKey(for: node)
-            guard key.hasPrefix("topic|") else { continue }
-            seenSubjects[key] = max(seenSubjects[key] ?? 0, node.activation)
-        }
-
-        var novelty = 0.0
-        for key in heldTopics {
-            // A familiar subject that is strongly activated is the LEAST novel;
-            // a familiar-but-cold one is partway back to new.
-            let familiarity = seenSubjects[key] ?? 0
-            novelty += (1 - familiarity.clamped01())
-        }
-        return (novelty / Double(heldTopics.count)).clamped01()
-    }
-
-    /// CLARITY ← the inverse of uncertainty, docked for an unresolved question.
-    ///
-    /// `affect.uncertainty` is the substrate's own honest read on how murky
-    /// things are. `pendingCompletion` is a completion still waiting to find out
-    /// how it landed — an open loop, which is exactly what un-clear feels like.
-    /// Always available (uncertainty is always defined once affect is on), so
-    /// unlike the other two this one does not return nil.
-    func substrateClarityProxy(affect: CognitiveAffectState, at now: Date) -> Double? {
-        guard configuration.enabled else { return nil }
-        var clarity = 1 - affect.uncertainty.clamped01()
-        if let pending = pendingCompletion {
-            let age = now.timeIntervalSince(pending.recordedAt)
-            if age >= 0, age <= Self.pendingCompletionMaxAge {
-                // Fades as the window ages: a question asked ten seconds ago
-                // clouds things more than one about to expire.
-                let freshness = 1 - (age / Self.pendingCompletionMaxAge)
-                clarity -= 0.15 * freshness
-            }
-        }
-        return clarity.clamped01()
-    }
 
 }

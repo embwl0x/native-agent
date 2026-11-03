@@ -65,9 +65,9 @@ public final class InboxFacade {
         self.store = LiveNotificationInbox.live(dataRoot: dataRoot)
     }
 
-    /// Cards newest first by `created_at` (blank last, then id). A row that
-    /// is not a card is skipped, but a feed where no row reads is corruption,
-    /// never an empty inbox, and throws.
+    /// Cards newest first by checked `created_at`, then id. Any unreadable
+    /// physical line/card throws with its cause; previous items remain visible
+    /// with loadError, never published as a healthy shorter inbox.
     /// The phone's inbox snapshot shares this order.
     public func list(unreadOnly: Bool = false) async throws -> [InboxItemRecord] {
         pendingItemReads += 1
@@ -91,17 +91,8 @@ public final class InboxFacade {
 
     private nonisolated func read() async throws -> [InboxItemRecord] {
         let rows = try await store.rows()
-        var items = InboxItemRecord.latest(in: rows)
-        if !rows.isEmpty && items.isEmpty {
-            throw NSError(domain: "NativeAgent", code: -3, userInfo: [
-                NSLocalizedDescriptionKey:
-                    "getInboxItems: all \(rows.count) inbox row(s) failed to decode — "
-                    + "refusing to render a corrupt inbox as empty"
-            ])
-        }
+        var items = try InboxItemRecord.latest(in: rows)
         items.sort { lhs, rhs in
-            if lhs.created_at.isEmpty { return false }
-            if rhs.created_at.isEmpty { return true }
             if lhs.created_at != rhs.created_at { return lhs.created_at > rhs.created_at }
             return lhs.id > rhs.id
         }
@@ -207,7 +198,7 @@ public enum InboxVisibleActionsPresentation {
         var seen: Set<String> = []
         var visible: [InboxActionRecord] = []
 
-        for action in item.effectiveActions {
+        for action in InboxActionVocabulary.actions(declared: item.actions, approvalLinked: item.hasLinkedApproval) {
             let canonicalID = InboxActionVocabulary.normalizedAction(action.id
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased())

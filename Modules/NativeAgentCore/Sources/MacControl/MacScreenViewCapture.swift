@@ -1,6 +1,9 @@
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
 
 enum MacScreenCaptureWindowSelection {
     static func selectedID(
@@ -27,7 +30,7 @@ import ApplicationServices
 #endif
 #if canImport(ScreenCaptureKit) && os(macOS)
 import ScreenCaptureKit
-// Blueprint: | `MacScreenViewCapture.swift` | Window/display capture selection, `SystemMacVisualObstructionProbe` (other apps' windows over a frame, for sight and a watch's hands) and `SystemMacScreenCaptureSource`; exactly-once callback cancellation invalidates results and resumes immediately, with no cancellation-ignoring join on an unabortable ScreenCaptureKit callback |
+// Blueprint: | `MacScreenViewCapture.swift` | Window/display capture selection and immutable image provenance; bounded capture-time AX hit regions and event-time window/frame validation plus control validation where a named control was captured share the existing AX hit owners, and live input ownership correcting transparent backings; `SystemMacVisualObstructionProbe` and `SystemMacScreenCaptureSource`; exactly-once callback cancellation invalidates results and resumes immediately, with no cancellation-ignoring join on an unabortable ScreenCaptureKit callback |
 #endif
 
 // MARK: - Production capture source (ScreenCaptureKit)
@@ -73,6 +76,111 @@ struct MacVisualWindowRecord: Sendable, Equatable {
     let layer: Int
     let frame: MacAXFrame
     let alpha: Double
+}
+
+extension MacImageCapture {
+    init(windows: [MacVisualWindowRecord], capturedAt: Date = Date()) {
+        self.init(capturedAt: capturedAt, windows: windows.map { window in
+            Window(number: window.number, pid: window.ownerPID, layer: window.layer, alpha: window.alpha,
+                   x: window.frame.x, y: window.frame.y, w: window.frame.w, h: window.frame.h)
+        }, targets: nil)
+    }
+
+    /// The complete existing AX walk supplies regions; the hit-test owner
+    /// supplies the identity actually reached there. Never store field values
+    /// or raw captions in the image's transport/trace metadata.
+    public static func pointTargets(nodes: [MacAXNode], pid: Int32, deadline: Date,
+                                    source: any MacAXActSource) -> [PointTarget] {
+        // Spend at most 750 ms and a quarter of the existing read's remaining
+        // time. Desktop still owes its post-capture secret inspection.
+        let hitDeadline = min(deadline, Date().addingTimeInterval(min(0.75, max(0, deadline.timeIntervalSinceNow / 4))))
+        return MacAXLimits.$readDeadline.withValue(hitDeadline) {
+            var seen = Set<MacAXFrame>()
+            var hits: [MacAXFrame: MacAXActTarget] = [:]
+            // Name-bearing inner controls earn the bounded hit reads first.
+            let ordered = nodes.sorted {
+                let lhs = $0.attributes.title?.isEmpty == false, rhs = $1.attributes.title?.isEmpty == false
+                if lhs != rhs { return lhs }
+                return ($0.attributes.frame.map { $0.w * $0.h } ?? .infinity)
+                    < ($1.attributes.frame.map { $0.w * $0.h } ?? .infinity)
+            }
+            return ordered.compactMap { node in
+                guard let frame = node.attributes.frame, frame.w > 0, frame.h > 0,
+                      [frame.x, frame.y, frame.w, frame.h].allSatisfy(\.isFinite) else { return nil }
+                let x = frame.x + frame.w / 2, y = frame.y + frame.h / 2
+                if seen.insert(frame).inserted, node.attributes.title?.isEmpty == false
+                    && Date() < hitDeadline && !Task.isCancelled
+                    && SystemMacVisualObstructionProbe.hitPID(x: x, y: y) == pid {
+                    hits[frame] = source.elementAtPosition(x: x, y: y, pid: pid)
+                }
+                let hit = hits[frame]
+                // A centre that hits a child cannot vouch for its entire parent.
+                let verified = hit?.frame == frame && hit?.role == node.attributes.role
+                    && hit?.title == node.attributes.title ? hit : nil
+                return PointTarget(pid: pid, role: verified?.role,
+                    labelDigest: labelDigest(verified?.title),
+                    x: frame.x, y: frame.y, w: frame.w, h: frame.h, path: node.path)
+            }
+        }
+    }
+
+    private static func labelDigest(_ label: String?) -> String? {
+        #if canImport(CryptoKit)
+        guard let label, !label.isEmpty else { return nil }
+        return SHA256.hash(data: Data(label.utf8)).map { String(format: "%02x", $0) }.joined()
+        #else
+        return nil
+        #endif
+    }
+
+    /// Window identity must still agree at the requested point; where a named
+    /// control was captured there, its role/label/frame must agree too.
+    func refusal(at point: MacPointerPosition, now: Date) -> (code: String, reason: String)? {
+        let age = now.timeIntervalSince(capturedAt)
+        guard age >= 0, age <= MacLookFrameStore.ttlSeconds, !windows.isEmpty else {
+            return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue, "The image has no current capture evidence; look again with pixels:true.")
+        }
+        let captured = windows.map { window in
+            MacVisualWindowRecord(number: window.number, ownerPID: window.pid, ownerName: "",
+                                  layer: window.layer, frame: window.frame, alpha: window.alpha)
+        }
+        guard let expected = SystemMacVisualObstructionProbe.topmost(in: captured, x: point.x, y: point.y),
+              let hitPID = SystemMacVisualObstructionProbe.hitPID(x: point.x, y: point.y) else {
+            return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue, "The image's window cannot be established at that point; look again with pixels:true.")
+        }
+        let live = SystemMacVisualObstructionProbe.windows()
+        // AX's actual input owner corrects input-transparent window-server
+        // backings, exactly as the shared obstruction owner does.
+        guard let current = SystemMacVisualObstructionProbe.topmost(in: live.filter { $0.ownerPID == hitPID }, x: point.x, y: point.y) else {
+            return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue, "The current input window cannot be established; look again with pixels:true.")
+        }
+        guard current.number == expected.number, current.ownerPID == expected.ownerPID,
+              current.frame == expected.frame else {
+            return ("window_drifted", "The captured window moved, resized, was replaced or is covered at that point; look again with pixels:true.")
+        }
+        // Resolve only within the captured top window's owner. A masked front
+        // layer cannot borrow a rear layer's control. Never inherit a broad
+        // ancestor's identity when its smaller inner region lacks evidence.
+        let regions = (targets ?? []).filter {
+            $0.pid == expected.ownerPID && $0.windowNumber == expected.number && point.isInside($0.frame)
+        }
+        // A canvas, game or picture has no named control there: the window's
+        // identity checked above is the evidence, as pixel pointing needs.
+        // Absence of a control is not a refusal (10-31 review).
+        guard let area = regions.map({ $0.w * $0.h }).min() else { return nil }
+        let narrowest = regions.filter { $0.w * $0.h == area }
+        guard let target = narrowest.first, let role = target.role, let label = target.labelDigest else { return nil }
+        guard narrowest.allSatisfy({ $0 == target }), regions.allSatisfy({ target.path.starts(with: $0.path) }) else {
+            return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue, "The captured control identity is ambiguous at that point; look again with pixels:true.")
+        }
+        guard let hit = defaultMacAXActSource().elementAtPosition(x: point.x, y: point.y, pid: hitPID) else {
+            return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue, "The control under the image point cannot be read; look again with pixels:true.")
+        }
+        guard hit.role == role, Self.labelDigest(hit.title) == label, hit.frame == target.frame else {
+            return (MacLookFrameStore.ResolveFailure.staleFrame.rawValue, "The control under the image point changed; look again with pixels:true.")
+        }
+        return nil
+    }
 }
 
 public struct MacVisualObstruction: Sendable, Equatable {
@@ -215,19 +323,12 @@ func macScreenCaptureWait<Value>(
 ) async throws -> Value {
     try Task.checkCancellation()
     let request = ContinuationOnce<Result<MacScreenCaptureValue<Value>, Error>>()
-    let result = await withTaskCancellationHandler {
-        await withCheckedContinuation { continuation in
-            if request.install(continuation) {
-                issue { value, error in
-                    if let error { request.resume(.failure(error)) }
-                    else if let value { request.resume(.success(MacScreenCaptureValue(value: value))) }
-                    else { request.resume(.failure(CocoaError(.coderValueNotFound))) }
-                }
-            }
-        }
-    } onCancel: {
-        request.resume(.failure(CancellationError()))
+    issue { value, error in
+        if let error { request.resume(.failure(error)) }
+        else if let value { request.resume(.success(MacScreenCaptureValue(value: value))) }
+        else { request.resume(.failure(CocoaError(.coderValueNotFound))) }
     }
+    let result = await request.wait(cancellingWith: .failure(TaskWaitDeadline.cancellationError))
     try Task.checkCancellation()
     return try result.get().value
 }
@@ -248,6 +349,16 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
 
     private static func windowImage(_ window: SCWindow, maxPixelWidth: Int? = nil) async throws -> MacScreenShot {
         try Task.checkCancellation()
+        let capture = MacImageCapture(windows: SystemMacVisualObstructionProbe.windows().filter {
+            $0.number == Int(window.windowID)
+        })
+        guard let capturedWindow = capture.windows.first,
+              capturedWindow.pid == window.owningApplication?.processID,
+              MacAXWindowIdentity.rectsMatch(capturedWindow.frame,
+                  MacAXFrame(x: window.frame.minX, y: window.frame.minY,
+                             w: window.frame.width, h: window.frame.height)) else {
+            throw MacScreenCaptureFailure.operationFailed("window capture", "The selected window changed before capture; read it again.")
+        }
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let configuration = SCStreamConfiguration()
         let rect = filter.contentRect
@@ -265,7 +376,7 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         try Task.checkCancellation()
         return MacScreenShot(bounds: MacAXFrame(
             x: window.frame.minX, y: window.frame.minY, w: window.frame.width, h: window.frame.height),
-            pixelWidth: image.width, pixelHeight: image.height, cgImage: image)
+            pixelWidth: image.width, pixelHeight: image.height, cgImage: image, capture: capture)
     }
 
     public func capture(window requested: MacAXWindowIdentity) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
@@ -381,6 +492,7 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         configuration.showsCursor = false
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
 
+        let capture = MacImageCapture(windows: SystemMacVisualObstructionProbe.windows())
         let image: CGImage
         do {
             image = try await macScreenCaptureWait { receive in
@@ -401,7 +513,8 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
             ),
             pixelWidth: image.width,
             pixelHeight: image.height,
-            cgImage: image
+            cgImage: image,
+            capture: capture
         ))
     }
 }

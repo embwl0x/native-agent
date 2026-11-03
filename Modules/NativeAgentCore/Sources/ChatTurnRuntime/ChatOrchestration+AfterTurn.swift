@@ -1,4 +1,5 @@
 import Foundation
+import AgentWorkspace
 import NativeAgentShared
 import NativeAgentCore
 import TurnTrace
@@ -6,7 +7,7 @@ import CognitiveSubstrate
 import Senses
 import StandingBots
 import MemoryV2
-// Blueprint: | `ChatOrchestration+AfterTurn.swift` | `SwiftNativeTurnEngine`: owed memory recording and serialized retained interpretation; predecessor tasks settle before current-handle cleanup |
+// Blueprint: | `ChatOrchestration+AfterTurn.swift` | `SwiftNativeTurnEngine`: owed memory recording and serialized retained interpretation; claimed wake cares join the settled reply's origin; predecessor tasks settle before current-handle cleanup |
 
 extension SwiftNativeTurnEngine {
     // Settlement awaits the owed recording; only interpretation rides the
@@ -20,6 +21,7 @@ extension SwiftNativeTurnEngine {
         let sessionId: String?
         let surface: String
         let origin: AfterTurnOrigin?
+        let repliedAt: Date
         let standingBot: BotDefinition?
         let senseReads: SenseTurnReads?
         /// The captured parent trace is rebound for recording and interpretation.
@@ -39,10 +41,13 @@ extension SwiftNativeTurnEngine {
     ) -> AfterReply {
         var origin = AfterTurnSource.origin
         origin?.took = took
+        if sessionId == ResidentWake.session, !AfterTurnSource.careWakes.isEmpty {
+            origin?.careWakes = AfterTurnSource.careWakes
+        }
         let pending = PendingMemoryPromotion(
             userMessage: userMessage, assistantMessage: assistantMessage,
             toolDispatches: toolDispatches, sessionId: sessionId, surface: surface,
-            origin: origin, standingBot: StandingBotContinuity.currentBot,
+            origin: origin, repliedAt: Date(), standingBot: StandingBotContinuity.currentBot,
             senseReads: SenseTurnReads.current, turnId: TurnTraceContext.turnId, bus: TurnTraceContext.bus)
         let held = held ?? afterReply {}
         held.beforeStart { await self.recordMemoryPromotion(pending) }
@@ -64,7 +69,7 @@ extension SwiftNativeTurnEngine {
                 sessionId: pending.sessionId ?? "swift-turn-engine",
                 surface: pending.surface,
                 standingAgentName: pending.standingBot?.name,
-                turnId: pending.turnId
+                turnId: pending.turnId, repliedAt: pending.repliedAt
             )
             let previous = deferredMemoryPromotion
             let id = UUID()

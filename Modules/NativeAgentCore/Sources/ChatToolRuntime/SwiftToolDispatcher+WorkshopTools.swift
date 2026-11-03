@@ -31,14 +31,14 @@ extension SwiftToolDispatcher {
                 connectorActionsProvider: { [self] in
                     // The app's own tools stay out: Workshop executes on its
                     // own dispatcher, which does not carry them.
-                    let schemas = ((try? await listAvailableToolSchemas()) ?? [])
+                    let schemas = try await listAvailableToolSchemas()
                         .filter { !contributedToolNames.contains($0.name) }
-                    return schemas.prefix(200).map { schema -> JSONValue in
+                    return try schemas.prefix(200).map { schema -> JSONValue in
                         var entry: [String: JSONValue] = [
                             "id": .string(schema.name),
                             "description": .string(schema.description),
                         ]
-                        entry["parameters"] = try? JSONValue.parse(schema.parametersJSON)
+                        entry["parameters"] = try schema.checkedParameters()
                         return .object(entry)
                     }
                 },
@@ -73,8 +73,6 @@ extension SwiftToolDispatcher {
         let title = (contextTitle?.isEmpty == false ? contextTitle! : nil)
             ?? String(text.prefix(160))
 
-        let requestedProcedure = optionalString(input, "procedure")?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
         let requestedOperation = optionalString(input, "operation")?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let expectedOutputs: [String]
@@ -90,26 +88,11 @@ extension SwiftToolDispatcher {
         default:
             throw AutonomyGateError.toolDenied(reason: "workshop.submit: expected_outputs must be an array of strings")
         }
-        if !expectedOutputs.isEmpty, requestedProcedure?.isEmpty == false || requestedOperation?.isEmpty == false {
-            throw AutonomyGateError.toolDenied(reason: "workshop.submit: expected_outputs applies to ordinary tasks; omit operation and procedure for synthesis")
+        if !expectedOutputs.isEmpty, requestedOperation?.isEmpty == false {
+            throw AutonomyGateError.toolDenied(reason: "workshop.submit: expected_outputs applies to ordinary tasks; omit operation for synthesis")
         }
-        let redundantExactPair = requestedProcedure == "local_file_copy_v1"
-            && requestedOperation == "copy_workspace_file"
-        if requestedProcedure?.isEmpty == false,
-           requestedOperation?.isEmpty == false,
-           !redundantExactPair {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("operation and procedure identify conflicting routes"),
-            ])
-        }
-        if let requestedProcedure, !requestedProcedure.isEmpty,
-           requestedProcedure != "local_file_copy_v1" {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("unsupported Workshop procedure '\(requestedProcedure)'"),
-                "supported_procedures": .array([.string("local_file_copy_v1")]),
-            ])
+        if input["procedure"] != nil && input["procedure"] != .null {
+            throw ToolFailureError("Choose the exact copy with operation:copy_workspace_file.", argumentPath: "$.procedure", effects: .none)
         }
         if let requestedOperation, !requestedOperation.isEmpty,
            requestedOperation != "copy_workspace_file" {
@@ -120,11 +103,8 @@ extension SwiftToolDispatcher {
             ])
         }
 
-        // The equivalent procedure/operation pair selects the stable operation; conflicting pairs fail admission.
-        let explicitProcedure = requestedProcedure == "local_file_copy_v1"
-            && !redundantExactPair
         let exactTypedOperation = requestedOperation == "copy_workspace_file"
-        if explicitProcedure || exactTypedOperation {
+        if exactTypedOperation {
             let source = optionalString(input, "source")?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let destination = optionalString(input, "destination")?
@@ -133,117 +113,93 @@ extension SwiftToolDispatcher {
                 return .object([
                     "status": .string("failed"),
                     "reason": .string(
-                        "procedure local_file_copy_v1 requires non-empty source and destination"
+                        "operation copy_workspace_file requires non-empty source and destination"
                     ),
                 ])
             }
 
             let store = ProcedureArtifactStore(dataRoot: dataRoot)
             do {
-                let artifact: DeclarativeProcedureArtifact?
-                if exactTypedOperation {
-                    artifact = try await store.loadActiveExactProcedure(
-                        procedureID: WorkshopCompiledLocalFileCopyPlanner.procedureID,
-                        implementationIdentity:
-                            WorkshopCompiledLocalFileCopyPlanner.implementationIdentity
-                    ).artifact
-                } else {
-                    let artifacts = try await store.loadInstalledArtifacts(
-                        domain: "workshop_execution"
-                    ).filter(WorkshopCompiledLocalFileCopyPlanner.isEligibleArtifact)
-                    artifact = artifacts.count == 1 ? artifacts.first : nil
-                    guard artifacts.count <= 1 else {
-                        return .object(["status": .string("failed"), "reason": .string("approved_artifact_ambiguous"),
-                            "procedure_used": .bool(false), "ordinary_fallback_submitted": .bool(false)])
-                    }
+                let artifact = try await store.loadActiveExactProcedure(
+                    procedureID: WorkshopCompiledLocalFileCopyPlanner.procedureID,
+                    implementationIdentity: WorkshopCompiledLocalFileCopyPlanner.implementationIdentity
+                ).artifact
+                let invocationKey = TurnTraceContext.turnId
+                    ?? CausalTransitionEvidence.opaqueIdentity([
+                        "direct-workshop-procedure",
+                        input["__session_id"]?.stringValue ?? "unbound",
+                        source,
+                        destination,
+                    ].joined(separator: "|"))
+                let invocation: WorkshopCompiledLocalFileCopyInvocation
+                do {
+                    invocation = try WorkshopCompiledLocalFileCopyInvocation(
+                        artifact: artifact,
+                        dataRoot: dataRoot,
+                        sourceRelativePath: Self.procedureRelativePath(source),
+                        destinationRelativePath: Self.procedureRelativePath(destination),
+                        invocationKey: invocationKey,
+                        deskHandle: optionalString(input, "desk_handle"),
+                        store: store
+                    )
+                } catch {
+                    return .object([
+                        "status": .string("failed"), "reason": .string("compiled_preflight_refused"),
+                        "error": .string(error.localizedDescription),
+                        "procedure": .string("local_file_copy_v1"), "procedure_used": .bool(false),
+                        "ordinary_fallback_submitted": .bool(false),
+                    ])
                 }
-                if let artifact {
-                    let invocationKey = TurnTraceContext.turnId
-                        ?? CausalTransitionEvidence.opaqueIdentity([
-                            "direct-workshop-procedure",
-                            input["__session_id"]?.stringValue ?? "unbound",
-                            source,
-                            destination,
-                        ].joined(separator: "|"))
-                    let invocation: WorkshopCompiledLocalFileCopyInvocation
-                    do {
-                        invocation = try WorkshopCompiledLocalFileCopyInvocation(
-                            artifact: artifact,
-                            dataRoot: dataRoot,
-                            sourceRelativePath: Self.procedureRelativePath(source),
-                            destinationRelativePath: Self.procedureRelativePath(destination),
-                            invocationKey: invocationKey,
-                            deskHandle: optionalString(input, "desk_handle"),
-                            store: store
-                        )
-                    } catch {
-                        return .object([
-                            "status": .string("failed"), "reason": .string("compiled_preflight_refused"),
-                            "error": .string(error.localizedDescription),
-                            "procedure": .string("local_file_copy_v1"), "procedure_used": .bool(false),
-                            "ordinary_fallback_submitted": .bool(false),
-                        ])
+                do {
+                    let policy: WorkshopCompiledLocalFileCopyInvocation.PolicyAllowed = {
+                        [dataRoot] in
+                        await Self.compiledWorkshopPolicyAllows(dataRoot: dataRoot)
                     }
-                    do {
-                        let policy: WorkshopCompiledLocalFileCopyInvocation.PolicyAllowed = {
-                            [dataRoot] in
-                            await Self.compiledWorkshopPolicyAllows(dataRoot: dataRoot)
+                    let dispatch: WorkshopCompiledLocalFileCopyInvocation.ToolDispatch = {
+                        [self] tool, arguments in
+                        switch tool {
+                        case "read_file":
+                            return try await impl_read_file(input: arguments)
+                        case "write_file":
+                            return try await impl_trusted_file_mutation(tool: "write_file", input: arguments)
+                        default:
+                            throw WorkshopCompiledProcedureRuntimeError.unsupportedTool
                         }
-                        let dispatch: WorkshopCompiledLocalFileCopyInvocation.ToolDispatch = {
-                            [self] tool, arguments in
-                            switch tool {
-                            case "read_file":
-                                return try await impl_read_file(input: arguments)
-                            case "write_file":
-                                return try await impl_trusted_file_mutation(tool: "write_file", input: arguments)
-                            default:
-                                throw WorkshopCompiledProcedureRuntimeError.unsupportedTool
-                            }
-                        }
-                        let outcome = if exactTypedOperation {
-                            try await invocation.invokeAutomaticExact(
-                                policyAllowed: policy,
-                                toolDispatch: dispatch
-                            )
-                        } else {
-                            try await invocation.invokeManual(
-                                policyAllowed: policy,
-                                toolDispatch: dispatch
-                            )
-                        }
-                        return Self.compiledWorkshopEnvelope(outcome)
-                    } catch {
-                        // Invocation may already own a canonical effect. Never
-                        // fall through to the ordinary planner after admission
-                        // and risk submitting the same work twice.
-                        var failure: [String: JSONValue] = [
-                            "status": .string("failed"),
-                            "reason": .string(error.localizedDescription),
-                            "procedure": .string("local_file_copy_v1"),
-                            "procedure_used": .bool(true),
-                            "ordinary_fallback_submitted": .bool(false),
-                        ]
-                        // Preserve the canonical correlation only if Workshop
-                        // actually admitted this deterministic identity. A
-                        // pre-admission policy refusal must not manufacture a
-                        // motor action, while an admitted failure must remain
-                        // visible to resident cognition and Outcome Tissue.
-                        do {
-                            if let record = try await workshopRunner()
-                                .getWorkshopExecution(invocation.executionID) {
-                                failure["id"] = .string(record.id)
-                                failure["execution_status"] = .string(record.status)
-                                failure["verification_status"] = record.verification
-                                    .map { .string($0.status.rawValue) } ?? .null
-                            }
-                        } catch {
-                            failure["execution_read_error"] = .string(error.localizedDescription)
-                        }
-                        return .object(failure)
                     }
+                    let outcome = try await invocation.invokeAutomaticExact(
+                        policyAllowed: policy,
+                        toolDispatch: dispatch
+                    )
+                    return Self.compiledWorkshopEnvelope(outcome)
+                } catch {
+                    // Invocation may already own a canonical effect. Never
+                    // fall through to the ordinary planner after admission
+                    // and risk submitting the same work twice.
+                    var failure: [String: JSONValue] = [
+                        "status": .string("failed"),
+                        "reason": .string(error.localizedDescription),
+                        "procedure": .string("local_file_copy_v1"),
+                        "procedure_used": .bool(true),
+                        "ordinary_fallback_submitted": .bool(false),
+                    ]
+                    // Preserve the canonical correlation only if Workshop
+                    // actually admitted this deterministic identity. A
+                    // pre-admission policy refusal must not manufacture a
+                    // motor action, while an admitted failure must remain
+                    // visible to resident cognition and Outcome Tissue.
+                    do {
+                        if let record = try await workshopRunner()
+                            .getWorkshopExecution(invocation.executionID) {
+                            failure["id"] = .string(record.id)
+                            failure["execution_status"] = .string(record.status)
+                            failure["verification_status"] = record.verification
+                                .map { .string($0.status.rawValue) } ?? .null
+                        }
+                    } catch {
+                        failure["execution_read_error"] = .string(error.localizedDescription)
+                    }
+                    return .object(failure)
                 }
-                return .object(["status": .string("failed"), "reason": .string("approved_artifact_unavailable"),
-                    "procedure_used": .bool(false), "ordinary_fallback_submitted": .bool(false)])
             } catch {
                 return .object([
                     "status": .string("failed"),
@@ -406,9 +362,7 @@ extension SwiftToolDispatcher {
                     "reason": .string("no Workshop execution with id \(id)"),
                 ])
             }
-            // Step-receipts summary from the timeline (best-effort; a read
-            // failure yields an empty summary, never fabricates).
-            let timeline = (try? await runner.readTimeline(id)) ?? []
+            let timeline = try await runner.readTimeline(id)
             let receipts = Self.workshopReceiptsSummary(timeline)
             var detail: [String: JSONValue]
             if case .object(let obj) = wire { detail = obj } else { detail = [:] }

@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentConversationExchange.swift` | `AgentConversationExchange`: `started`, `absorb`, `validate`; partial text is retained separately from a finished reply; each exchange retains its receipt's shelf result UUID across subsequent sends |
+// Blueprint: | `AgentConversationExchange.swift` | `AgentConversationExchange`: `started`, `absorb`, `validate`; protocol message strings are bound separately from operation UUIDs; partial text is retained separately from a finished reply; each exchange retains its receipt's shelf result UUID across subsequent sends |
 
 extension AgentConversationExchange {
     package static let textLimit = 8 * 1024
@@ -80,6 +80,7 @@ extension AgentConversationExchange {
         guard history.count <= countLimit, Set(history.map(\.id)).count == history.count,
               history.allSatisfy({ entry in
                   UUID(uuidString: entry.id) != nil
+                    && entry.messageID.map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } != false
                     && [entry.sentAt, entry.firstActivityAt, entry.settledAt].compactMap { $0 }.allSatisfy {
                         $0.timeIntervalSince1970.isFinite && $0 >= Date.distantPast && $0 <= Date.distantFuture
                     }
@@ -98,8 +99,8 @@ extension AgentConversationExchange {
         let encoder = JSONEncoder()
         var sizes = try result.map { try encoder.encode($0).count }
         var size = 2 + sizes.reduce(0, +) + max(0, sizes.count - 1)
-        // Oldest first, never a held message (or one being handed over): it is
-        // the only copy of what her contact has not yet taken (`takeHeld`).
+        // Oldest first, never a held receipt (or one being handed over): its
+        // delivery identity is still owed. Full payloads live in ContactThread.
         while result.count > 1, result.count > countLimit || size > byteLimit {
             guard let oldest = result.indices.dropLast().first(where: { !["held", "delivering"].contains(result[$0].status) }) else {
                 throw ToolFailureError("Conversation capacity is held by queued messages awaiting the contact's check-in.", effects: .unknown,

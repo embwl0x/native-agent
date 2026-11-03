@@ -1,10 +1,10 @@
 import Foundation
 import WebKit
-// Blueprint: | `BrowserActionRoutes+DOM.swift` | DOM scripts, mutation/readiness-driven reads with one 3750ms deadline and operation-owned cancellation, result decoding and browser errors |
+// Blueprint: | `BrowserActionRoutes+DOM.swift` | DOM mutation/readiness reads with one 3750ms script deadline and event cleanup; the visible adapter owns native interruption and bounds; result decoding and browser errors preserve unknown outcomes |
 
 extension BrowserActionRoutes {
     /// Evaluated with callAsyncJavaScript in the app's isolated content world.
-    /// One operation owns the observer and the old 250+500+1000+2000ms budget.
+    /// One observer owns readiness, event cleanup and the 3750ms script deadline.
     private static func domReadScript(read: String, ready: String) -> String {
         """
         return await new Promise((resolve, reject) => {
@@ -19,7 +19,6 @@ extension BrowserActionRoutes {
             document.removeEventListener('readystatechange', check);
             window.removeEventListener('pageshow', check);
             window.removeEventListener('pagehide', end);
-            if (globalThis.__nativeAgentDOMRead?.id === operationID) delete globalThis.__nativeAgentDOMRead;
             if (error) reject(error); else resolve(value);
           };
           const check = () => {
@@ -33,7 +32,6 @@ extension BrowserActionRoutes {
           document.addEventListener('readystatechange', check);
           window.addEventListener('pageshow', check);
           window.addEventListener('pagehide', end);
-          globalThis.__nativeAgentDOMRead = {id: operationID, cancel: () => finish(undefined)};
           timer = setTimeout(end, 3750);
           check();
         });
@@ -148,6 +146,7 @@ public enum BrowserError: LocalizedError {
     case busy
     case timeout
     case outcomeUnknown
+    case contentProcessTerminated
     /// C7 fix (N8): returned when the current page's URL scheme is not http/https.
     case unsafeScheme(String)
 
@@ -158,15 +157,16 @@ public enum BrowserError: LocalizedError {
         case .badRequest(let msg): return "Bad request: \(msg)"
         case .fillFailed(let detail): return "Browser fill failed: \(detail)"
         case .busy: return "Browser is busy with another navigation — try again shortly"
-        case .timeout: return "Browser navigation timed out; its outcome is unknown."
-        case .outcomeUnknown: return "Browser operation was interrupted after dispatch; its outcome is unknown."
+        case .timeout: return "Browser operation exceeded its native deadline; its outcome is unknown. The page was retired; open it explicitly before further use."
+        case .outcomeUnknown: return "Browser operation was interrupted after dispatch; its outcome is unknown. The page was retired; open it explicitly before further use."
+        case .contentProcessTerminated: return "Browser content process terminated; its outcome is unknown. The page was retired; open it explicitly before further use."
         case .unsafeScheme(let scheme): return "Current page scheme '\(scheme)' is not allowed; only http/https are permitted"
         }
     }
 
     var hasUnknownOutcome: Bool {
         switch self {
-        case .timeout, .outcomeUnknown: return true
+        case .timeout, .outcomeUnknown, .contentProcessTerminated: return true
         default: return false
         }
     }

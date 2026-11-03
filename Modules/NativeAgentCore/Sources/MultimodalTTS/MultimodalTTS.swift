@@ -66,9 +66,9 @@ public final class SwiftOpenAITTSClient: Sendable {
         self.dataRoot = PersistenceCore.defaultDataRoot()
     }
 
-    /// Read the flag through canonical saved authority; damaged policies deny.
-    private func ttsOpenAIAllowed() -> Bool {
-        SavedTrustPolicyAuthority.flag(
+    /// Missing flags use the shipped default; damaged policies throw their cause.
+    private func ttsOpenAIAllowed() throws -> Bool {
+        try SavedTrustPolicyAuthority.flag(
             block: "multimodalPolicy", key: "tts_openai", default: false, dataRoot: dataRoot
         )
     }
@@ -76,12 +76,12 @@ public final class SwiftOpenAITTSClient: Sendable {
     /// The audio, and how many scalars past the provider's per-request cap it does not read.
     public func synthesize(text: String, voice: String, format: String) async throws -> (audio: Data, unread: Int) {
         // Deny before input validation, credential resolution or network work.
-        guard ttsOpenAIAllowed() else { throw MultimodalTTSError.trustDenied }
+        guard try ttsOpenAIAllowed() else { throw MultimodalTTSError.trustDenied }
 
         if text.isEmpty { throw MultimodalTTSError.emptyText }
 
         // Resolve the platform key through the shared owner at this data root.
-        guard let key = LLMCredentialResolver.resolveAPIKey(
+        guard let key = try LLMCredentialResolver.checkedAPIKey(
                 providerConfigFile: "openai.json",
                 dataRoot: dataRoot),
               !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {

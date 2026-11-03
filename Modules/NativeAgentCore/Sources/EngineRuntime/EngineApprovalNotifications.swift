@@ -26,7 +26,6 @@ public final class ApprovalNotificationDelivery {
     public func refresh(
         router: AttentionRouter,
         telegram: () -> TelegramApprovalFiler?,
-        post: (_ title: String, _ body: String, _ userInfo: [String: String]) async -> NativeAgentNotificationPostResult,
         writeSnapshots: () -> Void
     ) async {
         let approvals = engine.approvals
@@ -46,6 +45,11 @@ public final class ApprovalNotificationDelivery {
                         "title": .string(NativeAppSecretRedactor.redactText(row.title)),
                         "summary": .string(NativeAppSecretRedactor.redactText(row.reason)),
                         "detail": .string(NativeAppSecretRedactor.redactText(row.payloadPreview)),
+                        "held_delivery": .array(seen != nil && !startupPendingIDs.contains(row.id) && ApprovalChatCards.canResolve(row) ? [.string("phone"), .string("mac")] : [.string("phone")]),
+                        "held_event_id": .string("approval:" + row.id), "held_reason": .string("approval:" + row.id),
+                        "held_importance": .string(AttentionImportance.ownerWaiting.rawValue),
+                        "held_user_info": .object(["screen": .string("approvals"), "source": .string("approval"),
+                            "itemId": .string(row.id), NativeAgentNotificationActions.approvalKey: .string(row.id)]),
                         "actions": .array(ApprovalChatCards.canResolve(row) ? [
                             .object(["id": .string("approve"), "label": .string("Approve")]),
                             .object(["id": .string("reject"), "label": .string("Deny")]),
@@ -59,7 +63,8 @@ public final class ApprovalNotificationDelivery {
             let retired: Int
             do {
                 let resolvedIDs = try await inbox.rows().compactMap { value -> String? in
-                    guard let item = InboxItemRecord(row: value), item.source == "approval",
+                    let item = try InboxItemRecord(row: value)
+                    guard item.source == "approval",
                           !pendingIDs.contains(item.id) else { return nil }
                     return item.id
                 }
@@ -93,9 +98,6 @@ public final class ApprovalNotificationDelivery {
             guard !Task.isCancelled else { return }
             let pending = rows.filter { $0.status == "pending" && !previous.contains($0.id) }
             guard !Task.isCancelled else { return }
-            // Share the existing quiet-hours policy. Suppressed requests
-            // remain visible in Approvals; no timer replays them later.
-            let held = AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: approvals.dataRoot)
             func filedIn(_ row: ApprovalRecord) -> String? {
                 if case .object(let payload) = row.payload, case .object(let origin)? = payload["origin"],
                    case .string(let session)? = origin["sessionId"] { return session }
@@ -110,9 +112,6 @@ public final class ApprovalNotificationDelivery {
                 cardRetries[row.id] = outcome == .failed && tries < 3 ? tries + 1 : nil
             }
             for row in pending {
-                let title = NativeAppSecretRedactor.redactText(row.title)
-                // The one human line; the raw payload is for Details, not a push.
-                let body = NativeAppSecretRedactor.redactText(row.reason)
                 // Filed by her resident wake in his quiet hours: the push
                 // waits in the inbox for them to end (releaseHeld).
                 let wakeHeld = AttentionRouter.holdsResidentWake(session: filedIn(row) ?? "", dataRoot: approvals.dataRoot)
@@ -122,43 +121,25 @@ public final class ApprovalNotificationDelivery {
                         telegram: telegram(), quiet: wakeHeld) == .failed {
                     cardRetries[row.id] = 1
                 }
-                guard !held, ApprovalChatCards.canResolve(row) else { continue }
-                let posted = await post(
-                    title,
-                    body,
-                    [NativeAgentNotificationActions.approvalKey: row.id]
-                )
-                if !posted.posted {
-                    nativeLog("[approval-notification] banner failed: %@", posted.error ?? posted.delivery)
-                }
             }
             // Re-read after card awaits. Attention's ledger suppresses
             // accepted sends; failures retry on owner or recovery events.
-            let notificationRows = try await inbox.rows()
             for row in try await approvals.list() where row.status == "pending" && !row.isAgentsOwnDecision {
                 guard !Task.isCancelled else { return }
                 let eventID = "approval:\(row.id)"
-                let alreadyHeld = notificationRows.contains {
-                    guard case .object(let card) = $0, case .array(let ways)? = card["held_delivery"] else { return false }
-                    return card["approval_id"] == .string(row.id) && ways.contains(.string("phone"))
-                }
-                if alreadyHeld { continue }
                 let title = NativeAppSecretRedactor.redactText(row.title)
                 let body = NativeAppSecretRedactor.redactText(row.reason)
-                if AttentionRouter.holdsResidentWake(session: filedIn(row) ?? "", dataRoot: approvals.dataRoot) {
-                    try await LiveNotificationInbox.hold(dataRoot: approvals.dataRoot, title: title, body: body, ways: ["phone"], approvalID: row.id)
-                } else {
-                    do {
-                        try await router.route(
-                            eventId: eventID, importance: .ownerWaiting, title: title, body: body,
-                            reason: eventID,
-                            userInfo: ["screen": "approvals", "source": "approval", NativeAgentNotificationActions.approvalKey: row.id]
-                        )
-                    } catch {
-                        nativeLog("[approval-notification] push failed: %@", error.localizedDescription)
-                    }
-                }
+                do {
+                    try await router.route(
+                        eventId: eventID, importance: .ownerWaiting, title: title, body: body,
+                        reason: eventID,
+                        userInfo: ["screen": "approvals", "source": "approval", "itemId": row.id,
+                            NativeAgentNotificationActions.approvalKey: row.id],
+                        macBanner: seen != nil && !startupPendingIDs.contains(row.id) && ApprovalChatCards.canResolve(row)
+                    )
+                } catch { nativeLog("[approval-notification] delivery remains owed: %@", error.localizedDescription) }
             }
+
             // Push first, snapshot after (User 09-28: everything instant): the
             // phone's own synced-approval notice then finds the push already
             // delivered under the same approvalId and stays quiet.

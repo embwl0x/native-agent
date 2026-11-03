@@ -169,6 +169,7 @@ extension MemoryStorage {
     private static func projectionEligible(_ stored: StoredMemory) -> Bool {
         stored.status == "active" && MemoryLifecycle.isRecallEligible(stored.lifecycle)
             && !metadataFlag(stored.metadata, pendingAdmissionKey)
+            && MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: stored.validTo, at: Date())
     }
 
     func pokeProjectionHooks(_ stored: StoredMemory) async {

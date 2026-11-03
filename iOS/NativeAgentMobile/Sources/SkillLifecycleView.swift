@@ -1,122 +1,38 @@
 // SkillLifecycleView.swift — iOS skill catalog (iCloud-only).
 // Data: iCloudSyncEngine reads `snapshots/skills_snapshot.json` (Mac publishes).
-// Lifecycle changes remain on the Mac, where the canonical registry and OAuth
-// owners can verify their outcomes.
+// Built-in persona guidance is read, never run. Executable parts live on Tools.
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `SkillLifecycleView.swift` | Shared typed skill catalog renderer, local filters and ID-resolved details; SkillsToolsView owns catalog refresh/loading |
+// Blueprint: | `SkillLifecycleView.swift` | Built-in guidance snapshot renderer and ID-resolved details; empty guidance directs to abilities on Tools; SkillsToolsView owns catalog refresh/loading |
 
 // MARK: - Snapshot model
 
-/// Decoded from the skills snapshot — one entry per skill in the manifest.
+/// Current built-in guidance metadata, published by InstalledSkillInventory.
 struct SkillManifestEntry: Decodable, Identifiable, Hashable, Sendable {
-    var id: String
-    var name: String
-    var description: String?
-    var source: String?         // "persona" | "learned" | "data" | "registry"
-    var kind: String?
-    var triggers: [String]?
-    var use_count: Int?
-    var state: String?          // Mac lifecycle state; presentation also accepts legacy names.
-    var version: String?
+    let id: String
+    let name: String
+    let description: String
+    let source: String
+    let bodyRevision: String?
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, description, source, kind, triggers, use_count, useCount, state, status, version
+        case id, name, description, source, bodyRevision
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
         name = try c.decode(String.self, forKey: .name)
-        id = (try? c.decode(String.self, forKey: .id)) ?? name
-        description = try? c.decode(String.self, forKey: .description)
-        source = try? c.decode(String.self, forKey: .source)
-        kind = try? c.decode(String.self, forKey: .kind)
-        triggers = try? c.decode([String].self, forKey: .triggers)
-        use_count = (try? c.decode(Int.self, forKey: .use_count)) ?? (try? c.decode(Int.self, forKey: .useCount))
-        let rawState = (try? c.decode(String.self, forKey: .state)) ?? (try? c.decode(String.self, forKey: .status))
-        state = rawState
-        version = try? c.decode(String.self, forKey: .version)
-    }
-}
-
-// MARK: - Filter enum
-
-private enum SkillFilter: String, CaseIterable, Identifiable {
-    case all      = "All"
-    case draft    = "Draft"
-    case on       = "On"
-    case archived = "Archived"
-    case off      = "Off"
-    case quarantined = "Quarantined"
-    case unknown = "Unknown"
-    var id: String { rawValue }
-}
-
-enum SkillLifecyclePresentation {
-    enum CanonicalState: Equatable {
-        case draft, on, archived, off, quarantined
-        case unknown(String?)
-    }
-
-    static func canonicalState(for skill: SkillManifestEntry) -> CanonicalState {
-        canonicalState(raw: skill.state)
-    }
-
-    static func canonicalState(raw: String?) -> CanonicalState {
-        switch raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "draft", "drafted", "available", "proposal": return .draft
-        case "on", "enabled", "installed", "active": return .on
-        case "archived": return .archived
-        case "off", "disabled", "dormant": return .off
-        case "quarantine", "quarantined": return .quarantined
-        default: return .unknown(raw)
+        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw DecodingError.dataCorruptedError(forKey: .id, in: c, debugDescription: "Guidance requires its canonical identity.")
         }
-    }
-
-    static func filtered(_ skills: [SkillManifestEntry], state: String?) -> [SkillManifestEntry] {
-        guard let state else { return skills }
-        if state == "unknown" {
-            return skills.filter {
-                if case .unknown = canonicalState(for: $0) { return true }
-                return false
-            }
+        description = try c.decode(String.self, forKey: .description)
+        source = try c.decode(String.self, forKey: .source)
+        guard source == "persona_body" else {
+            throw DecodingError.dataCorruptedError(forKey: .source, in: c, debugDescription: "Built-in guidance requires persona_body provenance.")
         }
-        return skills.filter { canonicalState(for: $0) == canonicalState(raw: state) }
+        bodyRevision = try c.decodeIfPresent(String.self, forKey: .bodyRevision)
     }
-
-    static func stateLabel(for skill: SkillManifestEntry) -> String {
-        stateLabel(for: canonicalState(for: skill))
-    }
-
-    static func stateLabel(for state: CanonicalState) -> String {
-        switch state {
-        case .draft: return "Draft"
-        case .on: return "On"
-        case .archived: return "Archived"
-        case .off: return "Off"
-        case .quarantined: return "Quarantined"
-        case .unknown(let raw):
-            let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return value.isEmpty ? "State unknown" : "Unknown: \(value)"
-        }
-    }
-
-
-}
-
-enum SkillSourcePresentation {
-    static func label(for skill: SkillManifestEntry) -> String {
-        switch skill.source?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "persona": return "PERSONA"
-        case "learned", "data": return "LEARNED"
-        case "registry": return "REGISTRY"
-        default:
-            let value = skill.source?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return value.isEmpty ? "UNKNOWN" : value.uppercased()
-        }
-    }
-
-
 }
 
 // MARK: - Top-level view
@@ -129,17 +45,9 @@ struct SkillLifecycleView: View {
     let refresh: () async -> Void
     private let sync = iCloudSyncEngine.shared
 
-    @State private var filter: SkillFilter = .all
     @State private var selectedSkillID: String?
 
     private var allSkills: [SkillManifestEntry] { MobileDesignSamples.rows(sync.skills) }
-
-    private var filtered: [SkillManifestEntry] {
-        SkillLifecyclePresentation.filtered(
-            allSkills,
-            state: filter == .all ? nil : filter.rawValue.lowercased()
-        )
-    }
 
     var body: some View {
         AlivePage(title: "Skills & Tools", line: "What I can do, and how.",
@@ -157,17 +65,10 @@ struct SkillLifecycleView: View {
                     Task { await refresh() }
                 }
             } else if allSkills.isEmpty {
-                AliveCalmState(title: "No skills yet", line: emptyDescription)
+                AliveCalmState(title: "No built-in guidance published", line: emptyDescription)
             } else {
-                AliveSection("Skills", trailing: { filterMenu }) {
-                    if filtered.isEmpty {
-                        Text(emptyDescription)
-                            .font(.subheadline)
-                            .foregroundStyle(AlivePalette.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .aliveRow()
-                    }
-                    ForEach(Array(filtered.enumerated()), id: \.element.id) { index, skill in
+                AliveSection("Built-in guidance") {
+                    ForEach(Array(allSkills.enumerated()), id: \.element.id) { index, skill in
                         if index > 0 { AliveDivider() }
                         SkillRow(skill: skill) { selectedSkillID = skill.id }
                     }
@@ -191,25 +92,6 @@ struct SkillLifecycleView: View {
 
     // MARK: Subviews
 
-    /// The state filter, as quiet words beside the eyebrow.
-    private var filterMenu: some View {
-        Menu {
-            Picker("Filter", selection: $filter) {
-                ForEach(SkillFilter.allCases) { f in
-                    Text(f.rawValue).tag(f)
-                }
-            }
-        } label: {
-            HStack(spacing: 4) {
-                Text(filter.rawValue)
-                Image(systemName: "chevron.up.chevron.down").imageScale(.small)
-            }
-            .font(.footnote.weight(.medium))
-            .foregroundStyle(AlivePalette.text)
-        }
-        .accessibilityLabel("Filter: \(filter.rawValue)")
-    }
-
     private var shimmerCard: some View {
         AliveCard {
             ForEach(0..<3, id: \.self) { index in
@@ -225,25 +107,7 @@ struct SkillLifecycleView: View {
     }
 
     private var emptyDescription: String {
-        switch filter {
-        case .all:       return "No skills found. The Mac's skill manifest is empty or unreachable."
-        case .draft:    return "No drafts. New skills and upgrades wait here until they are turned on."
-        case .on:       return "No skills are on. Turn on a skill on the Mac to make it available."
-        case .archived: return "No archived skills. Archived records stay available to restore on the Mac."
-        case .off:      return "No skills are off. Skills turned off on the Mac remain here."
-        case .quarantined: return "No quarantined skills. Quarantined skills require Mac review before they can run again."
-        case .unknown: return "No skills with unknown state. Their original Mac state is preserved when present."
-        }
-    }
-}
-
-/// State, where it came from and how often it has run, as one line of words.
-private enum SkillLine {
-    static func status(_ skill: SkillManifestEntry) -> String {
-        var parts = [SkillLifecyclePresentation.stateLabel(for: skill)]
-        parts.append(SkillSourcePresentation.label(for: skill).lowercased())
-        if let count = skill.use_count { parts.append("used " + AliveWords.count(count, "time")) }
-        return parts.joined(separator: " · ")
+        "Skills are built-in guidance. Her abilities are on the Tools page."
     }
 }
 
@@ -261,14 +125,14 @@ struct SkillRow: View {
                         .font(.body)
                         .foregroundStyle(AlivePalette.text)
                         .fixedSize(horizontal: false, vertical: true)
-                    if let desc = skill.description, !desc.isEmpty {
-                        Text(desc)
+                    if !skill.description.isEmpty {
+                        Text(skill.description)
                             .font(.subheadline)
                             .foregroundStyle(AlivePalette.secondary)
                             .lineLimit(2)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    Text(SkillLine.status(skill))
+                    Text("Built-in guidance")
                         .font(.footnote)
                         .foregroundStyle(AlivePalette.secondary)
                 }
@@ -293,8 +157,8 @@ struct SkillLifecycleDetailSheet: View {
     var body: some View {
         NavigationStack {
             AlivePage(title: skill.name) {
-                if let desc = skill.description, !desc.isEmpty {
-                    Text(desc)
+                if !skill.description.isEmpty {
+                    Text(skill.description)
                         .font(.body)
                         .lineSpacing(3)
                         .foregroundStyle(AlivePalette.text)
@@ -302,27 +166,11 @@ struct SkillLifecycleDetailSheet: View {
                         .padding(.top, -12)
                 }
 
-                AliveSection("About", footer: "The Mac reports each skill's state. Manage skills and restore archived records there.") {
-                    AliveRow("State") { value(SkillLifecyclePresentation.stateLabel(for: skill)) }
-                    AliveDivider()
-                    AliveRow("Source") {
-                        value(AliveWords.humanized(SkillSourcePresentation.label(for: skill).lowercased()))
-                    }
-                    if let kind = skill.kind, !kind.isEmpty {
+                AliveSection("About", footer: "Built-in guidance is read and followed. Executable abilities, senses and turns are on Tools.") {
+                    AliveRow("Source") { value("Built in") }
+                    if let revision = skill.bodyRevision {
                         AliveDivider()
-                        AliveRow("Kind") { value(AliveWords.humanized(kind)) }
-                    }
-                    if let count = skill.use_count {
-                        AliveDivider()
-                        AliveRow("Used") { value(AliveWords.count(count, "time")) }
-                    }
-                    if let version = skill.version, !version.isEmpty {
-                        AliveDivider()
-                        AliveRow("Version") { value(version) }
-                    }
-                    if let triggers = skill.triggers, !triggers.isEmpty {
-                        AliveDivider()
-                        AliveRow("Wakes on", detail: triggers.joined(separator: ", "))
+                        AliveRow("Revision") { value(revision) }
                     }
                 }
             }

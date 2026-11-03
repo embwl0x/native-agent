@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
 import TrustCenter
+import TurnTrace
 // Blueprint: | `ParallelToolDispatch.swift` | `ParallelToolDispatch` enum; `isSerialFallbackForced`, `isParallelSafe` reads the declared class and the catalog bucket (reads of their own data and files run side by side; their devices, the app door and the unplaced run one at a time); keyword scheduling inference removed |
 
 // MARK: - Parallel dispatch of independent tool calls
@@ -40,7 +41,16 @@ public enum ParallelToolDispatch {
     /// the app door takes her one pair of hands, one at a time; so does anything the catalog
     /// does not place. A write never runs beside another call.
     public static func isParallelSafe(internalToolName name: String, input: [String: JSONValue] = [:]) -> Bool {
-        guard PermissionLaw.toolClass(name, input: input) == .read else { return false }
+        // This is a certificate for concurrent scheduling, not an effect
+        // verdict. An unreadable policy supplies no certificate; admission
+        // still checks that same owner and returns its failure before acting.
+        do { guard try PermissionLaw.toolClass(name, input: input) == .read else { return false } }
+        catch {
+            TurnTraceBus.fireFromContext(kind: "tool.parallel_classification_unavailable", payload: .object([
+                "tool": .string(name), "failure": .string(error.localizedDescription),
+                "detail": .string("Concurrent scheduling is unverified. The action still requires its checked admission.")]))
+            return false
+        }
         let canonical = ToolNameAliases.canonical(name)
         // Working-tree git diff may rewrite .git/index, so it runs alone.
         if canonical == "git_diff" { return false }

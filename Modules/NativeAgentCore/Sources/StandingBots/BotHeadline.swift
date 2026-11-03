@@ -31,7 +31,7 @@ public enum BotHeadline {
         return ""
     }
 
-    /// Keep whole words, including when reading headlines saved by older builds.
+    /// Keep whole words at the requested display bound.
     public static func clipped(_ text: String, cap: Int = 240) -> String {
         guard cap > 0 else { return "" }
         guard text.count > cap else { return text }

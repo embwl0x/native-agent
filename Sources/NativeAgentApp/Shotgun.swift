@@ -1,7 +1,7 @@
 import AttentionRouting
 import NativeAgentShared
 
-// Blueprint: | `Shotgun.swift` | `ShotgunController`: person-only floating chat/window lifecycle while the agent drives, with step-aside, resume and saved placement |
+// Blueprint: | `Shotgun.swift` | `ShotgunController`: person-only floating chat/window lifecycle while the agent drives; nonisolated animation completion adapter shared with their pointer, direct deadline/Stop-aware fade wait, saved placement, and Resume through driver handoff plus ordinary session Send/queue |
 
 import AppKit
 import AppToolRuntime
@@ -96,8 +96,10 @@ enum ShotgunShortcut: String, CaseIterable, Identifiable {
         }
     }
 
-    static var current: ShotgunShortcut {
-        UserDefaults.standard.string(forKey: storageKey).flatMap(Self.init(rawValue:)) ?? .optionSpace
+    static var current: ShotgunShortcut? {
+        guard let saved = UserDefaults.standard.object(forKey: storageKey) else { return .optionSpace }
+        guard let raw = saved as? String else { return nil }
+        return Self(rawValue: raw)
     }
 }
 
@@ -183,6 +185,30 @@ final class ShotgunController: NSObject, NSWindowDelegate {
             let window = note.object as? NSWindow
             MainActor.assumeIsolated { ShotgunController.shared.windowBecameKey(window) }
         })
+        // She drives however her turn moves the Mac: hands, a shell `open`, a
+        // script hiding apps (10-31 demo: every step was shell, and Shotgun never
+        // came). Her turn putting another app in front, or hiding this one, is
+        // her driving: Shotgun comes up, and this app comes back from her hide.
+        // His keys and clicks are his.
+        observers.append(center.addObserver(
+            forName: NSApplication.didHideNotification, object: nil, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                guard let turn = ShotgunController.shared.herTurnMovedTheMac() else { return }
+                NSApp.unhideWithoutActivation()
+                ShotgunController.shared.driveBegan(turn)
+            }
+        })
+        observers.append(NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { note in
+            let pid = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
+            MainActor.assumeIsolated {
+                guard pid != ProcessInfo.processInfo.processIdentifier,
+                      let turn = ShotgunController.shared.herTurnMovedTheMac() else { return }
+                ShotgunController.shared.driveBegan(turn)
+            }
+        })
         // A turn from another door ended (or began): the remote driver is let go
         // the moment its turn leaves flight, and the view reads running again.
         observers.append(center.addObserver(
@@ -211,7 +237,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         let main = hiddenMain ?? Self.mainWindow()
         hiddenMain = nil
         hide()
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         if let main {
             main.alphaValue = 1
             main.makeKeyAndOrderFront(nil)
@@ -227,7 +253,17 @@ final class ShotgunController: NSObject, NSWindowDelegate {
     /// composer's "Let agent use Mac", from the person's own click.
     func resume() {
         guard let generation = MacAttentionSessionStore.shared.userHandoffGeneration() else { return }
-        Task { await MacAttentionSessionStore.shared.giveAgentControl(userGeneration: generation) }
+        let session = driver?.session ?? selectedSessionID
+        Task { @MainActor in
+            await MacAttentionSessionStore.shared.giveAgentControl(userGeneration: generation)
+            guard MacAttentionSessionStore.shared.currentDriverAllowed,
+                  let appModel = self.appModel, let session else { return }
+            // A takeover is already a tool result, so there is no parked model
+            // to wake. Use the same session acceptance/queue as his Send.
+            if case .rejected(let message) = await appModel.startChatTurnForSession(
+                "Mac control has returned; continue from the recorded results.", sessionId: session
+            ) { appModel.statusText = message }
+        }
     }
 
     /// After a send from Shotgun: the keyboard goes back to the app in front
@@ -301,6 +337,15 @@ final class ShotgunController: NSObject, NSWindowDelegate {
 
     // MARK: - Shortcut
 
+    /// Settings and the agent use the same save and live registration.
+    func setShortcut(_ shortcut: ShotgunShortcut) throws {
+        UserDefaults.standard.set(shortcut.rawValue, forKey: ShotgunShortcut.storageKey)
+        applyShortcut()
+        if shortcutTaken != nil {
+            throw QuietSettingError.unavailable("Saved \(shortcut.title), but macOS could not register it. Choose another Shotgun shortcut in Settings; View → Show Shotgun remains available.")
+        }
+    }
+
     /// Registers the chosen shortcut, replacing the last. A shortcut another
     /// app already owns is said once, in plain words; the View menu item
     /// keeps working.
@@ -325,7 +370,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
                 &hotKeyHandler
             )
         }
-        let shortcut = ShotgunShortcut.current
+        guard let shortcut = ShotgunShortcut.current else { return }
         guard let modifiers = shortcut.carbonModifiers else { return }
         var ref: EventHotKeyRef?
         let status = RegisterEventHotKey(
@@ -399,6 +444,30 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         stepAside()
     }
 
+    /// A turn of hers in flight while the Mac moved without his keys or clicks.
+    fileprivate func herTurnMovedTheMac() -> PersonOnlyWindows.Driver? {
+        let his = [CGEventType.keyDown, .leftMouseDown, .rightMouseDown].map {
+            CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0)
+        }
+        guard his.allSatisfy({ $0 > 1.5 }), let appModel else { return nil }
+        let turns = appModel.engine.turns
+        let active = appModel.activeChatSessionId
+        for session in [active] + turns.activeTurnIDsBySession.keys.sorted().filter({ $0 != active })
+        where turns.isBusy(session) {
+            if let turn = turns.activeTurnIDsBySession[session] { return .init(session: session, turn: turn) }
+        }
+        return nil
+    }
+
+    /// Once per turn, like every step-aside: a window he brought back stays back.
+    fileprivate func driveBegan(_ driving: PersonOnlyWindows.Driver) {
+        driver = driving
+        guard driving.turn != steppedAsideTurn,
+              UserDefaults.standard.object(forKey: Self.enabledKey) as? Bool ?? true else { return }
+        steppedAsideTurn = driving.turn
+        stepAside()
+    }
+
     /// Her sight or hands need the screen now (a desktop picture, a Mac verb
     /// on the front app): the main window goes, from any surface's turn, and
     /// the call returns once it is out of the picture. The composer's switch
@@ -412,8 +481,10 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         guard UserDefaults.standard.object(forKey: Self.enabledKey) as? Bool ?? true else { return }
         let main = Self.mainWindow().flatMap { $0.isVisible && !$0.isMiniaturized ? $0 : nil }
         guard let main else { return }
-        // His hands on this window right now: it stays under them; her verb goes on without it.
-        if main.isKeyWindow, let ago = MacPersonInput.activeSecondsAgo(), ago < 3 { return }
+        // His fingers on this window right now: it stays under them; her verb goes on without it.
+        // Keys only, from the hardware: a watching hand on the mouse is not typing here (10-31 demo:
+        // every drive he watched skipped Shotgun), and her own posted keys are not his.
+        if main.isKeyWindow, CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .keyDown) < 3 { return }
         // Once per turn: a window he brought back during the turn stays back.
         if let driving {
             guard driving.turn != steppedAsideTurn else { return }
@@ -421,14 +492,22 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         }
         // This operation owns the fade; settlement releases the waiter even
         // if the person brings the window back during it.
-        await withCheckedContinuation { continuation in
-            stepAside { continuation.resume() }
-        }
+        let done = ScopedWaiter()
+        stepAside { done.resume() }
+        await done.park()
     }
 
     private func agentPointerMoved(to point: CGPoint, pressed: Bool) {
         lastAgentPoint = point
         agentPointer.show(at: point, pressed: pressed, name: appModel?.agentDisplayName ?? "")
+    }
+
+    /// AppKit's ordinary completion block must enter without actor isolation;
+    /// only its UI work is scheduled on the main actor.
+    nonisolated static func animationCompletion(
+        _ completion: @escaping @MainActor @Sendable () -> Void
+    ) -> () -> Void {
+        { Task { @MainActor in completion() } }
     }
 
     /// The main window fades and orders out (never minimizes); Shotgun comes
@@ -439,18 +518,16 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         show(from: main.map { Self.composerRect(in: $0.frame) }, makeKey: false)
         guard let main else { completion(); return }
         hiddenMain = main
-        NSAnimationContext.runAnimationGroup { context in
+        NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.3
             main.animator().alphaValue = 0
-        } completionHandler: {
-            Task { @MainActor in
-                defer { completion() }
-                // Brought back mid-fade: leave it on screen.
-                guard ShotgunController.shared.hiddenMain === main else { return }
-                main.orderOut(nil)
-                main.alphaValue = 1
-            }
-        }
+        }, completionHandler: Self.animationCompletion {
+            defer { completion() }
+            // Brought back mid-fade: leave it on screen.
+            guard ShotgunController.shared.hiddenMain === main else { return }
+            main.orderOut(nil)
+            main.alphaValue = 1
+        })
     }
 
     /// Dock click, ⌘Tab, the menu bar item: User brought NativeAgent forward.
@@ -513,35 +590,31 @@ final class ShotgunController: NSObject, NSWindowDelegate {
         if makeKey { panel.makeKey() }
         publish()
         // Reduce Motion: a plain cross-fade in place.
-        NSAnimationContext.runAnimationGroup { context in
+        NSAnimationContext.runAnimationGroup({ context in
             context.duration = reduceMotion ? 0.2 : 0.35
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().alphaValue = 1
             if !reduceMotion { panel.animator().setFrame(target, display: true) }
-        } completionHandler: {
-            Task { @MainActor in
-                ShotgunController.shared.placing = false
-                ShotgunController.shared.publish()
-            }
-        }
+        }, completionHandler: Self.animationCompletion {
+            ShotgunController.shared.placing = false
+            ShotgunController.shared.publish()
+        })
     }
 
     private func hide() {
         guard isShown, let panel else { return }
         isShown = false
         setDone(false)
-        NSAnimationContext.runAnimationGroup { context in
+        NSAnimationContext.runAnimationGroup({ context in
             context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.15 : 0.2
             panel.animator().alphaValue = 0
-        } completionHandler: {
-            Task { @MainActor in
-                let controller = ShotgunController.shared
-                guard !controller.isShown else { return }
-                panel.orderOut(nil)
-                panel.ignoresMouseEvents = false
-                controller.publish()
-            }
-        }
+        }, completionHandler: Self.animationCompletion {
+            let controller = ShotgunController.shared
+            guard !controller.isShown else { return }
+            panel.orderOut(nil)
+            panel.ignoresMouseEvents = false
+            controller.publish()
+        })
     }
 
     /// The folded pill measured itself: the window hugs it, keeping the

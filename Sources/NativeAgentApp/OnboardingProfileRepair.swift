@@ -47,6 +47,8 @@ extension OnboardingWizard {
         switch error {
         case "missing_agent_name":
             return "Enter a name for the agent before saving."
+        case "invalid_agent_name":
+            return detail ?? "Choose a specific name for the agent, using at most 80 code points."
         case "missing_user_name":
             return "Enter your name before saving."
         case "profile_already_present":
@@ -97,7 +99,8 @@ struct ProfileRepairStep: View {
     let onRecheck: () -> Void
 
     private var canSave: Bool {
-        !state.trimmedAgentName.isEmpty && !state.trimmedUserName.isEmpty && !state.isLoading
+        NativeAgentIdentity.nameValidationMessage(state.trimmedAgentName) == nil
+            && !state.trimmedUserName.isEmpty && !state.isLoading
     }
 
     var body: some View {
@@ -142,6 +145,13 @@ struct ProfileRepairStep: View {
                     Text(message)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+
+                if !state.trimmedAgentName.isEmpty,
+                   let message = NativeAgentIdentity.nameValidationMessage(state.trimmedAgentName) {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
 
                 if let message = state.errorMessage {

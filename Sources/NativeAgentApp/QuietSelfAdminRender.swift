@@ -2,6 +2,8 @@ import Connectors
 import BackgroundWork
 import ApprovalTransactions
 import AppToolRuntime
+import AgentWorkspace
+import ChatToolRuntime
 import AppKit
 import ChatTurnRuntime
 import Foundation
@@ -21,7 +23,7 @@ import ToolRegistry
 import ToolExecution
 import TrustCenter
 import TrustPersistence
-// Blueprint: | `QuietSelfAdminRender.swift` | Quiet page assembly and app read/action host; Tools ability rows use Parts.list, including turn and senses; mounted presentation supplies the visible mode and Agent room for self-window reads, independently of Advanced sidebar `current` and its screenshot restriction; Today waiting uses `WorkOverviewRead`, helpers use the engine bot shelf, chat cards use the transcript owner's checked projection; page indexing/rendering receives live layout; context receipts read the engine data root |
+// Blueprint: | `QuietSelfAdminRender.swift` | Quiet page assembly and app read/action host; Tools ability rows use Parts.list, including turn and senses; mounted presentation supplies visible mode and Agent room independently of Advanced sidebar `current`. Page indexing uses the shipped page set independently of layout; Today, Agent view and screenshots retain content alongside the layout path/repair issue. Today waiting uses `WorkOverviewRead`, helpers use the engine bot shelf, chat cards use the transcript owner's checked projection; context receipts read the engine data root |
 
 extension EnvironmentValues {
     /// Screenshots suppress lifecycle writes while allowing read-only loads.
@@ -201,13 +203,12 @@ enum QuietSelfAdminRender {
 
     /// The data the page draws from, loaded before the copy is even built.
     ///
-    /// This is the rail's own loader — the call `TodayView` and the Connectors
-    /// tab make when a person opens the page — and it only fetches and
-    /// assigns: no file is written and no badge is cleared. Chat is the
-    /// exception and is deliberately absent: its branch runs `loadChatState`,
-    /// which writes shared session state, and a read must not do that.
+    /// Today uses its read-only projection below and in its quiet view task.
+    /// Its live sidebar loader refreshes approval/inbox owners, whose callbacks
+    /// publish notifications and widget state. Chat likewise stays absent:
+    /// its sidebar branch writes shared session state.
     private static func loadPageData(for page: QuietPage, appModel: AppModel) async {
-        guard page.item != .chat else { return }
+        guard page.item != .chat, page.item != .activity else { return }
         _ = await appModel.refreshForSidebarItem(page.item)
     }
 
@@ -223,8 +224,10 @@ enum QuietSelfAdminRender {
     private static func withPreparedHost<T>(
         for page: QuietPage, tab: String? = nil, appModel: AppModel, size: CGSize = defaultSize,
         _ body: (NSHostingView<AnyView>) -> T
-    ) async -> T {
+    ) async throws -> T {
+        try Task.checkCancellation()
         await loadPageData(for: page, appModel: appModel)
+        try Task.checkCancellation()
 
         let hosting = NSHostingView(rootView: AnyView(
             pageView(for: page, tab: tab, appModel: appModel, size: size)
@@ -259,8 +262,11 @@ enum QuietSelfAdminRender {
         if let warmUp = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) {
             hosting.cacheDisplay(in: hosting.bounds, to: warmUp)
         }
-        await settle(hosting)
-        return body(hosting)
+        try await settle(hosting)
+        try Task.checkCancellation()
+        let result = body(hosting)
+        try Task.checkCancellation()
+        return result
     }
 
     /// Turn the run loop until the page's read-only loads are done.
@@ -270,11 +276,11 @@ enum QuietSelfAdminRender {
     /// start: the counter reads zero for the first turns simply because the
     /// tasks have not begun yet, so a run of clear turns is what counts as
     /// finished, never the first reading.
-    private static func settle(_ hosting: NSHostingView<AnyView>) async {
+    private static func settle(_ hosting: NSHostingView<AnyView>) async throws {
         let deadline = Date().addingTimeInterval(loadBudget)
         var idleTurns = 0
         while Date() < deadline {
-            try? await Task.sleep(nanoseconds: 20_000_000)
+            try await Task.sleep(nanoseconds: 20_000_000)
             hosting.layoutSubtreeIfNeeded()
             idleTurns = QuietReadLoads.inFlight == 0 ? idleTurns + 1 : 0
             if idleTurns >= 6 { break }
@@ -301,11 +307,12 @@ enum QuietSelfAdminRender {
     /// anything that is not ours.
     static func pageImagePNG(
         for page: QuietPage, tab: String? = nil, appModel: AppModel, size: CGSize = defaultSize
-    ) async -> (data: Data, width: Int, height: Int)? {
+    ) async throws -> (data: Data, width: Int, height: Int)? {
+        try Task.checkCancellation()
         guard size.width.isFinite, size.height.isFinite,
               let width = Int(exactly: size.width.rounded(.down)), width > 0,
               let height = Int(exactly: size.height.rounded(.down)), height > 0 else { return nil }
-        return await withPreparedHost(for: page, tab: tab, appModel: appModel, size: size) { hosting in
+        return try await withPreparedHost(for: page, tab: tab, appModel: appModel, size: size) { hosting in
             // 1x: a retina page doubles the bytes for detail a model does not read.
             guard let bitmap = NSBitmapImageRep(
                 bitmapDataPlanes: nil,
@@ -339,6 +346,9 @@ extension QuietSelfAdminRender {
             await appModel.refreshTelegram()
         }
         var projection=await pageProjection(for:page,appModel:appModel)
+        if let failure = appModel.engine.layout.availability.failure {
+            projection.insert(layoutIssue(failure), at: 0)
+        }
         switch page.item.normalized {
         case .providers, .bots, .trust, .connectors, .diagnostics, .personality:
             let item=page.item.normalized
@@ -375,22 +385,22 @@ extension QuietSelfAdminRender {
             TrustGuardrailSummary.rows(policy: policy, accessMode: mode).map { "\($0.title): \($0.value). \($0.detail)" }
         }
         case .memories: return RuntimeReadouts.quietMemories(appModel.engine.memory,
-            keptLine: MemoriesPageContent.keptLine(appModel.engine.memory.memories.count), graphEntityCount: appModel.engine.memory.graphTotalEntities)
+            keptLine: MemoriesPageContent.keptLine(appModel.engine.memory.memories.count))
         case .desk: return await RuntimeReadouts.quietDesk(desk: appModel.engine.desk)
         case .inboxPolicy: return RuntimeReadouts.quietNotifications(appModel.engine.inbox)
         case .diagnostics: return await diagnosticsProjection(appModel: appModel)
         case .tools: return toolsProjection(appModel: appModel)
         case .capabilities: return RuntimeReadouts.quietCapabilities(trust: appModel.engine.trust, approvals: appModel.engine.approvals,
-            workflowCount: appModel.engine.desk.workflows.count, actionCount: appModel.engine.tools.nativeActions.count)
+            desk: appModel.engine.desk, actionCount: appModel.engine.tools.nativeActions.count)
         case .connectors where page.tab == "iphone": return await RuntimeReadouts.quietPairing(appModel.engine.sync, dataRoot: appModel.engine.dataRoot)
         case .connectors where page.tab == "agents": return await RuntimeReadouts.quietAgents(appModel.engine.contacts)
         case .connectors: return await RuntimeReadouts.quietConnectors(
-            appModel.engine.connectors, workspaceCount: appModel.engine.connectors.workspaces.count,
+            appModel.engine.connectors,
             statusText: connectorStatusText)
         case .telegram: return RuntimeReadouts.quietTelegram(appModel.engine.telegram)
         case .macIntegration: return await RuntimeReadouts.quietMacIntegration(
             connectors: appModel.engine.connectors, macIntegration: appModel.engine.macIntegration,
-            workspaceCount: appModel.engine.connectors.workspaces.count, statusText: connectorStatusText)
+            statusText: connectorStatusText)
         case .personality: return await RuntimeReadouts.quietPersonality(appModel.engine.persona, currentPersona: appModel.chatPersona)
         case .settings: return RuntimeReadouts.quietSettings(agentName: appModel.agentDisplayName, providerID: appModel.chatProvider,
             model: appModel.chatModel, fileAccess: appModel.chatFileAccess, status: appModel.statusForAgent)
@@ -444,6 +454,8 @@ extension QuietSelfAdminRender {
             line("Thinking", "think_word") ?? "",
             line("Trust", "trust_word") ?? "",
             line("Context used", "ring_percent").map { $0 + "%" } ?? "Context used: unknown",
+            line("Compact at", "context_compact_at_percent") ?? "Compact at: unknown",
+            line("Context measurement", "context_measurement_source") ?? "Context measurement: unknown",
             line("Open pane", "open_card") ?? "",
             "The chat.* actions work this row in process.",
         ].filter { !$0.isEmpty } + paneRows))
@@ -472,8 +484,8 @@ extension QuietSelfAdminRender {
     // MARK: Today
 
     private static func todayProjection(appModel: AppModel) async -> [JSONValue] {
+        let layout = appModel.engine.layout.availability
         let today = appModel.engine.today
-        await appModel.publishWorkStatus()
         await today.refresh(appModel.engine, activeSessionID: appModel.activeChatSessionId)
         let pending = WaitingOnYou.approvals(appModel)
         let waitingNotes = appModel.engine.inbox.items.filter { $0.status == "unread" }
@@ -507,7 +519,12 @@ extension QuietSelfAdminRender {
             "queues": queues,
         ]
         return (unavailable.isEmpty ? [] : [section("Today unavailable", unavailable)])
-            + appModel.engine.layout.layout.shown("today", profile: SimpleViewMode.advanced).flatMap { blocks[$0.name] ?? [] }
+            + layout.contentNames("today", profile: SimpleViewMode.advanced).flatMap { blocks[$0] ?? [] }
+    }
+
+    private static func layoutIssue(_ failure: SurfaceLayoutFailure) -> JSONValue {
+        RuntimeReadouts.quietPageIssue("Layout unavailable", reason: "invalid_file",
+            detail: failure.localizedDescription, instruction: failure.instruction)
     }
 
     // MARK: Providers
@@ -697,12 +714,14 @@ enum QuietPages {
 }
 
 @MainActor struct AppQuietToolPresentation: QuietToolPresentationPort {
-    /// The page index as the window shows it: a page whose rail row or place
-    /// the layout hides (ui/layout.json) leaves it, and still reads by name.
+    /// Shipped pages exist independently of their presentation in the layout.
     var pages: [QuietToolPage] {
-        guard let appModel = ApplicationLifetime.shared.appModel else { return [] }
-        return RuntimeReadouts.quietPages(
-            layout: appModel.engine.layout.layout, profile: SimpleViewMode.current)
+        get throws {
+            guard ApplicationLifetime.shared.appModel != nil else {
+                throw ToolFailureError("The app presentation has not attached.", effects: .none, code: "app_unattached")
+            }
+            return RuntimeReadouts.quietPages()
+        }
     }
     var currentPage: QuietToolPage? { ApplicationLifetime.shared.currentPage.map(\.value) }
     var visiblePageInput: [String: JSONValue]? { ApplicationLifetime.shared.visiblePageInput }
@@ -727,16 +746,23 @@ enum QuietPages {
     @MainActor
     func agentViewRead(input: [String: JSONValue]) async -> JSONValue {
         guard let appModel = ApplicationLifetime.shared.appModel else { return AppToolExecutor.unattachedFailure() }
-        return await AppToolExecutor.agentViewRead(input: input, rooms: HerScreenPreview.tabs(appModel.engine.layout.layout, profile: SimpleViewMode.agent),
+        let layout = appModel.engine.layout.availability
+        let result = await AppToolExecutor.agentViewRead(input: input, rooms: HerScreenPreview.tabs(layout, profile: SimpleViewMode.agent),
                                                    activeSessionID: appModel.activeChatSessionId) { room, scope in
             await appModel.engine.turns.readAgentScreen(room: room, scope: scope)
         }
+        if let failure = layout.failure, case .object(var fields) = result {
+            fields["layout_issue"] = SurfaceLayoutStore.failureResult(failure)
+            return .object(fields)
+        }
+        return result
     }
 
     // MARK: - page.screenshot
 
     @MainActor
     func pageScreenshot(input: [String: JSONValue]) async -> JSONValue {
+        guard let appModel = ApplicationLifetime.shared.appModel else { return AppToolExecutor.unattachedFailure() }
         let requested = Self.text(input["page"])
         let resolved = AppDoorNames.resolve(requested)
         let target = resolved == "current" ? ApplicationLifetime.shared.currentPage
@@ -766,7 +792,6 @@ enum QuietPages {
             }
             tab = home.tab
         }
-        guard let appModel = ApplicationLifetime.shared.appModel else { return AppToolExecutor.unattachedFailure() }
         var size = QuietSelfAdminRender.defaultSize
         if let requestedHeight = input["height"] {
             let height: Double?
@@ -781,7 +806,14 @@ enum QuietPages {
             }
             size.height = min(max(CGFloat(height), 400), 2400)
         }
-        guard let rendered = await QuietSelfAdminRender.pageImagePNG(for: page, tab: tab, appModel: appModel, size: size) else {
+        let image: (data: Data, width: Int, height: Int)?
+        do { image = try await QuietSelfAdminRender.pageImagePNG(for: page, tab: tab, appModel: appModel, size: size) }
+        catch is CancellationError {
+            return AppToolExecutor.failure("cancelled", "Page screenshot was cancelled; no image was produced.")
+        } catch {
+            return AppToolExecutor.failure("render_failed", error.localizedDescription)
+        }
+        guard let rendered = image else {
             return AppToolExecutor.failure("render_failed", "Offscreen bitmap allocation or PNG encoding failed.",
                 extra: ["page": .string(page.id), "tab": .string(tabKey),
                     "remedy": Repair.remedy(owner: "page.screenshot", nextCall: .object([

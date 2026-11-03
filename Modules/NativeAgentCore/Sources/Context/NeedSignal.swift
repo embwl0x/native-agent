@@ -1,6 +1,6 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `NeedSignal.swift` | Context need, admitted origin/authorization, cache identity and explicit conflict vocabulary |
+// Blueprint: | `NeedSignal.swift` | Context need, admitted origin/authorization, cache identity vocabulary |
 public enum ContextOriginClass: String, Codable, CaseIterable, Sendable {
     case localAuthenticated = "local_authenticated"
     case remoteAuthenticated = "remote_authenticated"
@@ -34,24 +34,6 @@ public enum ContextSelectionCacheState: String, Codable, Sendable {
     case miss
     case unavailable
 }
-public struct ContextConflictDefinition: Codable, Equatable, Sendable {
-    public let id: String
-    public let memberAtomIDs: Set<ContextAtomID>
-    public let resolvedAtomID: ContextAtomID?
-    public let provenance: String
-
-    public init(
-        id: String,
-        memberAtomIDs: Set<ContextAtomID>,
-        resolvedAtomID: ContextAtomID? = nil,
-        provenance: String
-    ) {
-        self.id = id
-        self.memberAtomIDs = memberAtomIDs
-        self.resolvedAtomID = resolvedAtomID
-        self.provenance = provenance
-    }
-}
 /// Pure, turn-scoped input to context selection. `selectionTimeBucket` is used
 /// instead of wall-clock reads so identical inputs remain restart deterministic.
 public struct NeedSignal: Codable, Equatable, Sendable {
@@ -67,16 +49,14 @@ public struct NeedSignal: Codable, Equatable, Sendable {
     public let activeTask: String?
     public let unresolvedQuestion: String?
     public let goal: String?
-    public let predictedToolGroups: Set<String>
-    public let contextualTerms: Set<String>
     public let cognitiveActivation: [ContextAtomID: Double]
     public let feedbackUtilityOverrides: [ContextAtomID: Double]
     public let feedbackDecayOverrides: [ContextAtomID: Double]
     /// How reachable each atom is from its history of use, 0...1
     /// (`ContextFeedbackAtomState.reachability`). The memory lane ranks by it.
     public let memoryReachability: [ContextAtomID: Double]
-    /// Turns since the atom was last served in this session's supplied history
-    /// (0 = the turn before this one).
+    /// Exchanges since the atom was last served in this session's retained
+    /// transcript (0 = the preceding exchange: a user message plus its reply).
     /// A memory served this recently rests unless the message singles it out.
     public let servedTurnsAgo: [ContextAtomID: Int]
     public let precoveredSourceIDs: Set<ContextSourceID>
@@ -105,20 +85,19 @@ public struct NeedSignal: Codable, Equatable, Sendable {
     /// to publish a matching expandable pointer. Summarized representations
     /// remain expandable independently. `0` = the caller renders bodies whole.
     public let packetAtomExpandThresholdChars: Int
-    /// Upper bound on `.memory`-kind atoms in one packet. `nil` leaves the
-    /// selector's own per-kind quota in charge (pre-existing behavior).
+    /// Shared upper bound on nonmandatory memory and correction atoms.
+    /// Mandatory atoms bypass this quota; `nil` uses the selector's quota.
     public let memoryAtomRowLimit: Int?
     public let selectionTimeBucket: Int64
     public let timeBucketSeconds: Int
-    public let explicitConflicts: [ContextConflictDefinition]
     public let cacheState: ContextSelectionCacheState
     public let measuredSelectionMicroseconds: Int?
 
     enum CodingKeys: String, CodingKey {
         case message, extractedEntities, surface, origin, authorization
         case sessionID, currentProjectID
-        case executionID = "missionID" // compatibility wire ID
-        case recentTurns, activeTask, unresolvedQuestion, goal, predictedToolGroups, contextualTerms
+        case executionID
+        case recentTurns, activeTask, unresolvedQuestion, goal
         case cognitiveActivation, feedbackUtilityOverrides, feedbackDecayOverrides
         case memoryReachability, servedTurnsAgo, precoveredSourceIDs, mandatoryAtomIDs, deletedAtomIDs, tombstonedAtomIDs
         case staleRuntimeAtomIDs, secretBearingAtomIDs, queryEmbedding, alternateQueryEmbedding, ownWordsQueryEmbeddings
@@ -126,7 +105,7 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         case characterBudget, mandatoryCharacterBudget
         case packetAtomExpandThresholdChars, memoryAtomRowLimit
         case selectionTimeBucket, timeBucketSeconds
-        case explicitConflicts, cacheState, measuredSelectionMicroseconds
+        case cacheState, measuredSelectionMicroseconds
     }
     public init(
         message: String,
@@ -141,8 +120,6 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         activeTask: String? = nil,
         unresolvedQuestion: String? = nil,
         goal: String? = nil,
-        predictedToolGroups: Set<String> = [],
-        contextualTerms: Set<String> = [],
         cognitiveActivation: [ContextAtomID: Double] = [:],
         feedbackUtilityOverrides: [ContextAtomID: Double] = [:],
         feedbackDecayOverrides: [ContextAtomID: Double] = [:],
@@ -166,7 +143,6 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         memoryAtomRowLimit: Int? = nil,
         now: Date = Date(),
         timeBucketSeconds: Int = 60,
-        explicitConflicts: [ContextConflictDefinition] = [],
         cacheState: ContextSelectionCacheState = .unavailable,
         measuredSelectionMicroseconds: Int? = nil
     ) {
@@ -183,8 +159,6 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         self.activeTask = activeTask
         self.unresolvedQuestion = unresolvedQuestion
         self.goal = goal
-        self.predictedToolGroups = predictedToolGroups
-        self.contextualTerms = contextualTerms
         self.cognitiveActivation = cognitiveActivation.mapValues { min(1, max(0, $0)) }
         self.feedbackUtilityOverrides = feedbackUtilityOverrides.mapValues {
             min(1, max(-1, $0.isFinite ? $0 : 0))
@@ -217,7 +191,6 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         self.memoryAtomRowLimit = memoryAtomRowLimit.map { max(0, $0) }
         self.selectionTimeBucket = Int64(floor(now.timeIntervalSince1970 / Double(bucketSize)))
         self.timeBucketSeconds = bucketSize
-        self.explicitConflicts = explicitConflicts
         self.cacheState = cacheState
         self.measuredSelectionMicroseconds = measuredSelectionMicroseconds
     }
@@ -250,8 +223,6 @@ public struct NeedSignal: Codable, Equatable, Sendable {
         ]
         parts += entityParts
         parts += recentTurns
-        parts += contextualTerms.sorted()
-        parts += predictedToolGroups.sorted()
         parts += authorization.allowedOrigins.map(\.rawValue).sorted()
         parts += authorization.allowedPrivacy.map(\.rawValue).sorted()
         parts += authorization.allowedSourceIDs.map(\.rawValue).sorted()
@@ -282,12 +253,6 @@ public struct NeedSignal: Codable, Equatable, Sendable {
             parts += reading.map { String($0.bitPattern) }
         }
         parts.append(queryEmbeddingModelFingerprint ?? "no-query-embedding-fingerprint")
-        for conflict in explicitConflicts.sorted(by: { $0.id < $1.id }) {
-            parts.append(conflict.id)
-            parts.append(contentsOf: conflict.memberAtomIDs.map(\.rawValue).sorted())
-            parts.append(conflict.resolvedAtomID?.rawValue ?? "unresolved")
-            parts.append(conflict.provenance)
-        }
         return ContextStableID.digest(parts: parts)
     }
 }

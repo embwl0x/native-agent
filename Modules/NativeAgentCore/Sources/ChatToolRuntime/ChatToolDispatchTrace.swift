@@ -18,7 +18,7 @@ import TrustCenter
 import ChromeControl
 import Senses
 import StandingBots
-// Blueprint: | `ChatToolDispatchTrace.swift` | `ChatToolDispatchTracer`: dispatch timing, redacted receipts and file-touch evidence; turn-bound receipts record act experience and repair attribution; nominated practice calls keep one redacted tape row with exact paths, steer and call-end sequence, built off the dispatch path (`TurnPractice`), every other call none |
+// Blueprint: | `ChatToolDispatchTrace.swift` | `ChatToolDispatchTracer`: dispatch timing, redacted receipts and file-touch evidence; structured failure fields survive beside bounded previews, redacted and capped at 300 characters each; turn-bound receipts record act experience and repair attribution; shared `isPreview` dispatch predicate excludes explicit app previews from recording and turn learning while keeping the gated chain |
 
 /// Trace-recording ToolDispatchClient. TurnTrace owns bound dispatches;
 /// `<dataRoot>/traces/events.jsonl` owns standalone dispatches:
@@ -65,7 +65,18 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         self.dataRoot = dataRoot
     }
 
+    /// One dispatch predicate for both recording and the turn's learning readers.
+    package static func isPreview(tool: String, input: [String: JSONValue]) -> Bool {
+        tool == "app" && input["preview"] == .bool(true)
+    }
+
     package func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        if Self.isPreview(tool: tool, input: input) {
+            // Keep the real gated chain. The preview owner records its inert
+            // trace; dispatch/act evidence would otherwise feed her body,
+            // habits and next dream as though she had performed the work.
+            return try await inner.dispatch(tool: tool, input: input, surface: surface)
+        }
         let startNs = DispatchTime.now().uptimeNanoseconds
         let receiptID = UUID().uuidString.lowercased()
         let parent = Experience.currentAct
@@ -169,12 +180,8 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             payload["user_front_changed"] = changed
         }
         if let result {
-            if status == "failed", case .object(let failure) = result {
-                // Failure fields bypass the serialized preview, so apply its
-                // secret redactor here too, before emission.
-                if case .string(let reason)? = failure["reason"] {
-                    payload["reason"] = .string(ChatSecretRedactor.redactText(reason))
-                }
+            if status == "failed" {
+                payload.merge(Self.failureFields(result)) { _, field in field }
                 payload["errorDetail"] = ChatToolOutcome.failureDetail(result).map(JSONValue.string)
             }
             // Redact echoed injections and screen pixels as the tool that ran.
@@ -250,40 +257,6 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         )
     }
 
-    /// A turn's own call of an operation that a nominated practice of this
-    /// agent uses keeps one tape row (`TurnPractice.TapeRow`); every other
-    /// call keeps none. Redacted as its trace preview is, the row keeps what
-    /// redaction left unchanged within its bound, path by path, and names
-    /// what it left out. Its steer is the provenance an `ability.save` in
-    /// this turn would carry. Built off the dispatch path.
-    private static func keepPractice(tool: String, input: [String: JSONValue], surface: String, receiptID: String, turn: String,
-                                     evidence: [String: JSONValue], result: JSONValue, dataRoot: URL, at: Date) {
-        let action: String? = if case .string(let text)? = input["action"] { text } else { nil }
-        guard let operation = TurnPractice.operation(tool: tool, keys: Set(input.keys), action: action) else { return }
-        let principal = TurnPractice.principal(helper: BotDefinition.id(forSession: traceSessionID(input)))
-        guard TurnPractice.records(operation, principal: principal, dataRoot: dataRoot) else { return }
-        let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
-                                          peerID: ChatToolSessionContext.envelope?.verifiedUserId)
-        let resultClass: String = if case .string(let text)? = evidence["resultClass"] { text } else { "unknown" }
-        let model: String? = if case .string(let text)? = evidence["model"] { text } else { nil }
-        // The call's place is taken here, as it ends; its row is built off the path.
-        let sequence = TurnPractice.nextSequence()
-        Task.detached(priority: .utility) {
-            let ran = ToolNameAliases.ranTool(tool, input: input)
-            let redactedArgs = TurnTraceRedactor.redactValue(
-                TurnPractice.arguments(operation, input: MacInjectionArgRedaction.redacted(tool: tool, input: input)))
-            let redactedResult = TurnTraceRedactor.redactValue(
-                MacInjectionResultRedaction.redacted(tool: ran, result: MacScreenViewResultRedaction.redacted(tool: ran, result: result)))
-            let row = TurnPractice.TapeRow(receipt: receiptID, turn: turn, operation: operation, resultClass: resultClass,
-                args: TurnPractice.arguments(operation, input: input), redactedArgs: redactedArgs,
-                options: TurnPractice.options(input), redactedOptions: TurnTraceRedactor.redactValue(
-                    TurnPractice.options(MacInjectionArgRedaction.redacted(tool: tool, input: input))),
-                result: result, redactedResult: redactedResult,
-                steer: steer.sources + steer.elevated, model: model, at: at, sequence: sequence)
-            await TurnPractice.Tape.shared.append(row, principal: principal, dataRoot: dataRoot)
-        }
-    }
-
     private static func traceSessionID(_ input: [String: JSONValue]) -> String? {
         let sessionID = ChatToolSessionInjection.explicitSessionId(in: input)
         return sessionID.isEmpty ? LLMCallContext.sessionId : sessionID
@@ -292,6 +265,29 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
     private static func traceSource(at date: Date = Date()) -> String {
         TurnTraceContext.turnId == nil ? "data/traces/events.jsonl"
             : "data/turn_traces/" + TurnTracePersistLane().path(for: date).lastPathComponent
+    }
+
+    /// Select failure evidence before preview clipping. Keep the result's status separately from the dispatch verdict.
+    /// Redact whole fields before bounding: a secret may otherwise be cut in half and evade redaction.
+    private static func failureFields(_ result: JSONValue) -> [String: JSONValue] {
+        guard case .object(let object) = result else { return [:] }
+        var fields: [String: JSONValue] = [:]
+        for key in ["status", "failure_code", "code", "reason", "argument_path", "error", "detail", "message"] {
+            guard let original = object[key] else { continue }
+            let value = TurnTraceRedactor.redactValue(original)
+            let target = key == "status" ? "result_status" : key
+            switch value {
+            case .null, .bool, .int, .double: fields[target] = value
+            default:
+                let raw: String?
+                if case .string(let text) = value { raw = text }
+                else { raw = try? value.serialize(pretty: false) }
+                guard let raw else { continue }
+                let redacted = ChatSecretRedactor.redactText(raw)
+                fields[target] = .string(redacted.count <= 300 ? redacted : String(redacted.prefix(299)) + "…")
+            }
+        }
+        return fields
     }
 
     private static func dispatchEvidence(
@@ -310,6 +306,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         fields["model"] = LLMCallContext.admittedModel.map(JSONValue.string)
         fields["reasoningEffort"] = LLMCallContext.reasoningEffort.map(JSONValue.string)
         if let result {
+            if status == "failed" { fields.merge(failureFields(result)) { _, field in field } }
             let preview = if case .object(let object) = result { object["status"] == .string("preview") || object["execution"] == .string("preview") } else { false }
             fields["resultClass"] = .string(preview ? "preview" : (verdict ?? ChatToolOutcome.exactResultClass(result)).rawValue)
             let evidence = receiptFields(result)
@@ -458,12 +455,10 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
                 status: status, durationMs: durationMs, result: result,
                 evidence: receiptEvidence, parent: parent, recordedAt: recordedAt
             )
-            // A call her night is learning from keeps its tape row.
-            if parent == nil, TurnTraceContext.automaticOrigin == nil {
-                Self.keepPractice(tool: tool, input: input, surface: surface, receiptID: receiptID, turn: turn,
-                                  evidence: evidence, result: result, dataRoot: dataRoot, at: recordedAt)
-            }
             // The act is the turn's, or its enclosing call's; its receipt is the evidence.
+            // A preview's only receipt is the trace just emitted. Experience
+            // and repair readers must never turn a proposed act into her life.
+            guard !Self.isPreview(tool: tool, input: input) else { return }
             guard case .string(let action)? = evidence["action"] else { return }
             let effects: Experience.Effects? = if case .object(let fields) = result, case .string(let raw)? = fields["effects"] {
                 Experience.Effects(rawValue: raw)
@@ -476,7 +471,8 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             let operation = ChatToolOutcome.repairOperation(action, input)
             let refusedBeforeEffect: Bool = if effects == Experience.Effects.none, case .object(let fields) = result {
                 ChatToolOutcome.neverRan(result) || verdict == .refused
-                    || fields["execution"] == .string("not_run") || fields["argument_path"] != nil && fields["argument_path"] != .null
+                    || fields["execution"] == .string("not_run") || fields["not_run_status"] != nil
+                    || fields["argument_path"] != nil && fields["argument_path"] != .null
                     || ["invalid_arguments", "unknown_contact", "not_run"].contains(fields["status"]?.stringValue ?? "")
             } else { false }
             // A refused probe changed nothing. Keep its act as evidence, but
@@ -486,7 +482,15 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             if !refusedBeforeEffect, !probeOnly, case .object(let fix)? = remedy, fix["kind"] == .string("repair"), case .string(let owner)? = fix["owner"] {
                 let tap: String? = if case .string(let tap)? = fix["tap"] { tap } else { nil }
                 let call = fix["next_call"].flatMap { $0 == .null ? nil : try? $0.serialize(pretty: false) }
-                own = OwedNo(operation: operation, owner: owner, lever: ChatToolOutcome.leverOperation(remedy),
+                let lever: String?
+                do { lever = try ChatToolOutcome.leverOperation(remedy) }
+                catch {
+                    lever = nil
+                    TurnTraceBus.fireFromContext(kind: "repair.lever_unavailable", payload: .object([
+                        "operation": .string(operation), "owner": .string(owner), "failure": .string(error.localizedDescription),
+                        "detail": .string("The original repair remains owed. Repair the action catalog before binding its settling operation.")]))
+                }
+                own = OwedNo(operation: operation, owner: owner, lever: lever,
                              nextCall: call.map(ChatSecretRedactor.redactText), tap: tap)
             }
             // A no inside a call is owed by the call that surfaced it; a call that
@@ -524,15 +528,17 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             }
             return
         }
+        var payload: [String: JSONValue] = [
+            "argKeys": .array(argKeys.map { .string($0) }),
+            "durationMs": .int(Int64(durationMs)),
+            "surface": .string(surface),
+            "turnId": .string(TurnTraceContext.turnId ?? "unknown"),
+            "receipt": .object(receiptEvidence),
+        ]
+        if status == "failed" { payload.merge(Self.failureFields(result)) { _, field in field } }
         let event = TurnTraceEvent(kind: "tool.dispatch", title: tool, status: status,
             // Compact evidence only; no argument or result bodies.
-            payload: .object([
-                "argKeys": .array(argKeys.map { .string($0) }),
-                "durationMs": .int(Int64(durationMs)),
-                "surface": .string(surface),
-                "turnId": .string(TurnTraceContext.turnId ?? "unknown"),
-                "receipt": .object(receiptEvidence),
-            ]), id: receiptID, createdAt: NativeTimestampFormat.plainZulu(recordedAt), ts: recordedAt)
+            payload: .object(payload), id: receiptID, createdAt: NativeTimestampFormat.plainZulu(recordedAt), ts: recordedAt)
         await TurnTracePersistLane(dataRootOverride: dataRoot).append(event)
     }
 }

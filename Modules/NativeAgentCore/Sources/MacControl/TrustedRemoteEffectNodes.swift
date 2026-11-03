@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TrustedRemoteEffectNodes.swift` | Reads operator-provisioned trusted node JSON and returns SSH execution receipts to the caller |
+// Blueprint: | `TrustedRemoteEffectNodes.swift` | Reads operator-provisioned trusted node JSON; SSH settlement retains bounded output, exit and truncation evidence on Stop without claiming remote cancellation |
 
 public struct TrustedRemoteEffectNode: Codable, Identifiable, Hashable, Sendable {
     public let id: String
@@ -34,6 +34,10 @@ public struct TrustedRemoteEffectReceipt: Codable, Identifiable, Hashable, Senda
     public let exitCode: Int32
     public let stdout: String
     public let stderr: String
+    public let stdoutTruncated: Bool
+    public let stderrTruncated: Bool
+    public let timedOut: Bool
+    public let cancelled: Bool
     public let hostKeyFingerprint: String
 }
 
@@ -101,11 +105,21 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
         let command = ([executable] + arguments).map(Self.shellQuote).joined(separator: " ")
         let digest = SHA256.hash(data: Data(command.utf8)).map { String(format: "%02x", $0) }.joined()
         let started = Date()
-        let result = try await Self.runSSH(
-            node: node,
-            command: command,
-            timeoutSeconds: max(1, min(timeoutSeconds, 300))
-        )
+        let result: ProcessRunResult
+        let cancelled: Bool
+        do {
+            result = try await Self.runSSH(
+                node: node,
+                command: command,
+                timeoutSeconds: max(1, min(timeoutSeconds, 300))
+            )
+            cancelled = false
+        } catch let stopped as ProcessRunCancellation {
+            result = stopped.result
+            cancelled = true
+        }
+        let stderr = result.stderr + (result.timedOut
+            ? (result.stderr.isEmpty ? "Timed out." : "\nTimed out.") : "")
         return await settle { TrustedRemoteEffectReceipt(
             id: UUID().uuidString.lowercased(),
             nodeId: node.id,
@@ -116,8 +130,11 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
             finishedAt: NativeTimestampFormat.plainZulu(Date()),
             exitCode: result.exitCode,
             stdout: Self.bounded(result.stdout),
-            stderr: Self.bounded(result.stderr + (result.timedOut
-                ? (result.stderr.isEmpty ? "Timed out." : "\nTimed out.") : "")),
+            stderr: Self.bounded(stderr),
+            stdoutTruncated: result.stdoutTruncated || result.stdout.utf8.count > 32_768,
+            stderrTruncated: result.stderrTruncated || stderr.utf8.count > 32_768,
+            timedOut: result.timedOut,
+            cancelled: cancelled,
             hostKeyFingerprint: node.hostKeyFingerprint ?? "invalid"
         ) }
     }

@@ -61,19 +61,21 @@ if [[ "$DMG_SIGNATURE_REQUIRED" == "true" ]]; then
     || fail "a signed release DMG must be notarized and stapled"
 fi
 
+DMG_SHA256="$(shasum -a 256 "$DMG" | awk '{print $1}')"
+DMG_BYTES="$(wc -c < "$DMG" | tr -d '[:space:]')"
 jq -e \
   --arg revision "$SOURCE_REVISION" \
+  --arg name "$(basename "$DMG")" --arg sha256 "$DMG_SHA256" --argjson bytes "$DMG_BYTES" \
   '.schema_version == 1
    and .source_revision == $revision
    and .source_dirty == false
    and (.canonical_gate == "script/release.sh --artifact-only" and .ios_required == false and .ios_result == "not_run")
-   and (.completed_at | type == "string" and length > 0)' \
+   and (.completed_at | type == "string" and length > 0)
+   and .artifact.name == $name and .artifact.sha256 == $sha256 and .artifact.byte_length == $bytes' \
   "$RECEIPT" >/dev/null \
   || fail "release receipt does not prove the exact clean source and artifact gate"
 
-DMG_SHA256="$(shasum -a 256 "$DMG" | awk '{print $1}')"
 RECEIPT_SHA256="$(shasum -a 256 "$RECEIPT" | awk '{print $1}')"
-DMG_BYTES="$(wc -c < "$DMG" | tr -d '[:space:]')"
 CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 mkdir -p "$(dirname "$OUTPUT")"
 TMP="$OUTPUT.tmp.$$"

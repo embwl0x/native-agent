@@ -4,71 +4,15 @@ import PersistenceCore
 import TurnTrace
 import NativeAgentShared
 
-// Blueprint: | `ToolNameAliases.swift` | `ToolNameAliases`: one spelling/argument translation owner across Trust, dispatch, receipts and visible app-call projection |
+// Blueprint: | `ToolNameAliases.swift` | `ToolNameAliases`: current internal-tool/action argument and schema projection owner across Trust, dispatch and receipts; pure prose folding memoized by exact input bytes under a lock, bounded to 4096 entries |
 
 // MARK: - Tool-name aliases
 
-/// Trust, dispatch, receipts, traces and chat pills resolve alternate tool spellings through this one table.
+/// Current internal tool IDs and public app actions share one explicit binding map.
 ///
 /// Spelling and argument translation grants no model visibility or catalog entries.
 /// `ProviderToolNameMap` owns provider-safe wire names at ingress.
 public enum ToolNameAliases {
-    /// canonical name → the spellings that mean it. Both are matched trimmed
-    /// and case-insensitively.
-    static let aliasesByCanonical: [String: [String]] = [
-        "recall_memory": ["recall_search"],
-        "scheduler_cancel_job": ["scheduler_delete_job"],
-        "search_chat_history": ["session_search"],
-        "mobile_notify": [
-            "mobile.notify", "iphone.notify", "iphone_notify", "ios.notify", "ios_notify",
-            "apns.notify", "apns_notify", "push.notify", "push_notify",
-        ],
-        "mac_notify": ["mac.notify", "native.notify", "native_notify"],
-        "mac_spotlight_search": ["spotlight_search"],
-        // Accept the connector-action ids shown by the Trust Center.
-        "mac_look": ["mac.look"],
-        "mac_view": ["mac.view"],
-        "browser.status": ["browser_status", "browser.get_status", "browser_get_status"],
-        "browser.open_url": [
-            "browser_open_url", "browser.open", "browser_open",
-            "browser.navigate", "browser_navigate", "navigate_browser",
-        ],
-        "browser.read_text": [
-            "browser_read_text", "browser.text", "browser_text", "browser_get_text",
-            "browser.dom_text", "browser_dom_text",
-        ],
-        "browser.read_links": ["browser_read_links", "browser.links", "browser_links"],
-        "browser.screenshot": [
-            "browser_screenshot", "browser.capture_screenshot", "browser_capture_screenshot",
-        ],
-        "browser.chrome_setup": ["browser_chrome_setup"],
-        "browser.chrome_status": ["browser_chrome_status"],
-    ].merging(Dictionary(uniqueKeysWithValues: [
-        "close_tab", "navigate", "snapshot", "look", "click", "fill", "type", "select",
-        "keypress", "set_checked", "double_click", "drag", "wait", "scroll", "media",
-    ].map { verb in
-        ("browser.chrome_\(verb)", ["browser_chrome_\(verb)", "chrome.\(verb)", "chrome_\(verb)"])
-    })) { $0 + $1 }
-
-    /// Retired per-area tools run nothing; their unknown-tool answer carries `retiredAppToolHint`.
-    public static let retiredAppTools: Set<String> = [
-        "inbox", "chat_session", "upkeep", "provider", "connections", "mind_run", "skill_manage", "ability_manage",
-        "workshop_reject", "app_settings_list", "app_setting_set", "app_page_read", "app_page_screenshot",
-        "interaction_act", "doctor_status", "telegram_status",
-        "chat_conversations", "list_memories", "rewrite_memory",
-        // Refused calls translate to `claude.say` through `appCall`.
-        "invoke_claude", "claude_message",
-        // Refused calls point to ability.list; parts run as authored.<id>.
-        "craft_run",
-    ]
-    /// Retired action ids → the retired tool each ran; a call answers as `appCall` translates it.
-    public static let retiredActions = ["claude.message": "claude_message", "craft.run": "craft_run",
-                                        "mac.screen": "screen", "mac.activity_query": "activity_query", "persona": "get_persona_doc"]
-    public static let retiredAppToolHint = "Use app — {} is your home and every page."
-
-    /// Discovery names translate to app home/find; there is no load lifecycle.
-    public static let mergedTools: Set<String> = ["workspace", "tool_catalog", "list_tools", "tool_load"]
-
     /// Internal tool name → app action id. Actions re-enter the named executor's gates.
     /// Direct model calls run nothing and receive `foldedToolHint`.
     /// Duplicate names log and keep their first entry without trapping.
@@ -99,8 +43,7 @@ public enum ToolNameAliases {
         "scheduler_list_jobs": "schedule.list", "scheduler_create_job": "schedule.create",
         "scheduler_update_job": "schedule.update", "scheduler_pause_job": "schedule.pause",
         "scheduler_resume_job": "schedule.resume", "scheduler_cancel_job": "schedule.cancel",
-        "scheduler_delete_job": "schedule.delete",
-        "recall_memory": "memory.recall", "recall_search": "memory.recall", "commit_memory": "memory.commit",
+        "recall_memory": "memory.recall", "commit_memory": "memory.commit",
         "forget_memory": "memory.forget", "memory_proposals_pending": "memory.proposals",
         "memory_proposal_review": "memory.review", "search_kg": "graph.search", "rebuild_knowledge_graph": "graph.rebuild",
         "scratchpad_read": "chat.scratch_read",
@@ -148,7 +91,7 @@ public enum ToolNameAliases {
         "browser.status": "browser.status", "browser.open_url": "browser.open", "browser.read_text": "browser.text",
         "browser.read_links": "browser.links", "browser.screenshot": "browser.screenshot",
         "browser.chrome_setup": "chrome.setup", "browser.chrome_status": "chrome.status",
-        "search_chat_history": "chat.search", "session_search": "chat.search",
+        "search_chat_history": "chat.search",
         "read_chat_message": "chat.message", "chat_reply": "chat.reply",
         "tool_result_page": "result.page",
         "screen": "mac.look", "act": "mac.act", "go": "mac.go", "wait": "mac.wait", "read": "mac.read",
@@ -172,60 +115,37 @@ public enum ToolNameAliases {
         "agent_connect": ["name": "agent"],
     ]
 
-    private static let whom = ["contact": "agent", "to": "agent"]
-    private static let argAliases: [String: [String: String]] = [
-        // A reader that searches takes `find`; `query` is what the others call it.
-        "*": ["max_rows": "max_nodes", "max_results": "limit", "query": "find"],
-        "agent.swarm": ["prompt": "objective", "timeout_seconds": "timeoutSeconds"],
-        "desk.close": ["outcome": "summary", "outcome_summary": "summary"],
-        "desk.wait": ["why": "note"],
-        "memory.commit": ["content": "text"],
-        // Parts use id and code; accepted alternate spellings translate here.
-        "ability.read": ["name": "id", "tool_id": "id"], "ability.validate": ["name": "id", "tool_id": "id", "fixtures": "input"],
-        "ability.enable": ["name": "id", "tool_id": "id", "digest": "version"], "ability.restore": ["name": "id", "tool_id": "id", "digest": "version"],
-        "ability.disable": ["name": "id", "tool_id": "id"], "ability.rollback": ["name": "id", "tool_id": "id"],
-        "ability.drop": ["name": "id", "tool_id": "id"], "ability.save": ["tool_id": "id", "tests": "fixtures", "script": "code"],
-        "agent.message": whom.merging(["message": "text"]) { $1 },
-        "agent.read": whom.merging(["id": "message_id"]) { $1 }, "agent.cancel": whom, "agent.verify": whom,
-        "agent.rename": whom, "agent.connect": whom, "agent.jobs": whom,
-        "mac.go": ["app": "name"], "shell.run": ["command": "cmd"], "shell.bash": ["command": "cmd"],
-    ]
-
-    private static func argumentNames(_ tool: String, _ input: [String: JSONValue]) -> [String: String] {
-        let action = appAction(tool) ?? tool
-        var names = argAliases[action] ?? [:]
-        // add_ref already uses id for the linked approval/trace, beside handle.
-        if action.hasPrefix("desk."), action != "desk.add_ref" || input["handle"] == nil { names["id"] = "handle" }
-        if action == "agent.swarm", case .int? = input["workers"] { names["workers"] = "agentCount" }
-        if action == "agent.jobs" { names["id"] = input["agent"] == .string("swarm") ? "run_id" : "message_id" }
-        return names
-    }
-
-    /// Repair only one possible spelling; conflicting names stay for validation.
-    public static func argumentName(_ name: String, tool: String, input: [String: JSONValue], known: Set<String>) -> (name: String, shimID: String)? {
-        let declared = argumentNames(tool, input)
-        let aliases = known.contains(name) ? declared : declared.merging(doorArgNames[tool] ?? [:]) { first, _ in first }
-        if let alias = aliases[name] { return known.contains(alias.split(separator: ".").first.map(String.init) ?? alias) ? (alias, "T05") : nil }
-        guard !known.contains(name) else { return nil }
-        if let alias = argAliases["*"]?[name] { return known.contains(alias) ? (alias, "T05") : nil }
-        func stem(_ text: String) -> String { text.lowercased().split(separator: "_").map { $0.hasSuffix("s") ? String($0.dropLast()) : String($0) }.joined(separator: "_") }
-        let matches = known.filter { candidate in
-            if stem(name) == stem(candidate) || name == "id" && candidate.hasSuffix("_id") { return true }
-            let a = Array(name.lowercased()), b = Array(candidate.lowercased())
-            guard min(a.count, b.count) >= 4, abs(a.count - b.count) <= 1 else { return false }
-            return characterEditDistance(a, b) <= 1
-        }
-        return matches.count == 1 ? matches.first.map { ($0, "T06") } : nil
-    }
-
     /// A folded tool's input with its arguments by the door's names.
     public static func doorArgs(_ tool: String, _ input: [String: JSONValue], reportShim: Bool = false) -> [String: JSONValue] {
-        renamed(renamed(input, doorArgNames[tool] ?? [:]), argumentNames(tool, input), reportShim: reportShim)
+        renamed(input, doorArgNames[tool] ?? [:], reportShim: reportShim)
     }
 
     /// Door args with the folded tool's own names.
     public static func hostArgs(_ tool: String, _ args: [String: JSONValue], reportShim: Bool = false) -> [String: JSONValue] {
-        renamed(renamed(args, argumentNames(tool, args), reportShim: reportShim), Dictionary(uniqueKeysWithValues: (doorArgNames[tool] ?? [:]).map { ($0.value, $0.key) }))
+        renamed(args, Dictionary(uniqueKeysWithValues: (doorArgNames[tool] ?? [:]).map { ($0.value, $0.key) }), reportShim: reportShim)
+    }
+
+    /// Project the current executor schema, including its root form constraints.
+    /// Argument names change only at this object level, never inside its data.
+    public static func doorSchema(_ tool: String, _ schema: JSONValue) -> JSONValue {
+        guard case .object(var fields) = schema else { return schema }
+        let names = doorArgNames[tool] ?? [:]
+        if case .object(let properties)? = fields["properties"] {
+            fields["properties"] = .object(doorArgs(tool, properties))
+        }
+        if case .array(let required)? = fields["required"] {
+            fields["required"] = .array(required.map { value in
+                guard case .string(let name) = value else { return value }
+                return .string(names[name] ?? name)
+            })
+        }
+        for key in ["allOf", "anyOf", "oneOf"] {
+            if case .array(let forms)? = fields[key] {
+                fields[key] = .array(forms.map { doorSchema(tool, $0) })
+            }
+        }
+        if let excluded = fields["not"] { fields["not"] = doorSchema(tool, excluded) }
+        return .object(fields)
     }
 
     private static func renamed(_ fields: [String: JSONValue], _ names: [String: String], reportShim: Bool = false) -> [String: JSONValue] {
@@ -287,15 +207,9 @@ public enum ToolNameAliases {
         return AppActionBinding.actionID(tool: tool, input: input)
     }
 
-    /// A name the model no longer calls: a folded tool, a merged one
-    /// (`workspace`, `tool_catalog`) or a retired one.
-    public static func isAppDoorName(_ tool: String) -> Bool {
-        appAction(tool) != nil || mergedTools.contains(tool) || retiredAppTools.contains(tool)
-    }
-
     /// An action that only passes the call on to the tool it folds.
     public static func isFoldedAction(_ id: String) -> Bool {
-        AppActionBinding.binding(id)?.folded == true
+        AppActionBinding.declaredBinding(id)?.folded == true
     }
 
     /// The tool a call ran: an `app` call of a folded action is that tool,
@@ -316,7 +230,7 @@ public enum ToolNameAliases {
             if page.isEmpty || page == "home" { return ("agent_message", args) }
         }
         guard name == "app", case .string(let action)? = input["action"],
-              let binding = AppActionBinding.binding(action), binding.folded else { return (name, input) }
+              let binding = AppActionBinding.declaredBinding(action), binding.folded else { return (name, input) }
         return (binding.tool, binding.arguments(args))
     }
 
@@ -355,63 +269,36 @@ public enum ToolNameAliases {
         return (call.name, (try? call.input.serialize(pretty: false)) ?? inputJSON)
     }
 
-    /// Her call to a folded tool, as the `app` call that runs it. `workspace`
-    /// is app's home: no args is `{}`, a name or ref is `item` (its text and
-    /// fields in args), a query is the home's find; a catalog query is `find`.
+    /// A current internal executor's call, presented through its app action.
     public static func appCall(_ name: String, input: [String: JSONValue]) -> [String: JSONValue]? {
         let args = input.filter { !$0.key.hasPrefix("__") }
-        if name == "workspace" {
-            if case .string(let item)? = args["action"] {
-                let extra = args.filter { ["text", "fields", "conversation"].contains($0.key) && $0.value != .null }
-                return extra.isEmpty ? ["item": .string(item)] : ["item": .string(item), "args": .object(extra)]
-            }
-            if case .string(let query)? = args["query"] { return ["page": .string("home"), "find": .string(query)] }
-            return [:]
-        }
-        if ["tool_catalog", "list_tools"].contains(name) {
-            if case .string(let query)? = args["query"] { return ["find": .string(query)] }
-            return [:]
-        }
-        if let handle = agentHandle(name) {
-            var extra = args
-            var options: [String: JSONValue] = if case .object(let options)? = args["options"] { options } else { [:] }
-            for key in ["working_directory", "topic", "model", "reasoning_effort", "fast", "pair_reviewer", "timeout_seconds", "priority", "desk_item", "completion_mode", "repository"] {
-                if let value = extra.removeValue(forKey: key) { options[key] = value }
-            }
-            if let cwd = extra.removeValue(forKey: "cwd") { options["working_directory"] = cwd }
-            if !options.isEmpty { extra["options"] = .object(options) }
-            if case .string(let context)? = extra.removeValue(forKey: "context"), case .string(let text)? = extra["text"] { extra["text"] = .string(context + "\n\n" + text) }
-            if extra["conversation_mode"] == .string("new") { extra.removeValue(forKey: "conversation_mode"); extra["new_conversation"] = .bool(true) }
-            if extra["conversation_mode"] == .string("resume"), extra["conversation_id"] != nil { extra.removeValue(forKey: "conversation_mode") }
-            extra["agent"] = .string(handle)
-            return ["action": .string("agent.message"), "args": .object(extra)]
-        }
-        // Its arguments were a hard-coded method's; a part takes its own.
-        if name == "craft_run" { return ["action": .string("ability.list")] }
         guard let id = appAction(name) else { return nil }
         return args.isEmpty ? ["action": .string(id)] : ["action": .string(id), "args": .object(doorArgs(name, args))]
     }
 
-    /// Legacy send spellings supply a target, never an identity or a grant.
-    public static func agentHandle(_ name: String) -> String? {
-        let parts = name.replacingOccurrences(of: ".", with: "_").split(separator: "_").map(String.init)
-        guard parts.count == 2 else { return nil }
-        if ["message", "say"].contains(parts[1]), ["claude", "claude", "codex", "omp"].contains(parts[0]) { return parts[0] }
-        if parts[0] == "invoke", ["claude", "codex"].contains(parts[1]) { return parts[1] }
-        return nil
-    }
-
-    /// The answer to a call of a folded tool by its old name: the same call,
-    /// already translated.
     public static func foldedToolHint(_ name: String, input: [String: JSONValue] = [:]) -> String {
         guard let call = appCall(name, input: input),
-              let data = try? JSONValue.object(call).serializedData(pretty: false) else { return retiredAppToolHint }
+              let data = try? JSONValue.object(call).serializedData(pretty: false) else { return "Use app — {} is your home and every page." }
         return "Use app " + String(decoding: data, as: UTF8.self) + " — {} is your home and every page."
     }
 
     /// Text that names folded tools, with each name as its action id: a
     /// folded tool's own description, read through the door.
+    private static let proseLock = NSLock()
+    nonisolated(unsafe) private static var proseByText: [Data: String] = [:]
+
     public static func foldedProse(_ text: String) -> String {
+        proseLock.withLock {
+            let key = Data(text.utf8) // Preserve distinct Unicode spellings as well as their meaning.
+            if let known = proseByText[key] { return known }
+            let out = foldProse(text)
+            if proseByText.count >= 4096 { proseByText.removeAll(keepingCapacity: true) }
+            proseByText[key] = out
+            return out
+        }
+    }
+
+    private static func foldProse(_ text: String) -> String {
         guard let pattern = foldedNamePattern else { return text }
         var out = text
         for match in pattern.matches(in: text, range: NSRange(text.startIndex..., in: text)).reversed() {
@@ -469,22 +356,11 @@ public enum ToolNameAliases {
             + "|(?<=`)(" + foldedTools.keys.filter { !$0.contains("_") && !$0.contains(".") }
             .sorted().map(NSRegularExpression.escapedPattern).joined(separator: "|") + ")(?=`)")
 
-    /// alias → canonical. Built with `uniqueKeysWithValues` on purpose: one
-    /// spelling naming two tools is the bug this table exists to end.
-    public static let table: [String: String] = Dictionary(uniqueKeysWithValues:
-        aliasesByCanonical.flatMap { canonical, aliases in aliases.map { ($0, canonical) } })
-
-    /// The canonical name for `name`. A name `known` already knows stays as
-    /// it is. A table alias resolves to its tool. Anything else comes back
-    /// exactly as given — an alias, not a fuzzy match.
-    public static func canonical(
-        _ name: String,
-        known: (String) -> Bool = { _ in false }
-    ) -> String {
-        if known(name) { return name }
-        let key = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return table[key] ?? (aliasesByCanonical[key] != nil ? key : name)
+    /// Whitespace normalization only. Unknown or retired IDs stay unknown.
+    public static func canonical(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
 }
 
 /// One turn's tool events as a person is shown them (`ToolNameAliases.shown`).

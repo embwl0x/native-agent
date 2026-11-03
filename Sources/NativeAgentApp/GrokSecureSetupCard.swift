@@ -2,6 +2,7 @@ import PersistenceCore
 import SwiftUI
 import Agents
 import AgentConversations
+import NativeAgentShared
 
 // Blueprint: | `GrokSecureSetupCard.swift` | `GrokSecureSetupCard`: masked credential submission through secure setup, without exposing secret values in the view |
 
@@ -27,7 +28,7 @@ struct GrokSecureSetupCard: View {
                             guard !name.isEmpty else { return }
                             try GrokBotConnection.selectBot(peer: contact.id, name: name, dataRoot: dataRoot)
                             status = "Bot selected. Connect again to send the routine request."
-                        } catch { status = "Could not save the Bot selection." }
+                        } catch { status = "Could not save the Bot selection: " + failureDetail(error) }
                     }.disabled(busy || botName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
                 Text(contact.grokSetup == "creating" ? "Routine setup is not confirmed. Connect again to continue this contact's setup. If a request was already submitted, it will not be sent again; approve it in Grok Bot if asked." : GrokBotRoute.securePasteBlocker).font(.caption)
@@ -50,7 +51,7 @@ struct GrokSecureSetupCard: View {
                 status = "Paste one JSON object with url and key. Nothing was saved."; return
             }
             ready()
-        } catch { status = "Could not save the routine credentials securely. Nothing was sent." }
+        } catch { status = "Could not save the routine credentials securely: " + failureDetail(error) }
     }
     private func importNative(_ contact: AgentPeerContact) {
         busy = true
@@ -61,11 +62,18 @@ struct GrokSecureSetupCard: View {
                     desktop: NativeAgentEngine.live.agents.desktop) else { return }
                 ready()
             } catch {
-                status = error.localizedDescription
+                status = failureDetail(error)
             }
         }
     }
     private func ready() {
         status = "Set up. Credentials are in Keychain. Send a test message; approve the local reply command in Grok Bot if asked."
+    }
+    private func failureDetail(_ error: any Error) -> String {
+        // A failed credential operation may echo its input. Remove the exact
+        // secure-field contents as well as the shared credential patterns.
+        let detail = paste.isEmpty ? error.localizedDescription
+            : error.localizedDescription.replacingOccurrences(of: paste, with: "[redacted]")
+        return String(TurnSecretRedactor.redactText(detail).prefix(1_000))
     }
 }

@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacAssistantStatus.swift` | assistant status composition from evidence snapshots, client contract, result, lightweight serialization, Mail readiness projection and native watch access evidence; typed catalog data and UI words come from `Resources/abilities/mac-watch-catalog.js`, never creating jobs; missing/disabled/invalid catalog is unavailable, never an empty catalog |
+// Blueprint: | `MacAssistantStatus.swift` | assistant status composition from evidence snapshots, client contract, result, lightweight serialization, Mail readiness accepts complete or partial checked account coverage with named gaps, Mac policy failures remain on dependent access rows, canonical tool names and card-based acquisition guidance; declared scheduler actions arrive from the app action owner; typed catalog data and UI words come from `Resources/abilities/mac-watch-catalog.js`, never creating jobs; missing/disabled/invalid catalog is unavailable, never an empty catalog |
 
 // Status rendering reads readiness evidence and never creates watch jobs.
 
@@ -192,14 +192,12 @@ public protocol MacAssistantStatusClient: Sendable {
 
 extension MacAssistantStatusResult {
     public static func compose(
-        macEnabled: Bool, macProven: Bool, notifications: (status: String, nextStep: String),
+        macControl: (status: String, nextStep: String), notifications: (status: String, nextStep: String),
         pushStatus: [String: JSONValue],
         availableTools: Set<String>, localStatuses: [String: [String: JSONValue]],
+        schedulerActions: [String],
         watchCatalog: @Sendable () async throws -> [MacAssistantWatchRecipe]
     ) async throws -> MacAssistantStatusResult {
-        // Ready requires a successful action receipt within the proof window.
-        let macState = !macEnabled ? "needs_policy" : macProven ? "ready" : "probe_needed"
-
         let pushState: String
         switch (pushStatus["status"].flatMap { if case .string(let s) = $0 { s.lowercased() } else { nil } }) {
         case "ok", "ready": pushState = "ready"
@@ -231,12 +229,15 @@ extension MacAssistantStatusResult {
                 return (localStatus, detail, nextStep)
             }
             let available = availableTools.contains(toolName)
-            return (available ? "probe_needed" : "needs_setup", detail, nextStep)
+            return (available ? "probe_needed" : "unavailable", detail, nextStep)
         }
 
-        let mailAccess = localAccessState(id: "local_mail", toolName: "mail_list_recent")
-        let calAccess = localAccessState(id: "local_calendar", toolName: "calendar_list_upcoming")
-        let remAccess = localAccessState(id: "local_reminders", toolName: "reminders_list_due_today")
+        let mailTool = "mail_list_recent"
+        let calendarTool = "mac_calendar_list_upcoming"
+        let remindersTool = "mac_reminders_list_due_today"
+        let mailAccess = localAccessState(id: "local_mail", toolName: mailTool)
+        let calAccess = localAccessState(id: "local_calendar", toolName: calendarTool)
+        let remAccess = localAccessState(id: "local_reminders", toolName: remindersTool)
         let mailState = mailAccess.status
         let calState = calAccess.status
         let remState = remAccess.status
@@ -245,11 +246,11 @@ extension MacAssistantStatusResult {
             MacAssistantAccessItem(
                 id: "mac_control",
                 title: "Mac control",
-                status: macState,
+                status: macControl.status,
                 detail: "Lets me run shortcuts, post notifications, read files and script apps on this Mac.",
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_mail", "local_calendar", "local_reminders", "mac_notifications"],
-                nextStep: !macEnabled ? "Turn on Mac control above." : macProven ? "" : "Run mac.self_test once to prove the bridge.",
+                nextStep: macControl.nextStep,
                 actionIds: ["mac.self_test"]
             ),
             MacAssistantAccessItem(
@@ -276,40 +277,39 @@ extension MacAssistantStatusResult {
                 id: "local_mail",
                 title: "Mac Mail",
                 status: mailState,
-                detail: "I read your Mail inbox (read only), through Apple Events."
-                    + (mailState == "ready" ? "" : " The first check shows the macOS permission prompt.")
+                detail: "I read Mail account metadata through Apple Events, mailbox pages through Mail's local Envelope Index, and message bodies from local message files. These reads need Automation and Full Disk Access."
                     + (mailAccess.detail.map { " \($0)" } ?? ""),
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_mail_watch"],
-                nextStep: mailAccess.nextStep ?? (mailState == "ready" ? "" : "Use Check Mail so macOS can ask for access."),
-                actionIds: ["mac.mail_list_recent"],
-                toolNames: ["mail_list_recent", "mail_search"]
+                nextStep: mailAccess.nextStep ?? (mailState == "ready" ? "" : "Use Check Mail to check account coverage. If access is missing, follow the returned permission remedy."),
+                actionIds: ["mail.recent"],
+                toolNames: [mailTool, "mail_search"]
             ),
             MacAssistantAccessItem(
                 id: "local_calendar",
                 title: "Mac Calendar",
                 status: calState,
                 detail: "I read Calendar (read only), through EventKit."
-                    + (calState == "ready" ? "" : " The first check shows the macOS permission prompt.")
+                    + " Reads check the current grant; missing access returns a permission card for you to allow."
                     + (calAccess.detail.map { " \($0)" } ?? ""),
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_calendar_watch"],
-                nextStep: calAccess.nextStep ?? (calState == "ready" ? "" : "Use Check Calendar and Reminders above so macOS can ask for access."),
-                actionIds: ["mac.calendar_list_upcoming"],
-                toolNames: ["calendar_list_upcoming"]
+                nextStep: calAccess.nextStep ?? (calState == "ready" ? "" : "Ask me to read Calendar, then allow access on the permission card if requested."),
+                actionIds: ["calendar.upcoming"],
+                toolNames: [calendarTool]
             ),
             MacAssistantAccessItem(
                 id: "local_reminders",
                 title: "Mac Reminders",
                 status: remState,
                 detail: "I read Reminders (read only), through EventKit."
-                    + (remState == "ready" ? "" : " The first check shows the macOS permission prompt.")
+                    + " Reads check the current grant; missing access returns a permission card for you to allow."
                     + (remAccess.detail.map { " \($0)" } ?? ""),
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_reminders_watch"],
-                nextStep: remAccess.nextStep ?? (remState == "ready" ? "" : "Use Check Calendar and Reminders above so macOS can ask for access."),
-                actionIds: ["mac.reminders_list_due_today"],
-                toolNames: ["reminders_list_due_today"]
+                nextStep: remAccess.nextStep ?? (remState == "ready" ? "" : "Ask me to read Reminders, then allow access on the permission card if requested."),
+                actionIds: ["reminders.due_today"],
+                toolNames: [remindersTool]
             ),
         ]
 
@@ -343,12 +343,12 @@ extension MacAssistantStatusResult {
 
         return MacAssistantStatusResult(
             status: blocked > 0 ? "attention" : (unproven ? "probe_needed" : "ready"),
-            summary: "Mac assistant watch setup is manifest-only here; no watcher jobs are created until scheduler.schedule_job is called.",
+            summary: "Watch recipes are inactive here. Reading this status creates no jobs; use an explicit schedule action to create a watch.",
             access: access,
             watchTemplates: templates,
             blockedAccessCount: blocked,
             templateAttentionCount: templateAttention,
-            schedulerActions: ["scheduler.schedule_job", "scheduler.create_job", "scheduler.list_jobs", "scheduler.cancel_job"],
+            schedulerActions: schedulerActions,
             lazyContract: lazyContract,
             createdAt: createdAt
         )
@@ -358,7 +358,7 @@ extension MacAssistantStatusResult {
 extension MacAssistantStatusResult {
     public static func mailReadiness(from result: JSONValue) -> (status: String, word: String, next: String?) {
         guard case .object(let out) = result else {
-            return ("failed", "Check failed", "Mail gave no answer I could read.")
+            return ("unavailable", "Coverage unavailable", "Mail gave no answer I could read. Use Check Mail again when Mail is available.")
         }
         let text = { (key: String) -> String? in
             if case .string(let s)? = out[key], !s.isEmpty { return s }
@@ -366,16 +366,33 @@ extension MacAssistantStatusResult {
         }
         switch text("status") {
         case "completed":
+            guard text("account_coverage") == "complete" else {
+                return ("unavailable", "Coverage unavailable", "Mail did not establish account coverage. Use Check Mail again to read the current mailbox accounts.")
+            }
             return ("ready", "Ready", nil)
+        case "partial":
+            guard text("account_coverage") == "partial",
+                  case .array(let gaps)? = out["accounts_not_listed"], !gaps.isEmpty,
+                  let message = text("message") else {
+                return ("unavailable", "Coverage unavailable", "Mail did not identify its account coverage gaps. Use Check Mail again to read the current mailbox accounts.")
+            }
+            var next = "Open Mail, check account and mailbox availability, then use Check Mail again."
+            next = message + " " + next
+            return ("ready", "Ready with account gaps", next)
         case "denied":
             return ("needs_permission", "Needs macOS permission",
                     "Allow NativeAgent to control Mail in System Settings → Privacy & Security → Automation.")
-        default:
+        case "failed":
+            if text("reason") == "mailbox_coverage_unavailable" {
+                return ("unavailable", "Coverage unavailable", text("message"))
+            }
             if text("reason") == "not_configured" {
                 return ("needs_setup", "Needs setup", text("fix"))
             } else {
                 return ("failed", "Check failed", text("error") ?? text("reason").map { "Mail said: \($0.replacingOccurrences(of: "_", with: " "))." })
             }
+        default:
+            return ("unavailable", "Coverage unavailable", "Mail returned no recognized read outcome. Use Check Mail again when Mail is available.")
         }
     }
 }

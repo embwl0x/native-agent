@@ -749,10 +749,13 @@ building intimacy), and directing future behaviour
 
 ### Remembering rewrites
 
-**Recall makes memories editable.** A retrieved memory becomes unstable and
-must be stored again, so it can be changed by what is going on at the time
-([Nader, Schafe & LeDoux 2000](https://doi.org/10.1038/35021052)). In the
-social version, talking about a shared past makes the speakers' memories
+**Recall can make memories editable.** In animal fear conditioning,
+reactivated memories can become unstable and require reconsolidation
+([Nader, Schafe & LeDoux 2000](https://doi.org/10.1038/35021052)); this does
+not establish that every human episodic recall reopens its trace. Human
+evidence is debated and key replications have failed; see
+[Memory research — Reconsolidation](MEMORY_RESEARCH.md#reconsolidation-does-recall-reopen-the-trace).
+Separately, talking about a shared past makes the speakers' memories
 converge. Details one person leaves out become harder for the listener to
 recall too ([Hirst & Echterhoff 2012](https://doi.org/10.1146/annurev-psych-120710-100340)).
 

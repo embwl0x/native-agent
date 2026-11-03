@@ -281,7 +281,7 @@ public actor HelperSenseRunner: SenseWatchReporting {
         try requireRunning()
         try requireHelper()
         guard record.language == .javascript else {
-            throw SenseFailure(code: "unsupported", message: "Authored senses require JavaScript. Convert this historical Swift sense before enabling it.")
+            throw SenseFailure(code: "unsupported", message: "Authored senses require JavaScript.")
         }
         guard !record.id.isEmpty, record.id != ".", record.id != "..",
               !record.id.contains("/"), !record.id.contains("\\"), record.version > 0,

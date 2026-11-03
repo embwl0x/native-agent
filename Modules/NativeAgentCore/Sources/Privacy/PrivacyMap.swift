@@ -26,6 +26,7 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
         "catalog/trust/roots.json",
         "capabilities",
         "persona",
+        ".onboarded",
         "scheduler/jobs.json",
         "connectors/registry.json",
         "connectors/workspaces.json",
@@ -72,14 +73,15 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
         let specs: [Spec] = [
             Spec(id: "persona", title: "Persona", relativePath: "persona", detail: "agent identity, voice, instructions, optional persona inputs, and document recovery copies"),
             Spec(id: "onboarding", title: "Onboarding", relativePath: "onboarding", detail: "pending completion/reset transactions; excluded from local backup, export, and phone sync"),
-            Spec(id: "onboarded", title: "Setup Completion", relativePath: ".onboarded", detail: "local completion sentinel; excluded from local backup, export, and phone sync"),
+            Spec(id: "onboarded", title: "Setup Completion", relativePath: ".onboarded", detail: "completion evidence carried by local/off-disk backup and production export with the identity data; no raw phone sync"),
             Spec(id: "embeddings", title: "Embedding Settings", relativePath: "config/embeddings.json", detail: "local embedding backend selection; excluded from local backup, export, and phone sync"),
             Spec(id: "user_prefs", title: "Quiet Hours", relativePath: "user_prefs.json", detail: "retained quiet-hour preferences; off-disk backup only; no local backup, production export, or preferences-file phone snapshot"),
             Spec(id: "embedding_install", title: "Embedding Installation", relativePath: "extras", detail: "downloaded embedding model and resumable installation state; excluded from backup, export, and phone sync"),
-            Spec(id: "notifications", title: "Notifications", relativePath: "notifications", detail: "live cards, archive, and canonical APNs registrations; phone receives the live-card projection; excluded from local backup and export"),
+            Spec(id: "notifications", title: "Notifications", relativePath: "notifications", detail: "live cards, archive, canonical APNs registrations and immutable notification publications; phone receives the live-card projection and signed notification envelopes; excluded from local backup and export"),
             Spec(id: "trust", title: "Trust", relativePath: "trust", detail: "saved trust policy and preserved damaged-policy evidence; backed up and exported; phone receives the policy projection"),
             Spec(id: "task_ledger", title: "Task Ledger", relativePath: "orchestration", detail: "task ledger events and compaction base; excluded from local backups and phone sync"),
             Spec(id: "native_actions", title: "Native Actions", relativePath: "native_power/actions", detail: "native action receipts; excluded from local backups and phone sync"),
+            Spec(id: "ability_fetches", title: "Ability Request Receipts", relativePath: "ability_fetches", detail: "outcomes of an ability's modifying web requests (reads keep none), so they are never blindly repeated; excluded from off-disk backup and phone sync"),
             Spec(id: "page_shots", title: "Page Pictures", relativePath: "diagnostics/page_shots", detail: "PNG page pictures returned to callers; excluded from local and off-disk backups and phone sync"),
             Spec(id: "layout", title: "Layout", relativePath: "ui", detail: "surface layout and previous revision; off-disk backup only; no local backup or production export; phone sync projects the current layout as ui_layout.json"),
             Spec(id: "workspace_desktops", title: "Saved Desktops", relativePath: "workspace_desktops", detail: "navigation references and draft inputs; off-disk backup excludes lock and temporary sidecars; no local backup, production export, or phone sync"),
@@ -157,7 +159,7 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
             Spec(id: "production", title: "Production Artifacts", relativePath: "production", detail: "exports, support bundles, and migration records"),
             Spec(id: "logs", title: "Logs", relativePath: "logs", detail: "runtime logs and diagnostic output"),
             Spec(id: "crash_reports", title: "Crash Reports", relativePath: "crash_reports", detail: "submitted crash report payloads"),
-            Spec(id: "catalog", title: "Capability Catalog", relativePath: "catalog", detail: "catalog authority, sources, trust roots, install receipts and hidden local signing key; local backup selects registry, installs, sources and trust roots, excluding retained packs and quarantine; no raw phone snapshot"),
+            Spec(id: "catalog", title: "Capability Catalog", relativePath: "catalog", detail: "saved sources and trust roots, retained pack records, receipts and hidden pack signing key; inventory counts regular hidden files; no pack identity creation or availability projection; local backup selects registry, sources and trust roots, excluding retained packs and quarantine; no raw phone snapshot"),
             Spec(id: "capabilities", title: "Capability Files", relativePath: "capabilities", detail: "retained capability files; locally backed up; no raw phone snapshot"),
             Spec(id: "graphs", title: "Graph Files", relativePath: "graphs", detail: "retained graph files; locally backed up; no raw phone snapshot"),
             Spec(id: "routing", title: "Routing Files", relativePath: "routing", detail: "retained routing files; locally backed up; no raw phone snapshot"),
@@ -166,7 +168,7 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
             Spec(id: "experiences", title: "Experiences", relativePath: "experiences", detail: "experience SQLite store, including repair obligations; off-disk backup only; no local backup or export; phone receives work-activity projections"),
             Spec(id: "cognition", title: "Cognition", relativePath: "cognition", detail: "organism/substrate state, human-turn timing, and repair copies written by their owner; excluded from local backup and archive inputs; phone receives the living status projection"),
             Spec(id: "runs", title: "Runs", relativePath: "runs", detail: "run ledger; excluded from local backup and archive inputs; phone receives a bounded run projection"),
-            Spec(id: "turn_traces", title: "Turn Traces", relativePath: "turn_traces", detail: "turn trace JSONL, reconciliation cursor, byte-preserved repair originals, and each agent's practice ledger and tape (exact redacted bodies of nominated calls only); excluded from all backups and archive inputs; phone receives turn summaries"),
+            Spec(id: "turn_traces", title: "Turn Traces", relativePath: "turn_traces", detail: "turn trace JSONL, reconciliation cursor, byte-preserved repair originals, and retired practice ledger/tape files if present (no live reader or writer); excluded from all backups and archive inputs; phone receives turn summaries"),
             Spec(id: "build_launch", title: "Build Identity", relativePath: "build_launch.json", detail: "build and launch identity; excluded from local backup and archive inputs; no direct phone copy"),
             Spec(id: "doctor", title: "Doctor Reports", relativePath: "doctor", detail: "DoctorReadout measured reports; support copies this tree; excluded from local backup and direct phone copy; phone health.json is a separate process-health projection"),
             Spec(id: "auto_doctor", title: "Doctor Configuration", relativePath: "auto_doctor", detail: "optional Doctor scheduling configuration read by DoctorReadout; excluded from local backup, archive inputs and phone sync"),
@@ -190,6 +192,7 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
             Spec(id: "diagnostics", title: "Diagnostics", relativePath: "diagnostics", detail: "cutoff output and runtime diagnostic artifacts"),
             Spec(id: "welcome_pending", title: "Welcome Request", relativePath: ".needs_welcome", detail: "pending first-run welcome marker"),
             Spec(id: "welcome_inflight", title: "Welcome Claim", relativePath: ".needs_welcome.inflight", detail: "claimed first-run welcome marker"),
+            Spec(id: "welcome_receipt", title: "Welcome Receipt", relativePath: ".needs_welcome.receipt", detail: "completed greeting's exact session and section title; retained for progression settlement repair; off-disk backup only, excluded from local backup, production export and phone sync"),
         ]
         return specs.map { spec in
             let selected = productionExportRelativePaths.compactMap { path in
@@ -218,33 +221,50 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
 
     private static func itemSummary(_ path: URL) -> String {
         let fm = FileManager.default
-        var isDirectory: ObjCBool = false
-        guard fm.fileExists(atPath: path.path, isDirectory: &isDirectory) else {
-            return "not present"
+        let root: URLResourceValues
+        do { root = try path.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey]) }
+        catch CocoaError.fileReadNoSuchFile { return "not present" }
+        catch { return "inventory unavailable: \(error.localizedDescription); repair access to \(path.path)" }
+        if root.isDirectory == false {
+            guard let bytes = root.fileSize else { return "1 file; size unavailable" }
+            return "1 file, \(sized(Int64(bytes)))"
         }
-        if !isDirectory.boolValue {
-            let bytes = (try? fm.attributesOfItem(atPath: path.path)[.size] as? NSNumber)?.int64Value ?? 0
-            return "1 file, \(sized(bytes))"
-        }
+        guard root.isDirectory == true else { return "inventory unavailable: item type could not be read" }
+        var failures: [String] = []
         guard let enumerator = fm.enumerator(
             at: path,
-            includingPropertiesForKeys: [.isRegularFileKey]
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            errorHandler: { url, error in
+                failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
+                return true
+            }
         ) else {
-            return "directory present"
+            return "directory present; inventory unavailable; repair access to \(path.path)"
         }
         var files = 0
         var bytes: Int64 = 0
         for case let url as URL in enumerator {
             guard files < 10_000 else { break }
-            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-            guard values?.isRegularFile == true else { continue }
-            files += 1
-            bytes += Int64(values?.fileSize ?? 0)
+            do {
+                let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+                guard let regular = values.isRegularFile else {
+                    failures.append("\(url.lastPathComponent): item type unavailable")
+                    continue
+                }
+                guard regular else { continue }
+                files += 1
+                guard let size = values.fileSize else {
+                    failures.append("\(url.lastPathComponent): size unavailable")
+                    continue
+                }
+                bytes += Int64(size)
+            } catch { failures.append("\(url.lastPathComponent): \(error.localizedDescription)") }
         }
+        let incomplete = failures.isEmpty ? "" : "; incomplete inventory (\(failures.count) unreadable item(s)): \(failures.prefix(3).joined(separator: "; ")); repair access and reload"
         if files >= 10_000 {
-            return "10,000+ files, \(sized(bytes)) scanned"
+            return "10,000+ files, \(sized(bytes)) scanned; inventory capped\(incomplete)"
         }
-        return "\(files.formatted()) file\(files == 1 ? "" : "s"), \(sized(bytes))"
+        return "\(files.formatted()) file\(files == 1 ? "" : "s"), \(sized(bytes))\(incomplete)"
     }
 
     /// "47 MB": the Mac's own file sizes, not raw bytes.

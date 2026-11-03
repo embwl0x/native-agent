@@ -13,9 +13,8 @@ import Foundation
 /// grants no authority; the resolver checks the canonical owner. Runtime
 /// replay state follows the `Continuation` contract below.
 ///
-/// Old transcripts decode: every field added after v1 is optional or has a
-/// default, and an unknown `kind` or `state` decodes to `.unknown` rather
-/// than failing the row.
+/// Unknown card kinds/states remain inert `.unknown` evidence. Core identity,
+/// action and continuation fields must satisfy the current contract.
 public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
     /// Wire version of this value. Bumped only for a shape change readers
     /// must notice; additive optional fields do not bump it.
@@ -74,7 +73,11 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 
         public init(from decoder: any Decoder) throws {
             let raw = try decoder.singleValueContainer().decode(String.self)
-            self = Scope(rawValue: raw) ?? .persistent
+            guard let value = Scope(rawValue: raw) else {
+                throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath,
+                    debugDescription: "Unknown Scope: \(raw)"))
+            }
+            self = value
         }
     }
 
@@ -95,7 +98,11 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 
         public init(from decoder: any Decoder) throws {
             let raw = try decoder.singleValueContainer().decode(String.self)
-            self = AccessMode(rawValue: raw) ?? .readWrite
+            guard let value = AccessMode(rawValue: raw) else {
+                throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath,
+                    debugDescription: "Unknown AccessMode: \(raw)"))
+            }
+            self = value
         }
 
         public var wantsRead: Bool { self != .write }
@@ -256,8 +263,12 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
             case continueTurn = "continue_turn"
 
             public init(from decoder: any Decoder) throws {
-                let raw = try decoder.singleValueContainer().decode(String.self)
-                self = Mode(rawValue: raw) ?? .continueTurn
+                let c = try decoder.singleValueContainer()
+                let raw = try c.decode(String.self)
+                guard let value = Mode(rawValue: raw) else {
+                    throw DecodingError.dataCorruptedError(in: c, debugDescription: "Unsupported continuation mode: \(raw)")
+                }
+                self = value
             }
         }
 
@@ -274,9 +285,6 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
             /// landed or the turn started: it becomes a failed card the person
             /// retries by hand, or nothing at all.
             ///
-            /// Deliberately ONE wire value for both. A second one would decode
-            /// as `.waiting` on an older build — which reclaims and starts a
-            /// duplicate continuation, exactly what this state exists to stop.
             case replaying
             case resumed
             case stopped
@@ -284,8 +292,12 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
             case invalidated
 
             public init(from decoder: any Decoder) throws {
-                let raw = try decoder.singleValueContainer().decode(String.self)
-                self = ResumeState(rawValue: raw) ?? .waiting
+                let c = try decoder.singleValueContainer()
+                let raw = try c.decode(String.self)
+                guard let value = ResumeState(rawValue: raw) else {
+                    throw DecodingError.dataCorruptedError(in: c, debugDescription: "Unsupported continuation state: \(raw)")
+                }
+                self = value
             }
         }
 
@@ -574,9 +586,8 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 
     // MARK: Codable
     //
-    // Hand-written only where the shape needs it (`state` is a discriminated
-    // object). Every optional/defaulted field decodes from a v1 file that
-    // never had it — a transcript written before this build must still render.
+    // `state` is a discriminated object. Missing core evidence never creates
+    // an executable pending card; optional content remains optional.
 
     private enum CodingKeys: String, CodingKey {
         case version, id, revision, kind, target, additionalTargets, mode, title, why
@@ -593,39 +604,44 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        version = try container.decodeIfPresent(Int.self, forKey: .version)
-            ?? InlineInteraction.currentVersion
+        version = try container.decode(Int.self, forKey: .version)
+        guard version == InlineInteraction.currentVersion else {
+            throw DecodingError.dataCorruptedError(forKey: .version, in: container, debugDescription: "Unsupported interaction version \(version)")
+        }
         id = try container.decode(String.self, forKey: .id)
-        revision = try container.decodeIfPresent(Int.self, forKey: .revision) ?? 1
+        revision = try container.decode(Int.self, forKey: .revision)
         kind = try container.decode(Kind.self, forKey: .kind)
-        target = try container.decodeIfPresent(String.self, forKey: .target) ?? ""
+        target = try container.decode(String.self, forKey: .target)
         additionalTargets = try container.decodeIfPresent([String].self, forKey: .additionalTargets) ?? []
         mode = try container.decodeIfPresent(AccessMode.self, forKey: .mode)
-        title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
-        why = try container.decodeIfPresent(String.self, forKey: .why) ?? ""
-        primaryActionLabel = try container.decodeIfPresent(String.self, forKey: .primaryActionLabel) ?? "Continue"
+        title = try container.decode(String.self, forKey: .title)
+        why = try container.decode(String.self, forKey: .why)
+        primaryActionLabel = try container.decode(String.self, forKey: .primaryActionLabel)
         secondaryActionLabel = try container.decodeIfPresent(String.self, forKey: .secondaryActionLabel)
-        declineConsequence = try container.decodeIfPresent(String.self, forKey: .declineConsequence) ?? ""
+        declineConsequence = try container.decode(String.self, forKey: .declineConsequence)
         persistenceNote = try container.decodeIfPresent(String.self, forKey: .persistenceNote)
         cardProse = try container.decodeIfPresent(String.self, forKey: .cardProse)
         options = try container.decodeIfPresent([Option].self, forKey: .options) ?? []
         primaryScope = try container.decodeIfPresent(Scope.self, forKey: .primaryScope)
-        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
         settledAt = try container.decodeIfPresent(Date.self, forKey: .settledAt)
         continuation = try container.decodeIfPresent(Continuation.self, forKey: .continuation)
         secret = try container.decodeIfPresent(SecretAsk.self, forKey: .secret)
-        let wire = try container.decodeIfPresent(WireState.self, forKey: .state)
-            ?? WireState(name: "pending", outcome: nil, reason: nil)
+        let wire = try container.decode(WireState.self, forKey: .state)
         switch wire.name {
         case "pending": state = .pending
         case "running": state = .running
         case "settled":
-            // A settled state whose outcome did not survive is still settled;
-            // an empty receipt is honest, a re-opened card is not.
-            state = .settled(wire.outcome ?? Outcome(summary: ""))
+            guard let outcome = wire.outcome else {
+                throw DecodingError.dataCorruptedError(forKey: .state, in: container, debugDescription: "Settled interaction has no outcome")
+            }
+            state = .settled(outcome)
         case "declined": state = .declined
-        case "failed": state = .failed(reason: wire.reason ?? "")
-        case "stopped": state = .stopped(reason: wire.reason ?? "")
+        case "failed", "stopped":
+            guard let reason = wire.reason else {
+                throw DecodingError.dataCorruptedError(forKey: .state, in: container, debugDescription: "Terminal interaction has no reason")
+            }
+            state = wire.name == "failed" ? .failed(reason: reason) : .stopped(reason: reason)
         case "superseded": state = .superseded
         default: state = .unknown(wire.name)
         }

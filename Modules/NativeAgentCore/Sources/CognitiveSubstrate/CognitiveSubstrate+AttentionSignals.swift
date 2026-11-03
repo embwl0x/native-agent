@@ -116,7 +116,7 @@ extension CognitiveSubstrate {
     ///     (id/label = tool name).
     ///   - NativeCognitionRuntime event factory: `chat_turn` (id =
     ///     `<session>:<message>`, label = "<surface> <role>"), `provider`,
-    ///     `approval`, `mission_step`, `memory_proposal`, `promotion_candidate`,
+    ///     `approval`, `execution_step`, `memory_proposal`, `promotion_candidate`,
     ///     `inbox_item`, `chat_session`, `remote_action`, `ios_action`.
     ///   - Memory-derived nodes: `memory` / `memory_record` (id = record id, an
     ///     opaque digest) — excluded here because their record id is surfaced
@@ -127,7 +127,7 @@ extension CognitiveSubstrate {
         "chat", "chat_turn", "chat_session",
         "chat.user_turn", "chat.assistant_turn", "chat.session", "chat.surface",
         "tool", "provider", "approval",
-        "mission_step", "memory_proposal", "promotion_candidate",
+        "execution_step", "memory_proposal", "promotion_candidate",
         "inbox_item", "remote_action", "ios_action", "app", "image",
         "memory", "memory_record",
     ]
@@ -151,7 +151,7 @@ extension CognitiveSubstrate {
         }
         let candidate = (subject.label ?? subject.id).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !candidate.isEmpty else { return nil }
-        // A ":"-composite is a machine handle (session:message, missionId:stepId).
+        // A ":"-composite is a machine handle (session:message, executionId:stepId).
         if candidate.contains(":") { return nil }
 
         let cleaned = candidate

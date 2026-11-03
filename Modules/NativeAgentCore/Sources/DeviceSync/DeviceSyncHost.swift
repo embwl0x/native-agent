@@ -7,7 +7,7 @@ import MemoryV2
 import NativeAgentShared
 import NotificationInbox
 import Transcripts
-// Blueprint: | `DeviceSyncHost.swift` | Engine snapshot/action seam; transcript timestamps bound read-only other-room exchanges to shown history; message owners omit previews for transport budgets |
+// Blueprint: | `DeviceSyncHost.swift` | Engine snapshot/action seam; surface layout carries checked value or owning path/repair failure to the phone; transcript timestamps bound read-only other-room exchanges to shown history; message owners omit previews for transport budgets |
 
 /// Snapshot rows whose type the app's mirrors still own. Device sync only
 /// encodes them, with the snapshot encoder, so the phone's bytes are the app
@@ -17,13 +17,11 @@ public typealias DeviceSyncSnapshotRows = any Encodable & Sendable
 /// What a Workshop submission hands back to the phone.
 public struct DeviceSyncWorkshopSubmission: Sendable {
     public var executionId: String?
-    public var id: String?
     public var desk_handle: String?
     public var desk_alias: String?
 
-    public init(executionId: String?, id: String?, desk_handle: String?, desk_alias: String?) {
+    public init(executionId: String?, desk_handle: String?, desk_alias: String?) {
         self.executionId = executionId
-        self.id = id
         self.desk_handle = desk_handle
         self.desk_alias = desk_alias
     }
@@ -45,7 +43,7 @@ public protocol DeviceSyncHost: Sendable {
     func getChatSessions() async throws -> [NativeAgentShared.ChatSession]
     func getChatTranscriptGenerations() async throws -> [String: Int?]
     @MainActor func sessionNavigation(for sessions: [NativeAgentShared.ChatSession]) -> ChatSessionNavigation
-    @MainActor func surfaceLayout() -> SurfaceLayout
+    @MainActor func surfaceLayout() -> SurfaceLayoutAvailability
     func getChatMessages(sessionId: String) async throws -> [ChatMessageRecord]
     func getOtherRoomExchanges() async throws -> [OtherRoomExchange]
     func getHealth() async throws -> RuntimeHealth

@@ -82,8 +82,14 @@ package enum PersonaSystemActions {
 
     static func personaListSkills(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         let verbose = boolField(input["verbose"])
-        let limit = intOrZero(input["limit"])
-        let offset = intOrZero(input["offset"])
+        func pagingInteger(_ name: String) -> Int? {
+            guard let value = input[name] else { return 0 }
+            guard case .int(let number) = value else { return nil }
+            return Int(exactly: number)
+        }
+        guard let limit = pagingInteger("limit"), let offset = pagingInteger("offset") else {
+            return FileSystemActions.errResult("limit and offset must be representable integers, or omitted.", code: "bad_input")
+        }
 
         let dataRoot = dataRootURL(ctx)
         var records: [String: PersonaEngine.SkillRecord] = [:]
@@ -209,17 +215,17 @@ package enum PersonaSystemActions {
         for child in children {
             let name = child.lastPathComponent
             if name == ".gitkeep" { continue }
-            var cIsDir: ObjCBool = false
-            _ = fm.fileExists(atPath: child.path, isDirectory: &cIsDir)
-            let isDirectory = cIsDir.boolValue
-            // Directories and unreadable metadata report zero bytes.
-            var size: Int64 = 0
-            if !isDirectory {
-                if let attrs = try? fm.attributesOfItem(atPath: child.path),
-                   let s = attrs[.size] as? NSNumber {
-                    size = s.int64Value
-                }
+            let attrs: [FileAttributeKey: Any]
+            do { attrs = try fm.attributesOfItem(atPath: child.path) }
+            catch { return .object(["ok": .bool(false), "status": .string("unavailable"),
+                "error": .string("Metadata for \(child.path) could not be read: \(error.localizedDescription)")]) }
+            guard let type = attrs[.type] as? FileAttributeType,
+                  let bytes = attrs[.size] as? NSNumber else {
+                return .object(["ok": .bool(false), "status": .string("unavailable"),
+                    "error": .string("Metadata for \(child.path) has no file type or size. Read the folder again.")])
             }
+            let isDirectory = type == .typeDirectory
+            let size: Int64 = isDirectory ? 0 : bytes.int64Value
             entries.append(Entry(isDir: isDirectory, name: name, size: size))
         }
         entries.sort { a, b in
@@ -357,22 +363,6 @@ private func boolField(_ v: JSONValue?) -> Bool {
     case .double(let d): return d != 0
     case .string(let s): return !s.isEmpty
     default: return false
-    }
-}
-
-/// Numbers and numeric strings truncate toward zero, booleans map to 0/1, and absent or invalid values yield zero.
-private func intOrZero(_ v: JSONValue?) -> Int {
-    switch v ?? .null {
-    case .null: return 0
-    case .int(let i): return Int(i)
-    case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? 0
-    case .string(let s):
-        if s.isEmpty { return 0 }
-        if let i = Int(s) { return i }
-        if let dd = Double(s) { return Int(exactly: dd.rounded(.towardZero)) ?? 0 }
-        return 0
-    case .bool(let b): return b ? 1 : 0
-    default: return 0
     }
 }
 

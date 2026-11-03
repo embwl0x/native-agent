@@ -77,6 +77,7 @@ struct DeskPageView: View {
                         showingNags = true
                     }
                     .accessibilityValue(nagConfig.isMuted(now: now) ? "Muted" : nagConfig.enabled ? "On" : "Off")
+                    .disabled(snapshot.nagConfigError != nil)
                     .popover(isPresented: $showingNags) {
                         DeskNagsPanel(items: items, selectedHandle: selectedHandle,
                                       selectedTitle: selectedItem?.title, perform: { perform($0) },
@@ -197,7 +198,9 @@ struct DeskPageView: View {
                 }
                 if let item = selectedItem {
                     DeskItemInspector(item: item, items: items, plan: snapshot.plan,
-                                      now: now, isBusy: actionInFlight != nil, mode: inspectorMode,
+                                      now: now,
+                                      pursuitSessionsToday: snapshot.board?.deskState?.pursuitWorkSessions(on: DeskClock.dayStamp(now), handle: item.handle),
+                                      isBusy: actionInFlight != nil, mode: inspectorMode,
                                       perform: { perform($0) },
                                       addNote: { text, completion in
                                           perform(.note(handle: item.handle, text: text), completion: completion)
@@ -335,6 +338,8 @@ struct DeskPageView: View {
     private var laneTrouble: [String] {
         var out: [String] = []
         if let liveUpdateError { out.append(liveUpdateError) }
+        if let detail = snapshot.nagConfigError { out.append(detail) }
+        if let detail = snapshot.botScheduleError { out.append(detail) }
         if snapshot.deskUnavailable != nil {
             out.append("I couldn't read the board just now, so this page is short a section.")
         }

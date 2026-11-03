@@ -18,6 +18,7 @@ public struct AgentContactRow: Identifiable, Sendable {
     public var health: AgentLocalHealth?
     /// Read once when the row is built (a Keychain read), not on every redraw.
     public var credentialAvailable = true
+    public var credentialFailure: ToolFailureError?
     public var elevationFailure: ToolFailureError?
     public var state: AgentPeerContactState?
 
@@ -79,10 +80,10 @@ public struct AgentContactRow: Identifiable, Sendable {
     }
 
     /// The same canonical contact identities as People, retaining each door's grants.
-    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], dataRoot: URL, everyDoor: Bool = false) -> [Self] {
+    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], dataRoot: URL, everyDoor: Bool = false) throws -> [Self] {
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
-        let identity = AgentContactIdentity(dataRoot: dataRoot)
-        let health = AgentContactHealth.read(dataRoot: dataRoot)
+        let identity = try AgentContactIdentity(dataRoot: dataRoot, peers: peers)
+        let health = try AgentContactHealth.read(dataRoot: dataRoot)
         let all = rows(peers: peers, candidates: candidates, everyDoor: true).map { row in
             var row = row
             row.health = health[row.key]
@@ -113,10 +114,17 @@ public struct AgentContactRow: Identifiable, Sendable {
     public static func rows(peers: [AgentPeerContact], installed: [AgentHostRow], everyDoor: Bool = false) -> [Self] {
         let configured = Set(peers.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
         return peers.filter { peer in everyDoor || !peers.contains { $0.id == peer.who } }.map { peer in
-            let available = AgentPeerCredentials.isAvailable(peer, peers: peers)
+            let availability = AgentPeerCredentials.availability(peer, peers: peers)
+            let available: Bool
+            let failure: ToolFailureError?
+            switch availability {
+            case .success(let value): available = value; failure = nil
+            case .failure(let error): available = false; failure = error
+            }
             let who = peers.first { $0.id == peer.who }
             return Self(id: "peer:" + peer.id, name: who.map { $0.name + " · " + peer.name } ?? peer.name, contact: peer,
-                        credentialAvailable: available, elevationFailure: peer.elevationUnavailable(peers: peers, available: available),
+                        credentialAvailable: available, credentialFailure: failure,
+                        elevationFailure: peer.elevationUnavailable(peers: peers, availability: availability),
                         state: available ? peer.state : .unavailable)
         }
             + installed.filter { !configured.contains($0.id) }
@@ -129,6 +137,7 @@ public struct AgentContactRow: Identifiable, Sendable {
 
     /// The one word the row's pill carries; the full status stays below it.
     public var pillWord: String {
+        if credentialFailure != nil { return "Unavailable" }
         if candidate?.setupFailure != nil { return "Unavailable" }
         if let word = health?.problemWord { return word }
         if let health, AgentLocalHealth.presenceStatuses.contains(health.status) { return health.word ?? "Not checked" }
@@ -145,6 +154,7 @@ public struct AgentContactRow: Identifiable, Sendable {
     }
 
     public var status: String {
+        if let failure = credentialFailure { return failure.localizedDescription }
         if let failure = candidate?.setupFailure { return failure }
         if let health, let problem = health.problem { return problem + (health.presenceDetail.map { " · " + $0 } ?? "") }
         if let health, AgentLocalHealth.presenceStatuses.contains(health.status) { return health.detail }

@@ -1,4 +1,5 @@
 import Foundation
+import MacControl
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
@@ -53,7 +54,7 @@ extension BuiltInToolSchemaFactory {
                     description: "Search inside local text files for lines matching a pattern or phrase. Returns bounded matching text with file paths, line numbers and explicit coverage; narrow the path/pattern when results are limited. Available only when Full Mac file access is active.",
                     parametersJSON: ToolSchema.params(
                         properties: [
-                            ("pattern", ToolSchema.strSchema("Regex/search pattern.")),
+                            ("pattern", ToolSchema.strSchema("POSIX extended regular expression, matched byte-wise by macOS grep (C locale). Recursive searches skip .git, .build, DerivedData*, node_modules and supported repository-root .gitignore basename globs; path-specific and nested rules are not applied. Other hidden text files remain searchable. Binary files and recursive symlinks are skipped. Unreadable children and undecodable matched lines appear as named gaps; readable siblings remain. A 30-second deadline returns partial coverage, even with no matches.")),
                             ("path", ToolSchema.strSchema("Directory or file to search. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace.")),
                             ("max_results", ToolSchema.intSchema("Maximum selected result lines, default/cap 50. Inspect coverage: a reached limit is not a total count. Narrow path/pattern to recover omitted matches; output is bounded to 30000 characters and engine capture to 1 MiB.")),
                         ],
@@ -140,10 +141,10 @@ extension BuiltInToolSchemaFactory {
                 requestedSchema(
                     name: "git",
                     toolClass: .write, reach: .his, capabilities: ["filesystem_write", "outside_app_data_write", "process_spawn", "shell", "tool_call"],
-                    description: "Run git with explicit args. Equivalent to `git <args>`. Returns stdout/stderr/exit_code. Default cwd is a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace. Default timeout 60s.Args may be an array (preferred) or a shell-style string for forgiving model calls. Mutating ops remain autonomy-gated.",
+                    description: "Run git with an explicit argv array. Returns stdout/stderr/exit_code. Default cwd is a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace. Default timeout 60s. Mutating ops remain autonomy-gated.",
                     parametersJSON: ToolSchema.params(
                         properties: [
-                            ("args", stringOrStringArraySchema("Required. Full argv to pass to git. Prefer ['status'], ['log','--oneline','-5'], ['diff','HEAD~1','HEAD']; a string like 'status --short' is also accepted.")),
+                            ("args", stringArraySchema("Required exact argv, including empty arguments, e.g. ['status','--short'].", minItems: 1)),
                             ("cwd", ToolSchema.strSchema("Optional existing working directory. Relative paths resolve in the canonical NativeAgent workspace/source checkout. Active Full Mac may select an ordinary absolute external project; sensitive authority and protected system paths remain denied.")),
                             ("timeout_seconds", ToolSchema.intSchema("Optional. Default 60, max 600.")),
                         ],
@@ -247,11 +248,11 @@ extension BuiltInToolSchemaFactory {
             schemas.append(requestedSchema(
                 name: "mac_media",
                 toolClass: .write, reach: .his,
-                description: "Control the Mac's Now Playing app with a system media key: play/pause, next or previous across Music, Spotify, browsers and podcasts. Play/pause is a toggle; the receipt reports the key sent and observed Music/Spotify states without claiming an unknown app's playback state. Requires Full Mac system access; never launches Music or Spotify to read their states.",
+                description: "Control the Mac's live Now Playing app with a system media key: toggle, next or previous across Music, Spotify, browsers and podcasts. The player process must be known and obeys its integration's Write switch where one exists. The receipt names the observed player and key sent without confirming playback. Requires Full Mac system access; never launches a player to resolve it. For idempotent play, resume or pause use the player's own action.",
                 parametersJSON: ToolSchema.params(properties: [
                     ("action", ToolSchema.obj([("type", .string("string")),
                         ("enum", .array(["play", "resume", "pause", "toggle", "next", "skip", "previous"].map(JSONValue.string))),
-                        ("description", .string("play / resume / pause / toggle send the play-pause key; next / skip send next; previous sends previous."))])),
+                        ("description", .string("toggle sends the play-pause key; next / skip send next; previous sends previous. play / resume / pause refuse rather than toggle an unknown playback state."))])),
                 ], required: ["action"])
             ))
             schemas.append(requestedSchema(
@@ -315,7 +316,7 @@ extension BuiltInToolSchemaFactory {
                         properties: [
                             ("path", ToolSchema.strSchema("Optional: read this file instead of the screen — an absolute path to a PDF or a plain-text file. Omit it to read the live window’s text, including unsaved edits.")),
                             ("app", ToolSchema.strSchema("Read this running app’s window without activating, raising or launching it, e.g. Preview. Missing/ambiguous app: use the failure’s cause and remedy. Ignored with path, which reads the file.")),
-                        ],
+                        ] + ToolSchema.senseViewProperties,
                         required: []
                     )
                 ),
@@ -326,7 +327,6 @@ extension BuiltInToolSchemaFactory {
                     description: "Read a bounded accessibility view and screenshot of the frontmost window. marks numbers selected clickable/scrollable elements with role, label, value, state, frame and element path; text contains selected reading-order text. Caps: 60 marks, 80 text items, plus node/depth/image limits; this is not complete window coverage. Read structure first, image for spatial context. Read-only. Marks belong to the latest view; after possible change, read mac.view again. Requires Full Mac Accessibility; screenshot also needs macOS Screen Recording. Without that grant, the legend remains and the missing image is reported.",
                     parametersJSON: ToolSchema.params(
                         properties: [
-                            ("full_screen", ToolSchema.boolSchema("Capture the whole display instead of just the frontmost window. Defaults to false (the focused window).")),
                             ("max_marks", ToolSchema.intSchema("Maximum number of elements to number. Clamped to the view's own cap (60); omit for the default.")),
                             ("max_text_items", ToolSchema.intSchema("Maximum lines of on-screen text to return. Clamped to the view's own cap (80); omit for the default.")),
                             ("max_image_bytes", ToolSchema.intSchema("Maximum encoded PNG size. The image is downscaled to fit; clamped to the view's own cap. Omit for the default.")),
@@ -340,7 +340,7 @@ extension BuiltInToolSchemaFactory {
                 requestedSchema(
                     name: "screen",
                     toolClass: .read, reach: .his, capabilities: ["tool_call"],
-                    description: "Look at the live screen now. Default: a structured page in words — SCREEN (app/window), WHERE (navigation), LIST/GRID or CANVAS, DO (controls), SAYS (status). Address a numbered row as 'row 3' (a bare number means a control labeled with it); look again for fresh evidence. Pass part to inspect a section or thing; part: menu reads the app's menu bar. Pass app to read another running app's window without activating it; act with the same app works there in the background. Structured reads of NativeAgent itself are refused because self Accessibility reads deadlock; use app (desk.read, mind.inner_state, agent.introspect) for internal state. When a window's accessibility is thin (canvas, game, video), screen attaches one small image of just that window; part: 'visual region N' crops to that region. For actual visible desktop pixels, use pixels:true with no app or part. That capture reads the other windows through Accessibility only to find secret fields (passwords, card codes, keys), which it masks; a window it cannot fully inspect, including NativeAgent's own, is masked in full. It does not claim an action succeeded just because a screenshot was captured. A window read's detail carries last_input (hers, person or unknown) and person_idle_seconds (how long the person has been idle, never counting your own input by any route; left out while unknown, as when the person hasn't been seen since launch or Secure Input hides typing), plus permission: input_monitoring_needed when macOS does not yet let NativeAgent tell them apart; check it before bringing an app forward.",
+                    description: "Look at the live screen now. Default: a structured page in words — SCREEN (app/window), WHERE (navigation), LIST/GRID or CANVAS, DO (controls), SAYS (status). Address a numbered row as 'row 3' (a bare number means a control labeled with it); look again for fresh evidence. Pass part to inspect a section or thing; part: menu reads the app's menu bar. Pass app to read a named app without activating it. A stopped app succeeds with status:ok, app and running:false; a running app with no readable window succeeds with running:true, windows:0 and any cheaply readable menus. Nothing is launched or opened. Act with the same app works there in the background when its target is available. Structured reads of NativeAgent itself are refused because self Accessibility reads deadlock; use app (desk.read, mind.inner_state, agent.introspect) for internal state. When a window's accessibility is thin (canvas, game, video), screen attaches one small image of just that window; part: 'visual region N' crops to that region. For actual visible desktop pixels, use pixels:true with no app or part. That capture reads the other windows through Accessibility only to find secret fields (passwords, card codes, keys), which it masks; a window it cannot fully inspect, including NativeAgent's own, is masked in full. It does not claim an action succeeded just because a screenshot was captured. A window read's detail carries last_input (hers, person or unknown) and person_idle_seconds (how long the person has been idle, never counting your own input by any route; left out while unknown, as when the person hasn't been seen since launch or Secure Input hides typing), plus permission: input_monitoring_needed when macOS does not yet let NativeAgent tell them apart; check it before bringing an app forward.",
                     parametersJSON: ToolSchema.params(
                         properties: [
                             ("pixels", ToolSchema.boolSchema("Set true for actual primary-desktop pixels to verify visual outcomes, including overlapping windows and Liquid Glass. Secret fields are masked; a window that cannot be fully inspected through Accessibility, including NativeAgent's own, is masked in full. Requires existing Full Mac read authority and Screen Recording permission. No focus change or permission prompt. With app or part it instead attaches that window's or region's image even when its accessibility is rich. Image is transient and bounded so you see it at the receipt's own size (short side ≤ 768 px); capture success is not action verification. Default false keeps the structured screen read.")),
@@ -348,8 +348,8 @@ extension BuiltInToolSchemaFactory {
                             ("__sense_screen_frame", ToolSchema.strSchema("The frozen screen identity from More. Pass the entire More object as mac.look args to continue that page with its original handles.")),
                             ("__sense_text_offset", ToolSchema.intSchema("The reading position from More; pass it unchanged with __sense_screen_frame and app.")),
                             ("part", ToolSchema.strSchema("Optional: a section, thing, or status readout to inspect by name. Use hud/readouts for observed status values, or a label such as Last drag or Energy to reveal a readout hidden by the ordinary display cap.")),
-                            ("app", ToolSchema.strSchema("Optional: read this running app's front window instead of whatever is in front, without activating it (\"Mail\", \"Safari\"). If nothing by that name is running, or the name matches more than one, the answer says so and names what is running.")),
-                        ],
+                            ("app", ToolSchema.strSchema("Optional: observe this app instead of whatever is in front, without activating it (\"Mail\", \"Safari\"). A stopped app is a successful running:false observation; a running app with no readable window reports running:true, windows:0. An ambiguous name still requires clarification.")),
+                        ] + ToolSchema.senseViewProperties,
                         required: []
                     )
                 ),
@@ -396,7 +396,6 @@ extension BuiltInToolSchemaFactory {
                             ("after_sequence", ToolSchema.intSchema("For next: wait only for activity newer than this attention sequence.")),
                             ("wait_ms", ToolSchema.intSchema("For next: event-driven wait before refreshing anyway, 0-15000ms. Defaults to 1500.")),
                             ("duration_seconds", ToolSchema.intSchema("For start: bounded observer lifetime, 15-1800 seconds. Defaults to 300.")),
-                            ("full_screen", ToolSchema.boolSchema("Capture the whole display instead of the focused window.")),
                             ("max_marks", ToolSchema.intSchema("Maximum numbered elements, with the same cap as mac.view.")),
                             ("max_text_items", ToolSchema.intSchema("Maximum visible text items, with the same cap as mac.view.")),
                             ("max_image_bytes", ToolSchema.intSchema("Maximum encoded PNG bytes, with the same cap as mac.view.")),
@@ -428,24 +427,41 @@ extension BuiltInToolSchemaFactory {
             ])
         }
         if includeFullMacAccessibilityInjectionTools {
+            let holding = ToolSchema.strSchema("Optional keys/modifiers held around a physical action, such as `w d`, `shift`, or `cmd+w`. Works with pointer hold, including right-button hold while movement keys are down. Not valid with a keyboard hold (put all keys in its target) or literal type.")
+            let button = ToolSchema.enumStringSchema(["auto", "left", "right"], "Use auto for the ordinary/default action, including key, type, scroll, move, and hover. Use left or right only to request an explicit mouse button on click, open (double-click), drag, or pointer hold. Right drag sends genuine right-button events, not Control-left-drag. Omission is equivalent to auto.")
             let point: [(String, JSONValue)] = [
                 ("type", .string("object")),
                 ("properties", ToolSchema.obj([("x", numSchema("Image pixels from the left edge.")), ("y", numSchema("Image pixels from the top edge."))])),
                 ("required", .array([.string("x"), .string("y")])),
             ]
-            let at = ToolSchema.obj(point + [("description", .string("Instead of a target: a point in pixels of an image a screen call handed you; click, double_click, right_click, hover, move or hold lands there."))])
+            let at = ToolSchema.obj(point + [("description", .string("Instead of a target: a point in pixels of an image a screen call handed you; click, type (click then type into the focused editor), double_click, right_click, hover, move or hold lands there."))])
             let from = ToolSchema.obj(point + [("description", .string("For drag by point: where it starts, in pixels of the image; give `to` as a point too."))])
-            let image = ToolSchema.strSchema("The screen observation's reference (frame_id and image.id are the same). With at/from: its delivered image's pixels. Omitted: the latest screen image this session was handed.")
+            let image = ToolSchema.strSchema("The screen observation's reference (frame_id and image.id are the same). With at/from: its delivered image's pixels. Omitted: the latest screen image this session was handed. Moved, resized, replaced or covered windows, changed controls, and missing capture-time control identity refuse the old point; take a fresh image.")
+            let screenAddress = ToolSchema.obj([
+                ("type", .string("object")),
+                ("properties", ToolSchema.obj([
+                    ("handle", ToolSchema.strSchema()), ("frame_id", ToolSchema.strSchema()),
+                    ("app", ToolSchema.strSchema()), ("target", ToolSchema.strSchema()),
+                    ("__sense_screen_frame", ToolSchema.strSchema()), ("label", ToolSchema.strSchema()),
+                ])),
+                ("anyOf", .array([
+                    ToolSchema.obj([("required", .array([.string("handle"), .string("frame_id")]))]),
+                    ToolSchema.obj([("required", .array([.string("app"), .string("target"), .string("__sense_screen_frame")]))]),
+                ])),
+            ])
             schemas.append(contentsOf: [
                 requestedSchema(
                     name: "act",
                     toolClass: .write, reach: .his, capabilities: ["ax_injection", "mac_control", "tool_call"],
-                    description: "Act by name/visible ordinal against a fresh screen, or run up to 12 steps in order. Steps accept names, menu paths, key chords or {verb,target,text,mode}; each reads/verifies afresh, stops on first failure and returns a receipt line. A trailing ? skips an absent optional target. Example: app:'TextEdit', front:true, steps:['Format > Make Plain Text','OK?','cmd+s',{verb:'type',target:'Save As',text:'hello.txt'},'cmd+d','return'] (cmd+d selects Desktop in a save dialog). Named controls use accessibility; unlabeled visual regions accept physical gestures only. For points, use at:{x,y}, or drag from:{x,y} to:{x,y}, in the delivered image’s pixels; image defaults to this conversation’s latest screen image. The receipt reports the mapped screen point; repeat/to_app do not apply to point acts. Named type defaults to replace; append preserves verified prior text and inserts exactly text at its verified end (include newlines). Unverifiable append refuses. Targetless type uses current focus in replace mode; when accessibility cannot set text, it uses keystrokes. repeat re-resolves each attempt and stops on ambiguity, drift, disappearance or time limit. holding wraps physical input in held keys/modifiers. Parameter help retains each gesture’s controls. With app behind, accessibility acts in the background; menus/keys/real input stop with needs_front unless the task explicitly requests front:true, which restores the previous front app afterward. Shotgun may bring the app forward. Requires Full Mac Accessibility app control; no per-call approval.",
+                    description: "Act by name/visible ordinal against a fresh screen, or run up to 12 steps in order. Steps accept names, menu paths, key chords, {verb,target,text,mode}, or {verb,handle,frame_id}; handle steps re-resolve the recorded identity live, stopping when it disappears or changes; each reads/verifies afresh, stops on first failure and returns a receipt line. A trailing ? skips an absent optional target. Example: app:'TextEdit', front:true, steps:['Format > Make Plain Text','OK?','cmd+s',{verb:'type',target:'Save As',text:'hello.txt'},'cmd+d','return'] (cmd+d selects Desktop in a save dialog). Named controls use accessibility; unlabeled visual regions accept physical gestures only. For points, use at:{x,y}, or drag from:{x,y} to:{x,y}, in the delivered image’s pixels; image defaults to this conversation’s latest screen image. The receipt reports the mapped screen point; repeat/to_app do not apply to point acts. Named type defaults to replace; append preserves verified prior text and inserts exactly text at its verified end (include newlines). Unverifiable append refuses. type with at clicks there then types into the editor that takes focus. Targetless type uses current editable focus in replace mode, even with frame_id and no handle. An unreadable editor receives keys with an unverified receipt and a pixel look offered; unknown or noneditable focus refuses. A bare scroll targets the window’s main content. Key chords post keys directly. repeat re-resolves each attempt and stops on ambiguity, drift, disappearance or time limit. holding wraps physical input in held keys/modifiers. Parameter help retains each gesture’s controls. With app behind, accessibility acts in the background; menus/keys/real input stop with needs_front unless the task explicitly requests front:true, which restores the previous front app afterward. Shotgun may bring the app forward. Requires Full Mac Accessibility app control; no per-call approval.",
                     parametersJSON: ToolSchema.params(
                         properties: [
-                            ("verb", ToolSchema.enumStringSchema(["click", "double_click", "right_click", "open", "type", "select", "toggle", "scroll", "dismiss", "hover", "move", "drag", "hold", "key", "press"], "What to do. press = key for a key/chord (cmd+s, return), click for a named control. double_click and right_click are the real mouse gestures.")),
-                            ("target", ToolSchema.strSchema("The thing, by name as the screen shows it — a label, a partial label, an ordinal like 'row 3', or a numbered unlabeled target like 'visual region 2'. For hold, `key w d` holds W and D simultaneously for seconds; space-separated keys/chords and bare modifiers are supported. For key, a space-separated sequence remains sequential.")),
-                            ("handle", ToolSchema.strSchema("Exact control from screen structured:true, with its frame_id. Native verb enum permits click, open, type, select, toggle, scroll (press aliases click); no physical gesture options. Workspace selections additionally support focus; this native schema does not expose it. A stale handle requires a fresh screen read; no name substitution or repeated action.")),
+                            ("verb", ToolSchema.enumStringSchema(MacFourVerbs.actionVerbs, "What to do. focus sets accessibility focus on a control that offers it. press = key for a key/chord (cmd+s, return), click for a named control. double_click and right_click are the real mouse gestures.")),
+                            ("target", ToolSchema.obj([
+                                ("anyOf", .array([ToolSchema.strSchema(), screenAddress])),
+                                ("description", .string("Omit for scroll of main content or replace-mode type into editable focus. Otherwise the name as the screen shows it, or the complete target object returned by that screen (handle/frame_id or a native-surface address). For hold, `key w d` holds W and D simultaneously for seconds; for key, a space-separated sequence remains sequential.")),
+                            ])),
+                            ("handle", ToolSchema.strSchema("Exact control from screen structured:true, with its frame_id. Supports " + MacFourVerbs.selectionVerbs.joined(separator: ", ") + " on that same live element (press aliases click); no name, point, repeat or other gesture options. A stale handle requires a fresh screen read; no name substitution or repeated action.")),
                             ("frame_id", ToolSchema.strSchema("The screen observation's reference, shared by handles and image pixels; image is an alias. Required with handle. Old handles are refused; read the screen again to get current choices.")),
                             ("text", ToolSchema.strSchema("For `type`: the literal text. Append adds exactly this text; include a newline when needed.")),
                             ("mode", ToolSchema.enumStringSchema(["replace", "append"], "For named `type`: replace (default) keeps form-fill behavior and may replace the whole value; append inserts at the verified end, preserves prior text, and never sets the whole value. Append requires a named accessibility text target and verified contents/end; otherwise it refuses. Omit or use replace for other verbs.")),
@@ -460,19 +476,22 @@ extension BuiltInToolSchemaFactory {
                             ("steps", ToolSchema.obj([
                                 ("type", .string("array")),
                                 ("maxItems", .int(12)),
-                                ("description", .string("Optional: up to 12 acts in ONE call, in order — [\"AC\",\"9\",\"×\",\"8\",\"=\"] (a string presses/clicks that name, a menu path like 'File > Save', or a key/chord) or {verb, target, text, mode}. Each step reads the window fresh and is verified; it stops at the first failure and says which step. With steps, verb/target/mode are ignored at the top level; each step chooses its own mode (replace by default), and app/front apply to all.")),
+                                ("description", .string("Optional: up to 12 acts in ONE call, in order — [\"AC\",\"9\",\"×\",\"8\",\"=\"] (a string presses/clicks that name, a menu path like 'File > Save', or a key/chord) or {verb, target, text, mode}, or {verb,handle,frame_id}. A handle records control identity; each step resolves it live in its recorded window and stops if it cannot be confirmed. frame_id may be inherited from the call. Each step reads the window fresh and is verified; it stops at the first failure and says which step. With steps, verb/target/mode are ignored at the top level; each step chooses its own mode (replace by default), and app/front apply to all.")),
                                 ("items", ToolSchema.obj([("anyOf", .array([
                                     ToolSchema.obj([("type", .string("string"))]),
                                     ToolSchema.obj([
                                         ("type", .string("object")),
                                         ("properties", ToolSchema.obj([
-                                            ("verb", ToolSchema.strSchema("click, double_click, right_click, open, type, select, toggle, scroll, dismiss, key or press.")),
-                                            ("target", ToolSchema.strSchema("The name, as the screen shows it. Required for append; omit only for replace-mode type into whatever has focus, or when at/from gives a point.")),
+                                            ("verb", ToolSchema.strSchema(MacFourVerbs.actionVerbs.joined(separator: ", ") + ". The same verbs and synonyms as a single act.")),
+                                            ("handle", ToolSchema.strSchema("Control identity from structured screen, with frame_id here or inherited from the call. Supports the same handle verbs as a single act, including double_click, right_click and hover; no target, point or other gesture options. Each step resolves that identity on the live screen.")),
+                                            ("target", ToolSchema.strSchema("The name, as the screen shows it. Required for append; omit for scroll of the main content, replace-mode type into editable focus, a handle selection, or when at/from gives a point.")),
                                             ("to", ToolSchema.obj([("anyOf", .array([ToolSchema.strSchema(), ToolSchema.obj(point)])), ("description", .string("For drag: the named destination, or with `from` a point {x, y} in image pixels."))])),
                                             ("at", at),
                                             ("from", from),
                                             ("image", image),
                                             ("frame_id", image),
+                                            ("holding", holding),
+                                            ("button", button),
                                             ("text", ToolSchema.strSchema("For type: the literal text; include a newline when append should add a line.")),
                                             ("mode", ToolSchema.enumStringSchema(["replace", "append"], "For named type: replace (default) keeps form-fill behavior; append preserves prior text and inserts at its verified end. Append requires a named accessibility text target; it never replaces the whole value. Omit or use replace for other verbs.")),
                                         ])),
@@ -482,13 +501,16 @@ extension BuiltInToolSchemaFactory {
                             ])),
                             ("app", ToolSchema.strSchema("Optional: act in this running app's window (\"TextEdit\", \"Mail\") without bringing it forward. Works for accessibility clicks, typing, select, toggle and open; effects that need the screen stop with needs_front and say why.")),
                             ("front", ToolSchema.boolSchema("Only when explicitly requested by the task. With app: bring that app forward for this act (menus, keys), then put the previous front app back. Not needed when the app is already in front or Shotgun is up. A name it lacks raises nothing. The result says how long it was in front.")),
-                            ("seconds", numSchema("For hover or hold: duration up to10 seconds. For drag: paced travel duration, bounded0.08–2 seconds;0/omission uses0.24 seconds. Drag duration controls movement, not two endpoint pauses.", minimum: 0, maximum: 10)),
+                            ("seconds", numSchema("For hover or hold: duration up to 10 seconds. For drag: paced travel duration, bounded 0.08–2 seconds; 0 or omission uses 0.24 seconds. Drag duration controls movement, not two endpoint pauses.", minimum: 0, maximum: 10)),
                             ("repeat", ToolSchema.intSchema("Optional bounded burst count. The target is freshly re-resolved before every attempt; planning and real elapsed execution are capped at 30 seconds.", minimum: 1, maximum: 12)),
                             ("interval", numSchema("Optional pause between repeated attempts.", minimum: 0, maximum: 2)),
-                            ("holding", ToolSchema.strSchema("Optional keys/modifiers held around a physical action, such as `w d`, `shift`, or `cmd+w`. Works with pointer hold, including right-button hold while movement keys are down. Not valid with a keyboard hold (put all keys in its target) or literal type.")),
-                            ("button", ToolSchema.enumStringSchema(["auto", "left", "right"], "Use auto for the ordinary/default action, including key, type, scroll, move, and hover. Use left or right only to request an explicit mouse button on click, open (double-click), drag, or pointer hold. Right drag sends genuine right-button events, not Control-left-drag. Omission is equivalent to auto.")),
+                            ("holding", holding),
+                            ("button", button),
                         ],
-                        required: ["verb", "target"]
+                        // Steps carry their own verbs; handle/point/focused-type
+                        // and bare-scroll forms do not require a named target.
+                        // The act parser owns each form's semantic requirements.
+                        required: []
                     )
                 ),
                 // Clipboard writes require app-control authority because they replace the next
@@ -543,7 +565,6 @@ extension BuiltInToolSchemaFactory {
                         properties: [
                             ("key_tap", ToolSchema.boolSchema("Also tap the left shift key, which types nothing but wakes some sleeping displays a mouse move alone does not. On by default; pass key_tap:false to omit the Shift tap.")),
                             ("settle_ms", ToolSchema.intSchema("How long to wait after the nudge before capturing, 0-3000ms. Defaults to 700, which is enough for the screensaver to finish tearing down. Raise it if the returned view still shows the saver.")),
-                            ("full_screen", ToolSchema.boolSchema("Capture the whole screen instead of just the frontmost window, same as mac.view.")),
                             ("attention_session", ToolSchema.strSchema("Required while mac_attention is active: its current conversation id.")),
                             ("attention_user_sequence", ToolSchema.intSchema("Required while mac_attention is active: the user_sequence from its latest observed fused view.")),
                         ],

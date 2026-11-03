@@ -71,13 +71,6 @@ public enum DoctorSafeRepairPolicy {
         ["warning", "failing"].contains(DoctorPlainCopy.bucket(for: normalized(status)))
     }
 
-    /// Keep executable instructions out of human-step copy in cached reports.
-    static func isCoreRepairInstruction(_ instruction: String?) -> Bool {
-        let instruction = normalized(instruction)
-        return instruction.hasPrefix("run repair safe issues")
-            || instruction.hasPrefix("press repair in diagnostics → health checks")
-    }
-
     private static func normalized(_ value: String?) -> String {
         (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }

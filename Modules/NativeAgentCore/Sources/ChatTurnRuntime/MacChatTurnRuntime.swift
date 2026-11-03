@@ -28,7 +28,7 @@ public final class MacChatTurnRuntime {
         defer { ChatCancelFlag.finish(stop) }
         try Task.checkCancellation()
         return try await ChatPersistenceContext.$pinnedTurnRunID.withValue(runID) {
-            try await TurnAdmission.shared.run(sessionID: sessionID, operation: operation)
+            try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionID, operation: operation)
         }
     }
 
@@ -118,7 +118,6 @@ public final class MacChatTurnRuntime {
     @ObservationIgnored public var phoneControlHandoffSentAt: [String: Date] = [:]
     @ObservationIgnored public let chatTurnTranscriptProofReader: MacChatTurnTranscriptProofReader
     @ObservationIgnored public var chatTurnLifecycleRepairCompleted = false
-    @ObservationIgnored public var residentRefreshPendingAfterActiveTurns = false
 
     public nonisolated init(dataRoot: URL) {
         self.dataRoot = dataRoot
@@ -292,9 +291,17 @@ public final class MacChatTurnRuntime {
         let namedRuns = runIDs + (runId.map { [$0] } ?? [])
         let flagPath = ChatCancelFlag.path(dataRoot: dataRoot, sessionId: safeSessionId)
         try await SwiftNativePersistenceCore.withFileLock(flagPath) {
-            let content = namedRuns.isEmpty ? ChatCancelFlag.stopContent(forFlagAt: flagPath)
-                : ((try? String(contentsOf: flagPath, encoding: .utf8)).map { $0 + "\n" } ?? "")
-                    + namedRuns.joined(separator: "\n")
+            let existing: String?
+            do { existing = try String(contentsOf: flagPath, encoding: .utf8) }
+            catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { existing = nil }
+            // A failed read cannot authorize replacing earlier Stop requests.
+            catch {
+                throw ToolFailureError("The existing Stop marker could not be read: \(error.localizedDescription). Its bytes were preserved. Repair \(flagPath.path) before merging another Stop request.",
+                    effects: .none, owner: flagPath.path, code: "stop_marker_unavailable", recovery: .repair)
+            }
+            let requested = namedRuns.isEmpty ? ChatCancelFlag.stopContent(forFlagAt: flagPath) : namedRuns.joined(separator: "\n")
+            // An existing empty marker means stop-all; preserve its exact meaning.
+            let content = existing.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? $0 : $0 + "\n" + requested } ?? requested
             try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(content.utf8), to: flagPath)
         }
     }

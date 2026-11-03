@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import Experiences
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+Persistence.swift` | `CognitiveSubstrate`: `persistAffectAndNodes`, `recordReceipt` |
+// Blueprint: | `CognitiveSubstrate+Persistence.swift` | `CognitiveSubstrate`: `persistAffectAndNodes`, checked owed-work receipts, diagnostic receipts and shared stage-specific persistence repair settlement |
 
 extension CognitiveSubstrate {
     /// Affect, consumed residue and node watermarks become durable together.
@@ -37,6 +37,14 @@ extension CognitiveSubstrate {
         )]
     }
 
+    /// Callers retaining owed work need confirmation, not a best-effort log.
+    public func recordReceiptChecked(kind: String, payload: JSONValue, id: UUID = UUID()) async throws {
+        guard configuration.enabled, configuration.persistenceEnabled, let store else {
+            throw CognitivePersistenceError.storeUnavailable
+        }
+        try await store.appendReceipt(kind: kind, payload: payload, at: dependencies.now(), id: id)
+    }
+
     public func recordReceipt(kind: String, payload: JSONValue = .object([:])) async {
         guard configuration.enabled, configuration.persistenceEnabled, let store else { return }
         do { try await store.appendReceipt(kind: kind, payload: payload, at: dependencies.now()) } catch {
@@ -51,12 +59,34 @@ extension CognitiveSubstrate {
     /// the next write of that stage persists the current resident state (the
     /// truth), which settles the repair and clears the stage. No replay.
     func notingPersistence(_ stage: String, _ write: () async throws -> Void) async {
-        guard let store else { return }
-        do {
+        do { try await checkingPersistence(stage, write) } catch { /* Accounted for by the checked owner. */ }
+    }
+
+    /// A read can succeed with no source. That absence is not repair evidence.
+    func notingPersistenceRead(_ stage: String, _ read: () async throws -> Bool) async {
+        do { try await checkingPersistenceOutcome(stage, read) } catch { /* Accounted for by the checked owner. */ }
+    }
+
+    /// The same accounting when the caller must stop dependent settlement.
+    func checkingPersistence(_ stage: String, _ write: () async throws -> Void) async throws {
+        try await checkingPersistenceOutcome(stage) {
             try await write()
-            guard unsavedStages.remove(stage) != nil else { return }
+            return true
+        }
+    }
+
+    private func checkingPersistenceOutcome(_ stage: String, _ operation: () async throws -> Bool) async throws {
+        guard let store else { throw CognitivePersistenceError.storeUnavailable }
+        do {
+            guard try await operation() else { return }
+            let wasUnsaved = unsavedStages.remove(stage) != nil
+            // Self-file debts may predate this process. Its checked read and
+            // write settle only their own claim; routine SQLite checkpoints
+            // need no repair-ledger read when no write has failed.
+            guard wasUnsaved || stage == "mind.self" || stage == "mind.self.read" else { return }
             RepairOwed.settle(Self.dataRoot(of: store), operation: "cognition.persist:" + stage,
                               evidence: .init(source: "cognition/cognition.sqlite", id: stage))
+            guard wasUnsaved else { return }
             guard unsavedStages.isEmpty, persistenceHealth.failureStage == "unsaved", !persistenceHealth.writesBlocked else { return }
             persistenceHealth = CognitivePersistenceHealth(
                 status: .healthy, writesBlocked: false,
@@ -66,21 +96,23 @@ extension CognitiveSubstrate {
             // A write refused because writes are blocked (her mind not yet read,
             // or a failed restore) is not a failed save: health already says
             // writes are blocked, and no repair is owed for it.
-            if let refusal = error as? CognitivePersistenceError, case .writesBlocked = refusal { return }
+            if let refusal = error as? CognitivePersistenceError, case .writesBlocked = refusal { throw error }
             // A write Clear's hold discarded is not durable and not a failure
             // of its own: the failed Clear's one repair names it, and nothing
             // it was saving is settled.
-            if error is CognitiveWriteDiscarded { return }
+            if error is CognitiveWriteDiscarded { throw error }
             oweUnsaved(stage, error, store: store)
-            guard !stage.hasPrefix("receipt."), !persistenceHealth.writesBlocked else { return }
-            unsavedStages.insert(stage)
-            persistenceHealth = CognitivePersistenceHealth(
-                status: .degraded, writesBlocked: false,
-                lastRestoreAttemptAt: persistenceHealth.lastRestoreAttemptAt,
-                lastSuccessfulRestoreAt: persistenceHealth.lastSuccessfulRestoreAt,
-                failureStage: "unsaved",
-                failureDetail: bounded("unsaved: \(unsavedStages.sorted().joined(separator: ", ")); last cause: \(error)",
-                                       maxCharacters: 320))
+            if !stage.hasPrefix("receipt."), !persistenceHealth.writesBlocked {
+                unsavedStages.insert(stage)
+                persistenceHealth = CognitivePersistenceHealth(
+                    status: .degraded, writesBlocked: false,
+                    lastRestoreAttemptAt: persistenceHealth.lastRestoreAttemptAt,
+                    lastSuccessfulRestoreAt: persistenceHealth.lastSuccessfulRestoreAt,
+                    failureStage: "unsaved",
+                    failureDetail: bounded("unsaved: \(unsavedStages.sorted().joined(separator: ", ")); last cause: \(error)",
+                                           maxCharacters: 320))
+            }
+            throw error
         }
     }
 
@@ -121,14 +153,6 @@ extension CognitiveSubstrate {
             return .available(try await store.loadReceiptRecords(limit: limit))
         } catch {
             return .unavailable(.readFailed)
-        }
-    }
-
-    func persistArtifact(kind: String, id: UUID, status: String, score: Double, payload: JSONValue,
-                         mindEpoch expectedMindEpoch: UInt64? = nil) async {
-        await notingPersistence("artifact.\(kind).\(id.uuidString)") {
-            try await persistArtifactChecked(kind: kind, id: id, status: status, score: score, payload: payload,
-                                             mindEpoch: expectedMindEpoch)
         }
     }
 
@@ -229,7 +253,8 @@ extension CognitiveSubstrate {
     // Evict the oldest by timestamp at each record tail, retained-N matched to
     // the family's
     // restore limit in `restoreArtifactFamilyLoads()`. The disk copy survives, so
-    // eviction is safe — restart reloads up to the same N.
+    // eviction is safe — restart reloads up to the same N. Reflection work
+    // still owing effects/journal acknowledgment is not history and is exempt.
 
     private func evictOldest<Value>(
         from dict: inout [UUID: Value],
@@ -262,10 +287,8 @@ extension CognitiveSubstrate {
     }
 
     func enforceReflectionReceiptCap() {
-        evictOldest(
-            from: &reflectionReceipts,
-            cap: reflectionReceiptCap
-        ) { $0.createdAt }
+        let settled = reflectionReceipts.values.filter { !$0.owesSettlement }.sorted { $0.createdAt > $1.createdAt }
+        for receipt in settled.dropFirst(reflectionReceiptCap) { reflectionReceipts[receipt.id] = nil }
     }
 
     // `replayEvidenceIds` is a dedup guard with no per-entry timestamp and no disk

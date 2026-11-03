@@ -1,5 +1,6 @@
 import Foundation
 import Experiences
+import NativeAgentCore
 import PersistenceCore
 
 // Blueprint: | `CognitiveEpisodeReplay.swift` | Episode, schema proposal, developmental timeline and dream/REM replay values |
@@ -43,6 +44,8 @@ public struct CognitiveSchemaProposal: Sendable, Equatable, Identifiable {
     public var target: String
     /// A read projection, never persisted as cognitive status.
     public var decision: Experience? = nil
+    /// Read through the canonical REM proposal owner, never persisted here.
+    public var replacementDescription: String = REMReplacement.describe(nil)
     public var status: CognitiveSchemaProposalStatus {
         guard let decision else { return .unavailable }
         switch decision.outcome?.status {
@@ -82,9 +85,6 @@ public struct CognitiveSchemaProposal: Sendable, Equatable, Identifiable {
 public enum CognitiveDevelopmentalTimelineKind: String, Sendable, Equatable, CaseIterable {
     case dreamEpisode
     case schemaProposal
-    /// Read compatibility for developmental timeline rows written by the
-    /// retired identity-proposal experiment. No production path emits it.
-    case identityProposal
     case proposalResolution
     case replayRun
 }
@@ -132,20 +132,17 @@ public struct CognitiveDreamReplayReference: Sendable, Equatable, Identifiable {
     public var date: String
     public var filename: String?
     public var content: String
-    public var modifiedAt: String?
 
     public init(
         id: String,
         date: String,
         filename: String? = nil,
-        content: String,
-        modifiedAt: String? = nil
+        content: String
     ) {
         self.id = id
         self.date = date
         self.filename = filename
         self.content = content
-        self.modifiedAt = modifiedAt
     }
 }
 public struct CognitiveREMProposalReference: Sendable, Equatable, Identifiable {

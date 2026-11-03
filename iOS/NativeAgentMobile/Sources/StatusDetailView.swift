@@ -1,6 +1,7 @@
 import SwiftUI
+import Combine
 import NativeAgentShared
-// Blueprint: | `StatusDetailView.swift` | Phone, Mac and organism status readback |
+// Blueprint: | `StatusDetailView.swift` | Phone, Mac and organism status readback, full build version and recent push diagnostics |
 
 // MARK: - Status detail
 
@@ -10,6 +11,7 @@ struct StatusDetailView: View {
     @ObservedObject private var cloudReplies = iCloudBridge.shared
     @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
+    @State private var pushReceipts = PushReceiptLedger.load()
 
     var body: some View {
         List {
@@ -18,6 +20,18 @@ struct StatusDetailView: View {
                 .padding(.horizontal, 4)
                 .aliveListRow(top: 4, bottom: 6)
             Group {
+            Section {
+                if let failure = pushReceipts.failure { Text(failure) }
+                else if pushReceipts.entries.isEmpty { Text("No pushes recorded on this iPhone.") }
+                ForEach(pushReceipts.entries.prefix(8)) { entry in
+                    LabeledContent(entry.source) {
+                        Text(entry.receivedAt, style: .relative)
+                    }
+                }
+            } header: { AliveEyebrow("Recent pushes") }
+            if let failure = cloudReplies.unverifiedRecordsError {
+                Section { Text(failure) } header: { AliveEyebrow("Verification history unavailable") }
+            }
             if !cloudReplies.unverifiedRecords.isEmpty {
                 // Show unverified Mac records with the reason they are deferred.
                 Section {
@@ -134,14 +148,6 @@ struct StatusDetailView: View {
                         Text("\(organism.signalCount)")
                             .foregroundStyle(.secondary)
                     }
-                    LabeledContent("Needs review") {
-                        Text("\(organism.counters.reflexesNeedReview)")
-                            .foregroundStyle(.secondary)
-                    }
-                    LabeledContent("Approved biases") {
-                        Text(OrganismStatusPresentation.approvedBiasesText(organism.counters.approvedReflexBiases))
-                            .foregroundStyle(.secondary)
-                    }
                     LabeledContent("iPhone") {
                         Text(organism.body.iPhoneReachable ? "reachable" : "stale")
                             .foregroundStyle(.secondary)
@@ -181,33 +187,6 @@ struct StatusDetailView: View {
                         }
                     }
                 } header: { AliveEyebrow(sync.agentDisplayName) }
-                let proposalSlice: OrganismStatusPresentation.DreamProposalSlice = organismState.displaysDetails
-                    ? OrganismStatusPresentation.dreamProposalSlice(organism.standingViewProposals ?? [])
-                    : .init(visible: [], hiddenCount: 0)
-                if !proposalSlice.visible.isEmpty {
-                    Section {
-                        ForEach(proposalSlice.visible) { proposal in
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(proposal.title)
-                                    .font(.callout)
-                                Text(proposal.rationale)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                if !proposal.evidenceIDs.isEmpty {
-                                    Text(AliveWords.count(proposal.evidenceIDs.count, "linked evidence item"))
-                                        .font(.caption)
-                                        .foregroundStyle(AlivePalette.secondary)
-                                }
-                            }
-                        }
-                        if proposalSlice.hiddenCount > 0 {
-                            Text(AliveWords.count(proposalSlice.hiddenCount, "more proposal") + " can be reviewed on the Mac.")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-                    } header: { AliveEyebrow("Dream proposals") }
-                }
             } else {
                 Section {
                     Label("Not reporting yet", systemImage: "exclamationmark.triangle")
@@ -224,5 +203,9 @@ struct StatusDetailView: View {
         .alivePageChrome(title: "Status", root: false)
         .task { await store.refreshHealth() }
         .refreshable { await store.refreshHealth() }
+        .onAppear { pushReceipts = PushReceiptLedger.load() }
+        .onReceive(NotificationCenter.default.publisher(for: PushReceiptLedger.didChange).receive(on: RunLoop.main)) { _ in
+            pushReceipts = PushReceiptLedger.load()
+        }
     }
 }

@@ -134,6 +134,22 @@ public struct FirstOutputDeadline: Sendable, Equatable {
 }
 
 extension LLMMessage {
+    /// Text presented to this request, in characters. Image encoding is not
+    /// text; its token cost remains part of the provider's reported input.
+    public static func inputCharacters(_ messages: [LLMMessage], system: String?, tools: [LLMToolSchema]) -> Int {
+        (system?.count ?? 0) + tools.reduce(0) {
+            $0 + $1.name.count + $1.description.count + String(decoding: $1.parametersJSON, as: UTF8.self).count
+        } + messages.reduce(0) { total, message in
+            message.content.reduce(total) { total, block in
+                switch block {
+                case .text(let text): total + text.count
+                case .toolUse(let id, let name, let input): total + id.count + name.count + String(decoding: input, as: UTF8.self).count
+                case .toolResult(let id, let content, _): total + id.count + content.count
+                case .image: total
+                }
+            }
+        }
+    }
     /// What a request asks the provider to read, in bytes as sent: the system
     /// prompt, every block (an image as its base64) and the tool schemas.
     public static func inputBytes(_ messages: [LLMMessage], system: String?, tools: [LLMToolSchema] = []) -> Int {

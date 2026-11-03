@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `PersonaModels.swift` | Shared personality traits, saved profile and identity-neutral display names; PersonaEngine owns canonical storage |
+// Blueprint: | `PersonaModels.swift` | Shared personality traits, saved profile, onboarding-name speech context, identity name validation and display names; PersonaEngine owns canonical storage |
 
 public struct PersonalityTraits: Codable, Hashable, Sendable {
     public var warmth: Double
@@ -28,6 +28,20 @@ public struct PersonalityTraits: Codable, Hashable, Sendable {
 public enum NativeAgentIdentity {
     private static let genericNames: Set<String> = ["agent", "custom", "ai", "male", "female"]
 
+    /// The same requirement applies before setup, repair and later profile saves.
+    public static func nameValidationMessage(_ rawValue: String) -> String? {
+        let name = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.isEmpty { return "Enter a name for the agent before saving." }
+        if genericNames.contains(name.lowercased()) {
+            return "Choose a specific name instead of a generic persona label."
+        }
+        if name.unicodeScalars.count > 80 { return "Use at most 80 code points for the agent's name." }
+        if name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
+            return "Use a single-line name without control characters."
+        }
+        return nil
+    }
+
     public static func displayName(
         _ rawValue: String?,
         fallback: String = "NativeAgent"
@@ -48,46 +62,26 @@ public struct PersonalityProfile: Codable, Hashable, Sendable {
     public var personaEngineVersion: String?
     public var name: String
     public var personaKind: String
-    public var essence: String
-    public var voice: String
-    public var customDirective: String?
     public var traits: PersonalityTraits
-    public var examples: [String]?
-    public var forbiddenPatterns: [String]?
-    public var instincts: [String]?
-    public var boundaries: [String]?
-    public var surfaceOverrides: [String: String]?
     public var updatedAt: String?
+    /// The person's onboarding name, projected from the canonical profile.
+    public var userName: String?
 
     public init(
         schemaVersion: Int? = nil,
         personaEngineVersion: String? = nil,
         name: String,
         personaKind: String,
-        essence: String,
-        voice: String,
-        customDirective: String? = nil,
         traits: PersonalityTraits,
-        examples: [String]? = nil,
-        forbiddenPatterns: [String]? = nil,
-        instincts: [String]? = nil,
-        boundaries: [String]? = nil,
-        surfaceOverrides: [String: String]? = nil,
-        updatedAt: String? = nil
+        updatedAt: String? = nil,
+        userName: String? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.personaEngineVersion = personaEngineVersion
         self.name = name
         self.personaKind = personaKind
-        self.essence = essence
-        self.voice = voice
-        self.customDirective = customDirective
         self.traits = traits
-        self.examples = examples
-        self.forbiddenPatterns = forbiddenPatterns
-        self.instincts = instincts
-        self.boundaries = boundaries
-        self.surfaceOverrides = surfaceOverrides
         self.updatedAt = updatedAt
+        self.userName = userName
     }
 }

@@ -201,7 +201,6 @@ struct MobileTrustEditor: View {
         case .outsideDefault: "Outside default"
         case .developerMode: "Developer mode"
         case .workshopEnabled: "Desk enabled"
-        case .autonomousTraining: "Autonomous training"
         case .dreamScheduler: "Dream scheduler"
         }
     }

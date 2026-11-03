@@ -1,6 +1,7 @@
 import Foundation
 import MemoryV2
 import ApprovalInbox
+import Experiences
 import AuthoredCapabilities
 import ChatTurnRuntime
 import CognitiveSubstrate
@@ -11,17 +12,24 @@ import PersonaEngine
 import PersistenceCore
 import ProviderRouting
 import TurnTrace
+import Transcripts
 import NativeAgentShared
 // Blueprint: | `NativeCognitionRuntime+BodyEvidence.swift` | `NativeCognitionRuntime` body evidence: phone, notification, memory, dream, tool, approval and thermal readings with debug projections |
 
 extension NativeCognitionRuntime {
     nonisolated static func makeOrganismBodyRead(
         dataRoot: URL,
-        mobileConfigured: Bool,
+        mobileConfigured: Bool?,
         now: Date = Date(),
         phoneDeliveryPrediction: OrganismPrediction? = nil
     ) async -> OrganismBodyRead {
-        let signedPeer = SignedPeerEvidenceStore.load(dataRoot: dataRoot)
+        let signedPeer: SignedPeerEvidence?
+        var peerReadFailure: String?
+        do { signedPeer = try SignedPeerEvidenceStore.load(dataRoot: dataRoot) }
+        catch {
+            signedPeer = nil
+            peerReadFailure = bodySourceFailure(error, source: "mobile/signed_peer_evidence.json", dataRoot: dataRoot)
+        }
         let staleAfter: TimeInterval = 60 * 60 * 36
         let peerPresenceBelief = PeerPresenceBelief(
             generatedAt: now,
@@ -34,7 +42,7 @@ extension NativeCognitionRuntime {
                     receivedAt: $0.contactAt
                 )]
             } ?? [],
-            staleAfter: staleAfter
+            staleAfter: staleAfter, sourceUnavailable: peerReadFailure
         )
         let notificationDeliveryBelief = notificationDeliveryReading(
             dataRoot: dataRoot,
@@ -150,89 +158,46 @@ extension NativeCognitionRuntime {
     private nonisolated static func notificationDeliveryReading(
         dataRoot: URL,
         now: Date,
-        configured: Bool,
+        configured: Bool?,
         staleAfter: TimeInterval,
         phoneDeliveryPrediction: OrganismPrediction?
     ) -> NotificationDeliveryBelief {
-        let apnsPath = dataRoot
-            .appendingPathComponent("mobile_push", isDirectory: true)
-            .appendingPathComponent("apns_outcomes.jsonl")
-        let apns = lastJSONObjectInJSONL(at: apnsPath)
-        let apnsDate = (apns?["at"] as? String).flatMap {
-            ISO8601DateFormatter().date(from: $0)
+        guard configured != nil else {
+            let cause = bodySourceFailure(
+                PersistenceCoreError.ioFailure("Phone notification target inventory is unavailable; inspect its repair obligation."),
+                source: "phone notification targets", dataRoot: dataRoot)
+            return NotificationDeliveryBelief(generatedAt: now, transportConfigured: configured == true,
+                sourceUnavailable: cause)
         }
-        let eventID = (apns?["eventId"] as? String) ?? "apns-unknown"
-        let receipts = (apns?["receipts"] as? [[String: Any]]) ?? []
-        let targets = (apns?["targets"] as? NSNumber)?.intValue ?? 0
-        let acceptedCount = (apns?["accepted"] as? NSNumber)?.intValue ?? 0
+        // The live kernel owns publication failure and signed phone receipt
+        // signals for the keyless route. Optional APNS wakes are diagnostics
+        // of a different effect and cannot judge notification delivery.
         var evidence: [BodyEvidenceReference] = []
-        var accepted = false
-        var failed = targets > acceptedCount || !(apns?["errors"] as? [String] ?? []).isEmpty
-        if let apnsDate {
-            for receipt in receipts {
-                let status = (receipt["status"] as? String)?.lowercased()
-                let httpStatus = (receipt["httpStatus"] as? NSNumber)?.intValue
-                let success = status == "ok" && httpStatus.map { (200..<300).contains($0) } == true
-                accepted = accepted || success
-                failed = failed || !success
-                let deviceID = (receipt["deviceId"] as? String) ?? "unknown"
-                let apnsID = (receipt["apnsId"] as? String) ?? "unknown"
-                evidence.append(BodyEvidenceReference(
-                    id: "apns:\(eventID):\(deviceID):\(apnsID):\(status ?? "unknown")",
-                    evidenceClass: success ? .apnsAcceptance : .notificationTransportFailure,
-                    observedAt: apnsDate, receivedAt: apnsDate
-                ))
-            }
-            // A deadline or fan-out error can leave a target without a receipt.
-            if targets > receipts.count || !(apns?["errors"] as? [String] ?? []).isEmpty {
-                evidence.append(BodyEvidenceReference(
-                    id: "apns:\(eventID):fan-out-failed",
-                    evidenceClass: .notificationTransportFailure,
-                    observedAt: apnsDate, receivedAt: apnsDate
-                ))
-            }
-        }
-
         var deviceReceived = false
         var deviceFailed = false
-        var deviceOutcomeAt: Date?
-        var deviceEvidence: BodyEvidenceReference?
         if let latest = phoneDeliveryPrediction, latest.kind == .phoneDelivery {
             deviceReceived = latest.status == .satisfied
             deviceFailed = latest.status == .violated
-            deviceOutcomeAt = latest.lastUpdatedAt
             if latest.status == .satisfied || latest.status == .violated {
-                deviceEvidence = BodyEvidenceReference(
+                evidence.append(BodyEvidenceReference(
                     id: "phone-delivery:\(latest.id):\(latest.status.rawValue)",
                     evidenceClass: latest.status == .satisfied
                         ? .deviceProcessReceipt
                         : .deviceProcessFailure,
                     observedAt: latest.lastUpdatedAt,
                     receivedAt: latest.lastUpdatedAt
-                )
+                ))
             }
         }
-
-        if let deviceEvidence { evidence.append(deviceEvidence) }
-        let latestSuccessAt = [accepted ? apnsDate : nil, deviceReceived ? deviceOutcomeAt : nil]
-            .compactMap { $0 }
-            .max()
-        let latestFailureAt = [failed ? apnsDate : nil, deviceFailed ? deviceOutcomeAt : nil]
-            .compactMap { $0 }
-            .max()
-        let currentlyFailed = latestFailureAt.map { failureAt in
-            latestSuccessAt.map { failureAt >= $0 } ?? true
-        } ?? false
         return NotificationDeliveryBelief(
             generatedAt: now,
-            transportConfigured: configured,
-            transportAccepted: accepted,
+            transportConfigured: configured == true,
             deviceReceived: deviceReceived,
             // No canonical display/read receipt exists. Never promote process
             // receipt or APNS acceptance into those stronger claims.
             displayed: false,
             userSeen: false,
-            transportFailed: currentlyFailed,
+            transportFailed: deviceFailed,
             evidence: evidence,
             staleAfter: staleAfter
         )
@@ -271,11 +236,12 @@ extension NativeCognitionRuntime {
         dataRoot: URL,
         now: Date
     ) -> DreamIntegrityReading {
-        let dreamRoot = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
-        let statePath = dreamRoot.appendingPathComponent(".dream_state.json")
-        let stateDate = latestDateValue(inJSONAt: statePath, keys: ["lastdreamedat", "last_dreamed_at"])
-        let newestEntryDate = newestFileModificationDate(in: dreamRoot, suffix: ".md")
-        let latest = [stateDate, newestEntryDate].compactMap { $0 }.max()
+        let latest: Date?
+        do { latest = try ChatSessionRecollections.dreamConsolidationMark(dataRoot: dataRoot) }
+        catch {
+            _ = bodySourceFailure(error, source: "dream_diary/.dream_state.json", dataRoot: dataRoot)
+            return DreamIntegrityReading(generatedAt: now, storeAvailable: false, completionEvidence: [])
+        }
         let evidence: [BodyEvidenceReference] = latest.map {
             [BodyEvidenceReference(
                 id: "dream-completion:\($0.timeIntervalSince1970)",
@@ -284,12 +250,9 @@ extension NativeCognitionRuntime {
                 receivedAt: $0
             )]
         } ?? []
-        let fm = FileManager.default
-        let storeAvailable = fm.fileExists(atPath: dreamRoot.path)
-            || fm.isWritableFile(atPath: dataRoot.path)
         return DreamIntegrityReading(
             generatedAt: now,
-            storeAvailable: storeAvailable,
+            storeAvailable: true,
             completionEvidence: evidence
         )
     }
@@ -301,11 +264,30 @@ extension NativeCognitionRuntime {
         // Her hands are her abilities as they stand now: any one on means
         // configured; a missing or stale run leaves them unproven, never unavailable.
         let abilities = AbilityStore(dataRoot: dataRoot)
-        let configured = ((try? abilities.files(kind: .part, includeProposals: false)) ?? [])
-            .contains { $0.record["status"] == .string("active") }
-        let rows = try? await TurnTraceRecentReader(dataRootOverride: dataRoot)
-            .traceEvidence(now: now, maximumReadBytes: 128 * 1_024).rows
-        let liveReceipt = rows?.reversed().compactMap { row -> [String: JSONValue]? in
+        let configured: Bool
+        let rows: [JSONValue]
+        let configurationDate: Date?
+        do {
+            configured = try abilities.files(kind: .part, includeProposals: false)
+                .contains { $0.record["status"] == .string("active") }
+            if configured {
+                guard let date = try FileManager.default.attributesOfItem(atPath: abilities.root.path)[.modificationDate] as? Date else {
+                    throw PersistenceCoreError.ioFailure("Ability configuration modification time is unavailable.")
+                }
+                configurationDate = date
+            } else { configurationDate = nil }
+            let read = try await TurnTraceRecentReader(dataRootOverride: dataRoot)
+                .traceEvidence(now: now, maximumReadBytes: 128 * 1_024)
+            guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine else {
+                throw PersistenceCoreError.ioFailure("Tool capability trace evidence contains unreadable rows.")
+            }
+            rows = read.rows
+        } catch {
+            let cause = bodySourceFailure(error, source: "abilities and turn_traces", dataRoot: dataRoot)
+            return ToolCapabilityReading(generatedAt: now, configured: false, liveCapabilityObserved: false,
+                evidence: [], sourceUnavailable: cause)
+        }
+        let liveReceipt = rows.reversed().compactMap { row -> [String: JSONValue]? in
             guard case .object(let object) = row, object["kind"] == .string("tool.dispatch"),
                   object["status"] == .string("ok") else { return nil }
             return object
@@ -317,8 +299,7 @@ extension NativeCognitionRuntime {
             $0.timeIntervalSince(now) <= 5 && now.timeIntervalSince($0) <= 6 * 60 * 60
         } == true
         var evidence: [BodyEvidenceReference] = []
-        if configured {
-            let date = modificationDate(abilities.root) ?? now
+        if let date = configurationDate {
             evidence.append(BodyEvidenceReference(
                 id: "ability-catalog:\(date.timeIntervalSince1970)",
                 evidenceClass: .toolConfiguration,
@@ -420,77 +401,21 @@ extension NativeCognitionRuntime {
         return size.intValue > 2
     }
 
-    private nonisolated static func modificationDate(_ url: URL) -> Date? {
-        (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
+    nonisolated static func bodySourceFailure(_ error: Error, source: String, dataRoot: URL) -> String {
+        let cause = source + ": " + error.localizedDescription
+        RepairOwed.owe(dataRoot, id: "body-source:" + UUID().uuidString, kind: .run,
+            operation: "cognition.body:" + source, owner: source,
+            words: "Body evidence is unavailable: " + cause,
+            tap: "Repair the named source, preserving its bytes, then refresh the inner life.")
+        return cause
     }
 
-    /// Reads only a bounded tail and returns the newest complete JSON object.
-    /// Receipt files can live for months; a body read must not ingest the full
-    /// ledger merely to rebuild one transient delivery belief.
-    private nonisolated static func lastJSONObjectInJSONL(at url: URL) -> [String: Any]? {
-        let maximumBytes = 128 * 1_024
-        guard let read = try? SwiftNativePersistenceCore.tailPhysicalLines(
-            url, limit: maximumBytes, maxBytes: maximumBytes) else { return nil }
-        let lines = read.lines.dropFirst(read.leadingFragment ? 1 : 0)
-        guard lines.allSatisfy({ String(data: $0, encoding: .utf8) != nil }) else { return nil }
-        // Invalid UTF-8 makes the window unreadable; malformed JSON rows are skipped.
-        for line in lines.reversed() {
-            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any]
-            else { continue }
-            return object
-        }
-        return nil
-    }
-
-    private nonisolated static func latestDateValue(inJSONAt url: URL, keys: Set<String>) -> Date? {
-        guard let object = jsonObject(at: url) else { return nil }
-        return latestDateValue(in: object, keys: keys)
-    }
-
-    private nonisolated static func latestDateValue(in object: Any, keys: Set<String>) -> Date? {
-        if let array = object as? [Any] {
-            return array.compactMap { latestDateValue(in: $0, keys: keys) }.max()
-        }
-        guard let dictionary = object as? [String: Any] else { return nil }
-        var dates: [Date] = []
-        for (key, value) in dictionary {
-            let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if keys.contains(normalized),
-               let string = value as? String,
-               let date = parseISODate(string) {
-                dates.append(date)
-            }
-            if let nested = latestDateValue(in: value, keys: keys) {
-                dates.append(nested)
-            }
-        }
-        return dates.max()
-    }
-
-    private nonisolated static func jsonObject(at url: URL) -> Any? {
-        guard hasReadableContent(url),
-              let data = try? Data(contentsOf: url) else {
+    func checkedPhoneNotificationConfiguration() async -> Bool? {
+        do { return try await host.phoneNotificationTargetCount(dataRoot: dataRoot) > 0 }
+        catch {
+            _ = Self.bodySourceFailure(error, source: "phone notification targets", dataRoot: dataRoot)
             return nil
         }
-        return try? JSONSerialization.jsonObject(with: data)
     }
 
-    private nonisolated static func parseISODate(_ string: String) -> Date? {
-        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-        return NativeTimestampFormat.parseISO8601FractionalFirst(trimmed)
-    }
-
-    private nonisolated static func newestFileModificationDate(in directory: URL, suffix: String) -> Date? {
-        guard let urls = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return nil
-        }
-        return urls
-            .filter { $0.lastPathComponent.hasSuffix(suffix) }
-            .compactMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }
-            .max()
-    }
 }

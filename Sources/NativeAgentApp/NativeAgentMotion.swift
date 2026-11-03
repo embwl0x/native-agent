@@ -35,9 +35,12 @@ enum NativeAgentMotion {
     static var arrivalFade: AnyTransition { .opacity.animation(arrivalCurve) }
     /// The reply's live, settled and folded phases share its arrival rhythm.
     static var replyDissolve: AnyTransition { arrivalFade }
-    static let breathe = Animation.easeInOut(duration: standardDuration * 5)
-    static var pulse: Animation? {
-        respecting(breathe.repeatForever(autoreverses: false), reduceMotion: reducesMotion)
+    static let breatheDuration = standardDuration * 5
+    static let breathe = Animation.easeInOut(duration: breatheDuration)
+    /// Where a repeating motion is in its loop, 0..<1, read from the clock. Repeating
+    /// motion is drawn from a TimelineView, never SwiftUI's repeatForever (10-31 crash).
+    static func loopPhase(at date: Date, period: TimeInterval) -> CGFloat {
+        CGFloat(date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: period) / period)
     }
 
     static func respecting(_ animation: Animation?, reduceMotion: Bool) -> Animation? {

@@ -376,13 +376,8 @@ public final class OtherDoorTurns {
         for await event in subscription.stream {
             guard self.generation == generation, !Task.isCancelled else { break }
             guard let sessionId = event.sessionId, let ended = reduce(event, appModel) else { continue }
-            if ended {
-                // A refresh that started while the card was up is dropped by
-                // its lifecycle guard; this one lands the reply.
-                await appModel.refreshChatMessagesAfterTurn(sessionId: sessionId, messagesAlreadyRefreshed: false)
-            } else {
-                show(sessionId, appModel)
-            }
+            // An ended turn's reply arrives through the store's own publication.
+            if !ended { show(sessionId, appModel) }
         }
         await settle { await TurnTraceBus.shared.unsubscribe(subscription.id) }
     }

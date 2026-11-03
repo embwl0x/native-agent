@@ -63,7 +63,7 @@ struct TurnTraceScanSummary: Sendable {
 
 // MARK: - DoctorMeasurementWindow
 //
-// The window uses this launch's valid build_launch.json stamp, or explicitly reports a 24h floor.
+// A window exists only for this launch's valid build_launch.json stamp.
 
 struct DoctorMeasurementWindow: Sendable {
     /// Rows older than this are not this build's behavior and are not read.
@@ -82,19 +82,12 @@ struct DoctorMeasurementWindow: Sendable {
 }
 
 enum DoctorWindowFloor {
-    /// Fallback window when the running build's launch cannot be established.
-    static let fallbackWindow: TimeInterval = 24 * 60 * 60
-
     static func resolve(
         root: URL,
         now: Date
-    ) -> DoctorMeasurementWindow {
+    ) -> DoctorMeasurementWindow? {
         guard let stamp = launchStamp(root: root, identity: .current), stamp <= now else {
-            return DoctorMeasurementWindow(
-                floor: now.addingTimeInterval(-fallbackWindow),
-                describedAs: "no launch stamp for this launch on disk, so the window"
-                    + " falls back to the last 24h"
-            )
+            return nil
         }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
@@ -112,6 +105,7 @@ enum DoctorWindowFloor {
     }
 
     private static func launchStamp(path: URL, identity: NativeAgentBuildIdentity) -> Date? {
+        guard identity.unavailableReason == nil else { return nil }
         guard let data = try? Data(contentsOf: path),
               let value = try? JSONValue.parse(data),
               case .object(let object) = value,
@@ -124,14 +118,10 @@ enum DoctorWindowFloor {
               object["version"]?.stringValue == identity.version,
               object["pid"] == .int(Int64(ProcessInfo.processInfo.processIdentifier))
         else { return nil }
-        // A revision recorded on the stamp must match the running one. Absent
-        // on either side is tolerated (older bundles did not stamp it); a
-        // DISAGREEMENT is not.
-        if let stamped = object["sourceRevision"]?.stringValue,
-           let running = identity.sourceRevision,
-           stamped.lowercased() != running.lowercased() {
-            return nil
-        }
+        // Source archives legitimately have no revision. Both sides must
+        // agree, including that absence; a missing stamped identity cannot
+        // certify a running build whose revision is known.
+        guard object["sourceRevision"]?.stringValue?.lowercased() == identity.sourceRevision?.lowercased() else { return nil }
         return stamp
     }
 }

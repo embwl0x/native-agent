@@ -5,7 +5,7 @@ import PersistenceCore
 import TelegramBot
 import TriggerScheduler
 import DreamREMCycle
-// Blueprint: | `SchedulerDueJobRunner+CycleHelpers.swift` | `SchedulerDueJobRunner`: `pruneRetiredRows`, `nextEpoch`, `containsLastRunToday`; dream/REM diary and inbox helpers |
+// Blueprint: | `SchedulerDueJobRunner+CycleHelpers.swift` | `SchedulerDueJobRunner`: `pruneRetiredRows` preserves legacy intention definitions and migration receipts; `nextEpoch`, `containsLastRunToday`; dream/REM diary and inbox helpers |
 
 extension SchedulerDueJobRunner {
     /// Keep recent one-shot completions; held outcomes are never age-retired.
@@ -27,6 +27,13 @@ extension SchedulerDueJobRunner {
             }
             let kind = (SchedulerJobRuntime.string(obj["kind"]) ?? "notify").lowercased()
             let enabled = SchedulerJobRuntime.bool(obj["enabled"], default: true)
+            // A paused/disabled intention is still the person's saved words
+            // and schedule. Migration receipts also remain the commit evidence.
+            // Restored rows owe a stopped record and Desk notice, never pruning.
+            if ["notify", "turn", "workshop"].contains(kind) {
+                kept.append(row)
+                continue
+            }
             // Held work retains the owner of its resume/reconciliation lever.
             if obj["activeOccurrence"] != nil
                 || SchedulerJobRuntime.string(obj["lastRunStatus"]) == "unknown"
@@ -124,16 +131,20 @@ extension SchedulerDueJobRunner {
         return dates
     }
 
-    static func dreamEntriesForToday(dataRoot: URL, dateKey: String) -> [DreamDiarySnippet] {
-        let files = (try? FileBackedDreamDiary(dataRoot: dataRoot).discover(in: .active, matching: .markdown)) ?? []
-        let newest = files
+    static func dreamEntriesForToday(dataRoot: URL, dateKey: String) throws -> [DreamDiarySnippet] {
+        let files = try FileBackedDreamDiary(dataRoot: dataRoot).discover(in: .active, matching: .markdown)
+        let newest = try files
             .filter { $0.name == "\(dateKey).md" || $0.name.hasPrefix("\(dateKey)_") }
             .map { file in
-                (file.url, (try? file.url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast)
+                let values = try file.url.resourceValues(forKeys: [.contentModificationDateKey])
+                guard let modified = values.contentModificationDate else {
+                    throw PersistenceCoreError.ioFailure("Dream metadata unavailable at \(file.url.path). Repair the diary file before publishing its receipt.")
+                }
+                return (file.url, modified)
             }
             .sorted { $0.1 > $1.1 }
-        return newest.prefix(5).map { url, _ in
-            let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        return try newest.prefix(5).map { url, _ in
+            let text = try String(contentsOf: url, encoding: .utf8)
             let dream = DreamNight(text).latest
             return DreamDiarySnippet(path: url.path, title: dream?.title ?? "", summary: dream?.summary ?? "")
         }

@@ -8,24 +8,27 @@ function createCodexTurnObservation({
   connectRpc,
   createWakeEventWaiter,
   extractTurnResultFromRollout,
-  extractTurnResultFromThread,
-  extractTurnResultFromTurn,
   nowISO,
   numberSetting,
   sleep
 }) {
 const fs = require("fs");
 const path = require("path");
+const { readRolloutRows } = require("./wake_worker_common.js");
 
 const ROLLOUT_PATH_CACHE = new Map();
 
 function findThreadRolloutPath(threadId, config, options = {}) {
   if (typeof config.rolloutPath === "string" && config.rolloutPath) {
-    return fs.existsSync(config.rolloutPath) ? config.rolloutPath : null;
+    fs.accessSync(config.rolloutPath, fs.constants.R_OK);
+    return config.rolloutPath;
   }
   if (!options.forceRefresh && ROLLOUT_PATH_CACHE.has(threadId)) {
     const cached = ROLLOUT_PATH_CACHE.get(threadId);
-    if (cached && fs.existsSync(cached)) return cached;
+    if (cached) {
+      try { fs.accessSync(cached, fs.constants.R_OK); return cached; }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+    }
   }
   const sessionsRoot = path.join(CODEX_HOME, "sessions");
   const stack = [sessionsRoot];
@@ -35,16 +38,16 @@ function findThreadRolloutPath(threadId, config, options = {}) {
     let entries;
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
+    } catch (error) {
+      if (error.code === "ENOENT" && dir === sessionsRoot) return null;
+      throw new Error(`Codex rollout inventory unavailable at ${dir}: ${error.message}`, { cause: error });
     }
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         stack.push(fullPath);
       } else if (entry.isFile() && entry.name.endsWith(".jsonl") && entry.name.includes(threadId)) {
-        let mtimeMs = 0;
-        try { mtimeMs = fs.statSync(fullPath).mtimeMs; } catch {}
+        const mtimeMs = fs.statSync(fullPath).mtimeMs;
         matches.push({ path: fullPath, mtimeMs });
       }
     }
@@ -62,22 +65,11 @@ function readLocalRolloutState(threadId, config) {
   // Liveness is judged by last write (file mtime), not turn start, so long healthy
   // turns stay active while a frozen one goes stale after ~10 minutes.
   const activeStaleMs = numberSetting(config, "activeStaleMs", "NATIVE_AGENT_CODEX_ACTIVE_STALE_MS", 10 * 60 * 1000);
-  let text;
-  try {
-    text = fs.readFileSync(rolloutPath, "utf8");
-  } catch {
-    return null;
-  }
   const openTurns = new Map();
   const terminalTypes = new Set(["task_complete", "turn_aborted"]);
-  for (const line of text.split("\n")) {
-    if (!line.includes("\"event_msg\"") || !line.includes("\"turn_id\"")) continue;
-    let row;
-    try {
-      row = JSON.parse(line);
-    } catch {
-      continue;
-    }
+  for (const { value: row } of readRolloutRows(rolloutPath)) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error(`Codex rollout row must be an object: ${rolloutPath}`);
+    if (row.type !== "event_msg") continue;
     const payload = row && row.payload;
     const type = payload && payload.type;
     const turnId = payload && payload.turn_id;
@@ -100,10 +92,7 @@ function readLocalRolloutState(threadId, config) {
 
   const allOpenTurns = [...openTurns.values()];
   const freshOpenTurns = allOpenTurns.filter((turn) => {
-    let rolloutMtimeMs = 0;
-    try {
-      rolloutMtimeMs = fs.statSync(rolloutPath).mtimeMs;
-    } catch {}
+    const rolloutMtimeMs = fs.statSync(rolloutPath).mtimeMs;
     const lastSignalMs = Math.max(turn.startedAtMs || 0, rolloutMtimeMs);
     if (!lastSignalMs) return true;
     return Date.now() - lastSignalMs < activeStaleMs;
@@ -126,8 +115,9 @@ function safeFileStat(filePath) {
   try {
     const stat = fs.statSync(filePath);
     return { ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
-  } catch {
-    return null;
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw new Error(`Codex rollout metadata unavailable at ${filePath}: ${error.message}`, { cause: error });
   }
 }
 
@@ -139,64 +129,10 @@ function sameFileStat(lhs, rhs) {
 }
 
 async function readCanonicalTurnResult(client, threadId, turnId, config, eventTurn = null) {
-  let rolloutPath = findThreadRolloutPath(threadId, config);
-  if (client) {
-    try {
-      const result = await client.request("thread/read", { threadId, includeTurns: true });
-      const fromThread = extractTurnResultFromThread(result && result.thread, turnId, rolloutPath);
-      if (fromThread) {
-        // The app-server marks provider-failed turns "completed" with no
-        // items, which reads as an unknown outcome. The rollout's
-        // task_complete row carries the actual outcome — let its terminal
-        // result override the ambiguous no-reply classification.
-        // A different app-server can hydrate a completed resumed turn as
-        // interrupted. Its exact durable terminal event wins over that view;
-        // retained answer text by itself never establishes completion.
-        if (fromThread.status === "completed_without_reply" || fromThread.status === "aborted") {
-          let livePath = rolloutPath && fs.existsSync(rolloutPath) ? rolloutPath : null;
-          let fromRollout = livePath ? extractTurnResultFromRollout(livePath, turnId) : null;
-          if (!fromRollout) {
-            // The app-server can report terminal before Codex flushes the
-            // task_complete line — or before the session file is even
-            // discoverable. One bounded delay, then re-find AND re-read;
-            // never poll beyond it. forceRefresh: a resumed thread can grow a
-            // NEWER session file than the cached one, and the stale cache
-            // would otherwise defeat this retry in a long-lived process.
-            await new Promise((resolve) => setTimeout(resolve, 400));
-            livePath = findThreadRolloutPath(threadId, config, { forceRefresh: true }) || livePath;
-            if (livePath && fs.existsSync(livePath)) {
-              fromRollout = extractTurnResultFromRollout(livePath, turnId);
-            }
-          }
-          if (fromRollout) return fromRollout;
-        }
-        const activity = rolloutPath
-          ? extractTurnResultFromRollout(rolloutPath, turnId, { includeNonTerminal: true }) : null;
-        return {
-          ...fromThread,
-          toolActivityCount: activity && (activity.status !== "in_flight" || activity.sawTurnStart)
-            ? activity.toolActivityCount : null,
-          noWorkObserved: activity && activity.status === "in_flight"
-            ? (activity.sawTurnStart ? activity.toolActivityCount === 0 && !activity.hasMessage : null)
-            : activity ? activity.noWorkObserved ?? null : null,
-          connectorDiagnostics: activity ? activity.connectorDiagnostics || null : null,
-        };
-      }
-    } catch {
-      // The rollout is the durable repair path when the app-server connection
-      // disappears after starting the turn.
-    }
-  }
-  if (!rolloutPath || !fs.existsSync(rolloutPath)) {
-    rolloutPath = findThreadRolloutPath(threadId, config);
-  }
-  if (rolloutPath) {
-    const fromRollout = extractTurnResultFromRollout(rolloutPath, turnId);
-    if (fromRollout) return fromRollout;
-  }
-  // `turn/completed` is exact server evidence, but it is intentionally the
-  // last read source: thread/read and the durable rollout remain canonical.
-  return extractTurnResultFromTurn(eventTurn, turnId, rolloutPath);
+  // One terminal owner in every lifecycle, including restart recovery.
+  // RPC/events wake this read; neither supplies substitute completion cargo.
+  const rolloutPath = findThreadRolloutPath(threadId, config, { forceRefresh: true });
+  return rolloutPath ? extractTurnResultFromRollout(rolloutPath, turnId) : null;
 }
 
 function createTurnCompletionEventWaiter(client, threadId, turnId, config, deadline) {
@@ -229,7 +165,9 @@ function createTurnCompletionEventWaiter(client, threadId, turnId, config, deadl
           const changed = filename == null ? "" : String(filename);
           if (!rolloutPath && changed && !changed.includes(threadId)) return;
           if (rolloutPath && initialRolloutStat) {
-            const current = safeFileStat(rolloutPath);
+            let current;
+            try { current = safeFileStat(rolloutPath); }
+            catch (error) { signal({ source: "rollout_metadata_unavailable", error: error.message }); return; }
             if (sameFileStat(initialRolloutStat, current)) return;
           }
           signal({ source: "rollout_file_event", turn: null });
@@ -319,7 +257,9 @@ async function waitForTurnResultEventFirst(threadId, turnId, config, client = nu
     // fs.watch has no ready callback. Yield once so its native registration is
     // active before the canonical race-closing read.
     await new Promise((resolve) => setImmediate(resolve));
-    const initial = await readCanonicalTurnResult(client, threadId, turnId, config);
+    let initial;
+    try { initial = await readCanonicalTurnResult(client, threadId, turnId, config); }
+    catch (error) { waiter.close(); throw error; }
     if (initial) {
       waiter.close();
       return { ...initial, waitSource: "initial_canonical_read" };
@@ -364,28 +304,28 @@ async function waitForTurnResult(threadId, turnId, config, windowMs = null, live
     12000
   );
   let client = null;
+  let wakeError = null;
   try {
     client = await connectRpc(requestTimeoutMs);
-  } catch {
-    // The vnode-backed durable rollout path still provides event-first repair.
+  } catch (error) {
+    // The durable owner is unchanged; only an optional wake transport failed.
+    wakeError = `Codex notification channel unavailable: ${error.message}`;
   }
   try {
-    return await waitForTurnResultEventFirst(threadId, turnId, config, client, windowMs, live, onObservation);
+    const result = await waitForTurnResultEventFirst(threadId, turnId, config, client, windowMs, live, onObservation);
+    return wakeError ? { ...result, wakeError } : result;
   } finally {
     if (client) client.close();
   }
 }
 
-async function waitForTurnResultWithEmptyRetry(job, config, options = {}) {
-  // Despite the compatibility name, this deliberately performs no automatic
-  // replay. A terminal turn without assistant cargo may already have changed
-  // files or external state; starting another thread or `codex exec` would
-  // repeat non-idempotent work. Manual retry remains an explicit user action.
+async function observeTurnResult(job, config, options = {}) {
+  // Observation never replays execution, including a terminal empty answer.
   const threadId = job.threadId;
   const turnId = job.turnId;
   const wait = options.waitForTurnResult || waitForTurnResult;
   const turnResult = await wait(threadId, turnId, config, options.windowMs || null, options.live || null, options.onObservation || null);
-  return { threadId, turnId, turnResult, attempts: [{ threadId, turnId, turnResult }] };
+  return { threadId, turnId, turnResult };
 }
 
 /// One wait-window's stall evidence. A "window" is a full replyWaitTimeoutMs
@@ -419,24 +359,21 @@ async function probeTurnLiveness(threadId, turnId, config) {
   let client = null;
   try {
     client = await connectRpc(probeTimeoutMs);
-  } catch {
-    return { serverReachable: false, turnFound: false, turnClaimsInProgress: false };
+  } catch (error) {
+    return { serverReachable: false, turnFound: null, turnClaimsInProgress: null, availability: "unavailable", error: error.message };
   }
   try {
     const result = await client.request("thread/read", { threadId, includeTurns: true });
-    const turns = result && result.thread && Array.isArray(result.thread.turns)
-      ? result.thread.turns
-      : [];
+    if (!result?.thread || !Array.isArray(result.thread.turns)) throw new Error("Codex thread/read omitted its turns array");
+    const turns = result.thread.turns;
     const turn = turns.find((candidate) => candidate && candidate.id === turnId);
     return {
       serverReachable: true,
       turnFound: Boolean(turn),
       turnClaimsInProgress: Boolean(turn && turn.status === "inProgress"),
     };
-  } catch {
-    // A failed read on a reachable socket is not evidence of a dead turn.
-    // Preserve found/inProgress so only the longer wedged-turn path can settle it.
-    return { serverReachable: true, turnFound: true, turnClaimsInProgress: true };
+  } catch (error) {
+    return { serverReachable: true, turnFound: null, turnClaimsInProgress: null, availability: "unavailable", error: error.message };
   } finally {
     client.close();
   }
@@ -446,6 +383,7 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
   const snapshotFn = options.rolloutStallSnapshot || rolloutStallSnapshot;
   const probeFn = options.probeTurnLiveness || probeTurnLiveness;
   const nowFn = options.now || Date.now;
+  // replyWaitTimeoutMs bounds each caller window, never the durable job.
   const hangWatchdogMs = numberSetting(
     config,
     "hangWatchdogMs",
@@ -487,9 +425,14 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
     const priorProbe = job.stallProbe && job.stallProbe.lastProbe;
     const nextIdleThresholdMs = priorProbe && priorProbe.serverReachable && priorProbe.turnFound
       ? stallWedgedIdleMs : Math.min(stallIdleMs, hangWatchdogMs);
-    const watchdogRemainingMs = beforeWait && Number.isFinite(beforeWait.mtimeMs)
-      ? Math.max(1, beforeWait.mtimeMs + nextIdleThresholdMs - nowFn())
-      : judgingWindowMs;
+    // An unavailable probe supplies no new deadline evidence. Re-arm a full
+    // bounded observation window, rather than spinning on the expired idle
+    // threshold; real rollout/event edges still wake it immediately.
+    const watchdogRemainingMs = priorProbe && priorProbe.availability === "unavailable"
+      ? judgingWindowMs
+      : beforeWait && Number.isFinite(beforeWait.mtimeMs)
+        ? Math.max(1, beforeWait.mtimeMs + nextIdleThresholdMs - nowFn())
+        : judgingWindowMs;
     const waitOptions = {
       ...options,
       windowMs: Math.min(judgingWindowMs, watchdogRemainingMs),
@@ -512,7 +455,7 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
           turnResult: { waitSource: "rollout_observation" } });
       },
     };
-    const observed = await waitForTurnResultWithEmptyRetry(job, config, waitOptions);
+    const observed = await observeTurnResult(job, config, waitOptions);
     if (observed.turnResult.status !== "timeout") return observed;
 
     // Dead-liveness settlement needs a stagnant rollout and confirmed probes.
@@ -557,9 +500,29 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
     const wedgedReady = idleMs != null
       ? idleMs >= stallWedgedIdleMs
       : effectiveStagnant >= wedgedWindows;
+    async function retainUnavailableProbe(evidence) {
+      job.stallProbe = {
+        rolloutSnapshot: currentSnapshot,
+        stagnantWindows: effectiveStagnant,
+        lastProbe: evidence,
+        toolActivityCount,
+        noWorkObserved,
+        idleThresholdMs: stallWedgedIdleMs,
+        observedAt: nowISO(),
+      };
+      await onTimeout({ ...observed, turnResult: { ...observed.turnResult,
+        status: "observation_unavailable", completedAt: null, observedAt: nowISO(), errorMessage: evidence.error,
+        stallEvidence: { ...evidence, observedAt: nowISO() } } });
+    }
     let liveness = null;
     if (idleReady) {
       liveness = await probeFn(observed.threadId, observed.turnId, config);
+      if (liveness.availability === "unavailable") {
+        // This window ended without a verdict. Keep this same watcher and
+        // turn owed; an unavailable probe cannot enter reply delivery.
+        await retainUnavailableProbe(liveness);
+        continue;
+      }
       let deadLiveness = !liveness.serverReachable || !liveness.turnFound;
       if (deadLiveness) {
         // Two readings must agree; a transient connection failure or server
@@ -571,6 +534,10 @@ async function waitForDurableTerminalExecution(job, config, onTimeout, options =
           5000
         ));
         const confirm = await probeFn(observed.threadId, observed.turnId, config);
+        if (confirm.availability === "unavailable") {
+          await retainUnavailableProbe(confirm);
+          continue;
+        }
         if (confirm.serverReachable && confirm.turnFound) {
           deadLiveness = false;
         }
@@ -650,7 +617,7 @@ return {
   sameFileStat,
   readCanonicalTurnResult,
   waitForTurnResultEventFirst,
-  waitForTurnResultWithEmptyRetry,
+  observeTurnResult,
   probeTurnLiveness,
   waitForDurableTerminalExecution
 };

@@ -48,40 +48,14 @@ public enum SchedulerJobRuntime {
     }
 
     public static func nextWallClockOccurrence(for job: [String: JSONValue]) -> String? {
-        if let saved = job["nextWallClockOccurrence"] { return string(saved) }
-        guard job["activeOccurrence"] == nil, job["retryPendingUntilEpoch"] == nil,
-              let schedule = wallClockSchedule(job) else { return nil }
-        let zone = TimeZone.autoupdatingCurrent
-        guard let utc = TimeZone(secondsFromGMT: 0) else { return nil }
-        func civil(_ value: JSONValue?) -> Double? {
-            // Machine stamps: an offset-less one was written as UTC.
-            string(value).flatMap { SchedulerJobNormalizer.parseISO($0, zone: utc) }.flatMap {
-                civilEpoch(occurrence(at: Date(timeIntervalSince1970: $0), zone: zone))
-            }
-        }
-        if schedule["firstRunAt"] != nil, string(job["lastRunAt"]) == nil,
-           job["lastWallClockOccurrence"] == nil,
-           let first = epoch(from: job["nextRunAt"]) ?? epoch(from: job["nextRunAtEpoch"]) {
-            return occurrence(at: Date(timeIntervalSince1970: first), zone: zone)
-        }
-        let anchor = string(schedule["wallClockAnchor"]).flatMap(civilEpoch) ?? civil(schedule["wallClockAnchor"])
-        let claimed = string(job["lastWallClockOccurrence"]).flatMap(civilEpoch)
-        guard schedule["wallClockAnchor"] == nil || anchor != nil,
-              job["lastWallClockOccurrence"] == nil || claimed != nil else { return nil }
-        // Settlement deliberately skips missed slots. Its actual completion
-        // bounds migration even when the old civil claim is several slots behind.
-        guard let after = [anchor, claimed, civil(job["lastRunAt"])].compactMap({ $0 }).max()
-            ?? civil(job["createdAt"]) else { return nil }
-        guard let next = try? SchedulerJobNormalizer.nextFromSchedule(schedule, afterEpoch: after, now: { Date() },
-                                                                       zone: utc) else { return nil }
-        return occurrence(at: Date(timeIntervalSince1970: next), zone: utc)
+        string(job["nextWallClockOccurrence"])
     }
 
-    /// Claims and rows bearing a legacy retry marker keep the saved instant, not the marker's value.
+    /// Claims keep their saved instant.
     /// Other wall-clock work resolves its civil identity in the current zone.
     public static func scheduledEpoch(for job: [String: JSONValue]) -> Double? {
         let saved = epoch(from: job["nextRunAt"]) ?? epoch(from: job["nextRunAtEpoch"])
-        guard job["activeOccurrence"] == nil, job["retryPendingUntilEpoch"] == nil,
+        guard job["activeOccurrence"] == nil,
               wallClockSchedule(job) != nil else { return saved }
         guard let key = nextWallClockOccurrence(for: job), let next = civilEpoch(key) else { return nil }
         if let saved, wallClockOccurrence(for: job, epoch: saved) == key { return saved }
@@ -111,7 +85,7 @@ public enum SchedulerJobRuntime {
     }
 
     public static func int(_ raw: JSONValue?, default defaultValue: Int) -> Int {
-        (try? SchedulerJobNormalizer.pyInt(raw)) ?? defaultValue
+        (try? SchedulerJobNormalizer.integer(raw)) ?? defaultValue
     }
 
     public static func nextRunEpoch(
@@ -121,13 +95,10 @@ public enum SchedulerJobRuntime {
     ) throws -> Double? {
         guard case .object(let obj) = job else { return nil }
         if bool(obj["oneShot"], default: false) { return nil }
-        if case .object(let schedule)? = obj["schedule"] {
-            return try SchedulerJobNormalizer.nextFromSchedule(schedule, afterEpoch: afterEpoch, now: now)
+        guard case .object(let schedule)? = obj["schedule"] else {
+            throw TriggerSchedulerError.schedulerInvalid("Saved job has no structured schedule; repair its definition before advancing it.")
         }
-        let interval = max(60, int(obj["intervalSeconds"] ?? obj["interval_seconds"], default: 3600))
-        let next = afterEpoch + Double(interval)
-        _ = try SchedulerJobNormalizer.checkedEpoch(next)
-        return next
+        return try SchedulerJobNormalizer.nextFromSchedule(schedule, afterEpoch: afterEpoch, now: now)
     }
 
     /// Past `now` and past the minute `dueEpoch` claimed: in a fall-back hour a
@@ -146,6 +117,6 @@ public enum SchedulerJobRuntime {
     }
 
     public static func floatString(_ value: Double) -> String {
-        SchedulerJobNormalizer.pyFloatString(value)
+        SchedulerJobNormalizer.floatString(value)
     }
 }

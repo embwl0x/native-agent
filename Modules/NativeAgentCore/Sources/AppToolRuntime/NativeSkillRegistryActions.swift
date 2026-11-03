@@ -2,6 +2,7 @@ import Foundation
 import PersistenceCore
 import Senses
 import ToolExecution
+import NativeAgentCore
 // Blueprint: | `NativeSkillRegistryActions.swift` | owner-facing enable/disable through `Parts`; `enableSkill`, `disableSkill` |
 
 /// The owner's own hand on a part: the Skills page's Install, an approved
@@ -15,11 +16,19 @@ public enum NativeSkillRegistryActions {
         let outcome = await OwnedProgramInvocation.$host.withValue(host) {
             await Parts(root: dataRoot).enable(name, version: reviewedDigest, fullMac: false, ownerAuthorized: true)
         }
-        guard outcome.ok else { throw PartError.invalid(outcome.text) }
+        guard outcome.ok else {
+            throw ToolFailureError(outcome.text,
+                effects: outcome.fields["effects"] == .string("none") ? .none : .unknown,
+                code: "part_enable_incomplete")
+        }
     }
 
     public static func disableSkill(name: String, dataRoot: URL) async throws {
         let outcome = Parts(root: dataRoot).disable(name, reason: nil, fullMac: false, ownerAuthorized: true)
-        guard outcome.ok else { throw PartError.invalid(outcome.text) }
+        guard outcome.ok else {
+            throw ToolFailureError(outcome.text,
+                effects: outcome.fields["effects"] == .string("none") ? .none : .unknown,
+                code: "part_disable_incomplete")
+        }
     }
 }

@@ -15,11 +15,13 @@ import TurnTrace
 import ProviderRouting
 import StandingBots
 import Privacy
-// Blueprint: | `ICloudIncomingTurnForwarder.swift` | Signed incoming phone turns route helpers to their own runner and resident conversations to chat; iCloudChatFileAccess; checked session commits, Privacy-redacted errors and retained conflated optional publication through `ICloudConflatedSender` |
+import Experiences
+// Blueprint: | `ICloudIncomingTurnForwarder.swift` | Signed phone turns route helpers/resident chat; payload-free pickup and text-delta acceptance timings; attachment-kind progress; checked session commits, Privacy-redacted errors and retained conflated optional publication; full replies keep streamed pre-tool words; Error/Stop envelopes mark accumulated reply text for phone settlement; every delta enters retained conflated optional publication through `ICloudConflatedSender` immediately; terminal delivery runs alongside admitted optional sends and traces `surface.replyDeliveryStarted`; iCloudChatFileAccess, checked session commits and Privacy-redacted errors |
 
 /// One retained worker; each presentation channel holds only its latest value.
-/// Closing discards unsent optional values and joins any send already admitted,
-/// so no progress can follow the terminal reply.
+/// Closing discards unsent optional values. The owner joins the admitted send
+/// alongside terminal delivery; a late optional value cannot reopen the phone's
+/// resolved correlation.
 final class ICloudConflatedSender: Sendable {
     private typealias Send = @Sendable () async -> Void
     private let mailbox = OSAllocatedUnfairLock(initialState: (closed: false, pending: [String: Send]()))
@@ -106,8 +108,14 @@ public struct ICloudIncomingTurnForwarder: Sendable {
     /// The only file-access IDs the signed iPhone chat route admits. This is
     /// intentionally shared with the mobile pill rather than treating its
     /// persisted label as authority.
-    static func iCloudChatFileAccess(from remoteMetadata: [String: String]) -> String {
-        ICloudChatFileAccessPolicy.normalized(remoteMetadata["fileAccess"] ?? "")
+    static func iCloudChatFileAccess(from remoteMetadata: [String: String]) throws -> String {
+        guard let raw = remoteMetadata["fileAccess"] else { return "auto" }
+        guard let mode = ICloudChatFileAccessPolicy.Mode(raw) else {
+            throw ToolFailureError("The phone's fileAccess request is unrecognized; no file access was inferred.",
+                argumentPath: "request.fileAccess",
+                accepted: ICloudChatFileAccessPolicy.acceptedIDs.sorted().joined(separator: ", "), effects: .none)
+        }
+        return mode.rawValue
     }
 
     /// Emit the typed needs-input envelope for inline cards; the accompanying sentence remains self-contained.
@@ -121,12 +129,14 @@ public struct ICloudIncomingTurnForwarder: Sendable {
 
     @MainActor
     public func forwardToSwiftRuntime(_ msg: BridgeMessage) async -> Bool {
+        let receivedAt = Date()
         let remoteMetadata = msg.metadata ?? [:]
         let sourceKey = remoteMetadata["sourceKey"] ?? "app"
         let routeKey = remoteMetadata["routeKey"] ?? remoteMetadata["deviceSourceKey"] ?? sourceKey
         func writeErrorReply(
             _ text: String,
             detail: String? = nil,
+            partialReply: String? = nil,
             sessionID: String?,
             turnReachedTerminalState: Bool = false,
             needs: String? = nil
@@ -141,14 +151,16 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                     "targetSourceKey": routeKey
                 ]
                 if let needs { metadata["needs"] = needs }
+                let body = partialReply.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+                if body != nil { metadata["partialReply"] = "true" }
                 _ = try await sync.bridge.sendChatMessage(
-                    text: text,
+                    text: body ?? text,
                     sessionID: sessionID,
                     correlationID: msg.id,
                     metadata: metadata
                 )
                 await sync.relay.sendICloudReplyPushNotification(
-                    text: text,
+                    text: body ?? text,
                     sessionID: sessionID,
                     correlationID: msg.id,
                     kind: "error"
@@ -198,15 +210,31 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         } else {
             resolvedSessionID = UUID().uuidString
         }
+        let chatFileAccess: String
+        do { chatFileAccess = try Self.iCloudChatFileAccess(from: remoteMetadata) }
+        catch { return await writeErrorReply(error.localizedDescription, sessionID: resolvedSessionID) }
         // The run is registered for Stop at admission, before any await: a Stop
         // from here on names this message's run wherever it has got to, and the
         // turn's own acceptance of the same run is the same registration.
         let turnID = TurnTraceContext.mintTurnId()
+        TurnTraceBus.fire(TurnTraceEvent(turnId: turnID, ts: receivedAt, kind: "phone.pickup",
+            sessionId: resolvedSessionID, surface: "ios", payload: .object([
+                "messageId": .string(msg.id),
+                "sentAt": .string(NativeTimestampFormat.fractionalZulu(msg.timestamp)),
+                "pickupMs": .double(receivedAt.timeIntervalSince(msg.timestamp) * 1_000)
+            ])))
         let stopFlag = ChatCancelFlag.accept(dataRoot: PersistenceCore.defaultDataRoot(),
                                              sessionId: resolvedSessionID, runId: msg.id, turnId: turnID)
         defer { ChatCancelFlag.finish(stopFlag) }
         do {
             try await iCloudBridge.bindReplySession(msg, sessionID: resolvedSessionID, dataRoot: PersistenceCore.defaultDataRoot())
+            // Also cover early-return handlers (control handoff and supersession),
+            // before they can perform work outside the stream task.
+            if try iCloudBridge.chatStopRequested(session: resolvedSessionID, runID: msg.id, dataRoot: PersistenceCore.defaultDataRoot()) {
+                _ = try await sync.bridge.sendChatMessage(text: "Stopped.", sessionID: resolvedSessionID,
+                    correlationID: msg.id, metadata: ["kind": "cancelled", "targetSourceKey": routeKey])
+                return true
+            }
         } catch {
             nativeLog("[iCloudBridge] reply session could not be retained: %@", error.localizedDescription)
             return false
@@ -230,7 +258,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 )
                 _ = try await sync.bridge.sendChatMessage(text: reply, sessionID: resolvedSessionID,
                     correlationID: msg.id, metadata: [
-                        "transport": "icloud", "source": "mac",
+                        "kind": "final", "transport": "icloud", "source": "mac",
                         "replyTo": remoteMetadata["clientSurface"] ?? "iphone", "targetSourceKey": routeKey,
                     ])
                 await sync.relay.sendICloudReplyPushNotification(text: reply, sessionID: resolvedSessionID,
@@ -289,12 +317,21 @@ public struct ICloudIncomingTurnForwarder: Sendable {
 
         port.received(in: resolvedSessionID)
         // User sent this from his phone, so it is the conversation he is in.
-        // Best-effort: a failed publish must never fail his message.
-        _ = try? await ConversationAnchor.publish(
-            sessionId: resolvedSessionID, source: "ios",
-            conversationKind: SessionConversation.kind(resolvedSessionID) ?? .legacy,
-            dataRoot: PersistenceCore.defaultDataRoot()
-        )
+        let anchorRoot = PersistenceCore.defaultDataRoot()
+        let anchorOperation = "conversation.anchor:" + resolvedSessionID
+        do {
+            _ = try await ConversationAnchor.publish(
+                sessionId: resolvedSessionID, source: "ios",
+                conversationKind: SessionConversation.kind(resolvedSessionID) ?? .legacy,
+                dataRoot: anchorRoot)
+            RepairOwed.settle(anchorRoot, operation: anchorOperation,
+                             evidence: .init(source: "conversation-anchor", id: resolvedSessionID))
+        } catch {
+            RepairOwed.owe(anchorRoot, id: anchorOperation, kind: .run,
+                operation: anchorOperation, owner: "Conversation anchor",
+                words: "The phone conversation was accepted, but its current-conversation anchor could not be published: \(error.localizedDescription)",
+                lever: "Repair the conversation anchor store and publish the accepted session \(resolvedSessionID); do not replay its message.")
+        }
 
         // File access remains a signed per-message request. Provider/model/
         // effort/tier metadata is UI evidence only; the central facade admits
@@ -302,10 +339,10 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         let replacementAssistantMessageID = ICloudChatReplacementIntent
             .decode(remoteMetadata)?.assistantMessageID
         let suppressUserAppend = replacementAssistantMessageID != nil
-        let chatFileAccess = Self.iCloudChatFileAccess(from: remoteMetadata)
 
         // MacSyncEngine retains the turn for explicit Stop; passive sync shutdown lets accepted work settle.
         let replyMetadata = [
+            "kind": "final",
             "transport": "icloud",
             "source": "mac",
             "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
@@ -328,27 +365,40 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         let progress = ICloudConflatedSender()
         writeProgress("Mac received it", stage: "received", sessionID: resolvedSessionID, sender: progress)
         if !(msg.attachments?.isEmpty ?? true) {
-            writeProgress("Reading attached photos", stage: "attachments", sessionID: resolvedSessionID, sender: progress)
+            let status = msg.attachments?.contains(where: { $0.type == "audio" }) == true
+                ? "Listening to your voice note"
+                : msg.attachments?.allSatisfy({ $0.type == "image" }) == true ? "Reading attached photos" : "Reading attachments"
+            writeProgress(status, stage: "attachments", sessionID: resolvedSessionID, sender: progress)
         }
-        writeProgress("\(agentDisplayName) is thinking", stage: "thinking", sessionID: resolvedSessionID, sender: progress)
+        // The conflated sender must not replace the voice-note line before
+        // it can leave the Mac. Deltas/tool progress take over naturally.
+        if msg.attachments?.contains(where: { $0.type == "audio" }) != true {
+            writeProgress("\(agentDisplayName) is thinking", stage: "thinking", sessionID: resolvedSessionID, sender: progress)
+        }
         let streamTask = Task.detached(priority: .userInitiated) { () -> (text: String, deltaSeq: Int, error: String?, toolEvents: Int, attachments: [NativeAgentShared.MultimodalAttachment], cause: Error?) in
             do {
-            return try await TurnAdmission.shared.run(sessionID: resolvedSessionID) {
+            if try iCloudBridge.chatStopRequested(session: resolvedSessionID, runID: msg.id, dataRoot: PersistenceCore.defaultDataRoot()) {
+                throw CancellationError()
+            }
+            let helper = try SessionConversation.checkedIsHelper(resolvedSessionID)
+            return try await TurnAdmission.shared.run(dataRoot: PersistenceCore.defaultDataRoot(), sessionID: resolvedSessionID) {
             return await TurnTraceContext.$turnId.withValue(turnID) {
             await ChatPersistenceContext.$pinnedTurnRunID.withValue(msg.id) {
-            await ChatToolSessionContext.$commandSignatureVerified.withValue(commandSignatureVerified) {
-            if SessionConversation.isHelper(resolvedSessionID) {
+            await ChatToolSessionContext.$envelope.withValue(TurnEnvelope(
+                surface: "ios", commandSignatureVerified: commandSignatureVerified, deliveryRoute: replyRoute
+            )) {
+            if helper {
+                let textProgress = OSAllocatedUnfairLock(initialState: ICloudTextDeltaCoalescer())
                 do {
-                    let textProgress = OSAllocatedUnfairLock(initialState: ICloudTextDeltaCoalescer())
                     let request = TurnRequest(message: msg.text, sessionID: resolvedSessionID, fileAccess: chatFileAccess,
-                        surface: "ios", envelope: TurnEnvelope(surface: "ios", commandSignatureVerified: commandSignatureVerified), replyRoute: replyRoute,
+                        surface: "ios", replyRoute: replyRoute,
                         replacementAssistantMessageID: .some(replacementAssistantMessageID))
                     let reply = try await request.bind {
                         try await port.helperReply(message: msg.text, sessionID: resolvedSessionID,
                             attachments: msg.attachments ?? [], fileAccess: chatFileAccess, progress: { event in
                                 guard case .delta(let text) = event else { return }
                                 let flush = textProgress.withLock { state in
-                                    state.push(delta: text, nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds)
+                                    state.push(delta: text)
                                 }
                                 if let flush {
                                     sendICloudTextDelta(flush, sender: progress, sessionID: resolvedSessionID, correlationID: msg.id,
@@ -361,7 +411,10 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                     let cause: Error? = reply.terminalState == .stopped ? CancellationError() : nil
                     return (reply.output, textProgress.withLock { $0.sequence },
                         reply.terminalState == .failed || reply.terminalState == .interrupted ? reply.statusDetail : nil, 0, attachments, cause)
-                } catch { return ("", 0, error.localizedDescription, 0, [], error) }
+                } catch {
+                    return (textProgress.withLock { $0.text }, textProgress.withLock { $0.sequence },
+                            error.localizedDescription, 0, [], error)
+                }
             }
             var finalAnswer: String?
             var sawError: String? = nil
@@ -396,10 +449,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                     switch event {
                     case .delta(let s):
                         if s.isEmpty { continue }
-                        if let flush = deltaCoalescer.push(
-                            delta: s,
-                            nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
-                        ) {
+                        if let flush = deltaCoalescer.push(delta: s) {
                             sendICloudTextDelta(
                                 flush,
                                 sender: progress,
@@ -410,15 +460,9 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                             )
                         }
                     case .final(let r):
-                        // The final turn is authoritative. Earlier deltas may
-                        // include pre-tool draft text that should not become
-                        // the durable reply once tool-loop synthesis finishes.
-                        // The phone saw her working as it streamed; the final
-                        // reply is the answer without that commentary.
-                        let answer = ChatTurnRuntime.ChatResponse.answerOnly(
-                            r.reply,
-                            workingCommentaryCharacters: r.workingCommentaryCharacters
-                        )
+                        // Settlement keeps all her words, including those
+                        // already shown before tools ran.
+                        let answer = r.reply
                         finalAnswer = answer
                         attachments = try Self.bridgeAttachments(
                             from: ChatGeneratedImageArtifacts.attachments(
@@ -434,7 +478,6 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                         break
                     case .notice(let noticeKind, let text):
                         // Transient notices keep their own KVS key so tool progress cannot overwrite them.
-                        // Mirror as progress for older phones; one shared id lets readers deduplicate.
                         sendICloudProgress(
                             text: text,
                             sessionID: resolvedSessionID,
@@ -448,24 +491,13 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                                 "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
                                 "targetSourceKey": routeKey
                             ],
-                            key: NativeAgentICloudBridgeConstants.KVSKey.chatNoticeLatest,
-                            mirrorKey: NativeAgentICloudBridgeConstants.KVSKey.chatProgressLatest
+                            key: NativeAgentICloudBridgeConstants.KVSKey.chatNoticeLatest
                         )
                     case .toolUse(let called, let input):
                         // Phone progress carries the tool's name and card phrase; full input/output stays Mac-local.
                         let call = shown.use(called, input: input)
                         let name = call.name
                         toolEventCounter += 1
-                        if let flush = deltaCoalescer.flush(nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds) {
-                            sendICloudTextDelta(
-                                flush,
-                                sender: progress,
-                                sessionID: resolvedSessionID,
-                                correlationID: msg.id,
-                                replyTo: remoteMetadata["clientSurface"] ?? "iphone",
-                                targetSourceKey: routeKey
-                            )
-                        }
                         sendICloudProgress(
                             text: name,
                             sessionID: resolvedSessionID,
@@ -488,16 +520,6 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                         let outcome = ChatToolOutcome.exactResultClass(output).rawValue
                         let detail = [ChatToolOutcome.explanation(output), ChatToolOutcome.remedy(output)].compactMap { $0 }.joined(separator: " · ")
                         toolEventCounter += 1
-                        if let flush = deltaCoalescer.flush(nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds) {
-                            sendICloudTextDelta(
-                                flush,
-                                sender: progress,
-                                sessionID: resolvedSessionID,
-                                correlationID: msg.id,
-                                replyTo: remoteMetadata["clientSurface"] ?? "iphone",
-                                targetSourceKey: routeKey
-                            )
-                        }
                         sendICloudProgress(
                             text: name,
                             sessionID: resolvedSessionID,
@@ -518,31 +540,11 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                         )
                     case .error(let m):
                         // Stream errors produce an error reply rather than a successful partial answer.
-                        if let flush = deltaCoalescer.flush(nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds) {
-                            sendICloudTextDelta(
-                                flush,
-                                sender: progress,
-                                sessionID: resolvedSessionID,
-                                correlationID: msg.id,
-                                replyTo: remoteMetadata["clientSurface"] ?? "iphone",
-                                targetSourceKey: routeKey
-                            )
-                        }
                         sawError = m
                         nativeLog("[iCloudBridge] chatStream error msg=%@: %@", msg.id, m)
                     }
                 }
             } catch {
-                if let flush = deltaCoalescer.flush(nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds) {
-                    sendICloudTextDelta(
-                        flush,
-                        sender: progress,
-                        sessionID: resolvedSessionID,
-                        correlationID: msg.id,
-                        replyTo: remoteMetadata["clientSurface"] ?? "iphone",
-                        targetSourceKey: routeKey
-                    )
-                }
                 sawError = "\(error)"
                 cause = error
                 nativeLog("[iCloudBridge] forwardToSwiftRuntime: chatStream() failed for msg %@: %@", msg.id, "\(error)")
@@ -567,15 +569,20 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         // for the placeholder it is waiting on, so a Stop can name it.
         sync.engine.registerActiveChatTask(streamTask, for: resolvedSessionID, runID: msg.id)
         let outcome = await streamTask.value
-        await progress.finish()
+        progress.close()
+        // An optional in-flight snapshot must settle, but it cannot hold her
+        // durable reply behind its network round trip. The phone rejects late
+        // progress for a resolved correlation. The group joins on every exit.
+        return await withTaskGroup(of: Void.self, returning: Bool.self) { group in
+        group.addTask { await progress.finish() }
         sync.engine.unregisterActiveChatTask(for: resolvedSessionID, expecting: streamTask)
         let wasCancelled = streamTask.isCancelled
-            || (SessionConversation.isHelper(resolvedSessionID) && outcome.cause is CancellationError)
+            || outcome.cause is CancellationError
 
         if wasCancelled {
             // Cancellation: write a final reply tagged as cancelled so iOS
-            // clears its placeholder and stops the typing indicator. Don't
-            // ship accumulated text as a "real" reply.
+            // keeps all produced words even if the terminal overtakes a
+            // snapshot, then ends the bubble as incomplete.
             do {
                 _ = try await sync.bridge.sendChatMessage(
                     text: outcome.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -585,6 +592,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                     correlationID: msg.id,
                     metadata: [
                         "kind": "cancelled",
+                        "partialReply": outcome.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "false" : "true",
                         "transport": "icloud",
                         "source": "mac",
                         "replyTo": remoteMetadata["clientSurface"] ?? "iphone",
@@ -616,7 +624,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             if let chatError = error as? ChatOrchestrationError,
                case .helperModelChoice(let sessionID, let reason, let message) = chatError {
                 return await writeErrorReply(
-                    message, sessionID: sessionID, turnReachedTerminalState: true,
+                    message, partialReply: outcome.text, sessionID: sessionID, turnReachedTerminalState: true,
                     needs: Self.needsInteractionEnvelope(kind: "model_choice", target: sessionID, reason: reason)
                 )
             }
@@ -624,6 +632,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 "NativeAgent hit an error answering that message.",
                 detail: error.flatMap { ProviderRecoveryPolicy.personMessage($0) } ?? ChatStreamErrorText.normalize(
                     NativeAppSecretRedactor.redactedRemoteErrorDetail(errMsg), retryAction: "Retry"),
+                partialReply: outcome.text,
                 sessionID: resolvedSessionID, turnReachedTerminalState: true
             )
         }
@@ -638,6 +647,9 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             )
         }
 
+        TurnTraceBus.fire(TurnTraceEvent(
+            turnId: turnID, kind: "surface.replyDeliveryStarted", sessionId: resolvedSessionID,
+            surface: "ios", payload: .object(["characters": .int(Int64(replyText.count))])))
         do {
             _ = try await sync.bridge.sendChatMessage(
                 text: replyText,
@@ -661,6 +673,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                 turnReachedTerminalState: true,
                 replyPublished: false
             )
+        }
         }
     }
 
@@ -746,6 +759,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         replyTo: String,
         targetSourceKey: String
     ) {
+        let turnID = TurnTraceContext.turnId
         sender.submit(key: "delta") {
             do {
                 _ = try await sync.bridge.sendChatMessage(
@@ -764,6 +778,12 @@ public struct ICloudIncomingTurnForwarder: Sendable {
                         "targetSourceKey": targetSourceKey
                     ]
                 )
+                if let turnID {
+                    TurnTraceBus.fire(TurnTraceEvent(turnId: turnID, kind: "phone.deltaAccepted",
+                        sessionId: sessionID, surface: "ios", payload: .object([
+                            "messageId": .string(correlationID), "seq": .int(Int64(flush.sequence))
+                        ])))
+                }
             } catch {
                 nativeLog("[iCloudBridge] failed text_delta seq=%d msg=%@: %@", flush.sequence, correlationID, "\(error)")
             }
@@ -772,12 +792,11 @@ public struct ICloudIncomingTurnForwarder: Sendable {
 
     private func sendICloudProgress(
         text: String, sessionID: String, correlationID: String, sender: ICloudConflatedSender,
-        metadata: [String: String], key: String = NativeAgentICloudBridgeConstants.KVSKey.chatProgressLatest,
-        mirrorKey: String? = nil
+        metadata: [String: String], key: String = NativeAgentICloudBridgeConstants.KVSKey.chatProgressLatest
     ) {
         sender.submit(key: key) {
             let delivered = await sync.bridge.sendKVSChatProgress(text: text, sessionID: sessionID,
-                correlationID: correlationID, metadata: metadata, key: key, mirrorKey: mirrorKey)
+                correlationID: correlationID, metadata: metadata, key: key)
             if !delivered { nativeLog("[iCloudBridge] optional progress not delivered for %@", correlationID) }
         }
     }
@@ -799,31 +818,18 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             "updatedAt": .string(nowISO),
             "source": .string("ios"),
             "threadKind": .string(ChatThreadKind.direct.rawValue),
-            "sourceKey": .string(NativeAgentICloudBridgeConstants.mobileSourceKey),
+            "sourceKey": .string(try NativeAgentICloudBridgeConstants.mobileSourceKey),
             "archived": .bool(false),
             "messageCount": .int(0),
+            ChatSessionIndexFile.transcriptGenerationKey: .int(0),
         ]
         let changed = try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () async throws -> Bool in
             var sessions = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
-            if let index = sessions.firstIndex(where: { row in
+            if sessions.contains(where: { row in
                 guard case .string(let id)? = row["id"] else { return false }
                 return id == sessionID
             }) {
-                let existingSourceKey: String? = {
-                    guard case .string(let value)? = sessions[index]["sourceKey"] else { return nil }
-                    return value
-                }()
-                guard !NativeAgentICloudBridgeConstants.isMobileSourceKey(existingSourceKey) else {
-                    return false
-                }
-                guard case .string(let existingSource)? = sessions[index]["source"],
-                      existingSource.lowercased() == "ios",
-                      (existingSourceKey ?? "").isEmpty else { return false }
-                // Compatibility migration for sessions authored by older iOS
-                // builds, which wrote only `source: ios`.
-                sessions[index]["sourceKey"] = .string(NativeAgentICloudBridgeConstants.mobileSourceKey)
-                try ChatSessionIndexFile.write(sessions, to: sessionsPath)
-                return true
+                return false
             }
             sessions.insert(entry, at: 0)
             try ChatSessionIndexFile.write(sessions, to: sessionsPath)

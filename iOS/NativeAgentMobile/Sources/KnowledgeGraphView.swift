@@ -50,7 +50,7 @@ enum KnowledgeGraphDetailNeighborsPresentation {
 
 // MARK: - Models
 
-// Canonical array and legacy dictionary snapshots expose the same entity/edge value.
+// The checked SQLite projection publishes one array envelope.
 struct KGEntityResponse: Decodable, Equatable, Sendable {
     var entities: [KGEntity]
     var edges: [KnowledgeGraphEdgeWireSnapshot]
@@ -58,45 +58,15 @@ struct KGEntityResponse: Decodable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case entities, edges
-        case total
         case totalEntities = "total_entities"
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
 
-        // Try the legacy dict shape first because decoding an array as a dict
-        // fails cheaply, then decode the canonical checked array envelope.
-        if let dict = try? container.decode([String: KGEntity].self, forKey: .entities) {
-            // Each value's `id` falls back to its dict key if absent or blank.
-            entities = dict.map { (key, value) -> KGEntity in
-                var e = value
-                if e.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    e.id = key
-                }
-                return e
-            }
-            // Stable order — by name, then id — so the SwiftUI list isn't random.
-            entities.sort { lhs, rhs in
-                if lhs.name == rhs.name { return lhs.id < rhs.id }
-                return lhs.name < rhs.name
-            }
-            // Legacy dict shape has no trustworthy top-level totals.
-            total = entities.count
-            edges = try container.decodeIfPresent([KnowledgeGraphEdgeWireSnapshot].self, forKey: .edges) ?? []
-            return
-        }
-
-        // Checked SQLite projection uses an entity array.
         entities = try container.decode([KGEntity].self, forKey: .entities)
-        edges = try container.decodeIfPresent([KnowledgeGraphEdgeWireSnapshot].self, forKey: .edges) ?? []
-        if let decodedTotal = try? container.decode(Int.self, forKey: .total) {
-            total = decodedTotal
-        } else if let decodedTotal = try? container.decode(Int.self, forKey: .totalEntities) {
-            total = decodedTotal
-        } else {
-            total = entities.count
-        }
+        edges = try container.decode([KnowledgeGraphEdgeWireSnapshot].self, forKey: .edges)
+        total = try container.decode(Int.self, forKey: .totalEntities)
     }
 }
 
@@ -119,9 +89,10 @@ struct KGEntity: Decodable, Identifiable, Equatable, Sendable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        // `id` may be absent on the value in the dict shape — caller fills it
-        // in from the dict key. Default to empty so this decode doesn't fail.
-        id = (try? c.decode(String.self, forKey: .id)) ?? ""
+        id = try c.decode(String.self, forKey: .id)
+        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw DecodingError.dataCorruptedError(forKey: .id, in: c, debugDescription: "Knowledge graph entities require their canonical identity.")
+        }
         let decodedName = try c.decode(String.self, forKey: .name)
         guard !decodedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw DecodingError.dataCorruptedError(
@@ -141,11 +112,11 @@ struct KGEntity: Decodable, Identifiable, Equatable, Sendable {
             )
         }
         type = decodedType
-        first_seen = try? c.decode(String.self, forKey: .first_seen)
-        last_seen = try? c.decode(String.self, forKey: .last_seen)
-        mention_count = try? c.decode(Int.self, forKey: .mention_count)
-        aliases = try? c.decode([String].self, forKey: .aliases)
-        summary = try? c.decode(String.self, forKey: .summary)
+        first_seen = try c.decodeIfPresent(String.self, forKey: .first_seen)
+        last_seen = try c.decodeIfPresent(String.self, forKey: .last_seen)
+        mention_count = try c.decodeIfPresent(Int.self, forKey: .mention_count)
+        aliases = try c.decodeIfPresent([String].self, forKey: .aliases)
+        summary = try c.decodeIfPresent(String.self, forKey: .summary)
     }
 }
 

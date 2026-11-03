@@ -73,9 +73,9 @@ extension QuietSettings {
     /// not reflection: each row names one bot by id and carries the same two store calls the Bots page makes (`update`, `pause`). A bot
     /// that has been deleted simply has no rows, which is the honest answer to "can I change its schedule".
     @MainActor
-    static func botRows(_ appModel: (any QuietSettingsHost)?, snapshot: Bool = false) -> [QuietSetting] {
-        guard let appModel,
-              let bots = try? botStore(appModel).list() else { return [] }
+    static func botRows(_ appModel: (any QuietSettingsHost)?, snapshot: Bool = false) throws -> [QuietSetting] {
+        guard let appModel else { throw QuietSettingError.unavailable("The helper settings owner is unavailable. Open Bots again before reading schedules.") }
+        let bots = try botStore(appModel).list()
         return bots.flatMap { bot -> [QuietSetting] in
             let key = bot.id.uuidString.lowercased()
             let name = bot.name
@@ -90,7 +90,7 @@ extension QuietSettings {
                         + "(bots.minimum_interval_minutes), which the store enforces.",
                     read: { appModel in
                         if snapshot { return .string(cadenceText(bot.cadence)) }
-                        guard let current = try? botStore(appModel).get(bot.id) else { return .string("") }
+                        let current = try botStore(appModel).get(bot.id)
                         return .string(cadenceText(current.cadence))
                     },
                     write: { appModel, value in
@@ -111,7 +111,7 @@ extension QuietSettings {
                     note: "Paused stops scheduled turns. Follow-ups and run-once still work.",
                     read: { appModel in
                         if snapshot { return .bool(bot.paused) }
-                        guard let current = try? botStore(appModel).get(bot.id) else { return .bool(false) }
+                        let current = try botStore(appModel).get(bot.id)
                         return .bool(current.paused)
                     },
                     write: { appModel, value in
@@ -130,7 +130,7 @@ extension QuietSettings {
             + "The person's, by the same rule the bot tools follow: no bot tool sets it.",
         ownerOnly: true,
         read: { _ in
-            .int(Int64((BotRunLimits.minimumInterval / 60).rounded()))
+            .int(Int64((try BotRunLimits.checkedMinimumInterval() / 60).rounded()))
         }
     )
 }

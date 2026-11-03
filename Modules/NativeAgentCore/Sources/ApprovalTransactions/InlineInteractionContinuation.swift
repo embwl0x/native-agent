@@ -27,7 +27,7 @@ import WorkshopExecution
 import Dispatcher
 import Browser
 import NotificationInbox
-// Blueprint: | `InlineInteractionContinuation.swift` | Card continuation and reclamation under existing claims |
+// Blueprint: | `InlineInteractionContinuation.swift` | Shared live-host/detached card continuation checks recorded provenance before claiming; reclamation and settlement retain existing claims |
 extension InlineInteractionResolver {
     /// Resume the suspended request EXACTLY ONCE.
     ///
@@ -45,17 +45,7 @@ extension InlineInteractionResolver {
               interaction.continuation?.state == .waiting,
               interaction.continuation?.resumedByTurnId == nil,
               resumesInFlight[interaction.id] == nil else { return }
-        let sources = interaction.continuation?.peerSources ?? [PeerDataTaint.unrecorded]
-        let elevated = interaction.continuation?.elevatedPeerSources ?? []
-        let taint = PeerDataTaint.current
-            ?? PeerDataTaint(restoring: sources, elevated: elevated)
-        // A turn already carrying this card must keep its provenance too.
-        // Historical steering cannot be cleared by a later trust change.
-        for source in sources { taint.mark(peer: source) }
-        for source in elevated { taint.elevate(peer: source) }
-        await PeerDataTaint.$current.withValue(taint) {
-            _ = await resumeUnderPeerProvenance(interaction, sessionID: sessionID, dataRoot: dataRoot)
-        }
+        _ = await resumeUnderPeerProvenance(interaction, sessionID: sessionID, dataRoot: dataRoot)
     }
     /// This owner holds the continuation until its effect ends, then writes
     /// its one terminal record and releases the slot, even after Stop.
@@ -65,10 +55,28 @@ extension InlineInteractionResolver {
         guard interaction.continuation?.state == .waiting,
               interaction.continuation?.resumedByTurnId == nil,
               resumesInFlight[interaction.id] == nil else { return nil }
+        let carried: (sources: [String], elevated: [String])
+        do {
+            carried = try PeerDataTaint.steer(in: .object([
+                "sources": interaction.continuation?.peerSources.map { .array($0.map(JSONValue.string)) } ?? .null,
+                "elevated": interaction.continuation?.elevatedPeerSources.map { .array($0.map(JSONValue.string)) } ?? .null,
+            ]))
+        } catch {
+            RepairOwed.owe(dataRoot, id: "interaction.provenance:" + interaction.id, kind: .run,
+                operation: "interaction.provenance:" + interaction.id, owner: "Inline interaction " + interaction.id,
+                words: error.localizedDescription,
+                lever: "Preserve the waiting interaction and repair its recorded provenance before continuation.")
+            return nil
+        }
+        let taint = PeerDataTaint.current ?? PeerDataTaint(restoring: carried.sources, elevated: carried.elevated)
+        carried.sources.forEach { taint.mark(peer: $0) }
+        carried.elevated.forEach { taint.elevate(peer: $0) }
         do {
             guard try DataRootLife.isCurrent(interaction.continuation?.lifeID, in: dataRoot) else { return nil }
         } catch { nativeLog("[interaction] life identity is unavailable: \(error)"); return nil }
-        let owner = Task { await runContinuation(interaction, sessionID: sessionID, dataRoot: dataRoot) }
+        let owner = PeerDataTaint.$current.withValue(taint) {
+            Task { await runContinuation(interaction, sessionID: sessionID, dataRoot: dataRoot) }
+        }
         resumesInFlight[interaction.id] = owner
         return await withTaskCancellationHandler {
             await owner.value
@@ -134,7 +142,10 @@ extension InlineInteractionResolver {
         func failure(_ reason: String) -> NSError {
             NSError(domain: "InteractionCard", code: 2, userInfo: [NSLocalizedDescriptionKey: reason])
         }
-        var origin = await originEnvelope(of: record.id, sessionID: sessionID, dataRoot: dataRoot)
+        guard let recordedOrigin = try await originEnvelope(of: record.id, sessionID: sessionID, dataRoot: dataRoot) else {
+            throw failure("This card has no recorded origin. Review it and raise a new request before continuing.")
+        }
+        var origin: TurnEnvelope? = recordedOrigin
         // A persisted envelope is not authority: recheck the signed phone's
         // witness against the current pairing before either world effect.
         if let continuation = record.continuation, continuation.signatureReceipt?.isEmpty == false {
@@ -206,12 +217,14 @@ extension InlineInteractionResolver {
             return (nil, prompt)
         }
         guard let startTurn else { throw failure("The request could not continue: no turn starter is available.") }
-        let binding: InlineInteractionModelOverride.Binding? = {
+        let binding: InlineInteractionModelOverride.Binding? = try {
             guard record.kind == .modelChoice, let outcome = record.state.outcome,
                   outcome.scope == .thisRequestOnly, let model = outcome.selection else { return nil }
-            let qualified = InlineInteractionRegistry.splitModelOptionID(model)
-            return .init(group: record.target, providerID: qualified?.providerID ?? "",
-                         model: qualified?.modelID ?? model)
+            guard let qualified = InlineInteractionRegistry.splitModelOptionID(model) else {
+                throw failure("This saved model choice does not name its account. Choose an account-qualified model in Providers before continuing.")
+            }
+            return .init(group: record.target, providerID: qualified.providerID,
+                         model: qualified.modelID)
         }()
         record.continuation?.state = .replaying
         try await persistTransition(record, from: .claimed, sessionID: sessionID, dataRoot: dataRoot)
@@ -250,7 +263,7 @@ extension InlineInteractionResolver {
         }
         // Mark the session only after its checked read and mutations succeed.
         var reconciled = true
-        for interaction in read.rows.compactMap({ SwiftNativeChatOrchestrationClient.inlineInteraction(in: $0, lifeID: read.lifeID) }) {
+        for (_, interaction) in interactionsByRow(in: read.rows, lifeID: read.lifeID) {
             // A same-life control held by the departed process needs a new tap.
             if case .running = interaction.state {
                 let orphaned = interaction.failed(

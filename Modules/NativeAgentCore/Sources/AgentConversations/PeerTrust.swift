@@ -50,9 +50,12 @@ public enum PeerTrust {
     public static func ownerTrusts(_ source: String, dataRoot: URL) -> Bool {
         let principal = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let key = principal.hasPrefix("peer:") ? String(principal.dropFirst(5)) : principal
+        // Her own lane (a wake, a part she runs) is hers, not a peer's.
+        if key == "self" { return true }
         // A helper of this install, made by the person or by her, carries the
         // person's grant: it is part of the household, not an outside agent.
-        if let id = BotDefinition.id(forSession: key) {
+        // Its lane reads "bot:<id>", its session "bot-<id>".
+        if let id = BotDefinition.id(forSession: key.hasPrefix("bot:") ? "bot-" + key.dropFirst(4) : key) {
             let file = dataRoot.appendingPathComponent("bots/definitions/\(id.uuidString).json")
             guard let data = try? Data(contentsOf: file),
                   let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

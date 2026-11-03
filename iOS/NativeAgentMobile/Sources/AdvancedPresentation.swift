@@ -1,6 +1,7 @@
 import SwiftUI
+import Foundation
 import NativeAgentShared
-// Blueprint: | `AdvancedPresentation.swift` | `View`: `mobileReadingScreen` |
+// Blueprint: | `AdvancedPresentation.swift` | Shared mobile reading presentation, bounded plain request summaries with raw prompts retained by callers, and process-local design samples |
 
 /// Process-local screenshot fixtures. Never published to a store or transport.
 enum MobileDesignSamples {
@@ -36,7 +37,7 @@ enum MobileDesignSamples {
         "MobileDeskItem": #"[{"handle":"design-desk","alias":"D-14","kind":"task","status":"active","project":"Weekend research and planning","title":"Collect the final notes for the project review","summary":"Compare the remaining sources and prepare a short summary.","openedAt":"2026-09-07T18:00:00Z","updatedAt":"2026-09-07T18:00:00Z","pinned":false,"blockedOn":[],"origin":"user","requiresOwnerInput":false,"recentNotes":[]}]"#,
         "WorkshopTaskRecord": #"[{"id":"design-task","title":"Prepare the project reading list","objective":"Collect the most useful references and explain what each adds.","status":"running","phase":"Research","summary":"Reviewing the final two references.","createdAt":"2026-09-07T18:00:00Z"}]"#,
         "KGEntity": #"[{"id":"design-entity","name":"Weekend research and planning","type":"project","mention_count":12,"aliases":["Reading list"],"summary":"A collection of references and decisions for the next project review."}]"#,
-        "SkillManifestEntry": #"[{"id":"design-skill","name":"Research notes and source comparison","description":"Collect useful sources, compare the evidence, and write a concise summary.","source":"learned","state":"active","use_count":8,"version":"1.2"}]"#,
+        "SkillManifestEntry": #"[{"id":"design-skill","name":"Research notes and source comparison","description":"Collect useful sources, compare the evidence, and write a concise summary.","source":"persona_body","triggers":[],"status":"active"}]"#,
         "MobileAppSetting": #"[{"id":"chat.file_access","page":"chat","label":"Chat file access","type":"choice","choices":["auto","workspace","read_only","none"],"writable":true,"value":"read_only"},{"id":"chat.quiet_mode","page":"chat","label":"Quiet mode","type":"boolean","choices":[],"writable":true,"value":"true"},{"id":"memories.mode","page":"memories","label":"Memory mode","type":"choice","choices":["performance","balanced","low_memory"],"writable":true,"value":"low_memory"},{"id":"memories.cross_session","page":"memories","label":"Remember across conversations","type":"boolean","choices":[],"writable":true,"value":"false"}]"#,
         "TurnSummaryRecord": #"[{"id":"design-turn","surface":"iPhone conversation","startedAt":810000000,"lastAt":810000008,"eventCount":12,"wallMs":8200,"llmTokens":1240,"ttftMs":430,"kinds":{"reply":1,"tool":2}}]"#
     ]
@@ -117,11 +118,12 @@ enum RunsLogPresentation: Equatable {
     case empty
     case unavailable(String)
 
-    static func state(runs: [RunRecord], error: String?) -> RunsLogPresentation {
+    static func state(runs: [RunRecord], hasLoaded: Bool, error: String?) -> RunsLogPresentation {
         guard runs.isEmpty else { return .content }
         if let error, !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return .unavailable(error)
         }
+        guard hasLoaded else { return .unavailable("The Mac run snapshot has not arrived. Keep NativeAgent open on the paired Mac and refresh after reconnecting.") }
         return .empty
     }
 }
@@ -192,6 +194,48 @@ enum RunDetailPromptPresentation {
         }
         return prompt
     }
+
+    /// Display only content fields, never JSON syntax or packed instructions.
+    /// Unknown, clipped or malformed structured requests say so; raw stays reachable.
+    static func summary(_ prompt: String?) -> String? {
+        guard let raw = copyablePrompt(prompt) else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        func text(_ value: String) -> String? {
+            let line = value.split(whereSeparator: \.isNewline).joined(separator: " ")
+            guard !line.isEmpty else { return nil }
+            if line.hasPrefix("{") || line.hasPrefix("[") { return nil }
+            return line.count > 200 ? String(line.prefix(199)) + "…" : line
+        }
+        // Exact headings produced by Resources/prompts/workshop-plan.md and
+        // workshop-synthesis.md; the captured prompt itself stays untouched.
+        for heading in ["Workshop task title: ", "Workshop task objective: "] {
+            if let line = trimmed.components(separatedBy: .newlines).first(where: { $0.hasPrefix(heading) }),
+               let summary = text(String(line.dropFirst(heading.count))) { return summary }
+        }
+        if let object = try? JSONSerialization.jsonObject(with: Data(trimmed.utf8)) {
+            func content(_ value: Any, depth: Int = 0) -> String? {
+                guard depth < 4 else { return nil }
+                if let string = value as? String { return text(string) }
+                if let fields = value as? [String: Any] {
+                    for key in ["title", "objective", "text", "prompt", "content", "messages"] {
+                        if let value = fields[key], let line = content(value, depth: depth + 1) { return line }
+                    }
+                }
+                if let rows = value as? [Any] {
+                    for row in rows.prefix(8) {
+                        if let fields = row as? [String: Any], fields["role"] as? String == "system" { continue }
+                        if let line = content(row, depth: depth + 1) { return line }
+                    }
+                }
+                return nil
+            }
+            return content(object) ?? "Structured request. Open the raw prompt for details."
+        }
+        if trimmed.hasPrefix("{") || trimmed.hasPrefix("[") || trimmed.hasPrefix("```json") {
+            return "Structured request; a readable summary is unavailable. Open the raw prompt for details."
+        }
+        return text(trimmed)
+    }
 }
 
 enum OrganismStatusPresentation {
@@ -209,15 +253,6 @@ enum OrganismStatusPresentation {
             case .disabled, .unavailable, .invalidTimestamp, .absent: false
             }
         }
-    }
-
-    struct DreamProposalSlice: Equatable {
-        let visible: [OrganismLivingStandingViewProposalFile]
-        let hiddenCount: Int
-    }
-
-    static func approvedBiasesText(_ value: Int?) -> String {
-        value.map(String.init) ?? "Not reported"
     }
 
 
@@ -243,12 +278,6 @@ enum OrganismStatusPresentation {
         }
     }
 
-    static func dreamProposalSlice(
-        _ proposals: [OrganismLivingStandingViewProposalFile],
-        visibleLimit: Int = 4
-    ) -> DreamProposalSlice {
-        .init(visible: Array(proposals.prefix(visibleLimit)), hiddenCount: max(0, proposals.count - visibleLimit))
-    }
 }
 
 /// Mac-owned snapshots become stale after 30 seconds on every phone surface.

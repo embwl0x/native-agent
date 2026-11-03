@@ -13,7 +13,7 @@ import NativeAgentShared
 import NativeAgentCore
 import MemoryV2
 import PersistenceCore
-// Blueprint: | `MacSyncEngine+Storage.swift` | `MacSyncEngine`: `recordProcessed`, `restoreState`, `cappedPreservingMarkers`; consolidated replay/digest restoration and device bookkeeping await the shared `DeviceSyncStorage` actor in `DeviceSync.swift` before admission/acknowledgement |
+// Blueprint: | `MacSyncEngine+Storage.swift` | `MacSyncEngine`: consolidated replay/digest restoration and device bookkeeping await `DeviceSyncStorage`; one current identity/digest schema admits action-ledger reads, writes, release and terminal retention |
 
 extension MacSyncEngine {
     /// Record a msgId as processed, capping the set at processedIdsCap (drops oldest first).
@@ -43,14 +43,18 @@ extension MacSyncEngine {
         let restored = await sync.storage.perform {
             let processed = Self.restoreProcessedIds(dataRoot: dataRoot, inMemory: inMemory)
             let digests: [String: SnapshotFileDigest]
+            var digestFailure: String?
             do {
                 let data = try Data(contentsOf: Self.snapshotDigestsURL(dataRoot: dataRoot))
                 digests = try JSONDecoder().decode([String: SnapshotFileDigest].self, from: data)
             } catch {
-                // Derived state is reseeded by the first snapshot pass.
                 digests = [:]
+                if !Self.isNoSuchFileError(error) {
+                    digestFailure = "Snapshot digest cache is unavailable (\(error.localizedDescription)); preserve icloud/snapshot_digests.json and repair its read before restarting phone sync."
+                    nativeLog("[MacSyncEngine] %@", digestFailure ?? "")
+                }
             }
-            return (processed, digests)
+            return (processed, digests, digestFailure)
         }
         guard generation == snapshotLifecycleGeneration, !Task.isCancelled else { return false }
         // Retiring writes and command completions can settle while disk reads run.
@@ -61,6 +65,11 @@ extension MacSyncEngine {
             ids, cap: cap, markerIds: restored.0.markerIds.union(completed))
         processedMsgIds = Set(processedMsgIdsOrdered)
         if let message = restored.0.message { syncError = message }
+        if restored.0.unreadable { return false }
+        if let message = restored.2 {
+            syncError = message
+            return false
+        }
         if !retiringWriter, snapshotFileDigests == inMemoryDigests { snapshotFileDigests = restored.1 }
         return true
     }
@@ -93,7 +102,13 @@ extension MacSyncEngine {
         var messages: [String] = []
         func add(_ id: String) { if !ids.contains(id) { ids.append(id) } }
 
-        let markers = ICloudSyncStatePaths.completedUnarchivedMsgIds(dataRoot: dataRoot)
+        let markers: [String]
+        do { markers = try ICloudSyncStatePaths.completedUnarchivedMsgIds(dataRoot: dataRoot) }
+        catch {
+            let message = "Completed iPhone command evidence could not be read (\(error.localizedDescription)). Command admission is paused; restore access to icloud/completed-unarchived and reconnect the phone."
+            nativeLog("[MacSyncEngine] %@", message)
+            return (ids, true, message, [])
+        }
         if !markers.isEmpty {
             for id in markers { add(id) }
             messages.append(
@@ -271,7 +286,7 @@ extension MacSyncEngine {
                 guard let record = try? JSONDecoder().decode(
                     ICloudTransactionRecord.self,
                     from: data
-                ) else { return .unreadable }
+                ), Self.hasCurrentInboxBinding(record, transactionID: id) else { return .unreadable }
                 return .present(record)
             }
         }.value
@@ -283,18 +298,26 @@ extension MacSyncEngine {
         return MacSyncSnapshotIntegrity.digest(canonical)
     }
 
-    /// Match bound fields, or action names for unbound rows, to reject transaction-id collisions.
+    /// The Mac's ledger schema requires the exact envelope identity and digest.
+    /// Unbound rows remain unavailable evidence, never replay or dispatch authority.
+    nonisolated static func hasCurrentInboxBinding(_ record: ICloudTransactionRecord, transactionID: String) -> Bool {
+        guard InboxActionFileBoundary.isCanonicalUUID(transactionID),
+              record.id == transactionID, record.direction == "ios_to_mac",
+              let msgId = record.msgId, InboxActionFileBoundary.isCanonicalUUID(msgId),
+              let digest = record.actionDigest, digest.utf8.count == 64,
+              digest.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return false }
+        return true
+    }
+
+    /// Match both current bindings and the action to reject transaction-id collisions.
     static func inboxLedgerRow(
         _ record: ICloudTransactionRecord,
         matchesMsgId msgId: String,
         digest: String?,
         action: String
     ) -> Bool {
-        if let storedMsgId = record.msgId, storedMsgId != msgId { return false }
-        if let storedDigest = record.actionDigest, let digest, storedDigest != digest { return false }
-        let bound = record.msgId != nil || (record.actionDigest != nil && digest != nil)
-        if !bound, record.action != action { return false }
-        return true
+        guard let digest, !digest.isEmpty else { return false }
+        return record.msgId == msgId && record.actionDigest == digest && record.action == action
     }
 
     /// True when the ledger state proves the action's effect has already been
@@ -347,11 +370,19 @@ extension MacSyncEngine {
                 guard let decoded = try? JSONDecoder().decode(
                     ICloudTransactionRecord.self,
                     from: data
-                ) else {
-                    nativeLog("[MacSyncEngine] Ledger row for %@ did not decode; left intact rather than overwritten", id)
+                ), Self.hasCurrentInboxBinding(decoded, transactionID: id) else {
+                    nativeLog("[MacSyncEngine] Ledger row for %@ unreadable or unbound; left intact rather than overwritten", id)
                     return nil
                 }
                 existing = decoded
+            }
+            if let existing {
+                guard existing.action == action,
+                      msgId == nil || msgId == existing.msgId,
+                      actionDigest == nil || actionDigest == existing.actionDigest else {
+                    nativeLog("[MacSyncEngine] Ledger binding collision for %@; existing evidence left intact", id)
+                    return nil
+                }
             }
             let record = ICloudTransactionRecord(
                 id: id,
@@ -368,7 +399,8 @@ extension MacSyncEngine {
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
-            guard let data = try? encoder.encode(record),
+            guard Self.hasCurrentInboxBinding(record, transactionID: id),
+                  let data = try? encoder.encode(record),
                   Self.coordinatedWriteReturningError(data: data, to: url) == nil else { return nil }
             return data
         }.value
@@ -390,7 +422,8 @@ extension MacSyncEngine {
                 do {
                     guard try Data(contentsOf: url) == reservation.contents else { return }
                     var record = try JSONDecoder().decode(ICloudTransactionRecord.self, from: reservation.contents)
-                    guard record.state == "running" else { return }
+                    guard Self.hasCurrentInboxBinding(record, transactionID: url.deletingPathExtension().lastPathComponent),
+                          record.state == "running" else { return }
                     record.state = "received"
                     let encoder = JSONEncoder()
                     encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
@@ -698,7 +731,8 @@ extension MacSyncEngine {
         if url.deletingLastPathComponent().lastPathComponent == "chat_transactions" {
             return iCloudBridge.isTerminalChatTransaction(data)
         }
-        guard let record = try? JSONDecoder().decode(ICloudTransactionRecord.self, from: data) else { return false }
+        guard let record = try? JSONDecoder().decode(ICloudTransactionRecord.self, from: data),
+              hasCurrentInboxBinding(record, transactionID: url.deletingPathExtension().lastPathComponent) else { return false }
         return record.state == "completed" || record.state == "failed"
             || (record.action == "chat" && record.state == "unknown")
     }

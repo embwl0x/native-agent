@@ -4,22 +4,17 @@ import NativeAgentCore
 import PersistenceCore
 import TelegramBot
 import TriggerScheduler
-// Blueprint: | `SchedulerDueJobRunner.swift` | `SchedulerDueJobRunner` actor; `runDueJobs`; reads canonical job rows through `SchedulerJobs`; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
+// Blueprint: | `SchedulerDueJobRunner.swift` | `SchedulerDueJobRunner` actor; `runDueJobs` stops restored intention records with a Desk notice before body-rhythm execution, with no notify/turn/workshop kinds; reads canonical job rows through `SchedulerJobs`; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
 
 public actor SchedulerDueJobRunner {
     enum JobKind: String, CaseIterable, Sendable {
-        case notify
         case connectorAction = "connector_action"
         case dream
         case rem
         case harnessBenchmark = "harness_benchmark"
         case proactiveScan = "proactive_scan"
-        case workshop
         /// A part's `schedule:<cron>` wake: one job per part and schedule.
         case part
-        /// A turn of hers on a schedule: the job's prompt runs as one tool turn with her
-        /// full tools on her Chat route; the reply lands in the inbox under the job's name.
-        case turn
     }
 
     typealias DueJob = SwiftNativeTriggerScheduler.DueJob
@@ -48,8 +43,6 @@ public actor SchedulerDueJobRunner {
     /// unknown inventory never reads as "nothing due". Only a new pass clears it.
     public internal(set) var activityFeedError: String?
     var running = false
-    /// Channel receipts settled by the body, retained until its terminal result.
-    var notificationOutcomes: [String: JSONValue] = [:]
     /// A part's schedule that does not parse, said once rather than every pass.
     var reportedWakes: Set<String> = []
 
@@ -88,6 +81,7 @@ public actor SchedulerDueJobRunner {
 
         let now = Date()
         do {
+            try await schedulerJobs.stopRestoredIntentionJobs()
             let repaired = try await ensureDefaultCycleJobs(now: now).repaired
             if !repaired.isEmpty {
                 try await appendActivity(

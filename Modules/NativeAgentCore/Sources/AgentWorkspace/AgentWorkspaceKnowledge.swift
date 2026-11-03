@@ -44,11 +44,16 @@ enum AgentWorkspaceKnowledge {
     private static func webSearch(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
         var content = result.objectValue ?? [:]
         var inner = (content.removeValue(forKey: "result") ?? .null).objectValue ?? [:]
-        let rows: [JSONValue] = if case .array(let list)? = inner.removeValue(forKey: "results") ?? content.removeValue(forKey: "results") { list } else { [] }
+        let returnedRows = inner.removeValue(forKey: "results") ?? content.removeValue(forKey: "results")
+        let rows: [JSONValue] = if case .array(let list)? = returnedRows { list } else { [] }
         content.merge(inner) { old, _ in old }
-        let items = rows.compactMap { value -> AgentWorkspaceItem? in
+        var gaps: [JSONValue] = if case .array(let values)? = content["gaps"] { values } else { [] }
+        let items = rows.enumerated().compactMap { index, value -> AgentWorkspaceItem? in
             let row = value.objectValue ?? [:]
-            guard let url = validWebURL(row["url"]) else { return nil }
+            guard let url = validWebURL(row["url"]) else {
+                gaps.append(.string("results[\(index)].url: this workspace reader requires an HTTP or HTTPS URL without credentials."))
+                return nil
+            }
             let title = row["title"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 } ?? url
             // A row reads as title · site · snippet; Bing's "…Read more" tail says nothing.
             let site = URL(string: url)?.host?.replacingOccurrences(of: #"^www\."#, with: "", options: .regularExpression) ?? url
@@ -60,11 +65,19 @@ enum AgentWorkspaceKnowledge {
                     input: ["url": .string(url)], title: "Background browser", textField: nil, isEffect: true)),
             ])
         }
+        content["gaps"] = .array(gaps)
         // A failed search reads as its error, never as "no results".
         let failed = ChatToolOutcome.carriesFailureEvidence(result)
         if !failed, content["status"] == nil || content["status"] == .string("ok") {
             content["status"] = .string("ok")
-            if items.isEmpty { content["message"] = .string("No results. Try other words.") }
+            let engines: [JSONValue] = if case .array(let values)? = content["unresponsive_engines"] { values } else { [] }
+            if !gaps.isEmpty {
+                content["message"] = .string(items.isEmpty
+                    ? "No usable results; the named gaps do not establish no matches. Repair the reported search reads."
+                    : "Readable results returned with named gaps. Repair the reported search reads.")
+            } else if returnedRows == .array([]), engines.isEmpty, content["message"] == nil {
+                content["message"] = .string("No results. Try other words.")
+            }
             if let query = input["query"]?.stringValue { content["about"] = .string("Private search for \"\(query.prefix(80))\"; no browser tab was opened.") }
         }
         return .init(title: "Web search", content: .object(content), items: items, actions: [

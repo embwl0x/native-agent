@@ -49,6 +49,9 @@ struct MobileDeskItemDetail: View {
     }
 
     private var noteCount: Int { note.trimmingCharacters(in: .whitespacesAndNewlines).count }
+    private var canSubmitNote: Bool {
+        AgentNameCache.fingerprint(sync.pairingStore?.iCloudPairingSecret) != nil
+    }
 
     var body: some View {
         NavigationStack {
@@ -162,7 +165,15 @@ struct MobileDeskItemDetail: View {
                 }
 
                 AliveSection("Add a note") {
+                    if !canSubmitNote {
+                        Text("Connect this iPhone to a Mac before adding a note. Your draft is retained.")
+                            .foregroundStyle(AlivePalette.secondary).aliveRow()
+                    }
+                    if let failure = outbox.storageError {
+                        Text(failure).foregroundStyle(AlivePalette.secondary).aliveRow()
+                    }
                     TextField("What changed?", text: $note, axis: .vertical)
+                        .disabled(isWorking || outbox.storageError != nil)
                         .lineLimit(2...6)
                         .foregroundStyle(AlivePalette.text)
                         .onChange(of: note) { _, value in
@@ -178,10 +189,10 @@ struct MobileDeskItemDetail: View {
                                              ? AnyShapeStyle(NativeAgentMobileTheme.Colors.trouble)
                                              : AnyShapeStyle(AlivePalette.secondary))
                         Spacer()
-                        Button("Add Note") { addNote() }
+                        Button("Add Note") { Task { await addNote() } }
                             .font(.subheadline.weight(.semibold))
                             .alivePrimaryButton()
-                            .disabled(isWorking || MobileDeskNotePresentation.submissionText(for: note) == nil)
+                            .disabled(isWorking || !canSubmitNote || outbox.storageError != nil || MobileDeskNotePresentation.submissionText(for: note) == nil)
                     }
                     .aliveRow()
                 }
@@ -204,14 +215,20 @@ struct MobileDeskItemDetail: View {
     }
 
     /// Save notes before Mac confirmation under one retained signed identity.
-    private func addNote() {
+    private func addNote() async {
+        guard !isWorking else { return }
+        guard outbox.storageError == nil else { errorMessage = outbox.storageError; return }
         guard let clean = MobileDeskNotePresentation.submissionText(for: note) else {
             errorMessage = MobileDeskNotePresentation.validationMessage(for: note)
             return
         }
-        outbox.submit(handle: item.handle, text: clean)
-        note = ""
-        dismiss()
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            try await outbox.submit(handle: item.handle, text: clean)
+            note = ""
+            dismiss()
+        } catch { errorMessage = error.localizedDescription }
     }
 }
 
@@ -302,8 +319,7 @@ struct NewMobileDeskItemSheet: View {
                 project: project.trimmingCharacters(in: .whitespacesAndNewlines),
                 title: title.trimmingCharacters(in: .whitespacesAndNewlines),
                 summary: summary.trimmingCharacters(in: .whitespacesAndNewlines),
-                submission: submission, intentionalNewRequest: intentionalNewRequest,
-                onReplacement: { submission = $0 }
+                submission: submission, intentionalNewRequest: intentionalNewRequest
             )
             await iCloudSyncEngine.shared.refreshDeskSnapshot()
             dismiss()

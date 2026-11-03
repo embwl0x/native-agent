@@ -98,7 +98,7 @@ extension NativeCognitionRuntime {
             summary: await substrate.observatorySnapshot(from: read),
             substrate: read.snapshot,
             workspace: read.workspace,
-            associations: await substrate.associationSnapshot(),
+            associations: read.associations,
             schemaProposals: schemas,
             developmentalTimeline: Array(timeline.prefix(40)),
             growthWeek: await substrate.growthWeek(from: timeline),
@@ -122,7 +122,7 @@ extension NativeCognitionRuntime {
             affect: cognition.affect,
             substrate: cognition.snapshot,
             workspace: cognition.workspace,
-            associations: await substrate.doctorAssociationSnapshot(at: date),
+            associations: cognition.associations,
             receiptRead: await substrate.receiptReadSnapshot(),
             organism: organism.snapshot,
             capsulePreviewInfo: lastInjectedCapsule.map {

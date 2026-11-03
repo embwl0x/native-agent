@@ -14,6 +14,12 @@ function daemonVersionsMismatch(info) {
   );
 }
 
+function daemonVersionsAligned(info) {
+  return Boolean(info && typeof info.cliVersion === "string" && info.cliVersion.trim()
+    && typeof info.appServerVersion === "string" && info.appServerVersion.trim()
+    && info.cliVersion === info.appServerVersion);
+}
+
 function socketOwnerPid() {
   const result = spawnSync("/usr/sbin/lsof", ["-t", SOCKET_PATH], {
     encoding: "utf8",
@@ -108,6 +114,7 @@ function daemonWorkingDirectoryState() {
 }
 
 return {
+  daemonVersionsAligned,
   daemonVersionsMismatch,
   socketOwnerPid,
   captureAppServerIdentity,

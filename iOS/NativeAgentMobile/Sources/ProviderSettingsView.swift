@@ -1,8 +1,14 @@
 // Phone credential entry is encrypted for the Mac's Keychain and verification.
 // Model selections are accepted only after a matching verified Mac tuple.
 import SwiftUI
+import Foundation
 import NativeAgentShared
-// Blueprint: | `ProviderSettingsView.swift` | `ProviderSettingsView` struct |
+// Blueprint: | `ProviderSettingsView.swift` | Provider settings and pairing-bound detail resolve current provider IDs; typed feedback follows signed receipts and thrown errors |
+
+struct ProviderActionFeedback: Sendable {
+    let text: String
+    let failed: Bool
+}
 
 /// Unknown or malformed wire keys remain explicit repair conditions.
 extension ProviderSurfaceLabel {
@@ -38,18 +44,18 @@ enum MobileProviderSurfaceModelMenuPresentation {
 /// its explicit `ok` status. An absent or unfamiliar payload is an incomplete
 /// test result, not evidence that the connection works.
 enum ProviderConnectionTestPresentation {
-    static func feedback(status: String, successPrefix: String = "Test complete.") -> String {
+    static func feedback(status: String, successPrefix: String = "Test complete.") -> ProviderActionFeedback {
         let trimmed = status.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            return "Error: Mac did not return a test result."
+            return ProviderActionFeedback(text: "Mac did not return a test result.", failed: true)
         }
         guard trimmed.lowercased() == "ok" else {
             if ["error", "failed", "needs_credentials"].contains(trimmed.lowercased()) {
-                return "Error: \(trimmed)"
+                return ProviderActionFeedback(text: trimmed, failed: true)
             }
-            return "Error: Mac returned an unrecognized test status: \(trimmed)"
+            return ProviderActionFeedback(text: "Mac returned an unrecognized test status: \(trimmed)", failed: true)
         }
-        return successPrefix
+        return ProviderActionFeedback(text: successPrefix, failed: false)
     }
 }
 
@@ -108,7 +114,7 @@ struct ProviderSettingsView: View {
             }
         }
         .sheet(item: $configSheet) { provider in
-            ProviderDetailSheet(provider: provider, onDone: {
+            ProviderDetailSheet(providerID: provider.provider_id, onDone: {
                 configSheet = nil
             })
         }
@@ -193,6 +199,7 @@ struct ProviderSettingsView: View {
                                 Text(ProviderWords.modelName(model))
                             }
                         }
+                        .disabled(model.supported_reasoning_efforts == nil)
                     }
                 }
             }
@@ -339,24 +346,53 @@ enum ProviderWords {
 // MARK: - Detail / action sheet
 
 struct ProviderDetailSheet: View {
-    let provider: ProviderInfo
+    let providerID: String
     let onDone: () -> Void
+    private let presentedPairing: Data?
 
     private let sync = iCloudSyncEngine.shared
     @State private var apiKey = ""
     @State private var signInRequestID: String?
     @State private var isWorking = false
     @State private var workLabel = ""
-    @State private var feedbackText = ""
+    @State private var feedback: ProviderActionFeedback?
 
-    init(provider: ProviderInfo, onDone: @escaping () -> Void) {
-        self.provider = provider
+    init(providerID: String, onDone: @escaping () -> Void) {
+        self.providerID = providerID
         self.onDone = onDone
+        self.presentedPairing = iCloudSyncEngine.shared.pairingStore?.iCloudPairingSecret
+    }
+
+    private var provider: ProviderInfo? {
+        guard sync.pairingStore?.iCloudPairingSecret == presentedPairing else { return nil }
+        return sync.providers.first { $0.provider_id == providerID }
     }
 
     var body: some View {
-        let provider = sync.providers.first(where: { $0.provider_id == self.provider.provider_id }) ?? self.provider
         NavigationStack {
+            Group {
+                if let provider { detail(provider) }
+                else {
+                    AlivePage(title: "Provider unavailable", line: "This provider is not available in the current Mac snapshot. Reconnect and refresh Providers.") { }
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { onDone() }
+                        .foregroundStyle(AlivePalette.text)
+                }
+            }
+            .onDisappear { apiKey = "" }
+            .onChange(of: sync.providerSignIns) { _, _ in applySignInState() }
+            .onChange(of: sync.pairingStore?.iCloudPairingSecret) { _, _ in
+                apiKey = ""
+                onDone()
+            }
+            .onAppear { applySignInState() }
+        }
+    }
+
+    private func detail(_ provider: ProviderInfo) -> some View {
             AlivePage(title: provider.display_name,
                      line: ProviderWords.state(provider.auth_status.state)) {
                 // ── Status ────────────────────────────────────────────────
@@ -387,6 +423,7 @@ struct ProviderDetailSheet: View {
                     ForEach(Array(provider.models.enumerated()), id: \.offset) { index, model in
                         if index > 0 { AliveDivider() }
                         AliveRow(ProviderWords.modelName(model), detail: ProviderWords.capabilities(model))
+                        if let note = model.controls_note { AliveNote(note) }
                     }
                 }
 
@@ -430,89 +467,83 @@ struct ProviderDetailSheet: View {
                     .controlSize(.large)
                     .disabled(isWorking)
 
-                    if feedbackText.isEmpty {
-                        AliveFootnote("The test runs on the Mac. The result shows here when it finishes.")
-                    } else {
-                        Text(feedbackText)
+                    if let feedback {
+                        Text(feedback.text)
                             .font(.footnote)
-                            .foregroundStyle(feedbackText.hasPrefix("Error")
+                            .foregroundStyle(feedback.failed
                                              ? NativeAgentMobileTheme.Colors.trouble : AlivePalette.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                             .padding(.horizontal, 4)
+                    } else {
+                        AliveFootnote("The test runs on the Mac. The result shows here when it finishes.")
                     }
                 }
             }
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") { onDone() }
-                        .foregroundStyle(AlivePalette.text)
-                }
-            }
-            .onDisappear { apiKey = "" }
-            .onChange(of: sync.providerSignIns) { _, _ in applySignInState() }
-            .onAppear { applySignInState() }
-        }
     }
 
     // MARK: - Actions
 
     private func sendAction(_ kind: String) {
+        guard provider != nil else { return }
         isWorking = true
         workLabel = kind
-        feedbackText = kind == "oauth" ? "Waiting for sign-in on your Mac…" : ""
+        feedback = kind == "oauth"
+            ? ProviderActionFeedback(text: "Waiting for sign-in on your Mac…", failed: false) : nil
         let submittedKey = kind == "save" ? apiKey : ""
         Task {
+            guard provider != nil else { isWorking = false; return }
             do {
                 switch kind {
                 case "oauth":
-                    signInRequestID = try await sync.startProviderSignIn(providerId: provider.provider_id)
+                    signInRequestID = try await sync.startProviderSignIn(providerId: providerID)
                     isWorking = false
                     applySignInState()
                 case "save":
-                    feedbackText = try await sync.configureProvider(
-                        providerId: provider.provider_id, apiKey: submittedKey
+                    feedback = try await sync.configureProvider(
+                        providerId: providerID, apiKey: submittedKey
                     )
                     if apiKey == submittedKey { apiKey = "" }
                     isWorking = false
                     _ = await sync.refreshProviderControlsSnapshot()
                 case "test":
-                    let status = try await iCloudSyncEngine.shared.testProvider(providerId: provider.provider_id)
+                    let status = try await iCloudSyncEngine.shared.testProvider(providerId: providerID)
                     finish(status: status, successPrefix: "Test complete.")
 
                 default:
                     isWorking = false
                 }
             } catch {
-                feedbackText = "Error: \(error.localizedDescription)"
+                feedback = ProviderActionFeedback(text: error.localizedDescription, failed: true)
                 isWorking = false
             }
         }
     }
 
     private func applySignInState() {
+        guard provider != nil else { return }
         if signInRequestID == nil, !isWorking {
-            signInRequestID = sync.providerSignIns[provider.provider_id]?["request_id"]
+            signInRequestID = sync.providerSignIns[providerID]?["request_id"]
         }
         guard let requestID = signInRequestID,
-              let state = sync.providerSignIns[provider.provider_id],
+              let state = sync.providerSignIns[providerID],
               state["request_id"] == requestID else { return }
         switch state["state"] {
         case "pending":
             workLabel = "oauth"
-            feedbackText = "Waiting for sign-in on your Mac…"
+            feedback = ProviderActionFeedback(text: "Waiting for sign-in on your Mac…", failed: false)
         case "signed_in":
             isWorking = false
-            feedbackText = "Sign-in completed on Mac."
+            feedback = ProviderActionFeedback(text: "Sign-in completed on Mac.", failed: false)
         case "failed":
             isWorking = false
-            feedbackText = "Error: Sign-in did not complete on the Mac. It may have been canceled; try again there."
+            feedback = ProviderActionFeedback(text: "Sign-in did not complete on the Mac. It may have been canceled; try again there.", failed: true)
         default: break
         }
     }
 
     private func finish(status: String, successPrefix: String) {
         isWorking = false
-        feedbackText = ProviderConnectionTestPresentation.feedback(
+        feedback = ProviderConnectionTestPresentation.feedback(
             status: status,
             successPrefix: successPrefix
         )

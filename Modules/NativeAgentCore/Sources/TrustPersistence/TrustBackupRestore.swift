@@ -10,7 +10,8 @@ import TrustCenter
 import MemoryV2
 import Privacy
 import SystemOps
-// Blueprint: | `TrustBackupRestore.swift` | TrustBackupPersistence forward restore installation; durable intent and receipt, cataloged pre-restore backup, continuity fences and transcript version advancement |
+import TriggerScheduler
+// Blueprint: | `TrustBackupRestore.swift` | TrustBackupPersistence forward restore; complete validation before intent, canonical persona installation, cataloged safety backup, required transcript floor, durable receipt and continuity fences |
 
 actor RestoreExclusion {
     private var activeDataRoots: Set<String> = []
@@ -66,18 +67,15 @@ extension TrustBackupPersistence {
         let snapshot: NativeValidatedBackupSnapshot
         do {
             snapshot = try Self.validateBackupSnapshot(id: id, dataRoot: root)
-        } catch {
-            do {
-                guard try Self.sealLegacyV1BackupForRestore(id: id, dataRoot: root) else {
-                    throw error
-                }
-                snapshot = try Self.validateBackupSnapshot(id: id, dataRoot: root)
-            } catch {
-                throw NSError(domain: "NativeAgentBackup", code: 422, userInfo: [
-                    NSLocalizedDescriptionKey: "Backup source, integrity, authority, or session state is invalid; restore was cancelled before current data changed: \(error.localizedDescription)",
-                    NSUnderlyingErrorKey: error,
-                ])
+            // Fail before staging if the current phone version floor cannot be proved.
+            _ = try await SwiftNativePersistenceCore.withFileLock(Self.chatSessionIndexPath(in: root)) {
+                try Self.requiredTranscriptGenerationFloor(in: root)
             }
+        } catch {
+            throw NSError(domain: "NativeAgentBackup", code: 422, userInfo: [
+                NSLocalizedDescriptionKey: "Backup source, integrity, persona, authority, session state or current transcript floor is invalid; no restore was staged or current data changed: \(error.localizedDescription)",
+                NSUnderlyingErrorKey: error,
+            ])
         }
         let intentPath = Self.backupRestoreIntentPath(dataRoot: root)
         guard !Self.pathEntryExists(intentPath) else {
@@ -198,10 +196,10 @@ extension TrustBackupPersistence {
             dataRoot: destinationRoot
         )
         let fm = FileManager.default
-        for rel in snapshot.restorePaths {
+        for rel in snapshot.copied {
             let source = snapshot.dataDirectory.appendingNativeRelativePath(rel)
-            let destination = destinationRoot.appendingNativeRelativePath(rel)
-            let kept = Self.unbackedChildren(of: rel, at: destination)
+            let destination = Self.backupDestination(rel, dataRoot: destinationRoot)
+            let kept = try Self.unbackedChildren(of: rel, at: destination)
             if kept.isEmpty {
                 if Self.pathEntryExists(destination) { try fm.removeItem(at: destination) }
             } else {
@@ -210,20 +208,19 @@ extension TrustBackupPersistence {
                     try fm.removeItem(at: child)
                 }
             }
-            if Self.pathEntryExists(source) {
-                try fm.createDirectory(
-                    at: destination.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                // Into a kept scope directory child by child, never over what it keeps.
-                let copies = kept.isEmpty ? [source] : try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil)
-                for from in copies where kept.isEmpty || !from.lastPathComponent.hasSuffix(".lock") {
-                    let to = kept.isEmpty ? destination : destination.appendingPathComponent(from.lastPathComponent)
-                    try fm.copyItem(at: from, to: to)
-                    // Sidecars are not snapshot data; live writers create their own.
-                    if let copied = fm.enumerator(at: to, includingPropertiesForKeys: nil) {
-                        for case let item as URL in copied where item.lastPathComponent.hasSuffix(".lock")
-                            && (try? item.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+            try fm.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            // Into a kept scope directory child by child, never over what it keeps.
+            let copies = kept.isEmpty ? [source] : try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil)
+            for from in copies where kept.isEmpty || !from.lastPathComponent.hasSuffix(".lock") {
+                let to = kept.isEmpty ? destination : destination.appendingPathComponent(from.lastPathComponent)
+                try fm.copyItem(at: from, to: to)
+                // Sidecars are not snapshot data; live writers create their own.
+                if try to.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true {
+                    for item in try Self.backupEntries(in: to) where item.lastPathComponent.hasSuffix(".lock") {
+                        if try item.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true {
                             try fm.removeItem(at: item)
                         }
                     }
@@ -253,53 +250,25 @@ extension TrustBackupPersistence {
               kept.reason == "before restore of \(target.id)" else {
             throw Self.backupError(code: 422, "The pre-restore backup changed. Tell the person: NativeAgent kept the restore intent and refused to replace current data.")
         }
-        var generationFloor: Int64 = 0
-        do {
-            generationFloor = try ChatSessionIndexFile.loadObjectRowsForMutation(at: Self.chatSessionIndexPath(in: kept.dataDirectory))
-                .compactMap { ChatSessionIndexFile.transcriptGeneration(in: $0) }.max() ?? 0
-        } catch {
-            notes.append("chat/sessions.json: \(error.localizedDescription); current transcript-version counters were not kept.")
-        }
-        do {
-            let epochPath = Self.transcriptRestoreEpochPath(in: destinationRoot)
-            if Self.pathEntryExists(epochPath) {
-                try Self.requireRegularFile(epochPath, maximumBytes: 1024)
-                guard case .object(let object) = try JSONValue.parse(Data(contentsOf: epochPath)),
-                      case .int(let value)? = object["epoch"], value >= 0 else {
-                    throw Self.backupError(code: 422, "The transcript restore epoch is malformed.")
-                }
-                generationFloor = max(generationFloor, value)
-            }
-        } catch {
-            notes.append("chat/transcript_restore_epoch.json: \(error.localizedDescription); current transcript version floor was not kept; readable carried/restored counters set the new floor.")
-        }
-        var carriedAbilities: [String: Data] = [:]
-        if !target.restorePaths.contains("abilities") {
-            let legacy = try AbilityStore(dataRoot: kept.dataDirectory).restoredLegacyCarry(backupRoot: target.dataDirectory)
-            carriedAbilities = legacy.files
-            notes += legacy.notes
-        }
+        // These are required evidence, never omissions. Read both before the first replacement,
+        // including on an interrupted .applying launch (the safety snapshot remains the old life).
+        let generationFloor = max(
+            try Self.requiredTranscriptGenerationFloor(in: kept.dataDirectory, epochRoot: destinationRoot),
+            try Self.requiredTranscriptGenerationFloor(in: target.dataDirectory, epochRoot: destinationRoot)
+        )
         try Self.applyBackupSnapshot(
             target,
             destinationRoot: destinationRoot
         )
         // Prove the selected backup exactly before overlaying facts that are intentionally newer than it.
         try Self.verifyAppliedSnapshot(target, destinationRoot: destinationRoot)
-        // A backup older than abilities/ restored the tools and skills they became; what it never carried (senses, her turn)
-        // stays.
-        if !target.restorePaths.contains("abilities") {
-            try AbilityStore(dataRoot: destinationRoot).installRestoredLegacy(carriedAbilities, backupRoot: target.dataDirectory)
-        }
         if let cause = try TelegramConfig.preserveCredential(safetyRoot: kept.dataDirectory, destinationRoot: destinationRoot) {
             notes.append("telegram/config.json: \(cause); current credential grant was not kept.")
         }
         notes += try SwiftNativeApprovalInbox.mergeRestoreFences(
             safetyRoot: kept.dataDirectory, destinationRoot: destinationRoot)
-        let schedulerPath = kept.dataDirectory.appendingNativeRelativePath("scheduler/jobs.json")
-        if Self.pathEntryExists(schedulerPath) {
-            let scheduler = try Data(contentsOf: schedulerPath)
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(scheduler, to: destinationRoot.appendingNativeRelativePath("scheduler/jobs.json"))
-        }
+        notes += try SwiftNativeTriggerScheduler.mergeRestoreFences(
+            safetyRoot: kept.dataDirectory, destinationRoot: destinationRoot)
         try DataRootLife.begin(in: destinationRoot, id: intent.transactionID)
         // Raise the selected backup above the prior phone version floor.
         try Self.rollTranscriptGenerationsForward(
@@ -308,28 +277,56 @@ extension TrustBackupPersistence {
         )
     }
 
-    /// Stamp the installed index above retained/readable version counters.
+    /// Include hot and archived generations: archiving moves a counter, never retires it.
+    /// A readable empty index has no counters; only the archive and epoch may be truly absent.
+    static func requiredTranscriptGenerationFloor(in root: URL, epochRoot: URL? = nil) throws -> Int64 {
+        let archive = root.appendingPathComponent("chat/archive/sessions.jsonl")
+        var floor: Int64 = 0
+        for index in [Self.chatSessionIndexPath(in: root), archive] {
+            do {
+                try Self.requireRegularFile(index, maximumBytes: nil)
+            } catch CocoaError.fileReadNoSuchFile where index == archive {
+                continue
+            }
+            let rows = index == archive
+                ? try ChatSessionRetention.archiveIndexRows(dataRoot: root)
+                : try ChatSessionIndexFile.loadObjectRowsForMutation(at: index)
+            try Self.requireRegularFile(index, maximumBytes: nil)
+            for row in rows {
+                guard case .string(let id)? = row["id"], !id.isEmpty,
+                      case .int(let value)? = row[ChatSessionIndexFile.transcriptGenerationKey],
+                      value >= 0, value <= Int64.max - 2 else {
+                    throw Self.backupError(code: 422, "A session's transcript generation is missing, malformed or exhausted: \(index.path)")
+                }
+                floor = max(floor, value)
+            }
+        }
+        let epochPath = Self.transcriptRestoreEpochPath(in: epochRoot ?? root)
+        do {
+            try Self.requireRegularFile(epochPath, maximumBytes: 1024)
+        } catch CocoaError.fileReadNoSuchFile {
+            return floor
+        }
+        guard case .object(let object) = try JSONValue.parse(Data(contentsOf: epochPath)),
+              case .int(let value)? = object["epoch"], value >= 0, value <= Int64.max - 2 else {
+            throw Self.backupError(code: 422, "The transcript restore epoch is malformed or exhausted: \(epochPath.path)")
+        }
+        return max(floor, value)
+    }
+
+    /// Stamp the installed index above the required pre-replacement version floor.
     private static func rollTranscriptGenerationsForward(
         in root: URL,
         priorGenerationFloor: Int64
     ) throws {
         let path = Self.chatSessionIndexPath(in: root)
+        let restoredFloor = try Self.requiredTranscriptGenerationFloor(in: root)
         var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
         guard !rows.isEmpty else { return }
-        let epoch = try Self.bumpTranscriptRestoreEpoch(in: root, atLeast: max(
-            priorGenerationFloor,
-            rows.compactMap { ChatSessionIndexFile.transcriptGeneration(in: $0) }.max() ?? 0))
-        guard epoch < Int64.max else { return }
-        var changed = false
+        let epoch = try Self.bumpTranscriptRestoreEpoch(in: root, atLeast: max(priorGenerationFloor, restoredFloor))
         for index in rows.indices {
-            guard case .string(_)? = rows[index]["id"] else { continue }
-            let restored = ChatSessionIndexFile.transcriptGeneration(in: rows[index]) ?? 0
-            let forward = max(restored, epoch + 1)
-            guard forward != restored else { continue }
-            rows[index][ChatSessionIndexFile.transcriptGenerationKey] = .int(forward)
-            changed = true
+            rows[index][ChatSessionIndexFile.transcriptGenerationKey] = .int(epoch + 1)
         }
-        guard changed else { return }
         do {
             try ChatSessionIndexFile.write(rows, to: path)
         } catch {
@@ -347,19 +344,17 @@ extension TrustBackupPersistence {
             .appendingPathComponent("transcript_restore_epoch.json")
     }
 
-    /// Persist a new epoch above the readable floor before publishing it.
+    /// Persist a new epoch above the checked floor before publishing it.
     private static func bumpTranscriptRestoreEpoch(
         in root: URL,
         atLeast floor: Int64
     ) throws -> Int64 {
         let path = Self.transcriptRestoreEpochPath(in: root)
-        guard floor < Int64.max else { return floor }
+        guard floor <= Int64.max - 2 else {
+            throw Self.backupError(code: 422, "Transcript versions are exhausted.")
+        }
         let next = floor + 1
         do {
-            var info = stat()
-            if lstat(path.path, &info) == 0, (info.st_mode & S_IFMT) != S_IFREG {
-                try FileManager.default.removeItem(at: path)
-            }
             try SwiftNativePersistenceCore.writeDataAtomicDurable(
                 JSONValue.object(["epoch": .int(next)]).serializedData(pretty: false), to: path)
         } catch {
@@ -381,17 +376,8 @@ extension TrustBackupPersistence {
         _ snapshot: NativeValidatedBackupSnapshot,
         destinationRoot: URL
     ) throws {
-        for rel in snapshot.restorePaths where !snapshot.copied.contains(rel) {
-            let destination = destinationRoot.appendingNativeRelativePath(rel)
-            guard Self.pathEntryExists(destination) else { continue }
-            // Only what no backup carries may remain.
-            let kept = Self.unbackedChildren(of: rel, at: destination)
-            guard !kept.isEmpty, try Set(FileManager.default.contentsOfDirectory(atPath: destination.path)) == kept else {
-                throw Self.backupError(code: 500, "Restored scope contains an item absent from the selected snapshot: \(rel)")
-            }
-        }
         for file in snapshot.files {
-            let destination = destinationRoot.appendingNativeRelativePath(file.path)
+            let destination = Self.backupDestination(file.path, dataRoot: destinationRoot)
             try Self.requireRegularFile(destination, maximumBytes: nil)
             let measured = try Self.fileDigest(destination)
             guard measured.sizeBytes == file.sizeBytes,
@@ -401,17 +387,19 @@ extension TrustBackupPersistence {
         }
         for link in snapshot.links {
             let path = destinationRoot.appendingNativeRelativePath(link.path)
-            guard (try? FileManager.default.destinationOfSymbolicLink(atPath: path.path)) == link.target else {
+            let target = try FileManager.default.destinationOfSymbolicLink(atPath: path.path)
+            guard target == link.target else {
                 throw Self.backupError(code: 500, "Restored link failed verification: \(link.path)")
             }
         }
     }
 
     /// The live children of a restore scope that no backup carries, kept in place.
-    private static func unbackedChildren(of rel: String, at destination: URL) -> Set<String> {
-        guard rel == "senses",
-              let values = try? destination.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
-              values.isDirectory == true, values.isSymbolicLink != true else { return [] }
-        return Self.unbackedSenseNames.filter { Self.pathEntryExists(destination.appendingPathComponent($0)) }
+    private static func unbackedChildren(of rel: String, at destination: URL) throws -> Set<String> {
+        guard rel == "senses" else { return [] }
+        do { try Self.requireRegularDirectory(destination) }
+        catch CocoaError.fileReadNoSuchFile { return [] }
+        let children = try FileManager.default.contentsOfDirectory(at: destination, includingPropertiesForKeys: nil)
+        return Set(children.map(\.lastPathComponent)).intersection(Self.unbackedSenseNames)
     }
 }

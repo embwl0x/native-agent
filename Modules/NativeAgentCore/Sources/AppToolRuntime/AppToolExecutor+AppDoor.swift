@@ -5,6 +5,7 @@ import TurnTrace
 import AuthoredCapabilities
 import AttentionRouting
 import ChatTurnContracts
+import ChatTurnRuntime
 import ChatToolRuntime
 import AgentConversations
 import ChatToolParsing
@@ -21,7 +22,7 @@ import TrustCenter
 import Senses
 import PersonaEngine
 import Desk
-// Blueprint: | `AppToolExecutor+AppDoor.swift` | The `app` schema and home/page/item/find/action/actions/script dispatch; self-window `visible` resolves through the mounted presentation before ordinary page lookup; compact expandable action catalogs, read-only conversion census and preserved domain execution receipts; owns version recovery, including sense.versions; generic failures and wrong or absent version scopes use action discovery, never registry scopes as page ids; `undo` re-enters the receipted layout, recipe or setting action's gates and restores through that owner; page action lists and guides use the same originating data root as their rows, including all face-page parts on Tools; Tools reads the bounded accounting-bearing ability list with named list/source offsets |
+// Blueprint: | `AppToolExecutor+AppDoor.swift` | The `app` schema and home/page/item/find/action/actions/script dispatch; self-window `visible` resolves through the mounted presentation before ordinary page lookup; compact expandable action catalogs, read-only conversion census and preserved domain execution receipts; owns version recovery, including sense.versions; generic failures and wrong or absent version scopes use action discovery, never registry scopes as page ids; `undo` re-enters the receipted layout, recipe or setting action's gates and restores through that owner; page action lists and guides use the same originating data root as their rows, including all face-page parts on Tools; Tools reads the bounded accounting-bearing ability list with named list/source offsets; argument-only preflight never spends a mind preview generation |
 /// `app`: NativeAgent as one always-on door, and her only tool.
 ///
 /// `{}` is her home (where she left off) and then the pages, `{page[, item]}`
@@ -33,8 +34,8 @@ extension AppToolExecutor {
     public static let doorToolNames = ["app"]
     /// Today's Inbox is a sheet, not a rail page, and the rail's word "inbox" means Notifications; the door's inbox is the notes.
     static let doorInbox = QuietToolPage.inbox
-    @MainActor var doorPages: [QuietToolPage] { [Self.doorInbox] + presentation.pages }
-    @MainActor var doorPageIndex: [String: QuietToolPage] { Dictionary(doorPages.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }) }
+    @MainActor var doorPages: [QuietToolPage] { get throws { [Self.doorInbox] + (try presentation.pages) } }
+    @MainActor var doorPageIndex: [String: QuietToolPage] { get throws { try Dictionary(doorPages.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first }) } }
     /// "current" is the visible Advanced sidebar page; self-window reads resolve "visible" through the mounted presentation before page lookup.
     @MainActor func doorPage(_ raw: String) -> QuietToolPage? {
         let key = AppDoorNames.resolve(raw)
@@ -113,6 +114,18 @@ extension AppToolExecutor {
                     configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root))
                 return .object(["status": .string("ok"), "id": .string(id), "let_go": .string(reason), "effects": .string("occurred")])
             }
+            // A reply owed to a door that is no longer worth carrying: the
+            // checkpoint that owns its redelivery settles it as let go, so the
+            // answer and recovery agree and nothing redelivers it.
+            if let owed, id.hasPrefix(Experience.answer(run: "")),
+               owed.owes.contains(where: { $0.key.hasPrefix("deliver:") && !$0.value.phase.isSettled }),
+               let conversation = owed.addressedTo.first(where: { $0.hasPrefix("conversation:") }) {
+                try await store.append([.claim(.init(claim: "let go: " + reason, evidence: []))], to: id)
+                try await SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: root,
+                    sessionId: String(conversation.dropFirst("conversation:".count)),
+                    runId: String(id.dropFirst(Experience.answer(run: "").count)), verdict: "let_go")
+                return .object(["status": .string("ok"), "id": .string(id), "let_go": .string(reason), "effects": .string("occurred")])
+            }
             if let owed, owed.owes["decide"]?.phase.isSettled == false {
                 return Self.doorRefusal("person_decides", "\(id) waits on the person's decision; it is theirs to answer, not yours to let go. Nothing was let go.",
                     remedy: "none", "Wait on it with desk.wait, or ask the person.")
@@ -150,7 +163,7 @@ extension AppToolExecutor {
         if let part = SkillRunContext.partID, part != "app-script" { return correction }
         guard case .object(let fields) = correction, case .object(let remedy)? = fields["remedy"],
               case .object(let next)? = remedy["next_call"], case .object(var call)? = next["input"],
-              call["preview"] != .bool(true), case .string(let id)? = call["action"], let action = AppActions.action(id) else { return correction }
+              call["preview"] != .bool(true), case .string(let id)? = call["action"], let action = try AppActions.action(id) else { return correction }
         // {item:"memory.recall", find:"words"}: the find text is the query it lacks (10-09).
         let takesQuery = action.argSpecs.flatMap(\.names).contains("query")
         if takesQuery, call["args"] == nil || call["args"] == .object([:]), case .string(let words)? = input["find"],
@@ -167,17 +180,17 @@ extension AppToolExecutor {
         for (key, value) in input where key.hasPrefix("__") { call[key] = value }
         var value = AgentWorkspace.resolvedRead(try await runAppDoor(input: call, surface: surface, inProcess: inProcess), as: id)
         if case .object(var result) = value {
-            result["argument_notes"] = .array([.string("Ran as {action:\"\(id)\"}; it is an action, not a page or item.")])
+            result["argument_notes"] = .array((result["argument_notes"]?.arrayValue ?? [])
+                + [.string("Ran as {action:\"\(id)\"}; it is an action, not a page or item.")])
             result["resolved"] = .string(id)
             value = .object(result)
         }
         return value
     }
-    static func doorActionCorrection(_ name: String, input: [String: JSONValue]) async -> JSONValue? {
+    static func doorActionCorrection(_ name: String, input: [String: JSONValue]) async throws -> JSONValue? {
         let key = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let args = if case .object(let args)? = input["args"] { args } else { [String: JSONValue]() }
-        let call = (AppActions.action(key) ?? AppActions.pagePrefixedAction(key)).map { ["action": JSONValue.string($0.id), "args": input["args"] ?? .object(args)] }
-            ?? ToolNameAliases.appCall(ToolNameAliases.retiredActions[key] ?? ToolNameAliases.canonical(key), input: args)
+        let call = try (AppActions.action(key) ?? AppActions.pagePrefixedAction(key)).map { ["action": JSONValue.string($0.id), "args": input["args"] ?? .object(args)] }
         guard var call else { return nil }
         for key in ["preview", "expected_version"] { if let value = input[key] { call[key] = value } }
         TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T16"), "site": .string("AppToolExecutor+AppDoor.swift:doorActionCorrection")]))
@@ -216,8 +229,12 @@ extension AppToolExecutor {
     public static func noteButton(id raw: String, label: String) -> String? {
         let id = InboxActionVocabulary.normalizedAction(raw.lowercased())
         guard !["view", "read", "reply"].contains(id) else { return nil }
-        let action = AppActions.all.first { $0.page == "inbox" && $0.label.caseInsensitiveCompare(label) == .orderedSame }
-            ?? (["archive", "dismiss", "repair"].contains(id) ? AppActions.action("inbox." + id) : nil)
+        // Inbox buttons are fixed declarations, never a file-backed catalog lookup.
+        let seeds: [AppAction]
+        do { seeds = try AppActions.seedActions }
+        catch { return label + " · action catalog unavailable: " + error.localizedDescription + "; repair the catalog before using this button" }
+        let action = seeds.first { $0.page == "inbox" && $0.label.caseInsensitiveCompare(label) == .orderedSame }
+            ?? (["archive", "dismiss", "repair"].contains(id) ? seeds.first { $0.id == "inbox." + id } : nil)
         guard let action else { return "inbox.act(action: \"\(id)\") \(label)" }
         return action.id + (action.isHis ? " · the owner's" : "")
     }
@@ -271,67 +288,7 @@ extension AppToolExecutor {
             return AgentWorkspace.resolvedRead(result, as: step.label)
         }
         let action = Self.doorText(input["action"])
-        let resolvedAction = await AppActions.resolvedAction(action, dataRoot: root)
-        var corrections: [String] = []
-        let given: [String: JSONValue]? = switch input["args"] {
-        case .object(let args)?: args
-        case nil, .null?: [:]
-        default: nil
-        }
-        if let target = resolvedAction?.action, var args = given {
-            let secrets = Set(MacInjectionArgRedaction.appDoorSecretKeys(input))
-            func movable(_ key: String, _ value: JSONValue?) -> Bool {
-                // A bare key names what is looked up (a setting's id); api_key and its kin name a secret.
-                let words = key.lowercased().split(separator: "_")
-                return !secrets.contains(key) && Set(words).isDisjoint(with: ["token", "secret", "password", "credential"])
-                    && (words.count == 1 || !words.contains("key"))
-                    && NativeAgentSecretRedactor.secretPath(.object([key: value ?? .string("")])) == nil
-            }
-            let names = Set(target.argSpecs.flatMap(\.names)).filter { movable($0, nil) }
-            let discovery = resolvedAction?.discovery ?? [:]
-            let properties: [String: JSONValue] = if case .object(let schema)? = discovery["args_schema"],
-                case .object(let properties)? = schema["properties"] { properties } else { [:] }
-            for key in args.keys.sorted() {
-                guard movable(key, args[key]), let supplied = args[key] else { continue }
-                let correction = ToolNameAliases.argumentName(key, tool: target.isFold ? target.tool : target.id, input: args, known: names)
-                var name = correction?.name
-                var shimID = correction?.shimID
-                var value = supplied
-                if let name, name.contains(".") {
-                    let corrected = ToolNameAliases.doorArgs(target.isFold ? target.tool : target.id, args, reportShim: true)
-                    if corrected != args {
-                        args = corrected
-                        corrections.append("Use args.\(name), not args.\(key).")
-                    }
-                    continue
-                }
-                if name == nil, properties[key] == nil {
-                    let matches = properties.compactMap { name, schema -> (String, JSONValue)? in
-                        guard case .object(let fields) = schema else { return nil }
-                        let variants = if case .array(let variants)? = fields["anyOf"] { variants } else { [JSONValue]() }
-                        let values = ([schema] + variants).flatMap { if case .object(let fields) = $0, case .array(let values)? = fields["enum"] { values } else { [JSONValue]() } }
-                        guard let match = values.first(where: { candidate in
-                            if case .string(let a) = supplied, case .string(let b) = candidate { return a.caseInsensitiveCompare(b) == .orderedSame }
-                            return supplied == candidate
-                        }) else { return nil }
-                        return (name, match)
-                    }
-                    if matches.count == 1 { name = matches[0].0; value = matches[0].1; shimID = "T11" }
-                }
-                if name == nil, properties[key] == nil, let schema = discovery["args_schema"] {
-                    name = Self.doorMeantArg(supplied, of: target, given: args, schema: schema)
-                    if name != nil { shimID = "T12" }
-                }
-                guard let name, names.contains(name), args[name] == nil || args[name] == .null || args[name] == value else { continue }
-                args.removeValue(forKey: key)
-                args[name] = value
-                if let shimID {
-                    TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string(shimID), "site": .string("AppToolExecutor+AppDoor.swift:runAppDoor")]))
-                }
-                corrections.append("Use args.\(name), not args.\(key).")
-            }
-            input["args"] = .object(args)
-        }
+        let resolvedAction = try await AppActions.resolvedAction(action, dataRoot: root)
         // A bare item names its unique owner; ambiguity is explicit, including a home room.
         if Self.doorText(input["page"]).isEmpty, case .string? = input["item"], !Self.doorText(input["item"]).isEmpty {
             let named = Self.doorText(input["item"])
@@ -387,7 +344,7 @@ extension AppToolExecutor {
         let stray = input.keys.filter { !Self.doorKeys.contains($0) && !$0.hasPrefix("__") }.sorted()
         if !stray.isEmpty {
             if stray.count == 1, action.isEmpty, let key = stray.first, let value = input[key],
-               let correction = await Self.doorActionCorrection(key, input: input.merging(["args": value]) { _, value in value }) {
+               let correction = try await Self.doorActionCorrection(key, input: input.merging(["args": value]) { _, value in value }) {
                 return try await runCorrectedRead(correction, input: input, surface: surface, inProcess: inProcess)
             }
             return Self.doorRefusal("unknown_key",
@@ -422,7 +379,7 @@ extension AppToolExecutor {
             return Self.previewApproval(await doorScript(script, input: input), preview: input["preview"] == .bool(true))
         }
         // A name from her screen given as an action (desk.3407.note, as an item's DO list shows it) is that item: it opens as one.
-        if !action.isEmpty, resolvedAction == nil, ToolNameAliases.retiredActions[action.lowercased()] == nil,
+        if !action.isEmpty, resolvedAction == nil,
            input[Self.doorScriptKey] != .bool(true),
            await HerScreen.classify(action, dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
                                     scope: input["__session_id"]?.scalarText ?? ChatToolSessionContext.verifiedSessionId ?? "") != .unknown {
@@ -439,10 +396,6 @@ extension AppToolExecutor {
         }
         if !action.isEmpty {
             var value = try await doorDo(action, resolved: resolvedAction, input: input, surface: surface, inProcess: inProcess)
-            if !corrections.isEmpty, case .object(var fields) = value {
-                fields["argument_notes"] = .array(corrections.map(JSONValue.string))
-                value = .object(fields)
-            }
             if let action = resolvedAction?.action, case .object(var fields) = value {
                 if fields["execution"] == nil { fields["execution"] = .string("not_run") }
                 var metadata = action.effectFields(args: input["args"]?.objectValue ?? [:], result: fields)
@@ -455,19 +408,19 @@ extension AppToolExecutor {
         let find = Self.doorText(input["find"])
         let page = Self.doorText(input["page"])
         var item = Self.doorText(input["item"])
-        if !page.isEmpty, item.isEmpty, doorPage(page) == nil, let correction = await Self.doorActionCorrection(page, input: input) {
+        if !page.isEmpty, item.isEmpty, doorPage(page) == nil, let correction = try await Self.doorActionCorrection(page, input: input) {
             return try await runCorrectedRead(correction, input: input, surface: surface, inProcess: inProcess)
         }
         // A guide names its action, and the action its page: guide:<id> reads with or without page,
         // and from a page that is not the action's own (a room, Senses) it reads from the action's.
         if item.hasPrefix("guide:"), page.isEmpty || doorPage(page) == nil,
-           let named = (await AppActions.resolvedAction(String(item.dropFirst("guide:".count)), dataRoot: root))?.action, named.page != "*" {
+           let named = (try await AppActions.resolvedAction(String(item.dropFirst("guide:".count)), dataRoot: root))?.action, named.page != "*" {
             var call = input
             call["page"] = .string(named.page)
             call["item"] = .string("guide:" + named.id)
             return try await runAppDoor(input: call, surface: surface, inProcess: inProcess)
         }
-        if page.isEmpty, !item.isEmpty, let correction = await Self.doorActionCorrection(item, input: input) {
+        if page.isEmpty, !item.isEmpty, let correction = try await Self.doorActionCorrection(item, input: input) {
             return try await runCorrectedRead(correction, input: input, surface: surface, inProcess: inProcess)
         }
         // An item with no page is a name or ref from home or one of its rooms.
@@ -482,7 +435,14 @@ extension AppToolExecutor {
         // A home item does what its name says at once: there is nothing to preview, and no page version guards it.
         if homeItem, input["preview"] == .bool(true) || !Self.doorText(input["expected_version"]).isEmpty {
             if item.lowercased().hasSuffix(".say") {
-                var args = given ?? [:]
+                var args: [String: JSONValue]
+                switch input["args"] {
+                case .object(let supplied)?: args = supplied
+                case nil, .null?: args = [:]
+                default:
+                    return Self.doorRefusal("invalid_args", "Message arguments must be an object. Nothing was sent.",
+                        remedy: "correct_arguments", "Use agent.message with its named arguments and preview:true.")
+                }
                 args["agent"] = .string(String(item.dropLast(4)))
                 return Self.doorRefusal("item_not_previewable",
                     "Use agent.message to preview an agent message. Nothing was sent.",
@@ -541,7 +501,7 @@ extension AppToolExecutor {
             }
             return Self.doorRefusal("unknown_page", "No page is called that.", remedy: "read_index",
                 "Read {} for the pages; nothing was done.", next: [:],
-                extra: ["requested": .string(page), "pages": .array(doorPages.map { .string($0.id) })])
+                extra: ["requested": .string(page), "pages": .array(try doorPages.map { .string($0.id) })])
         }
         switch input["args"] {
         case .object(let args)?:
@@ -581,14 +541,15 @@ extension AppToolExecutor {
         }
         let catalog = item == "actions"
         // A conversation named by its exact title, when exactly one has it.
-        if resolved.id == "chat", !item.isEmpty, !catalog, !item.hasPrefix("guide:"),
-           let rows = try? HumanConversationIndex.rows(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()),
-           !rows.contains(where: { $0["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) == item }) {
+        if resolved.id == "chat", !item.isEmpty, !catalog, !item.hasPrefix("guide:") {
+            let rows = try HumanConversationIndex.rows(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            if !rows.contains(where: { $0["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) == item }) {
             let named = rows.filter { $0["title"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })?.caseInsensitiveCompare(item) == .orderedSame }
             if named.count == 1, let id = named[0]["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) { item = id }
+            }
         }
         if resolved.id == "desk", !item.isEmpty, !catalog, !item.hasPrefix("guide:") {
-            return Self.doorItemRead(try await doorDo("desk.read", resolved: await AppActions.resolvedAction("desk.read", dataRoot: root), input: ["args": .object(["handle": .string(item), "structured": .bool(true)])],
+            return Self.doorItemRead(try await doorDo("desk.read", resolved: try await AppActions.resolvedAction("desk.read", dataRoot: root), input: ["args": .object(["handle": .string(item)])],
                                                       surface: surface, inProcess: inProcess), page: resolved, item: item)
         }
         let offset: Int64 = if case .int(let value)? = input["args"]?.objectValue?["offset"] { value } else { 0 }
@@ -602,7 +563,7 @@ extension AppToolExecutor {
             try await AgentWorkspaceNavigation.shared.rememberDoorPage(resolved.id, dataRoot: root, scope: scope)
         }
         if page != resolved.id { read["resolved"] = .string(resolved.id) }
-        read["version"] = read["version"] ?? .string(Self.doorVersion(page: resolved.id, item: catalog ? "" : item, read))
+        read["version"] = try read["version"] ?? .string(Self.doorVersion(page: resolved.id, item: catalog ? "" : item, read))
         if item.isEmpty, let items = Self.doorItemReads[resolved.id] {
             read["item_reads"] = .array(items.sorted { $0.key < $1.key }.map { .string("\($0.key): \($0.value)") })
         }
@@ -623,14 +584,14 @@ extension AppToolExecutor {
             }
         }
         let hasSettings = if case .array(let rows)? = read["settings"] { !rows.isEmpty } else { false }
-        let actions = await Self.doorPageActions(resolved.id, hasSettings: hasSettings, dataRoot: root)
+        let actions = try await Self.doorPageActions(resolved.id, hasSettings: hasSettings, dataRoot: root)
         // Over 8 reads compact, as over 12 did with the four every-page actions.
         let compact = actions.count > 8 && !catalog
         read["actions"] = .array(actions.map { .string(compact ? $0.signature : $0.line) })
         if compact { read["actions_read"] = .object(["page": .string(resolved.id), "item": .string("actions")]) }
         // One example teaches the preview shape; the action lines name the rest.
-        read["preview_examples"] = .array(actions.filter { $0.irreversible && $0.page != "*" }.prefix(1).compactMap {
-            if case .object(let discovery) = AppActions.discovery($0) { discovery["example"] } else { nil }
+        read["preview_examples"] = .array(try actions.filter { $0.irreversible && $0.page != "*" }.prefix(1).compactMap {
+            if case .object(let discovery) = try AppActions.discovery($0) { discovery["example"] } else { nil }
         })
         // The complete Mac act guide is an explicit read on this same page; other actions' argument rules ride find's args_schema and refusals.
         let guides = actions.filter { $0.id == "mac.act" }
@@ -647,11 +608,22 @@ extension AppToolExecutor {
 }
 /// The door's own answer comes before any card: a door call is previewed through the same checks the real call makes, and one it would refuse (an owner's action, bad arguments) refuses instead of asking anyone.
 extension AppToolExecutor: PureToolArgumentValidating {
+    // Argument validation uses preflight, never an owner's model call.
+    @TaskLocal static var argumentPreflightOnly = false
+
     public func argumentRefusal(tool: String, input: [String: JSONValue]) async -> JSONValue? {
         guard tool == "app", input["preview"] != .bool(true), input["action"] != nil else { return nil }
         var preview = input
         preview["preview"] = .bool(true)
-        guard case .object(var fields)? = try? await runAppDoor(input: preview, surface: "app", inProcess: true) else { return nil }
+        let result: JSONValue
+        do {
+            result = try await Self.$argumentPreflightOnly.withValue(true, operation: {
+                try await runAppDoor(input: preview, surface: "app", inProcess: true)
+            })
+        } catch { return ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none) }
+        guard case .object(var fields) = result else {
+            return ChatToolOutcome.failure(error: ToolFailureError("Argument preflight returned no structured result. Repair the action contract before running it.", effects: .none, code: "argument_preflight_failed"), tool: "app")
+        }
         if case .string(let code)? = fields["would_refuse"] {
             fields["status"] = .string("refused")
             fields["reason"] = .string(code)

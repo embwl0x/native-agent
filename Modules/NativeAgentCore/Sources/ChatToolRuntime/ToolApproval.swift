@@ -52,6 +52,19 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
     ) async -> JSONValue? {
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
         let input = ChatToolSessionInjection.apply(toolName: tool, input: rawInput)
+        do {
+            if let refusal = try await MacAppActGate.requestRefusal(tool: tool, input: input, dataRoot: dataRoot) {
+                return .object(refusal.fields)
+            }
+        } catch { return ChatToolOutcome.failure(error: error, effects: .none) }
+        // A switch User turned off is admission, not an inside check: a preview
+        // refuses exactly what the act would.
+        if let gate = MacIntegrationGates.byTool[tool] {
+            do {
+                if let refusal = try await Self.switchRefusal(integration: gate.integration, mode: gate.mode,
+                                                              store: macIntegrationPermissionStore) { return refusal }
+            } catch { return ChatToolOutcome.failure(error: error, effects: .none) }
+        }
         if let refusal = await argumentRefusal(tool: tool, input: input) { return refusal }
         if tool == "studio_canon_resolve",
            case .failure(let refusal) = StudioCanonSeatGate.liveTurnProvenance(dispatchSurface: surface) {
@@ -66,14 +79,19 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
         if let refusal = await standingBotsArgumentRefusal(tool: tool, input: input) { return refusal }
         // Unavailable Mac-control categories answer before approval admission,
         // using the tool's same Full Mac and surface-trigger access verdict.
-        if Self.screenControlToolNames.contains(tool), await !fullMacToolAccess(surface: surface).accessibilityAllowed,
-           let need = macControlCategoryNeedEnvelope(
-               categories: ["accessibility"], mode: Self.screenControlReadToolNames.contains(tool) ? .read : .write,
-               why: "Screen control lets me read and control apps on your Mac.") {
-            return need
-        }
-        if Self.fileAccessGatedToolNames.contains(tool), await !fullMacToolAccess(surface: surface).fileOpsAllowed {
-            return builderFullMacRequired(tool: tool, input: input)
+        if Self.screenControlToolNames.contains(tool) || Self.fileAccessGatedToolNames.contains(tool) {
+            do {
+                let access = try await fullMacToolAccess(surface: surface)
+                if Self.screenControlToolNames.contains(tool), !access.accessibilityAllowed,
+                   let need = macControlCategoryNeedEnvelope(
+                       categories: ["accessibility"], mode: Self.screenControlReadToolNames.contains(tool) ? .read : .write,
+                       why: "Screen control lets me read and control apps on your Mac.") {
+                    return need
+                }
+                if Self.fileAccessGatedToolNames.contains(tool), !access.fileOpsAllowed {
+                    return builderFullMacRequired(tool: tool, input: input)
+                }
+            } catch { return ChatToolOutcome.failure(error: error) }
         }
         return nil
     }
@@ -98,6 +116,13 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
         switch proposal {
         case .success: return nil
         case .failure(let error):
+            if let failure = error as? ToolFailureError { return ChatToolOutcome.failure(error: failure) }
+            guard error is AgentHostConnection.Refusal else {
+                return ChatToolOutcome.failure(error: ToolFailureError(
+                    "The named agent's setup could not be prepared: \(error.localizedDescription). Nothing was changed.",
+                    effects: .none, owner: "Agent connection setup", code: "agent_setup_unavailable",
+                    instruction: "Repair the reported contact or setup storage error, then request this connection again.", recovery: .repair))
+            }
             return .object(["status": .string("not_supported"),
                             "tool": .string(tool),
                             "changed": .bool(false),
@@ -108,7 +133,7 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
     /// Nil unless this really is an `agent_connect` with a name and nothing
     /// else — the by-name setup path and no other shape of the call.
     private func agentHostProposal(tool: String, input: [String: JSONValue])
-        -> Result<AgentHostConnection.Proposal, AgentHostConnection.Refusal>? {
+        -> Result<AgentHostConnection.Proposal, any Error>? {
         guard usesCanonicalBody, AgentHostConnection.isNamedConnect(tool: tool, input: input),
               case .string(let name)? = input["name"] else { return nil }
         let folder: String?
@@ -116,8 +141,7 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
         let workspace: String?
         if case .string(let value)? = input["workspace"] { workspace = value } else { workspace = nil }
         do { return .success(try AgentHostConnection.propose(name: name, store: AgentPeerStore(dataRoot: dataRoot), dataRoot: dataRoot, workspace: workspace, workingDirectory: folder)) }
-        catch let refusal as AgentHostConnection.Refusal { return .failure(refusal) }
-        catch { return nil }
+        catch { return .failure(error) }
     }
     /// ONE approval card covers the disclosed setup and nothing else, in the
     /// words `AgentHostConnection.cardText` writes.
@@ -132,12 +156,19 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
         if let sentence = standingBotApprovalReason(tool: tool, input: input) {
             return sentence
         }
-        guard case .success(var proposal)? = agentHostProposal(tool: tool, input: input),
-              proposal.existing == nil || proposal.row.route == .grokBot else { return nil }
+        // Reconnect can add or reconcile messaging allowances too; an existing
+        // contact still needs the same setup disclosure on its approval card.
+        guard let proposed = agentHostProposal(tool: tool, input: input) else { return nil }
+        let proposalValue: AgentHostConnection.Proposal
+        switch proposed {
+        case .success(let value): proposalValue = value
+        case .failure(let error): return "This connection's setup is unavailable: \(error.localizedDescription). Repair that cause before approving this connection."
+        }
+        var proposal = proposalValue
         // The approved replay carries this exact observation, not a later PATH lookup.
         if case .string(let path)? = input["executable_path"] { proposal.executablePath = path }
         else { proposal.executablePath = nil }
-        return AgentHostConnection.cardText(proposal, appName: Self.appDisplayName)
+        return AgentHostConnection.cardText(proposal, appName: Self.appDisplayName, agentName: PersonaCompiler.agentDisplayName())
     }
     /// The product's own name for the card's title. Not a persona name.
     public static var appDisplayName: String {

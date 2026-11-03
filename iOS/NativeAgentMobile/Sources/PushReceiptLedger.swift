@@ -13,6 +13,10 @@ struct PushReceiptEntry: Codable, Identifiable {
 }
 
 enum PushReceiptLedger {
+    struct Reading {
+        var entries: [PushReceiptEntry]
+        var failure: String?
+    }
     private static let key = "NativeAgentMobile.pushReceipts"
     private static let capacity = 20
     static let didChange = Notification.Name("NativeAgentMobile.pushReceiptLedgerDidChange")
@@ -26,7 +30,13 @@ enum PushReceiptLedger {
             itemId: (userInfo["itemId"] as? String) ?? "",
             eventId: NativeAgentNotificationEventGate.eventID(in: userInfo)
         )
-        var entries = load()
+        let reading = load()
+        guard reading.failure == nil else {
+            NSLog("[PushReceiptLedger] Receipt history unavailable; retained existing bytes: %@", reading.failure ?? "")
+            NotificationCenter.default.post(name: didChange, object: nil)
+            return entry
+        }
+        var entries = reading.entries
         entries.insert(entry, at: 0)
         if entries.count > capacity { entries = Array(entries.prefix(capacity)) }
         if let data = try? JSONEncoder().encode(entries) {
@@ -38,11 +48,8 @@ enum PushReceiptLedger {
         return entry
     }
 
-    static func load() -> [PushReceiptEntry] {
-        guard let data = UserDefaults.standard.data(forKey: key),
-              let entries = try? JSONDecoder().decode([PushReceiptEntry].self, from: data) else {
-            return []
-        }
-        return entries
+    static func load() -> Reading {
+        do { return Reading(entries: try MobileLocalStorage.restore([PushReceiptEntry].self, key: key, defaults: .standard) ?? []) }
+        catch { return Reading(entries: [], failure: "Push receipt history could not be read: \(error.localizedDescription). Its saved bytes are retained; repair this iPhone's receipt storage before recording further receipts.") }
     }
 }

@@ -25,18 +25,10 @@ public struct SlackSocketModeLoop: LoopRunner {
     let botEventIntake: SlackBotEventIntake
     let session: URLSession
     let deliveryJournal: SlackInboundDeliveryJournal
-    let historyPollState = SlackHistoryPollState()
-    let conversationCache = SlackConversationCache()
-    // Socket liveness gates history polling.
-    let socketHealth = SlackSocketHealth()
     let feedRetention = JSONLPathOwnedCapPolicy(
         maxLines: JSONLLineCaps.slackReceipts, maxBytes: 1_048_576, trimToBytes: 786_432
     )
 
-    /// A socket that has said `hello` and has produced a frame or a successful
-    /// ping inside this window counts as healthy. Pings run every 25s, so 90s
-    /// is three missed heartbeats.
-    static let socketHealthGrace: TimeInterval = 90
     static let shortLivedSessionFloor: TimeInterval = 30
     /// How long a socket-mode ping may wait for its pong before the wait is
     /// abandoned. Well inside the 25 s ping interval, so a dead socket is
@@ -144,26 +136,6 @@ public struct SlackSocketModeLoop: LoopRunner {
                 "receiveLoopErroredAt": .string(Self.nowString()),
             ])
             await recordError(context: "socket_mode", error: error)
-            // Poll history when opening fails; retain the socket failure outcome.
-            if config.historyPollEnabled, config.ingressPolicy.isConfigured {
-                do {
-                    try await pollSlackHistoryOnce()
-                    await writeState([
-                        "lastHistoryPollAt": .string(Self.nowString()),
-                        "lastHistoryPollTrigger": .string("socket_open_failed"),
-                        "lastHistoryPollError": .null,
-                    ])
-                } catch let error where error is CancellationError || Task.isCancelled {
-                    // Stopping a history poll records cancellation without a loop failure.
-                    await writeState([
-                        "connected": .bool(false),
-                        "cancelledAt": .string(Self.nowString()),
-                    ])
-                    return .skipped(reason: "Slack socket mode canceled")
-                } catch {
-                    await recordError(context: "history_poll", error: error)
-                }
-            }
             return .failed(error: Self.redact(String(describing: error)))
         }
     }
@@ -195,10 +167,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         let pingTask = Task {
             await pingUntilCancelled(socket: socket)
         }
-        let historyPollTask = Task {
-            await historyPollUntilCancelled()
-        }
-        // Every exit path drains the session's own children (ping, history);
+        // Every exit path drains the session's own ping;
         // accepted turns are not the session's and keep running.
         do {
             try await withTaskCancellationHandler {
@@ -207,22 +176,18 @@ public struct SlackSocketModeLoop: LoopRunner {
             } onCancel: {
                 // Cancelling the Swift task must also wake a parked receive.
                 pingTask.cancel()
-                historyPollTask.cancel()
                 socket.cancel(with: .goingAway, reason: nil)
             }
         } catch {
-            await drainSessionWork(pingTask: pingTask, historyPollTask: historyPollTask)
+            await drainSessionWork(pingTask: pingTask)
             throw error
         }
-        await drainSessionWork(pingTask: pingTask, historyPollTask: historyPollTask)
+        await drainSessionWork(pingTask: pingTask)
     }
 
-    private func drainSessionWork(pingTask: Task<Void, Never>, historyPollTask: Task<Void, Never>) async {
+    private func drainSessionWork(pingTask: Task<Void, Never>) async {
         pingTask.cancel()
-        historyPollTask.cancel()
-        await historyPollTask.value
         await pingTask.value
-        await socketHealth.markDisconnected()
     }
 
     private func receiveLoopBody(socket: URLSessionWebSocketTask) async throws {
@@ -242,7 +207,6 @@ public struct SlackSocketModeLoop: LoopRunner {
             guard case .object(let obj) = json else { continue }
             let type = obj["type"]?.stringValue ?? ""
             // Any received frame proves the socket is alive.
-            await socketHealth.markAlive()
             await writeState([
                 "lastWebSocketMessageAt": .string(Self.nowString()),
                 "lastWebSocketMessageType": .string(type.isEmpty ? "unknown" : type),
@@ -250,14 +214,12 @@ public struct SlackSocketModeLoop: LoopRunner {
             try Task.checkCancellation()
             switch type {
             case "hello":
-                await socketHealth.markConnected()
                 await writeState([
                     "connected": .bool(true),
                     "connectedAt": .string(Self.nowString()),
                     "lastError": .null,
                 ])
             case "disconnect":
-                await socketHealth.markDisconnected()
                 let reason = obj["reason"]?.stringValue ?? "disconnect"
                 await writeState([
                     "connected": .bool(false),
@@ -317,7 +279,6 @@ public struct SlackSocketModeLoop: LoopRunner {
                 try await Task.sleep(nanoseconds: 25_000_000_000)
                 try await sendPing(socket: socket)
                 try Task.checkCancellation()
-                await socketHealth.markAlive()
                 try Task.checkCancellation()
                 await writeState([
                     "connected": .bool(true),
@@ -326,7 +287,6 @@ public struct SlackSocketModeLoop: LoopRunner {
             } catch is CancellationError {
                 return
             } catch {
-                await socketHealth.markDisconnected()
                 await writeState([
                     "connected": .bool(false),
                     "lastPingErrorAt": .string(Self.nowString()),

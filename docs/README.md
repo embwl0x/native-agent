@@ -39,7 +39,7 @@ and [CHANGELOG.md](../CHANGELOG.md).
 | [Architecture Blueprint](ARCHITECTURE_BLUEPRINT.md) | Source-owner map (checked by `script/generate_architecture_blueprint.swift --check`) |
 | [Project Direction](PROJECT_DIRECTION.md) | Product principles and links to owning contracts |
 | [App tool contract](TOOL_LOADING.md) | One always-on `app`: home, pages, items, actions, scripts and discovery |
-| [Turn resilience](TURN_RESILIENCE.md) | Why a turn dies, what keeps it alive; 85% aging leaves ~55% raw, proportional parallel recollection blocks and rare dream-safe rollups |
+| [Turn resilience](TURN_RESILIENCE.md) | Why a turn dies, what keeps it alive; detected/Custom windows, shared request-builder measurement, Compact at percentage and proportional aging/verified fold targets |
 | [Stop](STOP.md) | The Stop law: Stop cancels the work, never its settlement |
 | [Senses](SENSES.md) | Native-world sense contract, helper wire protocol and source boundaries |
 | [Experience](EXPERIENCE.md) | One experience record, domain-owned outcomes, delivery and repair obligations |
@@ -50,6 +50,7 @@ and [CHANGELOG.md](../CHANGELOG.md).
 | [Subconscious](SUBCONSCIOUS.md), [Cognition wiring](COGNITION_WIRING.md), [Organism](ORGANISM.md) | The inner-life layers, as built |
 | [Continuous cognitive substrate](CONTINUOUS_COGNITIVE_SUBSTRATE.md) | The substrate engineering boundaries |
 | [Jev (retired)](JEV.md) | Retirement and legacy-data guidance |
+| [Chrome surface](../Extensions/NativeAgentChrome/README.md), [Chrome protocol](../Extensions/NativeAgentChrome/protocol/PROTOCOL.md) | Group-owned tabs, trusted text/key input, document-selected DOM/picture reads and effect/cleanup evidence |
 | [Codex bridge](CODEX_BRIDGE_DIAGNOSTICS.md), [Image generation](IMAGE_GENERATION.md) | Specific integrations |
 | [Skill manifest spec](skill_manifest_spec.md), [example manifests](example_manifests/), [Approval schema](approval-schema.md) | Formats |
 

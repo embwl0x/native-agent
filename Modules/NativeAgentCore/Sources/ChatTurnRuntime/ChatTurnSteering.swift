@@ -1,10 +1,11 @@
 import Foundation
+import NativeAgentCore
 import os
 import AgentWorkspace
 import Desk
 import Transcripts
 import TurnTrace
-// Blueprint: | `ChatTurnSteering.swift` | `ChatTurnSteering` actor; open turns and turn-activity clock; atomic resident claim/reservation under the common free-time law; person admission opens immediately |
+// Blueprint: | `ChatTurnSteering.swift` | `ChatTurnSteering` actor; open turns (the one live-turn truth, read without a hop, with idle edges for free-time owners) and turn-activity clock; atomic resident claim/reservation under the common free-time law, including NetworkSense's immediate offline hold before ledger claim; person admission opens immediately |
 
 /// Messages sent during work are offered to the running turn in that conversation on the same door.
 /// Each stays queued until taken or run as its own turn; Steer manually offers a queued message again.
@@ -85,7 +86,30 @@ public actor ChatTurnSteering {
     /// close could shut the window of the NEXT turn that already opened.
     private var open: [String: OpenTurn] = [:]
     private var lastTurnActivityAt: [String: Date] = [:]
+    /// The same windows, readable without an actor hop: the one truth of "a turn
+    /// of hers is running" for every free-time owner. Nothing mirrors it from
+    /// transcript events, which drift whenever a saved message is taken by a call
+    /// (a peer's reply to an awaited send) instead of answered by its own turn.
+    nonisolated private static let openRoots = OSAllocatedUnfairLock<[String: OpenRoot]>(initialState: [:])
+    nonisolated private static let idleListeners = OSAllocatedUnfairLock<[UUID: IdleListener]>(initialState: [:])
+    private struct OpenRoot: Sendable { let root: String; let helper: Bool }
+    private struct IdleListener: Sendable { let root: String; let edge: AsyncStream<Void>.Continuation }
     private init() {}
+
+    nonisolated private static func rootKey(_ dataRoot: URL) -> String {
+        dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    /// Each time the last open turn of hers in this data root closes. Free-time
+    /// owners re-consider on it: a turn's completion event can land before its
+    /// window closes, so the event alone would find her still busy.
+    nonisolated public static func idleEdges(dataRoot: URL) -> AsyncStream<Void> {
+        let (stream, edge) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let id = UUID()
+        idleListeners.withLock { $0[id] = IdleListener(root: rootKey(dataRoot), edge: edge) }
+        edge.onTermination = { _ in ChatTurnSteering.idleListeners.withLock { _ = $0.removeValue(forKey: id) } }
+        return stream
+    }
 
     /// Every turn registers its session so inline-card resume can check isTurnOpen before starting another.
     ///
@@ -96,10 +120,12 @@ public actor ChatTurnSteering {
     public func openTurn(
         sessionId: String, turnId: String, dataRoot: URL, door: ChatToolSessionContext.ReplyRoute? = nil,
         persist: Persister? = nil
-    ) -> UUID? {
+    ) throws -> UUID? {
         guard !sessionId.isEmpty else { return nil }
+        let helper = try SessionConversation.checkedIsHelper(sessionId, dataRoot: dataRoot)
         let token = TurnAdmission.token ?? UUID()
         open[sessionId] = OpenTurn(token: token, turnId: turnId, dataRoot: dataRoot, door: door, persist: persist)
+        Self.openRoots.withLock { $0[sessionId] = OpenRoot(root: Self.rootKey(dataRoot), helper: helper) }
         noteTurnActivity(for: dataRoot, at: Date())
         HerOpened.shared.began(sessionId)
         return token
@@ -110,6 +136,7 @@ public actor ChatTurnSteering {
         guard let token, let turn = open[sessionId], turn.token == token else { return }
         noteTurnActivity(for: turn.dataRoot, at: Date())
         open.removeValue(forKey: sessionId)
+        Self.openRoots.withLock { _ = $0.removeValue(forKey: sessionId) }
         ResidentWake.shared.turnEnded(dataRoot: turn.dataRoot)
         HerOpened.shared.ended(sessionId, dataRoot: turn.dataRoot)
         for offer in delivered.removeValue(forKey: sessionId) ?? [] {
@@ -123,6 +150,11 @@ public actor ChatTurnSteering {
         for offer in offers.reversed() {
             deliveryHandlers[offer.id] = nil
             if let handler = handlers[offer.id] { await handler(offer) }
+        }
+        guard !Self.hasOpenResidentTurn(dataRoot: turn.dataRoot) else { return }
+        let root = Self.rootKey(turn.dataRoot)
+        for listener in Self.idleListeners.withLock({ Array($0.values) }) where listener.root == root {
+            listener.edge.yield()
         }
     }
 
@@ -144,15 +176,11 @@ public actor ChatTurnSteering {
         open[sessionId] != nil
     }
 
-    /// Her resident wake waits for an open resident turn; helper-owned
-    /// loops are independent. Read the same session rows as every other door.
-    public func hasOpenResidentTurn(dataRoot: URL) -> Bool {
-        let root = dataRoot.standardizedFileURL.resolvingSymlinksInPath()
-        let sessions = try? SessionConversation(dataRoot: dataRoot)
-        return open.contains { session, turn in
-            turn.dataRoot.standardizedFileURL.resolvingSymlinksInPath() == root
-                && sessions?.isHelper(session) != true
-        }
+    /// Her resident wake and her free time wait for an open turn of hers;
+    /// helper-owned loops are independent (classified when the turn opens).
+    nonisolated public static func hasOpenResidentTurn(dataRoot: URL) -> Bool {
+        let root = rootKey(dataRoot)
+        return openRoots.withLock { $0.values.contains { $0.root == root && !$0.helper } }
     }
 
     public func noteTurnActivity(for dataRoot: URL, at: Date) {
@@ -168,7 +196,8 @@ public actor ChatTurnSteering {
     }
 
     package func residentWakeIsFree(dataRoot: URL, nextFreeAt: @Sendable (Date, Date) -> Date?) -> Bool {
-        if hasOpenResidentTurn(dataRoot: dataRoot) {
+        guard NetworkSense.isUp else { return false }
+        if Self.hasOpenResidentTurn(dataRoot: dataRoot) {
             ResidentWake.shared.wait(dataRoot: dataRoot, until: nil)
             return false
         }
@@ -190,6 +219,7 @@ public actor ChatTurnSteering {
               let wake = ResidentWake.shared.claim(dataRoot: dataRoot, prepared: items) else { return nil }
         open[ResidentWake.session] = OpenTurn(token: token, turnId: TurnTraceContext.turnId ?? token.uuidString,
                                             dataRoot: dataRoot, door: nil, persist: nil)
+        Self.openRoots.withLock { $0[ResidentWake.session] = OpenRoot(root: Self.rootKey(dataRoot), helper: false) }
         noteTurnActivity(for: dataRoot, at: Date())
         return wake
     }

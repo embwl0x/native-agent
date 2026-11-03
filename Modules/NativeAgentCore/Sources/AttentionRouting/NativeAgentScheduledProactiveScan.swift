@@ -5,7 +5,9 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 import TriggerScheduler
-// Blueprint: | `NativeAgentScheduledProactiveScan.swift` | `NativeAgentScheduledProactiveScan` enum; `inboxActions`, `evaluate` |
+import NotificationInbox
+import ApprovalInbox
+// Blueprint: | `NativeAgentScheduledProactiveScan.swift` | Proactive opportunities read checked inbox, scheduler, approval and Desk owners; ProactiveScanArguments owns admission and execution arguments, unavailable sources throw |
 
 public enum NativeAgentScheduledProactiveScan {
     public struct Opportunity: Sendable, Equatable {
@@ -73,8 +75,6 @@ public enum NativeAgentScheduledProactiveScan {
     /// Days a `now`/`next` Desk item may sit untouched before the scan asks
     /// about it. Five is deliberately about a working week: shorter and it nags
     /// on work that is simply in progress.
-    static let defaultDeskStaleDays = 5
-
     /// Desk items the scan is allowed to ask about. `now`/`next` only — these
     /// are the statuses that CLAIM to be the current front of the work, so an
     /// untouched one is a real question. `watch`/`todo` are backlog by
@@ -86,8 +86,9 @@ public enum NativeAgentScheduledProactiveScan {
         payload: [String: JSONValue],
         now: Date = Date()
     ) async throws -> Result {
-        let limit = max(1, min(int(payload["limit"], default: 10), 50))
-        let surfaceLimit = max(0, min(int(payload["surfaceLimit"] ?? payload["surface_limit"], default: 4), 12))
+        let arguments = try ProactiveScanArguments(payload)
+        let limit = arguments.limit
+        let surfaceLimit = arguments.surfaceLimit
         guard surfaceLimit > 0 else {
             return Result(scannedCount: 0, eligibleCount: 0, skippedAlreadySurfacedCount: 0, surfaced: [])
         }
@@ -95,26 +96,23 @@ public enum NativeAgentScheduledProactiveScan {
         let inboxPath = dataRoot
             .appendingPathComponent("notifications", isDirectory: true)
             .appendingPathComponent("inbox.jsonl")
-        let schedulerPath = dataRoot
-            .appendingPathComponent("scheduler", isDirectory: true)
-            .appendingPathComponent("jobs.json")
-        let approvalsPath = dataRoot
-            .appendingPathComponent("workflows", isDirectory: true)
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("requests.json")
+        let inboxRows = try await LiveNotificationInbox(path: inboxPath).rows()
+        let schedulerRows = try await SwiftNativeTriggerScheduler(root: dataRoot).listJobs()
+        let schedulerIssues = try schedulerRows.compactMap { row -> ScheduledJob? in
+            let job = try ScheduledJob(row: row)
+            let status = try JSONRow(row).optionalString("lastRunStatus")
+            return job.enabled && status == "error" ? job : nil
+        }
+        let pendingApprovals = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .pending).count
 
-        let inboxRows = (try? await SwiftNativePersistenceCore.readJSONL(inboxPath)) ?? []
-        let schedulerRaw = try await SwiftNativePersistenceCore.readJSON(schedulerPath, ifMissing: .array([]))
-        let approvalsRaw = try await SwiftNativePersistenceCore.readJSON(approvalsPath, ifMissing: .array([]))
-
-        let deskStaleDays = max(1, int(payload["staleDays"] ?? payload["stale_days"], default: defaultDeskStaleDays))
-        let deskItems = (try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items) ?? []
+        let deskStaleDays = arguments.staleDays
+        let deskItems = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items
 
         let surfacedIDs = alreadySurfacedOpportunityIDs(inboxRows)
-        var live = liveOpportunities(
+        var live = try liveOpportunities(
             inboxRows: inboxRows,
-            schedulerRaw: schedulerRaw,
-            approvalsRaw: approvalsRaw,
+            schedulerIssues: schedulerIssues,
+            pendingApprovals: pendingApprovals,
             dataRoot: dataRoot
         )
         live.append(contentsOf: deskOpportunities(
@@ -144,22 +142,16 @@ public enum NativeAgentScheduledProactiveScan {
 
     private static func liveOpportunities(
         inboxRows: [JSONValue],
-        schedulerRaw: JSONValue,
-        approvalsRaw: JSONValue,
+        schedulerIssues: [ScheduledJob],
+        pendingApprovals: Int,
         dataRoot: URL
-    ) -> [Opportunity] {
+    ) throws -> [Opportunity] {
         var opportunities: [Opportunity] = []
 
-        let actionableInbox = inboxRows.filter { row in
-            guard case .object(let obj) = row else { return false }
-            return isAttentionWorthyInboxBacklogItem(obj)
-        }
+        let actionableInbox = try InboxItemRecord.latest(in: inboxRows).filter(\.isAttentionWorthyBacklogItem)
         if !actionableInbox.isEmpty {
             let id = stableID(kind: "inbox_digest", seed: "visible-unread-\(actionableInbox.count)")
-            let memberIDs = actionableInbox.compactMap { row -> String? in
-                guard case .object(let object) = row else { return nil }
-                return nonEmptyString(object["id"])
-            }
+            let memberIDs = actionableInbox.map(\.id)
             let relatedGroups: [JSONValue] = memberIDs.isEmpty ? [] : [.object([
                 "id": .string("digest-actionable-\(id)"),
                 "title": .string("Actionable inbox items"),
@@ -181,17 +173,8 @@ public enum NativeAgentScheduledProactiveScan {
             ))
         }
 
-        let schedulerIssues: [[String: JSONValue]]
-        if case .array(let rows) = schedulerRaw {
-            schedulerIssues = rows.compactMap { row in
-                guard case .object(let obj) = row else { return nil }
-                return isActionableSchedulerIssue(obj) ? obj : nil
-            }
-        } else {
-            schedulerIssues = []
-        }
         if !schedulerIssues.isEmpty {
-            let names = schedulerIssues.prefix(3).compactMap { nonEmptyString($0["name"]) }
+            let names = schedulerIssues.prefix(3).map(\.name)
             let id = stableID(kind: "scheduler_health", seed: names.joined(separator: "|") + "|\(schedulerIssues.count)")
             opportunities.append(Opportunity(
                 id: id,
@@ -208,16 +191,6 @@ public enum NativeAgentScheduledProactiveScan {
             ))
         }
 
-        let pendingApprovals: Int
-        if case .array(let rows) = approvalsRaw {
-            pendingApprovals = rows.filter { row in
-                guard case .object(let obj) = row else { return false }
-                let status = (nonEmptyString(obj["status"]) ?? "").lowercased()
-                return ["pending", "open", "requested", "waiting"].contains(status)
-            }.count
-        } else {
-            pendingApprovals = 0
-        }
         if pendingApprovals > 0 {
             let id = stableID(kind: "approval_backlog", seed: "pending-\(pendingApprovals)")
             opportunities.append(Opportunity(
@@ -313,46 +286,6 @@ public enum NativeAgentScheduledProactiveScan {
         return formatter.string(from: updated)
     }
 
-    private static func isAttentionWorthyInboxBacklogItem(_ obj: [String: JSONValue]) -> Bool {
-        let status = (nonEmptyString(obj["status"]) ?? "unread").lowercased()
-        guard status == "unread" else { return false }
-
-        let source = nonEmptyString(obj["source"]) ?? ""
-        guard source != "scheduled_proactive_scan",
-              !source.hasPrefix("proactive_autonomy:") else {
-            return false
-        }
-
-        let severity = (nonEmptyString(obj["severity"]) ?? "info").lowercased()
-        if ["actionable", "critical"].contains(severity) { return true }
-
-        if nonEmptyString(obj["related_approval_id"]) != nil ||
-            nonEmptyString(obj["related_mission_id"]) != nil {
-            return true
-        }
-
-        return hasUsefulAction(obj["actions"])
-    }
-
-    private static func hasUsefulAction(_ raw: JSONValue?) -> Bool {
-        guard case .array(let actions)? = raw else { return false }
-        let passive = Set(["view", "read", "archive", "dismiss"])
-        return actions.contains { value in
-            guard case .object(let obj) = value,
-                  let id = nonEmptyString(obj["id"])?.lowercased() else {
-                return false
-            }
-            return !passive.contains(id)
-        }
-    }
-
-    private static func isActionableSchedulerIssue(_ obj: [String: JSONValue]) -> Bool {
-        guard SchedulerJobRuntime.bool(obj["enabled"], default: true) else { return false }
-        let status = (nonEmptyString(obj["lastRunStatus"]) ?? "").lowercased()
-        guard status == "error" else { return false }
-        return true
-    }
-
     private static func latestByID(_ opportunities: [Opportunity]) -> [Opportunity] {
         var order: [String] = []
         var latest: [String: Opportunity] = [:]
@@ -405,15 +338,6 @@ public enum NativeAgentScheduledProactiveScan {
             .joined()
             .prefix(12)
         return "opp-\(sourceComponent(kind))-\(digest)"
-    }
-
-    private static func int(_ raw: JSONValue?, default defaultValue: Int) -> Int {
-        switch raw {
-        case .int(let value): return Int(value)
-        case .double(let value): return Int(exactly: value.rounded(.towardZero)) ?? defaultValue
-        case .string(let value): return Int(value) ?? defaultValue
-        default: return defaultValue
-        }
     }
 
     private static func nonEmptyString(_ raw: JSONValue?) -> String? {

@@ -10,10 +10,11 @@ source "$ROOT/script/lib/provisioning_profile_contract.sh"
 source "$ROOT/script/lib/development_bundle_signing.sh"
 source "$ROOT/script/lib/development_bundle_validation.sh"
 source "$ROOT/script/lib/build_source_inventory.sh"
+source "$ROOT/script/lib/embedding_model_contract.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 APP_LOG="$ROOT/.runtime/nativeagent-app.log"
-# Modes: (default) build+sign+launch · --verify build+sign+test-launch+quit ·
+# Modes: (default) build+sign+launch ·
 # --logs launch+tail · --build-only build+sign ONLY (no kill, no launch —
 # install_app.sh uses this so the running app stays untouched until the new
 # bundle is fully proven).
@@ -24,10 +25,10 @@ for arg in "$@"; do
     --force-checkout-switch)
       FORCE_CHECKOUT_SWITCH=1
       ;;
-    --verify|--logs|--build-only)
+    --logs|--build-only)
       if [[ -n "$MODE" ]]; then
         echo "[build_and_run.sh] ERROR: too many arguments: $*" >&2
-        echo "Usage: ./script/build_and_run.sh [--verify|--logs|--build-only] [--force-checkout-switch]" >&2
+        echo "Usage: ./script/build_and_run.sh [--logs|--build-only] [--force-checkout-switch]" >&2
         exit 2
       fi
       MODE="$arg"
@@ -36,7 +37,7 @@ for arg in "$@"; do
       # Fail loud on typos: an unknown flag must not silently fall through to
       # the default kill+launch path (--build-only is a downtime-safety mode).
       echo "[build_and_run.sh] ERROR: unknown argument: $arg" >&2
-      echo "Usage: ./script/build_and_run.sh [--verify|--logs|--build-only] [--force-checkout-switch]" >&2
+      echo "Usage: ./script/build_and_run.sh [--logs|--build-only] [--force-checkout-switch]" >&2
       exit 2
       ;;
   esac
@@ -64,7 +65,7 @@ if ! command -v xcodegen >/dev/null 2>&1; then
   echo "[build_and_run.sh] ERROR: xcodegen is required; install it with: brew install xcodegen" >&2
   exit 1
 fi
-swift "$ROOT/script/generate_turn_part_versions.swift" --repo "$ROOT"
+# Turn upgrades consume the committed table; regeneration is a maintainer step.
 ruby "$ROOT/script/sync_build_declarations.rb"
 xcodegen --spec "$ROOT/project.yml"
 
@@ -79,7 +80,12 @@ NATIVEAGENT_ICLOUD_CONTAINER_ID="${NATIVEAGENT_ICLOUD_CONTAINER_ID:-iCloud.io.gi
 NATIVEAGENT_MOBILE_SOURCE_KEY="${NATIVEAGENT_MOBILE_SOURCE_KEY:-mobile_app}"
 NATIVEAGENT_BACKGROUND_TASK_PREFIX="${NATIVEAGENT_BACKGROUND_TASK_PREFIX:-io.github.embwl0x.nativeagent}"
 NATIVEAGENT_DEVICE_SYNC="${NATIVEAGENT_DEVICE_SYNC:-cloudkit}"
-NATIVEAGENT_RELEASE_PAGE_URL="${NATIVE_AGENT_RELEASE_PAGE_URL:-${NATIVEAGENT_RELEASE_PAGE_URL:-https://github.com/embwl0x/native-agent/releases}}"
+NATIVEAGENT_RELEASE_PAGE_URL="${NATIVEAGENT_RELEASE_PAGE_URL:-https://github.com/embwl0x/native-agent/releases}"
+
+# Select the product and signing contract before the one compile. The ordinary
+# local product is the host app; embedding a widget is an explicit selection.
+trap '[[ -z "${NATIVEAGENT_SIGNING_WORK:-}" ]] || rm -rf "$NATIVEAGENT_SIGNING_WORK"' EXIT
+nativeagent_prepare_development_signing "$ROOT" "$NATIVEAGENT_MAC_BUNDLE_ID" "[sign]"
 
 mkdir -p "$ROOT/.runtime" "$ROOT/dist"
 
@@ -90,29 +96,21 @@ mkdir -p "$ROOT/.runtime" "$ROOT/dist"
 # an older vector space through the existing epoch mechanism.
 EMBEDDING_MODEL_DIR="${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}"
 case "${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}" in
-  separate-download) EMBEDDING_MODEL_DIR=/dev/null; NATIVEAGENT_SKIP_EMBEDDING_FETCH=1 ;;
+  separate-download) EMBEDDING_MODEL_DIR=/dev/null ;;
   bundled) ;;
   *) echo '[build_and_run.sh] ERROR: embedding distribution must be separate-download or bundled' >&2; exit 2 ;;
 esac
-# This dev bundle's data root is $ROOT/data (REPO_PATH stamp). A model already
-# installed there (data/extras/coreml) outranks any bundle copy at runtime, so
-# a second 600+ MB copy in the bundle would never load: leave it out. Same
-# manifest as the one the bundle would carry = the runtime validates both
-# alike, so the copy could never win. (A launch with NATIVE_AGENT_DATA_ROOT
-# elsewhere reads that root's extras.)
-DATA_MODEL_DIR="$ROOT/data/extras/coreml"
-data_model_file() { plutil -extract "$1" raw -o - "$DATA_MODEL_DIR/embedding.json" 2>/dev/null; }
-if [[ -z "${NATIVEAGENT_EMBEDDING_MODEL_DIR:-}" ]] &&
-   cmp -s "$DATA_MODEL_DIR/embedding.json" "$EMBEDDING_MODEL_DIR/embedding.json" &&
-   model_file="$(data_model_file model)" && vocab_file="$(data_model_file vocab)" &&
-   [[ -n "$model_file" && -e "$DATA_MODEL_DIR/$model_file" && ! -L "$DATA_MODEL_DIR/$model_file" &&
-      -n "$vocab_file" && -f "$DATA_MODEL_DIR/$vocab_file" && ! -L "$DATA_MODEL_DIR/$vocab_file" ]]; then
-  echo "[embedding] data/extras/coreml holds the model this install loads; not copying it into the bundle"
-  EMBEDDING_MODEL_DIR=/dev/null
-# First build on a fresh checkout: fetch the model from the repository's model
-# release unless told not to. A failed fetch leaves semantic search fail-closed.
-elif [[ ! -f "$EMBEDDING_MODEL_DIR/embedding.json" && "${NATIVEAGENT_SKIP_EMBEDDING_FETCH:-0}" != "1" ]]; then
-  "$ROOT/script/fetch_embedding_model.sh" || echo "[embedding] bge-large-en-v1.5 fetch failed; memory search will fail closed unless the data root already has bge"
+# Bundled builds require their own complete model, independent of a user's
+# mutable data root. The assembly owner validates the manifest and resources.
+if [[ "${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}" == bundled && ! -f "$EMBEDDING_MODEL_DIR/embedding.json" ]]; then
+  NATIVEAGENT_EMBEDDING_MODEL_DIR="$EMBEDDING_MODEL_DIR" "$ROOT/script/fetch_embedding_model.sh"
+fi
+if [[ "${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}" == bundled ]]; then
+  nativeagent_require_embedding_model "$EMBEDDING_MODEL_DIR"
+else
+  [[ -r "${NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST:-}" ]] || {
+    echo '[embedding] separate-download requires NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST' >&2; exit 1;
+  }
 fi
 
 # NATIVEAGENT_BUILD_CONFIG=release installs an optimized binary (the speed of the
@@ -133,7 +131,7 @@ esac
 # overrides reach it as build settings (they outrank the xcconfig defaults).
 # Xcode does not sign here: nativeagent_sign_development_bundle below is the
 # one signing owner, so local/NativeAgent.xcconfig signing settings and
-# NATIVE_AGENT_ADHOC cannot disagree with it.
+# the selected signing mode cannot disagree with it.
 # Development builds consume the reviewed dependency pins; deliberate updates
 # belong in an explicit package-update workflow. The running app is not
 # touched until the POINT OF NO RETURN below (DOWNTIME GUARD 2026-07-02).
@@ -146,6 +144,8 @@ xcodebuild -quiet \
   ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
   DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
   NATIVEAGENT_MAC_BUNDLE_ID="$NATIVEAGENT_MAC_BUNDLE_ID" \
+  NATIVEAGENT_MAC_WIDGET_BUNDLE_ID="${NATIVEAGENT_MAC_WIDGET_BUNDLE_ID:-$NATIVEAGENT_MAC_BUNDLE_ID.widget}" \
+  NATIVEAGENT_MAC_APP_GROUP_ID="${NATIVEAGENT_MAC_APP_GROUP_ID:-group.$NATIVEAGENT_MAC_BUNDLE_ID}" \
   NATIVEAGENT_ICLOUD_CONTAINER_ID="$NATIVEAGENT_ICLOUD_CONTAINER_ID" \
   NATIVEAGENT_MOBILE_SOURCE_KEY="$NATIVEAGENT_MOBILE_SOURCE_KEY" \
   NATIVEAGENT_BACKGROUND_TASK_PREFIX="$NATIVEAGENT_BACKGROUND_TASK_PREFIX" \
@@ -173,7 +173,7 @@ rm -rf "$BUNDLE"
 # Sweep the staging dir on any exit; cleared after the swap below (once the
 # mv lands, $BUNDLE is reassigned to the final path — this trap must be gone
 # by then or it would delete the freshly installed bundle).
-trap 'rm -rf "$ROOT/dist/.$APP_NAME.app.staging.$$"' EXIT
+trap 'rm -rf "$ROOT/dist/.$APP_NAME.app.staging.$$" "$NATIVEAGENT_SIGNING_WORK"' EXIT
 ditto "$BUILT_APP" "$BUNDLE"
 if [[ -d "$BUNDLE/Contents/Resources/embedding" ]]; then
   echo "[embedding] staged $(basename "$EMBEDDING_MODEL_DIR") ($(du -sh "$BUNDLE/Contents/Resources/embedding" | cut -f1))"
@@ -184,6 +184,7 @@ nativeagent_assert_no_python_artifacts "$BUNDLE" "[swift-native]" staged app
 
 # Sign the finished development bundle before either launch or installation.
 nativeagent_sign_development_bundle "$BUNDLE" "$ROOT" "$NATIVEAGENT_MAC_BUNDLE_ID" "[sign]"
+rm -rf "$NATIVEAGENT_SIGNING_WORK"
 
 # ─── POINT OF NO RETURN ─────────────────────────────────────────────────────
 # The staged bundle is built, signed, and codesign-verified. Only now do we
@@ -228,22 +229,12 @@ JAVASCRIPT
   pkill -9 -fx "$APP_PROCESS_PATTERN" 2>/dev/null || true
 fi
 
-# Swap with rollback: move the old dist bundle aside instead of rm -rf'ing
-# it, so a failed mv can't leave dist/ empty (with the app already killed in
-# the non---build-only modes, that would be exactly the downtime this change
-# exists to prevent). None of the vars referenced in the trap are reassigned
-# before the trap is cleared.
+# Retain the prior artifact until the selected bundle lands. A failed move
+# reports both paths for forward repair; it never restores a prior version.
 BUNDLE_OLD="$BUNDLE_FINAL.old.$$"
 rm -rf "$BUNDLE_OLD"
-# Arm the combined trap BEFORE the old bundle is moved aside (no window where
-# only the staging-sweep trap covers a half-done swap), and restore FIRST —
-# a failed sweep must not be able to skip the restore under set -e.
 trap '
-  if [ -d "$BUNDLE_OLD" ] && [ ! -d "$BUNDLE_FINAL" ]; then
-    echo "[build_and_run.sh] mid-swap failure — restoring previous dist bundle" >&2
-    mv "$BUNDLE_OLD" "$BUNDLE_FINAL"
-  fi
-  rm -rf "$ROOT/dist/.$APP_NAME.app.staging.$$" || true
+  echo "[build_and_run.sh] incomplete promotion: selected staging bundle at $BUNDLE; previous artifact at $BUNDLE_OLD" >&2
 ' EXIT
 if [[ -d "$BUNDLE_FINAL" ]]; then
   mv "$BUNDLE_FINAL" "$BUNDLE_OLD"
@@ -259,31 +250,6 @@ case "$MODE" in
     # no process was killed and nothing is launched. The installer owns the
     # quit → swap → relaunch sequence after proving its own signed copy.
     echo "Built + signed $BUNDLE (--build-only: no kill, no launch)"
-    ;;
-  --verify)
-    _verify_cleanup() {
-      pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1 || return 0
-      osascript - "$BUNDLE" <<'APPLESCRIPT' >/dev/null 2>&1 || true
-on run argv
-  tell application (item 1 of argv) to quit
-end run
-APPLESCRIPT
-      pkill -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1 || true
-    }
-    trap '_verify_cleanup' EXIT
-    trap 'exit 1' INT TERM
-    if ! NATIVE_AGENT_SKIP_LOGIN_ITEM_REGISTER=1 /usr/bin/open -n "$BUNDLE"; then
-      echo "[build_and_run.sh] ERROR: failed to launch $BUNDLE" >&2
-      exit 1
-    fi
-    sleep 2
-    if ! pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1; then
-      echo "[build_and_run.sh] ERROR: $BUNDLE is not running after launch" >&2
-      exit 1
-    fi
-    echo "Verified $APP_NAME launched OK"
-    _verify_cleanup
-    trap - EXIT INT TERM
     ;;
   --logs)
     /usr/bin/open -n "$BUNDLE"

@@ -11,7 +11,7 @@ import PersistenceCore
 import CoreML
 #endif
 
-// Blueprint: | `MemoryV2+Embedding.swift` | Embedding provider contracts and `CoreMLEmbeddingProvider`: real-model loading, artifact epochs, bounded compiled-model storage, fail-closed availability, one batch prediction per embed call |
+// Blueprint: | `MemoryV2+Embedding.swift` | Embedding provider contracts and `CoreMLEmbeddingProvider`: real-model loading, artifact epochs, bounded compiled-model storage, fail-closed availability, one batch prediction with per-text normalization outcomes; complete-vector callers receive indexed failures |
 
 // MARK: - Embedding framework + on-disk store + Swift recaller
 //
@@ -29,29 +29,21 @@ public protocol EmbeddingProvider: Sendable {
     var embeddingEpoch: MemoryEmbeddingEpoch { get }
     func embed(_ texts: [String]) async throws -> [[Float]]
     func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch
+    func embedItemsWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingItemBatch
     /// Search queries, in the same space as the stored text they are scored
     /// against. Never for text that is stored.
     func embedQueriesWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch
 }
 
 public extension EmbeddingProvider {
+    func embedItemsWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingItemBatch {
+        let batch = try await embedWithEpoch(texts)
+        return MemoryEmbeddingItemBatch(epoch: batch.epoch, items: batch.vectors.map { .vector($0) })
+    }
+
     /// A symmetric model embeds a query like any other text.
     func embedQueriesWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
         try await embedWithEpoch(texts)
-    }
-
-    var embeddingEpoch: MemoryEmbeddingEpoch {
-        MemoryEmbeddingEpoch(
-            backend: modelId,
-            modelID: modelId,
-            modelArtifactDigest: "provider-defined-identity-unavailable",
-            tokenizerArtifactDigest: "provider-defined-identity-unavailable",
-            preprocessing: "provider-defined",
-            pooling: "provider-defined",
-            normalization: "provider-defined",
-            dimensions: dimensions,
-            maximumSequenceLength: nil
-        )
     }
 
     func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
@@ -143,7 +135,8 @@ public struct FailClosedEmbeddingProvider: EmbeddingProvider {
 
 // MARK: - CoreMLEmbeddingProvider
 //
-// Require a loaded Core ML model and WordPiece vocabulary; inference failures and unusable output throw.
+// Require a loaded Core ML model and vocabulary; shared inference failures
+// throw, while corpus convergence retains each unusable prediction's outcome.
 public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
     public static let allowedModelExtensions: Set<String> = ["mlpackage", "mlmodelc", "mlmodel"]
     // Share the artifact digest independently of each provider's epoch parameters.
@@ -152,22 +145,27 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     /// Cheap change detector for an installed extras model: every file under
     /// the package plus the manifest and vocab, as relative path, size and
     /// modification time.
-    private static func extrasFingerprint(_ installed: InstalledExtrasModel) -> String {
+    private static func extrasFingerprint(_ installed: InstalledExtrasModel) throws -> String {
         let fm = FileManager.default
-        func stamp(_ url: URL, relativeTo base: URL) -> String {
-            let attrs = (try? fm.attributesOfItem(atPath: url.path)) ?? [:]
-            let size = (attrs[.size] as? NSNumber)?.int64Value ?? -1
-            let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+        func stamp(_ url: URL, relativeTo base: URL) throws -> String {
+            let attrs = try fm.attributesOfItem(atPath: url.path)
+            guard let size = (attrs[.size] as? NSNumber)?.int64Value,
+                  let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 else {
+                throw EmbeddingError.invalidModelURL(reason: "Artifact size or modification time unavailable: \(url.path)")
+            }
             let rel = NativeAgentWorkspaceRoot.relativePath(url.path, under: base.path).map { $0.isEmpty || base.path == "/" ? $0 : "/" + $0 } ?? url.path
             return "\(rel)|\(size)|\(mtime)"
         }
-        var lines: [String] = [stamp(installed.vocabURL, relativeTo: installed.modelURL.deletingLastPathComponent()),
-                               stamp(installed.modelURL.deletingLastPathComponent().appendingPathComponent("embedding.json"),
+        var lines: [String] = [try stamp(installed.vocabURL, relativeTo: installed.modelURL.deletingLastPathComponent()),
+                               try stamp(installed.modelURL.deletingLastPathComponent().appendingPathComponent("embedding.json"),
                                      relativeTo: installed.modelURL.deletingLastPathComponent())]
-        if let e = fm.enumerator(at: installed.modelURL, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]) {
-            for case let file as URL in e { lines.append(stamp(file, relativeTo: installed.modelURL)) }
+        let attrs = try fm.attributesOfItem(atPath: installed.modelURL.path)
+        if attrs[.type] as? FileAttributeType == .typeDirectory {
+            for path in try fm.subpathsOfDirectory(atPath: installed.modelURL.path) {
+                lines.append(try stamp(installed.modelURL.appendingPathComponent(path), relativeTo: installed.modelURL))
+            }
         } else {
-            lines.append(stamp(installed.modelURL, relativeTo: installed.modelURL))
+            lines.append(try stamp(installed.modelURL, relativeTo: installed.modelURL))
         }
         return installed.modelURL.path + "\n" + lines.sorted().joined(separator: "\n")
     }
@@ -217,7 +215,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             throw EmbeddingError.modelNotFound(path: modelURL.path)
         }
         let modelArtifactDigest: String
-        let fingerprint = vocabURL.map { Self.extrasFingerprint(InstalledExtrasModel(
+        let fingerprint = try vocabURL.map { try Self.extrasFingerprint(InstalledExtrasModel(
             modelURL: modelURL, vocabURL: $0, modelID: modelId, dimensions: dimensions)) }
         let cachedDigest = Self.cachedExtrasEpoch.withLock { $0.flatMap { $0.fingerprint == fingerprint ? $0.digest : nil } }
         if let cachedDigest {
@@ -238,55 +236,29 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         )
 
         #if canImport(CoreML) && !os(Linux)
-        // Compile .mlpackage inputs into the durable cache before loading.
-        // A package load failure wipes that cache and recompiles once; retain the final cause.
-        var loadedModel: MLModel?
-        var loadFailure: Error?
+        // The cache owner loads the compiled artifact before serving it.
+        // A failed load reports that artifact; only explicit repair removes it.
         let configuration = Self.modelConfiguration()
         do {
-            let urlToLoad: URL
             if ext == "mlpackage" {
-                urlToLoad = try Self.compileAndCache(
+                self.mlModel = try Self.loadCompiledModel(
                     packageURL: modelURL,
-                    artifactDigest: modelArtifactDigest
+                    artifactDigest: modelArtifactDigest,
+                    configuration: configuration
                 )
             } else {
-                urlToLoad = modelURL
+                self.mlModel = try MLModel(contentsOf: modelURL, configuration: configuration)
             }
-            loadedModel = try MLModel(contentsOf: urlToLoad, configuration: configuration)
         } catch {
-            loadFailure = error
-            if ext == "mlpackage" {
-                Self.wipeCompileCache(packageURL: modelURL)
-                do {
-                    let recompiled = try Self.compileAndCache(
-                        packageURL: modelURL,
-                        artifactDigest: modelArtifactDigest
-                    )
-                    loadedModel = try MLModel(contentsOf: recompiled, configuration: configuration)
-                    loadFailure = nil
-                } catch {
-                    loadFailure = error
-                }
-            }
+            throw EmbeddingError.modelNotLoaded(reason: "\(modelURL.path): \(error)")
         }
-        var loadedTokenizer: WordPieceTokenizer?
-        if let vurl = vocabURL, FileManager.default.fileExists(atPath: vurl.path) {
-            do {
-                loadedTokenizer = try WordPieceTokenizer(vocabURL: vurl)
-            } catch {
-                loadFailure = error
-            }
+        guard let vocabURL else {
+            throw EmbeddingError.modelNotLoaded(reason: "WordPiece vocabulary was not configured for \(modelURL.path).")
         }
-        guard let loadedModel, let loadedTokenizer else {
-            let underlying = loadFailure.map { " Underlying: \(String(describing: $0))" } ?? ""
-            let missing = (loadedModel == nil ? "MLModel" : "WordPiece vocab")
-            throw EmbeddingError.modelNotLoaded(
-                reason: "CoreMLEmbeddingProvider could not load \(missing) at \(modelURL.path).\(underlying)"
-            )
+        do { self.tokenizer = try WordPieceTokenizer(vocabURL: vocabURL) }
+        catch {
+            throw EmbeddingError.modelNotLoaded(reason: "WordPiece vocabulary \(vocabURL.path): \(error)")
         }
-        self.mlModel = loadedModel
-        self.tokenizer = loadedTokenizer
         #else
         throw EmbeddingError.modelNotLoaded(reason: "Core ML is unavailable on this platform.")
         #endif
@@ -328,51 +300,53 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     }
 
     #if canImport(CoreML) && !os(Linux)
-    /// Remove the package's compiled cache under its cross-process lock.
-    public static func wipeCompileCache(packageURL: URL) {
-        let base = packageURL.deletingPathExtension().lastPathComponent
-        let root = compileCacheRoot()
-        let modelRoot = root
-            .appendingPathComponent(base, isDirectory: true)
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        try? withCompileCacheLock(cacheRoot: root) {
-            try? FileManager.default.removeItem(at: modelRoot)
+    /// Explicit repair removes only this source artifact's current OS cache.
+    public static func wipeCompileCache(packageURL: URL) throws {
+        let root = try compileCacheRoot()
+        let cached = try compileCacheDirectory(packageURL: packageURL,
+            artifactDigest: modelArtifactDigest(modelURL: packageURL))
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try withCompileCacheLock(cacheRoot: root) {
+            if FileManager.default.fileExists(atPath: cached.path) {
+                try FileManager.default.removeItem(at: cached)
+            }
         }
     }
     #endif
 
     #if canImport(CoreML) && !os(Linux)
-    /// Publish a durable digest/OS-keyed .mlmodelc atomically under a cross-process lock.
-    static func compileAndCache(
+    /// Load exactly once at its durable path under the cache's cross-process
+    /// lock. A failed artifact remains named for explicit repair, never served.
+    static func loadCompiledModel(
         packageURL: URL,
         artifactDigest: String,
+        configuration: MLModelConfiguration,
         cacheRoot overrideRoot: URL? = nil,
         osKey overrideOSKey: String? = nil
-    ) throws -> URL {
+    ) throws -> MLModel {
         let fm = FileManager.default
-        let root = overrideRoot ?? compileCacheRoot()
-        let cacheDir = compileCacheDirectory(
+        let root = try overrideRoot ?? compileCacheRoot()
+        let cacheDir = try compileCacheDirectory(
             packageURL: packageURL,
             artifactDigest: artifactDigest,
             cacheRoot: overrideRoot,
             osKey: overrideOSKey
         ).deletingLastPathComponent()
-        let cached = compileCacheDirectory(
+        let cached = try compileCacheDirectory(
             packageURL: packageURL,
             artifactDigest: artifactDigest,
             cacheRoot: overrideRoot,
             osKey: overrideOSKey
         )
 
-        try? fm.createDirectory(at: root, withIntermediateDirectories: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
         return try withCompileCacheLock(cacheRoot: root) {
             try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
             if fm.fileExists(atPath: cached.path) {
-                retainCurrentAndNewest(in: cacheDir, keeping: cached, maximumEntries: 2) { $0.pathExtension == "mlmodelc" }
-                retainCurrentAndNewest(in: cacheDir.deletingLastPathComponent(), keeping: cacheDir, maximumEntries: 1) {
-                    (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+                do { return try MLModel(contentsOf: cached, configuration: configuration) }
+                catch {
+                    throw EmbeddingError.modelNotLoaded(reason: "Compiled artifact \(cached.path) failed to load: \(error). Repair this artifact through Doctor.")
                 }
-                return cached
             }
 
             let compiled = try MLModel.compileModel(at: packageURL)
@@ -381,21 +355,18 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
                 isDirectory: true
             )
             defer { try? fm.removeItem(at: staging) }
-            do {
-                try fm.moveItem(at: compiled, to: staging)
-            } catch {
-                try fm.copyItem(at: compiled, to: staging)
-                try? fm.removeItem(at: compiled)
-            }
-            if fm.fileExists(atPath: cached.path) {
-                try? fm.removeItem(at: cached)
-            }
+            try fm.moveItem(at: compiled, to: staging)
             try fm.moveItem(at: staging, to: cached)
+            let model: MLModel
+            do { model = try MLModel(contentsOf: cached, configuration: configuration) }
+            catch {
+                throw EmbeddingError.modelNotLoaded(reason: "Compiled artifact \(cached.path) failed to load: \(error). Repair this artifact through Doctor.")
+            }
             retainCurrentAndNewest(in: cacheDir, keeping: cached, maximumEntries: 2) { $0.pathExtension == "mlmodelc" }
             retainCurrentAndNewest(in: cacheDir.deletingLastPathComponent(), keeping: cacheDir, maximumEntries: 1) {
                 (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
             }
-            return cached
+            return model
         }
     }
 
@@ -404,19 +375,18 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         artifactDigest: String,
         cacheRoot overrideRoot: URL? = nil,
         osKey overrideOSKey: String? = nil
-    ) -> URL {
+    ) throws -> URL {
         let base = packageURL.deletingPathExtension().lastPathComponent
         let osKey = sanitizedCacheComponent(overrideOSKey ?? operatingSystemCacheKey())
         let digest = sanitizedCacheComponent(artifactDigest)
-        return (overrideRoot ?? compileCacheRoot())
+        return try (overrideRoot ?? compileCacheRoot())
             .appendingPathComponent(base, isDirectory: true)
             .appendingPathComponent(osKey, isDirectory: true)
             .appendingPathComponent("\(digest).mlmodelc", isDirectory: true)
     }
 
-    static func compileCacheRoot(fileManager: FileManager = .default) -> URL {
-        let base = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+    static func compileCacheRoot(fileManager: FileManager = .default) throws -> URL {
+        let base = try fileManager.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
         return base
             .appendingPathComponent(InstallPaths.current.name("NativeAgent"), isDirectory: true)
             .appendingPathComponent("coreml-compiled-v2", isDirectory: true)
@@ -515,6 +485,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     /// A present but unusable manifest throws immediately. With neither copy,
     /// fail by name and path, exactly as for a broken install.
     public static func installedExtrasModel(root: URL?) throws -> InstalledExtrasModel {
+        _ = try EmbeddingModelDownload.configuredDescriptor()
         if let root,
            let installed = try extrasModel(inDirectory: root
                .appendingPathComponent("extras", isDirectory: true)
@@ -579,7 +550,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     public static func bundledEmbeddingEpoch(extrasRoot: URL? = nil) throws -> MemoryEmbeddingEpoch {
         let installed = try installedExtrasModel(root: extrasRoot)
         // Invalidate on recursive file stamps, including manifest and vocabulary changes.
-        let fingerprint = extrasFingerprint(installed)
+        let fingerprint = try extrasFingerprint(installed)
         let cached = cachedExtrasEpoch.withLock { $0.flatMap { $0.fingerprint == fingerprint ? $0 : nil } }
         if let epoch = cached?.epoch { return epoch }
         let digest = try cached?.digest ?? modelArtifactDigest(modelURL: installed.modelURL)
@@ -614,16 +585,22 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     }
 
     public func embed(_ texts: [String]) async throws -> [[Float]] {
-        try await embed(texts.map { tokenizer.encode($0, maxLength: maxSeqLength) })
+        try await embedItemsWithEpoch(texts).requireVectors()
+    }
+
+    public func embedItemsWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingItemBatch {
+        let items = try await embed(texts.map { tokenizer.encode($0, maxLength: maxSeqLength) })
+        return MemoryEmbeddingItemBatch(epoch: embeddingEpoch, items: items)
     }
 
     func embedCompleteTexts(_ texts: [String]) async throws -> [[Float]]? {
         let encoded = texts.map { tokenizer.encode($0, maxLength: maxSeqLength) }
         guard encoded.allSatisfy({ $0.isComplete }) else { return nil }
-        return try await embed(encoded)
+        let items = try await embed(encoded)
+        return try MemoryEmbeddingItemBatch(epoch: embeddingEpoch, items: items).requireVectors()
     }
 
-    private func embed(_ encoded: [(inputIds: [Int], attentionMask: [Int], isComplete: Bool)]) async throws -> [[Float]] {
+    private func embed(_ encoded: [(inputIds: [Int], attentionMask: [Int], isComplete: Bool)]) async throws -> [MemoryEmbeddingItem] {
         #if canImport(CoreML) && !os(Linux)
         // Predict every text in one call as a single batch.
         var inputs: [MLFeatureProvider] = []
@@ -658,7 +635,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         guard outputs.count == inputs.count else {
             throw EmbeddingError.modelNotLoaded(reason: "CoreML returned \(outputs.count) predictions for \(inputs.count) inputs")
         }
-        var results: [[Float]] = []
+        var results: [MemoryEmbeddingItem] = []
         results.reserveCapacity(encoded.count)
         for index in 0..<outputs.count {
             let out = outputs.features(at: index)
@@ -666,7 +643,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             // Take the first multiarray output and mean-pool over the token
             // dimension when shape is [1, seq, dim]; if it's already [1, dim]
             // (pooled output), use it as-is.
-            var pooled: [Float]? = nil
+            var pooled: MemoryEmbeddingItem? = nil
             for name in out.featureNames {
                 guard let val = out.featureValue(for: name), let arr = val.multiArrayValue else { continue }
                 pooled = Self.meanPoolAndNormalize(arr, mask: mask, dim: dimensions)
@@ -685,13 +662,13 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     }
 
     #if canImport(CoreML) && !os(Linux)
-    private static func meanPoolAndNormalize(_ arr: MLMultiArray, mask: [Int], dim: Int) -> [Float]? {
+    private static func meanPoolAndNormalize(_ arr: MLMultiArray, mask: [Int], dim: Int) -> MemoryEmbeddingItem? {
         let shape = arr.shape.map { $0.intValue }
         // Case 1: [1, dim] or [dim] — already pooled.
         if shape == [1, dim] || shape == [dim] {
             var out = [Float](repeating: 0, count: dim)
             for i in 0..<dim { out[i] = arr[i].floatValue }
-            return l2norm(out)
+            return normalizedItem(out)
         }
         // Case 2: [1, seq, dim] — mean-pool over seq using attention mask.
         if shape.count == 3, shape[0] == 1, shape[2] == dim {
@@ -708,17 +685,25 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
                 }
             }
             if denom > 0 { for d in 0..<dim { sum[d] /= denom } }
-            return l2norm(sum)
+            return normalizedItem(sum)
         }
         // Reject unexpected output shapes rather than constructing an unusable vector.
         return nil
     }
 
-    private static func l2norm(_ v: [Float]) -> [Float] {
-        var sumsq: Float = 0
-        for x in v { sumsq += x * x }
-        let n = sumsq > 0 ? sqrtf(sumsq) : 1
-        return v.map { $0 / n }
+    private static func l2norm(_ v: [Float]) throws -> [Float] {
+        try VectorMath.requireUsable(v)
+        let norm = v.reduce(0.0) { $0 + Double($1) * Double($1) }.squareRoot()
+        let normalized = v.map { Float(Double($0) / norm) }
+        try VectorMath.requireUsable(normalized, dimensions: v.count)
+        return normalized
+    }
+
+    /// Only normalization of this prediction is item-scoped. Missing output,
+    /// wrong output shape and failed batch inference remain shared failures.
+    private static func normalizedItem(_ vector: [Float]) -> MemoryEmbeddingItem {
+        do { return .vector(try l2norm(vector)) }
+        catch { return .unembeddable(reason: error.localizedDescription) }
     }
     #endif
 }

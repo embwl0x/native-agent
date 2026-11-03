@@ -7,6 +7,15 @@ The `grok-bot` row in `AgentHostDirectory` uses the installed app with bundle ID
 
 Use `app {"action":"agent.connect","args":{"agent":"Grok Bot"}}`.
 Sign in to Grok Bot and grant NativeAgent Accessibility access if required.
+Desktop replies use the Accessibility transcript. If that read is unavailable,
+the reply retains its existing partial text and names the blocker and recipe
+repair; it does not capture a screenshot or use OCR as another reader.
+Every desktop reply observation ends at its existing three-minute reply
+deadline, including when Accessibility notifications are supported. An
+unconfirmed answer remains partial, its receipt names the deadline, and any
+later answer stays in the Grok chat. Nothing is resent. Submission and reply
+correlation share whitespace normalization that preserves punctuation and emoji;
+a punctuation-only or emoji-only accepted message retains its identity.
 Foreground setup, desktop sends and foreground restoration use the Mac hands'
 measured app activation, shared with their window raise. App activation does not
 read AX windows, so restoration to NativeAgent retains the self-AX fence.
@@ -99,13 +108,27 @@ nativeagent-link reply --contact <UUID>
 It supplies `{"message_id":"…","text":"…"}` on stdin. The helper reads its
 credential from Keychain and sends the contact bearer over loopback. The saved
 pending record chooses the destination, not the reply body.
+The conversation journal binds the outbound `message_id` to a separately
+generated internal operation UUID. A supplied protocol ID is preserved exactly;
+without one, the send owner generates it once. The contact transcript uses the
+operation UUID; the pending request and webhook use the bound protocol ID.
+An exact send's saved approval carries the original arguments, including that
+message ID. Approval resumption uses the same send and settlement function as a
+direct send, retaining its read locator and replacing the approval-waiting state
+with the actual result. Replies and history correlation read the journal binding.
+Retained Grok requests whose protocol ID was their operation UUID remain readable
+through one Grok-only binding reader while those saved exchanges exist.
 Grok's credential authorizes correlated replies through `POST /agent/grok-reply`
 and conversations through `/agent/mcp`, with verified peer authorship under
 peer Trust, including Trust → Connected agents. Control routes, direct tool
 access and HTTP/gRPC A2A remain excluded.
 
-`GrokInboundReply` claims the request, saves the answer and settles the exact
-conversation exchange. If Agent's waiting turn already took the answer, it
+`GrokRequestStore` claims the request, persists the full correlated answer and
+its pending handover in one durable transition. A failed write leaves it
+claimable; an identical webhook replay keeps the saved handover intact.
+`GrokInboundReply` projects that saved answer onto the exact conversation
+exchange, repeating only this projection after a failed response or restart.
+If Agent's waiting turn already took the answer, it
 does not start a second turn; otherwise the answer is handed into the initiating
 chat with peer authorship. A person-initiated quiet send settles without waking
 Agent.

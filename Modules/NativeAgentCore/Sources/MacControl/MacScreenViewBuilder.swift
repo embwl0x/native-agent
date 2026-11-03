@@ -214,7 +214,7 @@ public enum MacScreenViewBuilder {
         let names = LabelIndex(nodes)
         for (index, candidate) in kept.enumerated() {
             let attributes = candidate.node.attributes
-            let named = inferLabel(for: candidate.node, frame: candidate.frame, in: names)
+            let named = inferLabel(for: candidate.node, in: names)
             let label = named.label
             let enclosing = MacScreenViewTextRedaction.enclosingKinds(
                 forNodeAt: candidate.frame,
@@ -250,6 +250,8 @@ public enum MacScreenViewBuilder {
                 frame: candidate.frame,
                 path: candidate.node.path,
                 actions: attributes.actions,
+                actionsUnreadable: attributes.actionsUnreadable,
+                attributeGaps: attributes.attributeGaps,
                 settableAttributes: settableAttributes(candidate.node),
                 enclosingCaption: enclosing,
                 labelRedaction: redaction(label, under: nil),
@@ -262,62 +264,27 @@ public enum MacScreenViewBuilder {
             offscreen: offscreen
         )
     }
-    /// Give every numbered control a NAME, and say where the name came from.
-    ///
-    /// The legend must support action on its own: use the control's own name,
-    /// else the text immediately left of or above it, with inferred names labeled.
-    ///
-    /// The inference is deliberately narrow and deterministic — nearest static
-    /// text within 240 points, on the same row (vertically overlapping) or
-    /// directly above with horizontal overlap, closest wins, path order breaks
-    /// ties — and it is always LABELLED as an inference, because a guessed name
-    /// presented as a fact is how a confident click lands on the wrong control.
-    /// The texts that can name a control, indexed once per node set: children
-    /// by parent path, and nameable text by 240-point cell, so naming every
-    /// control of a dense window costs its neighbourhood, not the whole tree.
-    /// Cells are read within the 2^16-point span any display can sit in.
+    /// Retain observed ownership when naming a numbered control.
+    /// Names come from the control or its owned descendants, never proximity.
+    /// Children are indexed once by parent path for bounded caption reads.
     public struct LabelIndex: Sendable {
         let nodes: [MacAXNode]
         let children: [[Int]: [Int]]
-        let cells: [SIMD2<Int>: [Int]]
         public init(_ nodes: [MacAXNode]) {
             var children: [[Int]: [Int]] = [:]
-            var cells: [SIMD2<Int>: [Int]] = [:]
             for (index, node) in nodes.enumerated() {
                 if !node.path.isEmpty { children[Array(node.path.dropLast()), default: []].append(index) }
-                // A scroll bar's thumb reads as a raw position (0.4012…), never a name.
-                guard textRoles.contains(node.attributes.role),
-                      !scrollPositionRoles.contains(node.attributes.role),
-                      let text = node.attributes.title ?? node.attributes.value,
-                      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                      let frame = node.attributes.frame, frame.w > 0, frame.h > 0 else { continue }
-                for cell in Self.cells(frame) { cells[cell, default: []].append(index) }
             }
             self.nodes = nodes
             self.children = children
-            self.cells = cells
-        }
-        static func cells(_ frame: MacAXFrame) -> [SIMD2<Int>] {
-            guard [frame.x, frame.y, frame.w, frame.h].allSatisfy(\.isFinite) else { return [] }
-            func cell(_ v: Double) -> Int { Int((min(max(v, -65_536), 65_536) / 240).rounded(.down)) }
-            return (cell(frame.y)...cell(frame.y + frame.h)).flatMap { y in
-                (cell(frame.x)...cell(frame.x + frame.w)).map { SIMD2(x: $0, y: y) }
-            }
-        }
-        /// Every nameable text that could sit left of or above `frame` within
-        /// reach; one spanning several cells comes once per cell, which the
-        /// nearest-wins rule does not mind.
-        func neighbours(of frame: MacAXFrame) -> [MacAXNode] {
-            Self.cells(MacAXFrame(x: frame.x - 241, y: frame.y - 241, w: frame.w + 242, h: frame.h + 242))
-                .flatMap { (cells[$0] ?? []).map { nodes[$0] } }
         }
     }
     public static func inferLabel(
         for node: MacAXNode,
-        frame: MacAXFrame,
         in index: LabelIndex
     ) -> (label: String?, source: String) {
         let nodes = index.nodes
+        if node.attributes.labelUnreadable { return (nil, "unreadable") }
         if let title = node.attributes.title, !title.isEmpty { return (title, "title") }
         // A popup button / checkbox often carries its meaning in its value.
         if !isSecretField(role: node.attributes.role, subrole: node.attributes.subrole, label: nil),
@@ -349,20 +316,6 @@ public enum MacScreenViewBuilder {
                 return (text, "descendant_text")
             }
         }
-        var best: (text: String, distance: Double, path: [Int])?
-        for candidate in index.neighbours(of: frame) {
-            // Only nameable text is indexed (see `LabelIndex`).
-            guard let text = candidate.attributes.title ?? candidate.attributes.value,
-                  let other = candidate.attributes.frame else { continue }
-            guard let distance = MacScreenViewTextRedaction.labelDistance(other, forValueAt: frame, proximity: 240) else { continue }
-            if let current = best,
-               !(distance < current.distance
-                 || (distance == current.distance && MacPerceptionCompiler.pathIsBefore(candidate.path, current.path))) {
-                continue
-            }
-            best = (text.trimmingCharacters(in: .whitespacesAndNewlines), distance, candidate.path)
-        }
-        if let best { return (best.text, "nearby_text") }
         return (nil, "none")
     }
     /// A scroll bar and its thumb: their value is a position, not a name.

@@ -19,7 +19,7 @@ extension CapabilityLifecycle {
             return NativeAgentWorkspaceRoot.relativePath(path, under: store) != nil
                 || NativeAgentWorkspaceRoot.relativePath(store, under: path) != nil
         }
-        let abilities = [dataRoot, libraryAppSupportFallback(appBundleIdentifier: canonicalPublicBundleIdentifier)]
+        let abilities = [dataRoot, applicationSupportDataRoot(appBundleIdentifier: canonicalPublicBundleIdentifier)]
             .flatMap { root in Store.allCases.map { $0.directory(in: root) } + [root.appendingPathComponent("abilities")] }
         if abilities.contains(where: reaches) || protectedStores.contains(where: { reaches(dataRoot.appendingPathComponent($0)) })
             || reaches(personaRoot ?? PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)) {
@@ -112,7 +112,7 @@ extension CapabilityLifecycle {
             }
             if let original = fields["builtIn"] { fields["builtIn"] = abilityContents(original) }
             for field in ["uses", "useCount", "lastUsedAt", "lastRunVersion", "lastRun",
-                          "lastCleanCode", "lastCleanVersion", "runs"] { fields.removeValue(forKey: field) }
+                          "lastCleanVersion", "runs"] { fields.removeValue(forKey: field) }
             return .object(fields)
         default: return value
         }

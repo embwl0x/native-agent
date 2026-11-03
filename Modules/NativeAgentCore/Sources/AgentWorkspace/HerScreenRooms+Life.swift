@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import ChatSessionWork
+import Transcripts
 // Blueprint: | `HerScreenRooms+Life.swift` | Native Music target bindings, status/unavailable evidence and rendering; playback narration, track/playlist curation and action labels are removed to `workspace-readout.js`; `lifeRoom` presents a failed nested Music readback with its full cause while retaining the original control receipt on its separate DONE line; `lifePulse`, `opening`; `HerItemPages` caches text without read-side peer lists |
 
 /// Music opens by name like any place (`music`).

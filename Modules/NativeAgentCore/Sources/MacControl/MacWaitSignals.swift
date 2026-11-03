@@ -13,8 +13,8 @@ import AppKit
 /// deadline. NSWorkspace publishes exactly this, so it is the second
 /// subscription rather than a reason to keep polling.
 public protocol MacAppActivationObserverSource: Sendable {
-    /// `nil` when no activation observer could be installed — which the caller
-    /// REPORTS (it falls back to the coarse re-check), never hides.
+    /// `nil` when no activation observer could be installed; the wait refuses
+    /// with its subscription failure instead of selecting another mechanism.
     func install(
         onActivation: @escaping @Sendable () -> Void
     ) -> (any MacAXEffectObservation)?
@@ -88,6 +88,7 @@ public final class MacWaitSignals: @unchecked Sendable {
 
     /// Whether AX observation is installed; activation alone cannot observe in-window changes.
     public let isObserving: Bool
+    public let installationFailure: String?
 
     public init(
         effects: any MacAXEffectObserverSource,
@@ -102,9 +103,14 @@ public final class MacWaitSignals: @unchecked Sendable {
                 onNotification: { sink.record($0) }
             )
         }
+        let installedActivation = activationSource.install(onActivation: { sink.signal() })
         self.effects = installedEffects
-        self.activation = activationSource.install(onActivation: { sink.signal() })
+        self.activation = installedActivation
         self.isObserving = installedEffects != nil
+        self.installationFailure = pid == nil ? "The screen read did not establish an app process to observe."
+            : installedEffects == nil ? "Accessibility change observation could not be installed for this app."
+            : installedActivation == nil ? "App activation observation could not be installed."
+            : nil
     }
 
     /// Anything since the last call? Drains both channels.

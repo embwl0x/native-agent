@@ -18,7 +18,7 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
-// Blueprint: | `SwiftToolDispatcher+DeskPlans.swift` | `SwiftToolDispatcher`: Desk plan construction; stable-handle reuse, validated batch-position dependencies, ordered child writes and explicit partial-write reporting |
+// Blueprint: | `SwiftToolDispatcher+DeskPlans.swift` | `SwiftToolDispatcher`: Desk plan construction through locked create-or-reuse, validated batch-position dependencies, ordered child writes and retained identity/operation receipts on partial writes or failed readback |
 
 extension SwiftToolDispatcher {
     /// Create or extend a parent with ordered children, dependency edges and defer dates.
@@ -102,8 +102,12 @@ extension SwiftToolDispatcher {
 
         let store = deskStore()
         let parentHandle: String
+        let parentAlias: String
         let project: String
         var reusedParent = false
+        // Receipts retain identities returned by writes, independent of readback.
+        var committed: [JSONValue] = []
+        var committedOperations: [JSONValue] = []
         let parentRaw = optionalString(input, "parent")?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let parentRaw, !parentRaw.isEmpty {
             // Graft mode: attach the new sub-items to an existing item.
@@ -112,6 +116,7 @@ extension SwiftToolDispatcher {
             guard let parentItem = state.items.first(where: { $0.handle == parentHandle }) else {
                 throw deskInvalid("parent", reason: "desk_breakdown: parent '\(parentRaw)' is not live")
             }
+            parentAlias = parentItem.alias
             project = parentItem.project
         } else {
             let proj = try deskString(input, "project").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -126,19 +131,17 @@ extension SwiftToolDispatcher {
                     reason: "desk_breakdown: unknown kind '\(kindRaw ?? "")' — one of \(DeskKind.allCases.map(\.rawValue).joined(separator: ", "))")
             }
             let summary = optionalString(input, "summary")?.trimmingCharacters(in: .whitespacesAndNewlines)
-            // Reuse an equivalent live campaign and add only its missing steps.
-            let same = SwiftNativeDeskStore.equivalentDeskText
-            if let existing = try await store.liveState().topLevel.first(where: {
-                !$0.status.isTerminal && $0.kind == kind && same($0.project) == same(proj) && same($0.title) == same(title)
-            }) {
-                parentHandle = existing.handle
-                reusedParent = true
-            } else {
-                parentHandle = try await store.createItem(
-                    kind: kind, project: proj, title: title,
-                    parent: nil, summary: (summary?.isEmpty == false) ? summary : nil
-                ).handle
-            }
+            let result = try await store.createOrReuseEquivalentItem(
+                kind: kind, project: proj, title: title,
+                parent: nil, summary: (summary?.isEmpty == false) ? summary : nil
+            )
+            parentHandle = result.item.handle
+            parentAlias = result.item.alias
+            reusedParent = result.reusedEquivalent
+            committed.append(.object([
+                "handle": .string(result.item.handle), "alias": .string(result.item.alias),
+                "reused": .bool(result.reusedEquivalent), "role": .string("parent"),
+            ]))
             project = proj
         }
 
@@ -147,40 +150,39 @@ extension SwiftToolDispatcher {
         var planLines: [String] = []
         // Reused steps keep their handles; finish their requested setup too.
         var reusedSteps: Set<Int> = []
-        let openSteps = reusedParent
-            ? try await store.liveState().children(of: parentHandle).filter { !$0.status.isTerminal } : []
-        func partial(_ reason: String) async -> JSONValue {
-            let state = try? await store.liveState()
-            let parentAlias = state?.items.first { $0.handle == parentHandle }?.alias ?? parentHandle
+        func partial(_ reason: String) -> JSONValue {
             return .object([
                 "status": .string("partial"),
                 "reason": .string(reason),
                 "parent": .string(parentAlias),
+                "handle": .string(parentHandle),
+                "committed": .array(committed),
+                "committed_operations": .array(committedOperations),
                 "created": .array(planLines.map { .string($0) }),
             ])
         }
         for (idx, spec) in specs.enumerated() {
-            if let open = openSteps.first(where: {
-                SwiftNativeDeskStore.equivalentDeskText($0.title) == SwiftNativeDeskStore.equivalentDeskText(spec.title)
-            }) {
-                createdHandles.append(open.handle)
-                reusedSteps.insert(idx)
-                continue
-            }
             do {
-                let child = try await store.createItem(
+                let result = try await store.createOrReuseEquivalentItem(
                     kind: .plan, project: project, title: spec.title,
                     parent: parentHandle, summary: spec.summary
                 )
+                let child = result.item
                 createdHandles.append(child.handle)
-                planLines.append("\(child.alias) \(spec.title)")
+                committed.append(.object([
+                    "handle": .string(child.handle), "alias": .string(child.alias),
+                    "reused": .bool(result.reusedEquivalent), "role": .string("child"),
+                    "position": .int(Int64(idx + 1)),
+                ]))
+                if result.reusedEquivalent { reusedSteps.insert(idx) }
+                else { planLines.append("\(child.alias) \(spec.title)") }
             } catch {
-                return await partial("creating child \(idx + 1) '\(spec.title)': \(error.localizedDescription)")
+                return partial("creating child \(idx + 1) '\(spec.title)': \(error.localizedDescription)")
             }
         }
         let wiringState: DeskState
         do { wiringState = try await store.liveState() }
-        catch { return await partial("reading created plan: \(error.localizedDescription)") }
+        catch { return partial("reading created plan: \(error.localizedDescription)") }
         for (idx, spec) in specs.enumerated() {
             if !spec.blockedOn.isEmpty {
                 var blockers: [String] = []
@@ -192,28 +194,31 @@ extension SwiftToolDispatcher {
                             blockers.append(try resolveDeskRef(token, in: wiringState, field: "children.\(idx).blocked_on"))
                         }
                     }
-                    _ = try await store.setBlockedOn(createdHandles[idx], blockers: blockers)
+                    let op = try await store.setBlockedOn(createdHandles[idx], blockers: blockers)
+                    committedOperations.append(op.toJSON())
                 } catch let e as DeskError {
-                    return await partial("wiring child \(idx + 1) blockers: \(e.errorDescription ?? "\(e)")")
+                    return partial("wiring child \(idx + 1) blockers: \(e.errorDescription ?? "\(e)")")
                 } catch {
-                    return await partial("wiring child \(idx + 1) blockers: \(error.localizedDescription)")
+                    return partial("wiring child \(idx + 1) blockers: \(error.localizedDescription)")
                 }
             }
             if let until = spec.deferUntil {
                 do {
-                    _ = try await store.setDeferUntil(createdHandles[idx], until: until)
+                    let op = try await store.setDeferUntil(createdHandles[idx], until: until)
+                    committedOperations.append(op.toJSON())
                 } catch let e as DeskError {
-                    return await partial("deferring child \(idx + 1): \(e.errorDescription ?? "\(e)")")
+                    return partial("deferring child \(idx + 1): \(e.errorDescription ?? "\(e)")")
                 } catch {
-                    return await partial("deferring child \(idx + 1): \(error.localizedDescription)")
+                    return partial("deferring child \(idx + 1): \(error.localizedDescription)")
                 }
             }
         }
 
         // The numbered plan + what's actionable right now, aliases only.
-        let state = try await store.liveState()
+        let state: DeskState
+        do { state = try await store.liveState() }
+        catch { return partial("final plan readback unavailable: \(error.localizedDescription). The committed identities are retained; read them before repeating this call.") }
         let plan = DeskSequencing.compute(state)
-        let parentAlias = state.items.first { $0.handle == parentHandle }?.alias ?? parentHandle
         let byHandle = Dictionary(state.items.map { ($0.handle, $0) }, uniquingKeysWith: { first, _ in first })
         var lines: [String] = []
         let addedHandles = createdHandles.enumerated().filter { !reusedSteps.contains($0.offset) }.map(\.element)
@@ -230,6 +235,8 @@ extension SwiftToolDispatcher {
                 "status": .string("existing"),
                 "parent": .string(parentAlias),
                 "handle": .string(parentHandle),
+                "committed": .array(committed),
+                "committed_operations": .array(committedOperations),
                 "plan": .array(lines.map { .string($0) }),
                 "ready_now": .array(readyNow.map { .string($0) }),
                 "confirmation": .string("campaign \(parentAlias) already live · added \(addedHandles.count) missing step(s), \(reusedSteps.count) already open"),
@@ -239,6 +246,8 @@ extension SwiftToolDispatcher {
             "status": .string("ok"),
             "parent": .string(parentAlias),
             "handle": .string(parentHandle),
+            "committed": .array(committed),
+            "committed_operations": .array(committedOperations),
             "plan": .array(lines.map { .string($0) }),
             "ready_now": .array(readyNow.map { .string($0) }),
             "confirmation": .string("campaign \(parentAlias) · \(createdHandles.count) sub-items · ready now: \(readyNow.isEmpty ? "none" : readyNow.joined(separator: ", "))"),

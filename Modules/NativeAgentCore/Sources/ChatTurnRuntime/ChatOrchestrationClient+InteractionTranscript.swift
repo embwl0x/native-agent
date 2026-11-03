@@ -2,6 +2,8 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import Experiences
+import CryptoKit
 import TurnTrace
 import Transcripts
 import TrustCenter
@@ -10,9 +12,10 @@ import MacControl
 import MacIntegration
 import CognitiveSubstrate
 import ChatToolRuntime
+import ChatTurnContracts
 import ChatToolParsing
 import ToolRegistry
-// Blueprint: | `ChatOrchestrationClient+InteractionTranscript.swift` | `SwiftNativeChatOrchestrationClient`: tool/approval/card rows, same-row CAS, supersession and exact replay witnesses; one shared durable append and receipt redaction policy |
+// Blueprint: | `ChatOrchestrationClient+InteractionTranscript.swift` | `SwiftNativeChatOrchestrationClient`: tool/approval/card rows, same-row CAS and exact replay witnesses; one locked append reuses open asks by tool and subject within a conversation; shared receipt redaction policy |
 
 extension SwiftNativeChatOrchestrationClient {
     /// Tool results are live-turn data, not durable context. Persist only a
@@ -27,6 +30,7 @@ extension SwiftNativeChatOrchestrationClient {
         sessionId: String,
         runId: String?,
         toolName: String,
+        invocationID: String,
         input: JSONValue,
         ranCall: (tool: String, input: [String: JSONValue])?,
         result: JSONValue,
@@ -82,8 +86,8 @@ extension SwiftNativeChatOrchestrationClient {
             record["content"] = .string(asked)
         }
         // Persist card display state on its tool row; native owners retain authority over the underlying need.
-        let raisedInteraction = InlineInteractionNeed.interaction(in: originalResult)
-            .map { Self.scrubbedCardDisplay($0) }
+        let requestedInteraction = InlineInteractionNeed.interaction(in: originalResult)
+        let raisedInteraction = requestedInteraction.map { Self.scrubbedCardDisplay($0) }
         var stampedInteraction: InlineInteraction?
         let origin = TurnEnvelope.current(surface: messageSource)
         var metadata: [String: JSONValue] = [
@@ -95,6 +99,7 @@ extension SwiftNativeChatOrchestrationClient {
                         : ChatTranscriptToolMessageKind.approvalPending
             ),
             "toolName": .string(toolName),
+            "toolInvocationId": .string(invocationID),
             "inputJSON": .string(safeInputJSON),
             "resultSummary": .string(safeResultSummary),
             "ok": .bool(ok),
@@ -107,7 +112,7 @@ extension SwiftNativeChatOrchestrationClient {
             let raw = try JSONValue.object(ranCall.input).serialize(pretty: false)
             let safe = Self.redactedPersistedToolInput(tool: ranCall.tool, json: raw)
             metadata["ranCall"] = .object(["tool": .string(ranCall.tool),
-                "input": (try? JSONValue.parse(Data(safe.utf8))) ?? .object([:])])
+                "input": try JSONValue.parse(Data(safe.utf8))])
         }
         // What its generations made, a list's and a script's included, kept before the body is bounded.
         let generated = ChatGeneratedImageArtifacts.generatedImages(ranTool, ranCall?.input ?? canonicalRiskInput, originalResult)
@@ -139,6 +144,7 @@ extension SwiftNativeChatOrchestrationClient {
         }
         metadata["receiptEvidence"] = evidence
         if let raisedInteraction {
+            metadata["choiceSubject"] = try requestedInteraction.flatMap { try Self.choiceSubject($0) }
             // Runtime-stamped identity locates the exact blocked call; redacted receipt text never becomes replay arguments.
             var stamped = raisedInteraction
             if stamped.continuation == nil {
@@ -186,7 +192,7 @@ extension SwiftNativeChatOrchestrationClient {
         record["metadata"] = .object(metadata)
         let toolRow: JSONValue = .object(record)
         try await Self.appendTranscriptRow(
-            toolRow, to: path, interaction: stampedInteraction)
+            toolRow, to: path)
         if stampedInteraction != nil {
             NotificationCenter.default.post(name: InlineInteractionWire.changedNotification, object: sessionId)
         }
@@ -194,6 +200,7 @@ extension SwiftNativeChatOrchestrationClient {
             sessionId: sessionId,
             runId: runId,
             toolName: ranTool,
+            invocationID: invocationID,
             resultSummary: safeResultSummary,
             ok: ok,
             cognitiveResult: cognitiveResult,
@@ -229,13 +236,16 @@ extension SwiftNativeChatOrchestrationClient {
         }
     }
 
-    package static func inlineInteraction(in row: JSONValue, lifeID: String? = nil) -> InlineInteraction? {
+    package static func checkedInlineInteraction(in row: JSONValue, lifeID: String? = nil) throws -> InlineInteraction? {
         guard case .object(let object) = row,
               case .object(let metadata)? = object["metadata"],
-              case .string(InlineInteractionWire.transcriptKind)? = metadata["kind"],
-              let raw = metadata[InlineInteractionWire.metadataKey]
+              case .string(InlineInteractionWire.transcriptKind)? = metadata["kind"]
         else { return nil }
-        guard var card = InlineInteractionNeed.decode(raw) else { return nil }
+        guard let raw = metadata[InlineInteractionWire.metadataKey] else {
+            throw InlineInteractionResolveError.noControl("The saved interaction card has no interaction payload. Repair its transcript row.")
+        }
+        var card = try InlineInteractionWire.decoder().decode(InlineInteraction.self,
+            from: raw.serializedData(pretty: false))
         if let lifeID, let continuation = card.continuation,
            DataRootLife.life(of: continuation.lifeID) != lifeID,
            [.waiting, .claimed, .replaying, .stopped].contains(continuation.state) {
@@ -262,9 +272,16 @@ extension SwiftNativeChatOrchestrationClient {
             }
             var rows = read.rows
             guard let index = rows.firstIndex(where: {
-                inlineInteraction(in: $0)?.id == interaction.id
+                guard case .object(let row) = $0,
+                      case .object(let metadata)? = row["metadata"],
+                      metadata["kind"] == .string(InlineInteractionWire.transcriptKind),
+                      case .object(let raw)? = metadata[InlineInteractionWire.metadataKey] else { return false }
+                return raw["id"] == .string(interaction.id)
             }) else { throw InlineInteractionResolveError.notFound }
-            if let expected, let persisted = inlineInteraction(in: rows[index]) {
+            guard let persisted = try checkedInlineInteraction(in: rows[index], lifeID: lifeID) else {
+                throw InlineInteractionResolveError.notFound
+            }
+            if let expected {
                 guard persisted.revision == expected else {
                     throw InlineInteractionResolveError.staleRevision(
                         expected: expected, actual: persisted.revision
@@ -272,12 +289,9 @@ extension SwiftNativeChatOrchestrationClient {
                 }
             }
             if let expecting {
-                guard let onDisk = inlineInteraction(in: rows[index], lifeID: lifeID) else {
-                    throw InlineInteractionResolveError.notFound
-                }
-                guard expecting(onDisk) else {
+                guard expecting(persisted) else {
                     throw InlineInteractionResolveError.staleRevision(
-                        expected: interaction.revision, actual: onDisk.revision
+                        expected: interaction.revision, actual: persisted.revision
                     )
                 }
             }
@@ -289,7 +303,7 @@ extension SwiftNativeChatOrchestrationClient {
             }
             let envelope = inlineInteractionReceiptEnvelope(interaction)
             metadata["resultSummary"] = .string(
-                (try? envelope.serialize(pretty: false)) ?? ""
+                try envelope.serialize(pretty: false)
             )
             metadata["resultStatus"] = .string(interaction.state.name)
             metadata["resultClass"] = .string(
@@ -340,105 +354,136 @@ extension SwiftNativeChatOrchestrationClient {
         }
     }
 
-    /// Append tool/card rows with their interaction supersession transaction.
+    /// One open ask per conversation, originating tool and subject. The
+    /// duplicate check and append share the transcript lock, so simultaneous
+    /// re-asks return the same card without a second mirror or prompt.
     /// Transcript JSONL is locally backed up, excluded from production export,
     /// projected to the phone and listed by PrivacyMap's chat category.
-    package static func appendTranscriptRow(
-        _ row: JSONValue,
-        to path: URL,
-        interaction: InlineInteraction? = nil
-    ) async throws {
-        try await SwiftNativePersistenceCore.withFileLock(path) {
-            var appended = row
-            if let interaction {
-                // Supersession must succeed before the append. A running card
-                // keeps its continuation; the new duplicate goes quiet instead.
-                let running = try await supersedeOlderPending(
-                    matching: SupersedeKey(kind: interaction.kind, target: interaction.target,
-                                          mode: interaction.mode, id: interaction.id),
-                    in: path)
-                if running { appended = supersededRow(row, as: interaction) }
-            }
-            // Durable receipts retain the evidence of already executed effects.
-            try await ContactThread.append(appended, to: path)
+    package static func fileInlineInteraction(
+        _ interaction: InlineInteraction, sessionID: String, resumeText: String? = nil,
+        resumable: Bool = true, toolName: String? = nil, toolArgumentsJSON: String? = nil,
+        toolCallId: String? = nil, requestingTool: String? = nil,
+        origin: TurnEnvelope, dataRoot: URL
+    ) async throws -> InlineInteraction {
+        guard let safeSession = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else {
+            throw ChatOrchestrationError.underlying("invalid chat session id")
         }
+        var stamped = scrubbedCardDisplay(interaction)
+        if stamped.continuation == nil {
+            stamped.continuation = try InlineInteraction.Continuation.stamped(
+                for: stamped, sessionID: sessionID, originRunId: ChatTurnExecution.current?.historyRunID, toolCallId: toolCallId,
+                toolName: toolName, toolArgumentsJSON: toolArgumentsJSON,
+                mode: toolName == nil ? .continueTurn : .retryBlockedTool,
+                state: resumable ? .waiting : .invalidated, resumeText: resumeText,
+                peerSurface: origin.surface, originEnvelope: origin, dataRoot: dataRoot)
+        }
+        guard let encoded = InlineInteractionNeed.encode(stamped) else {
+            throw ChatOrchestrationError.underlying("The interaction card could not be encoded; no card was filed.")
+        }
+        let envelope = inlineInteractionReceiptEnvelope(stamped)
+        var metadata: [String: JSONValue] = [
+            "kind": .string(InlineInteractionWire.transcriptKind),
+            "toolName": .string(requestingTool ?? toolName ?? InlineInteractionWire.toolName),
+            "inputJSON": .string("{}"), "resultSummary": .string(try envelope.serialize(pretty: false)),
+            "resultStatus": .string(stamped.state.name), "ok": .bool(false),
+            InlineInteractionWire.metadataKey: encoded, "interactionId": .string(stamped.id),
+            "envelope": origin.persistedMetadata(),
+        ]
+        metadata["choiceSubject"] = try choiceSubject(interaction)
+        let row: JSONValue = .object([
+            "id": .string(UUID().uuidString.lowercased()), "sessionId": .string(sessionID),
+            "role": .string("tool"), "content": .string(""),
+            "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
+            "source": .string(origin.surface), "runId": .string(stamped.continuation?.resumeRunId ?? stamped.id),
+            "metadata": .object(metadata),
+        ])
+        let path = dataRoot.appendingPathComponent("chat/messages/\(safeSession).jsonl")
+        guard let retained = try await appendTranscriptRow(row, to: path) else {
+            throw ChatOrchestrationError.underlying("The interaction append returned no card.")
+        }
+        return retained
     }
 
-    /// What makes two asks the SAME ask: the kind of thing needed, the thing
-    /// it is needed for, and the axis asked for. Not the wording, and not the
-    /// tool that happened to hit it.
-    private struct SupersedeKey: Sendable {
-        let kind: InlineInteraction.Kind
-        let target: String
-        let mode: InlineInteraction.AccessMode?
-        /// The new card's own id, so a re-persist can never supersede itself.
-        let id: String
-    }
-
-    /// Mark every older still-PENDING copy of this ask superseded, in place.
-    /// Called under the transcript's own file lock, immediately before the new
-    /// row is appended, so there is no window in which two live cards exist.
-    ///
-    /// Returns true when an older copy was left alone because it is `.running`
-    /// — a control is open on it and its continuation is live. The caller's own
-    /// new row is the one that goes quiet in that case.
     @discardableResult
-    private static func supersedeOlderPending(
-        matching key: SupersedeKey,
-        in path: URL
-    ) async throws -> Bool {
-        // Only asks with canonical targets supersede; unrelated choices remain independent.
-        guard key.kind != .choose else { return false }
-        // A failed transcript read must not masquerade as absence of older cards.
-        let (read, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
-        guard report.isClean else {
-            throw ChatOrchestrationError.underlying("The conversation contains unreadable rows. Its cards were not changed.")
-        }
-        var rows = read
-        var changed = false
-        var sawRunning = false
-        for index in rows.indices {
-            guard case .object(var object) = rows[index],
-                  case .object(var metadata)? = object["metadata"],
-                  case .string(InlineInteractionWire.transcriptKind)? = metadata["kind"],
-                  let raw = metadata[InlineInteractionWire.metadataKey],
-                  let existing = InlineInteractionNeed.decode(raw),
-                  existing.id != key.id,
-                  existing.state.isOpen,
-                  existing.kind == key.kind,
-                  existing.target == key.target,
-                  existing.mode == key.mode
-            else { continue }
-            // `.isOpen` is pending OR running, and the two are not the same
-            // thing to supersede: running means a tap already happened.
-            if case .running = existing.state {
-                sawRunning = true
-                continue
+    package static func appendTranscriptRow(_ row: JSONValue, to path: URL) async throws -> InlineInteraction? {
+        let lifeID: String?
+        if row.objectValue?["metadata"]?.objectValue?["kind"] == .string(InlineInteractionWire.transcriptKind) {
+            lifeID = try DataRootLife.current(in: path.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent())
+        } else { lifeID = nil }
+        return try await SwiftNativePersistenceCore.withFileLock(path) { () async throws -> InlineInteraction? in
+            let incoming = try checkedInlineInteraction(in: row, lifeID: lifeID)
+            if let incoming {
+                let read = try await SwiftNativePersistenceCore.readJSONLReporting(path)
+                guard read.report.isClean else {
+                    throw PersistenceCoreError.ioFailure("This conversation has damaged rows. No new card was filed.")
+                }
+                func tool(_ card: InlineInteraction, _ row: JSONValue) -> String? {
+                    card.continuation?.toolName ?? row.objectValue?["metadata"]?.objectValue?["toolName"]?.stringValue
+                }
+                func retainReceipt(pointingTo card: InlineInteraction) async throws {
+                    guard case .object(var receipt) = row,
+                          case .object(var metadata)? = receipt["metadata"],
+                          metadata["toolInvocationId"] != nil else { return }
+                    // Keep the dispatch receipt without minting another card.
+                    metadata["kind"] = .string(ChatTranscriptToolMessageKind.toolUse)
+                    metadata.removeValue(forKey: InlineInteractionWire.metadataKey)
+                    metadata["interactionId"] = .string(card.id)
+                    receipt["metadata"] = .object(metadata)
+                    try await ContactThread.append(.object(receipt), to: path)
+                }
+                for (index, prior) in read.rows.enumerated().reversed() {
+                    let card: InlineInteraction
+                    do {
+                        guard let decoded = try checkedInlineInteraction(in: prior, lifeID: lifeID) else { continue }
+                        card = decoded
+                    } catch {
+                        // An unreadable card cannot establish ask identity. Keep its
+                        // bytes and one row-owned repair while matching its siblings.
+                        let rowID = prior.objectValue?["id"]?.stringValue ?? "row-\(index + 1)"
+                        let operation = "interaction-row:" + path.path + ":" + rowID
+                        let dataRoot = path.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                        RepairOwed.owe(dataRoot, id: operation, kind: .run,
+                            operation: operation, owner: path.path + " row " + rowID,
+                            words: "Saved interaction row \(rowID) is unreadable and was skipped when matching asks: \(error.localizedDescription)",
+                            tap: ToolFailureError.fileRepairInstruction(path,
+                                shape: "Repair only interaction row \(rowID)'s payload to the current InlineInteraction contract, retaining its actual identity and continuation."))
+                        continue
+                    }
+                    if card.id == incoming.id {
+                        try await retainReceipt(pointingTo: card)
+                        return card
+                    }
+                    if card.state.isOpen,
+                       tool(card, prior) == tool(incoming, row),
+                       card.kind == incoming.kind,
+                       card.allTargets.sorted() == incoming.allTargets.sorted(),
+                       card.mode == incoming.mode, card.secret == incoming.secret,
+                       (card.kind != .choose || (row.objectValue?["metadata"]?.objectValue?["choiceSubject"] != nil
+                        && prior.objectValue?["metadata"]?.objectValue?["choiceSubject"] == row.objectValue?["metadata"]?.objectValue?["choiceSubject"])),
+                       card.options.sorted(by: { $0.id < $1.id }) == incoming.options.sorted(by: { $0.id < $1.id }) {
+                        try await retainReceipt(pointingTo: card)
+                        return card
+                    }
+                }
             }
-            rows[index] = supersededRow(rows[index], as: existing)
-            changed = true
+            try await ContactThread.append(row, to: path)
+            return incoming
         }
-        if changed {
-            try ContactThread.replace(rows, to: path)
-        }
-        return sawRunning
     }
 
-    /// The same row, carrying the interaction already superseded — used for a
-    /// duplicate raised while an identical card is running.
-    private static func supersededRow(
-        _ row: JSONValue, as interaction: InlineInteraction
-    ) -> JSONValue {
-        let superseded = interaction.superseded()
-        guard case .object(var object) = row,
-              case .object(var metadata)? = object["metadata"],
-              let encoded = InlineInteractionNeed.encode(superseded)
-        else { return row }
-        metadata[InlineInteractionWire.metadataKey] = encoded
-        metadata["resultStatus"] = .string(superseded.state.name)
-        metadata["resultSummary"] = .string((try? inlineInteractionReceiptEnvelope(superseded).serialize(pretty: false)) ?? "")
-        object["metadata"] = .object(metadata)
-        return .object(object)
+    /// Match the whole authored question and options, before display redaction
+    /// and clipping can make different subjects look alike. Only its digest is saved.
+    private static func choiceSubject(_ card: InlineInteraction) throws -> JSONValue? {
+        guard card.kind == .choose else { return nil }
+        struct Subject: Encodable {
+            let question: String
+            let options: [InlineInteraction.Option]
+        }
+        let encoder = InlineInteractionWire.encoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let bytes = try encoder.encode(Subject(question: card.title,
+            options: card.options.sorted { $0.id < $1.id }))
+        return .string(SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined())
     }
 
     nonisolated static func redactedProgressEvent(_ event: TurnStreamEvent) -> TurnStreamEvent {

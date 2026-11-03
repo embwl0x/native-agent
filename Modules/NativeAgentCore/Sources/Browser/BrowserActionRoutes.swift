@@ -4,7 +4,7 @@ import PersistenceCore
 import Privacy
 import ApprovalInbox
 import NativeAgentShared
-// Blueprint: | `BrowserActionRoutes.swift` | `BrowserActionRoutes` struct; `observeBrowserMotorAction`, `runBrowser`, direct dry-run/cancel commands to the canonical operation store, task-local `retainRead` delivery of the exact visible read capture |
+// Blueprint: | `BrowserActionRoutes.swift` | Browser orchestration; previews return validated in-memory runs; every post-start page preflight/effect exit reaches settlement; malformed approval payloads throw to the checked approval owner; task-local `retainRead` delivers the exact visible read capture |
 
 /// Browser operation orchestration. The canonical reducer remains the sole
 /// owner of persisted transitions and derived native-action receipts.
@@ -39,23 +39,10 @@ public struct BrowserActionRoutes: Sendable {
         // Browser Core owns every canonical operation transition and derived
         // receipt. The app owns only the visible WKWebView effect adapter.
         if dryRun {
-            let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let parsed = try? ValidBrowserURL(trimmed) else {
-                throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
-                    NSLocalizedDescriptionKey: "Browser dry-run body was not handled by the Swift browser writer."
-                ])
-            }
-            let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
-            let result = try await browser.executeBrowserOperation(.start(.init(
-                id: UUID().uuidString, url: trimmed, domain: parsed.domain,
-                initialState: .dryRun
-            )))
-            guard let run = result.run else {
-                throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
-                    NSLocalizedDescriptionKey: "Browser dry-run body was not handled by the Swift browser writer."
-                ])
-            }
-            return try BrowserRun(row: run)
+            let parsed = try ValidBrowserURL(url)
+            return BrowserRun(id: UUID().uuidString.lowercased(), url: parsed.url.absoluteString,
+                domain: parsed.domain, status: "dry_run", dryRun: true, visible: true,
+                opened: false, createdAt: SwiftNativeBrowserClient.nowISO(Date()))
         }
         let runID = UUID().uuidString.lowercased()
         let run = try await executeVisibleBrowserRun(
@@ -144,7 +131,7 @@ public struct BrowserActionRoutes: Sendable {
             else if capture?.readFailures["capture"] != nil { status = "failed" }
         } catch is CancellationError { status = "canceled" }
         catch {
-            status = "failed"
+            status = Task.isCancelled || captureTask.isCancelled ? "canceled" : "failed"
             sourceReceipt["openError"] = .string(error.localizedDescription)
             if (error as? BrowserError)?.hasUnknownOutcome == true {
                 sourceReceipt["outcomeKind"] = .string("outcome_unknown")
@@ -241,33 +228,46 @@ public struct BrowserActionRoutes: Sendable {
         defer { BrowserActiveRunRegistry.shared.unregister(runID: runID, token: token) }
         let start = BrowserOperationStart(id: runID, url: parsed.url.absoluteString, domain: parsed.domain, initialState: .running)
         let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
-        _ = try await browser.executeBrowserOperation(.start(start))
-        let phase = try await browser.motorActionReadModel(actionId: runID)?.phase
+        let claim = try await browser.executeBrowserOperation(.start(start))
+        guard claim.didTransition else {
+            guard let run = claim.run else { throw BrowserOperationStoreError.runNotFound }
+            return run
+        }
         var receipt = detail
         receipt["action"] = .string(name)
         var state = BrowserOperationTerminalState.succeeded
+        var dispatched = false
+        var effectCompleted = false
         let task = Task { @MainActor in
-            guard phase == .running else { throw CancellationError() }
+            // No throwing work may escape between the canonical claim and
+            // this task's catch/settlement boundary, including the owner read.
+            let phase = try await browser.motorActionReadModel(actionId: runID)?.phase
+            if phase == .cancelled { throw CancellationError() }
+            guard phase == .running else { throw BrowserOperationStoreError.invalidTransition }
             guard effects.currentURL() == page else {
                 throw NSError(domain: "NativeAgentBrowser", code: 409, userInfo: [
                     NSLocalizedDescriptionKey: "The page changed before the \(name) could land; nothing was sent to it."
                 ])
             }
             try Task.checkCancellation()
+            dispatched = true
             try await effect()
         }
         latch.install { task.cancel() }
         // The caller's cancel reaches the effect the way navigation's does.
         do {
             try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+            effectCompleted = true
+            receipt["effectCompleted"] = .bool(true)
             if Task.isCancelled || task.isCancelled { state = .canceled }
         } catch is CancellationError { state = .canceled } catch {
-            state = .failed
+            state = Task.isCancelled || task.isCancelled ? .canceled : .failed
             receipt["error"] = .string(error.localizedDescription)
             if (error as? BrowserError)?.hasUnknownOutcome == true {
                 receipt["outcomeKind"] = .string("outcome_unknown")
             }
         }
+        if state == .canceled, dispatched, !effectCompleted { receipt["outcomeKind"] = .string("outcome_unknown") }
         // Settlement outlives the caller's cancellation, as for a navigation.
         let completion = BrowserOperationCompletion(
             id: runID, requestDigest: SwiftNativeBrowserClient.browserRequestDigest(for: start),
@@ -313,63 +313,46 @@ public struct BrowserActionRoutes: Sendable {
         }
     }
 
-    public func executeApprovedBrowserRun(from approval: ApprovalRecord, dataRoot: URL) async throws {
+    /// One checked identity read for execution, rejection and receipt repair.
+    public static func browserApprovalPayload(_ approval: ApprovalRecord) throws
+        -> (url: ValidBrowserURL, runID: String, fields: [String: JSONValue]) {
         guard case .object(let payload) = approval.payload,
               case .string(let rawURL)? = payload["url"],
-              case .string(let runID)? = payload["runId"] ?? payload["run_id"] else {
-            // Malformed payload: annotate FAILED so the approved record never
-            // reads as silently executed.
-            try? await effects.annotateApprovalExecution(
-                id: approval.id,
-                executedAction: .object([
-                    "action": .string(approval.action),
-                    "error": .string("malformed payload: missing url/runId"),
-                ]),
-                detail: "Browser navigation FAILED: malformed payload (missing url/runId)", dataRoot: dataRoot)
-            return
+              case .string(let rawID)? = payload["runId"] ?? payload["run_id"] else {
+            throw BrowserError.badRequest("Malformed browser approval: missing url/runId")
         }
-        do {
-            let captureSource = connectorInputBool(
-                payload["captureSource"] ?? payload["capture_source"],
-                default: false
-            )
-            let captureScreenshot = connectorInputBool(
-                payload["captureScreenshot"] ?? payload["capture_screenshot"],
-                default: false
-            )
-            let run = try await executeVisibleBrowserRun(
-                parsed: try ValidBrowserURL(rawURL),
-                runID: runID,
-                approvalId: approval.id,
-                captureSource: captureSource,
-                captureScreenshot: captureScreenshot,
-                dataRoot: dataRoot
-            )
-            let status = run.objectValue?["status"]?.stringValue ?? "succeeded"
-            try await effects.annotateApprovalExecution(id: approval.id, executedAction: run,
-                                                        detail: "Browser navigation \(status)", dataRoot: dataRoot)
-        } catch {
-            // Mirror the self_improvement pattern: never leave an approved
-            // record without an execution annotation when the executor threw.
-            nativeLog("[approvals] browser run failed for \(approval.id): \(error)")
-            try? await effects.annotateApprovalExecution(
-                id: approval.id,
-                executedAction: .object([
-                    "action": .string(approval.action),
-                    "error": .string("\(error)"),
-                ]),
-                detail: "Browser navigation FAILED: \(error.localizedDescription)", dataRoot: dataRoot)
-            throw error
+        let runID = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !runID.isEmpty, runID.utf8.count <= 200 else {
+            throw BrowserOperationStoreError.invalidIdentity
         }
+        return (try ValidBrowserURL(rawURL), runID, payload)
     }
 
-    public func finishRejectedBrowserRun(from approval: ApprovalRecord, status: String, dataRoot: URL) async throws {
-        guard case .object(let payload) = approval.payload,
-              case .string(let rawURL)? = payload["url"],
-              case .string(let runID)? = payload["runId"] ?? payload["run_id"],
-              let parsed = try? ValidBrowserURL(rawURL) else {
-            return
-        }
+    public func executeApprovedBrowserRun(from approval: ApprovalRecord, dataRoot: URL) async throws -> JSONValue {
+        let request = try Self.browserApprovalPayload(approval)
+        let payload = request.fields
+        let captureSource = connectorInputBool(
+            payload["captureSource"] ?? payload["capture_source"],
+            default: false
+        )
+        let captureScreenshot = connectorInputBool(
+            payload["captureScreenshot"] ?? payload["capture_screenshot"],
+            default: false
+        )
+        return try await executeVisibleBrowserRun(
+            parsed: request.url,
+            runID: request.runID,
+            approvalId: approval.id,
+            captureSource: captureSource,
+            captureScreenshot: captureScreenshot,
+            dataRoot: dataRoot
+        )
+    }
+
+    public func finishRejectedBrowserRun(from approval: ApprovalRecord, status: String, dataRoot: URL) async throws -> JSONValue {
+        let request = try Self.browserApprovalPayload(approval)
+        let parsed = request.url
+        let runID = request.runID
         let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
         let start = BrowserOperationStart(
             id: runID,
@@ -381,29 +364,24 @@ public struct BrowserActionRoutes: Sendable {
         let digest = SwiftNativeBrowserClient.browserRequestDigest(for: start)
         _ = try await browser.executeBrowserOperation(.start(start))
         let terminal: BrowserOperationTerminalState = status == "denied" ? .denied : .canceled
-        let result = try await browser.executeBrowserOperation(.complete(.init(
-            id: runID,
-            requestDigest: digest,
-            state: terminal,
-            opened: false,
-            sourceReceipt: .object([
-                "url": .string(parsed.url.absoluteString),
-                "decision": .string(status),
-            ])
-        )))
+        let settled = await settle { () -> Result<BrowserOperationCommandResult, Error> in
+            do {
+                return .success(try await browser.executeBrowserOperation(.complete(.init(
+                    id: runID, requestDigest: digest, state: terminal, opened: false,
+                    sourceReceipt: .object([
+                        "url": .string(parsed.url.absoluteString), "decision": .string(status),
+                    ])
+                ))))
+            } catch { return .failure(error) }
+        }
+        let result = try settled.get()
         guard let committed = result.run else {
             throw NSError(domain: "NativeAgentBrowser", code: 500, userInfo: [
                 NSLocalizedDescriptionKey: "Browser rejection returned no canonical run"
             ])
         }
-        let committedStatus = committed.objectValue?["status"]?.stringValue ?? status
-        try await effects.annotateApprovalExecution(
-            id: approval.id,
-            executedAction: committed,
-            detail: "Browser navigation \(committedStatus)",
-            dataRoot: dataRoot
-        )
         await observeBrowserMotorAction(runID: runID, dataRoot: dataRoot)
+        return committed
     }
 
     @MainActor

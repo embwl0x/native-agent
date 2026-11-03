@@ -48,7 +48,7 @@ import NativeAgentShared
 import Senses
 import ToolExecution
 import Studio
-// Blueprint: | `EngineComposition.swift` | Concrete runtime and background-work composition through the existing root-bound engine ports |
+// Blueprint: | `EngineComposition.swift` | Concrete runtime and background-work composition through root-bound engine ports; the existing delegation scheduler combines independent contact-continuation and resident-wake deadlines and gives both owners their recovery pass |
 
 extension NativeAgentEngine {
 
@@ -140,14 +140,24 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
             dataRoot: dataRoot, configRoot: configRoot)
     }
 
+    /// Each reply owner reconciles on its own: one owner's failure is reported
+    /// after the others have run, never instead of them.
     func reconcileReplyDeliveries(dataRoot: URL) async throws {
-        try await NativeAgentEngine.live.agents.continuation.reconcileReplies()
-        try await NativeAgentEngine.makeTurnContinuationRuntime(dataRoot: dataRoot).reconcileReplyMirror()
+        var failures: [String] = []
+        func run(_ owner: String, _ body: () async throws -> Void) async {
+            do { try await body() } catch { failures.append("\(owner): \(error.localizedDescription)") }
+        }
+        await run("agent replies") { try await NativeAgentEngine.live.agents.continuation.reconcileReplies() }
+        await run("Telegram mirror") { try await NativeAgentEngine.makeTurnContinuationRuntime(dataRoot: dataRoot).reconcileReplyMirror() }
         if let telegram = await BackgroundLoops.BackgroundLoopLifetimes.shared.loopRunner(loopId: "telegram_poll") as? TelegramPollLoop {
-            try await telegram.reconcileSavedReplies()
+            await run("Telegram replies") { try await telegram.reconcileSavedReplies() }
         }
         if let slack = await BackgroundLoops.BackgroundLoopLifetimes.shared.loopRunner(loopId: "slack_socket_mode") as? SlackSocketModeLoop {
-            try await slack.reconcileSavedReplies()
+            await run("Slack replies") { try await slack.reconcileSavedReplies() }
+        }
+        guard failures.isEmpty else {
+            throw NSError(domain: "NativeAgent.ReplyReconciliation", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: failures.joined(separator: "; ")])
         }
     }
     func retryRequestedResults(dataRoot: URL) async throws {
@@ -161,7 +171,17 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
     }
 
     func reconcileAgentConversations() async throws {
-        try await NativeAgentEngine.live.agents.continuation.tick()
+        let agents = NativeAgentEngine.live.agents
+        // Both due-work owners get their pass. One contact's failed read must
+        // not prevent the resident from considering its own arrivals.
+        var firstError: Error?
+        do { try await agents.continuation.tick() }
+        catch is CancellationError { throw CancellationError() }
+        catch { firstError = error }
+        do { _ = try await agents.residentWake.tick() }
+        catch is CancellationError { throw CancellationError() }
+        catch { if firstError == nil { firstError = error } }
+        if let firstError { throw firstError }
     }
 
     func stopAgentConversations() async {
@@ -169,7 +189,9 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
     }
 
     func nextConversationDeadline(after now: Date) -> Date? {
-        NativeAgentEngine.live.agents.continuation.nextDeadline(after: now)
+        let agents = NativeAgentEngine.live.agents
+        return [agents.continuation.nextDeadline(after: now), agents.residentWake.nextDeadline(after: now)]
+            .compactMap { $0 }.min()
     }
 }
 
@@ -180,10 +202,7 @@ extension EngineBackgroundWorkPort: DelegationBackgroundWorkPort {
 extension NativeAgentEngine {
     public static func makeDeskNotifyLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        intervalSeconds: TimeInterval = 24 * 60 * 60,
-        postMacNotification: @escaping @Sendable (String, String, [String: String], String?) async -> Bool = { title, body, userInfo, sound in
-            await NativeAgentEngine.live.ports.backgroundWork.postMacNotification(title: title, body: body, userInfo: userInfo, soundName: sound).posted
-        }
+        intervalSeconds: TimeInterval = 24 * 60 * 60
     ) -> some LoopRunner {
         DeskNotifyRunner(
             interval: intervalSeconds,
@@ -196,14 +215,6 @@ extension NativeAgentEngine {
                     case .failure(let error): throw error
                     }
                 }
-            },
-            postMacNotification: postMacNotification,
-            postNagNotification: { title, body, handle in
-                await NativeAgentEngine.live.ports.backgroundWork.postMacNotification(
-                    title: title, body: body,
-                    userInfo: handle.map { [NativeAgentNotificationRoute.deskHandleKey: $0] } ?? [:],
-                    soundName: nil
-                ).posted
             }
         )
     }
@@ -304,7 +315,7 @@ extension EngineBackgroundWorkPort: MaintenanceBackgroundWorkPort {
             }
             return report.checks
         } catch {
-            if owned { await doctor.finishRun(nil) }
+            if owned { await doctor.finishRun(nil, failure: error.localizedDescription) }
             throw error
         }
     }

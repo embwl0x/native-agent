@@ -279,7 +279,7 @@ final class MacBridgeClient: ObservableObject {
         expectedPairing: String? = nil,
         onPrepared: ((BridgeMessage) async throws -> Void)? = nil
     ) async throws -> String {
-        let metadata = Self.chatSendMetadata(
+        let metadata = try Self.chatSendMetadata(
             controls: controls,
             suppressRemoteUserAppend: suppressRemoteUserAppend,
             replacementAssistantMessageID: replacementAssistantMessageID
@@ -288,9 +288,13 @@ final class MacBridgeClient: ObservableObject {
             try attachments.map { attachment in
                 var reference = attachment
                 if reference.type == "audio", reference.utterance != nil {
+                    guard reference.byteSize > 0, reference.byteSize <= ChatAttachmentTypeResolver.fileByteLimit,
+                          let bytes = Data(base64Encoded: reference.base64), bytes.count == reference.byteSize else {
+                        throw NSError(domain: "VoiceNote", code: 3, userInfo: [NSLocalizedDescriptionKey:
+                            "The voice recording is missing or exceeds the 10 MB limit. Record a shorter note."])
+                    }
                     _ = try MobileLocalStorage.retainRecording(reference)
-                    reference.utterance?.audioReference = "iphone-recording:\(reference.id)"
-                    reference.base64 = ""
+                    reference.utterance?.audioReference = nil
                     reference.path = nil
                 }
                 return reference
@@ -313,8 +317,8 @@ final class MacBridgeClient: ObservableObject {
         controls: ChatRuntimeControls,
         suppressRemoteUserAppend: Bool,
         replacementAssistantMessageID: UUID?
-    ) -> [String: String] {
-        var metadata = controls.metadata(transport: "icloud")
+    ) throws -> [String: String] {
+        var metadata = try controls.metadata(transport: "icloud")
         if suppressRemoteUserAppend, let replacementAssistantMessageID {
             metadata["suppressUserAppend"] = "true"
             metadata["replacementAssistantMessageId"] = replacementAssistantMessageID.uuidString

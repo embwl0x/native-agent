@@ -4,68 +4,89 @@ import Synchronization
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `LLMClient+CodexAdapter.swift` | `CodexProcess`: streaming and buffered Codex runners; pins the shared credential resolver's path for account controls, child-home binding and preparation; never lets the CLI select another credential; NativeAgentCore's ProcessPipeDrain owns shared nonblocking pipe capture without an executor dependency |
+// Blueprint: | `LLMClient+CodexAdapter.swift` | `CodexProcess`: streaming and buffered Codex runners share strict per-pipe incremental UTF-8 decoding, retaining valid prefixes and raw invalid suffixes on failure; pins the shared credential resolver's path for account controls, child-home binding and preparation; never lets the CLI select another credential; NativeAgentCore's ProcessPipeDrain owns shared nonblocking pipe capture without an executor dependency |
 
-/// Incremental UTF-8 decoder for chunked byte streams. A multibyte codepoint
-/// (2-4 bytes) can be split across two reads; naive per-read decoding drops
-/// the partial-byte read entirely. This holds the trailing 1-3 bytes of an
-/// in-progress codepoint until the continuation bytes arrive on the next read.
-/// Thread-safe via NSLock — `readabilityHandler` can fire on any background queue.
-/// `drain()` is the end-of-stream flush; any still-malformed trailing bytes
-/// are dropped (count reported via the returned tuple) instead of producing
-/// U+FFFD, since the consumer pastes deltas verbatim into UI and a stray
-/// replacement character reads worse than a silent drop of a known-bad byte run.
-final class Utf8StreamDecoder: @unchecked Sendable {
-    private var buffer = Data()
-    private let lock = NSLock()
-    init() {}
-    /// Append `new`, return the decodable prefix (or nil if nothing new is
-    /// decodable yet — bytes stay in the buffer for next call).
-    func append(_ new: Data) -> String? {
-        lock.lock(); defer { lock.unlock() }
-        buffer.append(new)
-        if buffer.isEmpty { return nil }
-        if let s = String(data: buffer, encoding: .utf8) {
-            buffer.removeAll(keepingCapacity: true)
-            return s.isEmpty ? nil : s
-        }
-        let maxDrop = Swift.min(3, buffer.count)
-        for drop in 1...maxDrop {
-            let prefixCount = buffer.count - drop
-            let prefix = buffer.prefix(prefixCount)
-            if let s = String(data: prefix, encoding: .utf8) {
-                buffer = Data(buffer.suffix(drop))
-                return s.isEmpty ? nil : s
-            }
-        }
-        return nil
+/// One strict decoder for each Codex pipe, shared by both runners. Only an
+/// incomplete scalar waits for another read. Invalid bytes and their entire
+/// suffix stay owned as raw evidence; valid text before them remains available.
+final class CodexUTF8Output: @unchecked Sendable {
+    struct Snapshot: Sendable {
+        let text: String
+        let undecodable: Data
     }
-    /// End-of-stream flush. Returns (decoded-tail, dropped-byte-count).
-    /// `dropped > 0` means the final bytes weren't valid UTF-8 and were
-    /// discarded; caller may log it.
-    func drain() -> (tail: String?, dropped: Int) {
-        lock.lock(); defer { lock.unlock() }
-        if buffer.isEmpty { return (nil, 0) }
-        if let s = String(data: buffer, encoding: .utf8) {
-            buffer.removeAll(keepingCapacity: true)
-            return (s.isEmpty ? nil : s, 0)
+    private let lock = NSLock()
+    private var pending: [UInt8] = []
+    private var text = ""
+    private var invalid = false
+
+    func append(_ data: Data) -> String? {
+        lock.withLock {
+            pending.append(contentsOf: data)
+            guard !invalid else { return nil }
+            var cursor = 0
+            while cursor < pending.count {
+                let first = pending[cursor]
+                let width: Int
+                switch first {
+                case 0...0x7F: width = 1
+                case 0xC2...0xDF: width = 2
+                case 0xE0...0xEF: width = 3
+                case 0xF0...0xF4: width = 4
+                default: invalid = true; width = 0
+                }
+                guard !invalid else { break }
+                // Validate available continuation bytes even on a split scalar;
+                // overlong encodings, surrogates and > U+10FFFF are invalid now.
+                for offset in 1..<width {
+                    guard cursor + offset < pending.count else { break }
+                    let byte = pending[cursor + offset]
+                    let range: ClosedRange<UInt8>
+                    if offset == 1, first == 0xE0 { range = 0xA0...0xBF }
+                    else if offset == 1, first == 0xED { range = 0x80...0x9F }
+                    else if offset == 1, first == 0xF0 { range = 0x90...0xBF }
+                    else if offset == 1, first == 0xF4 { range = 0x80...0x8F }
+                    else { range = 0x80...0xBF }
+                    if !range.contains(byte) { invalid = true; break }
+                }
+                guard !invalid, cursor + width <= pending.count else { break }
+                cursor += width
+            }
+            guard cursor > 0 else { return nil }
+            // The scanner admitted only complete valid Unicode scalars.
+            let delta = String(decoding: pending.prefix(cursor), as: UTF8.self)
+            pending.removeFirst(cursor)
+            text += delta
+            return delta
         }
-        let n = buffer.count
-        buffer.removeAll(keepingCapacity: true)
-        return (nil, n)
+    }
+
+    func finish() -> Snapshot {
+        lock.withLock { Snapshot(text: text, undecodable: Data(pending)) }
+    }
+}
+
+/// The process has settled; valid prefixes and exact undecodable pipe bytes
+/// stay on this error. Neither diagnostic prose nor logs publish raw bytes.
+struct CodexOutputEncodingFailure: Error, Sendable, LocalizedError, ProviderFailureWrapping {
+    let stdout: CodexUTF8Output.Snapshot
+    let stderr: CodexUTF8Output.Snapshot
+    var providerFailureCause: Error { ProviderFailure.Diagnostic(cause: .malformedResponse, detail: detail) }
+    var providerWorkState: ProviderFailure.WorkState? { .outcomeUnknown }
+    var errorDescription: String? { detail }
+    private var detail: String {
+        "Codex output was not valid UTF-8: stdout retained \(stdout.text.utf8.count) valid bytes and \(stdout.undecodable.count) undecodable bytes; stderr retained \(stderr.text.utf8.count) valid bytes and \(stderr.undecodable.count) undecodable bytes. The reply is incomplete; inspect the Codex output encoding before another call."
     }
 }
 
 private final class CodexProcessShutdown: @unchecked Sendable {
-    private let process: Process
+    private let process: ManagedProcess
     private let launchTree: ProcessTreeSnapshot
     private let lock = NSLock()
     private var requested = false
     private let stopped = DispatchGroup()
 
-    init(_ process: Process) {
+    init(_ process: ManagedProcess) {
         self.process = process
-        ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(process.processIdentifier)
         launchTree = ProcessTreeReaper.snapshot(rootPID: process.processIdentifier)
     }
 
@@ -175,7 +196,7 @@ public struct CodexProcessInvocation: Sendable {
         stderr: @escaping @Sendable (Data) -> Void,
         exited: @escaping @Sendable (Int32, Bool, Bool) -> Void
     ) throws {
-        let proc = Process()
+        let proc = ManagedProcess()
         var environment = environment ?? ProcessInfo.processInfo.environment
         environment["PATH"] = CodexExecutable.augmentedPath(environment["PATH"])
         proc.executableURL = try CodexExecutable.resolveCodexExecutable(
@@ -217,7 +238,8 @@ public struct CodexProcessInvocation: Sendable {
             stderrReader.stopAndWait()
             try? outPipe.fileHandleForReading.close()
             try? errPipe.fileHandleForReading.close()
-            exited(p.terminationStatus, timedOut.withLock { $0 }, cancelled.withLock { $0 })
+            if let failure = p.terminationError { stderr(Data(("\n" + failure).utf8)) }
+            exited(p.terminationStatus, timedOut.withLock { $0 }, cancelled.withLock { $0 } && p.terminationError == nil)
             timeoutSlot.withLock { slot in defer { slot = nil }; return slot }?.cancel()
         }
         do {
@@ -291,6 +313,9 @@ public final class CodexProcess: LLMTransport {
     public static let toolWire = ProviderToolWire.unsupported
     /// The CLI prompt is text: images are flattened away (`messagesPrompt`).
     public static let carriesImages = false
+    /// This transport sends no output-cap field.
+    public func requestOutputTokens(model: String) throws -> Int { 0 }
+
     public let providerId: String = "codex"
     private let codexBin: String?
     private let timeout: TimeInterval
@@ -318,7 +343,7 @@ public final class CodexProcess: LLMTransport {
     /// NativeAgent tools never reach the CLI; its tool wire is unsupported.
     public func complete(prompt: String, system: String?, model: String, tools: [LLMToolSchema]?) async throws -> String {
         let authPath = resolvedAuthPath()
-        let args = arguments(model: model, authPath: authPath)
+        let args = try arguments(model: model, authPath: authPath)
         let terminator = CodexTerminator()
         let invocation = CodexProcessInvocation(
             executable: try codexBin ?? CodexExecutable.resolveCodexExecutable(environment: processEnvironment).path,
@@ -467,7 +492,6 @@ public final class CodexProcess: LLMTransport {
         model: String
     ) -> AsyncThrowingStream<String, Error> {
         let authPath = resolvedAuthPath()
-        let args = arguments(model: model, authPath: authPath)
         let terminator = CodexTerminator()
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -475,6 +499,7 @@ public final class CodexProcess: LLMTransport {
                     var sawContent = false
                     do {
                         try Task.checkCancellation()
+                        let args = try arguments(model: model, authPath: authPath)
                         let invocation = CodexProcessInvocation(
                             executable: try codexBin ?? CodexExecutable.resolveCodexExecutable(environment: processEnvironment).path,
                             arguments: args,
@@ -501,6 +526,8 @@ public final class CodexProcess: LLMTransport {
                         }
                     } catch is CancellationError {
                         continuation.finish()
+                    } catch let err as any ProviderFailureWrapping {
+                        continuation.finish(throwing: err)
                     } catch let err as LLMError {
                         continuation.finish(throwing: err)
                     } catch {
@@ -510,6 +537,7 @@ public final class CodexProcess: LLMTransport {
                     terminator.fire()
                 }
             }
+            ProviderReplyWork.current?.own(task, stop: { terminator.fire() })
             continuation.onTermination = { _ in
                 terminator.fire()
                 task.cancel()
@@ -563,6 +591,7 @@ public final class CodexProcess: LLMTransport {
                     continuation.finish(throwing: ProviderFailure.normalize(error))
                 }
             }
+            ProviderReplyWork.current?.own(task, stop: {})
             continuation.onTermination = { _ in task.cancel() }
         }
     }
@@ -586,7 +615,7 @@ public final class CodexProcess: LLMTransport {
     }
 
     /// Non-interactive exec accepts piped prompts from any app working directory and emits uncolored output.
-    private func arguments(model: String, authPath: URL) -> [String] {
+    private func arguments(model: String, authPath: URL) throws -> [String] {
         // This transport is a model call. CLI tools would act outside the
         // NativeAgent dispatcher, so its declared no-tools contract applies
         // to the child too, independent of the person's CLI configuration.
@@ -608,27 +637,21 @@ public final class CodexProcess: LLMTransport {
         if ProviderStreamContext.stallOnly {
             args.append(contentsOf: ["-c", "model_reasoning_summary=\"auto\""])
         }
-        let cacheURL = CodexAccountModelCatalog.cacheCandidate(
-            environment: processEnvironment
-        )
-        let accountRow = CodexAccountModelCatalog.matchingModels(
-            providerID: "codex",
-            oauthAuthURL: authPath,
-            fallbackCacheURL: cacheURL
-        ).first { $0.id == model }
-        if let effort = OpenAIExecutionControls.reasoningEffort(
+        if let effort = try OpenAIExecutionControls.reasoningEffort(
             model: model,
             requested: LLMCallContext.reasoningEffort,
             transport: .codexCLI,
-            supportedEfforts: accountRow?.supportedReasoningEfforts
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+            oauthAuthURL: authPath
         ) {
             args.append(contentsOf: ["-c", "model_reasoning_effort=\"\(effort)\""])
         }
-        if let tier = OpenAIExecutionControls.serviceTier(
+        if let tier = try OpenAIExecutionControls.serviceTier(
             model: model,
             requested: LLMCallContext.serviceTier,
             transport: .codexCLI,
-            supportsFast: accountRow?.supportsFast
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+            oauthAuthURL: authPath
         ) {
             args.append(contentsOf: ["-c", "service_tier=\"\(tier)\""])
         }
@@ -649,27 +672,20 @@ public final class CodexProcess: LLMTransport {
         AsyncThrowingStream { continuation in
             let activity = ProviderStreamContext.activity
             let admitted = ProviderStreamContext.admitted
-            let stderrBuf = Mutex(Data())
-            let decoder = Utf8StreamDecoder()
-            continuation.onTermination = { _ in
-                inv.terminator.fire()
-            }
+            let stdout = CodexUTF8Output(), stderr = CodexUTF8Output()
+            continuation.onTermination = { _ in inv.terminator.fire() }
             do {
                 try inv.run(stdout: { data in
                     if !data.isEmpty { activity?(); admitted?() }
-                    if let text = decoder.append(data) { continuation.yield(text) }
+                    if let text = stdout.append(data) { continuation.yield(text) }
                 }, stderr: { data in
                     if !data.isEmpty { activity?() }
-                    stderrBuf.withLock { $0.append(data) }
+                    _ = stderr.append(data)
                 }, exited: { status, timedOut, cancelled in
-                    let (tail, dropped) = decoder.drain()
-                    if let tail { continuation.yield(tail) }
-                    if dropped > 0 {
-                        FileHandle.standardError.write(Data(
-                            "[codex] dropping \(dropped) malformed UTF-8 trailing bytes at stream end\n".utf8
-                        ))
-                    }
-                    if cancelled {
+                    let out = stdout.finish(), err = stderr.finish()
+                    if !out.undecodable.isEmpty || !err.undecodable.isEmpty {
+                        continuation.finish(throwing: CodexOutputEncodingFailure(stdout: out, stderr: err))
+                    } else if cancelled {
                         continuation.finish(throwing: CancellationError())
                     } else if timedOut {
                         continuation.finish(throwing: LLMError.underlying(message: "codex: timed out after \(inv.timeout)s"))
@@ -677,7 +693,7 @@ public final class CodexProcess: LLMTransport {
                         continuation.finish()
                     } else {
                         continuation.finish(throwing: CodexProcess.classifyCodexFailure(
-                            exitCode: status, stdout: "", stderr: String(data: stderrBuf.withLock { $0 }, encoding: .utf8) ?? ""))
+                            exitCode: status, stdout: out.text, stderr: err.text))
                     }
                 })
             } catch {
@@ -689,17 +705,20 @@ public final class CodexProcess: LLMTransport {
     /// Buffered output over the same spawn, stop, deadline and drain operation.
     public static let defaultRunner: CodexProcessRunner = { inv in
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CodexProcessResult, Error>) in
-            let stdout = Mutex(Data()), stderr = Mutex(Data())
+            let stdout = CodexUTF8Output(), stderr = CodexUTF8Output()
             do {
-                try inv.run(stdout: { data in stdout.withLock { $0.append(data) } },
-                            stderr: { data in stderr.withLock { $0.append(data) } },
-                            exited: { status, timedOut, _ in
-                    continuation.resume(returning: CodexProcessResult(
-                        exitCode: status,
-                        stdout: String(data: stdout.withLock { $0 }, encoding: .utf8) ?? "",
-                        stderr: String(data: stderr.withLock { $0 }, encoding: .utf8) ?? "",
-                        timedOut: timedOut
-                    ))
+                try inv.run(stdout: { data in _ = stdout.append(data) },
+                            stderr: { data in _ = stderr.append(data) },
+                            exited: { status, timedOut, cancelled in
+                    let out = stdout.finish(), err = stderr.finish()
+                    if !out.undecodable.isEmpty || !err.undecodable.isEmpty {
+                        continuation.resume(throwing: CodexOutputEncodingFailure(stdout: out, stderr: err))
+                    } else if cancelled, out.text.isEmpty {
+                        continuation.resume(throwing: CancellationError())
+                    } else {
+                        continuation.resume(returning: CodexProcessResult(
+                            exitCode: status, stdout: out.text, stderr: err.text, timedOut: timedOut))
+                    }
                 })
             } catch {
                 continuation.resume(throwing: error)

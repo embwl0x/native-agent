@@ -64,16 +64,6 @@ extension FeatureSurfaceRecord {
 public func featureSurfaceRecords(nowISO: String) -> [FeatureSurfaceRecord] {
     return [
         FeatureSurfaceRecord(
-            sourceId: "command_center",
-            name: "Command Center",
-            description: "System overview, Workshop task counts, recent activity, connector/trust summary, and quick task creation.",
-            triggers: ["status", "overview", "task", "mission", "what is running", "command center"],
-            permissions: [],
-            riskClass: "read_only",
-            updatedAt: nowISO,
-            endpoints: ["app mac.activity", "app workshop.status", "app workshop.submit"]
-        ),
-        FeatureSurfaceRecord(
             sourceId: "mac_assistant_watch_setup",
             name: "Mac Assistant Watch Setup",
             description: "Manifest-routed access map and scheduler templates for email, calendar, reminders, Mac notifications, and iPhone receipts. Rendering the surface does not create jobs.",

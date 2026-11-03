@@ -85,11 +85,15 @@ final class InboxStore: ObservableObject {
     // MARK: - Local notifications
 
     func requestNotificationAuthorization() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { granted, error in
-            if let error {
+        // The async form: a completion closure written here would be checked
+        // onto the main actor while iOS calls it on its own queue.
+        Task {
+            do {
+                let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound])
+                NSLog("[InboxStore] notification authorization granted=%@", granted ? "true" : "false")
+            } catch {
                 NSLog("[InboxStore] notification authorization error: %@", error.localizedDescription)
             }
-            NSLog("[InboxStore] notification authorization granted=%@", granted ? "true" : "false")
         }
     }
 

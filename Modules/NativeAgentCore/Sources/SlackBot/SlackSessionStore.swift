@@ -125,7 +125,8 @@ struct SlackSessionStore: Sendable {
     }
 
     /// Expired bindings stop protecting inactive sessions from transcript
-    /// retention. The bounded archive still resolves a returning old thread.
+    /// retention. Only the hot set is bounded; durable cold locators are not
+    /// trimmed and still resolve a returning old thread.
     private static func retainThreadBindings(
         sessions: inout [String: JSONValue],
         archived: inout [String: JSONValue],

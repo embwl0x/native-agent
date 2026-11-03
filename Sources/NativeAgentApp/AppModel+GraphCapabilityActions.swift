@@ -14,7 +14,20 @@ import DoctorChecks
 import Browser
 import AppToolRuntime
 import Senses
-// Blueprint: | `AppModel+GraphCapabilityActions.swift` | `AppModel`: `searchGraph`, `refreshGraph`, `runResearchLab`; Lab's frozen evidence calls the editable `research-lab` part through `Parts.call` and the canonical admission-only gate; native Research commits the accepted proposal |
+import ChatTurnContracts
+// Blueprint: | `AppModel+GraphCapabilityActions.swift` | `ResearchSearchFailure`; `AppModel`: research search, graph and capability actions; browser preview returns its in-memory proposal to the view without refreshing history; browser/gauntlet status carries typed context and failure; Lab's frozen evidence calls the editable `research-lab` part through `Parts.call` and the canonical admission-only gate; native Research commits the accepted proposal |
+
+enum ResearchSearchFailure: Error, Equatable {
+    case blankQuery
+    case requestFailed(String)
+
+    var message: String {
+        switch self {
+        case .blankQuery: return "Enter a research query."
+        case .requestFailed(let message): return message
+        }
+    }
+}
 
 /// A production export is successful only after the archive and its persisted
 /// registry receipt agree. Creating an archive alone is not enough for the UI
@@ -26,6 +39,27 @@ enum ProductionExportCreationOutcome: Equatable {
 
 @MainActor
 extension AppModel {
+    func search(_ query: String) async -> Result<ResearchSearchResponse, ResearchSearchFailure> {
+        let research = SwiftNativeResearchClient(dataRoot: engine.dataRoot)
+        return await search(query) { trimmed in
+            try await research.search(query: trimmed)
+        }
+    }
+
+    func search(
+        _ query: String,
+        using operation: (String) async throws -> ResearchSearchResponse
+    ) async -> Result<ResearchSearchResponse, ResearchSearchFailure> {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .failure(.blankQuery) }
+        do {
+            return .success(try await operation(trimmed))
+        } catch {
+            setFailureStatus(error, action: "run that research")
+            return .failure(.requestFailed(error.localizedDescription))
+        }
+    }
+
     @MainActor
     func searchGraph(_ query: String) async {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -71,7 +105,8 @@ extension AppModel {
                     return admission
                 } catch { return ChatToolOutcome.failure(error: error, tool: id) }
             }
-            let run = try await SwiftNativeResearchClient(dataRoot: root).runResearchLab(objective: trimmed, maxResults: 5) { input in
+            let run = try await ChatToolSessionContext.$envelope.withValue(.native("mac_ui:research_lab")) {
+            try await SwiftNativeResearchClient(dataRoot: root).runResearchLab(objective: trimmed, maxResults: 5) { input in
                 let result: PartCallResult<ResearchLabProposal> = await OwnedProgramInvocation.$host.withValue(host) {
                     await Parts(root: root).call(id: "research-lab", input: input)
                 }
@@ -79,6 +114,7 @@ extension AppModel {
                 case .success(let value): return value
                 case .failure(let error): throw error
                 }
+            }
             }
             engine.desk.recordResearchRun(run)
             let outcome = ResearchLabActionOutcome.recorded(run)
@@ -131,14 +167,14 @@ extension AppModel {
         }
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedName.isEmpty || !trimmedURL.isEmpty else {
-            return .refused("Enter a source name or URL before adding it.")
+        guard !trimmedName.isEmpty else {
+            return .refused("Enter a source name before adding it.")
         }
         capabilityCatalogSourceSaveInFlight = true
         defer { capabilityCatalogSourceSaveInFlight = false }
         do {
             let source = try await engine.trust.saveCatalogSource(
-                name: trimmedName.isEmpty ? "Capability Source" : trimmedName,
+                name: trimmedName,
                 url: trimmedURL,
                 kind: "local"
             )
@@ -191,15 +227,18 @@ extension AppModel {
     }
 
     @MainActor
-    func runBrowserDryRun(url: String = "https://example.com") async {
+    func runBrowserDryRun(url: String = "https://example.com") async -> BrowserRun? {
         do {
             let run = try await BrowserActionRoutes.app.runBrowser(
                 url: url, dryRun: true, captureSource: false, captureScreenshot: false, dataRoot: engine.dataRoot
             )
-            _ = await engine.tools.refreshNativePower()
             statusText = "Browser dry run: \(run.status)"
+            capabilityRunStatus = run.status == "failed" ? .failed : .reported
+            return run
         } catch {
             setFailureStatus("Browser run failed: " + UserFacingError.cause(error, action: "run the browser"), cause: error)
+            capabilityRunStatus = .failed
+            return nil
         }
     }
 
@@ -238,22 +277,13 @@ extension AppModel {
             let run = try await ImprovementGauntletRun.run(dataRoot: engine.dataRoot)
             _ = await engine.doctor.refreshHardening()
             statusText = "Gauntlet: \(run.status)"
+            capabilityRunStatus = run.status == "failed" ? .failed : .reported
         } catch {
             setFailureStatus("Gauntlet failed: " + UserFacingError.cause(error, action: "run the gauntlet"), cause: error)
+            capabilityRunStatus = .failed
         }
     }
 
-
-    @MainActor
-    func rollbackCapabilityPack(_ install: CapabilityPackInstall) async {
-        do {
-            _ = try await CapabilityPackInstall.rollback(id: install.id, dataRoot: engine.dataRoot)
-            statusText = "Rolled back \(install.name ?? install.packId)"
-            await refreshAll()
-        } catch {
-            setFailureStatus(error, action: "roll that back")
-        }
-    }
 
     @MainActor
     func createProductionExport(support: Bool = false) async -> ProductionExportCreationOutcome {

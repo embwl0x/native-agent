@@ -3,11 +3,12 @@ import CognitiveSubstrate
 import Context
 import NativeAgentCore
 import PersonaEngine
+import Experiences
 import PersistenceCore
 import ProviderRouting
 import TurnTrace
 
-// Blueprint: | `NativeCognitionRuntime+ProviderEvidence.swift` | `NativeCognitionRuntime` provider evidence: bounded lifecycle history restored from canonical traces and durable capability projection |
+// Blueprint: | `NativeCognitionRuntime+ProviderEvidence.swift` | `NativeCognitionRuntime` provider evidence: checked bounded lifecycle history from canonical traces; source failures owe repair, missing status remains unknown and cumulative capability beliefs never substitute |
 
 extension NativeCognitionRuntime {
     public nonisolated static func providerPathEvidence(
@@ -63,9 +64,22 @@ extension NativeCognitionRuntime {
     func restoreProviderLifecycleEvidence() async {
         // Keep a bounded evidence window across the canonical turn files and
         // standalone ledger, then restore the newest provider outcomes.
-        let rows = (try? await TurnTraceRecentReader(
-            dataRootOverride: dataRoot, rowLimit: Self.maximumProviderLifecycleEvidence * 64
-        ).traceEvidence(maximumReadBytes: 1_048_576).rows) ?? []
+        let rows: [JSONValue]
+        do {
+            let read = try await TurnTraceRecentReader(
+                dataRootOverride: dataRoot, rowLimit: Self.maximumProviderLifecycleEvidence * 64
+            ).traceEvidence(maximumReadBytes: 1_048_576)
+            guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine else {
+                throw PersistenceCoreError.ioFailure("Provider lifecycle history contains unreadable trace rows.")
+            }
+            rows = read.rows
+        } catch {
+            RepairOwed.owe(dataRoot, id: "provider-evidence:" + UUID().uuidString, kind: .run,
+                operation: "cognition.provider.evidence", owner: "turn_traces",
+                words: "Provider lifecycle history is unavailable: \(error.localizedDescription)",
+                tap: "Repair the named trace source while preserving its bytes. No cumulative belief will replace it.")
+            return
+        }
         var restored: [String: ProviderPathEvidence] = [:]
         for row in rows.reversed() {
             guard restored.count < Self.maximumProviderLifecycleEvidence else { break }
@@ -93,13 +107,14 @@ extension NativeCognitionRuntime {
               case .string(let model)? = payload["model"] else { return nil }
         let outcome: ProviderPathEvidenceOutcome? = {
             guard case .string(let status)? = object["status"] else {
-                return .succeeded // completed rows from before status existed
+                return nil // No recorded outcome attests a successful provider call.
             }
             switch status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             case "ok", "succeeded", "completed": return .succeeded
             case "cancelled", "canceled": return .cancelled
             case "unknown": return nil
-            default: return .failed
+            case "failed", "error": return .failed
+            default: return nil
             }
         }()
         guard let outcome else { return nil }
@@ -109,40 +124,6 @@ extension NativeCognitionRuntime {
         }()
         return (provider, model, ProviderPathEvidence(
             evidenceID: "trace-call:\(rowID)", observedAt: date, outcome: outcome))
-    }
-
-    /// The trace tail is a transient sensor and may be unavailable during the
-    /// launch race. The organism's cumulative capability belief is already a
-    /// durable projection over exact lifecycle outcomes, so it can bridge that
-    /// gap without manufacturing duplicate observations or extending the
-    /// provider body's six-hour freshness window.
-    nonisolated static func providerCapabilityFallbackProjection(
-        _ capability: OrganismCapabilityBelief?,
-        now: Date,
-        halfLife: TimeInterval = 2 * 60 * 60,
-        staleAfter: TimeInterval = 6 * 60 * 60
-    ) -> ProviderPathEstimate? {
-        guard let capability,
-              capability.kind == .providerCompletion,
-              capability.evidenceBasis == .cumulativeOutcomes,
-              capability.evidenceCount > 0,
-              let lastEvidenceAt = capability.lastEvidenceAt else { return nil }
-        let boundedHalfLife = halfLife.isFinite ? max(1, halfLife) : 2 * 60 * 60
-        let boundedStaleAfter = staleAfter.isFinite
-            ? max(boundedHalfLife, staleAfter)
-            : 6 * 60 * 60
-        let age = max(0, now.timeIntervalSince(lastEvidenceAt))
-        let freshness = age <= boundedStaleAfter
-            ? exp(-log(2) * age / boundedHalfLife)
-            : 0
-        return ProviderPathEstimate(
-            generatedAt: now,
-            estimate: capability.successLikelihood,
-            freshness: freshness,
-            uncertainty: capability.uncertainty,
-            evidenceCount: capability.evidenceCount,
-            newestEvidenceAt: lastEvidenceAt
-        )
     }
 
     private func enforceProviderLifecycleEvidenceCapacity() {

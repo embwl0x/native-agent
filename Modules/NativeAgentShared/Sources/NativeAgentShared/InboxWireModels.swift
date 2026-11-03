@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `InboxWireModels.swift` | Shared inbox rows and `InboxActionVocabulary`: action normalization and native operation set, with broader signed-wire recognition; `view` remains phone-local |
+// Blueprint: | `InboxWireModels.swift` | Shared inbox rows and `InboxActionVocabulary`: checked action routing and native operation set, the inbox's own read/archive/dismiss verbs on every card, broader signed-wire recognition; `view` remains phone-local |
 
 /// The signed Mac inbox route's vocabulary, also used by phone controls.
 public enum InboxActionVocabulary {
@@ -7,6 +7,22 @@ public enum InboxActionVocabulary {
         "read", "archive", "dismiss", "act", "approve", "reject", "open_approvals"
     ]
     public static let supportedActionIDs = nativeActionIDs.union(["reply", "deny", "repair"])
+    /// Verbs the inbox owns for every card it shows: a card never declares them.
+    public static let inboxVerbs: [InboxActionRecord] = [
+        InboxActionRecord(id: "read", label: "Mark read", description: "Mark this item read"),
+        InboxActionRecord(id: "archive", label: "Archive", description: "Archive this item"),
+        InboxActionRecord(id: "dismiss", label: "Dismiss", description: "Dismiss this item"),
+    ]
+
+    /// A card's actions: its declared ones, then the inbox's own verbs it lacks. A card
+    /// linked to an approval is settled by that approval, so it gains only "read": archiving
+    /// or dismissing it would leave the approval pending with no card.
+    public static func actions(declared: [InboxActionRecord], approvalLinked: Bool) -> [InboxActionRecord] {
+        let declaredIDs = Set(declared.map { normalizedAction($0.id) })
+        return declared + inboxVerbs.filter {
+            !declaredIDs.contains($0.id) && (!approvalLinked || $0.id == "read")
+        }
+    }
 
     public static func normalizedAction(_ actionID: String) -> String {
         actionID == "deny" ? "reject" : actionID
@@ -17,9 +33,9 @@ public enum InboxActionVocabulary {
             || (itemID.hasPrefix("interaction:") && actionID.hasPrefix("interaction_choice_"))
     }
 
-    public static func routedAction(_ actionID: String, itemID: String) -> String {
+    public static func routedAction(_ actionID: String, itemID: String) -> String? {
         let normalized = normalizedAction(actionID)
-        return supports(normalized, itemID: itemID) ? normalized : "act"
+        return supports(normalized, itemID: itemID) ? normalized : nil
     }
 }
 
@@ -93,6 +109,8 @@ public struct InboxItemRecord: Identifiable, Codable, Hashable, Sendable {
     public let summary: String
     public let detail: String?
     public let relatedWorkshopExecutionId: String?
+    /// Producer's durable delegated-job key; absent on notes without that link.
+    public var relatedDelegationID: String? = nil
     public let related_approval_id: String?
     public let related_paths: [String]?
     public let related_groups: [InboxRelatedGroup]?
@@ -104,7 +122,7 @@ public struct InboxItemRecord: Identifiable, Codable, Hashable, Sendable {
     /// The original card's session and identity, separate from its mirror destination.
     public let interaction_session_id: String?
     public let interaction_id: String?
-    /// What the source means, as the Mac says it; nil from a Mac too old to say.
+    /// What the source means, when its owner supplies presentation.
     public var presentation: InboxSourcePresentation? = nil
 
     public init(id: String, created_at: String, source: String, severity: String, title: String,
@@ -124,15 +142,12 @@ public struct InboxItemRecord: Identifiable, Codable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, created_at, source, severity, title, summary, detail
-        case relatedWorkshopExecutionId = "related_mission_id" // compatibility wire ID
+        case relatedWorkshopExecutionId = "related_execution_id"
+        case relatedDelegationID = "related_delegation_id"
         case related_approval_id, related_paths, related_groups, actions, status, read_at, chat_session_id, presentation
         case interaction_session_id, interaction_id
     }
 
-    // Decode the execution alias; encode the established mission key.
-    fileprivate enum FutureCodingKeys: String, CodingKey {
-        case related_execution_id
-    }
 }
 
 extension InboxItemRecord {
@@ -145,14 +160,8 @@ extension InboxItemRecord {
         title = try c.decode(String.self, forKey: .title)
         summary = try c.decode(String.self, forKey: .summary)
         detail = try c.decodeIfPresent(String.self, forKey: .detail)
-        let futureRelatedExecutionId: String? = {
-            guard let future = try? decoder.container(keyedBy: FutureCodingKeys.self) else {
-                return nil
-            }
-            return try? future.decodeIfPresent(String.self, forKey: .related_execution_id)
-        }()
-        relatedWorkshopExecutionId = try futureRelatedExecutionId
-            ?? c.decodeIfPresent(String.self, forKey: .relatedWorkshopExecutionId)
+        relatedWorkshopExecutionId = try c.decodeIfPresent(String.self, forKey: .relatedWorkshopExecutionId)
+        relatedDelegationID = try c.decodeIfPresent(String.self, forKey: .relatedDelegationID)
         related_approval_id = try c.decodeIfPresent(String.self, forKey: .related_approval_id)
         related_paths = try c.decodeIfPresent([String].self, forKey: .related_paths)
         related_groups = try c.decodeIfPresent([InboxRelatedGroup].self, forKey: .related_groups)
@@ -162,7 +171,7 @@ extension InboxItemRecord {
         chat_session_id = try c.decodeIfPresent(String.self, forKey: .chat_session_id)
         interaction_session_id = try c.decodeIfPresent(String.self, forKey: .interaction_session_id)
         interaction_id = try c.decodeIfPresent(String.self, forKey: .interaction_id)
-        presentation = try? c.decodeIfPresent(InboxSourcePresentation.self, forKey: .presentation)
+        presentation = try c.decodeIfPresent(InboxSourcePresentation.self, forKey: .presentation)
     }
 
 }

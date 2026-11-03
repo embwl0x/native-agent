@@ -9,7 +9,7 @@ import ChatTurnContracts
 import MemoryV2
 import TrustCenter
 import WorkshopExecution
-// Blueprint: | `ApprovalTransactionCoordinator+Effects.swift` | `ApprovalTransactionEffects` port; `ApprovalExecution.decideBlockedWorkshopStep`; workshop-step decision/approval transaction |
+// Blueprint: | `ApprovalTransactionCoordinator+Effects.swift` | `ApprovalTransactionEffects` port returns actual browser run outcomes to checked settlement; `ApprovalExecution.decideBlockedWorkshopStep`; workshop-step decision/approval transaction |
 
 /// Effect adapters supplied by the host; transaction ordering and replay fences
 /// remain in ApprovalExecution.
@@ -23,15 +23,16 @@ public protocol ApprovalTransactionEffects: Sendable {
     func continueChatToolApproval(dataRoot: URL, sessionID: String, envelope: TurnEnvelope, prompt: String, fileAccess: String) async throws
     func chatTurnCompleted(sessionID: String?) async
     func observeBrowserMotorAction(runID: String, dataRoot: URL) async
-    func executeApprovedBrowserRun(from record: ApprovalRecord) async throws
-    func finishRejectedBrowserRun(from record: ApprovalRecord, status: String) async throws
-    func workshopExecutor() -> WorkshopExecutorLoop
+    func executeApprovedBrowserRun(from record: ApprovalRecord) async throws -> JSONValue
+    func finishRejectedBrowserRun(from record: ApprovalRecord, status: String) async throws -> JSONValue
+    func workshopExecutor() throws -> WorkshopExecutorLoop
     func workshopStepNotFound(_ description: String) -> any Error
 }
 
 public extension ApprovalExecution {
     /// Deny or Approve on the Desk's waiting step (MacWorkOverviewDetail), for
-    /// the agent: the same `rejectStep` / `approveStep`, decided in her name.
+    /// the agent: the same `rejectStep` / `approveStep`, attributed to this
+    /// local agent seat rather than a mutable persona display name.
     /// Only the step the task is blocked on; approving is User's below Full
     /// Mac, and the door refuses it there.
     func decideBlockedWorkshopStep(id: String, approve: Bool, runner: @Sendable () -> SwiftNativeWorkshopRunner) async throws -> JSONValue {
@@ -49,13 +50,15 @@ public extension ApprovalExecution {
             return .object(["status": .string("not_blocked"), "id": .string(id), "execution_status": .string(execution.status),
                 "detail": .string("This task is \(execution.status), not waiting on a step approval, so there is nothing to \(approve ? "approve" : "deny").")])
         }
-        let provenance = ApprovalResolutionProvenance.local(
-            decidedBy: PersonaCompiler.agentDisplayName(dataRoot: dataRoot))
+        // Require the canonical identity to be readable before recording her
+        // decision. The stable seat is attribution; the display label is not.
+        _ = try PersonaCompiler.compileProfile(dataRoot: dataRoot)
+        let provenance = ApprovalResolutionProvenance.local(decidedBy: "agent")
         if approve {
             // A step that cannot be undone on his side waits for his tap even
             // under Full Mac (User, 10-17); her approve never stands in for his.
             let staged = try await stagedWorkshopStep(executionId: id, stepId: execution.currentStepId)
-            if PermissionLaw.humanDecides(action: staged.action, payload: staged.payload) {
+            if try PermissionLaw.humanDecides(action: staged.action, payload: staged.payload) {
                 return .object(["status": .string("owners_call"), "id": .string(id), "step_id": .string(execution.currentStepId),
                     "detail": .string("That step would run something that cannot be undone on the person's side, so its card waits for their tap even under Full Mac. Nothing was approved; leave it for them, or deny it.")])
             }
@@ -98,7 +101,6 @@ public extension ApprovalExecution {
     /// The pending card staged for exactly this step.
     func stagedWorkshopStep(executionId: String, stepId: String) async throws -> ApprovalRecord {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        try await inbox.mergeLegacyApprovalRows()
         let pending = try await inbox.list(filter: ApprovalFilter(status: "pending"))
         guard let staged = pending.first(where: { record in
             guard ExecutionEventVocabulary.matches(

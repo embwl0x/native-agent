@@ -24,8 +24,10 @@ public struct OAuthCredentialHealth: Sendable {
 public enum ProviderOAuthCredentialMaintenance {
     public static func status(provider: String, root: URL) throws -> OAuthCredentialHealth {
         let path = credentialPath(provider: provider, root: root)
-        let object: [String: Any]
-        if provider == "xai_oauth_direct" {
+        let object: [String: Any]?
+        if provider == "openai_oauth_direct" {
+            object = try ChatGPTTransport.loadAuthBlob(at: path)
+        } else if provider == "xai_oauth_direct" {
             object = try XAIOAuthCredentialStore.read(at: path)
         } else {
             let data = try Data(contentsOf: path)
@@ -43,7 +45,7 @@ public enum ProviderOAuthCredentialMaintenance {
         var health = verdict.health
         health.detail = verdict.detail
         health.authPath = path
-        if provider == "openai_oauth_direct" { health.accountEmail = NativeOAuthFlow.openAIAccountEmail(in: object) }
+        if provider == "openai_oauth_direct" { health.accountEmail = object.flatMap { NativeOAuthFlow.openAIAccountEmail(in: $0) } }
         return health
     }
 

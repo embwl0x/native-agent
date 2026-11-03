@@ -3,7 +3,7 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `ErrorFeeds.swift` | `ErrorFeeds`: shared live error-feed inventory and bounded recent-burst scans for heartbeat and weekly improvement |
+// Blueprint: | `ErrorFeeds.swift` | `ErrorFeeds`: shared live error-feed inventory and bounded recent-burst scans with explicit read/integrity availability |
 
 /// The live error sinks the heartbeat and the weekly self-improvement pass
 /// read. A burst across them is `errorBurstThreshold` rows inside
@@ -52,6 +52,7 @@ public enum ErrorFeeds {
     /// Bounded recent evidence from one watched feed.
     public struct ErrorFeedStatus: Sendable {
         public let feed: ErrorFeed
+        public let unavailable: String?
         /// Rows inside `errorBurstWindow` (always 0 for a silent feed — it is
         /// not read at all).
         public let recentCount: Int
@@ -68,42 +69,51 @@ public enum ErrorFeeds {
     static let errorLogTailBytes = 256 * 1024
 
     /// Reads every watched feed's bounded tail and reports what it saw. Rows
-    /// WITHOUT a parseable timestamp are SKIPPED from the count — counting
-    /// undated/malformed historical rows as "current" makes a stale corrupt log
-    /// a permanent false burst trigger. The whole bounded tail is scanned (no
+    /// without a parseable timestamp make the reading unavailable; they cannot
+    /// establish a current burst or a clean count. The whole bounded tail is scanned (no
     /// early break — interleaved out-of-order timestamps must not hide newer
     /// rows). A silent feed is never opened: its rows cannot be current, and a
     /// bogus future timestamp in a dead file must not manufacture a burst.
     public static func scanErrorFeeds(dataRoot: URL, now: Date) -> [ErrorFeedStatus] {
         errorFeeds.map { feed in
             let path = feed.url(dataRoot: dataRoot)
-            let lastWriteAt = (try? FileManager.default.attributesOfItem(atPath: path.path))?[
-                .modificationDate] as? Date
-            let silent = lastWriteAt.map { now.timeIntervalSince($0) > feedSilentAfter } ?? true
-            guard !silent else {
-                return ErrorFeedStatus(
-                    feed: feed, recentCount: 0, earliestExpiry: nil, recentLines: [])
+            do {
+                let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+                guard let lastWriteAt = attributes[.modificationDate] as? Date else {
+                    throw PersistenceCoreError.ioFailure("modification date unavailable at \(path.path)")
+                }
+                guard now.timeIntervalSince(lastWriteAt) <= feedSilentAfter else {
+                    return ErrorFeedStatus(feed: feed, unavailable: nil,
+                        recentCount: 0, earliestExpiry: nil, recentLines: [])
+                }
+                let kept = try recentRows(at: path, now: now)
+                return ErrorFeedStatus(feed: feed, unavailable: nil,
+                    recentCount: kept.lines.count, earliestExpiry: kept.earliestExpiry,
+                    recentLines: Array(kept.lines.prefix(30).reversed()))
+            } catch CocoaError.fileReadNoSuchFile {
+                return ErrorFeedStatus(feed: feed, unavailable: nil,
+                    recentCount: 0, earliestExpiry: nil, recentLines: [])
+            } catch {
+                return ErrorFeedStatus(feed: feed, unavailable: "\(path.path): \(error.localizedDescription)",
+                    recentCount: 0, earliestExpiry: nil, recentLines: [])
             }
-            let kept = recentRows(at: path, now: now)
-            return ErrorFeedStatus(
-                feed: feed,
-                recentCount: kept.lines.count, earliestExpiry: kept.earliestExpiry,
-                recentLines: Array(kept.lines.prefix(30).reversed()))
         }
     }
 
     /// Newest-first rows inside the burst window from one feed's bounded tail.
-    private static func recentRows(at path: URL, now: Date) -> (lines: [String], earliestExpiry: Date?) {
-        guard let read = try? SwiftNativePersistenceCore.tailPhysicalLines(path, limit: .max, maxBytes: errorLogTailBytes) else { return ([], nil) }
+    private static func recentRows(at path: URL, now: Date) throws -> (lines: [String], earliestExpiry: Date?) {
+        guard let read = try SwiftNativePersistenceCore.tailPhysicalLines(path, limit: .max, maxBytes: errorLogTailBytes) else { return ([], nil) }
         let cutoff = now.addingTimeInterval(-errorBurstWindow)
         var kept: [String] = []
         var earliestExpiry: Date?
-        for lineData in read.lines.reversed() {
+        for lineData in read.lines.dropFirst(read.leadingFragment ? 1 : 0).reversed() {
             guard let line = String(data: lineData, encoding: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
                   let ts = (obj["lastAt"] as? String ?? obj["createdAt"] as? String ?? obj["at"] as? String
                     ?? obj["ts"] as? String ?? obj["timestamp"] as? String).flatMap(parseISO)
-            else { continue }  // undated/malformed: never counted as current
+            else {
+                throw PersistenceCoreError.ioFailure("error feed has a malformed or undated row at \(path.path); repair the retained evidence before judging its burst count")
+            }
             // No early break: writers can interleave slightly out-of-order
             // timestamps, and one stale row must not hide newer rows behind
             // it. The scan is already bounded by errorLogTailBytes.

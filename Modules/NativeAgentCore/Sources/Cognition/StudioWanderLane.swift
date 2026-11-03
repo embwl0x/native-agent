@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import Studio
-// Blueprint: | `StudioWanderLane.swift` | `StudioWanderLane` enum; installation, eligibility, carried-hour state and prompt for studio wandering |
+// Blueprint: | `StudioWanderLane.swift` | `StudioWanderLane` enum; installation, eligibility, carried-hour state and prompt for studio wandering; explicit run-now wait satisfaction reaches both quiet/refractory policy and locked beginHour without bypassing live-turn admission or reading damaged state as empty |
 
 /// The hour's installation, refractory law and durable trace share cognition's
 /// runtime owner. Installation is resolved before reading state; an absent
@@ -63,10 +63,19 @@ public enum StudioWanderLane {
     /// to it would be two different bodies.
     public static let quietInterval: TimeInterval = 30 * 60
 
-    /// At most once per day. Mirrors the dream's 24-hour refractory rather than
+    /// Automatically at most once per day; explicit mind.wander satisfies this
+    /// wait in both decide and beginHour. Mirrors the dream's 24-hour refractory rather than
     /// a calendar day so a wander at 23:50 cannot be followed by another at
     /// 00:10.
     public static let refractoryInterval: TimeInterval = 24 * 60 * 60
+
+    /// Project the same quiet/refractory boundaries decide uses onto the
+    /// runtime's existing deadline. A live turn is released by its idle edge.
+    public static func nextEligibility(now: Date, lastTurnActivityAt: Date?, lastWanderAt: Date?) -> Date? {
+        [lastTurnActivityAt?.addingTimeInterval(quietInterval),
+         lastWanderAt?.addingTimeInterval(refractoryInterval)]
+            .compactMap { $0 }.filter { $0 > now }.max()
+    }
 
     public enum Decision: String, Sendable, Equatable, CaseIterable {
         /// Every gate is satisfied: she may spend the hour now.
@@ -99,14 +108,15 @@ public enum StudioWanderLane {
         now: Date,
         turnInFlight: Bool,
         lastTurnActivityAt: Date?,
-        lastWanderAt: Date?
+        lastWanderAt: Date?,
+        satisfyWait: Bool = false
     ) -> Decision {
         if turnInFlight { return .turnInFlight }
-        if let lastTurnActivityAt,
+        if !satisfyWait, let lastTurnActivityAt,
            now.timeIntervalSince(lastTurnActivityAt) < quietInterval {
             return .notQuiet
         }
-        if let lastWanderAt,
+        if !satisfyWait, let lastWanderAt,
            now.timeIntervalSince(lastWanderAt) < refractoryInterval {
             return .alreadyToday
         }
@@ -242,13 +252,14 @@ public enum StudioWanderLane {
     public enum StateError: Error { case malformed, refractory }
 
     /// Reserve the existing durable refractory BEFORE any provider/tool effect.
+    /// Explicit run-now satisfies only this interval, never the checked state read.
     /// A crash or failed final trace cannot authorize replay on the next launch.
-    public static func beginHour(dataRoot: URL, at: Date) async throws {
+    public static func beginHour(dataRoot: URL, at: Date, satisfyWait: Bool = false) async throws {
         let path = statePath(dataRoot: dataRoot)
         try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
         try await SwiftNativePersistenceCore.withFileLock(path) {
             let existing = try await loadState(dataRoot: dataRoot)
-            if let last = existing.lastWanderAt, at.timeIntervalSince(last) < refractoryInterval {
+            if !satisfyWait, let last = existing.lastWanderAt, at.timeIntervalSince(last) < refractoryInterval {
                 throw StateError.refractory
             }
             try await SwiftNativePersistenceCore.writeJSON(.object([

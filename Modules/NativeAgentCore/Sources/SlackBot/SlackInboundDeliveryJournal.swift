@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SlackInboundDeliveryJournal.swift` | `SlackInboundDeliveryJournal` actor; socket/history/recovery admission, retains accepted handler tasks until actual exit with one active handler per event in the process (across loop replacements), and terminal delivery truth; `path`, `recoverySummary`, `failedReplyClaims`, `confirmReplyPart` retain confirmed text/image progress across holds; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
+// Blueprint: | `SlackInboundDeliveryJournal.swift` | `SlackInboundDeliveryJournal` actor; socket/recovery admission, retains accepted handler tasks until actual exit with one active handler per event in the process (across loop replacements), and terminal delivery truth; `recordPreview` retains live message identity and uncertain creation, `path`, `recoverySummary`, `failedReplyClaims`, `confirmReplyPart` retain confirmed text/image progress across holds; malformed canonical bytes remain in place and throw; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
 
 enum SlackInboundDeliveryPhase: String, Codable, Sendable {
     case claimed
@@ -65,6 +65,8 @@ struct SlackInboundDeliveryRecord: Codable, Equatable, Sendable {
     var lastRejection: Rejection? = nil
     var confirmedText: Bool? = nil
     var confirmedUploadCount: Int? = nil
+    var previewMessageTs: String? = nil
+    var previewCreationUnknown: Bool? = nil
 
     var hasValidUploadProgress: Bool {
         (0...(prepared?.uploads.count ?? 0)).contains(confirmedUploadCount ?? 0)
@@ -102,31 +104,24 @@ public actor SlackInboundDeliveryJournal {
         public let pendingCount: Int
         public let unknownCount: Int
         let pendingLimit: Int
-        /// Damaged journals renamed aside (`…json.stale-<ts>`) rather than
-        /// deleted. Non-zero means accepted-but-undelivered rows may have been
-        /// lost from the live journal and are only readable in those files.
-        var quarantinedCount: Int = 0
         public var isAtCapacity: Bool { pendingCount >= pendingLimit }
-        public var hasQuarantinedEvidence: Bool { quarantinedCount > 0 }
     }
 
     private struct File: Codable {
         var version = 1
         var records: [SlackInboundDeliveryRecord] = []
         var pendingLimit: Int?
-        /// Event ids whose bot-event fan-out has been taken. Absent in journals
-        /// written before 0.4.12, which decode as none taken.
+        /// Event ids whose bot-event fan-out has been taken.
         var botEventClaims: [String] = []
 
         init() {}
 
-        /// Only `botEventClaims`, added in 0.4.12, may be absent in older journals.
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             version = try c.decode(Int.self, forKey: .version)
             records = try c.decode([SlackInboundDeliveryRecord].self, forKey: .records)
             pendingLimit = try c.decodeIfPresent(Int.self, forKey: .pendingLimit)
-            botEventClaims = try c.decodeIfPresent([String].self, forKey: .botEventClaims) ?? []
+            botEventClaims = try c.decode([String].self, forKey: .botEventClaims)
         }
     }
 
@@ -160,40 +155,22 @@ public actor SlackInboundDeliveryJournal {
     /// fresh socket hello cannot hide a queue requiring human recovery.
     public nonisolated static func recoverySummary(dataRoot: URL) throws -> RecoverySummary? {
         let path = path(dataRoot: dataRoot)
-        let existed = FileManager.default.fileExists(atPath: path.path)
-        let file = existed ? try loadFile(path: path) : File()
-        let quarantined = quarantinedEvidencePaths(dataRoot: dataRoot).count
-        guard existed || quarantined > 0 else { return nil }
+        guard let file = try loadFile(path: path) else { return nil }
         return RecoverySummary(
             pendingCount: file.records.filter { !$0.phase.isTerminal }.count,
             unknownCount: file.records.filter { $0.phase == .outcomeUnknown }.count,
-            pendingLimit: max(1, file.pendingLimit ?? 100),
-            quarantinedCount: quarantined
+            pendingLimit: max(1, file.pendingLimit ?? 100)
         )
     }
 
     public nonisolated static func failedReplyClaims(dataRoot: URL) throws -> [(path: URL, at: String)] {
         let path = path(dataRoot: dataRoot)
         let formatter = ISO8601DateFormatter()
-        return try loadFile(path: path).records.filter { $0.phase == .failedBeforeAnswer }.map {
+        guard let file = try loadFile(path: path) else { return [] }
+        return file.records.filter { $0.phase == .failedBeforeAnswer }.map {
             (path: path, at: formatter.string(from: $0.updatedAt))
         }
     }
-
-    /// Damaged journals this actor renamed aside, newest last. Never deleted:
-    /// they hold accepted message bodies whose delivery is unproven.
-    nonisolated static func quarantinedEvidencePaths(dataRoot: URL) -> [URL] {
-        let journal = path(dataRoot: dataRoot)
-        let directory = journal.deletingLastPathComponent()
-        let prefix = journal.lastPathComponent + quarantineSuffixPrefix
-        let entries = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
-        return entries
-            .filter { $0.hasPrefix(prefix) }
-            .sorted()
-            .map { directory.appendingPathComponent($0) }
-    }
-
-    private static let quarantineSuffixPrefix = ".stale-"
 
     func claim(_ inbound: SlackInboundMessage, now: Date = Date()) throws -> SlackInboundClaimOutcome {
         try CredentialFileLock.withLock(path) {
@@ -236,7 +213,7 @@ public actor SlackInboundDeliveryJournal {
     }
 
     func reserveReply(_ inbound: SlackInboundMessage, reply: SlackPreparedReply, runId: String,
-                      sessionId: String, priorVerdict: String?) throws -> SlackInboundDeliveryRecord {
+                      sessionId: String) throws -> SlackInboundDeliveryRecord {
         try CredentialFileLock.withLock(path) {
             var file = try load()
             if let record = file.records.first(where: { $0.inbound.eventId == inbound.eventId }) {
@@ -247,9 +224,9 @@ public actor SlackInboundDeliveryJournal {
             }
             guard file.records.filter({ !$0.phase.isTerminal }).count < pendingCap else { throw SlackInboundJournalError.saturated(pendingCap) }
             let record = SlackInboundDeliveryRecord(lifeID: try DataRootLife.current(in: dataRoot), inbound: inbound,
-                phase: priorVerdict == "completed" ? .delivered : priorVerdict == nil ? .prepared : .sentUnconfirmed,
+                phase: .prepared,
                 prepared: reply, dispatchStartedAt: nil, updatedAt: Date(),
-                outcomeDetail: priorVerdict == "sent_unconfirmed" ? "legacy_completion_dispatch_unconfirmed" : nil,
+                outcomeDetail: nil,
                 assistantRunId: runId, assistantSessionId: sessionId)
             file.records.append(record)
             try save(file)
@@ -322,6 +299,15 @@ public actor SlackInboundDeliveryJournal {
             record.dispatchStartedAt = now
             record.updatedAt = now
             record.outcomeDetail = nil
+        }
+    }
+
+    /// Record possible creation before the wire; a missing response cannot authorize another post.
+    func recordPreview(eventId: String, messageTs: String?, creationUnknown: Bool) throws {
+        _ = try mutate(eventId: eventId) {
+            $0.previewMessageTs = messageTs
+            $0.previewCreationUnknown = creationUnknown
+            $0.updatedAt = Date()
         }
     }
 
@@ -432,6 +418,7 @@ public actor SlackInboundDeliveryJournal {
             $0.assistantRunId = runId; $0.assistantSessionId = sessionId
             $0.prepared = response; $0.phase = .prepared; $0.failedBeforeAnswer = false; $0.dispatchStartedAt = nil; $0.updatedAt = Date()
             $0.confirmedText = nil; $0.confirmedUploadCount = nil
+            $0.previewMessageTs = nil; $0.previewCreationUnknown = nil
         }
     }
 
@@ -453,11 +440,16 @@ public actor SlackInboundDeliveryJournal {
     }
 
     private func load() throws -> File {
-        try Self.loadFile(path: path)
+        try Self.loadFile(path: path) ?? File()
     }
 
-    nonisolated private static func loadFile(path: URL) throws -> File {
-        guard FileManager.default.fileExists(atPath: path.path) else { return File() }
+    nonisolated private static func loadFile(path: URL) throws -> File? {
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                throw SlackInboundJournalError.malformed
+            }
+        } catch CocoaError.fileReadNoSuchFile { return nil }
         let data = try Data(contentsOf: path)
         do {
             let decoder = JSONDecoder()

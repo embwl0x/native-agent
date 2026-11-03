@@ -5,7 +5,7 @@ import Darwin
 import NativeAgentChromeRelayCore
 import TrustCenter
 import MacControl
-// Blueprint: | `ChromeControlRuntime+ConversationTabs.swift` | `ChromeControlRuntime` conversation tab members: durable last-tab memory rebuilt from the group, numeric addressing, per-tab reading views and remembered owned-tab page.look; last eight release causes/times/URLs survive reconnects for this app run |
+// Blueprint: | `ChromeControlRuntime+ConversationTabs.swift` | `ChromeControlRuntime` conversation tab members: durable last-tab memory forgotten on release/ownership refusal, numeric addressing, per-tab reading views and remembered owned-tab page.look; last eight release causes/times/URLs survive reconnects for this app run |
 
 extension ChromeControlRuntime {
     private func refreshGroupTabs() async {
@@ -15,7 +15,7 @@ extension ChromeControlRuntime {
         groupTabs = rows
     }
 
-    private func rememberTab(_ id: Int64, session: String) {
+    private func rememberTab(_ id: Int64?, session: String) {
         guard NativeAgentChatSessionID.isSafePathComponent(session) else { return }
         guard rememberedTabIDs[session] != id || conversationTabsStorageError != nil else { return }
         rememberedTabIDs[session] = id
@@ -27,8 +27,16 @@ extension ChromeControlRuntime {
     }
 
     func recordReleasedTab(_ tab: JSONValue) {
+        if case .object(let row) = tab, case .int(let id)? = row["tabId"] {
+            forgetTab(id)
+        }
         releasedTabs.append(tab)
         if releasedTabs.count > 8 { releasedTabs.removeFirst(releasedTabs.count - 8) }
+    }
+
+    private func forgetTab(_ id: Int64) {
+        let sessions = rememberedTabIDs.compactMap { $0.value == id ? $0.key : nil }
+        for session in sessions { rememberTab(nil, session: session) }
     }
 
     public func conversationTabStatus(_ verifiedSessionID: String?) async -> [String: JSONValue] {
@@ -48,7 +56,8 @@ extension ChromeControlRuntime {
     }
 
     public func conversationSnapshotView(_ verifiedSessionID: String?, tabID: Int64? = nil) -> [String: JSONValue]? {
-        let tab = tabID.flatMap { groupTabs[$0] } ?? verifiedSessionID.flatMap { rememberedTabIDs[$0] }.flatMap { groupTabs[$0] }
+        let tab = if let tabID { groupTabs[tabID] }
+            else { verifiedSessionID.flatMap { rememberedTabIDs[$0] }.flatMap { groupTabs[$0] } }
         return tab?.hasReadView == true ? tab?.readingView : nil
     }
 
@@ -80,8 +89,18 @@ extension ChromeControlRuntime {
         if effect == .snapshot, let current, resolved["tabId"] == .int(current.tabID) {
             for (key, value) in current.readingView where resolved[key] == nil { resolved[key] = value }
         }
-        let (response, respondingChannel) = try await performOnChannel(effect, payload: resolved)
+        let reply: (response: JSONValue, channel: ChromeControlChannel)
+        do {
+            reply = try await performOnChannel(effect, payload: resolved)
+        } catch ChromeControlRuntimeError.extensionRejected(let code, let message) where code == "tab_not_owned" {
+            if case .int(let id)? = resolved["tabId"] { forgetTab(id) }
+            throw ChromeControlRuntimeError.extensionRejected(code: code, message: message)
+        }
+        let (response, respondingChannel) = reply
         if channel === respondingChannel, case .object(let envelope) = response, case .object(let result)? = envelope["result"] {
+            if case .object(let error)? = result["error"], error["code"] == .string("tab_not_owned"),
+               case .int(let id)? = resolved["tabId"] { forgetTab(id) }
+            if effect == .closeTab, result["tabClosed"] == .bool(true), case .int(let id)? = resolved["tabId"] { forgetTab(id) }
             await refreshGroupTabs()
             if channel === respondingChannel, !(effect == .closeTab && result["tabClosed"] == .bool(true)),
                effect != .navigate || result["outcome"] == .string("succeeded"),

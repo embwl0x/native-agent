@@ -18,8 +18,7 @@ enum NativeAgentMCPWire {
     static let versions = ["2025-11-25", "2025-06-18", "2025-03-26"]
     /// How long `agent_message` holds the call open for the reply when the
     /// caller does not say. Below the 60 s per-call default most MCP clients
-    /// use (TypeScript SDK, Codex), and below the 30 s HTTP limit of relays
-    /// spawned before this change, which hosts keep running until restarted.
+    /// use (TypeScript SDK, Codex), leaving time for transport settlement.
     static let defaultWaitSeconds = 25
     static let maximumWaitSeconds = 300
 
@@ -135,7 +134,7 @@ enum NativeAgentMCPWire {
                     // A waited call carries what the task holds now.
                     var failed = !accepted
                     if accepted, let state = receipt["original_status"] as? String {
-                        for key in ["reply", "attachments", "completionDelivery", "deliveryId", "has_more", "next_offset", "original_status", "run_id", "provider_failure", "work", "delegated_completions", "retrieval_result_class", "execution_result_class", "execution_terminal"] {
+                        for key in ["reply", "attachments", "completionDelivery", "deliveryId", "has_more", "next_offset", "original_status", "run_id", "provider_failure", "work", "delegated_completions", "retrieval_result_class", "execution_result_class", "execution_terminal", "reply_recovery"] {
                             result[key] = receipt[key]
                         }
                         let more = receipt["has_more"] as? Bool == true
@@ -153,6 +152,16 @@ enum NativeAgentMCPWire {
                         } else {
                             result["detail"] = "Queued and still in progress (\(state)); reply holds what is written so far. Read the rest with agent_reply. Do not resend."
                         }
+                    }
+                    // Acceptance and the requested observation are independent.
+                    if let retrieval = receipt["retrieval_result_class"] {
+                        result["retrieval_result_class"] = retrieval
+                    }
+                    if receipt["retrieval_result_class"] as? String == "failed" {
+                        if accepted { result["status"] = "enqueued" }
+                        result["detail"] = receipt["detail"]
+                        result["evidence"] = receipt["evidence"]
+                        failed = true
                     }
                     return toolResult(id, fields: result, failed: failed, held: held)
                 })
@@ -178,7 +187,7 @@ enum NativeAgentMCPWire {
                     waitSeconds = value
                 }
                 return .reply(requestID: request, sessionID: session, offset: offset, waitSeconds: waitSeconds, project: { receipt in
-                    let allowed: Set<String> = ["status", "reply", "attachments", "completionDelivery", "deliveryId", "request_id", "session_id", "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail", "provider_failure", "work", "delegated_completions", "wait_ignored", "retrieval_result_class", "execution_result_class", "execution_terminal"]
+                    let allowed: Set<String> = ["status", "reply", "attachments", "completionDelivery", "deliveryId", "request_id", "session_id", "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail", "provider_failure", "work", "delegated_completions", "wait_ignored", "retrieval_result_class", "execution_result_class", "execution_terminal", "reply_recovery"]
                     return toolResult(id, fields: receipt.filter { allowed.contains($0.key) },
                                       // "pending" is a reply still being written, not an error.
                                       failed: ["retrieval_result_class", "execution_result_class"].contains {
@@ -240,7 +249,12 @@ enum NativeAgentMCPWire {
             fields["held_messages"] = held.messages
             fields["held_remaining"] = held.remaining
         }
-        let data = (try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])) ?? Data("{}".utf8)
+        let data: Data
+        do { data = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]) }
+        catch {
+            return ["jsonrpc": "2.0", "id": id.value, "error": ["code": -32603,
+                "message": "The retained tool result could not be encoded: \(error.localizedDescription). Repair the result projection; do not repeat the action."]]
+        }
         return ["jsonrpc": "2.0", "id": id.value, "result": [
             "content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]],
             "structuredContent": fields, "isError": failed

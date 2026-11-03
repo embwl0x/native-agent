@@ -1,7 +1,8 @@
 import Foundation
+import Darwin
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `ExistingCornersSourceProvider.swift` | `ExistingCornersSourceProvider`: contract ports for today's raw material, native pages and source-owned live-watch inventory; packageManifest owns package membership, symlink/type rejection and the 8,000 total-member bound, including watched directories, for watching and archive delivery; `SenseNativePages` owns readable Chrome places, bounded conversation/tab-scoped private continuation bindings, structural things/verbs and existing raw UTF-8 windows |
+// Blueprint: | `ExistingCornersSourceProvider.swift` | `ExistingCornersSourceProvider`: contract ports for today's raw material, native pages and source-owned live-watch inventory; file changes carry checked membership, gated root absence or explicit unavailability, retain the same root/parent subscription through failed reads and absence, and rearm bounded membership only on source edges; public packageManifest owns package membership, symlink/type rejection and the 8,000 total-member bound, including watched directories, for watching, shared part/intention change identities and archive delivery; `SenseNativePages` owns readable Chrome places, bounded conversation/tab-scoped private continuation bindings, structural things/verbs and existing raw UTF-8 windows |
 
 /// Launch assembly supplies the existing, gated raw readers. Keeping the ports
 /// here avoids a dependency from Senses back into the door that consults it.
@@ -12,13 +13,13 @@ public protocol SenseNativePageSource: SenseSourceProvider {
 public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceWatchingProvider, SenseWatchReporting {
     private let readMaterial: @Sendable (SenseCorner, String?) async throws -> SenseMaterial
     private let readPage: @Sendable (SenseCorner, String?) async throws -> NativePage
-    private let readChanges: (@Sendable (SenseCorner, String?) async throws -> AsyncStream<SenseMaterial>)?
+    private let readChanges: (@Sendable (SenseCorner, String?) async throws -> AsyncStream<SenseSourceChange>)?
     private let reportWatches: (@Sendable () async -> [SenseLiveWatch])?
 
     public init(
         readMaterial: @escaping @Sendable (SenseCorner, String?) async throws -> SenseMaterial,
         readPage: @escaping @Sendable (SenseCorner, String?) async throws -> NativePage,
-        readChanges: (@Sendable (SenseCorner, String?) async throws -> AsyncStream<SenseMaterial>)? = nil,
+        readChanges: (@Sendable (SenseCorner, String?) async throws -> AsyncStream<SenseSourceChange>)? = nil,
         reportWatches: (@Sendable () async -> [SenseLiveWatch])? = nil
     ) {
         self.readMaterial = readMaterial
@@ -37,7 +38,7 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
         try await readPage(corner, address)
     }
 
-    public func changes(for corner: SenseCorner, address: String?) async throws -> AsyncStream<SenseMaterial> {
+    public func changes(for corner: SenseCorner, address: String?) async throws -> AsyncStream<SenseSourceChange> {
         if case .site = corner, let readChanges { return try await readChanges(corner, address) }
         if case .app = corner {
             guard let readChanges else {
@@ -45,45 +46,81 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
             }
             return try await readChanges(corner, address)
         }
-        guard case .fileKind = corner, case .file(let path, _, _) = try await material(for: corner, address: address) else {
+        guard case .fileKind = corner, let address else {
             throw SenseFailure(code: "unsupported", message: "This corner has no event-backed source watch.")
         }
+        // DoorSource supplies a JSON read address; part wakes supply a path.
+        // Resolving identity does not admit a read: each source edge below still
+        // passes material's ordinary gates before exposing any membership.
+        let path: String
+        if address.hasPrefix("{") {
+            guard case .object(let fields) = try JSONValue.parse(Data(address.utf8)),
+                  case .string(let value)? = fields["path"] else {
+                throw SenseFailure(code: "source_unavailable", message: "A file watch needs its requested path.")
+            }
+            path = value
+        } else if let url = URL(string: address), url.isFileURL { path = url.path }
+        else { path = NSString(string: address).expandingTildeInPath }
+        guard path.hasPrefix("/") else {
+            throw SenseFailure(code: "source_unavailable", message: "A file watch needs an absolute path.")
+        }
         let root = URL(fileURLWithPath: path)
-        let paths = try Self.watchPaths(root)
+        // Root/parent observation survives absence and unreadable membership.
+        // It is the same source subscription, never an EnginePartWake substitute.
+        let paths = [root, root.deletingLastPathComponent()]
         let initial = FileChangeEvents(paths: paths, emitInitial: false)
-        let pair = AsyncStream<SenseMaterial>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let pair = AsyncStream<SenseSourceChange>.makeStream(bufferingPolicy: .bufferingNewest(1))
         // Observation outlives the turn; it must not inherit its session,
         // approvals, file grants or action callback.
         let task = Task.detached(priority: .utility) {
             var events = initial
             var watched = Set(paths)
             defer { events.cancel(); pair.continuation.finish() }
-            do {
-                await events.waitUntilArmed()
-                guard !Task.isCancelled else { return }
-                // One race-closing read, rather than one initial edge per
-                // package member. JS compares the actual bytes before notifying.
-                pair.continuation.yield(try await self.material(for: corner, address: address))
-                while !Task.isCancelled {
-                    var rearmed = false
-                    for await _ in events.stream {
-                        guard !Task.isCancelled else { return }
-                        let nextPaths = try Self.watchPaths(root)
-                        if Set(nextPaths) != watched {
-                            let next = FileChangeEvents(paths: nextPaths, emitInitial: false)
-                            await next.waitUntilArmed()
-                            guard !Task.isCancelled else { next.cancel(); return }
-                            events.cancel(); events = next; watched = Set(nextPaths); rearmed = true
-                        }
-                        pair.continuation.yield(try await self.material(for: corner, address: address))
-                        if rearmed { break }
+            func unavailable(_ error: Error) async {
+                let failure = (error as? SenseFailure) ?? SenseFailure(code: "source_unavailable", message: error.localizedDescription)
+                pair.continuation.yield(.unavailable(failure))
+            }
+            guard await events.waitUntilArmed() else {
+                if !Task.isCancelled { await unavailable(SenseFailure(code: "source_unavailable", message: "File observation could not be armed for \(path).")) }
+                return
+            }
+            guard !Task.isCancelled else { return }
+            while !Task.isCancelled {
+                do {
+                    let material = try await self.material(for: corner, address: address)
+                    guard case .file(let admittedPath, _, _) = material,
+                          URL(fileURLWithPath: admittedPath).standardizedFileURL.path == root.standardizedFileURL.path else {
+                        throw SenseFailure(code: "source_unavailable", message: "File observation must retain its requested path.")
                     }
-                    if !rearmed { break }
+                    let nextPaths = try Self.watchPaths(root)
+                    if Set(nextPaths) != watched {
+                        let next = FileChangeEvents(paths: nextPaths, emitInitial: false)
+                        guard await next.waitUntilArmed() else {
+                            next.cancel()
+                            throw SenseFailure(code: "source_unavailable", message: "File membership observation could not be armed for \(path).")
+                        }
+                        guard !Task.isCancelled else { next.cancel(); return }
+                        events.cancel(); events = next; watched = Set(nextPaths)
+                    }
+                    // Identity is checked only after read admission. Failure
+                    // retains the previous identity, never a guessed deletion.
+                    let identity = try Self.fileIdentity(root)
+                    pair.continuation.yield(.changed(material, files: identity))
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    if let failure = error as? SenseFailure, failure.code == "source_absent" {
+                        pair.continuation.yield(.absent)
+                    } else {
+                        await unavailable(error)
+                    }
                 }
-            } catch {
-                guard !Task.isCancelled else { return }
-                await Self.postWatchFailure(error, corner: corner, address: address ?? path, observationID: path, what: "File")
-                FileHandle.standardError.write(Data("[senses] Live file observation failed: \(error)\n".utf8))
+                // No timer or reread after failure. A source edge is the only
+                // repair admission; no edge leaves the unavailable watch waiting.
+                var iterator = events.stream.makeAsyncIterator()
+                guard await iterator.next() != nil else {
+                    if !Task.isCancelled { await unavailable(SenseFailure(code: "source_unavailable", message: "File observation ended for \(path); a part/catalog change can register it again.")) }
+                    return
+                }
             }
         }
         pair.continuation.onTermination = { _ in task.cancel(); initial.cancel() }
@@ -104,16 +141,32 @@ public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceW
     }
 
     private static func watchPaths(_ root: URL) throws -> [URL] {
-        var directory: ObjCBool = false
-        _ = FileManager.default.fileExists(atPath: root.path, isDirectory: &directory)
-        return [root, root.deletingLastPathComponent()] + (directory.boolValue ? try packageManifest(root,
+        let directory = try root.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
+        return [root, root.deletingLastPathComponent()] + (directory ? try packageManifest(root,
             symlinkMessage: "A watched document package cannot contain symbolic links.",
             memberFailure: SenseFailure(code: "material_too_large", message: "The document package has too many watched members.")).map(\.url) : [])
     }
 
+    private static func fileIdentity(_ root: URL) throws -> [String: [Int64]] {
+        func stamp(_ url: URL, directory: Bool) throws -> [Int64] {
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else {
+                throw SenseFailure(code: "source_unavailable", message: "File identity is unreadable at \(url.path) (errno \(errno)).")
+            }
+            if directory { return [Int64(info.st_ino)] }
+            return [Int64(info.st_ino), Int64(info.st_size), Int64(info.st_mtimespec.tv_sec), Int64(info.st_mtimespec.tv_nsec)]
+        }
+        let directory = try root.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
+        var result = [root.path: try stamp(root, directory: directory)]
+        if directory {
+            for member in try packageManifest(root) { result[member.url.path] = try stamp(member.url, directory: !member.isFile) }
+        }
+        return result
+    }
+
     /// Watching and delivery share the 8,000-member bound, including directories
     /// watched for changes. Only regular files are archived for the helper.
-    static func packageManifest(_ root: URL, symlinkMessage: String = "Sense document packages cannot contain symbolic links.",
+    public static func packageManifest(_ root: URL, symlinkMessage: String = "Sense document packages cannot contain symbolic links.",
                                 memberFailure: SenseFailure = SenseFailure(code: "input_limit", message: "Sense document package exceeds its member limit.")) throws -> [(url: URL, isFile: Bool)] {
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
         var traversalFailed = false

@@ -15,35 +15,9 @@ import PersistenceCore
 import Desk
 import Transcripts
 import ProviderRouting
-// Blueprint: | `MacSyncEngine+SnapshotFreshness.swift` | Cancelled snapshot reads, stale-group accounting and group build outcomes |
+// Blueprint: | `MacSyncEngine+SnapshotFreshness.swift` | Manifest-derived stale-page accounting and group build outcomes; cancelled reads remain unavailable |
 
 extension MacSyncEngine {
-    nonisolated static func snapshotReadWasCancelled(_ error: Error) -> Bool {
-        if error is CancellationError { return true }
-        let nsError = error as NSError
-        return nsError.domain.contains("CancellationError")
-    }
-
-    /// Read a snapshot group, retrying EXACTLY once when the first attempt was
-    /// cancelled while this pass itself is still live. A pass that is genuinely
-    /// cancelled retries nothing — the second read would fail identically and
-    /// the caller must still record the skip.
-    static func retryingCancelledGroupRead<T>(
-        _ label: String,
-        _ read: () async throws -> T
-    ) async throws -> T {
-        do {
-            return try await read()
-        } catch {
-            guard snapshotReadWasCancelled(error), !Task.isCancelled else { throw error }
-            nativeLog(
-                "[MacSyncEngine] snapshot group %@ read was cancelled — retrying once before calling the phone stale",
-                label
-            )
-            return try await read()
-        }
-    }
-
     /// The staleness marker the phone renders per screen.
     ///
     /// `snapshot_skips.json` is LOCAL Mac bookkeeping (Doctor reads it), so a
@@ -82,9 +56,21 @@ extension MacSyncEngine {
     ) -> [String: String] {
         let url = ICloudSyncStatePaths.snapshotSkips(dataRoot: dataRoot)
         var unresolved: [String: String] = [:]
-        if let data = try? Data(contentsOf: url),
-           let prior = try? JSONDecoder().decode([String: String].self, from: data) {
+        do {
+            let data = try Data(contentsOf: url)
+            let prior = try JSONDecoder().decode([String: String].self, from: data)
             unresolved = prior.filter { $0.key != "_observedAt" }
+        } catch {
+            if !Self.isNoSuchFileError(error) {
+                // A current pass cannot prove recovery for groups whose prior
+                // obligations are unreadable. Preserve that file unchanged.
+                let reason = "Snapshot failure history is unavailable (\(error.localizedDescription)); restore access to icloud/snapshot_skips.json and rebuild phone snapshots."
+                nativeLog("[MacSyncEngine] %@", reason)
+                let stems = Set(NAMobileSnapshotGroup.allCases.flatMap(\.filenames).map {
+                    URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent
+                })
+                return Dictionary(uniqueKeysWithValues: stems.map { ($0, reason) })
+            }
         }
         for group in attemptedGroups {
             unresolved.removeValue(forKey: group)

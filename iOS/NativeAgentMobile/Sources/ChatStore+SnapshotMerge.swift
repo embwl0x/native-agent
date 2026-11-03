@@ -44,8 +44,9 @@ extension ChatStore {
         }
         let placeholders = Set(matches.map { $0.1 })
         messages.removeAll { placeholders.contains($0.id) }
-        for (_, _, reply) in matches {
-            onReply?(reply.text)
+        for (pendingId, _, reply) in matches {
+            onTalkReply?(pendingId, reply.text, true, reply.completionState == "completed" ? nil : reply.failureDetail ?? "This reply ended before completion. Read it in Chat.")
+            onReply?(reply.text, pendingId)
         }
     }
 }

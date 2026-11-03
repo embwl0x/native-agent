@@ -21,25 +21,18 @@ import Transcripts
 
 extension SwiftToolDispatcher {
     func impl_context_lookup(input: [String: JSONValue]) async throws -> JSONValue {
-        var body = input
-        if body["type"]?.stringValue == nil,
-           body["lookup"]?.stringValue == nil,
-           body["id"]?.stringValue == nil {
-            body["type"] = .string("lookup_feature_surface")
+        try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["context_lookup"]).turnSchemas().compactMap { $0 }.first)
+        if let type = input["type"], type != .string("lookup_feature_surface") {
+            throw AutonomyGateError.toolDenied(reason: "capabilities.lookup type must be lookup_feature_surface.")
         }
-        let client = SwiftNativeContextClient()
-        guard let result = await client.lookup(body: body) else {
-            return .object([
-                "status": .string("unsupported"),
-                "runtime": .string("swift-native"),
-                "error": .string("context_lookup currently supports only the Swift-native feature-surface operating map branch."),
-                "supported_types": .array([
-                    .string("lookup_feature_surface"),
-                    .string("feature_surface"),
-                    .string("features"),
-                ]),
-            ])
-        }
+        let query: String
+        if let value = input["query"] {
+            guard case .string(let text) = value else {
+                throw AutonomyGateError.toolDenied(reason: "capabilities.lookup query must be a string.")
+            }
+            query = text
+        } else { query = "" }
+        let result = await SwiftNativeContextClient().lookup(query: query)
         // The lookup has finished. "ready" describes the feature catalog, not
         // a tool still waiting to run.
         guard case .object(var fields) = result.toJSON() else { return result.toJSON() }
@@ -48,10 +41,9 @@ extension SwiftToolDispatcher {
     }
 
     func impl_scratchpad_read(input: [String: JSONValue]) async throws -> JSONValue {
+        try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["scratchpad_read"]).turnSchemas().compactMap { $0 }.first)
         let input = input.filter { $0.value != .string("") }
-        let rawSessionID = input["session_id"]?.stringValue
-            ?? input["sessionId"]?.stringValue
-            ?? ""
+        let rawSessionID = input["session_id"]?.stringValue ?? ""
         let sessionID = rawSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !sessionID.isEmpty else {
             throw AutonomyGateError.toolDenied(reason: "scratchpad_read requires session_id")
@@ -100,6 +92,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_recent_trace_summary(input: [String: JSONValue]) async throws -> JSONValue {
+        try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["recent_trace_summary"]).turnSchemas().compactMap { $0 }.first)
         if input["view"]?.stringValue == "model_calls" {
             return try await TurnTraceRecentReader(dataRootOverride: dataRoot).modelCalls()
         }
@@ -142,11 +135,10 @@ extension SwiftToolDispatcher {
         let statusFilter = input["status"]?.stringValue
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .flatMap { $0.isEmpty ? nil : $0 }
-        // Normalize each alias before choosing one: a blank optional primary
-        // must not erase an explicit compatibility-alias filter.
-        let normalizedSessionFilter = ["session_id", "sessionId"]
-            .compactMap { input[$0]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty }
+        let normalizedSessionFilter: String? = {
+            guard let text = input["session_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+            return text
+        }()
         let turnID = input["turn_id"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let trace = input["trace"]?.stringValue
@@ -216,7 +208,7 @@ extension SwiftToolDispatcher {
         }
 
         let anchor: JSONValue = { if let event = events.first, case .object(let row) = event.jsonRow { return row["ts"] ?? .null }; return .null }()
-        func nonReadReceipt(_ event: TurnTraceEvent) -> Bool {
+        func nonReadReceipt(_ event: TurnTraceEvent) throws -> Bool {
             guard event.kind == "tool.dispatch", case .object(let payload) = event.payload,
                   payload["phase"] == .string("end") else { return false }
             let receipt = if case .object(let receipt)? = payload["receipt"] { receipt } else { [String: JSONValue]() }
@@ -224,12 +216,12 @@ extension SwiftToolDispatcher {
             let action = receipt["action"]?.stringValue ?? payload["name"]?.stringValue ?? payload["tool"]?.stringValue ?? ""
             let arguments = payload["args"]?.stringValue.flatMap { try? JSONValue.parse(Data($0.utf8)) }
             let args = if case .object(let args)? = arguments { args } else { [String: JSONValue]() }
-            let policy = AppActionBinding.action(input: ["action": .string(action), "args": args["args"] ?? .object(args)])
+            let policy = try AppActionBinding.action(input: ["action": .string(action), "args": args["args"] ?? .object(args)])
             return result["effects"] == .string("occurred")
                 || (policy?.read == false && (arguments != nil || policy?.readWhen.isEmpty == true))
         }
         // Rank after anchoring in time so continuation offsets retain this ordering.
-        let classified = events.map { (event: $0, nonRead: receiptView && nonReadReceipt($0)) }
+        let classified = try events.map { (event: $0, nonRead: try receiptView && nonReadReceipt($0)) }
         let ranked = receiptView ? classified.filter(\.nonRead) + classified.filter { !$0.nonRead } : classified
         events = ranked.map(\.event)
         var summaries: [JSONValue] = []

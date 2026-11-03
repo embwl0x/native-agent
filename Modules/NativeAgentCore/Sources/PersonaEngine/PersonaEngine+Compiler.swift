@@ -3,7 +3,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `PersonaEngine+Compiler.swift` | `PersonaCompiler`: `compile`, `fingerprint`, `renderPrompt`; batched context surfaces share canonical persona documents and identity, with separate surface overrides; USER core projection |
+// Blueprint: | `PersonaEngine+Compiler.swift` | `PersonaCompiler`: every compile/snapshot requires checked identity; checked-missing required canonical documents reach their locked genesis owner; unreadable inputs fail by path; batched surfaces share documents and identity; display labels remain nonthrowing; `configuredNames` (checked sender and recipient) |
 
 // MARK: - PersonalityPacket
 
@@ -91,18 +91,10 @@ public struct CompiledPersonalityProfile: Sendable, Equatable {
     public let personaEngineVersion: String
     public let name: String
     public let personaKind: String
-    public let essence: String
-    public let voice: String
-    public let customDirective: String
     public let traits: CompiledPersonalityTraits
-    public let examples: [String]
-    public let forbiddenPatterns: [String]
-    public let instincts: [String]
-    public let boundaries: [String]
-    public let surfaceOverrides: [String: String]
     public let updatedAt: String
 
-    /// Unknown profile.json keys round-trip losslessly, disjoint from normalized fields and the consumed gender alias.
+    /// Unknown profile.json keys round-trip losslessly, disjoint from current fields.
     public let extras: [String: JSONValue]
 
     public init(
@@ -110,15 +102,7 @@ public struct CompiledPersonalityProfile: Sendable, Equatable {
         personaEngineVersion: String,
         name: String,
         personaKind: String,
-        essence: String,
-        voice: String,
-        customDirective: String,
         traits: CompiledPersonalityTraits,
-        examples: [String],
-        forbiddenPatterns: [String],
-        instincts: [String],
-        boundaries: [String],
-        surfaceOverrides: [String: String],
         updatedAt: String,
         extras: [String: JSONValue] = [:]
     ) {
@@ -126,59 +110,28 @@ public struct CompiledPersonalityProfile: Sendable, Equatable {
         self.personaEngineVersion = personaEngineVersion
         self.name = name
         self.personaKind = personaKind
-        self.essence = essence
-        self.voice = voice
-        self.customDirective = customDirective
         self.traits = traits
-        self.examples = examples
-        self.forbiddenPatterns = forbiddenPatterns
-        self.instincts = instincts
-        self.boundaries = boundaries
-        self.surfaceOverrides = surfaceOverrides
         self.updatedAt = updatedAt
         self.extras = extras
     }
 
-    /// Normalization seed for missing profile storage and absent or malformed fields.
-    public static let defaults: CompiledPersonalityProfile = CompiledPersonalityProfile(
-        schemaVersion: 2,
-        personaEngineVersion: "2.0",
-        name: "NativeAgent",
-        personaKind: "AI",
-        essence: "A calm, sharp, practical native macOS agent that improves itself inside its own sandbox and helps the user get real work done.",
-        voice: "Direct, grounded, specific, with no corporate fluff.",
-        customDirective: "",
-        traits: CompiledPersonalityTraits(
-            warmth: 0.45, directness: 0.82, humor: 0.12, proactivity: 0.78,
-            rigor: 0.86, autonomy: 0.82, creativity: 0.58, brevity: 0.74
-        ),
-        examples: [
-            "When tools are involved, be explicit about what was actually done.",
-        ],
-        forbiddenPatterns: [
-            "Claiming tool or file actions that did not happen.",
-        ],
-        instincts: [
-            "Keep self-improvement autonomous but contained to app-owned paths.",
-        ],
-        boundaries: [
-            "Do not invent tool results.",
-            "Do not claim files were changed unless they were.",
-            "Do not autonomously modify unrelated computer files while improving yourself.",
-        ],
-        surfaceOverrides: [
-            "chat": "",
-            "dream": "Reflect like an internal agent maintenance pass: specific lessons, memory candidates, eval ideas, and improvement targets.",
-            "autonomy": "Operate as a careful self-improvement engineer inside the app-owned worktree.",
-        ],
-        updatedAt: ""
-    )
+    /// Only explicit onboarding/repair inputs can create an identity.
+    package static func genesis(name: String, personaKind: String) -> CompiledPersonalityProfile {
+        CompiledPersonalityProfile(
+            schemaVersion: 2, personaEngineVersion: "2.0", name: name,
+            personaKind: personaKind,
+            traits: CompiledPersonalityTraits(
+                warmth: 0.45, directness: 0.82, humor: 0.12, proactivity: 0.78,
+                rigor: 0.86, autonomy: 0.82, creativity: 0.58, brevity: 0.74),
+            updatedAt: NativeTimestampFormat.fractionalZulu(Date()))
+    }
+
 }
 
 // MARK: - PersonaCompiler
 
 /// Compiles each surface from the engine's persona and data roots.
-/// Optional active.json, selected persona documents, MEMORY.md and surface
+/// Selected persona documents, optional MEMORY.md and surface
 /// overrides remain accepted file inputs. Local/off-disk backup and data export
 /// include the persona root; phone sync excludes it; PrivacyMap: persona.
 public actor PersonaCompiler {
@@ -208,23 +161,17 @@ public actor PersonaCompiler {
 
     // MARK: Public API
 
-    /// Honours the shared persona selection. When the selected name identifies
-    /// a subdir under the persona root that contains at least one marker doc,
-    /// that subdir wins over the on-disk `active.json` / scan resolution.
-    /// Override resolution failures fall through to the normal resolver — a
-    /// typo can't blank the persona. A turn requires the saved name: an
-    /// unreadable profile then throws the repair text instead of omitting it.
+    /// Every surface requires the canonical identity and resolves an explicit
+    /// persona selection exactly. An unavailable source fails compilation.
     public func compile(
         surface: String,
         personaOverride: String? = nil,
-        userMemoryCore: [String]? = nil,
-        identityRequired: Bool = false
+        userMemoryCore: [String]? = nil
     ) async throws -> PersonalityPacket {
         try await resolvedCompilation(
             surface: surface,
             personaOverride: personaOverride,
-            userMemoryCore: userMemoryCore,
-            identityRequired: identityRequired
+            userMemoryCore: userMemoryCore
         ).packet
     }
 
@@ -235,34 +182,35 @@ public actor PersonaCompiler {
     private func resolvedCompilation(
         surface: String,
         personaOverride: String?,
-        userMemoryCore: [String]? = nil,
-        identityRequired: Bool = false
+        userMemoryCore: [String]? = nil
     ) async throws -> ResolvedCompilation {
         let root = await engine.personaRoot
 
         let persona = try Self.resolveActivePersona(
             root: root, personaOverride: personaOverride, fileManager: fileManager
         )
-        let documents = try canonicalDocuments(root: root, personaSubdir: persona.subdir)
-        var identity: String?
-        // Unless a turn requires it, an unreadable profile omits the line;
-        // her documents still carry her name.
-        do {
-            identity = try Self.identityPrompt(dataRoot: await engine.dataRootURL)
-        } catch where !identityRequired {}
+        let documents = try await canonicalDocuments(root: root, personaSubdir: persona.subdir)
+        let identity = try Self.identityPrompt(dataRoot: await engine.dataRootURL)
         return try resolvedCompilation(
             surface: surface, root: root, persona: persona,
             documents: documents, identity: identity, userMemoryCore: userMemoryCore
         )
     }
 
-    private func canonicalDocuments(root: URL, personaSubdir: URL?) throws -> [PersonaContextDocumentSource] {
+    private func canonicalDocuments(root: URL, personaSubdir: URL?) async throws -> [PersonaContextDocumentSource] {
         var documents: [PersonaContextDocumentSource] = []
         for (order, id) in Self.canonicalDocOrder.enumerated() {
             if let personaSubdir, let override = try readDoc(root: personaSubdir, id: id, order: order) {
                 documents.append(override)
-            } else if let canonical = try readDoc(root: root, id: id, order: order) {
-                documents.append(canonical)
+            } else {
+                if id != "MEMORY" {
+                    // Genesis precedes the read, only for checked absence. A failed
+                    // read never selects a template or another source.
+                    _ = try await engine.createMissingRequiredDocument(id: id)
+                }
+                if let canonical = try readDoc(root: root, id: id, order: order, required: id != "MEMORY") {
+                    documents.append(canonical)
+                }
             }
         }
         return documents
@@ -273,7 +221,7 @@ public actor PersonaCompiler {
         root: URL,
         persona: (kind: String, id: String, subdir: URL?),
         documents: [PersonaContextDocumentSource],
-        identity: String?,
+        identity: String,
         userMemoryCore: [String]? = nil
     ) throws -> ResolvedCompilation {
         var documents = documents
@@ -352,7 +300,7 @@ public actor PersonaCompiler {
     ) async throws -> [PersonaContextSourceSnapshot] {
         let root = await engine.personaRoot
         let selected = PersonaSelection.current() ?? ""
-        let identity = try? Self.identityPrompt(dataRoot: await engine.dataRootURL)
+        let identity = try Self.identityPrompt(dataRoot: await engine.dataRootURL)
         var resolvedByOverride: [String: (kind: String, id: String, subdir: URL?)] = [:]
         var documentsByPersona: [String: [PersonaContextDocumentSource]] = [:]
         var snapshots: [PersonaContextSourceSnapshot] = []
@@ -371,7 +319,7 @@ public actor PersonaCompiler {
             if let cached = documentsByPersona[persona.id] {
                 documents = cached
             } else {
-                let loaded = try canonicalDocuments(root: root, personaSubdir: persona.subdir)
+                let loaded = try await canonicalDocuments(root: root, personaSubdir: persona.subdir)
                 documentsByPersona[persona.id] = loaded
                 documents = loaded
             }
@@ -402,7 +350,7 @@ public actor PersonaCompiler {
         )
     }
 
-    /// Only missing storage receives defaults when compiling authoritative identity.
+    /// Existing identity is always a checked read. Only onboarding creates a profile.
     public nonisolated static func compileProfile(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) throws -> CompiledPersonalityProfile {
@@ -414,23 +362,21 @@ public actor PersonaCompiler {
             guard let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 throw PersonaEngineError.underlying("The profile must be a JSON object.")
             }
-            guard raw["name"] == nil || raw["name"] is String else {
-                throw PersonaEngineError.underlying("The profile name must be text.")
-            }
-            return normalize(raw: raw, defaults: .defaults)
-        } catch CocoaError.fileReadNoSuchFile {
-            return normalize(raw: [:], defaults: .defaults)
+            return try decodeProfile(raw: raw)
         } catch {
-            throw PersonaEngineError.underlying("The saved personality profile is unavailable. Repair or restore access to memory/profile.json before continuing. \(error.localizedDescription)")
+            throw PersonaEngineError.profileUnavailable(path: profileURL.path, reason: error.localizedDescription)
         }
     }
 
-    /// Display and trait readers use a default-seeded projection when storage is unavailable.
-    /// Authoritative identity and profile editing use the checked compiler.
-    public nonisolated static func loadProfile(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> CompiledPersonalityProfile {
-        (try? compileProfile(dataRoot: dataRoot)) ?? .defaults
+    /// Routing wording requires both saved identities. Onboarding alone owns
+    /// creating them; consumers never invent a sender or recipient.
+    public nonisolated static func configuredNames(dataRoot: URL) throws -> (agent: String, user: String) {
+        let profile = try compileProfile(dataRoot: dataRoot)
+        guard case .string(let supplied)? = profile.extras["userName"],
+              !supplied.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw PersonaEngineError.underlying("memory/profile.json.userName must be nonempty text. Repair that field before starting the helper.")
+        }
+        return (agentDisplayName(profile: profile), supplied.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     /// Shared display-name normalization, including generic names and the
@@ -445,7 +391,11 @@ public actor PersonaCompiler {
     public nonisolated static func agentDisplayName(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> String {
-        return agentDisplayName(profile: loadProfile(dataRoot: dataRoot))
+        do { return agentDisplayName(profile: try compileProfile(dataRoot: dataRoot)) }
+        catch {
+            FileHandle.standardError.write(Data("Persona identity unavailable: \(error.localizedDescription)\n".utf8))
+            return ""
+        }
     }
 
     // MARK: - Internals
@@ -461,70 +411,30 @@ public actor PersonaCompiler {
         try fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey],
                                            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants])
             .filter { dir in
-                (try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-                    && (try? selectedPersonaDirectory(name: dir.lastPathComponent, root: root)) != nil
-                    && subdirHasMarker(dir, fileManager: fileManager)
+                guard try dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { return false }
+                let selected = try selectedPersonaDirectory(name: dir.lastPathComponent, root: root)
+                return try subdirHasMarker(selected, fileManager: fileManager)
             }.sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
-    /// Returns (kind, id, customSubdirURL?). Selection order:
-    ///   1. `<root>/active.json` { "persona": "<Name>" } if present + dir
-    ///      exists + dir has at least one marker doc → Custom.
-    ///   2. Otherwise scan immediate subdirs; pick the first (sorted)
-    ///      that contains a marker doc → Custom.
-    ///   3. None found → Default / "canonical".
+    /// Resolve one explicit selection. Only the absence of any saved selection
+    /// selects the canonical root; a missing custom persona cannot select another.
     private static func resolveActivePersona(
         root: URL,
         personaOverride: String?,
         fileManager: FileManager
     ) throws -> (kind: String, id: String, subdir: URL?) {
-        // 0. Shared selection. Trim, then look
-        //    for a subdir with at least one marker doc. Misses fall through
-        //    to the normal resolver so a typo can't blank the persona.
         if let raw = personaOverride ?? PersonaSelection.current() {
             let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if !name.isEmpty {
+                if name == "canonical" { return ("Default", "canonical", nil) }
                 let candidate = try selectedPersonaDirectory(name: name, root: root)
-                if subdirHasMarker(candidate, fileManager: fileManager) {
+                if try subdirHasMarker(candidate, fileManager: fileManager) {
                     return ("Custom", name, candidate)
                 }
-                // Override naming the canonical persona by display name (e.g.
-                // the configured name when SOUL.md lives at the root) —
-                // fall through to the scan + default. The chosen-persona name
-                // is preserved on `metadata.persona` upstream regardless.
+                throw PersonaEngineError.rootUnreadable(reason: "Selected persona \(name) has no persona documents at \(candidate.path). Repair the selection or select canonical.")
             }
         }
-        // 1. active.json
-        let activeFile = root.appendingPathComponent("active.json")
-        if fileManager.fileExists(atPath: activeFile.path) {
-            let name: String
-            do {
-                let data = try Data(contentsOf: activeFile)
-                guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let rawName = object["persona"] as? String,
-                      !rawName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    throw PersonaEngineError.rootUnreadable(
-                        reason: "active.json must contain a non-empty persona string"
-                    )
-                }
-                name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-            } catch let error as PersonaEngineError {
-                throw error
-            } catch {
-                throw PersonaEngineError.rootUnreadable(
-                    reason: "cannot read active.json: \(error.localizedDescription)"
-                )
-            }
-            let candidate = try selectedPersonaDirectory(name: name, root: root)
-            if subdirHasMarker(candidate, fileManager: fileManager) {
-                return ("Custom", name, candidate)
-            }
-        }
-        // 2. Scan immediate subdirs.
-        if let dir = try? customPersonaDirectories(root: root, fileManager: fileManager).first {
-            return ("Custom", dir.lastPathComponent, try selectedPersonaDirectory(name: dir.lastPathComponent, root: root))
-        }
-        // 3. Default
         return ("Default", "canonical", nil)
     }
 
@@ -543,33 +453,38 @@ public actor PersonaCompiler {
         return candidate
     }
 
-    private static func subdirHasMarker(_ dir: URL, fileManager: FileManager) -> Bool {
-        guard (try? dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
+    private static func subdirHasMarker(_ dir: URL, fileManager: FileManager) throws -> Bool {
+        let isDirectory: Bool?
+        do { isDirectory = try dir.resourceValues(forKeys: [.isDirectoryKey]).isDirectory }
+        catch CocoaError.fileReadNoSuchFile { return false }
+        guard isDirectory == true else {
             return false
         }
         for id in Self.personaMarkerDocs {
             let f = dir.appendingPathComponent("\(id).md")
-            if fileManager.fileExists(atPath: f.path) { return true }
+            do {
+                if try f.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true { return true }
+            } catch CocoaError.fileReadNoSuchFile { continue }
         }
         return false
     }
 
-    private func readDoc(root: URL, id: String, order: Int, surfaceOverride: Bool = false) throws -> PersonaContextDocumentSource? {
+    private func readDoc(root: URL, id: String, order: Int, surfaceOverride: Bool = false, required: Bool = false) throws -> PersonaContextDocumentSource? {
         let url = root.appendingPathComponent("\(id).md")
-        guard fileManager.fileExists(atPath: url.path) else { return nil }
-        return PersonaContextDocumentSource(id: surfaceOverride ? "surface:\(id)" : id,
-            fileURL: url, content: try readPersonaDocument(at: url), canonicalOrder: order,
-            optional: surfaceOverride || id == "MEMORY", surfaceOverride: surfaceOverride)
-    }
-
-    private func readPersonaDocument(at url: URL) throws -> String {
-        do {
-            return try SwiftNativePersonaEngine.readPersonaDocument(at: url)
-        } catch {
+        if try SwiftNativePersonaEngine.personaDocumentIsMissing(at: url) {
+            if required { throw PersonaEngineError.missingRequiredDocument(path: url.path) }
+            return nil
+        }
+        let content: String
+        do { content = try SwiftNativePersonaEngine.readPersonaDocument(at: url) }
+        catch {
             throw PersonaEngineError.rootUnreadable(
-                reason: "cannot read \(url.lastPathComponent): \(error.localizedDescription)"
+                reason: "cannot read \(url.path): \(error.localizedDescription). Repair or restore this document before continuing."
             )
         }
+        return PersonaContextDocumentSource(id: surfaceOverride ? "surface:\(id)" : id,
+            fileURL: url, content: content, canonicalOrder: order,
+            optional: surfaceOverride || id == "MEMORY", surfaceOverride: surfaceOverride)
     }
 
     public static func fingerprint(documents: [String: String], surface: String) -> String {

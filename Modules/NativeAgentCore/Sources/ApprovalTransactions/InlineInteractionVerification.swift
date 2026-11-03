@@ -27,7 +27,7 @@ import WorkshopExecution
 import Dispatcher
 import Browser
 import NotificationInbox
-// Blueprint: | `InlineInteractionVerification.swift` | Real-world card completion verification |
+// Blueprint: | `InlineInteractionVerification.swift` | Real-world card completion verification; Mail cards and transcript projections read the integration-status owner's checked readiness |
 extension InlineInteractionResolver {
     //
     // One rule, six kinds: ask the canonical owner, never the card, and never
@@ -45,25 +45,43 @@ extension InlineInteractionResolver {
     public static func completeIfVerified(
         id: String,
         sessionID: String,
+        expectedRevision: Int? = nil,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> Bool {
-        guard let current = await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
-              current.state.isOpen
-        else { return true }
+        let current: InlineInteraction
+        do {
+            // No card remains for this local watch to settle. This retires
+            // only the watch; it records no successful effect or outcome.
+            guard let found = try await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot) else { return true }
+            current = found
+        } catch {
+            recordControlFailure(id, dataRoot: dataRoot, error: error)
+            return false
+        }
+        guard current.state.isOpen else { return current.state.isTerminal }
+        if let expectedRevision, current.revision != expectedRevision { return true }
         guard !Task.isCancelled else { return false }
         guard case .success(let outcome) = await verify(
             current, selection: current.target, scope: nil, dataRoot: dataRoot
         ) else { return false }
-        return (try? await finish(
-            current, verification: .success(outcome), sessionID: sessionID, dataRoot: dataRoot
-        ))?.state.outcome != nil
+        do {
+            return try await finish(current, verification: .success(outcome), sessionID: sessionID,
+                                    dataRoot: dataRoot).state.outcome != nil
+        } catch let error as ResolveError {
+            if case .staleRevision = error { return true }
+            recordControlFailure(id, dataRoot: dataRoot, error: error)
+            return false
+        } catch {
+            recordControlFailure(id, dataRoot: dataRoot, error: error)
+            return false
+        }
     }
     /// READ SIDE ONLY. A card whose thing is already done — connected in the
     /// sheet, on the Connectors page, by Agent, before a relaunch — draws as
     /// the receipt its owner would give now. Nothing is written and nothing
     /// resumes: the owner's live state is the answer, every read. Kinds that
     /// need a pick (model, choose) are left to their own controls; Mail reads
-    /// macOS's live grant instead of its AppleScript probe.
+    /// the integration-status owner's evidence without starting a Mail check.
     public static func liveProjection(
         _ interaction: InlineInteraction,
         dataRoot: URL
@@ -76,18 +94,9 @@ extension InlineInteractionResolver {
         case .connector, .permission, .apiKey, .capability: break
         default: return interaction
         }
-        if interaction.kind == .connector, interaction.target == "mail" {
-            // Mail's own check is an AppleScript round trip; the cheap read is
-            // macOS's live Automation grant (never prompts; Mail not running
-            // reads as unknown, so the card stays), plus read access here.
-            guard await MacIntegrationPermissionStore(dataRoot: dataRoot).allows(MacIntegrationID.mail, mode: .read),
-                  await platform.probeAppleEventApp("Mail") == "granted"
-            else { return interaction }
-            return interaction.settled(.init(selection: "mail", summary: "Mail connected"),
-                                       at: interaction.settledAt ?? interaction.createdAt)
-        }
         guard case .success(let outcome) = await verify(
-            interaction, selection: interaction.target, scope: nil, dataRoot: dataRoot
+            interaction, selection: interaction.target, scope: nil, dataRoot: dataRoot,
+            checkMail: false
         ) else { return interaction }
         return interaction.settled(outcome, at: interaction.settledAt ?? interaction.createdAt)
     }
@@ -95,20 +104,19 @@ extension InlineInteractionResolver {
         _ interaction: InlineInteraction,
         selection: String?,
         scope: InlineInteraction.Scope?,
-        dataRoot: URL
+        dataRoot: URL,
+        checkMail: Bool = true
     ) async -> Verification {
         switch interaction.kind {
         case .connector:
             if interaction.target == "mail" {
-                let store = MacIntegrationPermissionStore(dataRoot: dataRoot)
-                guard await store.allows(MacIntegrationID.mail, mode: .read) else {
-                    return .failure("Mail read access is off or unavailable in Trust → Mac → Mail.")
+                let readiness = await platform.mailReadiness(root: dataRoot, check: checkMail)
+                guard readiness.status == "ready" else {
+                    if let next = readiness.next { return .failure(next) }
+                    return .failure(readiness.word)
                 }
-                let result = try? await platform.mailListRecent(input: ["limit": .int(1)])
-                guard case .object(let object) = result, object["status"] == .string("completed") else {
-                    return .failure("Mail still needs an enabled account and access to its inbox.")
-                }
-                return .success(.init(selection: "mail", summary: "Mail connected"))
+                let summary = "Mail connected" + (readiness.next.map { ". " + $0 } ?? "")
+                return .success(.init(selection: "mail", summary: summary))
             }
             if interaction.target == "chrome" {
                 let status = await platform.chromeConnectionStatus()
@@ -119,7 +127,10 @@ extension InlineInteractionResolver {
                 return .success(.init(selection: "chrome", summary: "Chrome connected"))
             }
             if interaction.target == "iphone" {
-                guard await platform.pairedPhoneCount() > 0 else {
+                guard let count = await platform.pairedPhoneCount() else {
+                    return .failure("Paired iPhone storage is unavailable. Restore access to the paired-phone store before checking setup again.")
+                }
+                guard count > 0 else {
                     return .failure("No iPhone is paired yet: open NativeAgent on the iPhone, then choose Pair here when the codes match.")
                 }
                 return .success(.init(selection: "iphone", summary: "iPhone paired"))
@@ -128,7 +139,9 @@ extension InlineInteractionResolver {
             // Connectors page shows. A pasted-but-invalid token does not read
             // as connected here, which is the point.
             let target = InlineInteractionRegistry.canonicalConnectorID(interaction.target)
-            let records = (try? await platform.connectorRecords(root: dataRoot)) ?? []
+            let records: [InlineInteractionConnectorStatus]
+            do { records = try await platform.connectorRecords(root: dataRoot) }
+            catch { return .failure(TurnSecretRedactor.redactText(error.localizedDescription)) }
             guard let record = records.first(where: {
                 InlineInteractionRegistry.canonicalConnectorID($0.id) == target
             }) else {
@@ -159,19 +172,24 @@ extension InlineInteractionResolver {
             // `trust/policy.json` behind the posture gate, and before this a
             // card for one of those could never settle because only the store
             // was ever asked.
-            let store = MacIntegrationPermissionStore(dataRoot: dataRoot)
-            let granted = (try? await store.currentChecked()) ?? [:]
+            let granted: [String: MacIntegrationPermission]
+            if interaction.allTargets.contains(where: { MacIntegrationID.all.contains($0) }) {
+                do { granted = try await MacIntegrationPermissionStore(dataRoot: dataRoot).currentChecked() }
+                catch { return .failure(error.localizedDescription) }
+            } else { granted = [:] } // This card has no integration axes to read.
             var missing: [String] = []
             for capability in interaction.allTargets {
                 if capability == "applescript" || capability == "automation" {
                     return .failure("Automation consent is per app. Request permission with target applescript:<bundle_id>.")
                 }
                 if InlineInteractionRegistry.isMacControlCategory(capability) {
-                    if !InlineInteractionRegistry.macControlCategoryAllowed(
+                    do {
+                    if try !InlineInteractionRegistry.macControlCategoryAllowed(
                         capability, dataRoot: dataRoot
                     ) {
                         missing.append(capability)
                     }
+                    } catch { return .failure(error.localizedDescription) }
                     continue
                 }
                 if !MacIntegrationID.all.contains(capability),
@@ -240,10 +258,10 @@ extension InlineInteractionResolver {
             guard let picked = selection, !picked.isEmpty else {
                 return .failure("No model was chosen.")
             }
-            // A pick names the account and the model. A card written before
-            // that — or a permanent change read back from Providers — carries
-            // the model alone.
-            let model = InlineInteractionRegistry.splitModelOptionID(picked)?.modelID ?? picked
+            guard let qualified = InlineInteractionRegistry.splitModelOptionID(picked) else {
+                return .failure("This model choice does not name its account. Choose an account-qualified model in Providers.")
+            }
+            let model = qualified.modelID
             if resolvedScope == .thisRequestOnly {
                 // Nothing to read back: the binding IS the resolution, and it
                 // is applied to the resumed request rather than stored. It is
@@ -261,19 +279,20 @@ extension InlineInteractionResolver {
             // Read the routing snapshot back and confirm the group actually
             // moved before the card claims it did.
             let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
-            guard let snapshot = try? await router.checkedRoutingSnapshotReadOnly() else {
-                return .failure("Couldn't read your provider settings back.")
-            }
+            let snapshot: ProviderRoutingSnapshot
+            do { snapshot = try await router.checkedRoutingSnapshotReadOnly() }
+            catch { return .failure(TurnSecretRedactor.redactText(error.localizedDescription)) }
             let group = ProviderSurfaceGroups.all.first { $0.id == interaction.target }
             let surfaces = group?.surfaces ?? [interaction.target]
             let matched = surfaces.contains { surface in
                 ProviderRoutingSurfaceLookup.value(snapshot.preferences, surface)?.model == model
+                    && ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, surface) == qualified.providerID
             }
             guard matched else {
                 return .failure("\(group?.title ?? interaction.target) isn't on \(model) yet.")
             }
             return .success(.init(
-                selection: model,
+                selection: picked,
                 summary: "\(group?.title ?? interaction.target) now uses \(model)",
                 scope: .persistent
             ))
@@ -303,7 +322,9 @@ extension InlineInteractionResolver {
             let target = InlineInteractionRegistry.canonicalProviderID(interaction.target)
             let doors = [target] + [InlineInteractionRegistry.providerSignIn(for: target)?.oauthProviderID]
                 .compactMap { $0 }
-            let providers = (try? await platform.providers()) ?? []
+            let providers: [InlineInteractionProviderStatus]
+            do { providers = try await platform.providers() }
+            catch { return .failure(TurnSecretRedactor.redactText(error.localizedDescription)) }
             let rows = doors.compactMap { id in providers.first { $0.providerID == id } }
             guard let first = rows.first else {
                 return .failure("No provider named \(interaction.target).")
@@ -321,7 +342,9 @@ extension InlineInteractionResolver {
             guard let flag = InlineInteractionRegistry.capabilityFlags[interaction.target] else {
                 return .failure("That isn't a switch this build has.")
             }
-            let policy = await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy()
+            let policy: [String: JSONValue]
+            do { policy = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked() }
+            catch { return .failure("Trust policy is unavailable: \(error.localizedDescription)") }
             guard case .object(let block)? = policy[flag.policyBlock],
                   block[flag.policyKey] == .bool(true)
             else {

@@ -68,6 +68,7 @@ public final class AgentContacts: Sendable {
     public let humanReplies: HumanConversationReplies
     public let grok: GrokInboundReply
     public let continuation: AgentConversationContinuation
+    public let residentWake: ResidentWakeRuntime
     private let dot: ChatGPTDotConversation
 
     public func refreshDotSession(_ sessionID: String) async -> Bool {
@@ -124,7 +125,8 @@ public final class AgentContacts: Sendable {
         // Restore projections once; let-go sends' states can reach their rows again.
         AgentConversationStore.restoreProjections(dataRoot: dataRoot)
         tasks = AgentContactTasks(dataRoot: dataRoot) { turn, emit in
-            try await AgentContactRuntime.run(turn, client: clients.bridgeChatClient(), dataRoot: dataRoot, emit: emit)
+            try await AgentContactRuntime.run(turn, client: clients.bridgeChatClient(), dataRoot: dataRoot,
+                completionSender: completionSender, emit: emit)
         }
         desktop = DesktopAgentConversationRoute(clients: clients, dataRoot: dataRoot)
         humanReplies = HumanConversationReplies(dataRoot: dataRoot, sender: completionSender) { id, expected, text, run in
@@ -135,5 +137,6 @@ public final class AgentContacts: Sendable {
         grok = GrokInboundReply(clients: clients)
         continuation = AgentConversationContinuation(dataRoot: dataRoot, clients: clients, grok: grok, dot: dot,
                                                      completionSender: completionSender)
+        residentWake = ResidentWakeRuntime(dataRoot: dataRoot, clients: clients, completionSender: completionSender)
     }
 }

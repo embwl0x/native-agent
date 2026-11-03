@@ -38,6 +38,7 @@ enum QueuedSendStripAction: Equatable {
 extension ChatStore {
     @discardableResult
     func enqueueSend(_ queued: QueuedChatSend) -> Bool {
+        guard admitChatMutation() else { return false }
         let sessionKey = queueSessionKey(queued.sessionID)
         guard queuedSends.filter({ queueSessionKey($0.sessionID) == sessionKey && !inFlightSendIDs.contains($0.id.uuidString) }).count < QueuedChatSend.maxPerSession else {
             errorBanner = "Send-next queue is full (20 messages)"
@@ -63,7 +64,7 @@ extension ChatStore {
         queuedSendID: UUID? = nil,
         steer: Bool = false
     ) -> Bool {
-        guard (!text.isEmpty || !attachments.isEmpty), !isSwitchingSession else { return false }
+        guard (!text.isEmpty || !attachments.isEmpty), !isSwitchingSession, admitChatMutation() else { return false }
         guard let pairing = AgentNameCache.fingerprint(client.pairingStore?.iCloudPairingSecret) else {
             errorBanner = "Connect this iPhone to a Mac before submitting."
             return false
@@ -88,12 +89,14 @@ extension ChatStore {
             if emitHaptic { Haptics.send() }
             return true
         }
-        // Accepted composer sends retain their payload in the durable queue before transport admission.
+        // Every send, including Regenerate, retains its payload before admission.
         var queuedSendID = queuedSendID
-        if appendUser && queuedSendID == nil {
+        if queuedSendID == nil {
             let retained = QueuedChatSend(
                 id: UUID(), sessionID: selectedSessionID, text: text,
-                controls: controls, attachments: attachments, createdAt: Date(), pairingFingerprint: pairing
+                controls: controls, attachments: attachments, createdAt: Date(), pairingFingerprint: pairing,
+                suppressRemoteUserAppend: suppressRemoteUserAppend,
+                replacementAssistantMessageID: replacementAssistantMessageID
             )
             guard enqueueSend(retained) else { return false }
             queuedSendID = retained.id
@@ -124,6 +127,8 @@ extension ChatStore {
             var reused = messages[idx]
             reused.text = ""
             reused.isStreaming = true
+            reused.completionState = nil
+            reused.failureDetail = nil
             reused.toolEvents = []
             messages[idx] = reused
             placeholderId = reuse
@@ -173,7 +178,13 @@ extension ChatStore {
         )
         timedOutPendingIds.removeValue(forKey: correlationID)
         let transport = Task {
-            defer { inFlightSendIDs.remove(correlationID) }
+            defer {
+                inFlightSendIDs.remove(correlationID)
+                // A session switch or replacement send cancels this task, not
+                // its durable confirmation. Rearm after releasing the in-flight
+                // guard so restoration cannot race the cancelled task's exit.
+                resumeDeliveryConfirmations()
+            }
             do {
                 let messageId = try await client.sendMessage(
                     text,
@@ -186,6 +197,15 @@ extension ChatStore {
                     preparedMessage: preparedMessage,
                     expectedPairing: pairing,
                     onPrepared: { [self] message in
+                        if iCloudBridge.shared.usesCloudKitDeviceTransport,
+                           var record = pendingExchanges[correlationID] {
+                            // Include the upload budget, the transport's first
+                            // five-second proof read, and its 60-second window.
+                            record.deliveryConfirmationDeadline = Date().addingTimeInterval(
+                                try CloudKitDeviceTransport.sendTimeoutSeconds(for: message) + 65)
+                            pendingExchanges[correlationID] = record
+                            showWaitStatus(correlationID: correlationID)
+                        }
                         try await storage.flush()
                         guard let queuedSendID else { return }
                         guard let index = queuedSends.firstIndex(where: { $0.id == queuedSendID }) else {
@@ -197,7 +217,7 @@ extension ChatStore {
                         try await checkpointQueuedSend(queuedSendID)
                     }
                 )
-                if let queuedSendID { queuedSends.removeAll { $0.id == queuedSendID } }
+                noteDeliveryAccepted(correlationID)
                 guard !Task.isCancelled else { return }
                 guard sendCompletionOwnsReply(correlationID, placeholderId: placeholderId) else { return }
                 // Transport completion rearms only correlations the reply owner still leaves pending.
@@ -213,13 +233,22 @@ extension ChatStore {
                 }
                 pendingICloudPlaceholders[messageId] = placeholderId
                 renamePendingExchange(from: correlationID, to: messageId)
+                if messageId != correlationID { onTalkRunRenamed?(correlationID, messageId) }
                 showWaitStatus(correlationID: messageId)
                 timedOutPendingIds.removeValue(forKey: messageId)
                 armTimeout(for: messageId, placeholderId: placeholderId)
-                armReplyPoll(client: client)
+                armReplyStatus()
             } catch {
                 guard !Task.isCancelled else { return }
                 guard sendCompletionOwnsReply(correlationID, placeholderId: placeholderId) else { return }
+                // A Mac progress event may arrive before the transport returns.
+                // Neither a late transport error nor silence can contradict it.
+                if pendingExchanges[correlationID]?.acknowledged == true { return }
+                if error is DeviceSyncSendOutcomeUnknown {
+                    markDeliveryUnconfirmed(correlationID)
+                    armReplyStatus()
+                    return
+                }
                 pendingICloudPlaceholders.removeValue(forKey: correlationID)
                 closePendingExchange(correlationID)
                 // A cancelled send leaves loading cleanup to its cancellation owner.
@@ -240,6 +269,7 @@ extension ChatStore {
                     onFailure?()
                 }
                 releaseLoading(for: placeholderId)
+                onTalkReply?(correlationID, "", true, "Send failed: \(error.localizedDescription). The message remains in Chat for review.")
             }
         }
         if !steer { sendTask = transport }
@@ -252,27 +282,41 @@ extension ChatStore {
         if resolvedICloudReplyIds.contains(correlationID) {
             return false
         }
-        return pendingExchanges[correlationID]?.request != nil
+        return pendingExchanges[correlationID] != nil
             && (pendingICloudPlaceholders[correlationID] == placeholderId
                 || timedOutPendingIds[correlationID] == placeholderId)
     }
 
     /// The Mac's own Stop, scoped to every open run here: a send still
     /// crossing, a request gone silent, and a live turn another door started.
-    /// Nothing changes on the phone until the Mac says how each run ended
-    /// (its cancelled event or its transcript); a Stop it could not make says
-    /// why.
+    /// Release the composer now; only the Mac's cancelled event or terminal
+    /// transcript settles the run. A Stop it could not confirm says why.
     func stop(client: MacBridgeClient) {
         if !queuedSendsForSelectedSession.isEmpty {
             pausedQueueSessionKeys.insert(queueSessionKey(selectedSessionID))
         }
         let stoppedSessionID = selectedSessionID
         let stoppedRunIDs = Array(activeTurnRunIDs)
+        guard !stoppedRunIDs.isEmpty else { return }
+        pausedQueueSessionKeys.insert(queueSessionKey(stoppedSessionID))
+        // Release the composer, not the evidence. Missing acknowledgment does
+        // not prove nonreceipt; only the Mac can settle this named request.
+        for run in stoppedRunIDs {
+            if let placeholder = pendingICloudPlaceholders[run] ?? pendingExchanges[run]?.placeholderID {
+                releaseLoading(for: placeholder)
+            }
+        }
+        errorBanner = "Stop requested. Waiting for your Mac to confirm."
         Task {
             do {
                 try await client.cancelChat(sessionID: stoppedSessionID, runIDs: stoppedRunIDs)
             } catch {
-                errorBanner = "The Mac did not stop it: \(error.localizedDescription)"
+                // A terminal can arrive while the action wait is still open.
+                // Its result outranks a late failure to observe the Stop ACK.
+                guard stoppedRunIDs.contains(where: {
+                    (pendingExchanges[$0].map { !$0.isExpired } ?? false) || liveTurnBubbles[$0] != nil
+                }) else { return }
+                errorBanner = "Stop is unconfirmed: \(error.localizedDescription). Still watching the original request."
             }
         }
     }
@@ -292,6 +336,11 @@ extension ChatStore {
     /// its own message at once; one with files waits for its turn.
     func sendQueuedNow(_ id: UUID, client: MacBridgeClient) {
         guard let queued = queuedSends.first(where: { $0.id == id }), canDeliverQueuedSend(queued) else { return }
+        if pendingExchanges[id.uuidString]?.deliveryUnconfirmed == true {
+            // Explicit Retry replays this envelope; it must never become Steer.
+            sendAsOwnMessage(id, client: client)
+            return
+        }
         guard promoteQueuedSend(id) else { return }
         let key = queueSessionKey(selectedSessionID)
         pausedQueueSessionKeys.remove(key)
@@ -316,16 +365,23 @@ extension ChatStore {
 
     /// A queued message sent beside whatever the phone shows as working, only
     /// into its own conversation; another one's waits in that queue for its drain.
-    func sendAsOwnMessage(_ id: UUID, client: MacBridgeClient, rowWritten: Bool = false) {
+    func sendAsOwnMessage(_ id: UUID, client: MacBridgeClient) {
         guard let next = queuedSends.first(where: { $0.id == id }),
               queueSessionKey(next.sessionID) == queueSessionKey(selectedSessionID) else { return }
-        _ = send(text: next.text, client: client, controls: next.controls, appendUser: next.userMessageID == nil,
+        _ = send(text: next.text, client: client, controls: next.controls,
+                 appendUser: next.userMessageID == nil && !next.suppressRemoteUserAppend,
                  attachments: next.attachments, reusePlaceholderId: next.placeholderID,
-                 retainedUserMessageID: next.userMessageID, suppressRemoteUserAppend: rowWritten,
+                 retainedUserMessageID: next.userMessageID,
+                 suppressRemoteUserAppend: next.suppressRemoteUserAppend,
+                 replacementAssistantMessageID: next.replacementAssistantMessageID,
                  emitHaptic: false, queuedSendID: next.id, steer: true)
     }
 
     func resumeQueuedSends(startingWith id: UUID? = nil) {
+        if let id, pendingExchanges[id.uuidString]?.deliveryUnconfirmed == true {
+            if let client = pendingRetryClient { sendQueuedNow(id, client: client) }
+            return
+        }
         if let id { _ = promoteQueuedSend(id) }
         pausedQueueSessionKeys.remove(queueSessionKey(selectedSessionID))
         transportPausedQueueSessionKeys.remove(queueSessionKey(selectedSessionID))
@@ -386,16 +442,21 @@ extension ChatStore {
     private func drainNextQueuedSendIfPossible() {
         guard !isLoading, !isSwitchingSession, !isSelectedQueuePaused,
               let client = pendingRetryClient,
-              let next = queuedSendsForSelectedSession.first(where: { canDeliverQueuedSend($0) && !steeringQueuedIDs.contains($0.id) })
+              let next = queuedSendsForSelectedSession.first(where: {
+                  canDeliverQueuedSend($0) && !steeringQueuedIDs.contains($0.id)
+                      && pendingExchanges[$0.id.uuidString]?.deliveryUnconfirmed != true
+              })
         else { return }
         let accepted = send(
             text: next.text,
             client: client,
             controls: next.controls,
-            appendUser: next.userMessageID == nil,
+            appendUser: next.userMessageID == nil && !next.suppressRemoteUserAppend,
             attachments: next.attachments,
             reusePlaceholderId: next.placeholderID,
             retainedUserMessageID: next.userMessageID,
+            suppressRemoteUserAppend: next.suppressRemoteUserAppend,
+            replacementAssistantMessageID: next.replacementAssistantMessageID,
             onFailure: { [weak self] in
                 guard let self else { return }
                 self.transportPausedQueueSessionKeys.insert(self.queueSessionKey(next.sessionID))
@@ -441,16 +502,16 @@ extension ChatStore {
     /// "Send now": the person's explicit resend of a request the Mac signed a
     /// refusal for because it aged out unread.
     ///
-    /// This is the ONE place a phone-side resend is safe, and only because the
-    /// signed rejection proves the turn never started — elapsed waiting alone
-    /// never earns it. It
-    /// mints a fresh event through the ordinary send path, reusing the same
-    /// bubble, and never runs by itself.
+    /// The signed rejection proves the turn never started, authorizing a fresh
+    /// event (unlike an unconfirmed send's Retry, which replays its exact event).
+    /// Elapsed waiting alone never earns a new identity. Reuses the same bubble
+    /// and never runs by itself.
     func sendNow(messageId placeholderId: UUID, client: MacBridgeClient) {
         guard !isLoading, !isSwitchingSession,
               let record = expiredExchange(for: placeholderId),
-              let args = record.request
+              let pairing = AgentNameCache.fingerprint(client.pairingStore?.iCloudPairingSecret)
         else { return }
+        let args = record.request
         let pendingId = record.correlationID
         // Reserve durable replacement arguments before consuming expiry; refused admission preserves Send now.
         // send retains this queue entry and its exact envelope on transport failure.
@@ -463,7 +524,7 @@ extension ChatStore {
             createdAt: Date(),
             placeholderID: placeholderId,
             userMessageID: args.appendedUserId,
-            pairingFingerprint: AgentNameCache.fingerprint(client.pairingStore?.iCloudPairingSecret)
+            pairingFingerprint: pairing
         )
         guard enqueueSend(retained) else { return }
         let retainedID = retained.id

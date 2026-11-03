@@ -48,7 +48,7 @@ public enum MobileTrustAction: Sendable {
 
     public enum Field: String, CaseIterable, Sendable {
         case permissionLevel, autonomyDefault, requireBackups, outsideDefault, developerMode
-        case workshopEnabled, autonomousTraining, dreamScheduler
+        case workshopEnabled, dreamScheduler
 
         public var values: [String] {
             switch self {

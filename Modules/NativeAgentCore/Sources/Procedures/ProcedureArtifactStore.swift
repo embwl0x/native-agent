@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import Darwin
-// Blueprint: | `ProcedureArtifactStore.swift` | ProcedureArtifactStore immutable artifact installation, discovery, revalidation and status; explicit backup/export/sync decisions and privacy-map coverage |
+// Blueprint: | `ProcedureArtifactStore.swift` | ProcedureArtifactStore immutable current-schema artifact installation and discovery with shared reference-locked capacity admission; status, backup/export/sync decisions and privacy-map coverage |
 
 /// Immutable procedure artifacts, canonical invocation receipts and exact activations.
 public actor ProcedureArtifactStore {
@@ -12,6 +12,9 @@ public actor ProcedureArtifactStore {
     // it without lock sidecars. PrivacyMap lists living_fabric/procedures.
     package let root: URL
     package let clock: @Sendable () -> Date
+    /// Admission and discovery share this ceiling; retention cannot remove
+    /// protected references to make room for an accepted installation.
+    static let maxInstalledArtifacts = 1_024
     public init(
         dataRoot: URL,
         clock: @escaping @Sendable () -> Date = Date.init
@@ -22,21 +25,32 @@ public actor ProcedureArtifactStore {
 
     @discardableResult
     public func install(_ artifact: DeclarativeProcedureArtifact) async throws -> URL {
-        guard Self.valid(artifact), !artifact.requiresLegacyRevalidation else {
+        guard Self.valid(artifact) else {
             throw ProcedureArtifactStoreError.invalidArtifact
         }
         let path = artifactPath(artifact.id)
         let value = try JSONValue.parse(JSONEncoder().encode(artifact))
-        try await SwiftNativePersistenceCore.withFileLock(path) {
-            if FileManager.default.fileExists(atPath: path.path) {
-                // Immutability is semantic, not dependent on a particular
-                // PersistenceCore JSON whitespace/ordering implementation.
-                guard let decoded = try? await load(artifact.id), decoded == artifact else {
-                    throw ProcedureArtifactStoreError.immutableConflict
+        // The root's reference lock serializes count-and-write across store
+        // instances and excludes retention, in its ledger -> artifact order.
+        try await SwiftNativePersistenceCore.withFileLock(root.appendingPathComponent("invocations.jsonl")) {
+            try await SwiftNativePersistenceCore.withFileLock(path) {
+                let urls = try Self.installedArtifactURLs(in: self.root)
+                guard urls.count <= Self.maxInstalledArtifacts else {
+                    throw ProcedureArtifactStoreError.artifactCapacityExceeded
                 }
-                return
+                if urls.contains(path) {
+                    // Immutability is semantic, not dependent on a particular
+                    // PersistenceCore JSON whitespace/ordering implementation.
+                    guard try await self.load(artifact.id) == artifact else {
+                        throw ProcedureArtifactStoreError.immutableConflict
+                    }
+                    return
+                }
+                guard urls.count < Self.maxInstalledArtifacts else {
+                    throw ProcedureArtifactStoreError.artifactCapacityExceeded
+                }
+                try await SwiftNativePersistenceCore.writeJSON(value, to: path)
             }
-            try await SwiftNativePersistenceCore.writeJSON(value, to: path)
         }
         // Retention runs off this actor after installation. Reference admission
         // shares the invocation ledger lock with a sweep's eligibility/deletion.
@@ -58,58 +72,8 @@ public actor ProcedureArtifactStore {
         return artifact
     }
 
-    /// Recompile the original reviewed evidence and compare every field before
-    /// binding v1 bytes to a full digest. IDs and activation pointers stay intact;
-    /// migrating either would require a new exact activation approval.
-    public func revalidateLegacyArtifact(
-        _ artifactID: String,
-        candidate: ProcedureCandidate
-    ) async throws {
-        let artifact = try await load(artifactID)
-        guard artifact.requiresLegacyRevalidation,
-              try DeclarativeProcedureCompiler.compile(candidate).withLegacyIdentity() == artifact else {
-            throw ProcedureArtifactStoreError.invalidArtifact
-        }
-        let receipt = try legacyRevalidationReceipt(artifact)
-        let path = legacyRevalidationPath(artifactID)
-        try await SwiftNativePersistenceCore.withFileLock(path) {
-            if FileManager.default.fileExists(atPath: path.path) {
-                guard await legacyRevalidationMatches(artifact) else {
-                    throw ProcedureArtifactStoreError.immutableConflict
-                }
-                return
-            }
-            try await SwiftNativePersistenceCore.writeJSON(receipt, to: path)
-        }
-    }
-
     func loadForInvocation(_ artifactID: String) async throws -> DeclarativeProcedureArtifact {
-        let artifact = try await load(artifactID)
-        if artifact.requiresLegacyRevalidation && !legacyRevalidationMatches(artifact) {
-            throw ProcedureArtifactStoreError.legacyArtifactRequiresRevalidation
-        }
-        return artifact
-    }
-
-    internal nonisolated func legacyRevalidationMatches(_ artifact: DeclarativeProcedureArtifact) -> Bool {
-        let path = legacyRevalidationPath(artifact.id)
-        guard let data = Self.checkedRegularFile(path, maximumBytes: 64 * 1_024),
-              let receipt = try? JSONValue.parse(data),
-              let expected = try? legacyRevalidationReceipt(artifact) else { return false }
-        return receipt == expected
-    }
-
-    private nonisolated func legacyRevalidationPath(_ artifactID: String) -> URL {
-        root.appendingPathComponent("legacy_revalidations", isDirectory: true)
-            .appendingPathComponent("\(artifactID).json")
-    }
-
-    private nonisolated func legacyRevalidationReceipt(_ artifact: DeclarativeProcedureArtifact) throws -> JSONValue {
-        .object([
-            "schema": .string("declarative-procedure-revalidation.v1"),
-            "artifactID": .string(artifact.id),
-            "canonicalIdentity": .string(try artifact.canonicalIdentity()),
-        ])
+        try await load(artifactID)
     }
 
     /// Checked bounded discovery for callers that already have an explicit
@@ -123,22 +87,10 @@ public actor ProcedureArtifactStore {
         if let domain, !Self.token(domain, maximum: 64) {
             throw ProcedureArtifactStoreError.invalidArtifact
         }
-        let artifactsDirectory = root.appendingPathComponent("artifacts", isDirectory: true)
-        guard FileManager.default.fileExists(atPath: artifactsDirectory.path) else { return [] }
-        let urls: [URL]
-        do {
-            urls = try FileManager.default.contentsOfDirectory(
-                at: artifactsDirectory,
-                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
-                options: [.skipsHiddenFiles]
-            )
-            .filter { $0.pathExtension == "json" }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        } catch {
-            throw ProcedureArtifactStoreError.corruptArtifact
-        }
+        let urls = try Self.installedArtifactURLs(in: root)
         guard urls.count <= Self.maxInstalledArtifacts else {
-            // An over-ceiling store heals by its sweep, never fail-closed forever.
+            // A sweep can free unreferenced capacity; protected artifacts stay
+            // protected even when the inventory is already over the ceiling.
             await requestRetentionSweep()
             throw ProcedureArtifactStoreError.artifactCapacityExceeded
         }
@@ -155,11 +107,28 @@ public actor ProcedureArtifactStore {
         return artifacts
     }
 
+    /// Missing is an observed empty directory; unreadable is never capacity.
+    private static func installedArtifactURLs(in root: URL) throws -> [URL] {
+        do {
+            return try FileManager.default.contentsOfDirectory(
+                at: root.appendingPathComponent("artifacts", isDirectory: true),
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles]
+            )
+            .filter { $0.pathExtension == "json" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return []
+        } catch {
+            throw ProcedureArtifactStoreError.corruptArtifact
+        }
+    }
+
     public func statusSnapshot() async -> ProcedureArtifactStatusSnapshot {
         var unreadable: [String] = []
         let artifactURLs = Self.statusListing(
             root.appendingPathComponent("artifacts", isDirectory: true), unreadable: &unreadable
-        ).prefix(1_024)
+        ).prefix(Self.maxInstalledArtifacts)
         var validArtifacts = 0
         var corruptArtifacts = 0
         for url in artifactURLs {

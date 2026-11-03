@@ -24,8 +24,7 @@ extension ContextSelector {
         _ atom: ContextStoredAtom,
         need: NeedSignal,
         context: ScoreContext,
-        lexicalEntry: ContextSelectionIndexEntry,
-        hasUnresolvedConflict: Bool
+        lexicalEntry: ContextSelectionIndexEntry
     ) -> ContextCandidateScoreFeatures {
         let exact = context.normalizedMessage.map {
             lexicalEntry.normalizedSearchableText.contains($0) ? 1.0 : 0.0
@@ -59,7 +58,6 @@ extension ContextSelector {
         let decay = need.feedbackDecayOverrides[atom.draft.id]
             ?? atom.draft.decayState
         let w = configuration.weights
-        let conflictPenalty = hasUnresolvedConflict ? w.conflictPenalty : 0
         let costRatio = Double(atom.draft.body.count) / Double(max(1, need.characterBudget))
         let costPenalty = min(w.characterCostPenaltyCap, costRatio * w.characterCostPenaltyCap)
         // Current-message coverage excludes carried context and reaches full weight
@@ -86,7 +84,6 @@ extension ContextSelector {
             + (w.usefulness * usefulness)
             + (w.decay * decay)
             + (w.messageCoverage * messageCoverage)
-            - conflictPenalty
             - costPenalty
         return ContextCandidateScoreFeatures(
             lexicalExact: exact,
@@ -102,7 +99,6 @@ extension ContextSelector {
             messageCoverage: messageCoverage,
             diversityBonus: 0,
             redundancyPenalty: 0,
-            conflictPenalty: conflictPenalty,
             characterCostPenalty: costPenalty,
             total: total
         )
@@ -223,9 +219,9 @@ extension ContextSelector {
     /// Memory touch is the best leave-one-out standing across query readings:
     /// primary, other voice, and a follow-up's own words and other voice.
     /// Remove each atom's mean pull toward others relative to the lane's mean.
-    /// Summed unit vectors and aggregate moments keep this linear. The chance
-    /// bar counts readings × atoms and assumes roughly independent Gaussian
-    /// background scores; this is a heuristic, not a calibrated probability.
+    /// Summed unit vectors and aggregate moments keep this linear. The selector
+    /// applies its configured fixed deviation floor to the best reading;
+    /// `looks` records atoms × readings for diagnostics only.
     /// Above a constant background, infinite standing saturates to finite Double.
     /// Fewer than three vectors use model-scaled semantics; no comparable vectors give no touch.
     func memoryRelevance(

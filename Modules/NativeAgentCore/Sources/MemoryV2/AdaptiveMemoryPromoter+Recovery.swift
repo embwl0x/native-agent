@@ -92,10 +92,6 @@ extension AdaptiveMemoryPromoter {
     @discardableResult
     private func askOwedMoments(memory: SwiftNativeMemoryV2, door: LivedMomentDoor) async -> (nextDue: Date?, processed: Bool) {
         guard let memoryManager else { return (nil, false) }
-        if !heldImported {
-            heldImported = true
-            await importHeldTurns(door: door)
-        }
         // A FAIR CURSOR: rows whose last attempt failed wait out their backoff,
         // and among the due ones the least recently tried goes first, so one
         // failing row never starves the rest.

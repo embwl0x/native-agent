@@ -117,7 +117,9 @@ public enum MemoryRecordDisclosurePolicy {
     /// A record whose `valid_to` has passed was true once and is not now: it
     /// stays in the store and leaves what is disclosed, like a superseded one.
     public static func isTemporallyEligible(validTo: String?, at now: Date) -> Bool {
-        validTo.flatMap(MemoryRecallScoring.parseTimestamp).map { $0 > now } ?? true
+        guard let validTo else { return true }
+        guard let expiry = MemoryRecallScoring.parseTimestamp(validTo) else { return false }
+        return expiry > now
     }
 
     public static func classify(_ record: MemoryRecord, at now: Date = Date()) -> MemoryDisclosureClassification? {

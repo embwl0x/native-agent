@@ -173,7 +173,9 @@ struct ChatView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            if !shellColumnBlocks.isEmpty && !sidebarsHidden { shellConversationsColumn }
+            if !appModel.engine.layout.availability.contentNames("chat", profile: layoutProfile).isEmpty && !sidebarsHidden {
+                shellConversationsColumn(appModel.engine.layout.availability)
+            }
             chatColumn
                 // The chat gives the pane its width down to this floor (the
                 // detached window's); past it the pane narrows instead.

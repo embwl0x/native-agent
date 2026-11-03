@@ -3,7 +3,8 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Photos
-// Blueprint: | `AppToolExecutor+Photos.swift` | `AppToolExecutor`: `runPhotosRead`; read-only PhotoKit counts and recent asset metadata, with action-time macOS authorization |
+import MacIntegration
+// Blueprint: | `AppToolExecutor+Photos.swift` | `AppToolExecutor`: `runPhotosRead`; read-only PhotoKit counts and recent asset metadata; nonprompting authorization refusal carries the shared permission-card remedy |
 
 extension AppToolExecutor {
     @MainActor
@@ -33,12 +34,10 @@ extension AppToolExecutor {
         case .int(let value)? where (1...100).contains(value): limit = Int(value)
         default: return Self.failure("invalid_limit", "limit must be an integer from 1 to 100; default 10.")
         }
-        var authorization = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-        if authorization == .notDetermined {
-            authorization = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-        }
+        let authorization = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         guard authorization == .authorized || authorization == .limited else {
-            return Self.failure("photos_access_off", "Photos access is off. The owner can enable NativeAgent in System Settings › Privacy & Security › Photos. If access is restricted by device management, the administrator must allow it.")
+            return Self.failure("photos_access_off", "Photos access is off. Allow Photos on NativeAgent's permission card. If access is restricted by device management, the administrator must allow it.",
+                extra: ["remedy": SystemPermissionPreflight.remedy("photos") ?? .null])
         }
         let limited = authorization == .limited
         let dates = bounds

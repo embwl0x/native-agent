@@ -148,11 +148,16 @@ extension FileSystemActions {
         guard let contentVal = input["content"], !isNull(contentVal) else {
             return errResult("content is required", code: "bad_input")
         }
-        let content = jsonToStr(contentVal)
-        let append: Bool = {
-            if case .bool(let b)? = input["append"] { return b }
-            return false
-        }()
+        let content: String
+        do { content = try jsonToStr(contentVal) }
+        catch { return errResult("Content could not be serialized: \(error.localizedDescription)", code: "bad_input") }
+        let append: Bool
+        if let value = input["append"] {
+            guard case .bool(let requested) = value else {
+                return errResult("append must be true or false, or omitted for replacement.", code: "bad_input")
+            }
+            append = requested
+        } else { append = false }
         let expectedHash: String?
         // An empty expected hash means no replacement guard was requested.
         let blankHash: Bool = {
@@ -237,7 +242,7 @@ extension FileSystemActions {
                        metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
                        metadata.st_size <= 200_000,
                        let before = try? handle.read(upToCount: 200_000) {
-                        beforeContent = decodeUTF8Replacing(before)
+                        beforeContent = String(data: before, encoding: .utf8)
                     }
                     try? handle.close()
                 }

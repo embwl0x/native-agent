@@ -69,12 +69,18 @@ sit beside the agent as a parallel silo.
 - Canonical: skills were a dead parallel library for three weeks; dissolving
   them into recall (pointer rows, 2026-07-03) made them part of how the agent
   thinks. That move — silo → mind — is the shape of clause-1 work.
+- Their helpers' newest replies join the same bounded per-turn awareness as
+  their other rooms, since their last reply here, instead of requiring a tool read
+  to know what they did. They obey "Remember across conversations" and carry
+  no words into peer-steered turns. The [turn anatomy](ANATOMY_OF_A_TURN.md#4-the-provider-request-is-assembled)
+  owns the bounds and transcript source.
 - The consolidation triad is the spine: episodic (dreams), semantic
   (memory/KG), procedural (skills). Experience becomes identity (REM→GROWTH,
-  approval-gated), repetition becomes craft through the implemented
-  [nightly practice compiler](AGENT_IS_THE_APP.md#practice-compiles-the-night-as-built-10-27):
-  recorded examples must replay exactly before normal keep authority admits
-  the ability; those examples do not prove other inputs or branches.
+  approval-gated), repetition becomes craft through the turn's private
+  [keep on the second meeting of hand work](HABITS.md#h3--keep-what-repeats-not-what-happened-once).
+  The separate nightly compiler is removed. Existing compiled abilities
+  still replay their embedded examples before admission; those examples
+  do not prove other inputs or branches.
 - The agent's persona is self-owned. Direct persona writes are governed by
   [Trust](TOOL_LOADING.md#authority-and-receipts): under Full Mac they writes
   their own persona; REM→GROWTH proposals remain the approval-gated path.
@@ -94,11 +100,14 @@ does exactly what it says.
   is fixed forward in its new design, never reverted to the old way. Only what
   should not exist at all is cut.
   The one exception is their own turn program: their turn must not fail because
-  their edit of `turn.js` throws. That edit is set aside for its last clean
-  version (or the shipped seed), the turn is replayed, and the repair is owed
-  to them. Nothing else swaps back automatically. This exception does not
-  promise completion after an unrecoverable helper, setup, seed or provider
-  failure; those failures are shown plainly.
+  `turn.js` or its helper fails. Every non-Stop execution or helper-admission
+  failure sets the selected program aside for an unfailed previous version
+  (or the shipped seed), replays the turn, and owes repair to them. Each source
+  is attempted once per turn, with one extra fresh lease if the helper fails
+  while running the seed; the original cause and selected program are
+  recorded. Stop still cancels. Unreadable storage, failed recovery writes,
+  exhaustion of all available programs and provider failures remain plain
+  failures; no uncommitted replacement runs. Nothing else swaps back automatically.
 - Canonical: 2026-07-03 removed ~1,000 lines of theater in a day — dead
   Panels layers (both platforms), preset knobs wired to nothing, disabled
   placeholder buttons — and the system got MORE alive, not smaller.

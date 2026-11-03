@@ -96,7 +96,7 @@ enum OnboardingTourEffect: Equatable, Sendable {
         currentStopID = steps.first?.id
     }
     private static func steps(in layout: SurfaceLayout) -> [OnboardingTourStep] {
-        SidebarItem.rail(layout).compactMap { item in onboardingTourStops.first { $0.item == item } }
+        SidebarItem.rail(.available(layout)).compactMap { item in onboardingTourStops.first { $0.item == item } }
     }
     var stepIndex: Int { steps.firstIndex { $0.id == currentStopID } ?? 0 }
     private(set) var didComplete = false

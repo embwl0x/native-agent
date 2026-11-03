@@ -73,8 +73,7 @@ struct SlackInboundMessage: Sendable, Codable, Equatable {
         channelType = try values.decodeIfPresent(String.self, forKey: .channelType)
         isDirectMessage = try values.decode(Bool.self, forKey: .isDirectMessage)
         files = try values.decode([SlackInboundFile].self, forKey: .files)
-        // Older receipts replied at top level; new input keeps its initializer default.
-        opensReplyThread = try values.decodeIfPresent(Bool.self, forKey: .opensReplyThread) ?? false
+        opensReplyThread = try values.decode(Bool.self, forKey: .opensReplyThread)
         attachments = []
     }
 
@@ -117,15 +116,14 @@ struct SlackSocketModeReply: Sendable, Equatable {
 }
 
 
-/// In-turn provider and context notices share the progress lane.
-typealias SlackChatProgressSink = @Sendable (_ kind: String, _ text: String) async -> Void
+/// Visible prose and notices share the turn's progress lane.
+typealias SlackChatProgressSink = @Sendable (TurnStreamEvent) async -> Void
 
 /// Wakes standing bots on a message the runner accepted. The host
 /// owns the bot router and the autonomy switch it admits runs under.
-public typealias SlackBotEventIntake = @Sendable (_ channelId: String, _ text: String, _ userId: String) async -> Void
+public typealias SlackBotEventIntake = @Sendable (_ channelId: String, _ text: String, _ userId: String, _ eventId: String) async throws -> Void
 
 typealias SlackProgressChat = @Sendable (
     _ message: SlackInboundMessage,
-    _ sessionId: String,
-    _ progress: @escaping SlackChatProgressSink
+    _ sessionId: String
 ) async throws -> SlackSocketModeReply

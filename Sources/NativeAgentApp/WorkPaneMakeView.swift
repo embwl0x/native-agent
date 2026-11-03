@@ -9,7 +9,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import WebKit
 
-// Blueprint: | `WorkPaneMakeView.swift` | `WorkPaneMakeView`: Make studio refs/version preview and actions over canonical studio state |
+// Blueprint: | `WorkPaneMakeView.swift` | Make refs/version previews over canonical studio state; image-owner errors stay visible without switching renderer, and export shows both output outcomes without truncation |
 
 /// The Work pane's Make tab: what I made, one version at a time, with the
 /// earlier ones one click back (`MakeStudio`). A mockup renders in an offline
@@ -138,7 +138,11 @@ struct WorkPaneMakeView: View {
                     .padding(12)
                     .id(revision)
             } else if prepared?.file == file, prepared?.revision == revision {
-                MakeQuickLookView(file: file, revision: revision)
+                Text(prepared?.imageFailure ?? "Image preview unavailable: no decoded image was returned.")
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .textSelection(.enabled)
+                    .padding(12)
             }
         } else {
             MakeQuickLookView(file: file, revision: revision)
@@ -170,7 +174,8 @@ struct WorkPaneMakeView: View {
                 Text(note)
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.secondary)
-                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
             }
         }
         .padding(12)
@@ -233,7 +238,7 @@ struct WorkPaneMakeView: View {
             guard let target else { return }
             note = await Task.detached(priority: .userInitiated) {
                 do {
-                    return try MakeStudio.export(file, to: target, prompt: prompt)
+                    return try MakeStudio.export(file, to: target, prompt: prompt).message
                 } catch {
                     return UserFacingError.message(error, action: "save that image")
                 }

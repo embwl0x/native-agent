@@ -30,7 +30,7 @@ enum KGTimeWindow: String, CaseIterable, Identifiable {
     case week = "Last week"
     case month = "Last month"
     var id: String { rawValue }
-    /// Cutoff date — anything with `last_seen` (or `first_seen` fallback) at or
+    /// Cutoff date — anything with a valid recorded `last_seen` at or
     /// after the cutoff is included. `nil` means no filter.
     var cutoff: Date? {
         let cal = Calendar.current
@@ -44,51 +44,10 @@ enum KGTimeWindow: String, CaseIterable, Identifiable {
     }
 }
 
-extension KnowledgeGraphView {
-    /// Graph time filters accept ISO-8601 timestamps and date-only YYYY-MM-DD.
-    static func parseKGDate(_ s: String?) -> Date? {
-        guard let s, !s.isEmpty else { return nil }
-        if let date = NativeTimestampFormat.parseISO8601FractionalFirst(s) { return date }
-        let dateOnly = DateFormatter()
-        dateOnly.locale = Locale(identifier: "en_US_POSIX")
-        dateOnly.timeZone = TimeZone(secondsFromGMT: 0)
-        dateOnly.dateFormat = "yyyy-MM-dd"
-        return dateOnly.date(from: String(s.prefix(10)))
-    }
-}
-
 enum KnowledgeGraphFilterCatalog {
     static let selectableKinds = [
         "person", "organization", "project", "concept", "place", "event", "tool", "fact",
     ]
-}
-
-enum KGViewModePickerPresentation {
-    /// Mirror the actual canvas owner. The picker is a helpful early route;
-    /// `KGGraphCanvasLayout` still enforces this cap for every direct caller.
-    static let maximumGraphEntities = KGGraphCanvasLayout.maximumRenderableEntities
-
-    enum Route: Equatable {
-        case list
-        case graph
-        case graphSafetyFallback(entityCount: Int)
-    }
-
-    static func route(requested: KGViewMode, displayedEntityCount: Int) -> Route {
-        guard requested == .graph else { return .list }
-        guard displayedEntityCount <= maximumGraphEntities else {
-            return .graphSafetyFallback(entityCount: displayedEntityCount)
-        }
-        return .graph
-    }
-
-    static func pickerNotice(requested: KGViewMode, displayedEntityCount: Int) -> String? {
-        guard case let .graphSafetyFallback(entityCount) = route(
-            requested: requested,
-            displayedEntityCount: displayedEntityCount
-        ) else { return nil }
-        return "Graph view is unavailable for \(entityCount) shown entities; the list is displayed instead. Narrow the filters to use the graph."
-    }
 }
 
 @MainActor
@@ -105,6 +64,7 @@ enum KnowledgeGraphPresentation {
         private var validUntil = Date.distantPast
         private var evaluatedAt = Date.distantPast
         private var calendar = Calendar.current
+        private(set) var unavailableRecencyCount = 0
 
         var nextExpiry: Date? { validUntil == .distantFuture ? nil : validUntil }
 
@@ -120,9 +80,7 @@ enum KnowledgeGraphPresentation {
                now >= evaluatedAt, now < validUntil { return rows }
             if changed {
                 source = entities
-                dates = entities.map {
-                    KnowledgeGraphView.parseKGDate($0.lastSeen) ?? KnowledgeGraphView.parseKGDate($0.firstSeen)
-                }
+                dates = entities.map(\.lastSeenDate)
             }
             self.kinds = kinds
             self.window = window
@@ -130,6 +88,11 @@ enum KnowledgeGraphPresentation {
             calendar = currentCalendar
             evaluatedAt = now
             let cutoff = window.cutoff
+            unavailableRecencyCount = zip(entities, dates).filter { entity, date in
+                date == nil && (kinds.isEmpty || kinds.contains(entity.type)) &&
+                    (query.isEmpty || entity.name.localizedCaseInsensitiveContains(query)
+                        || (entity.summary ?? "").localizedCaseInsensitiveContains(query))
+            }.count
             rows = zip(entities, dates).compactMap { entity, date in
                 guard kinds.isEmpty || kinds.contains(entity.type),
                       cutoff.map({ boundary in date.map { $0 >= boundary } == true }) ?? true,
@@ -145,7 +108,7 @@ enum KnowledgeGraphPresentation {
         }
     }
 
-    enum Content: Equatable { case loading, unavailable(String), policyUnavailable, policyUnreadable(String), disabled, empty, filteredEmpty, list, graph, graphSafetyNet(count: Int) }
+    enum Content: Equatable { case loading, unavailable(String), policyUnavailable, policyUnreadable(String), disabled, empty, filteredEmpty, list, graph }
     enum ErrorPlacement: Equatable { case none, emptyState(String), retainedDataBanner(message: String, isStale: Bool) }
     /// Error provenance is retained with the message so the mounted banner
     /// never labels a maintenance-action error as stale graph data.  A boolean
@@ -157,7 +120,6 @@ enum KnowledgeGraphPresentation {
         error: String?,
         entityCount: Int,
         displayedEntityCount: Int,
-        renderableGraphEntityCount: Int? = nil,
         isEnabled: Bool?,
         viewMode: KGViewMode,
         policyReadError: String? = nil
@@ -175,16 +137,11 @@ enum KnowledgeGraphPresentation {
         if isEnabled == nil { return .policyUnavailable }
         if entityCount == 0 { return isEnabled == true ? .empty : .disabled }
         if displayedEntityCount == 0 { return .filteredEmpty }
-        switch KGViewModePickerPresentation.route(
-            requested: viewMode,
-            displayedEntityCount: renderableGraphEntityCount ?? displayedEntityCount
-        ) {
+        switch viewMode {
         case .list:
             return .list
         case .graph:
             return .graph
-        case let .graphSafetyFallback(entityCount):
-            return .graphSafetyNet(count: entityCount)
         }
     }
 

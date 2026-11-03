@@ -37,6 +37,8 @@ public enum ActivityInputEvent: Sendable, Equatable {
     case wake(at: Double)
     /// The observed app quit, or the watcher is shutting down cleanly.
     case terminate(at: Double)
+    /// Required observation was lost; no later duration is supported by evidence.
+    case observationUnavailable
     /// The 60 s liveness tick with nothing else to report.
     case heartbeat(at: Double)
 }
@@ -99,14 +101,8 @@ public struct ActivitySpanEngine: Sendable {
 
     private var lockedByLock = false
     private var lockedBySleep = false
-    private let tzOffsetMin: Int
-
-    public init(
-        policy: ActivityPolicy,
-        tzOffsetMin: Int = ActivitySpan.currentTZOffsetMinutes()
-    ) {
+    public init(policy: ActivityPolicy) {
         self.policy = policy
-        self.tzOffsetMin = tzOffsetMin
         self.openSpan = nil
         self.isGated = false
         self.lastEmittedAt = 0
@@ -199,6 +195,10 @@ public struct ActivitySpanEngine: Sendable {
 
         case .terminate(let at):
             return [closeCurrent(reason: .quit, at: at)].compactMap { $0 }
+
+        case .observationUnavailable:
+            guard let span = openSpan else { return [] }
+            return [closeCurrent(reason: .observationUnavailable, at: span.lastSeenAt)].compactMap { $0 }
 
         case .heartbeat(let at):
             guard !isGated, let span = openSpan else { return [] }
@@ -301,7 +301,7 @@ public struct ActivitySpanEngine: Sendable {
             titleRedacted: titleRedacted,
             eventCount: 0,
             closeReason: nil,
-            tzOffsetMin: tzOffsetMin
+            tzOffsetMin: ActivitySpan.tzOffsetMinutes(at: Date(timeIntervalSince1970: start))
         )
         openSpan = OpenSpan(
             id: span.id,
@@ -322,7 +322,8 @@ public struct ActivitySpanEngine: Sendable {
         openSpan = nil
         // Idle is discovered after its threshold, but ends at the last input,
         // which can precede heartbeats already emitted for this span.
-        let stamp = reason == .idle ? max(span.startedAt, at) : clamp(at)
+        let stamp = reason == .idle || reason == .observationUnavailable
+            ? max(span.startedAt, at) : clamp(at)
         return .close(id: span.id, reason: reason, at: stamp)
     }
 

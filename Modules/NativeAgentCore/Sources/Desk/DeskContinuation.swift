@@ -90,7 +90,10 @@ public struct DeskContinuation: Codable, Sendable, Equatable {
         // Measuring before cutting (10-29): an open child under a closed outer receipt is a producer
         // that does not own its child's evidence. Each one logged here is a producer to fix; when none
         // log, this dig becomes a read of the outer receipt alone.
-        if depth == 0, path.contains("."), case .object(let outer) = value {
+        // A root reason reads ".status=accepted"; only a deeper location is a
+        // child receipt (10-31: all 36 logged lines were root matches).
+        let location = path.split(separator: "=", maxSplits: 1).first.map(String.init) ?? path
+        if depth == 0, location.dropFirst().contains(where: { $0 == "." || $0 == "[" }), case .object(let outer) = value {
             let who = ["action", "tool", "verb", "kind", "source"].compactMap { outer[$0]?.scalarText }.first ?? "?"
             nestedOpenLog("receipt.nested_open who=%@ path=%@ keys=%@", who, path,
                           outer.keys.sorted().prefix(12).joined(separator: ","))
@@ -181,7 +184,7 @@ public actor DeskContinuationTurn {
     private var record: DeskContinuation
     private var handle: String?
     private var writing = false
-    private var writers: [CheckedContinuation<Void, Never>] = []
+    private var writers: [ScopedWaiter] = []
     private var fenced = false
     /// Steps this process began; any other pending step lost its receipt.
     private var begun: Set<String> = []
@@ -343,7 +346,9 @@ public actor DeskContinuationTurn {
 
     private func acquireWriter() async {
         if writing {
-            await withCheckedContinuation { writers.append($0) }
+            let done = ScopedWaiter()
+            writers.append(done)
+            await Task { await done.park() }.value
         } else { writing = true }
     }
 

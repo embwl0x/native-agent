@@ -17,7 +17,7 @@ import CryptoKit
 import CoreText
 import ScreenCaptureKit
 #endif
-// Blueprint: | `MacLookFrames.swift` | Retained frame values and task-scoped frame store |
+// Blueprint: | `MacLookFrames.swift` | LatestRead-owned frame publication with superseded replies withholding action handles; every frame requires its producer's compile caps; batch-scoped immutable frames retain original TTL without replacing live publication |
 /// What a handle resolves back to.
 public struct MacLookFrameEntry: Sendable, Equatable {
     public let handle: String
@@ -29,7 +29,7 @@ public struct MacLookFrameEntry: Sendable, Equatable {
     /// compares the recorded value/enabled against the post-action percept, so
     /// "the checkbox became checked" is answerable without a second look.
     public let value: String?
-    public let enabled: Bool
+    public let enabled: Bool?
     /// The act echoes whether the handle was position-derived; drift checks still apply.
     public let ambiguous: Bool
     /// Preserve cohort size for `identityDrift`: removing a sibling can leave token and rect unchanged.
@@ -50,7 +50,7 @@ public struct MacLookFrameEntry: Sendable, Equatable {
         label: String?,
         frame: MacAXFrame?,
         value: String? = nil,
-        enabled: Bool = true,
+        enabled: Bool? = nil,
         ambiguous: Bool = false,
         ambiguityNote: String? = nil,
         labelJSON: JSONValue? = nil,
@@ -98,9 +98,8 @@ public struct MacLookReadoutRecord: Sendable, Equatable {
         self.textJSON = textJSON
         self.secret = secret
     }
-    /// Handle when there is one; the path otherwise. A readout with no handle
-    /// is still diffable — it just cannot survive a re-layout, which is the
-    /// same honesty the affordance path fallback carries.
+    /// Handle when there is one; the observed path otherwise. A readout with
+    /// no handle is still diffable within that topology, but cannot survive a re-layout.
     public static func key(handle: String?, path: [Int]) -> String {
         if let handle, !handle.isEmpty { return handle }
         return "path:" + path.map(String.init).joined(separator: ",")
@@ -154,10 +153,8 @@ public struct MacLookFrame: Sendable, Equatable {
     public let readouts: [String: MacLookReadoutRecord]
     /// Act resolution and post-act reads target this window or refuse; nil leaves only the pid anchor.
     public let windowIdentity: MacAXWindowIdentity?
-    /// The bounds THIS frame's compile ran under. nil ⇒ the frame predates the
-    /// record (its diff simply cannot claim incomparability rather than
-    /// inventing one).
-    public let caps: MacLookCompileCaps?
+    /// The bounds this frame's compile ran under, supplied by its producer.
+    public let caps: MacLookCompileCaps
     /// Identity revalidation and post-action reads retain the sight's scope.
     public let completeWindow: Bool
     public init(
@@ -173,7 +170,7 @@ public struct MacLookFrame: Sendable, Equatable {
         modalPath: [Int]? = nil,
         readouts: [String: MacLookReadoutRecord] = [:],
         windowIdentity: MacAXWindowIdentity? = nil,
-        caps: MacLookCompileCaps? = nil,
+        caps: MacLookCompileCaps,
         completeWindow: Bool = false
     ) {
         self.windowIdentity = windowIdentity
@@ -268,7 +265,7 @@ public struct MacLookFrame: Sendable, Equatable {
         windowTitle: String?,
         rendered: Int? = nil,
         windowIdentity: MacAXWindowIdentity? = nil,
-        caps: MacLookCompileCaps? = nil,
+        caps: MacLookCompileCaps,
         completeWindow: Bool = false
     ) -> MacLookFrame {
         MacLookFrame(
@@ -284,11 +281,10 @@ public struct MacLookFrame: Sendable, Equatable {
             modalPath: percept.modal?.path,
             readouts: readoutRecords(from: percept),
             windowIdentity: windowIdentity,
-            // The walk's own truncation always travels with the frame; the
-            // caller adds the caps it asked for (a compile that ran under a
-            // lowered max_affordances/max_nodes/max_depth is not comparable
-            // with one that did not).
-            caps: caps ?? MacLookCompileCaps(truncated: percept.truncated),
+            // The caller records the walk's truncation and the caps it asked
+            // for; a compile under lowered bounds is not comparable with one
+            // that did not use those bounds.
+            caps: caps,
             completeWindow: completeWindow
         )
     }
@@ -366,6 +362,9 @@ public final class MacLookFrameStore {
     }
     /// Workspace and direct calls have independent slots; every act re-resolves the frame's pid/window.
     @TaskLocal public nonisolated static var source = "direct"
+    /// Immutable observations held only for one batch. Each act still checks
+    /// TTL, process, window and live control identity; no motor authority here.
+    @TaskLocal public nonisolated static var batchFrames: [String: MacLookFrame]?
     private var latestBySource: [String: MacLookFrame] = [:]
     private var latest: MacLookFrame? { latestBySource[Self.source] }
     private var publications: [String: LatestRead] = [:]
@@ -380,13 +379,21 @@ public final class MacLookFrameStore {
         _ load: @Sendable () async -> (MacControlResult, MacLookFrame?)
     ) async -> MacControlResult {
         let source = Self.source
+        var published = false
         do {
             let result = try await publication(for: source).read({
                 let result = await load()
                 guard result.0.ok, result.1 != nil else { throw MacSnapshotUnavailable(result: result.0) }
                 return result
             }) { result in
-                if let frame = result.1 { latestBySource[source] = frame }
+                if let frame = result.1 { latestBySource[source] = frame; published = true }
+            }
+            guard published else {
+                return MacControlResult(ok: false, action: result.0.action,
+                    output: .object([
+                        "frame_id": .null, "frame_current": .bool(false),
+                        "message": .string("This look was superseded or invalidated while in flight. Take a fresh look before acting."),
+                    ]), error: "look_capture_superseded", durationMs: result.0.durationMs)
             }
             return result.0
         } catch { return MacSnapshotUnavailable.result(for: error) }
@@ -399,19 +406,15 @@ public final class MacLookFrameStore {
     public func latestFrameId() -> String? { latest?.frameId }
     /// The frame with this id if it is the latest of ANY source (ids are UUIDs).
     public func frame(frameId: String) -> MacLookFrame? {
-        latestBySource.values.first { $0.frameId == frameId }
-    }
-    /// True when no held frame is within its TTL — the signal the live seam uses
-    /// to decide the Chromium enhanced-AX flag's lifetime is over.
-    public func isExpired(now: Date) -> Bool {
-        !latestBySource.values.contains { now.timeIntervalSince($0.capturedAt) <= Self.ttlSeconds }
+        if let held = Self.batchFrames?[frameId] { return held }
+        return latestBySource.values.first { $0.frameId == frameId }
     }
     public func resolve(
         handle: String,
         frameId: String,
         now: Date
     ) -> Result<MacLookFrameEntry, ResolveFailure> {
-        guard !latestBySource.isEmpty else { return .failure(.noFrame) }
+        guard !latestBySource.isEmpty || Self.batchFrames?.isEmpty == false else { return .failure(.noFrame) }
         guard let latest = frame(frameId: frameId) else { return .failure(.staleFrame) }
         guard now.timeIntervalSince(latest.capturedAt) <= Self.ttlSeconds else {
             return .failure(.frameExpired)

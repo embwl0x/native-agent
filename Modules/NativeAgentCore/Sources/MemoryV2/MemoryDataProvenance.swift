@@ -1,8 +1,9 @@
+import CognitiveSubstrate
 import ChatTurnContracts
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryDataProvenance.swift` | `MemoryDataProvenance`: stamp, retain and display memory sources across writes, readbacks and prompt projections |
+// Blueprint: | `MemoryDataProvenance.swift` | `MemoryDataProvenance`: current source/evidence and turn stamps, time and word-fold helpers, source retention and display across writes, readbacks and prompt projections |
 
 /// Stored untrusted content keeps its steer through duplicate saves and edits.
 /// Reading remains allowed; only subsequent effects use the turn's usual gates.
@@ -23,10 +24,20 @@ public enum MemoryDataProvenance {
         // An explicit empty checkpoint attests a clean write. Only older rows
         // need their descriptive told provenance interpreted as a boundary.
         if fields["peer_sources"] == nil, fields["provenance"] == .string("told"),
-           case .string(let by)? = fields["provenance_by"], !by.isEmpty,
-           by.caseInsensitiveCompare(MemoryRecallQueryExpansion.names(
-            storeDirectory: dataRoot.appendingPathComponent("memory")).user ?? "the user") != .orderedSame,
-           !sources.contains(by) { sources.append(by) }
+           case .string(let by)? = fields["provenance_by"], !by.isEmpty, !sources.contains(by) {
+            do {
+                let name = try MemoryRecallQueryExpansion.names(
+                    storeDirectory: dataRoot.appendingPathComponent("memory")).user
+                if let name {
+                    if by.caseInsensitiveCompare(name) != .orderedSame { sources.append(by) }
+                } else { sources.append(by) }
+            } catch {
+                // Unreadable identity cannot establish that these are the
+                // person's trusted words. Keep their actual named boundary.
+                sources.append(by)
+                nativeLog("Memory provenance identity unavailable; retaining named source %@: %@", by, error.localizedDescription)
+            }
+        }
         if sources.isEmpty, fields["untrusted_remote_data"] == .bool(true) {
             sources.append("untrusted stored content")
         }
@@ -81,4 +92,58 @@ public enum MemoryDataProvenance {
     }
 
     // Kept memories disclose their speaker through `fields(in:)`; only peer words in the turn's input steer it.
+
+    static func author(surface: String, peer: Bool) -> String {
+        surface == "studio_wander" ? "app" : peer ? "peer" : "user"
+    }
+
+    /// Where a kept memory came from and when it became true, in the keys the
+    /// store lifts into `evidence_json`, `observed_at` and `valid_from`: the
+    /// exchange (session, message, turn), who spoke, and the supporting words.
+    public static func sourceMetadata(sessionId: String?, messageId: String?, turnId: String?, at: Date,
+                                      speaker: String, words: String?) -> [String: JSONValue] {
+        var evidence: [String: JSONValue] = ["speaker": .string(speaker)]
+        if let sessionId { evidence["session_id"] = .string(sessionId) }
+        if let messageId { evidence["message_id"] = .string(messageId) }
+        if let turnId { evidence["turn_id"] = .string(turnId) }
+        let words = MemoryTextClip.wordClip((words ?? "").trimmingCharacters(in: .whitespacesAndNewlines), cap: 400)
+        if !words.isEmpty { evidence["words"] = .string(words) }
+        return ["evidence": .object(evidence), "observed_at": .string(at.ISO8601Format()),
+                "valid_from": .string(at.ISO8601Format())]
+    }
+
+    /// The turn a memory was kept in: turn, run and session ids, and the
+    /// transcript locator the recent_receipts strip renders (`history:` and the
+    /// id of the message that opened the turn) and when. Moments, standing
+    /// corrections and committed memories stamp it alike, so a correction knows
+    /// its miss — and a repeat that collapses into it keeps its own turn.
+    public static func turnMetadata(turnId: String?, origin: AfterTurnOrigin?) -> [String: JSONValue] {
+        var meta: [String: JSONValue] = [:]
+        if let turnId { meta["turn_id"] = .string(turnId) }
+        guard let origin else { return meta }
+        meta["session_id"] = .string(origin.sessionId)
+        if let runId = origin.runId { meta["run_id"] = .string(runId) }
+        meta["history"] = .string("history:" + origin.messageId)
+        meta["turn_at"] = .string((origin.occurredAt ?? Date()).ISO8601Format())
+        return meta
+    }
+
+    /// Calendar-day key (local zone) used by the REM evidence owner.
+    public static func dayKey(_ instant: Date, calendar: Calendar = .current) -> String {
+        let parts = calendar.dateComponents([.year, .month, .day], from: instant)
+        return String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
+    }
+
+    public static func parseTimestamp(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
+    }
+
+    /// Words only, single-spaced, lowercase: a copied span with a comma added
+    /// or a period dropped is still the same span.
+    static func wordFold(_ text: String) -> String {
+        text.lowercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .joined(separator: " ")
+    }
 }

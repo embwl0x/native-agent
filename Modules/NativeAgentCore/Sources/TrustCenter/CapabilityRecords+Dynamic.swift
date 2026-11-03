@@ -4,7 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import ToolRegistry
-// Blueprint: | `CapabilityRecords+Dynamic.swift` | Read-only capability projections; workflow and catalog registries use their owners' checked schemas, never default over damaged saved state |
+// Blueprint: | `CapabilityRecords+Dynamic.swift` | Checked read-only capability projections from abilities through Parts' shared name schema, saved workflows and connector actions; absent source status/counts/dates remain unknown, name damage stays row-local and other malformed fields reject the read |
 
 // Read-only capability aggregation. Authored parts and saved workflow templates
 // come from their owners; extra JSON fields remain intact in the projections.
@@ -12,13 +12,12 @@ import ToolRegistry
 
 // MARK: - Helpers (file-local)
 
-private func jsonInt(_ obj: [String: JSONValue], _ key: String) -> Int {
-    switch obj[key] ?? .null {
-    case .int(let i): return Int(i)
-    case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? 0
-    case .bool(let b): return b ? 1 : 0
-    default: return 0
+private func capabilityStatus(_ row: JSONRow) throws -> JSONValue {
+    guard let status = try row.optionalString("status") else { return .null }
+    guard !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        throw JSONRow.Malformed.field("status")
     }
+    return .string(status)
 }
 
 // MARK: - Risky tool permissions
@@ -68,15 +67,18 @@ public func promptSafeCapabilityText(_ raw: String?, limit: Int = 500) -> String
 public func listTools(
     dataRoot: URL
 ) async throws -> [[String: JSONValue]] {
-    guard case .array(let rows) = try AbilityStore(dataRoot: dataRoot).registry(kind: .part) else { return [] }
-    return rows.compactMap {
-        if case .object(let fields) = $0 { return fields }
-        return nil
-    }.sorted { lhs, rhs in
-        let left = (lhs["updatedAt"]?.stringValue ?? "").isEmpty ? (lhs["createdAt"]?.stringValue ?? "") : (lhs["updatedAt"]?.stringValue ?? "")
-        let right = (rhs["updatedAt"]?.stringValue ?? "").isEmpty ? (rhs["createdAt"]?.stringValue ?? "") : (rhs["updatedAt"]?.stringValue ?? "")
-        return left > right
+    let rows = try Parts(root: dataRoot).rows(kind: .part)
+    let dated = try rows.enumerated().map { index, value in
+        (index: index, fields: value, stamp: try RegistryTimestampSortKey.sortKey(.object(value)))
     }
+    return dated.sorted { lhs, rhs in
+        switch (lhs.stamp, rhs.stamp) {
+        case (.some(let left), .some(let right)) where left != right: return left > right
+        case (.some, .none): return true
+        case (.none, .some): return false
+        default: return lhs.index < rhs.index
+        }
+    }.map(\.fields)
 }
 
 // MARK: - Saved workflows
@@ -85,35 +87,20 @@ public func listTools(
 // checked schema and stable timestamp sort. Neither listing nor capability
 // aggregation seeds defaults or writes the registry.
 public func listWorkflows(dataRoot: URL) async throws -> [[String: JSONValue]] {
-    try SavedWorkflows.readProjection(dataRoot: dataRoot).compactMap {
-        if case .object(let record) = $0 { return record }
-        return nil
+    try SavedWorkflows.readProjection(dataRoot: dataRoot).map {
+        _ = try WorkflowRecord(row: $0)
+        return try JSONRow($0).fields
     }
 }
 
-// MARK: - Capability catalog
-//
-// Read only the catalog owner's checked records, sorted by name/id.
-public func listCapabilityCatalog(dataRoot: URL) async throws -> [[String: JSONValue]] {
-    let path = dataRoot
-        .appendingPathComponent("catalog", isDirectory: true)
-        .appendingPathComponent("registry.json")
-    return try await CapabilityCatalogStoreReader.loadRegistryChecked(path).sorted { lhs, rhs in
-        let lk = (lhs["name"]?.stringValue ?? "").isEmpty
-            ? (lhs["id"]?.stringValue ?? "") : (lhs["name"]?.stringValue ?? "")
-        let rk = (rhs["name"]?.stringValue ?? "").isEmpty
-            ? (rhs["id"]?.stringValue ?? "") : (rhs["name"]?.stringValue ?? "")
-        return lk < rk
-    }
-}
 
 private func capabilityTrustMetadata(_ source: [String: JSONValue]) -> [String: JSONValue] {
-    source.filter { ["sourcePackId", "provenance", "signature"].contains($0.key) }
+    source.filter { ["provenance", "signature"].contains($0.key) }
 }
 
 // MARK: - Capability aggregation
 
-// Merge built-in features, installed skills, authored parts, workflows, connectors and catalog records in that order.
+// Merge built-in features, installed skills, authored parts, workflows and connectors in that order.
 public func capabilityRecordsFull(
     dataRoot: URL,
     nowISO: String,
@@ -136,85 +123,67 @@ public func capabilityRecordsFull(
         rec["sourceId"] = .string(sid)
         rec["name"] = .string(promptSafeCapabilityText(skill.name))
         rec["kind"] = .string("skill")
-        let status = skill.status ?? ""
-        rec["status"] = .string(status.isEmpty ? "active" : status)
-        rec["description"] = .string(
-            promptSafeCapabilityText(skill.description)
-        )
+        rec["status"] = skill.status.map(JSONValue.string) ?? .null
+        rec["description"] = .string(promptSafeCapabilityText(skill.description))
         rec["triggers"] = .array(skill.triggers.map(JSONValue.string))
         rec["permissions"] = .array([])
         rec["riskClass"] = .string("routine")
         rec["autoload"] = .bool(false)
-        rec["useCount"] = .int(Int64(skill.useCount ?? 0))
+        rec["useCount"] = skill.useCount.map { .int(Int64($0)) } ?? .null
         rec["lastUsedAt"] = skill.lastUsedAt.map(JSONValue.string) ?? .null
-        let updated = skill.updatedAt ?? ""
-        let created = skill.createdAt ?? ""
-        rec["updatedAt"] = .string(updated.isEmpty ? created : updated)
+        rec["updatedAt"] = skill.updatedAt.map(JSONValue.string) ?? .null
         records.append(rec)
     }
 
     // Authored parts
     let tools = try await listTools(dataRoot: dataRoot)
     for tool in tools.prefix(150) {
+        let row = try JSONRow(.object(tool))
         var rec = capabilityTrustMetadata(tool)
-        let tid = (tool["id"]?.stringValue ?? "")
+        let tid = try row.string("id")
         rec["id"] = .string("tool:\(tid)")
         rec["sourceId"] = .string(tid)
         rec["name"] = tool["name"] ?? .null
         rec["kind"] = .string("tool")
-        // status = tool.status or tool.phase or "proposal"
-        let toolStatus = (tool["status"]?.stringValue ?? "")
-        let toolPhase = (tool["phase"]?.stringValue ?? "")
-        let resolvedStatus = !toolStatus.isEmpty ? toolStatus :
-            (!toolPhase.isEmpty ? toolPhase : "proposal")
-        rec["status"] = .string(resolvedStatus)
+        rec["status"] = try capabilityStatus(row)
         rec["description"] = tool["description"] ?? .null
-        rec["triggers"] = .array((tool["triggers"]?.arrayValue?.compactMap(\.stringValue) ?? []).map { .string($0) })
-        let perms = (tool["permissions"]?.arrayValue?.compactMap(\.stringValue) ?? [])
-        rec["permissions"] = .array(perms.map { .string($0) })
-        let isRisky = !Set(perms).intersection(riskyToolPermissions).isEmpty
-        rec["riskClass"] = .string(isRisky ? "risky_tool" : "app_owned_tool")
+        rec["triggers"] = try row.optionalStrings("triggers").map { .array($0.map(JSONValue.string)) } ?? .null
+        let perms = try row.optionalStrings("permissions")
+        rec["permissions"] = perms.map { .array($0.map(JSONValue.string)) } ?? .null
+        rec["riskClass"] = perms.map {
+            .string(Set($0).intersection(riskyToolPermissions).isEmpty ? "app_owned_tool" : "risky_tool")
+        } ?? .null
         rec["autoload"] = .bool(false)
-        rec["useCount"] = .int(Int64(jsonInt(tool, "useCount")))
+        let useCount = try row.optionalInt("useCount")
+        if let useCount, useCount < 0 { throw JSONRow.Malformed.field("useCount") }
+        rec["useCount"] = useCount.map { .int(Int64($0)) } ?? .null
         rec["lastUsedAt"] = tool["lastUsedAt"] ?? .null
-        let updated = (tool["updatedAt"]?.stringValue ?? "")
-        let created = (tool["createdAt"]?.stringValue ?? "")
-        rec["updatedAt"] = .string(updated.isEmpty ? created : updated)
+        rec["updatedAt"] = tool["updatedAt"] ?? .null
         records.append(rec)
     }
 
     // Saved workflows
     let workflows = try await listWorkflows(dataRoot: dataRoot)
     for workflow in workflows.prefix(100) {
+        let row = try JSONRow(.object(workflow))
         var rec = capabilityTrustMetadata(workflow)
-        let wid = (workflow["id"]?.stringValue ?? "")
+        let wid = try row.string("id")
         rec["id"] = .string("workflow:\(wid)")
         rec["sourceId"] = .string(wid)
         rec["name"] = workflow["name"] ?? .null
         rec["kind"] = .string("workflow")
-        let wstatus = (workflow["status"]?.stringValue ?? "")
-        rec["status"] = .string(wstatus.isEmpty ? "active" : wstatus)
+        rec["status"] = try capabilityStatus(row)
         rec["description"] = workflow["description"] ?? .null
-        let trigger = (workflow["trigger"]?.stringValue ?? "")
-        rec["triggers"] = trigger.isEmpty ? .array([]) : .array([.string(trigger)])
+        rec["triggers"] = try row.optionalString("trigger").map { .array([.string($0)]) } ?? .null
         rec["permissions"] = .array([])
         // requires approval check on steps
-        var anyRequires = false
-        if case .array(let steps) = workflow["steps"] ?? .null {
-            for step in steps {
-                guard case .object(let so) = step else { continue }
-                if case .bool(true) = so["requiresApproval"] ?? .null {
-                    anyRequires = true; break
-                }
-            }
-        }
-        rec["riskClass"] = .string(anyRequires ? "approval_gated" : "app_data")
+        let requirements = try row.array("steps").map { try JSONRow($0).optionalBool("requiresApproval") }
+        rec["riskClass"] = requirements.contains(true) ? .string("approval_gated")
+            : requirements.contains(nil) ? .null : .string("app_data")
         rec["autoload"] = .bool(false)
-        rec["useCount"] = .int(0)
+        rec["useCount"] = .null
         rec["lastUsedAt"] = .null
-        let updated = (workflow["updatedAt"]?.stringValue ?? "")
-        let created = (workflow["createdAt"]?.stringValue ?? "")
-        rec["updatedAt"] = .string(updated.isEmpty ? created : updated)
+        rec["updatedAt"] = workflow["updatedAt"] ?? .null
         records.append(rec)
     }
 
@@ -231,59 +200,34 @@ public func capabilityRecordsFull(
             throw CapabilityTrustError.unavailable
         }
         rec["status"] = .string(status)
-        let descSource = action.description ?? "Connector action \(action.id)."
-        rec["description"] = .string(promptSafeCapabilityText(descSource, limit: 500))
-        rec["triggers"] = .array([
-            .string(action.id),
-            .string(action.connectorId),
-            .string(action.category ?? ""),
-        ])
-        let risk = action.risk.isEmpty ? "low" : action.risk
-        rec["permissions"] = .array([.string(risk)])
-        rec["riskClass"] = .string(risk)
+        rec["description"] = action.description.map { .string(promptSafeCapabilityText($0, limit: 500)) } ?? .null
+        rec["triggers"] = .array(([action.id, action.connectorId] + [action.category].compactMap { $0 }).map(JSONValue.string))
+        rec["permissions"] = action.risk.isEmpty ? .null : .array([.string(action.risk)])
+        rec["riskClass"] = action.risk.isEmpty ? .null : .string(action.risk)
         rec["autoload"] = .bool(false)
-        rec["useCount"] = .int(0)
+        rec["useCount"] = .null
         rec["lastUsedAt"] = .null
         // Static actions have no update timestamp.
         rec["updatedAt"] = .null
         records.append(rec)
     }
 
-    // Catalog records
-    let catalog = try await listCapabilityCatalog(dataRoot: dataRoot)
-    for item in catalog {
-        var rec = capabilityTrustMetadata(item)
-        let iid = (item["id"]?.stringValue ?? "")
-        rec["id"] = .string("catalog:\(iid)")
-        rec["sourceId"] = .string(iid)
-        rec["name"] = item["name"] ?? .null
-        rec["kind"] = .string("catalog")
-        let installed = (item["installed"]?.boolValue ?? false)
-        rec["status"] = .string(installed ? "installed" : "available")
-        rec["description"] = item["description"] ?? .null
-        rec["triggers"] = .array([item["name"] ?? .null])
-        rec["permissions"] = .array([])
-        let riskClass = (item["riskClass"]?.stringValue ?? "")
-        rec["riskClass"] = .string(riskClass.isEmpty ? "app_data" : riskClass)
-        rec["autoload"] = .bool(false)
-        rec["useCount"] = .int(0)
-        let installedAt = (item["installedAt"]?.stringValue ?? "")
-        rec["lastUsedAt"] = installedAt.isEmpty ? .null : .string(installedAt)
-        let created = (item["createdAt"]?.stringValue ?? "")
-        let resolvedUpdated = !installedAt.isEmpty ? installedAt : created
-        rec["updatedAt"] = resolvedUpdated.isEmpty ? .null : .string(resolvedUpdated)
-        records.append(rec)
-    }
+    // Every caller receives the same checked rows, including the trust network
+    // and evaluator that do not otherwise pass through the typed summary.
+    for record in records { _ = try CapabilityRecord(catalogRow: record) }
 
-    // Sort by updatedAt or name descending, preserving merge order for equal keys.
+    // Sort by supplied updatedAt or name, preserving undated/unnamed absence
+    // and merge order for equal keys; this does not rewrite either field.
     let indexed = records.enumerated().map { ($0.offset, $0.element) }
     let sorted = indexed.sorted { lhs, rhs in
-        let lk = (lhs.1["updatedAt"]?.stringValue ?? "").isEmpty
-            ? (lhs.1["name"]?.stringValue ?? "") : (lhs.1["updatedAt"]?.stringValue ?? "")
-        let rk = (rhs.1["updatedAt"]?.stringValue ?? "").isEmpty
-            ? (rhs.1["name"]?.stringValue ?? "") : (rhs.1["updatedAt"]?.stringValue ?? "")
-        if lk != rk { return lk > rk }
-        return lhs.0 < rhs.0
+        let lk = lhs.1["updatedAt"]?.stringValue ?? lhs.1["name"]?.stringValue
+        let rk = rhs.1["updatedAt"]?.stringValue ?? rhs.1["name"]?.stringValue
+        switch (lk, rk) {
+        case (.some(let left), .some(let right)) where left != right: return left > right
+        case (.some, .none): return true
+        case (.none, .some): return false
+        default: return lhs.0 < rhs.0
+        }
     }
     return sorted.map { $0.1 }
 }

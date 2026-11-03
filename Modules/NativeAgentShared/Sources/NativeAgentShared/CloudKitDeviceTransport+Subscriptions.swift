@@ -3,56 +3,52 @@ import Foundation
 import CloudKit
 import CryptoKit
 import OSLog
-// Blueprint: | `CloudKitDeviceTransport+Subscriptions.swift` | Silent notification subscriptions and registration reconciliation |
+// Blueprint: | `CloudKitDeviceTransport+Subscriptions.swift` | Keyless visible ordinary-notification subscription, silent signed-result/chat wakes and exact registration reconciliation |
 
 extension CloudKitDeviceTransport {
-    // MARK: subscription (silent push — the live cross-device trigger)
+    // MARK: subscriptions (ordinary alerts and silent cross-device triggers)
 
-    public func subscribeToChanges() async throws {
+    func subscribeToChatChanges() async throws {
+        try await registerBroadSubscription(
+            recordType: NADeviceSyncRecordType.chatMessage,
+            subscriptionID: DeviceCloudKitSubscriptionID.chat,
+            label: "subscribeToChatChanges"
+        )
+    }
+
+    /// CloudKit builds the alert from the record even without app execution.
+    /// Requested results are chat records, so they cannot match this subscription.
+    func subscribeToVisibleNotifications() async throws {
         do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.subscribeToChanges", onFailure: accountFailureReporter) {
-                // Both peers repair the shared legacy visible subscription.
-                // Direct APNS is the sole remote alert; CloudKit only wakes sync.
-                try await self.ensureSilentNotificationSubscription()
-                let sub = Self.makeSilentChatSubscription()
+            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.subscribeToVisibleNotifications", onFailure: accountFailureReporter) {
+                let sub = Self.makeVisibleNotificationSubscription()
                 try await self.ensureSubscription(sub, id: sub.subscriptionID)
             }
         } catch is DeviceCKLandmineTimeout {
-            throw DeviceSyncError.transient(message: "CloudKit subscribe timed out")
+            throw DeviceSyncError.transient(message: "CloudKit visible notification subscription timed out")
         }
     }
 
-    // Chat subscriptions use a schema-independent broad predicate; direct APNS owns alerts and CloudKit only wakes sync.
-    static func makeSilentChatSubscription() -> CKQuerySubscription {
-        let sub = CKQuerySubscription(
-            recordType: NADeviceSyncRecordType.chatMessage,
-            predicate: NSPredicate(value: true),
-            subscriptionID: DeviceCloudKitSubscriptionID.chat,
-            options: [.firesOnRecordCreation, .firesOnRecordUpdate]
-        )
-        let info = CKSubscription.NotificationInfo()
-        info.shouldSendContentAvailable = true
-        sub.notificationInfo = info
-        return sub
-    }
-
-    /// Wake sync for explicit notification records without a second alert.
-    private func ensureSilentNotificationSubscription() async throws {
-        let sub = Self.makeSilentNotificationSubscription()
-        try await ensureSubscription(sub, id: sub.subscriptionID)
-        try await retireSubscription(id: "NAChatMessage.notifications.visible")
-    }
-
-    static func makeSilentNotificationSubscription() -> CKQuerySubscription {
+    static func makeVisibleNotificationSubscription() -> CKQuerySubscription {
         let sub = CKQuerySubscription(
             recordType: NADeviceSyncRecordType.notification,
-            predicate: NSPredicate(value: true),
+            // Only notification envelopes carry a direction in this family.
+            // Presence shares the type but has no direction or alert fields.
+            // direction is queryable in Production; kind/title/eventId are not.
+            predicate: NSPredicate(format: "direction == %@", NAChatDirection.mac2ios.rawValue),
             subscriptionID: DeviceCloudKitSubscriptionID.visibleNotifications,
             options: [.firesOnRecordCreation]
         )
         let info = CKSubscription.NotificationInfo()
         info.shouldSendContentAvailable = true
-        // Preserve the deployed subscription ID so upgrades remove its alert.
+        info.shouldSendMutableContent = true
+        info.alertLocalizationKey = "NATIVEAGENT_CLOUDKIT_NOTIFICATION_BODY_FORMAT"
+        info.alertLocalizationArgs = ["text"]
+        info.titleLocalizationKey = "NATIVEAGENT_CLOUDKIT_NOTIFICATION_TITLE_FORMAT"
+        info.titleLocalizationArgs = ["notificationTitle"]
+        info.soundName = "default"
+        // CloudKit permits three desired keys. Title/body use localization args;
+        // routing can read the exact envelope in the notification extension.
         info.desiredKeys = [
             "notificationScreen",
             "notificationEventId",
@@ -61,19 +57,6 @@ extension CloudKitDeviceTransport {
         info.collapseIDKey = "notificationEventId"
         sub.notificationInfo = info
         return sub
-    }
-
-    /// Remove the pre-split visual projection. Leaving it installed would let
-    /// legacy `NAChatMessage(kind=notification)` writes keep competing with the
-    /// silent chat subscription on upgraded accounts.
-    private func retireSubscription(id: CKSubscription.ID) async throws {
-        do {
-            _ = try await database.deleteSubscription(withID: id)
-        } catch let error as CKError where error.code == .unknownItem {
-            return
-        } catch {
-            throw Self.mapError(error)
-        }
     }
 
     /// Durable silent-push subscription for the peer's pairing writes. Same broad

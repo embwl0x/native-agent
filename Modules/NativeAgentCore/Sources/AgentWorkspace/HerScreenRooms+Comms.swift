@@ -32,17 +32,22 @@ extension HerScreen {
     static let numbersNote = "numbers stay with each item, gaps are normal"
 
     /// Warn on failed sends only while no newer inbound evidence is available at render.
-    static func sendTrouble(agents: [String], dataRoot: URL, now: Date) -> [String: String] {
+    static func sendTrouble(agents: [String], dataRoot: URL, now: Date) throws -> [String: String] {
         guard !agents.isEmpty else { return [:] }
-        let records: [AgentConversationRecord] = HerMemo.shared.cached(dataRoot.standardizedFileURL.path + "\u{0}sendTrouble.records", stamp: [stamp(dataRoot.appendingPathComponent("agents/conversations.json"))]) {
-            ((try? AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)) ?? []).filter { !$0.agent.hasPrefix("bot") }
+        do { return try checkedSendTrouble(agents: agents, dataRoot: dataRoot, now: now) }
+        catch { return Dictionary(Set(agents).map { ($0.lowercased(), "Send status unavailable: " + error.localizedDescription + ". Repair conversation storage before interpreting the previous send.") }, uniquingKeysWith: { first, _ in first }) }
+    }
+
+    private static func checkedSendTrouble(agents: [String], dataRoot: URL, now: Date) throws -> [String: String] {
+        let records: [AgentConversationRecord] = try HerMemo.shared.cached(dataRoot.standardizedFileURL.path + "\u{0}sendTrouble.records", stamp: [stamp(dataRoot.appendingPathComponent("agents/conversations.json"))]) {
+            try AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true).filter { !$0.agent.hasPrefix("bot") }
         }
-        let chats = bridgeChats(dataRoot: dataRoot)
-        let identity = AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot)
+        let chats = try bridgeChats(dataRoot: dataRoot)
+        let identity = try AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot)
         let contacts = contacts(identity: identity)
-        let transcripts = try? ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, archived: [:])
+        let transcripts = try ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, archived: [:])
         var out: [String: String] = [:]
-        let health = AgentWorkspacePorts.current.conversations.liveHealth(dataRoot: dataRoot)
+        let health = try AgentWorkspacePorts.current.conversations.liveHealth(dataRoot: dataRoot)
         for agent in Set(agents.map { $0.lowercased() }) {
             if let problem = health[agent]?.problem { out[agent] = problem; continue }
             guard let contact = contacts.first(where: { $0.id == agent || $0.agents.contains(agent) }),
@@ -51,7 +56,7 @@ extension HerScreen {
             if health[agent]?.resolves(record) == true { continue }
             let receipt = record.sendEvidence
             if receipt["needs_input"] == .bool(true) || receipt["needs_authentication"] == .bool(true) { continue }
-            let heard = transcripts.flatMap { thread(contact, dataRoot: dataRoot, identity: identity, transcripts: $0) }?.heard
+            let heard = try thread(contact, dataRoot: dataRoot, identity: identity, transcripts: transcripts)?.heard
             let inbound = chats.filter { $0.who == contact.id || contact.agents.contains($0.who) || $0.who == record.name.lowercased() }
                 .compactMap(\.heard).max()
             if max(heard ?? .distantPast, inbound ?? .distantPast) > record.updatedAt { continue }
@@ -102,12 +107,23 @@ extension HerScreen {
         } else { result }
         switch tool {
         case "notes_search":
-            // The header carries the counts; the tool's "Showing 12 of 20" would say it twice.
-            let noteContent: JSONValue = if case .object(let root) = content { .object(root.filter { $0.key != "message" }) } else { content }
+            // The header carries complete counts; partial reads retain their repair notice.
+            let noteContent: JSONValue = if case .object(let root) = content {
+                .object(root.filter { $0.key != "message" || root["status"] == .string("partial") })
+            } else { content }
             return .init(title: "Notes", content: noteContent, items: rows("notes").compactMap { row in
                 guard let name = text(row["name"]) else { return nil }
                 // By the note's own id: two notes can share a title.
-                let by: [String: JSONValue] = if let id = text(row["id"]) { ["id": .string(id)] } else { ["title": .string(name)] }
+                guard case .string(let id)? = row["id"], nonEmpty(id) != nil, id != "missing value" else {
+                    return .init(title: name, content: .object([
+                        "status": .string("unavailable"), "reason": .string("note_identity_unavailable"),
+                        "detail": .string("This Notes row has no recorded ID; it cannot be opened by title."),
+                        "source": .object(row), "effects": .string("none"),
+                        "remedy": Repair.remedy(owner: "notes_search", nextCall: nil, tap: nil,
+                            instruction: "Repair the Notes source's missing identifier, then refresh Notes.")
+                    ]), actions: [])
+                }
+                let by: [String: JSONValue] = ["id": .string(id)]
                 let about: [String: JSONValue] = ["kind": row["folder"] ?? .null, "date": row["modified_at"] ?? .null,
                                                   "snippet": row["body_preview"] ?? row["body"] ?? .null]
                 return .init(title: name, content: .object(about),
@@ -126,7 +142,7 @@ extension HerScreen {
                         .compactMap { $0 }.joined(separator: ", ")
                 return .init(title: name, content: .object(["kind": row["organizationName"] ?? .null, "summary": .string(holds)]),
                     actions: [.init(label: "Open", action: .open(.record(tool: "contacts_search",
-                        input: ["identifier": .string(id), "query": .string(name)], title: name)))])
+                        input: ["identifier": .string(id)], title: name)))])
             }, actions: [.init(label: "Search contacts", action: .perform(tool: "contacts_search", input: [:], title: "Contacts search", textField: "query", isEffect: false), needsText: true)])
         default: return nil
         }
@@ -169,7 +185,7 @@ extension HerScreen {
             // same message or thread keeps it.
             let identity = input.filter { !["body_offset", "text_offset", "before_message_id", "limit", "position"].contains($0.key) }
             let itemKey = key(.record(tool: tool, input: identity, title: title)) ?? title
-            let name = family + ".\(try withNames(dataRoot) { book in try book.number("item." + family, id: itemKey) { [itemKey] } })"
+            let name = family + ".\(try withNames(dataRoot) { book in try book.number("item." + family, id: itemKey, title: title) { [itemKey] } })"
             func rowsOf(_ key: String) -> [[String: JSONValue]] {
                 guard case .array(let list)? = object[key] else { return [] }
                 return list.compactMap { if case .object(let row) = $0 { row } else { nil } }
@@ -264,6 +280,7 @@ extension HerScreen {
                 }
             default: return nil
             }
+            sections.append(section("GAPS", pageGaps(projection.content)))
             if !previewing { HerNamed.shared.keep(dataRoot, keep.filter { AgentWorkspaceReadiness.allows($0.value) }, room: name, scope: scope) }
             return screen(header, sections, verbs: verbs, back: "Back: home · \(family).", verbWidth: 24, omitEmptyHeader: true)
         } catch { return nameFailure(error) }

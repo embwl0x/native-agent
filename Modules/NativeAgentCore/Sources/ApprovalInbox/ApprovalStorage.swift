@@ -9,7 +9,7 @@ import PersistenceCore
 // the remote/iOS sets. A second copy of them here would be a second answer to
 // "is this surface the person" — the thing that type exists to prevent.
 import TrustCenter
-// Blueprint: | `ApprovalStorage.swift` | Checked approval storage and legacy import |
+// Blueprint: | `ApprovalStorage.swift` | Checked canonical approval storage |
 extension SwiftNativeApprovalInbox {
     /// The most rows `requests.json` keeps. Terminal rows above it are the
     /// store's settled history and are evictable; pending work is not.
@@ -124,8 +124,7 @@ extension SwiftNativeApprovalInbox {
     public nonisolated static func validateApprovalRows(_ items: [JSONValue]) throws {
         var ids = Set<String>()
         for (index, item) in items.enumerated() {
-            guard case .object(let object) = item,
-                  let record = ApprovalRecord(json: item) else {
+            guard let record = ApprovalRecord(json: item) else {
                 throw ApprovalInboxError.malformedResponse(
                     "approval store row \(index) is not a valid approval record"
                 )
@@ -135,71 +134,13 @@ extension SwiftNativeApprovalInbox {
                     "approval store contains duplicate id \(record.id)"
                 )
             }
-            guard record.status == "pending" || terminalApprovalStatuses.contains(record.status) else {
-                throw ApprovalInboxError.malformedResponse(
-                    "approval store row \(index) has invalid status"
-                )
-            }
-            // Retired writers emitted explicit null authority fields on
-            // terminal history. Those rows can no longer grant authority and
-            // remain safe to read; pending rows below still require two exact
-            // booleans. Wrong-typed non-null values remain store corruption.
-            for key in ["remoteResolvable", "localOnly"] {
-                guard let value = object[key], value != .null else { continue }
-                guard case .bool = value else {
-                    throw ApprovalInboxError.malformedResponse(
-                        "approval store row \(index) has non-boolean \(key)"
-                    )
-                }
-            }
             if record.status == "pending" {
-                guard case .string(let title)? = object["title"], !title.isEmpty,
-                      case .string(let action)? = object["action"], !action.isEmpty,
-                      case .string? = object["risk"],
-                      case .string? = object["reason"],
-                      case .object? = object["payload"],
-                      case .string? = object["payloadPreview"],
-                      case .string(let createdAt)? = object["createdAt"], !createdAt.isEmpty else {
-                    throw ApprovalInboxError.malformedResponse(
-                        "pending approval row \(index) lacks required typed fields"
-                    )
-                }
-                guard case .bool? = object["remoteResolvable"],
-                      case .bool? = object["localOnly"] else {
-                    throw ApprovalInboxError.malformedResponse(
-                        "pending approval row \(index) lacks authority fields"
-                    )
-                }
-                guard object["decision"] == .null, object["resolvedAt"] == .null else {
-                    throw ApprovalInboxError.malformedResponse(
-                        "pending approval row \(index) carries terminal decision state"
-                    )
+                guard record.localOnly == !record.remoteResolvable else {
+                    throw ApprovalInboxError.malformedResponse("pending approval row \(index) has conflicting authority fields")
                 }
                 if Self.hardLocalOnlyActions.contains(record.action),
                    (record.remoteResolvable || !record.localOnly) {
-                    throw ApprovalInboxError.malformedResponse(
-                        "pending approval row \(index) widens a local-only action"
-                    )
-                }
-            }
-            if record.status == "pending", record.localOnly != !record.remoteResolvable {
-                throw ApprovalInboxError.malformedResponse(
-                    "approval store row \(index) has conflicting authority fields"
-                )
-            }
-            let decidedByPresent = object["decidedBy"] != nil
-            let provenancePresent = object["resolutionProvenance"] != nil
-            guard decidedByPresent == provenancePresent else {
-                throw ApprovalInboxError.malformedResponse(
-                    "approval store row \(index) has incomplete resolution provenance"
-                )
-            }
-            if provenancePresent {
-                guard let provenance = record.resolutionProvenance,
-                      record.decidedBy == provenance.decidedBy else {
-                    throw ApprovalInboxError.malformedResponse(
-                        "approval store row \(index) has malformed resolution provenance"
-                    )
+                    throw ApprovalInboxError.malformedResponse("pending approval row \(index) widens a local-only action")
                 }
             }
         }
@@ -319,67 +260,5 @@ extension SwiftNativeApprovalInbox {
     /// fractional seconds and a `+00:00` offset.
     nonisolated static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
-    }
-    /// One-time legacy merge under the canonical owner's mutation lock.
-    /// Canonical wins on conflicts. Renaming the source completes the import;
-    /// its absence prevents retention-evicted rows from being re-imported.
-    /// The .migrated archive preserves the completed import's source bytes.
-    public func mergeLegacyApprovalRows() async throws {
-        let legacyPath = root
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("requests.json")
-        guard FileManager.default.fileExists(atPath: legacyPath.path) else { return }
-        try await SwiftNativePersistenceCore.withFileLock(approvalsPath) { [approvalsPath] in
-            try Self.mergeLegacyRowsLocked(
-                legacyPath: legacyPath,
-                canonicalPath: approvalsPath
-            )
-        }
-    }
-    /// The merge itself. Caller holds the approvals lock.
-    private nonisolated static func mergeLegacyRowsLocked(
-        legacyPath: URL,
-        canonicalPath: URL
-    ) throws {
-        let legacyRows: [JSONValue] = {
-            guard let data = try? Data(contentsOf: legacyPath),
-                  let parsed = try? JSONValue.parse(data),
-                  case .array(let rows) = parsed else { return [] }
-            return rows
-        }()
-        if !legacyRows.isEmpty {
-            var merged = try Self.loadApprovalRowsChecked(at: canonicalPath)
-            func rowKey(_ value: JSONValue) -> String? {
-                guard case .object(let object) = value else { return nil }
-                let execution: String? = {
-                    if case .string(let s) = object["executionId"] ?? object["execution_id"]
-                        ?? object["missionId"] ?? object["mission_id"] ?? .null { return s }
-                    return nil
-                }()
-                let step: String? = {
-                    if case .string(let s) = object["stepId"] ?? object["step_id"]
-                        ?? object["id"] ?? .null { return s }
-                    return nil
-                }()
-                guard let execution, let step else { return nil }
-                return "\(execution)#\(step)"
-            }
-            let existing = Set(merged.compactMap(rowKey))
-            var appended = false
-            for row in legacyRows where rowKey(row).map({ !existing.contains($0) }) == true {
-                merged.append(row)
-                appended = true
-            }
-            if appended {
-                try Self.validateApprovalRows(merged)
-                let data = try JSONValue.array(merged).serialize(pretty: false)
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(data.utf8), to: canonicalPath)
-            }
-        }
-        let migratedPath = legacyPath
-            .deletingLastPathComponent()
-            .appendingPathComponent("requests.json.migrated")
-        try? FileManager.default.removeItem(at: migratedPath)
-        try? FileManager.default.moveItem(at: legacyPath, to: migratedPath)
     }
 }

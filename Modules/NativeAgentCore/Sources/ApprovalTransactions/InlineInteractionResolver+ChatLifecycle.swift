@@ -1,4 +1,5 @@
 import Foundation
+import Experiences
 import NativeAgentCore
 import ChatToolRuntime
 import NativeAgentShared
@@ -10,32 +11,6 @@ import MacControl
 // Blueprint: | `InlineInteractionResolver+ChatLifecycle.swift` | `InlineInteractionResolver` owns local and signed-phone control effects with retained provenance, local OS prompts, permission return checks and verified card settlement |
 
 extension InlineInteractionResolver {
-    /// Legacy transcripts can contain repeated open asks. Only the newest
-    /// retains controls; projection never rewrites the transcript.
-    private static func collapsingOlderAsks(
-        _ pairs: [(rowID: String, interaction: InlineInteraction)]
-    ) -> [(rowID: String, interaction: InlineInteraction)] {
-        // Transcript order defines newest. Superseded/unknown rows cannot
-        // shadow a readable ask; choose cards do not name a shared target.
-        var newest: [String: Int] = [:]
-        for (index, pair) in pairs.enumerated() where pair.interaction.kind != .choose {
-            switch pair.interaction.state {
-            case .superseded, .unknown: continue
-            default: newest[Self.askKey(pair.interaction)] = index
-            }
-        }
-        return pairs.enumerated().map { index, pair in
-            // Only a still-waiting ask goes quiet. The newest one keeps
-            // whatever it is — live, or the receipt it settled into — so
-            // answering it does not hand the question back to an older copy.
-            guard pair.interaction.state.isOpen,
-                  let newest = newest[Self.askKey(pair.interaction)],
-                  newest != index
-            else { return pair }
-            return (pair.rowID, pair.interaction.superseded(at: pair.interaction.createdAt))
-        }
-    }
-
     /// Adjacent identical declined or failed asks render once, at the newest
     /// receipt, with a repeat count. Separated asks remain separate events.
     private static func collapsingAnsweredRepeats(
@@ -84,16 +59,15 @@ extension InlineInteractionResolver {
         }
     }
 
-    /// The two collapse passes and the count, in one place.
+    /// Open asks are reused by the transcript writer; fold terminal repeats only.
     public static func collapsedCards(
         _ pairs: [(rowID: String, interaction: InlineInteraction)]
     ) -> CollapsedCards {
-        let quieted = collapsingOlderAsks(pairs)
-        let collapsed = collapsingAnsweredRepeats(quieted)
+        let collapsed = collapsingAnsweredRepeats(pairs)
         return CollapsedCards(
             pairs: collapsed.pairs,
             counts: collapsed.counts,
-            foldedCount: max(0, quieted.count - collapsed.pairs.count)
+            foldedCount: max(0, pairs.count - collapsed.pairs.count)
         )
     }
 
@@ -112,8 +86,9 @@ extension InlineInteractionResolver {
             .first { $0.id == interaction.target }?.surfaces ?? [interaction.target]
         for surface in surfaces {
             if let model = ProviderRoutingSurfaceLookup.value(snapshot.preferences, surface)?.model,
-               !model.isEmpty {
-                return model
+               !model.isEmpty, let provider = ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, surface),
+               !provider.isEmpty {
+                return InlineInteractionRegistry.modelOptionID(providerID: provider, modelID: model)
             }
         }
         return nil
@@ -122,10 +97,10 @@ extension InlineInteractionResolver {
     public static func beginControl(
         _ id: String, sessionID: String, dataRoot: URL
     ) async throws -> (interaction: InlineInteraction, descriptor: InlineInteractionDescriptor)? {
-        guard let current = await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot) else { return nil }
+        let current = try await require(id: id, sessionID: sessionID, dataRoot: dataRoot)
         let control = descriptor(for: current, dataRoot: dataRoot)
-        _ = try await begin(id: id, sessionID: sessionID, expectedRevision: current.revision, dataRoot: dataRoot)
-        return (current, control)
+        let running = try await begin(id: id, sessionID: sessionID, expectedRevision: current.revision, dataRoot: dataRoot)
+        return (running, control)
     }
 
     public static func runControl(
@@ -136,7 +111,7 @@ extension InlineInteractionResolver {
         watch: @MainActor () -> Void, refresh: @MainActor () async -> Void
     ) async {
         func finish(selection: String?, error: String? = nil, note: String? = nil) async {
-            await completeControl(interaction.id, sessionID: sessionID, selection: selection,
+            await completeControl(interaction.id, sessionID: sessionID, expectedRevision: interaction.revision, selection: selection,
                 scope: nil, setupError: error, note: note, dataRoot: dataRoot)
             await refresh()
         }
@@ -154,7 +129,7 @@ extension InlineInteractionResolver {
             if !controls.chromeControlEnabled, !controls.fullMacGrantIsActive {
                 await controls.enableChromeControl()
             }
-            if await completeIfVerified(id: interaction.id, sessionID: sessionID, dataRoot: dataRoot) {
+            if await completeIfVerified(id: interaction.id, sessionID: sessionID, expectedRevision: interaction.revision, dataRoot: dataRoot) {
                 await refresh()
                 return
             }
@@ -176,7 +151,13 @@ extension InlineInteractionResolver {
                 // Not now while a sign-in runs leaves the card declined: the late token is not kept.
                 let id = interaction.id
                 refused = await NativeOAuthFlow.grantSecret(name, ask: ask, pasted: value, open: {
-                    await Self.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot)?.state == .running
+                    do {
+                        guard let current = try await Self.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot) else { return false }
+                        return current.state == .running && current.revision == interaction.revision
+                    } catch {
+                        await recordControlFailure(id, dataRoot: dataRoot, error: error)
+                        return false
+                    }
                 }, shown: refresh)
             }
             await finish(selection: interaction.target, error: refused)
@@ -213,33 +194,48 @@ extension InlineInteractionResolver {
             let outcome = await saveAPIKey(interaction, value: value, controls: controls, dataRoot: dataRoot)
             return (outcome.error, outcome.note, false)
         case .macPermissionGrant:
-            return (nil, nil, await grantPermissions(interaction, controls: controls, dataRoot: dataRoot, phone: phone))
+            do { return (nil, nil, try await grantPermissions(interaction, controls: controls, dataRoot: dataRoot, phone: phone)) }
+            catch { return (error.localizedDescription, nil, false) }
         case .capabilityFlag:
-            return (nil, nil, await setCapabilityFlag(interaction, controls: controls, dataRoot: dataRoot, askMacOS: phone == nil))
+            do { return (nil, nil, try await setCapabilityFlag(interaction, controls: controls, dataRoot: dataRoot, askMacOS: phone == nil)) }
+            catch { return (error.localizedDescription, nil, false) }
         default: return (nil, nil, false)
         }
     }
 
-    public static func settleOrReopen(_ id: String, sessionID: String, dataRoot: URL) async {
-        if !(await completeIfVerified(id: id, sessionID: sessionID, dataRoot: dataRoot)),
-           let current = await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
-           case .running = current.state {
-            _ = try? await returnToPending(current, sessionID: sessionID, dataRoot: dataRoot)
+    public static func settleOrReopen(_ id: String, sessionID: String, expectedRevision: Int, dataRoot: URL) async {
+        guard !(await completeIfVerified(id: id, sessionID: sessionID, expectedRevision: expectedRevision, dataRoot: dataRoot)) else { return }
+        do {
+            if let current = try await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
+               current.revision == expectedRevision, case .running = current.state {
+                _ = try await returnToPending(current, sessionID: sessionID, dataRoot: dataRoot)
+            }
+        } catch {
+            recordControlFailure(id, dataRoot: dataRoot, error: error)
         }
     }
 
-    public static func verifyOnReturn(_ pending: [String: String], dataRoot: URL, refresh: @MainActor () async -> Void) async {
-        for (id, sessionID) in pending {
-            guard let current = await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
-                  current.state.isOpen else { continue }
+    public static func verifyOnReturn(_ pending: [String: (sessionID: String, revision: Int)], dataRoot: URL, refresh: @MainActor () async -> Void) async {
+        for (id, claim) in pending {
+            let sessionID = claim.sessionID
+            do {
+            guard let current = try await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
+                  current.state.isOpen, current.revision == claim.revision else { continue }
             if current.kind == .connector {
-                await settleOrReopen(id, sessionID: sessionID, dataRoot: dataRoot)
+                await settleOrReopen(id, sessionID: sessionID, expectedRevision: claim.revision, dataRoot: dataRoot)
                 await refresh()
                 continue
             }
-            let selection = try? await selectionForReturn(current, dataRoot: dataRoot)
-            _ = try? await complete(id: id, sessionID: sessionID, selection: selection,
-                scope: current.kind == .modelChoice ? .persistent : nil, dataRoot: dataRoot)
+            let selection: String?
+            do { selection = try await selectionForReturn(current, dataRoot: dataRoot) }
+            catch {
+                _ = try await complete(id: id, sessionID: sessionID, expectedRevision: current.revision,
+                    setupError: error.localizedDescription, dataRoot: dataRoot)
+                continue
+            }
+            _ = try await complete(id: id, sessionID: sessionID, selection: selection,
+                scope: current.kind == .modelChoice ? .persistent : nil, expectedRevision: current.revision, dataRoot: dataRoot)
+            } catch { recordControlFailure(id, dataRoot: dataRoot, error: error) }
         }
     }
 
@@ -247,7 +243,7 @@ extension InlineInteractionResolver {
         _ interaction: InlineInteraction,
         controls: any InlineInteractionControlPort,
         dataRoot: URL, phone: (actionID: String, clientID: String)? = nil
-    ) async -> Bool {
+    ) async throws -> Bool {
         // Every capability in the chain, in one grant — the card asked once.
         // The need carries the axis the blocked call wanted, so each capability
         // gets THAT axis and no more, which is exactly what the card's scope
@@ -261,7 +257,7 @@ extension InlineInteractionResolver {
             }
             guard MacIntegrationID.all.contains(capability) else { continue }
             do {
-                _ = try await MacIntegrationPermissionStore.shared.setWithReceipt(
+                _ = try await MacIntegrationPermissionStore(dataRoot: dataRoot).setWithReceipt(
                     integrationId: capability,
                     read: MacIntegrationID.supportsRead(capability) && (mode?.wantsRead ?? true),
                     write: MacIntegrationID.supportsWrite(capability) && (mode?.wantsWrite ?? true),
@@ -275,7 +271,7 @@ extension InlineInteractionResolver {
                     onlyAddingAxes: true
                 )
             } catch {
-                nativeLog("[interaction] grant failed for \(capability): \(error)")
+                throw error
             }
         }
         if !categories.isEmpty {
@@ -284,16 +280,20 @@ extension InlineInteractionResolver {
         guard phone == nil else { return false }
         // macOS is asked only for what the app side actually allowed: a Trust
         // write refused outside Full Mac never leads to a macOS prompt.
-        let granted = (try? await MacIntegrationPermissionStore.shared.currentChecked()) ?? [:]
-        let allowed = interaction.allTargets.filter { capability in
+        let granted: [String: MacIntegrationPermission]
+        if interaction.allTargets.contains(where: { MacIntegrationID.all.contains($0) }) {
+            granted = try await MacIntegrationPermissionStore(dataRoot: dataRoot).currentChecked()
+        } else { granted = [:] } // OS-only/category cards do not read integration authority.
+        let allowed = try interaction.allTargets.filter { capability in
             if !MacIntegrationID.all.contains(capability), !InlineInteractionRegistry.isMacControlCategory(capability) {
                 return SystemPermissionPreflight.cardSettingsCapability(capability) != nil
             }
-            return InlineInteractionRegistry.isMacControlCategory(capability)
-                ? InlineInteractionRegistry.macControlCategoryAllowed(capability, dataRoot: dataRoot)
-                : (granted[capability]?.read ?? false) || (granted[capability]?.write ?? false)
+            if InlineInteractionRegistry.isMacControlCategory(capability) {
+                return try InlineInteractionRegistry.macControlCategoryAllowed(capability, dataRoot: dataRoot)
+            }
+            return (granted[capability]?.read ?? false) || (granted[capability]?.write ?? false)
         }
-        if await platform.askMacOSForCard(allowed, mode: mode) {
+        if try await platform.askMacOSForCard(allowed, mode: mode) {
             return true
         }
 
@@ -306,7 +306,7 @@ extension InlineInteractionResolver {
         _ interaction: InlineInteraction,
         controls: any InlineInteractionControlPort,
         dataRoot: URL, askMacOS: Bool = true
-    ) async -> Bool {
+    ) async throws -> Bool {
         // The ONE field the card named, patched into the locked generation
         // through the same helper `interaction_act` uses. Sending back the
         // whole cached multimodal block overwrote any other switch the person
@@ -316,7 +316,7 @@ extension InlineInteractionResolver {
         }
         await controls.grantCapabilityFlag(policyKey: flag.policyKey, dataRoot: dataRoot, logTag: askMacOS ? "interaction" : "signed-phone-card")
         if askMacOS, flag.id != "screen_capture" || controls.screenCaptureEnabled,
-           await platform.askMacOSForCard([flag.id], mode: nil) {
+           try await platform.askMacOSForCard([flag.id], mode: nil) {
             return true
         }
         // Trust is re-read by the resolver; the tap is not the authority.
@@ -341,9 +341,12 @@ extension InlineInteractionResolver {
         guard let group = ProviderSurfaceGroups.all.first(where: { $0.id == target }) else {
             throw ProviderRoutingError.invalidRequest
         }
-        let option = InlineInteractionRegistry.splitModelOptionID(picked)
-        try await controls.saveProviderGroupSelection(group: group, providerID: option?.providerID,
-            model: option?.modelID ?? picked)
+        guard let option = InlineInteractionRegistry.splitModelOptionID(picked) else {
+            throw ToolFailureError("This model choice does not name its account. Choose a current account-qualified model option in Providers.",
+                effects: .none, code: "model_choice_identity_unavailable")
+        }
+        try await controls.saveProviderGroupSelection(group: group, providerID: option.providerID,
+            model: option.modelID)
     }
 
     /// The one way any door answers a model choice: begin on the card's
@@ -365,8 +368,8 @@ extension InlineInteractionResolver {
     ) async {
         do {
             _ = try await settleModelChoice(interaction, sessionID: sessionID, picked: picked,
-                scope: interaction.primaryScope ?? .persistent, controls: controls, dataRoot: dataRoot)
-        } catch { nativeLog("[interaction] complete failed for \(interaction.id): \(error)") }
+                scope: interaction.primaryScope ?? .persistent, expectedRevision: interaction.revision, controls: controls, dataRoot: dataRoot)
+        } catch { recordControlFailure(interaction.id, dataRoot: dataRoot, error: error) }
     }
 
     private static func settleModelChoice(
@@ -374,6 +377,9 @@ extension InlineInteractionResolver {
         expectedRevision: Int? = nil, attribution: String? = nil,
         controls: (any InlineInteractionControlPort)?, dataRoot: URL
     ) async throws -> InlineInteraction {
+        let current = try await require(id: card.id, sessionID: sessionID, dataRoot: dataRoot)
+        try checkRevision(current, expectedRevision)
+        guard case .running = current.state else { throw ResolveError.alreadySettled(current.state.name) }
         var setupError: String?
         if (scope ?? .persistent) == .persistent {
             do {
@@ -388,27 +394,37 @@ extension InlineInteractionResolver {
     }
 
     public static func settleVerifiedControls(
-        _ waiting: [String: String], dataRoot: URL, didSettle: @MainActor (String) -> Void
+        _ waiting: [String: (sessionID: String, revision: Int)], dataRoot: URL, didSettle: @MainActor (String) -> Void
     ) async -> Bool {
-        for (id, sessionID) in waiting {
-            guard await completeIfVerified(id: id, sessionID: sessionID, dataRoot: dataRoot) else { return false }
-            didSettle(id)
+        var allSettled = true
+        for (id, claim) in waiting {
+            if await completeIfVerified(id: id, sessionID: claim.sessionID, expectedRevision: claim.revision, dataRoot: dataRoot) {
+                didSettle(id)
+            } else { allSettled = false }
         }
-        return true
+        return allSettled
     }
 
     /// Complete against the session captured at the tap; a control can outlive
     /// a conversation switch, and a refusal must not disappear into UI refresh.
     public static func completeControl(
-        _ id: String, sessionID: String, selection: String?, scope: InlineInteraction.Scope?,
+        _ id: String, sessionID: String, expectedRevision: Int, selection: String?, scope: InlineInteraction.Scope?,
         setupError: String?, note: String?, dataRoot: URL
     ) async {
         do {
             _ = try await complete(id: id, sessionID: sessionID, selection: selection,
-                scope: scope, setupError: setupError, note: note, dataRoot: dataRoot)
+                scope: scope, expectedRevision: expectedRevision, setupError: setupError, note: note, dataRoot: dataRoot)
         } catch {
-            nativeLog("[interaction] complete failed for \(id): \(error)")
+            recordControlFailure(id, dataRoot: dataRoot, error: error)
         }
+    }
+
+    static func recordControlFailure(_ id: String, dataRoot: URL, error: any Error) {
+        // The CAS loser did no work: Not now or another tap already moved it.
+        if let error = error as? ResolveError, case .staleRevision = error { return }
+        RepairOwed.owe(dataRoot, id: "interaction-control-\(id)", kind: .act,
+            operation: "interaction.control", owner: "transcript",
+            words: TurnSecretRedactor.redactText(error.localizedDescription))
     }
 }
 
@@ -484,11 +500,25 @@ extension InlineInteractionResolver {
 
         private func recheckGrants(_ identity: UUID) async {
             var waiting = grantWatches
-            for card in await InlineInteractionResolver.platform.openInteractionCards() {
+            let cards: [(id: String, sessionID: String)]
+            do { cards = try await InlineInteractionResolver.platform.openInteractionCards() }
+            catch {
+                RepairOwed.owe(dataRoot, id: "interaction-card-census", kind: .act,
+                    operation: "interaction.cards", owner: "inbox",
+                    words: "Open permission cards could not be read: \(error.localizedDescription). Repair the inbox; no card has been declared absent or settled.")
+                return
+            }
+            for card in cards {
                 let key = dataRoot.standardizedFileURL.path + ":" + card.id
                 if waiting[key] != nil { continue }
                 guard current(identity) else { return }
-                guard let current = await InlineInteractionResolver.interaction(id: card.id, sessionID: card.sessionID, dataRoot: dataRoot),
+                let found: InlineInteraction?
+                do { found = try await InlineInteractionResolver.interaction(id: card.id, sessionID: card.sessionID, dataRoot: dataRoot) }
+                catch {
+                    InlineInteractionResolver.recordControlFailure(card.id, dataRoot: dataRoot, error: error)
+                    continue
+                }
+                guard let current = found,
                       current.kind == .permission, current.state.isOpen else { continue }
                 guard self.current(identity) else { return }
                 waiting[key] = (card.id, card.sessionID, dataRoot)

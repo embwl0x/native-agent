@@ -42,7 +42,10 @@ public actor SwiftNativeChatOrchestrationClient {
     let continuationCapabilityProfile: String?
     let cognitiveRuntime: (any CognitiveRuntimeProviding)?
     let providerLifecycleObserverInstalled: Bool
-    let autocompactionConfig: ChatSessionAutocompactionConfig
+    private let configuredAutocompaction: ChatSessionAutocompactionConfig?
+    var autocompactionConfig: ChatSessionAutocompactionConfig {
+        configuredAutocompaction ?? .productionDefault()
+    }
     let clock: @Sendable () -> Date
 
     /// Parts waking between turns use the same client and checked Chat pick,
@@ -81,7 +84,7 @@ public actor SwiftNativeChatOrchestrationClient {
         continuationCapabilityProfile: String? = nil,
         cognitiveRuntime: (any CognitiveRuntimeProviding)? = nil,
         providerLifecycleObserverInstalled: Bool = false,
-        autocompactionConfig: ChatSessionAutocompactionConfig = .productionDefault(),
+        autocompactionConfig: ChatSessionAutocompactionConfig? = nil,
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         // Reuse the executable parser; malformed or unknown calls remain actions.
@@ -103,7 +106,7 @@ public actor SwiftNativeChatOrchestrationClient {
         self.continuationCapabilityProfile = continuationCapabilityProfile
         self.cognitiveRuntime = cognitiveRuntime
         self.providerLifecycleObserverInstalled = providerLifecycleObserverInstalled
-        self.autocompactionConfig = autocompactionConfig
+        self.configuredAutocompaction = autocompactionConfig
         self.clock = clock
     }
 
@@ -168,12 +171,8 @@ public actor SwiftNativeChatOrchestrationClient {
                 // this caller consumes live progress (bridge vs. Telegram).
                 // chat() callers await the reply; deltas they draw (Telegram's
                 // draft) are a preview, not the answer.
-                progress: progress,
-                noticeSink: { kind, text in await progress?(.notice(kind: kind, text: text)) }
+                progress: progress
             )
-            if case .success = execution.turn, let suffix = TurnSettle.takeStreamSuffix() {
-                await progress?(.delta(suffix))
-            }
             let requested = model.trimmingCharacters(in: .whitespacesAndNewlines)
             execution.response.requestedModel = requested.isEmpty ? nil : requested
             return execution

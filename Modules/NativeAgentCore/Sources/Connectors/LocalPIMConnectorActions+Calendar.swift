@@ -7,7 +7,7 @@ import PersistenceCore
 import Privacy
 import MacIntegration
 import ToolExecution
-// Blueprint: | `LocalPIMConnectorActions+Calendar.swift` | Calendar CRUD, bounded event snapshots and calendar day/range interpretation on the existing LocalPIMStore |
+// Blueprint: | `LocalPIMConnectorActions+Calendar.swift` | Calendar CRUD with checked supplied text fields, event notes redacted before preview bounds and exclusive next-day boundaries on LocalPIMStore; the day perception's titles-only projection never reads location, notes or attendees |
 
 extension LocalPIMConnectorActions {
     struct CalendarListWindow: Equatable, Sendable {
@@ -17,7 +17,7 @@ extension LocalPIMConnectorActions {
         let day: String?
     }
 
-    public static func calendarListUpcoming(input: [String: JSONValue]) async throws -> JSONValue {
+    public static func calendarListUpcoming(input: [String: JSONValue], titlesOnly: Bool = false) async throws -> JSONValue {
         let window = try calendarListWindow(input: input)
         let store = LocalPIMStore()
         let granted = try await store.requestCalendarAccess(.read)
@@ -30,15 +30,15 @@ extension LocalPIMConnectorActions {
             )
         }
 
-        let limit = MacAppleScriptBridge.clampedInt(input["limit"] ?? input["max"], defaultValue: 20, min: 1, max: 100)
-        let calendarName = (input["calendar_name"] ?? input["calendarName"])?.scalarText?
+        let limit = try MacAppleScriptBridge.clampedInt(input["limit"], defaultValue: 20, min: 1, max: 100)
+        let calendarName = input["calendar_name"]?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let calendarID = input["calendar_id"]?.scalarText
         if let calendarID, !store.calendars(for: .event).contains(where: { $0.calendarIdentifier == calendarID }) {
             return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("Unknown calendar_id.")])
         }
         let events = try await upcomingEventRows(window: window, calendarName: calendarName, calendarID: calendarID,
-            query: input["query"]?.scalarText ?? "", limit: limit)
+            query: input["query"]?.scalarText ?? "", limit: limit, titlesOnly: titlesOnly)
 
         var payload: [String: JSONValue] = [
             "status": .string("completed"),
@@ -66,7 +66,8 @@ extension LocalPIMConnectorActions {
         calendarName: String?,
         calendarID: String?,
         query: String,
-        limit: Int
+        limit: Int,
+        titlesOnly: Bool
     ) async throws -> [JSONValue] {
         try Task.checkCancellation()
         let read = Task.detached(priority: .userInitiated) { () throws -> [JSONValue] in
@@ -79,10 +80,10 @@ extension LocalPIMConnectorActions {
             let rows = LocalPIMStore.withEvents(start: window.start, end: window.end, calendarIDs: calendarID.map { [$0] }, calendarMatches: calendarMatches) { events, _ -> [JSONValue] in
                 return events
                     .filter { query.isEmpty || ($0.title ?? "").localizedCaseInsensitiveContains(query)
-                        || ($0.notes ?? "").localizedCaseInsensitiveContains(query) }
+                        || (!titlesOnly && ($0.notes ?? "").localizedCaseInsensitiveContains(query)) }
                     .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
                     .prefix(limit)
-                    .map { eventJSON($0) }
+                    .map { eventJSON($0, titlesOnly: titlesOnly) }
             }
             return rows
         }
@@ -186,7 +187,7 @@ extension LocalPIMConnectorActions {
         }
         let notes = input["notes"]?.scalarText
         let location = input["location"]?.scalarText
-        let calendarNameField = input["calendar_name"] ?? input["calendarName"]
+        let calendarNameField = input["calendar_name"]
         let calendarName = calendarNameField?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if input["calendar_id"] != nil, input["calendar_id"]?.scalarText?.isEmpty != false {
@@ -324,9 +325,11 @@ extension LocalPIMConnectorActions {
         }
         var arguments = CalendarModifyArguments(id: id)
         if input.keys.contains("title") {
-            guard let title = input["title"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty else {
-                throw invalid("Invalid field: title (must be non-empty)")
+            guard case .string(let raw) = input["title"] else {
+                throw invalid("Invalid field: title (must be a non-empty string)")
             }
+            let title = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else { throw invalid("Invalid field: title (must be a non-empty string)") }
             arguments.title = title
             arguments.fields.append("title")
         }
@@ -345,11 +348,17 @@ extension LocalPIMConnectorActions {
             arguments.fields.append("end")
         }
         if input.keys.contains("notes") {
-            arguments.notes = input["notes"]?.scalarText ?? ""
+            guard case .string(let notes) = input["notes"] else {
+                throw invalid("Invalid field: notes (must be a string; use an empty string to clear it)")
+            }
+            arguments.notes = notes
             arguments.fields.append("notes")
         }
         if input.keys.contains("location") {
-            arguments.location = input["location"]?.scalarText ?? ""
+            guard case .string(let location) = input["location"] else {
+                throw invalid("Invalid field: location (must be a string; use an empty string to clear it)")
+            }
+            arguments.location = location
             arguments.fields.append("location")
         }
         guard !arguments.fields.isEmpty else {
@@ -479,7 +488,15 @@ extension LocalPIMConnectorActions {
         }
     }
 
-    nonisolated private static func eventJSON(_ event: EKEvent) -> JSONValue {
+    nonisolated private static func eventJSON(_ event: EKEvent, titlesOnly: Bool = false) -> JSONValue {
+        if titlesOnly {
+            var row: [String: JSONValue] = [
+                "title": .string(NativeAppSecretRedactor.redactText(event.title ?? "(Untitled event)")),
+                "allDay": .bool(event.isAllDay),
+            ]
+            if let start = event.startDate { row["startAt"] = .string(iso(start)) }
+            return .object(row)
+        }
         var obj: [String: JSONValue] = [
             // Event identifiers let callers modify listed events.
             "id": .string(event.eventIdentifier ?? ""),
@@ -496,7 +513,7 @@ extension LocalPIMConnectorActions {
             obj["location"] = .string(NativeAppSecretRedactor.redactText(location))
         }
         if let notes = event.notes, !notes.isEmpty {
-            obj["notesPreview"] = .string(NativeAppSecretRedactor.redactText(String(notes.prefix(300))))
+            obj["notesPreview"] = .string(String(NativeAppSecretRedactor.redactText(notes).prefix(300)))
         }
         return .object(obj)
     }
@@ -538,8 +555,8 @@ extension LocalPIMConnectorActions {
             return CalendarListWindow(start: now, end: end,
                 hoursAhead: max(1, Int(ceil(end.timeIntervalSince(now) / 3600))), day: nil)
         }
-        let hoursAhead = MacAppleScriptBridge.clampedInt(
-            input["hours_ahead"] ?? input["hoursAhead"],
+        let hoursAhead = try MacAppleScriptBridge.clampedInt(
+            input["hours_ahead"],
             defaultValue: 24,
             min: 1,
             max: 24 * 30
@@ -564,8 +581,10 @@ extension LocalPIMConnectorActions {
             )
         }
 
-        let end = calendar.date(byAdding: .hour, value: hoursAhead, to: now) ??
-            now.addingTimeInterval(TimeInterval(hoursAhead) * 3600)
+        guard let end = calendar.date(byAdding: .hour, value: hoursAhead, to: now) else {
+            throw NSError(domain: "NativeAgentCalendar", code: -400,
+                userInfo: [NSLocalizedDescriptionKey: "Calendar could not form this time window. Correct the duration or calendar before reading again."])
+        }
         return CalendarListWindow(start: now, end: end, hoursAhead: hoursAhead, day: nil)
     }
 
@@ -610,6 +629,6 @@ extension LocalPIMConnectorActions {
         guard let nextDay = calendar.date(byAdding: .day, value: 1, to: dayStart) else {
             return nil
         }
-        return (label, dayStart, nextDay.addingTimeInterval(-1))
+        return (label, dayStart, nextDay)
     }
 }

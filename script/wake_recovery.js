@@ -3,9 +3,6 @@
 // Lane-specific recovery; entrypoints supply runtime policy and effects.
 
 function createCodexRecovery({
-  DEFAULT_WAKE_CONCURRENCY,
-  WAKE_CAPACITY_DIR,
-  PINNED_THREAD_MODE,
   REPLY_DELIVERIES_PATH,
   REPLY_JOBS_DIR,
   REPLY_RECOVERY_LOCK_DIR,
@@ -15,207 +12,46 @@ function createCodexRecovery({
   connectRpcOnce,
   deadLetterPath,
   deliverReplyJob,
-  dirLockOwnerAlive,
   entryLaneKey,
-  isUnhealthyThreadState,
   markInboxConsumed,
   markInboxTerminal,
   markPendingStaleRecovery,
   messageIdForPayload,
   numberSetting,
-  pidAlive,
   probeTurnLiveness,
   readCanonicalTurnResult,
-  processStartIdentity,
   readWakeJSONLines,
   redactDiagnosticText,
-  removeStaleSocket,
   sleep,
-  socketOwnerPid,
-  startDaemon,
-  threadStateFromThread,
   unicodePrefix,
-  wakeLaneKey,
-  wakeLaneLockPath,
-  withDirLock
+  withWakeLock
 }) {
 const fs = require("fs");
 const path = require("path");
 
-async function waitForPIDExit(pid, timeoutMs, operations) {
-  const deadline = operations.now() + Math.max(0, timeoutMs);
-  do {
-    if (!operations.pidAlive(pid)) return true;
-    if (operations.now() >= deadline) break;
-    await operations.sleep(Math.min(100, Math.max(1, deadline - operations.now())));
-  } while (operations.now() <= deadline);
-  return !operations.pidAlive(pid);
-}
-
-async function terminateKnownHungAppServer(job, operations = {}) {
-  const known = job && job.appServer;
-  const pid = Number(known && known.pid);
-  if (!Number.isInteger(pid) || pid <= 1) {
-    return { action: "app_server_kill_skipped_no_known_pid", pidKilled: null };
-  }
-  const ownerPID = (operations.socketOwnerPid || socketOwnerPid)();
-  if (ownerPID !== pid) {
-    return { action: "app_server_kill_skipped_owner_mismatch", pidKilled: null };
-  }
-  const identity = operations.processStartIdentity || processStartIdentity;
-  if (known.startIdentity && identity(pid) !== known.startIdentity) {
-    return { action: "app_server_kill_skipped_identity_mismatch", pidKilled: null };
-  }
-  const ops = {
-    now: operations.now || Date.now,
-    sleep: operations.sleep || sleep,
-    pidAlive: operations.pidAlive || pidAlive,
-  };
-  const signal = operations.kill || ((target, name) => process.kill(target, name));
-  try {
-    signal(pid, "SIGTERM");
-  } catch (error) {
-    return {
-      action: "app_server_kill_failed",
-      pidKilled: null,
-      error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 500),
-    };
-  }
-  if (await waitForPIDExit(pid, operations.termWaitMs ?? 3000, ops)) {
-    return { action: "app_server_killed", pidKilled: pid };
-  }
-  try {
-    signal(pid, "SIGKILL");
-  } catch (error) {
-    return {
-      action: "app_server_kill_failed",
-      pidKilled: null,
-      error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 500),
-    };
-  }
-  if (await waitForPIDExit(pid, operations.killWaitMs ?? 2000, ops)) {
-    return { action: "app_server_killed", pidKilled: pid };
-  }
-  return { action: "app_server_kill_failed_still_alive", pidKilled: null };
-}
-
-async function recoverExactHungTurn(job, threadId, turnId, operations = {}) {
+async function recoverExactHungTurn(threadId, turnId, operations = {}) {
   let client;
-  const connect = operations.connectRpcOnce || connectRpcOnce;
   try {
-    client = await connect(12000);
-    try {
-      await client.request("turn/interrupt", { threadId, turnId });
-      return { action: "hung_turn_interrupted", pidKilled: null };
-    } catch {}
-
-    // Hold every admission slot while checking the shared server, so another
-    // wake cannot start between the inventory and termination.
-    const capacityRoot = operations.capacityRoot || WAKE_CAPACITY_DIR;
-    fs.mkdirSync(capacityRoot, { recursive: true, mode: 0o700 });
-    async function withAllSlots(index, fn) {
-      if (index === DEFAULT_WAKE_CONCURRENCY) return await fn();
-      return await withDirLock(path.join(capacityRoot, `slot-${index}.lock`),
-        async () => withAllSlots(index + 1, fn),
-        { waitMs: 0, preserveLiveOwner: true });
-    }
-    return await withAllSlots(0, async () => {
-      const loaded = await client.request("thread/loaded/list", {});
-      if (!loaded || !Array.isArray(loaded.data) || loaded.nextCursor) {
-        return { action: "app_server_kill_skipped_unverified_lanes", pidKilled: null };
-      }
-      for (const id of loaded.data) {
-        const read = await client.request("thread/read", { threadId: id, includeTurns: true });
-        if (!read || !read.thread || read.thread.id !== id) {
-          return { action: "app_server_kill_skipped_unverified_lanes", pidKilled: null };
-        }
-        const state = threadStateFromThread(read.thread, id);
-        const otherActiveTurn = state.inProgressTurnIds.some((active) => id !== threadId || active !== turnId);
-        if (isUnhealthyThreadState(state) || !["idle", "active"].includes(state.statusType)
-            || otherActiveTurn || (state.active && (id !== threadId || state.inProgressTurnIds.length === 0))) {
-          return { action: "app_server_kill_skipped_other_active_lane", pidKilled: null };
-        }
-      }
-      const confirmed = await client.request("thread/loaded/list", {});
-      if (!confirmed || !Array.isArray(confirmed.data) || confirmed.nextCursor
-          || JSON.stringify([...confirmed.data].sort()) !== JSON.stringify([...loaded.data].sort())) {
-        return { action: "app_server_kill_skipped_unverified_lanes", pidKilled: null };
-      }
-      return await terminateKnownHungAppServer(job, operations);
-    });
+    client = await (operations.connectRpcOnce || connectRpcOnce)(12000);
+    await client.request("turn/interrupt", { threadId, turnId });
+    return { action: "hung_turn_interrupted", executionOutcome: "unknown" };
   } catch (error) {
-    return { action: error && error.message === "lock_busy"
-      ? "app_server_kill_skipped_active_admission" : "app_server_kill_skipped_unverified_lanes", pidKilled: null };
-  } finally {
-    if (client) client.close();
-  }
-}
-
-function clearStaleWakeLaneLock(laneKey, lockDir = null, operations = {}) {
-  const resolvedLockDir = lockDir || wakeLaneLockPath(laneKey);
-  if (!fs.existsSync(resolvedLockDir)) {
-    return {
-      action: "wake_lane_lock_absent",
-      laneKey,
-      lockDir: resolvedLockDir,
-      pidKilled: null,
-    };
-  }
-  const ownerAlive = operations.dirLockOwnerAlive || dirLockOwnerAlive;
-  if (ownerAlive(resolvedLockDir)) {
-    return {
-      action: "wake_lane_lock_preserved_live_owner",
-      laneKey,
-      lockDir: resolvedLockDir,
-      pidKilled: null,
-    };
-  }
-  try {
-    fs.rmSync(resolvedLockDir, { recursive: true, force: true });
-    return {
-      action: "stale_wake_lane_lock_cleared",
-      laneKey,
-      lockDir: resolvedLockDir,
-      pidKilled: null,
-    };
-  } catch (error) {
-    return {
-      action: "stale_wake_lane_lock_clear_failed",
-      laneKey,
-      lockDir: resolvedLockDir,
-      pidKilled: null,
-      error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 500),
-    };
-  }
-}
-
-function respawnAppServerAfterHang(operations = {}) {
-  const owner = operations.socketOwnerPid || socketOwnerPid;
-  const existingPID = owner();
-  if (existingPID != null) {
-    return { action: "app_server_respawn_skipped_live_owner", pidKilled: null };
-  }
-  (operations.removeStaleSocket || removeStaleSocket)();
-  (operations.startDaemon || startDaemon)();
-  const restartedPID = owner();
-  return {
-    action: restartedPID == null ? "app_server_respawn_failed" : "app_server_respawned",
-    pidKilled: null,
-  };
+    return { action: "turn_interrupt_failed", executionOutcome: "unknown",
+      error: redactDiagnosticText(String(error.message || error)) };
+  } finally { if (client) client.close(); }
 }
 
 async function recoverHungTurn(job, execution, config, options = {}) {
   if (!execution || !execution.turnResult || execution.turnResult.status !== "failed_hung") {
-    return { status: "not_hung", retryCount: Number(job && job.hangRetryCount || 0) };
+    return { status: "not_hung" };
   }
-  const retryCount = Math.max(0, Number(job && job.hangRetryCount || 0));
   const turnId = execution.turnId || job.turnId;
   const threadId = execution.threadId || job.threadId;
   const reconcile = options.readCanonicalTurnResult || readCanonicalTurnResult;
   const terminal = await reconcile(null, threadId, turnId, config);
-  if (terminal) return { status: "reconciled_terminal", retryCount, turnResult: terminal };
+  if (terminal) return { status: "reconciled_terminal", turnResult: terminal };
   if (!boolSetting(config, "hangAutoRecover", "NATIVE_AGENT_CODEX_HANG_AUTORECOVER", true)) {
-    return { status: "disabled", retryCount };
+    return { status: "disabled" };
   }
   const nowFn = options.now || Date.now;
   const writeReceipt = options.appendReceipt || appendHangWatchdogReceipt;
@@ -224,8 +60,8 @@ async function recoverHungTurn(job, execution, config, options = {}) {
     const receipt = {
       turnId,
       action: result.action,
-      pidKilled: result.pidKilled ?? null,
-      retryCount: result.retryCount ?? retryCount,
+      executionOutcome: result.executionOutcome || "unknown",
+      ...(result.error ? { error: result.error } : {}),
       toolActivityCount: execution.turnResult.toolActivityCount ?? null,
       noWorkObserved: execution.turnResult.noWorkObserved ?? null,
       timestamp: new Date(nowFn()).toISOString(),
@@ -237,32 +73,13 @@ async function recoverHungTurn(job, execution, config, options = {}) {
     return result;
   }
 
-  const processOperations = options.processOperations || {};
-  const laneKey = wakeLaneKey({}, job && job.threadId, PINNED_THREAD_MODE);
-  const killed = await record(await recoverExactHungTurn(job, threadId, turnId, processOperations));
-  const lock = await record(clearStaleWakeLaneLock(
-    laneKey,
-    options.laneLockDir || null,
-    {
-      dirLockOwnerAlive: options.dirLockOwnerAlive,
-    }
-  ));
-  // A terminal write can land during shutdown. Preserve it before repairing
-  // the process; an activity count never proves which effects completed.
+  const interruption = await record(await recoverExactHungTurn(threadId, turnId, options.processOperations || {}));
+  // An accepted interrupt is not terminal evidence. No process kill, lane
+  // unlink or daemon restart can substitute for this exact turn's result.
   const settled = await reconcile(null, threadId, turnId, config);
-  const respawn = await record(respawnAppServerAfterHang(processOperations));
-  if (settled) {
-    return { status: "reconciled_terminal", retryCount, turnResult: settled, killed, lock, respawn, receipts };
-  }
-  await record({ action: "hang_effect_reconciliation_required", pidKilled: null });
-  return {
-    status: "reconciliation_required",
-    retryCount,
-    killed,
-    lock,
-    respawn,
-    receipts,
-  };
+  if (settled) return { status: "reconciled_terminal", turnResult: settled, interruption, receipts };
+  await record({ action: "hang_effect_reconciliation_required" });
+  return { status: "reconciliation_required", interruption, receipts };
 }
 
 async function recoverStaleQueuedWake(entry, state, config, options = {}) {
@@ -331,6 +148,7 @@ async function recoverStaleQueuedWake(entry, state, config, options = {}) {
   const proofs = [];
   for (const turnId of unresolvedTurnIds) {
     const first = await probe(entry.threadId, turnId, config);
+    if (first.availability === "unavailable") return { status: "evidence_unavailable", ageMs, staleAgeMs, turnId, proof: first };
     const firstDead = !first.serverReachable || !first.turnFound;
     if (!firstDead) {
       return {
@@ -343,6 +161,7 @@ async function recoverStaleQueuedWake(entry, state, config, options = {}) {
     }
     await pause(confirmDelayMs);
     const confirm = await probe(entry.threadId, turnId, config);
+    if (confirm.availability === "unavailable") return { status: "evidence_unavailable", ageMs, staleAgeMs, turnId, proof: confirm };
     const confirmedDead = !confirm.serverReachable || !confirm.turnFound;
     proofs.push({ turnId, first, confirm });
     if (!confirmedDead) {
@@ -394,11 +213,10 @@ async function recoverStaleQueuedWake(entry, state, config, options = {}) {
 
 async function recoverReplyJobs(config, options = {}) {
   const worker = options.worker || options.spawnJob || ((jobPath) => deliverReplyJob(jobPath, config));
-  const concurrency = Math.max(1, Math.min(2, Number(options.concurrency || 2)));
   const jobsDir = options.jobsDir || REPLY_JOBS_DIR;
   const recoveryLockDir = options.recoveryLockDir || REPLY_RECOVERY_LOCK_DIR;
   try {
-    return await withDirLock(recoveryLockDir, async () => {
+    return await withWakeLock(recoveryLockDir, async () => {
       let jobPaths = [];
       try {
         jobPaths = fs.readdirSync(jobsDir, { withFileTypes: true })
@@ -411,37 +229,19 @@ async function recoverReplyJobs(config, options = {}) {
         }
         throw error;
       }
-      const jobs = new Array(jobPaths.length);
-      let nextIndex = 0;
-      const runWorker = async () => {
-        while (true) {
-          const index = nextIndex;
-          nextIndex += 1;
-          if (index >= jobPaths.length) return;
-          const jobPath = jobPaths[index];
-          try {
-            jobs[index] = await worker(jobPath);
-          } catch (error) {
-            jobs[index] = {
-              status: "failed",
-              reason: "reply_job_recovery_failed",
-              jobPath,
-              error: unicodePrefix(redactDiagnosticText(String(error && error.message || error)), 500),
-            };
-          }
-        }
-      };
-      await Promise.all(
-        Array.from({ length: Math.min(concurrency, jobPaths.length) }, () => runWorker())
-      );
+      const jobs = await Promise.all(jobPaths.map(async (jobPath) => {
+        try { return await worker(jobPath); }
+        catch (error) { return { status: "failed", reason: "reply_job_recovery_failed", jobPath,
+          error: unicodePrefix(redactDiagnosticText(String(error.message || error)), 500) }; }
+      }));
       return {
         status: "completed",
         scanned: jobPaths.length,
         started: jobs.filter((job) => job && !["failed", "already_running"].includes(job.status)).length,
         jobs,
       };
-    // A killed helper (bridge stop) leaves its lock behind; its dead owner frees it at once.
-    }, { waitMs: 0, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+    // The kernel releases this recovery owner on helper exit.
+    }, { waitMs: 0 });
   } catch (error) {
     if (error && error.message === "lock_busy") {
       return { status: "already_running", reason: "reply_recovery_lock_busy", lockDir: recoveryLockDir };
@@ -456,8 +256,8 @@ async function repairConsumedFromDeliveries(config) {
     raw = fs.readFileSync(REPLY_DELIVERIES_PATH, "utf8");
   } catch (error) {
     return {
-      status: "skipped",
-      reason: "reply_deliveries_missing",
+      status: error.code === "ENOENT" ? "skipped" : "unavailable",
+      reason: error.code === "ENOENT" ? "reply_deliveries_missing" : "reply_deliveries_unavailable",
       deliveriesPath: REPLY_DELIVERIES_PATH,
       error: String(error.message || error),
     };
@@ -466,7 +266,7 @@ async function repairConsumedFromDeliveries(config) {
   let receipts = 0;
   let markedCount = 0;
   const details = [];
-  for (const { value: receipt } of readWakeJSONLines(raw)) {
+  for (const { value: receipt } of readWakeJSONLines(raw, null, REPLY_DELIVERIES_PATH)) {
     const bridgeStatus = receipt && receipt.bridge && receipt.bridge.status;
     if (bridgeStatus !== "delivered" && bridgeStatus !== "dry_run") continue;
     const messageIds = Array.isArray(receipt.messageIds) ? receipt.messageIds.filter(Boolean) : [];
@@ -511,8 +311,8 @@ async function repairTerminalFromDeadLetters(options = {}) {
     raw = fs.readFileSync(path, "utf8");
   } catch (error) {
     return {
-      status: "skipped",
-      reason: "dead_letters_missing",
+      status: error.code === "ENOENT" ? "skipped" : "unavailable",
+      reason: error.code === "ENOENT" ? "dead_letters_missing" : "dead_letters_unavailable",
       deadLetterPath: path,
       error: String(error.message || error),
     };
@@ -520,7 +320,7 @@ async function repairTerminalFromDeadLetters(options = {}) {
 
   const byMessageId = new Map();
   let malformed = 0;
-  for (const { value: receipt } of readWakeJSONLines(raw, () => { malformed += 1; })) {
+  for (const { value: receipt } of readWakeJSONLines(raw, () => { malformed += 1; }, path)) {
     const original = receipt && receipt.entry;
     const payload = original && original.payload || {};
     const messageId = messageIdForPayload(payload);

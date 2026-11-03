@@ -5,7 +5,7 @@ import NativeAgentShared
 
 /// Binds the conversation and tool owners for the app's read-only screen door.
 public enum HerScreenPreview {
-    public static func tabs(_ layout: SurfaceLayout, profile: String?) -> [String] {
+    public static func tabs(_ layout: SurfaceLayoutAvailability, profile: String?) -> [String] {
         AgentWorkspaceScreenPreview.tabs(layout, profile: profile)
     }
     public static let watchedPaths = AgentWorkspaceScreenPreview.watchedPaths

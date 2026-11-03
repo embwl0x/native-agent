@@ -21,6 +21,7 @@ extension ContextSQLiteStore {
         let injectionPolicy: ContextInjectionPolicy
         let contentRole: ContextContentRole
         let entities: [ContextEntity]
+        let memoryProvenance: ContextMemoryProvenance?
         let triggers: [String]
         let activation: Double
         let recentUsefulness: Double
@@ -41,6 +42,7 @@ extension ContextSQLiteStore {
             injectionPolicy = atom.injectionPolicy
             contentRole = atom.contentRole
             entities = atom.entities
+            memoryProvenance = atom.memoryProvenance
             triggers = atom.triggers
             activation = atom.activation
             recentUsefulness = atom.recentUsefulness
@@ -106,6 +108,7 @@ extension ContextSQLiteStore {
             injectionPolicy: payload.injectionPolicy,
             contentRole: payload.contentRole,
             entities: payload.entities,
+            memoryProvenance: payload.memoryProvenance,
             triggers: payload.triggers,
             activation: payload.activation,
             recentUsefulness: payload.recentUsefulness,
@@ -113,22 +116,6 @@ extension ContextSQLiteStore {
             embedding: embedding
         )
         return ContextStoredAtom(
-            versionKey: versionKey,
-            draft: draft,
-            validFromGeneration: validFrom,
-            validToGeneration: validTo
-        )
-    }
-
-    static func decodeRelationship(_ row: Row) throws -> ContextStoredRelationship {
-        guard let versionKey: String = row["version_key"],
-              let payloadJSON: String = row["payload_json"],
-              let validFrom: Int64 = row["valid_from_generation"] else {
-            throw ContextFlowStoreError.malformedStoredValue("relationship")
-        }
-        let draft: ContextRelationshipDraft = try decodeJSON(payloadJSON)
-        let validTo: Int64? = row["valid_to_generation"]
-        return ContextStoredRelationship(
             versionKey: versionKey,
             draft: draft,
             validFromGeneration: validFrom,

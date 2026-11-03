@@ -81,7 +81,7 @@ extension MaintenanceBackgroundWork {
                     "title": .string(title),
                     "summary": .string(content.summary),
                     "detail": .string(detail),
-                    "related_mission_id": .null,
+                    "related_execution_id": .null,
                     "related_approval_id": .null,
                     "related_paths": .array([]),
                     "related_groups": .array([]),

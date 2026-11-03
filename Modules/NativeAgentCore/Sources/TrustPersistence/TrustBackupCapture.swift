@@ -6,7 +6,7 @@ import TrustCenter
 import MemoryV2
 import Privacy
 import SystemOps
-// Blueprint: | `TrustBackupCapture.swift` | TrustBackupPersistence capture and export copying; ordered scopes, writer locks, credential exclusions and read-only SQLite copies |
+// Blueprint: | `TrustBackupCapture.swift` | TrustBackupPersistence capture and export copying; canonical live persona, sequential local scopes, Make and memory/chat locks, read-only SQLite images; no whole-root transaction |
 
 public enum TrustBackupPersistence {
     public static func createBackup(reason: String, dataRoot root: URL) async throws -> BackupRecord {
@@ -52,9 +52,9 @@ public enum TrustBackupPersistence {
         }
     }
 
-    /// Writes `<backupDir>/data` and its sealed `manifest.json`. `offDisk` is the copy that leaves this Mac: the whole data
-    /// root minus `offDiskExcludedPaths` and credentials, plus the live persona root (the repo's `persona/`) as `persona`, with
-    /// every SQLite copy out of WAL mode so it opens where it lands. The local scope is `backupRelativePaths`.
+    /// Writes `<backupDir>/data` and its sealed `manifest.json`. Both forms carry the canonical live persona as `persona`.
+    /// `offDisk` leaves this Mac: the whole data root minus `offDiskExcludedPaths` and credentials, with every SQLite copy
+    /// out of WAL mode so it opens where it lands. The local scope is `backupRelativePaths`.
     static func writeBackupSnapshot(
         id: String,
         reason: String,
@@ -67,13 +67,11 @@ public enum TrustBackupPersistence {
         let dataDir = backupDir.appendingPathComponent("data", isDirectory: true)
         try fm.createDirectory(at: backupDir, withIntermediateDirectories: true)
         try fm.createDirectory(at: dataDir, withIntermediateDirectories: true)
+        let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: root).standardizedFileURL
+        try Self.requireRegularDirectory(personaRoot)
+        try Self.requireRegularFile(personaRoot.appendingPathComponent("SOUL.md"), maximumBytes: nil)
         var copied: [String] = []
         if offDisk {
-            let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: root)
-            // Persona is the point of this copy: no SOUL.md fails the backup.
-            guard Self.pathEntryExists(personaRoot.appendingPathComponent("SOUL.md")) else {
-                throw Self.backupError(code: 422, "Live persona root has no SOUL.md: \(personaRoot.path)")
-            }
             if try await Self.copyOffDiskItem(personaRoot, relative: "persona", into: dataDir, dataRoot: root) {
                 copied.append("persona")
             }
@@ -88,7 +86,7 @@ public enum TrustBackupPersistence {
                 $0 != "memory" && !$0.hasPrefix("chat/")
             }
             for relative in ordinaryPaths {
-                let source = root.appendingNativeRelativePath(relative)
+                let source = Self.backupDestination(relative, dataRoot: root)
                 guard Self.pathEntryExists(source) else { continue }
                 try await Self.copyLocalSnapshotItem(
                     from: source,
@@ -135,10 +133,10 @@ public enum TrustBackupPersistence {
             "createdAt": .string(createdAt),
             "id": .string(id),
             "integrityVersion": .int(2),
-            "scopeVersion": .int(2),
+            "scopeVersion": .int(3),
+            "personaRoot": .string(personaRoot.path),
             "lifeID": .string(try DataRootLife.current(in: root)),
-            // An off-disk copy is never a restore target: its `data/persona` is the live persona root, which a restore would
-            // write to `<dataRoot>/persona` and so move Agent's persona root.
+            // Off-disk copies carry a broader, credential-excluded scope and are never local restore targets.
             "kind": .string(offDisk ? "offdisk_backup" : "backup"),
             "reason": .string(reason),
             "scope": .array(scope.map { .string($0) }),
@@ -165,17 +163,10 @@ public enum TrustBackupPersistence {
         try sourceQueue.close()
     }
 
-    // Chat paths are restored only when carried by the snapshot; their absence in an older backup must not erase live
-    // attachment or queue state. Capture queue references before the attachment tree: the queue owner durably writes each
+    // Capture allowlist, never a deletion scope: restore replaces only validated `copied` members of the selected snapshot.
+    // Capture queue references before the attachment tree: the queue owner durably writes each
     // attachment before publishing its lifecycle reference.
-    static let backupRelativePaths = legacyBackupRelativePaths + [
-        "abilities", "senses", "make", "chat/mac_turn_lifecycle.json", "chat/attachments",
-    ]
-
-    /// No backup carries the live sense ledger or unread news.
-    static let unbackedSenseNames: Set<String> = ["ledger", "news"]
-
-    static let legacyBackupRelativePaths: [String] = [
+    static let backupRelativePaths: [String] = [
         "trust",
         "memory",
         "workshop",
@@ -191,7 +182,6 @@ public enum TrustBackupPersistence {
         "improvements",
         "workflows",
         "catalog/registry.json",
-        "catalog/installs.json",
         "catalog/sources/sources.json",
         "catalog/trust/roots.json",
         "capabilities",
@@ -202,7 +192,21 @@ public enum TrustBackupPersistence {
         "routing",
         "telegram",
         "dream_diary",
+        "abilities", "senses", "make", "chat/mac_turn_lifecycle.json", "chat/attachments",
+        ".onboarded",
     ]
+
+    /// No backup carries the live sense ledger or unread news.
+    static let unbackedSenseNames: Set<String> = ["ledger", "news"]
+
+    /// Snapshot paths stay relative to `data/`; persona lands at its one live owner.
+    static func backupDestination(_ relative: String, dataRoot: URL) -> URL {
+        if relative == "persona" { return PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot).standardizedFileURL }
+        if relative.hasPrefix("persona/") {
+            return PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot).appendingNativeRelativePath(String(relative.dropFirst("persona/".count)))
+        }
+        return dataRoot.appendingNativeRelativePath(relative)
+    }
 
     public static func nativeArtifactTimestamp() -> String {
         ISO8601DateFormatter().string(from: Date())

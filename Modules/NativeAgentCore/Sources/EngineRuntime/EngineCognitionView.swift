@@ -117,17 +117,18 @@ public final class CognitionViewFacade {
 
         var contextFlowReady = true
         if enabled {
-            let stored = UserDefaults.standard.string(
-                forKey: NativeContextFlowConfiguration.modeDefaultsKey
-            ).flatMap(ContextFlowMode.init(rawValue:))
-            let preferred = stored ?? .active
             let status: NativeContextFlowModeStatus
-            if stored == nil {
+            if UserDefaults.standard.object(forKey: NativeContextFlowConfiguration.modeDefaultsKey) == nil {
                 status = await contextFlow.setMode(.active)
             } else {
                 status = await contextFlow.modeStatus()
             }
-            contextFlowReady = status.effectiveMode == preferred
+            if let mode = status.effectiveMode, status.unavailableReason == nil {
+                contextFlowReady = mode.rawValue == UserDefaults.standard.string(
+                    forKey: NativeContextFlowConfiguration.modeDefaultsKey)
+            } else {
+                contextFlowReady = false
+            }
         }
         return (state, contextFlowReady)
     }
@@ -149,8 +150,8 @@ public final class CognitionViewFacade {
     }
 
     /// TrustCenter supplies policy; DreamREMCycle owns the composite gate arithmetic.
-    public nonisolated func dreamGate() async -> DreamREMGatePolicy {
-        DreamREMGatePolicy(authority: .read(dataRoot: dataRoot))
+    public nonisolated func dreamGate() async throws -> DreamREMGatePolicy {
+        try DreamREMGatePolicy(authority: .read(dataRoot: dataRoot))
     }
 
     /// Manual REM changes persistent, approval-gated state. Unlike a passive
@@ -159,12 +160,12 @@ public final class CognitionViewFacade {
     /// apparently enabled REM cycle.
     public nonisolated func dreamGateChecked() async throws -> DreamREMGatePolicy {
         let policy = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked()
-        return DreamREMGatePolicy(authority: .present(policy))
+        return try DreamREMGatePolicy(authority: .present(policy))
     }
 
     /// A dream needs both the scheduler and personality-cycle gates.
-    public nonisolated func dreamEnabled() async -> Bool {
-        await dreamGate().dreamEnabled
+    public nonisolated func dreamEnabled() async throws -> Bool {
+        try await dreamGate().dreamEnabled
     }
 
     /// The file-backed diary, newest first, with its composite gate.
@@ -228,7 +229,7 @@ public final class CognitionViewFacade {
     /// One night's entry; a missing one is the read route's not-found error.
     public nonisolated func dreamEntry(date: String) async throws -> DreamEntry {
         guard let entry = try FileBackedDreamDiary(dataRoot: dataRoot).getEntry(date) else {
-            throw DaemonError.notFound("/v1/dream/\(date)")
+            throw DreamREMCycleError.underlying("No dream entry for \(date) in \(dataRoot.appendingPathComponent("dream_diary").path)")
         }
         return entry
     }

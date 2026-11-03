@@ -4,7 +4,7 @@ import PersistenceCore
 import ProviderRouting
 import StandingBots
 import Transcripts
-// Blueprint: | `BotChatContract.swift` | Helper identity, personality, job/output instructions and checked provider choice; helpers follow Chat unless explicitly pinned |
+// Blueprint: | `BotChatContract.swift` | Helper identity, personality, unified job instructions and checked provider choice; helpers follow Chat unless explicitly pinned; shared following-settings admission names every conflicting field and acknowledges inherited-value no-ops for tools and phone edits |
 
 /// Every door into a helper uses its current brief and the same checked choice.
 public struct BotChatContract: Sendable, Equatable {
@@ -16,13 +16,45 @@ public struct BotChatContract: Sendable, Equatable {
     public var choice: ProviderTurnChoice?
     /// What the bot still needs before it can run, or nil when it can.
     public var modelChoiceProblem: String? = nil
+    /// The same checked helper definition that supplies its model choice.
+    public var outputBudgetTokens: Int? = nil
+
+    public struct FollowingSettingsRefusal: Error, LocalizedError, Sendable {
+        public let problems: [(field: String, message: String)]
+        public var errorDescription: String? { problems.map(\.message).joined(separator: "\n") }
+    }
+
+    /// Only submitted settings are compared, never the helper's obsolete saved
+    /// tuple. An unset pin flag follows Chat just as an explicit false does.
+    public static func followingSettings(
+        for bot: BotDefinition, fields: [String: JSONValue], dataRoot: URL
+    ) async throws -> [String] {
+        guard bot.modelPinned != true else { return [] }
+        let settings = [("provider", "provider"), ("model", "model"),
+                        ("reasoning_effort", "Think"), ("fast", "Fast")]
+            .filter { fields[$0.0] != nil && fields[$0.0] != .null }
+        guard !settings.isEmpty else { return [] }
+        let inherited = try await choice(for: bot, dataRoot: dataRoot)
+        let values: [String: JSONValue] = [
+            "provider": .string(inherited.provider), "model": .string(inherited.model),
+            "reasoning_effort": .string(inherited.reasoningEffort), "fast": .bool(inherited.fast)
+        ]
+        var problems: [(field: String, message: String)] = []
+        var notes: [String] = []
+        for (field, label) in settings {
+            if fields[field] == values[field] {
+                notes.append("\(field) already matches Chat's \(label); \(bot.name) follows Providers, so it was accepted as a no-op without saving a per-helper value.")
+            } else {
+                problems.append((field, "\(field) applies only to a pinned model; \(bot.name) follows Providers and uses Chat's \(label). Pin a model (model_pinned:true, model, provider) to set it."))
+            }
+        }
+        guard problems.isEmpty else { throw FollowingSettingsRefusal(problems: problems) }
+        return notes
+    }
 
     public static func instructions(for bot: BotDefinition) throws -> String {
-        let output = try bot.outputFormat.map {
-            try completionPolicy("helper-rounds", section: "output", arguments: [$0])
-        } ?? ""
         return try completionPolicy("helper-rounds", arguments: [
-            bot.name, bot.personality.map { "\n\n" + $0 } ?? "", bot.name, bot.brief, output
+            bot.name, bot.personality.map { "\n\n" + $0 } ?? "", bot.name, bot.brief
         ])
     }
 
@@ -30,8 +62,15 @@ public struct BotChatContract: Sendable, Equatable {
         _ sessionId: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> BotChatContract? {
-        let owned = try? BotDefinitionStore(dataRoot: dataRoot).definition(forSession: sessionId)
-        guard owned != nil || SessionConversation.isHelper(sessionId, dataRoot: dataRoot) else { return nil }
+        let owned: BotDefinition?
+        do {
+            owned = try BotDefinitionStore(dataRoot: dataRoot).definition(forSession: sessionId)
+            let helper = try SessionConversation.checkedIsHelper(sessionId, dataRoot: dataRoot)
+            guard owned != nil || helper else { return nil }
+        } catch {
+            return BotChatContract(name: "Helper unavailable", instructions: "", choice: nil,
+                modelChoiceProblem: "This conversation's helper ownership could not be read: \(error.localizedDescription). Repair its saved helper definition or session index before continuing.")
+        }
         guard let bot = owned, bot.deleted != true else {
             return BotChatContract(name: "Bot", instructions: "", choice: nil,
                                    modelChoiceProblem: "This helper's definition is unavailable or deleted. Choose an existing helper before continuing.")
@@ -40,7 +79,8 @@ public struct BotChatContract: Sendable, Equatable {
         do {
             instructions = try Self.instructions(for: bot)
             let choice = try await choice(for: bot, dataRoot: dataRoot)
-            return BotChatContract(name: bot.name, instructions: instructions, choice: choice)
+            return BotChatContract(name: bot.name, instructions: instructions, choice: choice,
+                outputBudgetTokens: bot.budget.tokens)
         } catch {
             return BotChatContract(name: bot.name, instructions: instructions, choice: nil, modelChoiceProblem: String(describing: error))
         }

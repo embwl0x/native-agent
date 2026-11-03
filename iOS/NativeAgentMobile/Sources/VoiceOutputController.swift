@@ -2,6 +2,7 @@
 import Foundation
 import SwiftUI
 import AVFoundation
+import UIKit
 
 @MainActor
 final class VoiceOutputController: NSObject, ObservableObject {
@@ -62,13 +63,12 @@ final class VoiceOutputController: NSObject, ObservableObject {
     // MARK: - Public API
 
     func speak(_ text: String) {
-        guard enabled, !text.isEmpty, !isSpeaking, preparationTask == nil else { return }
-        // Use the person's language preferences, as speech input does. A
-        // missing installed voice is a failure, never an English substitution.
-        guard let voice = Locale.preferredLanguages.lazy.compactMap({ AVSpeechSynthesisVoice(language: $0) }).first else {
-            error = "No spoken-reply voice is available for your preferred languages."
-            return
-        }
+        guard enabled, !text.isEmpty, !isSpeaking, preparationTask == nil,
+              UIApplication.shared.applicationState == .active else { return }
+        guard !TalkModeController.shared.isPresented, iCloudSyncEngine.shared.voicePreference?.quiet != true else { return }
+        let voice: AVSpeechSynthesisVoice?
+        do { voice = try TalkModeController.preferredVoice() }
+        catch { self.error = error.localizedDescription; return }
         let token = UUID()
         audioToken = token
         preparationTask = Task {
@@ -77,7 +77,9 @@ final class VoiceOutputController: NSObject, ObservableObject {
                 try await MobileDictation.shared.prepareOutput(token: token,
                     configure: configureAudioSession, activate: activateAudioSession)
                 audioSessionActive = true
-                guard !Task.isCancelled, audioToken == token, enabled else {
+                guard !Task.isCancelled, audioToken == token, enabled,
+                      !TalkModeController.shared.isPresented,
+                      UIApplication.shared.applicationState == .active else {
                     releaseAudioSessionIfIdle(); return
                 }
                 let synth = ensureSynthesizer()

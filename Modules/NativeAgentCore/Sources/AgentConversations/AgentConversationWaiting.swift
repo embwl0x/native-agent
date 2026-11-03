@@ -3,13 +3,15 @@ import ChatToolParsing
 import AgentWorkspace
 import ApprovalInbox
 import Foundation
+import Experiences
 import NativeAgentCore
 import PersistenceCore
 import StandingBots
 import TurnTrace
 
-// Blueprint: | `AgentConversationWaiting.swift` | Conversation waits, interrupted recovery and approval readiness |
+// Blueprint: | `AgentConversationWaiting.swift` | Conversation waits, interrupted recovery and checked approval readiness; missing approval evidence owes its exact send a named repair and stays held while unrelated launch queues resume |
 extension AgentConversationSession {
+    private static let approvalWaitFailureCode = "agent_conversation_approval_unavailable"
     /// `wait` on a contact: back as soon as the reply in flight on its thread
     /// settles (every settle is a store write, which wakes this) or when
     /// `seconds` run out, saying which. What it returns is `read`'s agent_read.
@@ -18,10 +20,10 @@ extension AgentConversationSession {
     package static func waitForReply(input: [String: JSONValue], scope: String, dataRoot: URL, admit: Bool = false,
                              read: @escaping Dispatch) async throws -> JSONValue {
         guard var agent = string(input["agent"]) else { throw AgentConversationStore.Failure(message: "Name the contact to wait for.") }
-        agent = AgentConversationDelivery.door(for: agent, dataRoot: dataRoot)?.agent ?? agent
+        agent = try AgentConversationDelivery.door(for: agent, dataRoot: dataRoot)?.agent ?? agent
         let store = AgentConversationStore(dataRoot: dataRoot)
         let records = Result { try store.records() }
-        let pinned = named(string(input["conversation"]), agent: agent, scope: scope, rows: (try? records.get()) ?? [])
+        let pinned = named(string(input["conversation"]), agent: agent, scope: scope, rows: try records.get())
         let label = pinned.label
         let exact = input.filter { ["conversation_id", "message_id", "task_id"].contains($0.key) && $0.value != .null && $0.value != .string("") }
         let retained = exact.isEmpty ? nil : try records.get().filter { row in
@@ -76,7 +78,7 @@ extension AgentConversationSession {
             let first = try await $returnsHistory.withValue(false) { try await read("agent_read", readInput) }
             if readRefused(first) { return first }
         }
-        let transport = (try? AgentPeerStore(dataRoot: dataRoot).list())?.first { "peer:" + $0.id == agent }?.transport
+        let transport = try AgentPeerStore(dataRoot: dataRoot).list().first { "peer:" + $0.id == agent }?.transport
         var outcome = "nothing_in_flight"
         var latest: AgentConversationRecord?
         // While this watches, a reply that lands comes back here, not as a second turn.
@@ -90,7 +92,7 @@ extension AgentConversationSession {
                   retained == nil || row.operationID == retained?.operationID else { outcome = "not_opened"; break }
             latest = row
             if watching == nil { watching = row.id; AgentConversationRunning.shared.watch(row.id) }
-            guard replyInFlight(row, transport) else {
+            guard try replyInFlight(row, transport, dataRoot: dataRoot) else {
                 if outcome != "nothing_in_flight" { outcome = "settled" }
                 break
             }
@@ -115,13 +117,13 @@ extension AgentConversationSession {
            let delivered = string(fields["reply"]), let latest, agent.hasPrefix("peer:"),
            let message = string(latest.readInput?["message_id"]) {
             let clipped = fields["reply_truncated"] == .bool(true)
-            GrokRequestStore(dataRoot: dataRoot).shown(message, peer: String(agent.dropFirst(5)), by: "wait") {
+            try GrokRequestStore(dataRoot: dataRoot).shown(message, peer: String(agent.dropFirst(5)), by: "wait") {
                 $0 == delivered || (clipped && $0.hasPrefix(delivered))
             }
         }
         // A contact's wait hands back the exchange, not its retained history.
         if agent.hasPrefix("peer:"), let latest,
-           case .object(let shown) = AgentConversationView.compact(.object(fields), row: (try? store.records().first { $0.id == latest.id }) ?? latest) {
+           case .object(let shown) = AgentConversationView.compact(.object(fields), row: latest) {
             fields = shown
         }
         fields["wait_outcome"] = .string(outcome)
@@ -138,17 +140,17 @@ extension AgentConversationSession {
     }
     /// The thread is occupied: its reply is still coming, or a queued message
     /// is ahead (waiting or taken to go next). A new message queues behind.
-    static func inFlight(_ row: AgentConversationRecord, _ transport: AgentPeerTransport?) -> Bool {
-        replyInFlight(row, transport) || AgentConversationRunning.shared.watched(row.id) || row.queueReservation != nil
-            || row.queued?.contains(where: { $0.held == nil }) == true
+    static func inFlight(_ row: AgentConversationRecord, _ transport: AgentPeerTransport?, dataRoot: URL) throws -> Bool {
+        try replyInFlight(row, transport, dataRoot: dataRoot) || AgentConversationRunning.shared.watched(row.id) || row.queueReservation != nil
+            || row.queued?.contains(where: { $0.held == nil || $0.waitingForMac == true }) == true
     }
     /// The reply ahead is still coming. A "sending" row only counts while this
     /// process still owns that send.
-    static func replyInFlight(_ row: AgentConversationRecord, _ transport: AgentPeerTransport?) -> Bool {
+    static func replyInFlight(_ row: AgentConversationRecord, _ transport: AgentPeerTransport?, dataRoot: URL) throws -> Bool {
         if row.phase == "sending" { return AgentConversationRunning.shared.live(row: row.id, operation: row.operationID) }
         // A live hand-off settles on its own reply, delivery of an FYI, or release.
         if liveHandOff(row), row.phase == "waiting" || stoppedOrReleased(row) { return !settled(row) }
-        if unsettledAttention(row) { return true }
+        if try unsettledAttentionChecked(row, dataRoot: dataRoot) { return true }
         guard row.phase == "waiting" else { return false }
         // A desktop answer, or a background send, is watched by this process; none after a restart.
         if transport == .desktop || backgroundSend(row) { return !stoppedOrReleased(row) && AgentConversationRunning.shared.routeWatching(row: row.id, operation: row.operationID) }
@@ -165,23 +167,30 @@ extension AgentConversationSession {
     /// more settles as interrupted and unanswered, never waiting forever. That
     /// is a background send, any lane's send caught mid-way, or one left with
     /// an unknown outcome, begun before this process. Nothing is resent.
-    static func settleInterrupted(dataRoot: URL) {
+    static func settleInterrupted(dataRoot: URL) throws {
         let store = AgentConversationStore(dataRoot: dataRoot)
         let running = AgentConversationRunning.shared
-        let desktop = Set(((try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []).filter { $0.transport == .desktop }.map { "peer:" + $0.id })
-        func orphaned(_ row: AgentConversationRecord) -> Bool {
+        let desktop = Set(try AgentPeerStore(dataRoot: dataRoot).list().filter { $0.transport == .desktop }.map { "peer:" + $0.id })
+        func orphaned(_ row: AgentConversationRecord) throws -> Bool {
             if backgroundSend(row) { return !running.routeWatching(row: row.id, operation: row.operationID) }
             guard ownerless(row) else { return false }
             // Only a desktop answer is watched by the process that pasted it; every
             // other waiting lane settles on its own evidence after a restart.
             if row.phase == "waiting" { return desktop.contains(row.agent) && !running.routeWatching(row: row.id, operation: row.operationID) }
-            return row.phase == "sending" || unsettledAttention(row) && !awaitingApproval(row)
+            return try row.phase == "sending" || unsettledAttentionChecked(row, dataRoot: dataRoot) && !awaitingApproval(row)
         }
         // A receipt correction, not news: an old row keeps its time (a phase change still moves it).
-        for row in (try? store.records()) ?? [] where orphaned(row) {
-            _ = try? store.update(id: row.id, operationID: row.operationID, touch: false) {
-                guard orphaned($0) else { return }
-                interrupted(&$0)
+        for row in try store.records() {
+            do {
+                guard try orphaned(row) else { continue }
+                _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
+                    guard try orphaned($0) else { return }
+                    interrupted(&$0)
+                }
+            } catch let failure as ToolFailureError where failure.code == approvalWaitFailureCode {
+                // The missing/unreadable approval belongs to this send. Its
+                // owner has recorded a named repair; unrelated queues resume.
+                nativeLog("Conversation %@ remains held: %@", row.id, failure.localizedDescription)
             }
         }
         // The restart that cut a reply off may also have marked the agent
@@ -189,9 +198,13 @@ extension AgentConversationSession {
         // an agent's newest send is that interrupted one, lift a mark written
         // since it began (a later real failure would be its own, newer send).
         let peers = AgentPeerStore(dataRoot: dataRoot)
-        // Rank sends by their start, preserving updatedAt ordering for legacy records.
-        let newest = Dictionary(((try? store.records()) ?? []).filter { $0.agent.hasPrefix("peer:") }
-            .map { row in (row.agent, (row: row, startedAt: row.operationStartedAt ?? row.updatedAt)) }) {
+        let newest = try Dictionary(store.records().filter { $0.agent.hasPrefix("peer:") }
+            .map { row -> (String, (row: AgentConversationRecord, startedAt: Date)) in
+                guard let startedAt = row.operationStartedAt else {
+                    throw AgentConversationStore.Failure(message: "Conversation \(row.id) has no operation start time; repair its retained evidence before ordering interrupted sends.")
+                }
+                return (row.agent, (row: row, startedAt: startedAt))
+            }) {
                 a, b in a.startedAt >= b.startedAt ? a : b
             }
         for (agent, send) in newest {
@@ -203,7 +216,7 @@ extension AgentConversationSession {
     /// send any more. Never judged by liveness alone (a send of this process
     /// is briefly not yet registered as live).
     static func ownerless(_ row: AgentConversationRecord) -> Bool {
-        (row.operationStartedAt ?? row.updatedAt) < AbandonedTurnReconciler.processEpoch
+        row.operationStartedAt.map { $0 < AbandonedTurnReconciler.processEpoch } == true
             && !AgentConversationRunning.shared.live(row: row.id, operation: row.operationID)
     }
     /// What a send the app's own quit or restart cut off says: its turn ended
@@ -242,14 +255,12 @@ extension AgentConversationSession {
     /// An attention send that may still act: dispatched with an unknown outcome
     /// (it may be running remotely), or held on an approval that may still send
     /// it. It fences the thread until terminal evidence or agent_cancel.
+    // Retained receipt projection only. Executable waits use the checked owner below.
     package static func unsettledAttention(_ row: AgentConversationRecord) -> Bool {
         guard row.phase == "attention", !stoppedOrReleased(row), case .object(let root)? = row.receipt else { return false }
         let value = row.sendEvidence
         if root["sent"] == .bool(false) || value["sent"] == .bool(false) { return false }
-        let status = GrokBotRoute.normalizedStatus(string(value["run_status"]) ?? string(value["status"]) ?? "")
-        if AgentConversationRecord.approvalWaits(status), approvalDecided(string(value["approvalId"]) ?? string(root["approvalId"])) {
-            return false
-        }
+        let status = string(value["run_status"]) ?? string(value["status"]) ?? ""
         // An unknown outcome holds the thread while its reply may still come;
         // a terminal one (its call ended, bounded by the route's own timeout)
         // has nothing more coming, so the next message goes.
@@ -259,13 +270,34 @@ extension AgentConversationSession {
     /// A send held on an approval stops fencing the thread once that approval is
     /// decided (denied, expired), or its approved replay has finished. Keep the
     /// approved exchange's place until its replay claims it, ahead of its queue.
-    static func approvalDecided(_ id: String?) -> Bool {
-        guard let id, !id.isEmpty else { return false }
-        let url = PersistenceCore.defaultDataRoot().appendingPathComponent("workflows/approvals/requests.json")
-        guard let rows = try? SwiftNativeApprovalInbox.loadApprovalRowsChecked(at: url),
-              let value = rows.first(where: { if case .object(let row) = $0 { row["id"] == .string(id) } else { false } }),
-              case .object(let row) = value, row["status"] != .string("pending") else { return false }
-        if row["decision"] == .string("approved") { return row["executedAction"] != nil && row["executedAction"] != .null }
+    static func unsettledAttentionChecked(_ row: AgentConversationRecord, dataRoot: URL) throws -> Bool {
+        guard unsettledAttention(row) else { return false }
+        let value = row.sendEvidence
+        let status = string(value["run_status"]) ?? string(value["status"]) ?? ""
+        if AgentConversationRecord.approvalWaits(status), case .object(let root)? = row.receipt {
+            let operation = "agent.approval-wait:" + row.operationID
+            let approval = string(value["approvalId"]) ?? string(root["approvalId"])
+            let inbox = SwiftNativeApprovalInbox(root: dataRoot)
+            do {
+                guard let approval, !approval.isEmpty else {
+                    throw AgentConversationStore.Failure(message: "The retained receipt has no approval identity.")
+                }
+                let settled = try inbox.decisionSettledUnlocked(approval)
+                RepairOwed.settle(dataRoot, operation: operation,
+                    evidence: .init(source: "approval", id: approval))
+                return !settled
+            } catch {
+                let owner = approval == nil ? AgentConversationStore(dataRoot: dataRoot).fileURL.path : inbox.approvalsPath.path
+                let words = "Conversation \(row.id), operation \(row.operationID), approval \(approval ?? "identity unavailable"): "
+                    + error.localizedDescription + " The send remains held; its outcome is unproven."
+                let lever = "Repair this send's exact approval evidence, then read the conversation again; do not resend it to repair bookkeeping."
+                RepairOwed.owe(dataRoot, id: row.operationID + ":approval", kind: .message,
+                    evidence: [.init(source: "agents/conversations", id: row.id)],
+                    operation: operation, owner: owner, words: words, lever: lever)
+                throw ToolFailureError(words, effects: .unknown, owner: owner,
+                    code: approvalWaitFailureCode, instruction: lever, recovery: .reconcile)
+            }
+        }
         return true
     }
     /// Held on an approval the person has not decided yet: lifecycle events

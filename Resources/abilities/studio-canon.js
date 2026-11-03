@@ -1,7 +1,7 @@
 /* NativeAgent ability
-{"id":"studio-canon","kind":"tool","version":1,
+{"id":"studio-canon","kind":"ability","version":1,
  "reach":{"capabilities":[]},
- "record":{"description":"Propose canon tending from neutral recurrence, production-pull and membership facts, with reasons and the next silence deadline. Never decides membership.","actions":[],"inputSchema":{"type":"object","required":["now","evidence","members"]}}}
+ "record":{"description":"Propose canon tending from neutral recurrence, production-pull and membership facts, with reasons and the next silence deadline. satisfy_wait asks for the silence-clock path now, preserving actual timestamps and evidence. Never decides membership.","actions":[],"inputSchema":{"type":"object","required":["now","evidence","members"]}}}
 */
 function run(input) {
     const recurrenceThreshold = 3, recallThreshold = 1, silenceWindow = 90 * 24 * 60 * 60;
@@ -17,9 +17,10 @@ function run(input) {
     }
     let nextAt = null;
     for (const member of input.members) {
-        if (member.last_signal_seconds !== null && input.now - member.last_signal_seconds >= silenceWindow) {
+        if (member.last_signal_seconds !== null && (input.satisfy_wait === true || input.now - member.last_signal_seconds >= silenceWindow)) {
             proposals.push({key:member.key,action:"demote",evidenceKind:"silence",
-                reasonLine:"Nothing has been written about this work and nothing has pulled it since "
+                reasonLine:(input.satisfy_wait === true ? "Considering its silence now at your request. " : "")
+                    + "Nothing has been written about this work and nothing has pulled it since "
                     + (member.last_signal || "it entered the canon") + ". Demote it, or say it still holds and it stays."});
         }
         if (member.deadline_signal_seconds !== null) {

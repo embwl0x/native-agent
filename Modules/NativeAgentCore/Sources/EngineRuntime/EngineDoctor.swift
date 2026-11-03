@@ -15,7 +15,7 @@ import ToolRegistry
 import SystemOps
 import Cognition
 import ProviderRouting
-// Blueprint: | `EngineDoctor.swift` | DoctorFacade owns report evidence, tool health receipts, loop verdicts and DoctorPlainCopy summary/issue rows; rooted weekly digest/error, activity, hardening/exports, gauntlet, health card, liveness, watchdog and live report refresh publish through LatestRead; completed reports and committed exports use write. RuntimeHealth is liveness metadata; lifecycle facts remain manager-owned; run history belongs to engine.runs. |
+// Blueprint: | `EngineDoctor.swift` | DoctorFacade owns report evidence, latest-run availability across retained/partially refreshed reports, rooted checked current-route issues, tool health receipts, loop verdicts and DoctorPlainCopy summary/issue rows; rooted weekly digest/error, activity, hardening/exports, gauntlet, health card, liveness, watchdog and live report refresh publish through LatestRead; completed reports and committed exports use write. RuntimeHealth is liveness metadata; lifecycle facts remain manager-owned; run history belongs to engine.runs. |
 
 /// `NativeAgentEngine.doctor`: Doctor, this runtime's health and the
 /// background-loop watchdog for one data root, in core types. Diagnostics,
@@ -82,6 +82,12 @@ public final class DoctorFacade {
     /// next run, so a page read mid-run names the report it shows (Support
     /// Snapshot is refused while `isRunning`), and clears if that run fails.
     public var reportCompletedAt: Date?
+    /// A failed full run remains unavailable through partial live-row refreshes.
+    public private(set) var latestRunFailure: String?
+    public var reportAvailabilityIssue: String? {
+        if isRunning { return "A Doctor run is in progress; retained checks are not current until it finishes." }
+        return latestRunFailure
+    }
     /// Runtime liveness metadata, as of the last probe.
     public var health: RuntimeHealth?
     @ObservationIgnored private let healthRead = LatestRead()
@@ -204,10 +210,13 @@ public final class DoctorFacade {
     /// a run that threw or was cancelled leaves the last report standing but
     /// clears its stamp, so nothing (Support Snapshot's reuse) takes that
     /// rollup as current after a newer run failed to confirm it.
-    public func finishRun(_ finished: DoctorReport?) {
+    public func finishRun(_ finished: DoctorReport?, failure: String? = nil) {
         reportRead.write {
         if let finished { report = finished }
         reportCompletedAt = finished == nil ? nil : Date()
+        latestRunFailure = finished == nil
+            ? "The latest Doctor run did not complete. \(failure ?? "Run health checks again to obtain a current report.")"
+            : nil
         }
         isRunning = false
         runStartedAt = nil
@@ -215,21 +224,39 @@ public final class DoctorFacade {
 
     public func toolStatusEnvelope() async throws -> JSONValue {
         guard let report else {
+            if let latestRunFailure, !isRunning {
+                return AppToolExecutor.failure("doctor_unavailable", latestRunFailure)
+            }
             return AppToolExecutor.failure(isRunning ? "doctor_running" : "doctor_not_run", isRunning
                 ? "A Doctor run is in progress and this launch has no report yet; read this page again when it finishes."
                 : "No Doctor report yet. Run doctor.run, then read this page.")
         }
         let completedAt = reportCompletedAt
         let runningSince = runStartedAt
-        let dataRoot = PersistenceCore.defaultDataRoot()
+        let reportIssue = reportAvailabilityIssue
         let surface = ChatTurnRuntimeContext.current?.surface ?? "chat"
         let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
-        let configuredProviderID = try? await router.checkedRoutingSnapshot().activeProviders
-        let activeProviderID = ChatTurnRuntimeContext.current?.providerID
-            ?? configuredProviderID.flatMap { ProviderRoutingSurfaceLookup.value($0, surface) }
-        let providers = try? await ProvidersFacade.connections(from: router.checkedProviderSnapshot())
-        let activeProvider = activeProviderID.flatMap { providerID in
-            providers?.first(where: { $0.provider_id == providerID })
+        let activeProviderID: String?
+        let activeProvider: ProviderInfo?
+        let routeIssue: JSONValue?
+        do {
+            let snapshot = try await router.checkedProviderSnapshot()
+            let providers = try ProvidersFacade.connections(from: snapshot)
+            activeProviderID = ChatTurnRuntimeContext.current?.providerID
+                ?? ProviderRoutingSurfaceLookup.value(snapshot.routing.activeProviders, surface)
+            activeProvider = activeProviderID.flatMap { providerID in
+                providers.first(where: { $0.provider_id == providerID })
+            }
+            routeIssue = nil
+        } catch {
+            activeProviderID = nil
+            activeProvider = nil
+            routeIssue = .object([
+                "status": .string("unavailable"),
+                "source": .string(dataRoot.appendingPathComponent("providers").path),
+                "surface": .string(surface),
+                "detail": .string(NativeAppSecretRedactor.redactText(boundedDoctorDetail(error.localizedDescription))),
+            ])
         }
         let executableRepairs = DoctorSafeRepairPolicy.executableCoreIDs(for: report.checks)
         let checks = report.checks.map { check in
@@ -252,7 +279,7 @@ public final class DoctorFacade {
             if check.remedy != nil {
                 row["owner"] = check.repairOwner.map(JSONValue.string) ?? .null
             }
-            if let action = check.recoveryAction(repairAvailable: repairAvailable) {
+            if let action = check.recoveryAction() {
                 row["human_action"] = .string(NativeAppSecretRedactor.redactText(boundedDoctorDetail(action)))
             }
             if let receipt = check.receipt?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -285,14 +312,19 @@ public final class DoctorFacade {
             return true
         }
         var envelope: [String: JSONValue] = [
-            "status": .string(report.status),
+            "status": .string(reportIssue == nil && routeIssue == nil ? report.status : "unavailable"),
+            "report_status": .string(report.status),
+            "report_availability": .string(reportIssue == nil ? "current" : runningSince != nil ? "running" : "unavailable"),
+            "report_issue": reportIssue.map(JSONValue.string) ?? .null,
             "report_completed_at": completedAt.map { .string(NativeTimestampFormat.plainZulu($0)) } ?? .null,
-            "active_path_status": .string(DoctorReadout.doctorRollup(pathChecks.map(\.status))),
+            "active_path_status": .string(reportIssue == nil && routeIssue == nil
+                ? DoctorReadout.doctorRollup(pathChecks.map(\.status)) : "unavailable"),
             "active_path_check_ids": .array(pathChecks.map { .string($0.id) }),
             "active_provider_id": activeProviderID.map(JSONValue.string) ?? .null,
             // The receipt's own word (ready, saved, failed, rejected, needs_*).
-            "active_provider_status": .string(activeProvider?.auth_status.state ?? "unknown"),
-            "status_scope_note": .string("status rolls up every check; active_path_status rolls up only the checks a chat turn here depends on (active_path_check_ids); off, not needed and unmeasured rows never fail either"),
+            "active_provider_status": .string(routeIssue == nil ? activeProvider?.auth_status.state ?? "unknown" : "unavailable"),
+            "current_route_issue": routeIssue ?? .null,
+            "status_scope_note": .string("status requires a completed latest run and readable current routing, then rolls up every check; report_status describes the retained checks; active_path_status covers the checks a chat turn here depends on (active_path_check_ids). Off and not needed are non-fault states; unmeasured and unknown checks cannot establish health."),
             "repaired": .bool(report.repaired),
             "check_count": .int(Int64(checks.count)),
             "checks": .array(checks),
@@ -342,11 +374,18 @@ public final class DoctorFacade {
         let loopStatuses = await backgroundLoopsManager.status()
         let running = await backgroundLoopsManager.isRunning()
         let uptime = await backgroundLoopsManager.uptimeSeconds()
-        let loopHealth = DoctorLoopHealth.doctorCheck(
-            observations: loopStatuses,
-            recentFailureDates: DoctorLoopHealth.recentFailureDates(
-                receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl")),
-            now: Date())
+        let loopHealth: CheckResult
+        do {
+            loopHealth = DoctorLoopHealth.doctorCheck(
+                observations: loopStatuses,
+                recentFailureDates: try DoctorLoopHealth.recentFailureDates(
+                    receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl")),
+                now: Date())
+        } catch {
+            loopHealth = CheckResult(source: "logs/background_loop_failures.jsonl",
+                id: "background_loops", title: "Background loops", status: "fail",
+                detail: "Loop failure history is unavailable: \(error.localizedDescription)")
+        }
         let adverse = DoctorSafeRepairPolicy.isAdverse(loopHealth.status)
         let lifecycleStatus = running ? (adverse ? "degraded" : loopHealth.status) : "stopped"
         let newestRun = loopStatuses.compactMap(\.lastRun).max()
@@ -457,7 +496,10 @@ public enum SystemHealthSummary: Sendable, Equatable {
 extension DoctorFacade {
     public var systemHealth: (summary: SystemHealthSummary,
         issues: [(id: String, title: String, detail: String, repairAvailable: Bool)]) {
-        // Prefer an explicit Doctor run. Otherwise reuse the health card that
+        if let issue = reportAvailabilityIssue {
+            return (.unknown, [("doctor.latest_run", "Health checks unavailable", issue, false)])
+        }
+        // Prefer an explicit Doctor run. Before any run, reuse the health card that
         // Chat already keeps current instead of launching a second full Doctor
         // pass from this always-mounted toolbar control.
         func summarize(_ statuses: [String]) -> SystemHealthSummary {
@@ -466,7 +508,7 @@ extension DoctorFacade {
             let warnCount = buckets.filter { $0 == "warning" }.count
             if failCount > 0 { return .error(count: failCount) }
             if warnCount > 0 { return .warn(count: warnCount) }
-            if buckets.isEmpty || buckets.contains("unclear") { return .unknown }
+            if buckets.isEmpty || buckets.contains("unclear") || buckets.contains("reading") { return .unknown }
             return .ok
         }
         let rows = report.map { $0.checks.map { ($0.id, $0.title, $0.status, $0.repairFace, $0.repair_available == true) } }

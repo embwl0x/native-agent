@@ -2,11 +2,18 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SlackWebAPI.swift` | Shared HTTP response normalization for replies, history's injected session and explicit setup tokens; replies retain grant checks and record proofs through ConnectorActionReceipt, history/setup retain strict rejection; uploads and `requireConfiguredToken` |
+// Blueprint: | `SlackWebAPI.swift` | Shared HTTP response normalization for replies, reconciliation's injected session and explicit setup tokens; bounded reply posts/updates and uploads propagate checked grant-read failures and record proofs through ConnectorActionReceipt; `requireConfiguredToken` |
 
 /// Slack Web API HTTP mechanics, replies and uploads. Callers own token grants,
-/// setup validation, history sessions and connection-proof policy.
+/// setup validation, reconciliation sessions and connection-proof policy.
 public enum SlackWebAPI {
+    private static let replySession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 30
+        return URLSession(configuration: configuration)
+    }()
+
     public static func apiURL(_ method: String) -> URL {
         if let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_SLACK_LOOPBACK_API"],
            let url = URL(string: raw), ["127.0.0.1", "localhost"].contains(url.host ?? "") {
@@ -28,7 +35,8 @@ public enum SlackWebAPI {
     public static func postMessage(
         input: [String: JSONValue],
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        tokenOverride: String? = nil
+        tokenOverride: String? = nil,
+        updatingMessageTs: String? = nil
     ) async throws -> JSONValue {
         let input = input.filter { $0.value != .null && $0.value != .string("") }
         let channel = input["channel"]?.scalarText?
@@ -45,35 +53,43 @@ public enum SlackWebAPI {
                 NSLocalizedDescriptionKey: "slack.post_message requires text"
             ])
         }
-        let threadTs = (input["thread_ts"] ?? input["threadTs"])?.scalarText?
+        guard input["threadTs"] == nil else {
+            throw ToolFailureError("Slack requires thread_ts for a reply thread. Update this call's argument before sending.",
+                argumentPath: "$.threadTs", accepted: "thread_ts", effects: .none)
+        }
+        let threadTs = input["thread_ts"]?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         var body: [String: Any] = [
             "channel": channel,
             "text": text,
         ]
-        if let threadTs, !threadTs.isEmpty {
+        if let updatingMessageTs { body["ts"] = updatingMessageTs }
+        if updatingMessageTs == nil, let threadTs, !threadTs.isEmpty {
             body["thread_ts"] = threadTs
         }
         if let metadata = try messageMetadata(input: input) {
             body["metadata"] = metadata
         }
-        if let idempotencyKey = input["client_msg_id"]?.scalarText?
+        if updatingMessageTs == nil, let idempotencyKey = input["client_msg_id"]?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !idempotencyKey.isEmpty {
             body["client_msg_id"] = idempotencyKey
         }
-        let token = try resolvedToken(override: tokenOverride, dataRoot: dataRoot)
-        var request = URLRequest(url: apiURL("chat.postMessage"))
+        let token: String
+        do { token = try resolvedToken(override: tokenOverride, dataRoot: dataRoot) }
+        catch { throw NotificationDeliveryFailure(.notDelivered(reason: error.localizedDescription), error.localizedDescription) }
+        var request = URLRequest(url: apiURL(updatingMessageTs == nil ? "chat.postMessage" : "chat.update"))
         request.httpMethod = "POST"
         request.timeoutInterval = 30
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         // Slack accepts JSON without an explicit charset, but returns a
         // `missing_charset` response warning.
         request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        do { request.httpBody = try JSONSerialization.data(withJSONObject: body) }
+        catch { throw NotificationDeliveryFailure(.notDelivered(reason: error.localizedDescription), error.localizedDescription) }
         return envelope(
-            action: "slack.post_message",
-            response: try await response(for: request, dataRoot: dataRoot)
+            action: updatingMessageTs == nil ? "slack.post_message" : "slack.update_message",
+            response: try await response(for: request, dataRoot: dataRoot, session: replySession)
         )
     }
 
@@ -180,9 +196,9 @@ public enum SlackWebAPI {
         return try await response(for: req, dataRoot: dataRoot)
     }
 
-    private static func response(for request: URLRequest, dataRoot: URL) async throws -> [String: Any] {
+    private static func response(for request: URLRequest, dataRoot: URL, session: URLSession = .shared) async throws -> [String: Any] {
         do {
-            let parsed = try await response(for: request, session: .shared)
+            let parsed = try await response(for: request, session: session)
             await recordConnectionProof(parsed, dataRoot: dataRoot)
             return parsed
         }
@@ -244,7 +260,7 @@ public enum SlackWebAPI {
             }
             // A snapshot a turn captured is used only while it is still the granted
             // token: every request and upload step checks, so Disconnect stops them all.
-            guard (try? SlackCredentials.read(.bot, dataRoot: dataRoot)) == token else {
+            guard try SlackCredentials.read(.bot, dataRoot: dataRoot) == token else {
                 throw NSError(domain: "NativeAgentSlack", code: -401, userInfo: [
                     NSLocalizedDescriptionKey: "Slack was disconnected; nothing more was sent"
                 ])

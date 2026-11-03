@@ -2,7 +2,8 @@ import Foundation
 import MacIntegration
 import PersistenceCore
 import ChatSessionWork
-// Blueprint: | `AgentWorkspaceMail.swift` | `AgentWorkspaceMail` enum; `project` |
+import ChatToolParsing
+// Blueprint: | `AgentWorkspaceMail.swift` | `AgentWorkspaceMail` enum; mailbox projection preserves covered rows and continuation for complete and partial account coverage |
 
 extension AgentWorkspace {
     /// Bind observed workspace names once; caller-supplied locator fields may
@@ -71,7 +72,8 @@ enum AgentWorkspaceMail {
         guard case .object(var content) = result, case .array(let rows)? = content["messages"] else {
             return .init(title: "Mail", content: result, items: [], actions: actions)
         }
-        if input["message_id"] == nil, content["status"] == .string("completed"),
+        let readable = ChatToolOutcome.hasReadEvidence(result)
+        if input["message_id"] == nil, readable,
            let offset = content["next_offset"] {
             var next = input
             next["offset"] = offset
@@ -90,7 +92,7 @@ enum AgentWorkspaceMail {
             var rowActions: [AgentWorkspaceButton] = []
             if case .object(let object) = row,
                let locator = MailReadLocator.parse(object, allowMissingMessageID: true),
-               content["status"] == .string("completed") {
+               readable {
                 var bound: [String: JSONValue] = ["message_id": .int(locator.id), "expected_message_id": .string(locator.messageID)]
                 bound["scope"] = object["scope"] ?? content["scope"] ?? .string("inbox")
                 // Its account too: the same email in another account's inbox is never the target.

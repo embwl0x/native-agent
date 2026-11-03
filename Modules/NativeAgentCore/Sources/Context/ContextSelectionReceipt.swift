@@ -1,34 +1,6 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `ContextSelectionReceipt.swift` | Selection conflicts, degraded sources, budget, index and receipt evidence with byte-compatible coding keys |
-public enum ContextConflictHandling: String, Codable, Sendable {
-    case resolved
-    case includedUncertainty = "included_uncertainty"
-    case omittedIrrelevant = "omitted_irrelevant"
-    case omittedBudget = "omitted_budget"
-    case ineligible
-}
-public struct ContextConflictSet: Codable, Equatable, Sendable {
-    public let id: String
-    public let claims: [ContextAtomPointer]
-    public let resolvedAtomID: ContextAtomID?
-    public let provenance: [String]
-    public let handling: ContextConflictHandling
-
-    public init(
-        id: String,
-        claims: [ContextAtomPointer],
-        resolvedAtomID: ContextAtomID?,
-        provenance: [String],
-        handling: ContextConflictHandling
-    ) {
-        self.id = id
-        self.claims = claims
-        self.resolvedAtomID = resolvedAtomID
-        self.provenance = provenance
-        self.handling = handling
-    }
-}
+// Blueprint: | `ContextSelectionReceipt.swift` | Selection degraded sources, budget, index and explicit current receipt evidence |
 public struct ContextDegradedSourceNotice: Codable, Equatable, Sendable {
     public let sourceID: ContextSourceID
     public let reason: String
@@ -91,19 +63,17 @@ public struct ContextSelectionReceipt: Equatable, Sendable {
     public let mandatoryAtomIDs: [ContextAtomID]
     public let coveredMandatoryAtomIDs: [ContextAtomID]
     public let mandatoryCoverage: Double
-    public let conflicts: [ContextConflictSet]
     public let budget: ContextBudgetUsage
     public let degradedSources: [ContextDegradedSourceNotice]
     public let cacheState: ContextSelectionCacheState
     public let measuredSelectionMicroseconds: Int?
-    /// Optional for wire compatibility with receipts persisted before latency
-    /// provenance existed. Readers must treat nil as unavailable, never zero.
+    /// Nil is unavailable latency provenance, never zero.
     public let selectionLatencyProvenance: ContextSelectionLatencyProvenance?
-    /// Memories × readings is the chance bar's n; missing decodes as 0 and zero is omitted on encode.
+    /// Comparable memories × query readings, diagnostic population only; never changes the floor.
     public let memoryPopulation: Int
-    /// Candidates below the selector's `memoryStandout`; a missing receipt key decodes as 0.
+    /// Candidates below the selector's `memoryStandout`.
     public let memoryFloorDroppedCount: Int
-    /// Touched memory candidates record touch, reachability and rest state; a missing key decodes as [].
+    /// Touched memory candidates record touch, reachability and rest state.
     public let memoryRecall: [ContextMemoryRecallScore]
 }
 extension ContextSelectionReceipt: Codable {
@@ -111,7 +81,7 @@ extension ContextSelectionReceipt: Codable {
         case id, needFingerprint, generationID, sourceFingerprint, selectionTimeBucket
         case eligibility, candidateScores, selectedAtomIDs, pointerAtomIDs
         case mandatoryAtomIDs, coveredMandatoryAtomIDs, mandatoryCoverage
-        case conflicts, budget, degradedSources, cacheState
+        case budget, degradedSources, cacheState
         case measuredSelectionMicroseconds, selectionLatencyProvenance
         case memoryFloorDroppedCount, memoryRecall, memoryPopulation
     }
@@ -130,7 +100,6 @@ extension ContextSelectionReceipt: Codable {
             mandatoryAtomIDs: try values.decode([ContextAtomID].self, forKey: .mandatoryAtomIDs),
             coveredMandatoryAtomIDs: try values.decode([ContextAtomID].self, forKey: .coveredMandatoryAtomIDs),
             mandatoryCoverage: try values.decode(Double.self, forKey: .mandatoryCoverage),
-            conflicts: try values.decode([ContextConflictSet].self, forKey: .conflicts),
             budget: try values.decode(ContextBudgetUsage.self, forKey: .budget),
             degradedSources: try values.decode([ContextDegradedSourceNotice].self, forKey: .degradedSources),
             cacheState: try values.decode(ContextSelectionCacheState.self, forKey: .cacheState),
@@ -139,15 +108,15 @@ extension ContextSelectionReceipt: Codable {
                 ContextSelectionLatencyProvenance.self,
                 forKey: .selectionLatencyProvenance
             ),
-            memoryPopulation: try values.decodeIfPresent(Int.self, forKey: .memoryPopulation) ?? 0,
-            memoryFloorDroppedCount: try values.decodeIfPresent(
+            memoryPopulation: try values.decode(Int.self, forKey: .memoryPopulation),
+            memoryFloorDroppedCount: try values.decode(
                 Int.self,
                 forKey: .memoryFloorDroppedCount
-            ) ?? 0,
-            memoryRecall: try values.decodeIfPresent(
+            ),
+            memoryRecall: try values.decode(
                 [ContextMemoryRecallScore].self,
                 forKey: .memoryRecall
-            ) ?? []
+            )
         )
     }
     public func encode(to encoder: any Encoder) throws {
@@ -164,23 +133,14 @@ extension ContextSelectionReceipt: Codable {
         try values.encode(mandatoryAtomIDs, forKey: .mandatoryAtomIDs)
         try values.encode(coveredMandatoryAtomIDs, forKey: .coveredMandatoryAtomIDs)
         try values.encode(mandatoryCoverage, forKey: .mandatoryCoverage)
-        try values.encode(conflicts, forKey: .conflicts)
         try values.encode(budget, forKey: .budget)
         try values.encode(degradedSources, forKey: .degradedSources)
         try values.encode(cacheState, forKey: .cacheState)
         try values.encodeIfPresent(measuredSelectionMicroseconds, forKey: .measuredSelectionMicroseconds)
         try values.encodeIfPresent(selectionLatencyProvenance, forKey: .selectionLatencyProvenance)
-        // Written only when the floor actually refused something, so a receipt
-        // from a turn it never touched stays byte-identical to a pre-floor one.
-        if memoryFloorDroppedCount != 0 {
-            try values.encode(memoryFloorDroppedCount, forKey: .memoryFloorDroppedCount)
-        }
-        if !memoryRecall.isEmpty {
-            try values.encode(memoryRecall, forKey: .memoryRecall)
-        }
-        if memoryPopulation != 0 {
-            try values.encode(memoryPopulation, forKey: .memoryPopulation)
-        }
+        try values.encode(memoryFloorDroppedCount, forKey: .memoryFloorDroppedCount)
+        try values.encode(memoryRecall, forKey: .memoryRecall)
+        try values.encode(memoryPopulation, forKey: .memoryPopulation)
     }
 }
 /// Why one memory came into the turn, or rested: the message's touch in

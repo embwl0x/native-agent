@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Privacy
-// Blueprint: | `Research+Lab.swift` | `SwiftNativeResearchClient`: `researchLabRuns`, `runResearchLab`; SearXNG evidence explicitly distinguishes unavailable from empty, an injected L0 part call selects sources and composes the brief, native validation binds selected sources to that search, and settlement commits locked capped history plus activity/trace receipts with native status/error truth; source selection, brief wording and `buildResearchBrief` moved to `Resources/abilities/research-lab.js` |
+// Blueprint: | `Research+Lab.swift` | `SwiftNativeResearchClient`: complete current Lab history validates before sorting, reading or capped writes; SearXNG evidence distinguishes unavailable from empty, the research-lab part selects sources/composes the brief, native validation binds sources and settlement commits locked history plus activity/trace receipts |
 
 /// Authored content only. Identity, source evidence and publication remain native.
 public struct ResearchLabProposal: Codable, Sendable {
@@ -14,26 +14,24 @@ extension SwiftNativeResearchClient {
     // MARK: research lab
 
     /// Lock-free so the read-modify-write below can hold the file lock.
-    public func researchLabRuns() async throws -> [JSONValue] {
+    public func researchLabRuns() async throws -> [ResearchLabRun] {
         let raw = try await SwiftNativePersistenceCore.readJSON(labRunsPath, ifMissing: .array([]))
         guard case .array(let rows) = raw else {
             throw PersistenceCoreError.ioFailure(
                 "Saved research runs must be an array. Original contents have been preserved."
             )
         }
-        // Sort by createdAt descending, using an empty string for missing or non-string values; preserve ties.
-        let decorated = rows.enumerated().map { (idx, row) -> (Int, String, JSONValue) in
-            var created = ""
-            if case .object(let obj) = row, case .string(let s) = obj["createdAt"] ?? .null {
-                created = s
+        let decorated = try rows.enumerated().map { index, row -> (Int, ResearchLabRun) in
+            guard let run = ResearchLabRun(row: row) else {
+                throw ResearchClientError.malformedResponse("Saved research history is unavailable: runs[\(index)] is not a complete current run. Original contents have been preserved.")
             }
-            return (idx, created, row)
+            return (index, run)
         }
         let sorted = decorated.sorted { a, b in
-            if a.1 != b.1 { return a.1 > b.1 }   // createdAt descending
+            if a.1.createdAt != b.1.createdAt { return a.1.createdAt > b.1.createdAt }
             return a.0 < b.0                      // stable: preserve input order on ties
         }
-        return sorted.map { $0.2 }
+        return sorted.map { $0.1 }
     }
 
     public func runResearchLab(objective rawObjective: String, maxResults rawMax: Int,
@@ -47,10 +45,12 @@ extension SwiftNativeResearchClient {
         var searchError = ""
         var failure: String?
         var engines: [String] = []
+        var gaps: [String] = []
         do {
             let resp = try await search(query: objective)
             results = resp.results
             engines = resp.unresponsiveEngines
+            gaps = resp.gaps
             if resp.enginesFailed {
                 failure = "engines_failed"
                 searchError = "Search engines returned no sources: " + engines.joined(separator: "; ")
@@ -78,12 +78,14 @@ extension SwiftNativeResearchClient {
                 "reason": failure.map(JSONValue.string) ?? .null, "error": .string(searchError),
                 "results": .array(results.map { $0.toJSON() }),
                 "unresponsiveEngines": .array(engines.map(JSONValue.string)),
+                "gaps": .array(gaps.map(JSONValue.string)),
             ]),
         ]))
         // A part authors the run, never its source evidence or native identity.
         guard proposed.sources.allSatisfy({ results.contains($0) }) else {
             throw ResearchClientError.malformedResponse("Research Lab part selected sources outside this search")
         }
+        let issues = [searchError].filter { !$0.isEmpty } + gaps
         let run = ResearchLabRun(
             id: UUID().uuidString.lowercased(),
             objective: objective,
@@ -93,7 +95,7 @@ extension SwiftNativeResearchClient {
             brief: proposed.brief,
             createdAt: Self.isoTimestamp(Date()),
             connector: connector,
-            error: searchError.isEmpty ? nil : searchError
+            error: issues.isEmpty ? nil : issues.joined(separator: "; ")
         )
         // Once accepted, save the run and its feed/trace settlement even if Stop arrives.
         let result: Result<ResearchLabRun, Error> = await settle {
@@ -108,8 +110,8 @@ extension SwiftNativeResearchClient {
         let labRunsPath = self.labRunsPath
         let writeBack: @Sendable () async throws -> Void = {
             var existing = try await self.researchLabRuns()
-            existing.insert(run.toJSON(), at: 0)
-            let capped = Array(existing.prefix(100))
+            existing.insert(run, at: 0)
+            let capped = existing.prefix(100).map { $0.toJSON() }
             try await SwiftNativePersistenceCore.writeJSON(.array(capped), to: labRunsPath)
         }
         try await SwiftNativePersistenceCore.withFileLock(labRunsPath, writeBack)

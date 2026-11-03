@@ -2,13 +2,14 @@ import AuthoredCapabilities
 import ChatToolRuntime
 import ChatTurnContracts
 import Darwin
+import Experiences
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import StandingBots
 import TurnTrace
-// Blueprint: | `Expansion.swift` | `Expansion`: live call threads, per-mind/model/authority practice storage, settlement and one coalescing writer; `expansion/record.json` |
+// Blueprint: | `Expansion.swift` | `Expansion`: live call threads, turn-start read claims and follow-up predictions, per-mind/authority practice storage, settlement and one checked coalescing writer; failed saves retain unavailable practice and owe repair for `expansion/record.json` |
 
 /// Live call threads, authority-separated practice storage and one coalescing writer.
 public actor Expansion {
@@ -17,10 +18,12 @@ public actor Expansion {
     var books: [String: Book] = [:]
     var unavailable: [String: String] = [:]
     private var threads: [String: CallThread] = [:]
-    private var closing: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private var closing: [String: [ScopedWaiter]] = [:]
     /// Roots with a write running, and roots changed since it began.
     private var writing: [String: Task<Void, Never>] = [:]
     private var dirty: Set<String> = []
+
+    func savePending(_ root: String) -> Bool { dirty.contains(root) || writing[root] != nil }
 
     // MARK: - Who is acting
 
@@ -41,8 +44,8 @@ public actor Expansion {
         let steered: [String]
 
         var authority: String { steered.isEmpty ? "own" : "steered:" + steered.joined(separator: ",") }
-        var practice: String { [agent, model, authority].joined(separator: "\u{1}") }
-        var thread: String { [root, agent, model, authority, session, turn].joined(separator: "\u{1}") }
+        var practice: String { [agent, authority].joined(separator: "\u{1}") }
+        var thread: String { [root, agent, authority, session, turn].joined(separator: "\u{1}") }
 
         static func current(dataRoot: URL, session: String?, surface: String) -> Caller? {
             guard SkillRunContext.partID == nil else { return nil }
@@ -50,8 +53,7 @@ public actor Expansion {
             let envelope = ChatToolSessionContext.envelope
             let agent: String
             let model: String
-            // A helper's saved choice may inherit another route. Practice
-            // belongs to the admitted model, never that unresolved setting.
+            // Keep the admitted model for diagnostics, never practice identity.
             if let bot = StandingBotContinuity.currentBot {
                 guard let admitted = LLMCallContext.admittedModel else { return nil }
                 agent = "helper:" + bot.id.uuidString.lowercased()
@@ -83,12 +85,26 @@ public actor Expansion {
 
     // MARK: - The door's three moments
 
+    /// Before the opening model call, the first read this wake's past turns
+    /// made. The actual first call labels it even when its read was delivered.
+    func start(_ caller: Caller, at: Date, deliver: Bool) -> Plan? {
+        load(caller.root)
+        guard unavailable[caller.root] == nil, books[caller.root] != nil, threads[caller.thread] == nil else { return nil }
+        let situation = "start woke:" + caller.woke
+        var thread = CallThread(caller, at: at)
+        thread.last = Last(situation: situation, index: [:], returnedAt: at)
+        let plan = predict(caller, thread: thread, situation: situation, values: [:], index: [:],
+                           at: at, deliver: deliver, firstCall: true)
+        trimThreads()
+        return plan
+    }
+
     /// A call arrives: it is the next call of whatever came before it in its
     /// thread. It settles that step's predictions and is kept as an example of
     /// that step's situation. Returns whether it is the thread's first call.
     func arrive(_ caller: Caller, tool: String, input: [String: JSONValue], at: Date) -> Bool {
         load(caller.root)
-        guard books[caller.root] != nil else { return true }
+        guard unavailable[caller.root] == nil, books[caller.root] != nil else { return true }
         guard threads[caller.thread]?.ended != true else { return false }
         let call = Self.stripped(input)
         // A new turn of this mind in this conversation ends its turns before.
@@ -124,6 +140,7 @@ public actor Expansion {
     /// The call returned in `seconds`: what this follow-up costs when the mind
     /// makes it herself, kept on its example.
     func ran(_ caller: Caller, seconds: Double) {
+        guard unavailable[caller.root] == nil else { return }
         guard var thread = threads[caller.thread], let open = thread.open else { return }
         thread.open = nil
         threads[caller.thread] = thread
@@ -144,7 +161,7 @@ public actor Expansion {
     func consider(_ caller: Caller, tool: String, input: [String: JSONValue], result: JSONValue,
                   first: Bool, at: Date, deliver: Bool) -> Plan? {
         load(caller.root)
-        guard var thread = threads[caller.thread], !thread.ended else { return nil }
+        guard unavailable[caller.root] == nil, var thread = threads[caller.thread], !thread.ended else { return nil }
         let situation = Self.situation(tool: tool, input: input, result: result, woke: first ? caller.woke : nil)
         var flat: [(path: String, value: JSONValue)] = []
         guard JSONValue.object(Self.stripped(input)).leaves(prefix: "in", into: &flat, limit: Law.leafCap, depthLimit: 128),
@@ -162,7 +179,14 @@ public actor Expansion {
             }
         }
         thread.last = Last(situation: situation, index: index, returnedAt: at)
-        var practice = books[caller.root]?.practices[caller.practice] ?? Practice(agent: caller.agent, model: caller.model, steered: caller.steered, at: at)
+        return predict(caller, thread: thread, situation: situation, values: values, index: index,
+                       at: at, deliver: deliver)
+    }
+
+    private func predict(_ caller: Caller, thread: CallThread, situation: String, values: [String: JSONValue],
+                         index: [String: [String]], at: Date, deliver: Bool, firstCall: Bool = false) -> Plan? {
+        var thread = thread
+        var practice = books[caller.root]?.practices[caller.practice] ?? Practice(agent: caller.agent, steered: caller.steered, at: at)
         practice.lastAt = at
         var place = practice.situations[situation] ?? Situation(at: at)
         place.lastAt = at
@@ -170,16 +194,23 @@ public actor Expansion {
         let among = max(1, practice.records.values.filter { $0.lifetimeTries > 0 }.count)
         var best: (plan: Plan, gain: Double)?
         var tries: [Try] = []
-        for template in Self.templateEvidence(place.examples).templates {
+        let templates: [Template]
+        do { templates = try Self.templateEvidence(place.examples).templates }
+        catch { fail(caller.root, error); return nil }
+        for template in templates {
             guard let call = Self.fill(template, from: values) else { continue }
             let signature = situation + "\u{1}" + template.form
             var record = practice.records[signature] ?? Record(situation: situation, form: template.form, at: at)
-            let nature = Self.nature(call)
+            let nature: Nature?
+            do {
+                nature = try Self.nature(call)
+                if firstCall, try !Self.openingRead(call) { continue }
+            } catch { fail(caller.root, error); return nil }
             let measure = Law.measure(record, template, among: among)
             var attempt = Try(signature: signature, call: call, nature: nature, turn: caller.turn,
-                              standing: measure.stands, lower: measure.lower, bar: measure.bar, known: Set(index.keys))
+                              standing: measure.stands, lower: measure.lower, bar: measure.bar, known: Set(index.keys), firstCall: firstCall)
             if deliver, measure.stands, let nature, let cHit = measure.cHit, let cMiss = measure.cMiss {
-                if Double.random(in: 0..<1) < Law.withholding(tries: record.tries, hits: record.hits) {
+                if Double.random(in: 0..<1) < Expectation.withholding(tries: record.tries, hits: record.hits) {
                     attempt.withheld = true
                     do { try record.increment(\.withheld, "withheld") }
                     catch { fail(caller.root, error); return nil }
@@ -220,7 +251,8 @@ public actor Expansion {
               let index = thread.tries.firstIndex(where: { $0.invocation == invocation && $0.planned }) else { return }
         thread.tries[index].planned = false
         let signature = thread.tries[index].signature
-        guard var practice = books[caller.root]?.practices[caller.practice], var record = practice.records[signature] else {
+        guard unavailable[caller.root] == nil,
+              var practice = books[caller.root]?.practices[caller.practice], var record = practice.records[signature] else {
             thread.tries.remove(at: index)
             retain(thread, key: caller.thread)
             return
@@ -296,9 +328,10 @@ public actor Expansion {
         let ended = threads.filter { $0.value.caller.root == root && $0.value.caller.turn == turn }.map(\.key)
         for key in ended { end(key) }
         for key in ended {
-            await withCheckedContinuation { continuation in
-                if threads[key] == nil { continuation.resume() }
-                else { closing[key, default: []].append(continuation) }
+            if threads[key] != nil {
+                let done = ScopedWaiter()
+                closing[key, default: []].append(done)
+                await Task { await done.park() }.value
             }
         }
         // Join the same coalescing writer used by calls, including any write
@@ -308,12 +341,13 @@ public actor Expansion {
 
     private func settle(_ tries: [Try], caller: Caller, tool: String?, next: [String: JSONValue]?,
                         observationLost: Bool = false) {
-        guard !tries.isEmpty, var practice = books[caller.root]?.practices[caller.practice] else { return }
+        guard unavailable[caller.root] == nil, !tries.isEmpty,
+              var practice = books[caller.root]?.practices[caller.practice] else { return }
         let among = max(1, practice.records.values.filter { $0.lifetimeTries > 0 }.count)
         for attempt in tries where !attempt.planned || tool == nil {
             guard var record = practice.records[attempt.signature] else { continue }
             let outcome: Outcome = observationLost ? .unknown : Self.outcome(attempt, tool: tool, next: next)
-            do { try record.note(outcome, z: Law.z(among: among)) }
+            do { try record.note(outcome, z: Expectation.z(among: among)) }
             catch { fail(caller.root, error); return }
             practice.records[attempt.signature] = record
             var row: [String: JSONValue] = [
@@ -364,8 +398,11 @@ public actor Expansion {
     /// call and result that held exactly that value.
     private func learn(_ caller: Caller, situation: String, call: [String: JSONValue], index: [String: [String]],
                        gap: Double, at: Date) -> Open? {
+        do {
+            if situation.hasPrefix("start woke:"), try !Self.openingRead(call) { return nil }
+            if try Self.carriesSecret(call) { return nil }
+        } catch { fail(caller.root, error); return nil }
         guard ((try? JSONValue.object(call).serialize(pretty: false))?.utf8.count ?? .max) <= Law.callCap,
-              !Self.carriesSecret(call),
               var practice = books[caller.root]?.practices[caller.practice],
               var place = practice.situations[situation] else { return nil }
         var flat: [(path: String, value: JSONValue)] = []
@@ -393,9 +430,10 @@ public actor Expansion {
 
     private func fail(_ root: String, _ error: Error) {
         unavailable[root] = error.localizedDescription
-        books[root] = nil
-        dirty.remove(root)
-        nativeLog("Expansion record unavailable at %@; bytes preserved: %@", root, error.localizedDescription)
+        // Keep any unsaved practice and dirty state, but never use or rewrite
+        // it after a failure. A failed publication may already have renamed
+        // the destination: neither old bytes nor durability can be promised.
+        nativeLog("Expansion record unavailable at %@: %@", Self.path(URL(fileURLWithPath: root)).path, error.localizedDescription)
     }
 
     private func store(_ practice: Practice, _ caller: Caller) {
@@ -408,15 +446,14 @@ public actor Expansion {
         }
         if practice.records.count > Law.recordCap {
             let pinned = Set(threads.values.filter {
-                $0.caller.root == caller.root && $0.caller.agent == caller.agent
-                    && $0.caller.model == caller.model && $0.caller.steered == caller.steered
+                $0.caller.root == caller.root && $0.caller.practice == caller.practice
             }.flatMap { $0.tries.map(\.signature) })
             for key in practice.records.filter({ !pinned.contains($0.key) }).sorted(by: { $0.value.lastAt < $1.value.lastAt })
                 .prefix(practice.records.count - Law.recordCap).map(\.key) {
                 practice.records[key] = nil
             }
         }
-        guard var book = books[caller.root] else { return }
+        guard unavailable[caller.root] == nil, var book = books[caller.root] else { return }
         book.practices[caller.practice] = practice
         let active = Set(threads.values.filter { $0.caller.root == caller.root }.map { $0.caller.practice })
         if book.practices.count > Law.practiceCap, let stalest = book.practices.filter({ !active.contains($0.key) }).min(by: { $0.value.lastAt < $1.value.lastAt })?.key {
@@ -445,10 +482,31 @@ public actor Expansion {
     }
 
     private func drain(_ root: String) async {
-        while dirty.remove(root) != nil, let book = books[root] {
-            await Task.detached(priority: .utility) {
-                Self.write(book, root: URL(fileURLWithPath: root, isDirectory: true))
-            }.value
+        while unavailable[root] == nil, dirty.remove(root) != nil, let book = books[root] {
+            let dataRoot = URL(fileURLWithPath: root, isDirectory: true)
+            let url = Self.path(dataRoot)
+            do {
+                try await Task.detached(priority: .utility) {
+                    try Self.write(book, root: dataRoot)
+                }.value
+            } catch {
+                dirty.insert(root)
+                let words = "Durable expansion save unproven at \(url.path): \(error.localizedDescription). Inspect this exact file before repairing; publication may have preceded the failure. Unsaved practice is retained but unavailable in this runtime; no automatic write will retry."
+                fail(root, NSError(domain: "Expansion", code: 3, userInfo: [NSLocalizedDescriptionKey: words]))
+                TurnTraceBus.fireFromContext(kind: "expansion.record.failed", payload: .object([
+                    "path": .string(url.path), "message": .string(words)
+                ]))
+                RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run,
+                    operation: "expansion.record.save", owner: url.path, words: words,
+                    lever: "Inspect and repair the named storage failure without replacing retained practice with an empty record; then restart NativeAgent to read the repaired record.")
+                writing[root] = nil
+                return
+            }
+            TurnTraceBus.fireFromContext(kind: "expansion.record.saved", payload: .object([
+                "path": .string(url.path), "version": .int(Int64(book.version)),
+                "pending_changes": .bool(dirty.contains(root))
+            ]))
+            RepairOwed.settle(dataRoot, operation: "expansion.record.save", evidence: .init(source: url.path, id: "durable-save"))
         }
         writing[root] = nil
     }
@@ -469,8 +527,8 @@ public actor Expansion {
         let data = try Data(contentsOf: url)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let book = try decoder.decode(Book.self, from: data)
-        guard book.version == Book.current else {
+        var book = try decoder.decode(Book.self, from: data)
+        guard book.version == 2 || book.version == Book.current else {
             throw NSError(domain: "Expansion", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unsupported record version \(book.version)"])
         }
         for (practice, value) in book.practices {
@@ -484,18 +542,15 @@ public actor Expansion {
                 }
             }
         }
+        try book.fold()
         return book
     }
 
-    private static func write(_ book: Book, root: URL) {
+    private static func write(_ book: Book, root: URL) throws {
         let url = path(root)
-        do {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.sortedKeys]
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(book), to: url)
-        } catch {
-            nativeLog("The expansion record was not saved to %@: %@", url.path, error.localizedDescription)
-        }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(book), to: url)
     }
 }

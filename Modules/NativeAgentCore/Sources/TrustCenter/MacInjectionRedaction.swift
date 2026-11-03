@@ -22,18 +22,60 @@ public enum MacInjectionArgRedaction {
         "browser.chrome_type": ["text", "value", "fields"],
         "browser.chrome_fill": ["text", "value", "fields"],
         "browser.chrome_navigate": ["text", "value", "fields"],
-        // Retired card names a model may still call from memory: whatever
-        // token it wrote must never reach a receipt or trace in the clear.
-        "interaction_act": ["value"], "card_act": ["value"], "answer_card": ["value"],
+        // The current folded card.answer executor carries the answer value.
+        "interaction_act": ["value"],
     ]
 
     public static func carriesSecretArgs(tool: String) -> Bool {
-        secretKeysByTool[normalized(tool)] != nil
+        secretKeysByTool[normalized(tool)] != nil || argumentProtectionReason(tool) != nil
+    }
+
+    /// Unknown ingress has no trusted argument contract. Withhold its input
+    /// generically instead of maintaining a list of retired spellings. Dynamic
+    /// faces and sense actions are recognized by their checked current owner.
+    private static func argumentProtectionReason(_ tool: String) -> String? {
+        let name = tool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if AuthoredToolEffects.isPrimitiveEffect(name) { return nil }
+        if name == "app" || AppActionBinding.declaredSchema(name) != nil || AppActionBinding.declaredBinding(name) != nil
+            || AppActionBinding.bindsTool(name) { return nil }
+        do {
+            if try AppActionBinding.binding(name) != nil { return nil }
+            return "The call is unrecognized; its arguments were withheld because no current contract declares them."
+        } catch {
+            return "The call's argument contract could not be read: \(error.localizedDescription). Its arguments were withheld; repair the catalog before submitting the original call again."
+        }
+    }
+
+    /// A withheld call is never executable, even if its catalog is repaired
+    /// between redaction and admission. The original arguments must be supplied
+    /// again; missing bytes cannot become defaults or an approval payload.
+    private static let argumentContractUnavailableKey = "_nativeagent_argument_contract_unavailable"
+
+    public static func withheldArgumentReason(in value: JSONValue) -> String? {
+        switch value {
+        case .object(let object):
+            if let reason = object[argumentContractUnavailableKey]?.stringValue { return reason }
+            for value in object.values {
+                if let reason = withheldArgumentReason(in: value) { return reason }
+            }
+        case .array(let values):
+            for value in values {
+                if let reason = withheldArgumentReason(in: value) { return reason }
+            }
+        default: break
+        }
+        return nil
+    }
+
+    private static func withheld(_ reason: String) -> [String: JSONValue] {
+        [argumentContractUnavailableKey: .string(reason)]
     }
 
     /// The secret args an `app` call carries, by its action.
     public static func appDoorSecretKeys(_ input: [String: JSONValue]) -> [String] {
-        let keys = AppActionBinding.action(input: input)?.secretArgs ?? []
+        // Credential declarations belong to the fixed door vocabulary. An
+        // authored action has no :secret argument declarations.
+        let keys = input["action"]?.stringValue.flatMap { AppActionBinding.declaredBinding($0)?.secretArgs } ?? []
         let foldedTool = ToolNameAliases.ranTool("app", input: input)
         return Array(Set(keys + (secretKeysByTool[normalized(foldedTool)] ?? []))).sorted()
     }
@@ -58,6 +100,7 @@ public enum MacInjectionArgRedaction {
     /// An `app` call whose args, script or listed actions could carry a key or token.
     public static func appDoorCarriesSecret(_ input: [String: JSONValue]) -> Bool {
         if !appDoorSecretKeys(input).isEmpty { return true }
+        if let action = input["action"]?.stringValue, argumentProtectionReason(action) != nil, input["args"] != nil { return true }
         if case .string(let script)? = input["script"], namesAppDoorSecretAction(script) { return true }
         if case .array(let entries)? = input["actions"] {
             return entries.contains { if case .object(let call) = $0 { appDoorCarriesSecret(call) } else { false } }
@@ -68,14 +111,21 @@ public enum MacInjectionArgRedaction {
     /// Replace literal text and form fields with count + digest.
     /// Non-secret arguments and non-injection tools pass through untouched.
     public static func redacted(tool: String, input: [String: JSONValue]) -> [String: JSONValue] {
+        if withheldArgumentReason(in: .object(input)) != nil {
+            return withheld("This call contains withheld arguments. Submit the original call after its current argument contract is available.")
+        }
         // An action id called as a tool name (mac.act) is an app call; redact it as one.
         let action = JSONValue.string(tool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-        if tool.contains("."), AppActionBinding.action(input: ["action": action]) != nil,
+        if tool.contains("."), AppActionBinding.declaredBinding(tool) != nil,
            case .object(let args)? = redacted(tool: "app", input: ["action": action, "args": .object(input)])["args"] {
             return args
         }
         if normalized(tool) == "app" {
             var out = input
+            if let action = input["action"]?.stringValue, let reason = argumentProtectionReason(action), input["args"] != nil {
+                out["args"] = .object(withheld(reason))
+                return out
+            }
             if case .string(let script)? = input["script"], namesAppDoorSecretAction(script) {
                 out["script"] = .string(appDoorScriptPlaceholder)
             }
@@ -90,7 +140,9 @@ public enum MacInjectionArgRedaction {
             }
             return out
         }
-        guard let keys = secretKeysByTool[normalized(tool)] else { return input }
+        guard let keys = secretKeysByTool[normalized(tool)] else {
+            return argumentProtectionReason(tool).map(withheld) ?? input
+        }
         var out = redacting(keys, in: input)
         if normalized(tool) == "act", case .array(let steps)? = input["steps"] {
             out["steps"] = .array(steps.map { step in
@@ -313,23 +365,13 @@ public enum MacInjectionResultRedaction {
 
 // MARK: - Injection TOOL vocabulary (the model-facing names)
 
-/// `macControlAccessibilityInjectionActions` names the MacControl ACTIONS.
-/// This names the model-facing TOOLS that map onto them, in every spelling the
-/// catalog has ever used. Single source of truth for the autonomy floor, the
-/// YOLO exclusion, and the redaction sinks — three places that were previously
-/// keeping their own copies of the same four strings, which is how one of them
-/// (the autonomy override path) ended up out of step.
+/// Current wake-tool classification for injection handling and approval replay.
+/// PermissionLaw owns authority; this vocabulary only maps tool names to wake.
 public enum MacInjectionToolNames {
     public static let canonical: [String: String] = [
-        // W6 — mac_wake posts a HID nudge, so it belongs to the SAME
-        // vocabulary: one entry here gives it replay verification, redaction,
-        // and the body-bound capability path, with no wake-shaped special case
-        // anywhere in the gate.
         "mac_wake": "wake",
         "mac.wake": "wake",
     ]
-
-    public static var all: Set<String> { Set(canonical.keys) }
 
     public static func isInjectionTool(_ toolName: String) -> Bool {
         canonical[toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] != nil

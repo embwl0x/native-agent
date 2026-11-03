@@ -10,7 +10,7 @@ import NativeAgentShared
 
 // INTEROCEPTION — production wiring for the passive provider vitals organ.
 //
-// `observeProviderCall` (NativeCognitionRuntime+Events) feeds every non-debug
+// `observeProviderCall` (NativeCognitionRuntime+Events) feeds every actual
 // lifecycle event to `providerVitalsSensor`. When a provider crosses a health
 // band, the sensor returns a transition; here we mint the graded
 // `.providerVitalsShift` CognitiveEvent, run it through the SAME
@@ -62,8 +62,7 @@ extension NativeCognitionRuntime {
     }
 
     /// Feed one lifecycle event to the sensor and route any band transition.
-    /// Called from `observeProviderCall` after the debug-session guard, so a
-    /// diagnostic/bridge call never moves a band by itself.
+    /// Actual diagnostic and bridge provider calls also contribute evidence.
     ///
     /// Turn-path budget: one in-memory sensor update; on the rare band
     /// transition, one organism ingest (the same cost class as the existing
@@ -71,26 +70,6 @@ extension NativeCognitionRuntime {
     func feedProviderVitals(_ event: LLMCallLifecycleEvent) async {
         if let transition = await providerVitalsSensor.ingest(lifecycle: event) {
             await ingestProviderVitalsTransition(transition)
-        }
-    }
-
-    /// Bootstrap archives any active provider-vitals inbox cards.
-    func retireProviderVitalsNotices() async {
-        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
-        do {
-            let ids = try await inbox.rows().compactMap { row -> String? in
-                guard case .object(let object) = row,
-                      case .string("provider_vitals")? = object["source"],
-                      case .string(let id)? = object["id"] else { return nil }
-                return id
-            }
-            _ = try await inbox.archiveActive(
-                ids: ids, readAt: ISO8601DateFormatter().string(from: now())
-            )
-        } catch {
-            FileHandle.standardError.write(
-                Data("ProviderVitals: retiring old inbox cards failed: \(error)\n".utf8)
-            )
         }
     }
 

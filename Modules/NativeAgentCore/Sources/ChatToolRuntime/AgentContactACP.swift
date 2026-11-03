@@ -20,18 +20,26 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import TurnTrace
-// Blueprint: | `AgentContactACP.swift` | ACP launch, execution and live updates |
+// Blueprint: | `AgentContactACP.swift` | ACP launch, execution and live updates; update-following checks capture, approval and current contact reads before launch instead of retaining an earlier executable binding after failure |
 extension SwiftToolDispatcher {
     /// The installed program, approved in place of the one pinned at connect
     /// when it moved (Cursor's version folders) or changed (Hermes in place).
-    private static func followACPUpdate(_ contact: AgentPeerContact, installed: String?, environment: [String: String], store: AgentPeerStore) async -> AgentPeerContact {
-        guard let installed else { return contact }
+    private static func followACPUpdate(_ contact: AgentPeerContact, installed: String?, environment: [String: String], store: AgentPeerStore) async throws -> AgentPeerContact {
+        guard let installed else {
+            throw ToolFailureError("The installed ACP program could not be found. Repair this contact's recipe before sending; nothing ran.",
+                effects: .none, owner: contact.name,
+                nextCall: ToolFailureError.call("app", ["action": .string("agent.recipe")]), recovery: .repair)
+        }
         let path = URL(fileURLWithPath: installed).standardizedFileURL.resolvingSymlinksInPath().path
         if let approved = contact.approvedACPExecutable, approved.path == path, approved.isCurrent { return contact }
         // Its version, for the startup check (startupBlocker) and the contact's version note.
-        let version = try? await AgentACPExecutable.capture(path: path).reported(environment: environment)
-        guard (try? store.approveExecutable(peerID: contact.id, path: path, version: version)) == true else { return contact }
-        return (try? store.list())?.first { $0.id == contact.id } ?? contact
+        let version = try await AgentACPExecutable.capture(path: path).reported(environment: environment)
+        guard try store.approveExecutable(peerID: contact.id, path: path, version: version) else {
+            throw ToolFailureError("The contact changed before its updated ACP program could be approved. Read agent.contacts before continuing; nothing ran.",
+                effects: .unknown, owner: store.fileURL.path,
+                nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]), recovery: .inspect)
+        }
+        return try checkedPeerSnapshot(contact.id, store: store).contact
     }
     /// What a dry run changed in an ACP recipe, said plainly: the two downgrades, or what it recorded.
     static func learned(_ old: AgentHostACP, _ new: AgentHostACP) -> String {
@@ -57,7 +65,9 @@ extension SwiftToolDispatcher {
         }
         if case .denied(let reason) = permission { return refused("failed", "Nothing was launched: \(reason).", reason: "launch_blocked") }
         guard permission != .fullMac else { return (.run { executable, arguments in [executable] + arguments }, [:]) }
-        let sandbox = await Self.builderShellSandboxMode(dataRoot: dataRoot)
+        let sandbox: BuilderShellSandboxMode
+        do { sandbox = try await Self.builderShellSandboxMode(dataRoot: dataRoot) }
+        catch { return refused("unavailable", error.localizedDescription, reason: "trust_policy_unavailable") }
         guard sandbox != .lockedDown else { return refused("unavailable", "Running another agent is turned off in the current permission settings.") }
         // Peers use the URL-only descriptor and cannot read the main bridge bearer.
         let bridgeDir = Self.sbplEscapeLiteral(AgentHostDirectory.bridgeDiscoveryDirectory(dataRoot: dataRoot)
@@ -68,7 +78,7 @@ extension SwiftToolDispatcher {
     }
     func hostACPRun(contact: AgentPeerContact, message: String, conversationID: String?, store: AgentPeerStore,
                             surface: String) async throws -> JSONValue {
-        guard usesCanonicalBody, await fullMacToolAccess(surface: surface).fileOpsAllowed else {
+        guard usesCanonicalBody, try await fullMacToolAccess(surface: surface).fileOpsAllowed else {
             return builderFullMacRequired(tool: "agent_message")
         }
         // The recipe this send runs on, kept for its proof.
@@ -161,7 +171,7 @@ extension SwiftToolDispatcher {
         ]).serialize(pretty: false)
         var lease: AgentACPConnections.Lease?
         do {
-            let acquired = try await AgentACPConnections.shared.acquire(peer: contact.id, conversation: dryRun ? nil : conversationID, configuration: configuration)
+            let acquired = try await AgentACPConnections.shared.acquire(peer: contact.id, conversation: dryRun ? nil : conversationID, configuration: configuration, dataRoot: dataRoot)
             lease = acquired
             let reply = try await acquired.client.turn(
                 executable: program, arguments: arguments,
@@ -283,6 +293,14 @@ extension SwiftToolDispatcher {
                 return Self.peerRedact(.object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false), "agent": .string("peer:" + contact.id),
                     "transport": .string("acp"), "detail": .string("\(shown) did not finish its handshake: "
                         + ((error as? AgentACPClient.Failure)?.localizedDescription ?? error.localizedDescription) + handshakeCheck)]), token: secret)
+            }
+            if let unavailable = error as? AgentACPClient.PermissionUnavailable {
+                var result: [String: JSONValue] = ["status": .string("unavailable"), "reason": .string("permission_decision_unavailable"),
+                    "agent": .string("peer:" + contact.id), "transport": .string("acp"), "sent": .null,
+                    "completed": .bool(false), "terminal": .bool(true), "detail": .string(unavailable.localizedDescription),
+                    "permission_failure": ChatToolOutcome.failure(error: unavailable.cause)]
+                if let session { result["conversation_id"] = .string(session) }
+                return Self.peerRedact(.object(result), token: secret)
             }
             if let failure = ProviderFailure.report(error, work: .outcomeUnknown) {
                 var result: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("acp")]

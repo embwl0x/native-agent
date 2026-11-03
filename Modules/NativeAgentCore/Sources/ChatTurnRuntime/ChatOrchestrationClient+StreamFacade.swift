@@ -13,7 +13,7 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import AgentWorkspace
-// Blueprint: | `ChatOrchestrationClient+StreamFacade.swift` | `SwiftNativeChatOrchestrationClient`: `chatStream`, `chatStreamExecution`; `ChatStreamExecution` joins or cancels its producer Task's settled result |
+// Blueprint: | `ChatOrchestrationClient+StreamFacade.swift` | `SwiftNativeChatOrchestrationClient`: `chatStream`, `chatStreamExecution`; the producer mounts its exact session/run recipient with SessionTurnDelivery; `ChatStreamExecution` joins or cancels its producer Task's settled result |
 
 /// Joinable ownership for one core streaming producer. Surface adapters that
 /// cancel a consumer must wait for this execution before treating the turn as
@@ -145,8 +145,8 @@ extension SwiftNativeChatOrchestrationClient {
             return await request.bind {
                 await TurnTraceContext.$bus.withValue(turnTraceBus) {
                 await TurnTraceContext.$turnId.withValue(turnId) {
-                await TurnTraceContext.$replyRow.withValue(replyRowID.map {
-                    TurnTraceContext.ReplyRow(turnId: turnId, messageId: $0)
+                await TurnTraceContext.$replyRow.withValue(replyRowID.flatMap { row in
+                    sessionId.map { TurnTraceContext.ReplyRow(turnId: turnId, sessionId: $0, messageId: row) }
                 }) {
                 await ProviderTurnChoice.$current.withValue(choice ?? ProviderTurnChoice.current) {
                 await MacWorkContinuation.$current.withValue(macContinuation ?? MacWorkContinuation.current) {
@@ -176,8 +176,21 @@ extension SwiftNativeChatOrchestrationClient {
             return .failure(ChatOrchestrationError.emptyMessage)
         }
         let execution: StructuredChatExecution
+        let runID = ChatPersistenceContext.pinnedTurnRunID ?? UUID().uuidString
+        // The stream is this session's mounted delivery. Every entry into the
+        // session resolves it through the owner, including a resumed turn.
+        let lease = request.sessionID.map {
+            SessionTurnDelivery.mount(dataRoot: dataRoot, sessionID: $0, runID: runID,
+                recipient: .init(progress: { event in continuation.yield(event) }))
+        }
+        defer {
+            if let session = request.sessionID, let lease {
+                SessionTurnDelivery.unmount(dataRoot: dataRoot, sessionID: session, runID: runID, lease: lease)
+            }
+        }
         do {
-            execution = try await chatExecution(
+            execution = try await ChatPersistenceContext.$pinnedTurnRunID.withValue(runID) {
+            try await chatExecution(
                 message: request.message,
                 sessionId: request.sessionID,
                 model: request.model,
@@ -187,8 +200,9 @@ extension SwiftNativeChatOrchestrationClient {
                 persona: request.persona,
                 surface: request.surface,
                 suppressUserAppend: request.suppressUserAppend,
-                progress: { event in continuation.yield(event) }
+                progress: nil
             )
+            }
         } catch {
             continuation.finish(throwing: ProviderFailure.report(error) ?? error)
             return .failure(error)

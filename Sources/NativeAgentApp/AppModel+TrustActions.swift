@@ -30,8 +30,35 @@ import TelegramBot
 import DeviceSync
 // Blueprint: | `AppModel+TrustActions.swift` | `AppModel`: Trust policy, backups, approval resolution and Mac control commands |
 
+enum BackupCreationOutcome {
+    case created(BackupRecord, String)
+    case failed(String)
+}
+
 @MainActor
 extension AppModel {
+    func resolveApproval(_ approval: ApprovalRecord, decision: String) async {
+        let result = await resolveApprovalOnce(id: approval.id, decision: decision)
+        switch result {
+        case .applied, .noOpAlreadyResolved:
+            statusText = result.visibleMessage
+            await refreshAll()
+        case .noOpInFlight, .unavailable:
+            statusText = result.visibleMessage
+        }
+    }
+
+    /// All mounted approval controls share the facade's one resolution flight.
+    func resolveApprovalOnce(id: String, decision: String) async -> ApprovalsFacade.Resolution {
+        do {
+            return try await engine.approvals.resolveOnce(id: id) { id in
+                try await resolveApproval(id: id, decision: decision)
+            }
+        } catch {
+            return .unavailable(UserFacingError.cause(error, action: "update that approval"))
+        }
+    }
+
     @MainActor
     func saveWorkshopPolicyToggle(enabled: Bool? = nil) async {
         do {
@@ -144,29 +171,35 @@ extension AppModel {
         trustCenterActionOutcome = .failed(message)
     }
 
-    /// The backup, or nil; either way `statusText` carries the receipt.
+    /// The command owns its result; UI status is only its projection.
     @MainActor
     @discardableResult
-    func createBackup(reason: String) async -> BackupRecord? {
+    func createBackup(reason: String) async -> BackupCreationOutcome {
         let receipt: String
+        let result: BackupCreationOutcome
         var cause: String?
-        var created: BackupRecord?
         do {
             let backup = try await TrustBackupPersistence.createBackup(
                 reason: reason, dataRoot: firstRunDataRoot
             )
-            created = backup
             receipt = "Backup created at \(backup.createdAt): \(backup.reason)"
+            result = .created(backup, receipt)
         } catch {
             receipt = UserFacingError.message(error, action: "make a backup")
+            result = .failed(receipt)
             cause = error.localizedDescription
         }
         await refreshBackupList(preserving: receipt, cause: cause)
-        return created
+        switch result {
+        case .created: trustCenterActionOutcome = .saved(receipt)
+        case .failed: trustCenterActionOutcome = .failed(receipt)
+        }
+        return result
     }
 
     @MainActor
-    func restoreBackup(_ backup: BackupRecord) async {
+    @discardableResult
+    func restoreBackup(_ backup: BackupRecord) async -> TrustCenterActionOutcome {
         let receipt: String
         let outcome: TrustCenterActionOutcome
         var cause: String?
@@ -175,8 +208,9 @@ extension AppModel {
                 id: backup.id, dataRoot: firstRunDataRoot
             )
             if result.requiresRestart {
-                statusText = "Restore validated and staged. NativeAgent is restarting to install the backup and carry only readable current requests and consumption evidence. A turn in progress when the backup was taken is restored as stopped; nothing from the backup runs on its own."
-                trustCenterActionOutcome = .saved(statusText)
+                let message = "Restore validated and staged. NativeAgent is restarting to install the backup and carry only readable current requests and consumption evidence. A turn in progress when the backup was taken is restored as stopped; nothing from the backup runs on its own."
+                statusText = message
+                trustCenterActionOutcome = .saved(message)
                 AppRelaunch.relaunchApp(terminate: {
                     RunLoop.main.perform(inModes: [.common]) {
                         MainActor.assumeIsolated { NSApplication.shared.terminate(nil) }
@@ -184,7 +218,7 @@ extension AppModel {
                 }, onSpawnFailure: { error in
                     ModuleLog.app("[relaunch] failed to spawn relaunch helper for %@: %@", Bundle.main.bundlePath, "\(error)")
                 })
-                return
+                return .saved(message)
             }
             let scopes = TrustBackupPersistence.scopeNames(for: result.restored)
             let restoredDescription = scopes.isEmpty ? "no matching data scopes" : scopes.joined(separator: ", ")
@@ -198,6 +232,7 @@ extension AppModel {
         }
         await refreshBackupList(preserving: receipt, cause: cause)
         trustCenterActionOutcome = outcome
+        return outcome
     }
 
     @MainActor

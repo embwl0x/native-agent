@@ -38,7 +38,14 @@ public struct CognitiveReflectionJudgment: Codable, Sendable, Equatable {
     /// about is the reflection's to say, never a cosine's.
     public var care: String?
 
-    public func validate(material: [String: CognitiveReflectionCause]) throws {
+    public func validate(material: [String: CognitiveReflectionCause], cares: [CognitiveCareLine]) throws {
+        if let care {
+            let key = care.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard key == "new" || cares.contains(where: { $0.key.lowercased() == key }) else {
+                throw DecodingError.dataCorrupted(.init(codingPath: [],
+                    debugDescription: "Invalid reflection care target: \(care) was not offered."))
+            }
+        }
         guard affect.map({ $0.isFinite && (-1...1).contains($0) }) ?? true,
               takeaway.map({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.count <= 240 }) ?? true,
               Set(sources).isSubset(of: Set(material.keys)),
@@ -48,7 +55,7 @@ public struct CognitiveReflectionJudgment: Codable, Sendable, Equatable {
         }
     }
 }
-public struct CognitiveReflectionRequest: Sendable, Equatable {
+public struct CognitiveReflectionRequest: Codable, Sendable, Equatable {
     public var reservationId: UUID?
     public var reason: String
     public var prompt: String
@@ -60,17 +67,14 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
     public var requestedAt: Date
     /// Reflection evidence uses the nodes frozen at prompt construction, never the workspace after the model returns.
     public var sourceNodeIds: [UUID]
-    /// Historical receipt provenance; new requests keep selected causes in `material`.
-    public var materialProvenance: String?
-    /// Historical quoted lines, retained when decoding older receipts.
-    public var sourceExcerpts: [String]
+
     /// Full peer identities captured with the sources; excerpt labels are presentation only.
     /// Nil means provenance is unknown, including receipts predating this field.
     public var sourcePeerIds: [String]?
     /// Full source material keyed by its canonical reference, frozen for this call.
     public var material: [String: CognitiveReflectionCause]
     /// The cares the call was shown, by key, for naming the one its thought
-    /// belongs to. Not persisted: the thought is placed when the call returns.
+    /// belongs to. Retained with the judgment until care integration lands.
     public var cares: [CognitiveCareLine]
 
     public init(
@@ -83,8 +87,6 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
         reasoningEffort: String = "high",
         requestedAt: Date,
         sourceNodeIds: [UUID] = [],
-        materialProvenance: String? = nil,
-        sourceExcerpts: [String] = [],
         sourcePeerIds: [String]? = nil,
         material: [String: CognitiveReflectionCause] = [:],
         cares: [CognitiveCareLine] = []
@@ -98,14 +100,12 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
         self.reasoningEffort = reasoningEffort
         self.requestedAt = requestedAt
         self.sourceNodeIds = sourceNodeIds
-        self.materialProvenance = materialProvenance
-        self.sourceExcerpts = sourceExcerpts
         self.sourcePeerIds = sourcePeerIds
         self.material = material
         self.cares = cares
     }
 }
-public struct CognitiveReflectionReceipt: Sendable, Equatable, Identifiable {
+public struct CognitiveReflectionReceipt: Codable, Sendable, Equatable, Identifiable {
     public var id: UUID
     public var request: CognitiveReflectionRequest
     public var resultSummary: String
@@ -115,11 +115,20 @@ public struct CognitiveReflectionReceipt: Sendable, Equatable, Identifiable {
     public var estimatedPromptTokens: Int
     public var estimatedResultTokens: Int
     public var estimatedCostUnits: Double
-    public var proposalYieldScore: Double
-    public var proposalIds: [UUID]
+    /// Affected care identities. SQLite retains its existing `proposalIds` key.
+    public var affectedCareIDs: [UUID]
     public var judgment: CognitiveReflectionJudgment?
     /// The returned judgment remains available even if its undertone failed to save.
     public var dispositionSaveFailed: Bool
+    /// Present on judgments whose effects have not yet run. Existing recorded
+    /// receipts already integrated cares and keep that recorded completion.
+    public var careIntegrationPending: Bool?
+    public var integrationEpoch: UInt64?
+    public var integrationSkipped: String?
+    public var journalPending: Bool?
+
+    var owesSettlement: Bool { careIntegrationPending == true || dispositionSaveFailed || journalPending == true }
+    var persistenceStatus: String { owesSettlement ? "owed" : (cancelled ? "cancelled" : "recorded") }
 
     public init(
         id: UUID,
@@ -131,10 +140,12 @@ public struct CognitiveReflectionReceipt: Sendable, Equatable, Identifiable {
         estimatedPromptTokens: Int = 0,
         estimatedResultTokens: Int = 0,
         estimatedCostUnits: Double = 0,
-        proposalYieldScore: Double = 0,
-        proposalIds: [UUID] = [],
+        affectedCareIDs: [UUID] = [],
         judgment: CognitiveReflectionJudgment? = nil,
-        dispositionSaveFailed: Bool = false
+        dispositionSaveFailed: Bool = false,
+        careIntegrationPending: Bool? = nil,
+        integrationEpoch: UInt64? = nil,
+        integrationSkipped: String? = nil
     ) {
         self.id = id
         self.request = request
@@ -145,10 +156,12 @@ public struct CognitiveReflectionReceipt: Sendable, Equatable, Identifiable {
         self.estimatedPromptTokens = max(0, estimatedPromptTokens)
         self.estimatedResultTokens = max(0, estimatedResultTokens)
         self.estimatedCostUnits = max(0, estimatedCostUnits)
-        self.proposalYieldScore = (proposalYieldScore).clamped01()
-        self.proposalIds = proposalIds
+        self.affectedCareIDs = affectedCareIDs
         self.judgment = judgment
         self.dispositionSaveFailed = dispositionSaveFailed
+        self.careIntegrationPending = careIntegrationPending
+        self.integrationEpoch = integrationEpoch
+        self.integrationSkipped = integrationSkipped
     }
 }
 public struct CognitiveReceiptRecord: Sendable, Equatable, Identifiable {

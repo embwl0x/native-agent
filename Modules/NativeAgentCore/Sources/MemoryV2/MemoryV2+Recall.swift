@@ -19,7 +19,8 @@ extension SwiftNativeMemoryV2 {
         while true {
             try Task.checkCancellation()
             let state = try await memoryEmbeddingEpochState()
-            if state.activeEpoch == embedder.embeddingEpoch.rawValue { return nil }
+            if state.activeEpoch == embedder.embeddingEpoch.rawValue, state.dimensions == embedder.dimensions,
+               state.activationFailure?.epoch != embedder.embeddingEpoch.rawValue { return nil }
             do {
                 return try await reindexAllMemoryEmbeddingsForCurrentProvider()
             } catch let error as MemoryStorageError {
@@ -78,7 +79,8 @@ extension SwiftNativeMemoryV2 {
             throw MemoryStorageError.searchFailure("The memory search model is not loaded.\(failed)",
                 code: "memory_search_model_not_loaded", instruction: "It loads on its own; recall again shortly. If it keeps failing, Doctor names the load error.")
         }
-        guard try await memoryEmbeddingEpochState().activeEpoch == residentEpoch.rawValue else {
+        let epochState = try await memoryEmbeddingEpochState()
+        guard epochState.activeEpoch == residentEpoch.rawValue, epochState.dimensions == embedder?.dimensions else {
             requestEmbeddingEpochReconcile()
             throw Self.recallCorpusConverging
         }
@@ -91,7 +93,7 @@ extension SwiftNativeMemoryV2 {
         let storeDirectory = await storage.path.deletingLastPathComponent()
         let rewritten = MemoryRecallQueryExpansion.rewrite(
             query.text,
-            names: MemoryRecallQueryExpansion.names(storeDirectory: storeDirectory)
+            names: try MemoryRecallQueryExpansion.names(storeDirectory: storeDirectory)
         )
         guard let embedder else {
             throw MemoryStorageError.searchFailure("No memory search model is attached.",
@@ -320,7 +322,6 @@ extension SwiftNativeMemoryV2 {
                 preview: MemoryTextClip.sentenceClip(displayText, cap: memoryRecallPreviewCap),
                 content: content,
                 source: "swift-native",
-                rankingSignals: nil,
                 extras: .object(extras)
             )
         }

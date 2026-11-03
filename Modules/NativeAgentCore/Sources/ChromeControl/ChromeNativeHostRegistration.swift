@@ -34,7 +34,7 @@ public enum ChromeNativeHostRegistration {
             "nativeagent_bundle_id": paths.bundleIdentifier,
         ]
         let data = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
-        try update(paths: paths, relay: relay) { destination in
+        try update(paths: paths) { destination in
             try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: destination)
         }
     }
@@ -45,19 +45,19 @@ public enum ChromeNativeHostRegistration {
         guard FileManager.default.fileExists(atPath: paths.chromeManifest.path) else { return true }
         guard let data = try? Data(contentsOf: paths.chromeManifest),
               let manifest = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-        return paths.ownsChromeManifest(manifest, relay: bundledRelayURL())
+        return paths.ownsChromeManifest(manifest)
     }
 
     static func uninstall(home: URL = FileManager.default.homeDirectoryForCurrentUser,
-                          relayURL: URL? = nil, bundleIdentifier: String? = currentAppBundleIdentifier()) throws {
+                          bundleIdentifier: String? = currentAppBundleIdentifier()) throws {
         let paths = InstallPaths(bundleIdentifier: bundleIdentifier, home: home)
         guard FileManager.default.fileExists(atPath: paths.chromeManifest.path) else { return }
-        try update(paths: paths, relay: relayURL ?? bundledRelayURL()) { destination in
+        try update(paths: paths) { destination in
             try FileManager.default.removeItem(at: destination)
         }
     }
 
-    private static func update(paths: InstallPaths, relay: URL, _ write: (URL) throws -> Void) throws {
+    private static func update(paths: InstallPaths, _ write: (URL) throws -> Void) throws {
         let directory = paths.chromeManifest.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         // The directory lock serializes ownership checks and atomic manifest replacement.
@@ -68,7 +68,7 @@ public enum ChromeNativeHostRegistration {
         if FileManager.default.fileExists(atPath: paths.chromeManifest.path) {
             let data = try Data(contentsOf: paths.chromeManifest)
             guard let manifest = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  paths.ownsChromeManifest(manifest, relay: relay) else { return }
+                  paths.ownsChromeManifest(manifest) else { return }
         }
         try write(paths.chromeManifest)
     }

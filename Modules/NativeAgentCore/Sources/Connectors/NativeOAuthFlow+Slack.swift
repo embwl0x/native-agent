@@ -74,23 +74,26 @@ extension NativeOAuthFlow {
                         guard try slackSaveRevision(dataRoot: root) == snapshot.revision else {
                             throw PersistenceCoreError.ioFailure("Slack credentials changed while saving. The token was not saved.")
                         }
-                        var connector = try SlackCredentials.metadata(dataRoot: root)
+                        let policy = try TransportAllowlist.slackPolicy(dataRoot: root)
+                        // Publish only the current schema, not a copy of any
+                        // obsolete policy keys a prior document may contain.
+                        var connector: [String: JSONValue] = [:]
                         let savedAppToken = appToken.isEmpty
                             ? try SlackCredentials.read(.app, dataRoot: root, allowMissingGrant: !providedToken.isEmpty)
                             : appToken
-                        let reference = try SlackCredentials.stageGrant(bot: token, app: savedAppToken, dataRoot: root)
+                        let reference = try SlackCredentials.stageGrant(bot: token, app: savedAppToken,
+                            dataRoot: root, allowMissingGrant: !providedToken.isEmpty)
                         connector["provider"] = .string("slack")
-                        for key in SlackCredentials.fileKeys.values.joined() { connector[key] = nil }
                         connector["credential_store"] = .string("keychain")
                         connector[SlackCredentials.referenceField] = .string(reference)
                         connector["token_type"] = .string("Bearer")
                         connector["auth_mode"] = .string("manual_oauth_token")
                         connector["saved_at"] = .string(now)
-                        if !appToken.isEmpty { connector["socket_mode_enabled"] = .bool(true) }
+                        connector["socket_mode_enabled"] = .bool(!appToken.isEmpty || policy.socketModeEnabled)
                         mergeSlackIngressFields(
                             allowedChannelIds: channels,
                             allowedUserIds: users,
-                            requireMention: requireMention,
+                            requireMention: requireMention ?? policy.requireMention,
                             into: &connector
                         )
                         mergeSlackAuthFields(authFields, into: &connector)
@@ -113,7 +116,6 @@ extension NativeOAuthFlow {
                 entry["authState"] = .string("connected")
                 entry["healthStatus"] = .string("ok")
                 entry["connected"] = .bool(true)
-                entry["connected_at"] = .string(now)
                 entry["connectedAt"] = .string(now)
             }
         } catch {
@@ -191,20 +193,14 @@ extension NativeOAuthFlow {
     }
 
     private static func mergeSlackIngressFields(
-        allowedChannelIds: Set<String>?,
-        allowedUserIds: Set<String>?,
-        requireMention: Bool?,
+        allowedChannelIds: Set<String>,
+        allowedUserIds: Set<String>,
+        requireMention: Bool,
         into obj: inout [String: JSONValue]
     ) {
-        if let allowedChannelIds {
-            obj["allowed_channel_ids"] = .array(allowedChannelIds.sorted().map(JSONValue.string))
-        }
-        if let allowedUserIds {
-            obj["allowed_user_ids"] = .array(allowedUserIds.sorted().map(JSONValue.string))
-        }
-        if let requireMention {
-            obj["require_mention"] = .bool(requireMention)
-        }
+        obj["allowed_channel_ids"] = .array(allowedChannelIds.sorted().map(JSONValue.string))
+        obj["allowed_user_ids"] = .array(allowedUserIds.sorted().map(JSONValue.string))
+        obj["require_mention"] = .bool(requireMention)
     }
 
 }

@@ -6,7 +6,7 @@ import TrustCenter
 import ApplicationServices
 #endif
 
-// Blueprint: | `MacActClosedLoop.swift` | `MacActClosedLoop.verify` owns the declared-effect verdict for semantic, menu and physical act receipts: exact complete AXValue, selection range, selected/state/focus, owned window/sheet creation, confirmed removal or process exit and AX surface transitions; pixels are witnesses only; readable mismatches are `acted_mismatch`, unavailable readback (including canonically masked text values) is `acted_unobserved`; an unchanged surface without press evidence is unobserved, never a mismatch (only a contradicted destination is) |
+// Blueprint: | `MacActClosedLoop.swift` | Closed-loop action grammar, rendered-identity re-resolution, positional cohort/geometry guards, declared effects and bounded notification waits |
 
 // Actions use the existing actuator and event sink; effect verification
 // compiles the same read organ after the observation settles.
@@ -70,6 +70,9 @@ public enum MacLookScope: String, Sendable, Equatable, CaseIterable {
 /// model names an INTENTION, and this file decides the mechanism.
 public enum MacActVerb: String, Sendable, Equatable, CaseIterable {
     case click
+    case doubleClick = "double_click"
+    case rightClick = "right_click"
+    case hover
     /// Open through advertised AXOpen or the same guarded double-click path used by click.
     case open
     case type
@@ -329,15 +332,16 @@ public enum MacActClosedLoop {
         public let found: JSONValue
     }
 
-    /// Recompile through the same walker and compare rendered identity, ordinal cohort and geometry; focus-only entries resolve through the live focus at the same path.
+    /// Resolve the recorded rendered identity on the live screen. Positional
+    /// identities still require their original cohort and geometry below.
     public static func liveIdentity(
         entry: MacLookFrameEntry,
         percept: MacLookPercept
     ) -> MacLookAffordance? {
-        if let affordance = percept.affordances.first(where: { $0.path == entry.path }) {
+        if let affordance = percept.affordances.first(where: { $0.handle == entry.handle }) {
             return affordance
         }
-        guard let focus = percept.focus, focus.path == entry.path, let handle = focus.handle else {
+        guard let focus = percept.focus, focus.handle == entry.handle, let handle = focus.handle else {
             return nil
         }
         // Built from the FOCUS channel exactly as `MacLookFrame.entries` built
@@ -355,8 +359,8 @@ public enum MacActClosedLoop {
         )
     }
 
-    /// Nothing at that path at all is drift too: the element she named is not
-    /// merely different, it is not there.
+    /// An identity not found in this observation cannot authorize an act;
+    /// an incomplete/unreadable observation does not prove removal.
     public static func identityDrift(
         entry: MacLookFrameEntry,
         live: MacLookAffordance?
@@ -368,7 +372,7 @@ public enum MacActClosedLoop {
                     "role": .null,
                     "handle": .null,
                     "label": .null,
-                    "note": .string("no addressable control is at that path in the live window"),
+                    "note": .string("the recorded control identity could not be confirmed in the live observation"),
                 ])
             )
         }
@@ -518,17 +522,6 @@ public enum MacActClosedLoop {
 
     // MARK: - The Open command
 
-    /// Use only measured Open chords, keyed by bundle ID; display names and assumed app shortcuts cannot authorize input.
-    public static func openCommandChord(forBundleId bundleId: String?) -> MacKeyChord? {
-        guard let bundleId else { return nil }
-        switch bundleId {
-        case "com.apple.finder":
-            return MacKeyChord(modifiers: .command, keyCode: 0x7D, source: "cmd+down")
-        default:
-            return nil
-        }
-    }
-
     /// Does the destination we LANDED on correspond to what we asked to open?
     /// Finder retitles the window to the opened folder's name, so the acted
     /// row's label and the post-act title are directly comparable.
@@ -601,7 +594,8 @@ public enum MacActClosedLoop {
 
     static func verify(
         _ effect: DeclaredEffect,
-        value: @autoclosure () -> String? = nil, selection: @autoclosure () -> NSRange? = nil,
+        value: @autoclosure () -> String? = nil, valueBefore: String? = nil,
+        selection: @autoclosure () -> NSRange? = nil,
         selected: Bool? = nil, focused: @autoclosure () -> Bool? = nil,
         surfaceChanged: @autoclosure () -> Bool? = nil, dismissed: @autoclosure () -> Bool? = nil,
         processGone: @autoclosure () -> Bool = false,
@@ -635,13 +629,26 @@ public enum MacActClosedLoop {
                     let tail = String(decoding: Array(text.utf16.dropFirst(max(0, offset - 1)).prefix(40)), as: UTF16.self)
                     return receiptText(tail) ?? ""
                 }
-                return ActClassification(status: "acted_mismatch", reason: "text_mismatch",
-                    note: "AXValue differs at UTF-16 offset \(offset): expected \"\(excerpt(expected))\", read \"\(excerpt(value))\" (expected length \(expected.utf16.count), read length \(value.utf16.count)).")
+                // The field was read. Only a field that moved off its pre-typing value took
+                // the input (an app that capitalizes or curls quotes changed it); unknown or
+                // unchanged is not evidence that anything landed.
+                let quoted = "typed \"\(excerpt(expected))\", it reads \"\(excerpt(value))\" (from UTF-16 offset \(offset); typed length \(expected.utf16.count), read length \(value.utf16.count))"
+                guard let valueBefore, value != valueBefore else {
+                    return ActClassification(status: "acted_unobserved",
+                        reason: valueBefore == nil ? "text_differs" : "text_unchanged",
+                        note: valueBefore == nil
+                            ? "The field reads differently from what was typed: \(quoted). Whether the input landed is unknown."
+                            : "The field still reads what it read before typing: \(quoted). The input did not show up there.")
+                }
+                return ActClassification(status: "acted_changed", reason: "text_changed",
+                    note: "The field took the input and now reads differently: \(quoted). Read what it says before typing again.")
             }
         case .placement(let placement, let directory):
-            guard directory == placement.directoryName else {
+            let wanted = URL(fileURLWithPath: placement.directory, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
+            let actual = directory.flatMap(URL.init(string:))
+            guard actual?.isFileURL == true, actual?.standardizedFileURL.resolvingSymlinksInPath() == wanted else {
                 return ActClassification(status: directory == nil ? "acted_unobserved" : "acted_mismatch",
-                    reason: "save_panel_placement_unverified", note: "Where popup reads \(receiptText(directory) ?? "unknown"); expected \(receiptText(placement.directoryName) ?? "").")
+                    reason: "save_panel_placement_unverified", note: "Directory URL reads \(receiptText(directory) ?? "unavailable"); expected \(receiptText(wanted.absoluteString) ?? "").")
             }
             return verify(.text(placement.name), value: value(), redactingText: redactingText)
         case .selectAll:
@@ -721,7 +728,7 @@ public enum MacActClosedLoop {
             readback = "The target window or modal is no longer present in its process."
             mismatch = "The target window or modal is still present; dismissal was expected."
             matches = processGone || dismissed == true || diff?.modalDisappeared == true
-                ? true : dismissed ?? diff.map { $0.modalDisappeared }
+                ? true : dismissed
         case .scroll:
             readback = "The target's accessibility scroll state changed."
             mismatch = "AXScrollBar reads the same value; a scroll position change was expected."
@@ -750,106 +757,6 @@ public enum MacActClosedLoop {
         )
         if case .string(let text) = value { return text }
         return "[redacted]"
-    }
-
-    /// Roles that are a legitimate CLICK target when the handle itself will not
-    /// open. A Finder list ROW is the thing that opens.
-    ///
-    /// `AXCell` is deliberately NOT here. Finder's shape is
-    /// `AXRow > AXCell > AXStaticText` (see `MacPerceptionCompiler`'s own note),
-    /// and double-clicking the filename CELL is the RENAME gesture — the exact
-    /// bug this resolution exists to fix. A cell is climbed THROUGH, never
-    /// stopped at; it can still win a hop by advertising `AXOpen`, which is a
-    /// semantic call and not a click.
-    public static let openableAncestorRoles: Set<String> = ["AXRow", "AXOutlineRow"]
-
-    /// Stop ancestor search at containers: their centre can target an unrelated row or default action.
-    public static let openWalkStopRoles: Set<String> = [
-        "AXOutline", "AXTable", "AXList", "AXScrollArea",
-        "AXGroup", "AXSplitGroup", "AXWindow",
-        "AXBrowser", "AXCollection", "AXGrid", "AXWebArea",
-        "AXTabGroup", "AXToolbar", "AXSheet", "AXDrawer",
-    ]
-
-    /// A filename cell is one or two hops under its row. Three is slack, not an
-    /// invitation to climb to the window.
-    public static let maxOpenWalkHops = 3
-
-    public struct OpenTargetResolution: Sendable, Equatable {
-        public let path: [Int]
-        public let hops: Int
-        public let role: String
-        public let advertisesOpen: Bool
-        /// Why THIS element: `handle_advertises_open`, `ancestor_advertises_open`,
-        /// `nearest_openable_row`, or `no_openable_ancestor`.
-        public let reason: String
-
-        public init(path: [Int], hops: Int, role: String, advertisesOpen: Bool, reason: String) {
-            self.path = path
-            self.hops = hops
-            self.role = role
-            self.advertisesOpen = advertisesOpen
-            self.reason = reason
-        }
-
-        /// True when the act will land somewhere other than the handle she named
-        /// — which is exactly the thing that must be REPORTED, never silent.
-        public var redirected: Bool { hops > 0 }
-
-        public func toJSON() -> JSONValue {
-            .object([
-                "role": .string(role),
-                "hops": .int(Int64(hops)),
-                "path": .array(path.map { .int(Int64($0)) }),
-                "reason": .string(reason),
-                "redirected": .bool(redirected),
-                "advertises_open": .bool(advertisesOpen),
-            ])
-        }
-    }
-
-    /// Probe only within the validated window; semantic candidates may be any role, while synthetic double-click candidates must be content rows.
-    public struct OpenTargetPlan: Sendable, Equatable {
-        public let semantic: OpenTargetResolution?
-        public let click: OpenTargetResolution?
-
-        public init(semantic: OpenTargetResolution?, click: OpenTargetResolution?) {
-            self.semantic = semantic
-            self.click = click
-        }
-    }
-
-    /// Resolve bounded ancestors through the same PID/window-anchored probe as the act; planning emits no input.
-    public static func planOpenFallback(
-        path: [Int],
-        probe: ([Int]) -> (role: String, actions: [String])?
-    ) -> OpenTargetPlan {
-        guard maxOpenWalkHops > 0 else { return OpenTargetPlan(semantic: nil, click: nil) }
-        var semantic: OpenTargetResolution?
-        var click: OpenTargetResolution?
-        for hop in 1...maxOpenWalkHops {
-            guard path.count > hop else { break }
-            let ancestorPath = Array(path.dropLast(hop))
-            guard !ancestorPath.isEmpty, let hit = probe(ancestorPath) else { break }
-            if semantic == nil, hit.actions.contains("AXOpen") {
-                semantic = OpenTargetResolution(
-                    path: ancestorPath, hops: hop, role: hit.role,
-                    advertisesOpen: true, reason: "ancestor_advertises_open"
-                )
-            }
-            // STOP-ROLE CHECK: a container never becomes a click target just
-            // because the walk reached it. The walk ends here — past a
-            // container, child indexes address a different kind of thing.
-            if openWalkStopRoles.contains(hit.role) { break }
-            if click == nil, openableAncestorRoles.contains(hit.role) {
-                click = OpenTargetResolution(
-                    path: ancestorPath, hops: hop, role: hit.role,
-                    advertisesOpen: hit.actions.contains("AXOpen"),
-                    reason: "nearest_openable_row"
-                )
-            }
-        }
-        return OpenTargetPlan(semantic: semantic, click: click)
     }
 
     /// Diff the BEFORE frame (what she looked at and named handles from)

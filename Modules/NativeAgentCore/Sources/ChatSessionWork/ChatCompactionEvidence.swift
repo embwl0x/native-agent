@@ -8,6 +8,14 @@ import Transcripts
 import ProviderRouting
 // Blueprint: | `ChatCompactionEvidence.swift` | Compaction trace, retained coverage and safe replacement accounting |
 extension ChatSessionAutocompactor {
+    func emitContextSizeTrace(kind: String, sessionId: String, payload: [String: JSONValue]) async {
+        let date = now()
+        let event = TurnTraceEvent(kind: kind, title: sessionId, status: payload["status"]?.stringValue ?? "ok",
+            payload: .object(payload), createdAt: ISO8601DateFormatter().string(from: date), ts: date,
+            turnId: TurnTraceContext.turnId, sessionId: sessionId, surface: LLMCallContext.surface)
+        if TurnTraceContext.turnId != nil { TurnTraceBus.fire(event, on: TurnTraceContext.bus ?? .shared) }
+        else { await TurnTracePersistLane(dataRootOverride: dataRoot).append(event) }
+    }
     func emitCompactionTrace(
         _ outcome: ChatSessionCompactionOutcome,
         model: String,
@@ -43,20 +51,22 @@ extension ChatSessionAutocompactor {
         if TurnTraceContext.turnId != nil { TurnTraceBus.fire(event, on: TurnTraceContext.bus ?? .shared) }
         else { await TurnTracePersistLane(dataRootOverride: dataRoot).append(event) }
     }
-    /// Select only enough oldest source to leave ~55% of the effective window
-    /// raw. Live cards/results stay raw and count toward that allowance too.
+    /// Select source against the same measured request as the ring. Reserve
+    /// the distiller's one-fifth ask; the caller checks the actual result and
+    /// continues toward target, without imposing a new output-length rule.
     static func rawHistoryReplacementCount(
-        rows: [JSONValue], windowTokens: Int, divisor: Double, force: Bool
-    ) -> Int {
+        rows: [JSONValue], targetTokens: Int, measurement: SessionContextMeasurement, force: Bool
+    ) throws -> Int {
         guard rows.count > 1 else { return 0 }
         let rawRows = rows.filter { !isRecollection($0) }
-        let rawChars = transcriptCharacterCount(rawRows)
-        let target = Int(Double(windowTokens) * divisor
-            * ChatSessionAutocompactionConfig.rawHistoryTargetFraction)
+        let rawChars = measurement.characters(in: rawRows)
+        let target = targetTokens
         // An explicit manual fold can still shorten a history already below
         // the automatic target; leave half of that smaller raw stretch.
-        let keepChars = force && rawChars <= target ? rawChars / 2 : target
-        guard rawChars > keepChars else { return 0 }
+        let reduction = max(0, Double(measurement.tokens - target) * measurement.charactersPerToken)
+        let retainedShare = 1.0 / Double(ChatCompactionDistiller.sourceToBlockRatio)
+        let removeChars = force && reduction == 0 ? Double(rawChars) / 2 : reduction / (1 - retainedShare)
+        guard removeChars > 0, rawChars > 0 else { return 0 }
         let (results, compactible) = InlineInteractionCompactionRetention.splitPendingResults(rawRows)
         let (cards, _) = InlineInteractionCompactionRetention.split(compactible)
         let protected = Set(results + cards)
@@ -66,11 +76,11 @@ extension ChatSessionAutocompactor {
             let row = rows[index]
             // Never consume the destination of an in-flight foreground fold.
             if hasPendingDistillation(row) { break }
-            if !isRecollection(row), !protected.contains(row), case .object(let object) = row {
-                removedChars += ChatCompactionRowRendering.characterCount(object)
+            if !isRecollection(row), !protected.contains(row) {
+                removedChars += measurement.characters(in: [row])
             }
             count = index + 1
-            if rawChars - removedChars <= keepChars { break }
+            if Double(removedChars) >= removeChars { break }
         }
         return keepingLastUserRow(rows: rows, replaceCount: count)
     }
@@ -206,18 +216,20 @@ extension ChatSessionAutocompactor {
         guard let lastUser = rows[..<replaceCount].lastIndex(where: { role($0) == "user" }) else { return 0 }
         return lastUser > 0 && containsRawTurn(Array(rows.prefix(lastUser))) ? lastUser : 0
     }
-    static func transcriptCharacterCount(_ rows: [JSONValue]) -> Int {
+    static func transcriptCharacterCount(_ rows: [JSONValue]) throws -> Int {
         var total = 0
         for row in rows {
             guard case .object(let obj) = row else { continue }
-            total += ChatCompactionRowRendering.characterCount(obj)
+            total += try ChatCompactionRowRendering.characterCount(obj)
         }
         return total
     }
-    static func fileSize(_ path: URL) -> Int64 {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
-              let size = attrs[.size] as? NSNumber else {
-            return 0
+    static func fileSize(_ path: URL) throws -> Int64 {
+        let attrs: [FileAttributeKey: Any]
+        do { attrs = try FileManager.default.attributesOfItem(atPath: path.path) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return 0 }
+        guard let size = attrs[.size] as? NSNumber else {
+            throw ChatSessionCompactionTranscriptError(errorDescription: "Transcript size is unavailable. Repair access to the transcript before compacting it.")
         }
         return size.int64Value
     }

@@ -127,10 +127,11 @@ public final class VoiceInputCapture {
 
     // Every concurrent stop caller waits for the same terminal capture result.
     // The first caller owns finish(); later callers only join this list. Each
-    // continuation is drained exactly once by a final result, failure, or
+    // waiter is drained exactly once by a final result, failure, or
     // timeout, so a duplicate UI/hotkey stop cannot observe a transient
     // partial transcript as a completed phrase.
-    private var stopWaiters: [CheckedContinuation<VoiceInputStopResult, Never>] = []
+    private var stopWaiters: [UUID: ScopedWaiter] = [:]
+    private var stopResults: [UUID: VoiceInputStopResult] = [:]
     private var stopInFlight = false
     // A mounted composer can observe `isListening` and queue its stop task in
     // the same run-loop turn that the timeout wins. Preserve that terminal
@@ -179,14 +180,16 @@ public final class VoiceInputCapture {
     /// submit only the final transcript; recovery can describe partial capture.
     public func stopListeningResult() async -> VoiceInputStopResult {
         guard isListening else { return latestStopResult ?? .final(transcript) }
-        return await withCheckedContinuation { cont in
-            stopWaiters.append(cont)
-            guard !stopInFlight else { return }
+        let id = UUID(), done = ScopedWaiter()
+        stopWaiters[id] = done
+        if !stopInFlight {
             stopInFlight = true
             let generation = nextStopGeneration()
             armStopTimeout(for: generation)
             finishRecognition()
         }
+        await Task { await done.park() }.value
+        return stopResults.removeValue(forKey: id)!
     }
 
     private func nextStopGeneration() -> UInt64 {
@@ -215,8 +218,9 @@ public final class VoiceInputCapture {
         stopInFlight = false
         stopTimeoutTask?.cancel()
         stopTimeoutTask = nil
-        for waiter in waiters {
-            waiter.resume(returning: result)
+        for (id, done) in waiters {
+            stopResults[id] = result
+            done.resume()
         }
     }
 
@@ -318,9 +322,7 @@ public final class VoiceInputCapture {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.contextualStrings = recognitionContext()
-        if #available(macOS 13.0, *) {
-            request.addsPunctuation = true
-        }
+        request.addsPunctuation = true
         recognitionRequest = request
 
         let inputNode = audioEngine.inputNode

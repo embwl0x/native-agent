@@ -3,7 +3,10 @@ import SwiftUI
 import AppKit
 import NativeAgentShared
 import PersonaEngine
-// Blueprint: | `PersonalityView.swift` | `PersonalityView` struct; document editing makes no claim that memory review writes the optional MEMORY.md input |
+import Cognition
+import CognitiveSubstrate
+import PersistenceCore
+// Blueprint: | `PersonalityView.swift` | Persona document editing and read-only Becoming traits/story from the resident inner-state owner, refreshed through LatestRead and runtime changes; memory review does not write optional MEMORY.md |
 
 // Persona documents own personality; guarded onboarding cannot overwrite a live persona.
 
@@ -73,6 +76,53 @@ struct PersonalityDocumentDraftState: Equatable {
         if succeeded && editRevisions[documentID, default: 0] == revision {
             unsavedDrafts.removeValue(forKey: documentID)
         }
+    }
+}
+
+/// The same resident reading as mind.inner_state, shown without editing her words.
+private struct PersonalityBecomingView: View {
+    @Environment(AppModel.self) private var appModel
+    @State private var reading: CognitiveInnerStateReading?
+    @State private var latestRead = LatestRead()
+
+    var body: some View {
+        Group {
+            if let issue = reading?.selfKnowledgeIssue {
+                AdvancedSection(title: "Becoming", card: .single) {
+                    Text("Her self-reading is unavailable: " + issue)
+                        .foregroundStyle(NativeAgentShell.trouble)
+                }
+            } else if let knowledge = reading?.selfKnowledge,
+                      !knowledge.traits.isEmpty || !knowledge.story.isEmpty {
+                AdvancedSection(title: "Becoming", card: .single) {
+                    ForEach(Array(knowledge.traits.enumerated()), id: \.offset) { _, trait in
+                        Text(trait.line).textSelection(.enabled)
+                    }
+                    ForEach(Array(knowledge.story.enumerated()), id: \.offset) { _, entry in
+                        Text(entry.line).textSelection(.enabled)
+                    }
+                }
+            }
+        }
+        .task {
+            guard let runtime = appModel.engine.cognitionView.runtime else { return }
+            let changes = await runtime.changes()
+            await refresh(runtime)
+            for await _ in changes {
+                guard !Task.isCancelled else { return }
+                await refresh(runtime)
+            }
+        }
+    }
+
+    @MainActor
+    private func refresh(_ runtime: NativeCognitionRuntime) async {
+        _ = await latestRead.read({
+            await runtime.innerStateReading(windowHours: 6, detail: .compact)
+        }, publish: { next in
+            guard !Task.isCancelled else { return }
+            reading = next
+        })
     }
 }
 
@@ -147,6 +197,7 @@ struct PersonalityView: View {
                     VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
                         if personaInitialized {
                             identityPanel
+                            PersonalityBecomingView()
                             docsPanel
                             ResetPersonaView {
                                 await loadProfile(forceRefresh: true)
@@ -193,7 +244,7 @@ struct PersonalityView: View {
             TextField("Name", text: starterAgentName)
                 .textFieldStyle(.roundedBorder)
 
-            TextField("Your name (optional)", text: starterUserName)
+            TextField("Your name (required)", text: starterUserName)
                 .textFieldStyle(.roundedBorder)
 
             AdvancedTextEditor(
@@ -206,7 +257,9 @@ struct PersonalityView: View {
                 Button(starterBusy ? "Creating\u{2026}" : "Create") {
                     Task { await createStarterPersona() }
                 }
-                .disabled(starterBusy || starterAgentName.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(starterBusy
+                    || starterAgentName.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || starterUserName.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                 if let starterError {
                     Text(starterError)

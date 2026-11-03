@@ -19,7 +19,12 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
     /// Warnings derived from the sync engine's own durable state files. Deliberately ordered most-actionable first.
     static func localSyncStateWarnings(dataRoot: URL) -> (details: [String], fault: Bool) {
         var warnings: [String] = []
-        let stranded = ICloudSyncStatePaths.completedUnarchivedMsgIds(dataRoot: dataRoot)
+        var localFault = false
+        let stranded: [String]
+        do { stranded = try ICloudSyncStatePaths.completedUnarchivedMsgIds(dataRoot: dataRoot) }
+        catch {
+            return (["Completed-command replay evidence is unavailable: \(error.localizedDescription). Restore access to the completion-marker directory; command admission stays paused."], true)
+        }
         if !stranded.isEmpty {
             warnings.append(
                 "\(stranded.count) iPhone command(s) completed but their completion record could not be filed "
@@ -28,8 +33,8 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
             )
         }
         let skipsURL = ICloudSyncStatePaths.snapshotSkips(dataRoot: dataRoot)
-        if let data = try? Data(contentsOf: skipsURL),
-           let skips = try? JSONDecoder().decode([String: String].self, from: data) {
+        do {
+            let skips = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: skipsURL))
             let groups = skips.keys.filter { !$0.hasPrefix("_") }.sorted()
             if !groups.isEmpty {
                 // Named with why, so a group that never reached the phone says so instead of only that it is old.
@@ -41,8 +46,13 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
                         .joined(separator: "; ")
                 )
             }
+        } catch CocoaError.fileReadNoSuchFile {
+            // No snapshot has been skipped yet.
+        } catch {
+            localFault = true
+            warnings.append("iPhone snapshot skip history is unavailable at \(skipsURL.path): \(error.localizedDescription). Repair this ledger before treating phone snapshots as current")
         }
-        return (warnings, !stranded.isEmpty)
+        return (warnings, localFault || !stranded.isEmpty)
     }
 
     /// Folds local sync-state warnings into the active transport verdict without downgrading a harder existing status.
@@ -68,14 +78,19 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
     }
 
     public func run(repair: Bool) async -> CheckResult {
+        let containerID: String
+        do { containerID = try NativeAgentICloudBridgeConstants.containerID }
+        catch {
+            return merging(CheckResult(source: "iCloud build configuration", id: id, title: title,
+                status: "fail", detail: error.localizedDescription, owner: .builder))
+        }
         let services = Self.entitlementValues(DeviceCloudKitPreflight.iCloudServicesEntitlementKey)
         guard let snapshot = await ICloudBridgeHealthReader.snapshot(dataRoot: dataRoot) else {
-            return merging(CheckResult(source: "iCloud container " + NativeAgentICloudBridgeConstants.containerID,
+            return merging(CheckResult(source: "iCloud container " + containerID,
                 id: id, title: title, status: "unmeasured",
                 detail: "iCloud transport health is unmeasured; the app's bridge has not started."
             ))
         }
-        let containerID = NativeAgentICloudBridgeConstants.containerID
         let cloudKit = snapshot.transport == .cloudKit
         // A CloudKit-signed build whose configured container is not the one its signature grants never gets the CloudKit
         // transport; say that, not the iCloud Drive entitlement it fell back to and never needed.
@@ -92,7 +107,7 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
         let containerKey = cloudKit ? DeviceCloudKitPreflight.iCloudContainersEntitlementKey
             : "com.apple.developer.ubiquity-container-identifiers"
         guard services.contains(service), Self.entitlementValues(containerKey).contains(containerID) else {
-            return merging(CheckResult(source: "iCloud container " + NativeAgentICloudBridgeConstants.containerID,
+            return merging(CheckResult(source: "iCloud container " + containerID,
                 id: id, title: title, status: "warn",
                 detail: "The active \(cloudKit ? "CloudKit" : "iCloud Drive") transport lacks its signed \(service) service or container entitlement.",
                 harm: "The phone cannot exchange messages with her through iCloud.",
@@ -100,22 +115,22 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
             ))
         }
         if cloudKit {
-            return merging(cloudKitResult(snapshot))
+            return merging(cloudKitResult(snapshot, containerID: containerID))
         }
         // Doctor's launch run can precede the bridge's first transfer. Not measured yet is a reading, not a defect: nothing is
         // wrong and nothing can be done, so it must not wake her or the phone.
         if case .unmeasured = snapshot.health {
-            return merging(CheckResult(source: "iCloud container " + NativeAgentICloudBridgeConstants.containerID,
+            return merging(CheckResult(source: "iCloud container " + containerID,
                 id: id, title: title, status: "unmeasured", detail: "iCloud Drive is starting; transport health is not measured yet."
             ))
         }
         guard case .available = snapshot.health, let docsURL = snapshot.documentsURL else {
             let signedIn = FileManager.default.ubiquityIdentityToken != nil
-            return merging(CheckResult(source: "iCloud container " + NativeAgentICloudBridgeConstants.containerID,
+            return merging(CheckResult(source: "iCloud container " + containerID,
                 id: id, title: title, status: "warn",
                 detail: signedIn ? "The active iCloud Drive container is unavailable." : "The active iCloud Drive transport has no signed-in iCloud account.",
                 harm: "The phone cannot exchange messages with her through iCloud.",
-                repair: signedIn
+                human_action: signedIn
                     ? "Open System Settings → Apple Account → iCloud → Drive and turn on Sync this Mac; allow NativeAgent under Apps Syncing to iCloud Drive."
                     : "Open System Settings → Apple Account and sign in to iCloud.",
                 ask: signedIn ? .permission : .signIn
@@ -160,7 +175,7 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
             }
         }
         if repair, !created.isEmpty {
-            return merging(CheckResult(source: "iCloud container " + NativeAgentICloudBridgeConstants.containerID,
+            return merging(CheckResult(source: "iCloud container " + containerID,
                 id: id,
                 title: title,
                 status: "ok",
@@ -179,7 +194,7 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
                 repair_available: true
             ))
         }
-        return merging(CheckResult(source: "iCloud container " + NativeAgentICloudBridgeConstants.containerID,
+        return merging(CheckResult(source: "iCloud container " + containerID,
             id: id,
             title: title,
             status: "ok",
@@ -187,10 +202,10 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
         ))
     }
 
-    private func cloudKitResult(_ snapshot: ICloudBridgeHealthSnapshot) -> CheckResult {
-        let receive = cloudKitResult(snapshot.health, operation: "receive")
+    private func cloudKitResult(_ snapshot: ICloudBridgeHealthSnapshot, containerID: String) -> CheckResult {
+        let receive = cloudKitResult(snapshot.health, operation: "receive", containerID: containerID)
         let failures = snapshot.sendFailures.sorted { $0.key < $1.key }.map {
-            cloudKitResult($0.value, operation: "send (\($0.key))")
+            cloudKitResult($0.value, operation: "send (\($0.key))", containerID: containerID)
         }
         let send = failures.isEmpty
             ? (snapshot.sendMeasured ? "CloudKit has accepted outbound delivery; iOS receipt is not confirmed"
@@ -198,7 +213,7 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
             : failures.map { $0.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) }.joined(separator: "; ")
         let adverse = ([receive] + failures).first { $0.status == "fail" }
             ?? ([receive] + failures).first { DoctorSafeRepairPolicy.isAdverse($0.status) }
-        return CheckResult(source: "iCloud container " + NativeAgentICloudBridgeConstants.containerID,
+        return CheckResult(source: "iCloud container " + containerID,
             id: id, title: title,
             status: adverse?.status ?? (receive.status == "ok" && snapshot.sendMeasured && failures.isEmpty ? "ok" : "unmeasured"),
             detail: receive.detail.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + "; " + send + ".",
@@ -207,7 +222,7 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
         )
     }
 
-    private func cloudKitResult(_ health: ICloudBridgeHealthSnapshot.Health, operation: String) -> CheckResult {
+    private func cloudKitResult(_ health: ICloudBridgeHealthSnapshot.Health, operation: String, containerID: String) -> CheckResult {
         var status = "warn"
         let detail: String
         var action: String?
@@ -228,7 +243,7 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
         case .notEntitled:
             owner = .builder
             detail = "CloudKit \(operation) is not configured with its required entitlements."
-            action = "Install a signed NativeAgent build granting CloudKit and container \(NativeAgentICloudBridgeConstants.containerID)."
+            action = "Install a signed NativeAgent build granting CloudKit and container \(containerID)."
         case .quotaExceeded:
             detail = "The active CloudKit transport cannot \(operation) because iCloud storage is full."
             action = "Open System Settings → Apple Account → iCloud → Manage and free iCloud storage."
@@ -241,7 +256,7 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
                 ask = .signIn
             case .missingEntitlement:
                 owner = .builder
-                action = "Install a signed NativeAgent build granting CloudKit and container \(NativeAgentICloudBridgeConstants.containerID)."
+                action = "Install a signed NativeAgent build granting CloudKit and container \(containerID)."
             case .managedAccountRestricted:
                 action = "Ask your Apple Account administrator to allow CloudKit for NativeAgent."
                 ask = .permission
@@ -256,7 +271,7 @@ public struct ICloudBridgeStateCheck: RepairingDoctorCheck {
             detail = "The iPhone is paired with another Mac (or an earlier install) on this Apple Account; this Mac stays quiet toward it."
             action = "Choose Use my iPhone with this Mac in Connectors → iPhone to disconnect it from the other Mac and connect it here."
         }
-        return CheckResult(source: "iCloud container " + NativeAgentICloudBridgeConstants.containerID + ": " + operation, id: id, title: title, status: status, detail: detail,
+        return CheckResult(source: "iCloud container " + containerID + ": " + operation, id: id, title: title, status: status, detail: detail,
                            harm: DoctorSafeRepairPolicy.isAdverse(status) ? "The phone cannot exchange messages with her through iCloud." : nil,
                            human_action: action, ask: ask, owner: owner)
     }

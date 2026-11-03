@@ -5,7 +5,7 @@ import PersistenceCore
 import NativeAgentCore
 import NativeAgentShared
 import Transcripts
-// Blueprint: | `NativeAgentIntents.swift` | `NativeAgentChatIntent`: `perform`, `reply` |
+// Blueprint: | `NativeAgentIntents.swift` | Named resident-agent Shortcuts; NativeAgentDoctorIntent admits and settles runs through the live DoctorFacade |
 
 /// One resident agent, named by this installation's canonical persona.
 struct ResidentAgentEntity: AppEntity {
@@ -53,8 +53,7 @@ struct ResidentAgentQuery: EntityStringQuery {
     }
 }
 
-/// The original Ask action stays source- and shortcut-compatible. This action
-/// adds a finite entity vocabulary; free-form messages are elicited by Siri,
+/// One finite entity vocabulary; free-form messages are elicited by Siri,
 /// never interpolated as a second phrase parameter.
 struct AskResidentAgentIntent: AppIntent {
     @available(macOS 27, *)
@@ -82,12 +81,16 @@ struct AskResidentAgentIntent: AppIntent {
         let reply: String
         if #available(macOS 27, *) {
             reply = try await performBackgroundTask {
-                try await NativeAgentChatIntent.reply(to: message)
+                try await Self.reply(to: message)
             }
         } else {
-            reply = try await NativeAgentChatIntent.reply(to: message)
+            reply = try await Self.reply(to: message)
         }
         return .result(value: reply, dialog: IntentDialog(stringLiteral: reply))
+    }
+    static func reply(to message: String) async throws -> String {
+        try await ApplicationLifetime.shared.prepare()
+        return try await NativeAgentEngine.live.replyToIntent(message)
     }
 }
 
@@ -110,42 +113,6 @@ struct NativeAgentStatusIntent: AppIntent {
     }
 }
 
-struct NativeAgentChatIntent: AppIntent {
-    @available(macOS 27, *)
-    static var allowedExecutionTargets: IntentExecutionTargets { .main }
-
-    static let title: LocalizedStringResource = "Ask NativeAgent"
-    static let description = IntentDescription("Sends a message to NativeAgent in the conversation you're in.")
-    static let openAppWhenRun = false
-
-    @Parameter(title: "Message")
-    var message: String
-
-    static var parameterSummary: some ParameterSummary {
-        Summary("Ask NativeAgent \(\.$message)")
-    }
-
-    func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
-        let reply: String
-        if #available(macOS 27, *) {
-            reply = try await performBackgroundTask {
-                try await Self.reply(to: message)
-            }
-        } else {
-            reply = try await Self.reply(to: message)
-        }
-        return .result(value: reply, dialog: IntentDialog(stringLiteral: reply))
-    }
-
-    static func reply(to message: String) async throws -> String {
-        try await ApplicationLifetime.shared.prepare()
-        return try await NativeAgentEngine.live.replyToIntent(message)
-    }
-}
-
-@available(macOS 27, *)
-extension NativeAgentChatIntent: LongRunningIntent {}
-
 @available(macOS 27, *)
 extension AskResidentAgentIntent: LongRunningIntent {}
 
@@ -157,9 +124,21 @@ struct NativeAgentDoctorIntent: AppIntent {
     static let description = IntentDescription("Runs the local Doctor check without unsafe repairs.")
     static let openAppWhenRun = true
 
+    @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         try await ApplicationLifetime.shared.prepare()
-        let report = try await AppDoctorPort(dataRoot: PersistenceCore.defaultDataRoot()).runtime.runDoctor()
+        let doctor = NativeAgentEngine.live.doctor
+        guard doctor.admitRun() else {
+            throw ToolFailureError("Health checks are already running.", effects: .none)
+        }
+        let report: DoctorReport
+        do {
+            report = try await AppDoctorPort(dataRoot: doctor.dataRoot).runtime.runDoctor()
+            doctor.finishRun(report)
+        } catch {
+            doctor.finishRun(nil, failure: UserFacingError.message(error, action: "run the health checks"))
+            throw error
+        }
         return .result(dialog: "Doctor finished with status \(report.status). \(report.checks.count) checks ran.")
     }
 }
@@ -222,12 +201,6 @@ struct NativeAgentShortcuts: AppShortcutsProvider {
             phrases: ["Check \(.applicationName) status", "Ask \(.applicationName) status"],
             shortTitle: "Status",
             systemImageName: "waveform.path.ecg"
-        )
-        AppShortcut(
-            intent: NativeAgentChatIntent(),
-            phrases: ["Ask \(.applicationName)", "Send \(.applicationName) a message"],
-            shortTitle: "Ask",
-            systemImageName: "bubble.left.and.bubble.right"
         )
         AppShortcut(
             intent: NativeAgentDoctorIntent(),

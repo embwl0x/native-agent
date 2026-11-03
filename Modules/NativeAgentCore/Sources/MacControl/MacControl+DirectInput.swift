@@ -22,7 +22,7 @@ extension SwiftNativeMacControl {
         body: [String: JSONValue]
     ) async -> MarkResolution {
         guard let mark = body["mark"]?.integerValue.flatMap(Int.init(exactly:)) else { return .absent }
-        guard let viewId = body["view"]?.stringValue ?? body["view_id"]?.stringValue,
+        guard let viewId = body["view"]?.stringValue,
               !viewId.isEmpty else {
             return .refused(injectionRefusal(
                 action: action,
@@ -51,25 +51,25 @@ extension SwiftNativeMacControl {
         }
     }
 
-    /// Resolve only in the captured window. Nearby-text guesses or duplicate
-    /// labels cannot establish element identity, so those marks require a fresh
-    /// semantic target. A row named by its own child text re-resolves by it.
+    /// Resolve only in the captured window. Only observed names establish
+    /// element identity; unnamed or unreadable marks need a fresh semantic target.
+    /// A row named by its own child text re-resolves by it.
     private func liveMarkedTarget(
         _ mark: MacScreenViewMark,
         snapshot: MacScreenViewSnapshot
-    ) -> MacAXActTarget? {
+    ) throws -> MacAXActTarget? {
         guard let identity = snapshot.windowIdentity,
               identity.pid != getpid(),
               accessibilitySource.frontmostApp()?.processIdentifier == identity.pid,
               let label = mark.label, !label.isEmpty,
               ["title", "value", "descendant_text"].contains(mark.labelSource)
         else { return nil }
-        let windows = accessibilityActSource.windows(pid: identity.pid)
+        let windows = try accessibilityActSource.windows(pid: identity.pid)
         guard case .matched(let window, _) = MacAXWindowIdentity.match(
             identity, among: windows.map { (handle: $0, identity: $0.identity) }
         ), let focused = accessibilityActSource.focusedWindow(pid: identity.pid),
            focused.handle == window.handle,
-           let target = accessibilityActSource.uniqueTarget(
+           let target = try accessibilityActSource.uniqueTarget(
                role: mark.role, label: label, labelSource: mark.labelSource, inWindow: window
            ), target.enabled
         else { return nil }
@@ -160,12 +160,23 @@ extension SwiftNativeMacControl {
             markedSnapshot = snapshot
         case .absent: break
         }
-        let button: MacMouseButton = {
-            let raw = (body["button"]?.stringValue ?? "").lowercased()
-            if raw == "right" { return .right }
-            if case .bool(true)? = body["right"] { return .right }
-            return .left
-        }()
+        let button: MacMouseButton
+        if let supplied = body["button"] {
+            guard let raw = supplied.stringValue?.lowercased(), let parsed = MacMouseButton(rawValue: raw) else {
+                return injectionRefusal(action: "click", error: "button must be left or right", status: 400)
+            }
+            button = parsed
+        } else { button = body["right"] == .bool(true) ? .right : .left }
+        if let right = body["right"], right != .bool(true), right != .bool(false) {
+            return injectionRefusal(action: "click", error: "right must be a boolean", status: 400)
+        }
+        let durationMs: Int
+        if let supplied = body["duration_ms"] {
+            guard let ms = supplied.integerValue.flatMap(Int.init(exactly:)), (80...2_000).contains(ms) else {
+                return injectionRefusal(action: "click", error: "duration_ms must be an integer in 80...2000", status: 400)
+            }
+            durationMs = ms
+        } else { durationMs = 240 }
 
         func point(_ key: String) -> (Double, Double)? {
             if case .object(let obj)? = body[key],
@@ -227,7 +238,6 @@ extension SwiftNativeMacControl {
                 "count": .int(Int64(count)),
             ]
         } else if let from = point("from"), let to = point("to") {
-            let durationMs = max(80, min(body["duration_ms"]?.integerValue.flatMap(Int.init(exactly:)) ?? 240, 2_000))
             let steps = max(4, min(60, durationMs / 16))
             let start = CGPoint(x: from.0, y: from.1)
             let end = CGPoint(x: to.0, y: to.1)
@@ -287,7 +297,11 @@ extension SwiftNativeMacControl {
                     x = lastPosted.x
                     y = lastPosted.y
                 } else {
-                    guard let target = liveMarkedTarget(markedTarget, snapshot: markedSnapshot),
+                    let live: MacAXActTarget?
+                    do { live = try liveMarkedTarget(markedTarget, snapshot: markedSnapshot) }
+                    catch { return injectionRefusal(action: "click", error: "ax_evidence_unavailable", status: 409,
+                        extra: ["guidance": .string(error.localizedDescription)]) }
+                    guard let target = live,
                           let centre = target.centre else {
                         return injectionRefusal(action: "click", error: "mark_drifted: take a fresh view", status: 409)
                     }
@@ -328,8 +342,8 @@ extension SwiftNativeMacControl {
     /// scroll lands on the intended view rather than wherever the cursor sat.
     func handleScroll(_ body: [String: JSONValue]) async -> MacControlResult {
         let started = now()
-        let dy = body["dy"]?.integerValue.flatMap(Int.init(exactly:)) ?? body["delta_y"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0
-        let dx = body["dx"]?.integerValue.flatMap(Int.init(exactly:)) ?? body["delta_x"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0
+        let dy = body["dy"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0
+        let dx = body["dx"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0
         if dx == 0 && dy == 0 {
             return injectionRefusal(
                 action: "scroll",
@@ -340,8 +354,13 @@ extension SwiftNativeMacControl {
         // Bounded: a runaway delta is a denial-of-attention event.
         let clampedX = Int32(max(-10_000, min(dx, 10_000)))
         let clampedY = Int32(max(-10_000, min(dy, 10_000)))
-        let unit: MacScrollUnit = (body["units"]?.stringValue ?? body["unit"]?.stringValue ?? "line")
-            .lowercased() == "pixel" ? .pixel : .line
+        let unit: MacScrollUnit
+        if let supplied = body["units"] {
+            guard let raw = supplied.stringValue?.lowercased(), let parsed = MacScrollUnit(rawValue: raw) else {
+                return injectionRefusal(action: "scroll", error: "units must be line or pixel", status: 400)
+            }
+            unit = parsed
+        } else { unit = .line }
         let at: (Double, Double)? = {
             guard let x = body["x"]?.numberValue(coercingStrings: false, finiteOnly: true), let y = body["y"]?.numberValue(coercingStrings: false, finiteOnly: true) else { return nil }
             return (x, y)
@@ -379,9 +398,8 @@ extension SwiftNativeMacControl {
 
     /// `ax_act` — THE semantic act. Target an element by the `path` that
     /// `ax_tree`/`ax_find` handed out and run its own AX action, so the app
-    /// executes its real handler instead of guessing at a coordinate. Falls
-    /// back to a synthesized click at the element's frame centre only when the
-    /// element advertises no usable action — and says which one it used.
+    /// executes its real handler. Unreadable action names refuse with their
+    /// original evidence error; no pointer or keyboard action substitutes.
     func handleAXAct(_ body: [String: JSONValue]) async -> MacControlResult {
         let started = now()
         // Marks carry their captured window through to the actuator.
@@ -487,13 +505,26 @@ extension SwiftNativeMacControl {
         let value = body["value"]?.stringValue
         var resolvedTarget: MacAXActTarget?
         if let markedTarget, let markedSnapshot {
-            guard let target = liveMarkedTarget(markedTarget, snapshot: markedSnapshot) else {
+            let live: MacAXActTarget?
+            do { live = try liveMarkedTarget(markedTarget, snapshot: markedSnapshot) }
+            catch { return injectionRefusal(action: "ax_act", error: "ax_evidence_unavailable", status: 409,
+                extra: ["guidance": .string(error.localizedDescription)]) }
+            guard let target = live else {
                 return injectionRefusal(action: "ax_act", error: "mark_drifted: take a fresh view", status: 409)
             }
             resolvedTarget = target
         }
         let pathJSON = JSONValue.array(path.map { .int(Int64($0)) })
-        guard let target = resolvedTarget ?? accessibilityActSource.resolve(path: path) else {
+        if resolvedTarget == nil, let app = accessibilitySource.frontmostApp() {
+            switch accessibilityActSource.resolve(path: path, inAppPid: app.processIdentifier) {
+            case .resolved(let hit): resolvedTarget = hit
+            case .unavailable(let detail):
+                return injectionRefusal(action: "ax_act", error: "ax_evidence_unavailable", status: 409,
+                    extra: ["guidance": .string(detail)])
+            default: break
+            }
+        }
+        guard let target = resolvedTarget else {
             await screenViewStore.invalidate()
             return injectionRefusal(
                 action: "ax_act",
@@ -504,11 +535,9 @@ extension SwiftNativeMacControl {
         }
         let result = await MacAccessibilityActuator.act(
             source: accessibilityActSource,
-            sink: eventSink,
             target: target,
             action: requestedAction,
-            value: value,
-            emit: { await self.executeHand($0, action: "ax_act", body: body).refusal?.error }
+            value: value
         )
         await screenViewStore.invalidate()
         // Written/secure values use count+digest. Path-only calls lack the
@@ -557,7 +586,7 @@ extension SwiftNativeMacControl {
             "verified": .bool(false),
             "value_redacted": .bool(redactValue),
         ]
-        output["fallback_reason"] = result.fallbackReason.map { .string($0) } ?? .null
+        output.merge(result.outcome.receipt) { _, new in new }
         if let markedTarget {
             output["targeted_by"] = .string("mark")
             output["mark"] = .int(Int64(markedTarget.mark))

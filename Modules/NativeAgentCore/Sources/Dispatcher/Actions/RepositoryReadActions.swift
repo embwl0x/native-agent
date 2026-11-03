@@ -9,9 +9,8 @@ import CoreWLAN
 import SystemConfiguration
 #if canImport(Darwin)
 import Darwin
-import Darwin
 #endif
-// Blueprint: | `RepositoryReadActions.swift` | `FileSystemActions` repository reads: descriptor-pinned grep, parsed Git status, dated diff/log and dirty summary; Git executable, environment, config and sandbox policy shared with `FileReadSourceMaterial.shellReadLaunch` |
+// Blueprint: | `RepositoryReadActions.swift` | `FileSystemActions` repository reads: descriptor-pinned system grep skips build/VCS and supported root ignore globs, retaining per-record gaps and deadline partials; parsed Git status, dated diff/log and dirty summary; Git policy shared with `FileReadSourceMaterial.shellReadLaunch` |
 
 let connectorGrepMaxResults = 50
 
@@ -133,68 +132,184 @@ extension FileSystemActions {
         }
         #endif
 
-        let rgPath = which("rg")
-        let launch: String
-        let args: [String]
+        let launch = "/usr/bin/grep"
+        guard FileManager.default.isExecutableFile(atPath: launch) else {
+            return errResult("The macOS search tool /usr/bin/grep is unavailable. Repair the macOS installation before searching files.", code: "grep_unavailable")
+        }
         // Patterns are regex data, never CLI options (e.g. searching --help
         // must not execute the engine's help command and report it as matches).
         // The sensitive-path filter parses NUL-delimited filenames.
-        // `--no-config` stops an inherited RIPGREP_CONFIG_PATH from rewriting
-        // it (or the search), and `--with-filename` / `-H` keep the filename on
-        // every line even when the search path is a single file.
-        if let rg = rgPath {
-            launch = rg
-            args = [
-                "--no-config", "--null", "--with-filename", "--no-heading", "--line-number",
-                "-m", String(maxResults), "-e", pattern, "--", searchTarget,
-            ]
-        } else if let grepBin = which("grep") {
-            launch = grepBin
-            args = ["-rHnE", "--null", "--include=*", "-m", String(maxResults), "-e", pattern, "--", searchTarget]
-        } else {
-            // Missing engines retain a generic error without error_code.
-            return errResult("grep not found")
+        // macOS grep is the only engine. -p refuses recursive symlink traversal;
+        // -I skips binary files and --devices=skip avoids FIFOs/devices. The
+        // fixed environment removes GREP_OPTIONS and makes matching byte-based,
+        // so invalid UTF-8 in one text line cannot hide its valid siblings.
+        // The verified single file is handed through /dev/fd, itself a symlink:
+        // read it directly, rather than asking recursive -p to walk it.
+        var traversal: [String] = []
+        if fileDisplayPath == nil {
+            traversal = ["-r", "-p"] + [".git", ".build", "DerivedData*", "node_modules"].flatMap {
+                ["--exclude-dir=\($0)", "--exclude-dir=*/\($0)"]
+            }
+            if let repository = enclosingRepository(searchPath) {
+                switch grepIgnoreArguments(at: repository) {
+                case .success(let exclusions): traversal += exclusions
+                case .failure(let failure): return errResult(failure.message, code: failure.code)
+                }
+            }
         }
+        let args = traversal + [
+            "-I", "-H", "-n", "-E", "--null", "--devices=skip",
+            "-m", String(maxResults), "-e", pattern, "--", searchTarget,
+        ]
+        let environment = ["LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
 
         // -m limits each file, not the complete recursive output. Keep pipe
         // capture bounded as well as the agent-facing presentation.
         let captureLimit = 1_048_576
+        let searchDeadline: TimeInterval = 30
         #if canImport(Darwin)
         let run = runProcess(
             launch, args, cwdDescriptor: cwdFD,
             inheritDescriptor: searchFD >= 0
                 ? (source: searchFD, target: inheritedChildDescriptor) : nil,
-            timeout: 30, captureByteLimit: captureLimit
+            timeout: searchDeadline, environment: environment, captureByteLimit: captureLimit, captureAsBytes: true
         )
         #else
-        let run = runProcess(launch, args, timeout: 30, captureByteLimit: captureLimit)
+        let run = runProcess(launch, args, timeout: searchDeadline, environment: environment,
+            captureByteLimit: captureLimit, captureAsBytes: true)
         #endif
-        if run.timedOut { return errResult("grep timed out after 30s", code: "bash_timeout") }
-        if !run.launched { return errResult("could not run grep") }
-        // Only 0 (matches) and 1 (no matches) establish a completed search.
-        // A killed/aborted engine may leave partial stdout, not valid coverage.
-        if run.captureReadFailed {
-            return errResult("Could not read the search engine output; search coverage is unknown.", code: "grep_error")
+        if !run.launched { return errResult("Could not start /usr/bin/grep: \(run.stderr)", code: "grep_error") }
+        guard let raw = run.rawOutput else {
+            return errResult("Search capture did not return its requested bytes; search coverage is unknown.", code: "grep_error")
         }
-        if run.status != 0 && run.status != 1 {
-            let stderr = run.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            return errResult(stderr.isEmpty ? "grep exited with status \(run.status)" : stderr, code: "grep_error")
+        var gaps: [JSONValue] = []
+        var gapCount = 0
+        func gap(_ fields: [String: JSONValue]) {
+            gapCount += 1
+            if gaps.count < connectorGrepMaxResults { gaps.append(.object(fields)) }
         }
-        // Filenames may contain newlines and colons. Judge the complete NUL-
-        // delimited filename before formatting any match for the transcript.
-        let admitted = grepMatchRecords(run.stdout).compactMap { record -> String? in
+        func displayPath(_ recordPath: String) -> String? {
             let path: String
             if let display = fileDisplayPath {
-                guard record.path == searchTarget else { return nil }
+                guard recordPath == searchTarget else { return nil }
                 path = display
-            } else if let directory = spawnDirectory, !record.path.hasPrefix("/") {
-                let relative = record.path.hasPrefix("./") ? String(record.path.dropFirst(2)) : record.path
-                path = directory.path + "/" + relative
+            } else if let directory = spawnDirectory, !recordPath.hasPrefix("/") {
+                let relative = recordPath.hasPrefix("./") ? String(recordPath.dropFirst(2)) : recordPath
+                path = relative == "." ? directory.path : directory.path + "/" + relative
             } else {
-                path = record.path
+                path = recordPath
             }
             guard path.hasPrefix("/"), !isSensitiveDataPath(URL(fileURLWithPath: path), ctx) else { return nil }
-            return path + ":" + record.match
+            return path
+        }
+        // Filenames may contain newlines and colons. Judge the complete NUL-
+        // delimited filename before exposing either its match or its line gap.
+        let admitted = grepMatchRecords(raw.stdout, capped: run.stdoutTruncated || run.timedOut).compactMap { record -> String? in
+            guard let pathBytes = record.path, let recordPath = String(data: pathBytes, encoding: .utf8),
+                  !recordPath.isEmpty else {
+                gap(["code": .string("unreadable_match_path"),
+                     "capture_byte_offset": .int(Int64(record.offset)),
+                     "message": .string("Match filename is incomplete or not valid UTF-8; this record is unavailable.")])
+                return nil
+            }
+            guard let path = displayPath(recordPath) else { return nil }
+            var detail: [String: JSONValue] = ["path": .string(path), "capture_byte_offset": .int(Int64(record.offset))]
+            guard let colon = record.body.firstIndex(of: 58), colon != record.body.startIndex,
+                  record.body[..<colon].allSatisfy({ (48...57).contains($0) }) else {
+                detail["code"] = .string("unreadable_match_record")
+                detail["message"] = .string("The match's line number is unavailable; this record is omitted.")
+                gap(detail)
+                return nil
+            }
+            let line = String(decoding: record.body[..<colon], as: UTF8.self) // validated ASCII digits
+            detail["line"] = .string(line)
+            var text = Data(record.body[record.body.index(after: colon)...])
+            let dropped = record.partial ? grepIncompleteUTF8SuffixCount(text) : 0
+            if dropped > 0 { text.removeLast(dropped) }
+            guard let decoded = String(data: text, encoding: .utf8) else {
+                detail["code"] = .string("invalid_utf8")
+                detail["message"] = .string("This matched line is not valid UTF-8; its text is unavailable.")
+                gap(detail)
+                return nil
+            }
+            if record.partial {
+                detail["code"] = .string("capture_cut_line")
+                detail["dropped_trailing_utf8_bytes"] = .int(Int64(dropped))
+                detail["message"] = .string("Capture ended inside this line; output retains only its captured text through the last complete character.")
+                gap(detail)
+            }
+            return path + ":" + line + ":" + decoded
+        }
+        // BSD warn/warnx emits `grep: path: reason` in the fixed C locale.
+        // Split at the last colon-space so colons in a filename stay in its path.
+        // Each warning starts with grep's prefix. Keep embedded filename LFs
+        // inside that warning. Undecodable/cut diagnostics remain named by byte
+        // offset rather than an invented filename or reason.
+        let diagnosticBoundary = Data("\ngrep: ".utf8)
+        var remainingDiagnostics = raw.stderr[...]
+        var hasPathDiagnostic = false
+        while !remainingDiagnostics.isEmpty {
+            let offset = remainingDiagnostics.startIndex
+            let end = remainingDiagnostics.range(of: diagnosticBoundary)?.lowerBound ?? remainingDiagnostics.endIndex
+            var row = remainingDiagnostics[..<end]
+            let cut = end == remainingDiagnostics.endIndex && run.stderrTruncated && row.last != 10
+            remainingDiagnostics = end == remainingDiagnostics.endIndex
+                ? remainingDiagnostics[end...] : remainingDiagnostics[remainingDiagnostics.index(after: end)...]
+            if row.last == 10 { row = row.dropLast() }
+            if row.isEmpty { continue }
+            var detail: [String: JSONValue] = ["code": .string("search_diagnostic"),
+                "capture_byte_offset": .int(Int64(offset))]
+            if cut {
+                detail["message"] = .string("Search diagnostic was capped; its full path and reason are unavailable.")
+            } else if let diagnostic = String(data: Data(row), encoding: .utf8) {
+                let body = diagnostic.hasPrefix("grep: ") ? String(diagnostic.dropFirst(6)) : diagnostic
+                if diagnostic.hasPrefix("grep: "), let separator = body.range(of: ": ", options: .backwards) {
+                    let recordPath = String(body[..<separator.lowerBound])
+                    if recordPath.hasPrefix("./") || recordPath.hasPrefix("/") || recordPath == searchTarget {
+                        hasPathDiagnostic = true
+                        guard let path = displayPath(recordPath) else { continue }
+                        detail["code"] = .string("unreadable_search_path")
+                        detail["path"] = .string(path)
+                        detail["message"] = .string(String(body[separator.upperBound...]))
+                    } else {
+                        detail["message"] = .string(diagnostic)
+                    }
+                } else {
+                    detail["message"] = .string(diagnostic)
+                }
+            } else {
+                detail["message"] = .string("Search diagnostic is not valid UTF-8; its text is unavailable.")
+            }
+            gap(detail)
+        }
+        if run.captureReadFailed {
+            gap(["code": .string("search_output_read_incomplete"),
+                 "message": .string("The search's output could not be read completely; matches shown may be missing some.")])
+        }
+        if run.stderrTruncated {
+            gap(["code": .string("search_diagnostic_capture_cut"),
+                 "message": .string("Search diagnostic capture was capped; further path failures may be unavailable.")])
+        }
+        if run.timedOut {
+            gap(["code": .string("search_timed_out"),
+                 "deadline_seconds": .int(Int64(searchDeadline)),
+                 "message": .string("Search reached its \(Int(searchDeadline))-second deadline; these are only the matches captured before it stopped. Narrow the path or pattern; no matches does not establish absence.")])
+        }
+        // Grep's exit status and captured output decide the result. Exit 0
+        // means matches; exit 1 without stderr means no matches. Exit 2 keeps
+        // stdout matches and path-specific gaps, even with no sibling matches.
+        // Judge stdout before decoding/filtering: those steps cannot turn a
+        // matched but unavailable record into a whole-search failure.
+        let failure: String? = run.timedOut || run.status == 0 || (run.status == 1 && raw.stderr.isEmpty)
+            ? nil : "grep exited with status \(run.status); search coverage is incomplete."
+        if let failure {
+            if raw.stdout.isEmpty && !hasPathDiagnostic {
+                let diagnostic = String(data: raw.stderr, encoding: .utf8)
+                    ?? "Search diagnostic is not valid UTF-8; its text is unavailable."
+                return errResult(failure + "\n" + diagnostic, code: "grep_error")
+            }
+            gap(["code": .string("search_incomplete"), "message": .string(failure),
+                 "exit_status": .int(Int64(run.status))])
         }
         // Negative limits have already failed in the engine.
         let lines = Array(admitted.prefix(sliceCount))
@@ -211,14 +326,16 @@ extension FileSystemActions {
         var result: [String: JSONValue] = [
             "ok": .bool(true),
             "pattern": .string(pattern),
-            "status": .string("ok"),
+            "status": .string(run.timedOut || failure != nil ? "partial" : "ok"),
+            "timed_out": .bool(run.timedOut),
+            "deadline_seconds": .int(Int64(searchDeadline)),
             "path": .string(searchPath.path),
             "matches": .int(Int64(lines.count)),
             "output": .string(output),
             "coverage": .object([
-                "complete": .bool(!limitReached && !outputClipped && !run.stdoutTruncated),
-                "scope": .string("Text matches admitted by the existing path policy and search engine ignore/binary rules; not every file on disk."),
-                "matches_are_total": .bool(!limitReached && !outputClipped && !run.stdoutTruncated),
+                "complete": .bool(!limitReached && !outputClipped && !run.stdoutTruncated && gapCount == 0),
+                "scope": .string("Byte-based POSIX extended-regex matches from macOS grep, admitted by the path policy. Recursive searches skip .git, .build, DerivedData*, node_modules and supported repository-root .gitignore basename globs. Anchored/path-specific, escaped and nested ignore rules are not applied; hidden files otherwise remain searchable. Binary files, devices and recursive symlinks are skipped. Explicit files are searched regardless of ignore rules."),
+                "matches_are_total": .bool(!limitReached && !outputClipped && !run.stdoutTruncated && gapCount == 0),
                 "observed_matches_lower_bound": .int(Int64(admitted.count)),
                 "omitted_observed_matches": .int(Int64(omittedObserved)),
                 "match_limit_reached": .bool(limitReached),
@@ -226,32 +343,122 @@ extension FileSystemActions {
                 "output_character_limit": .int(Int64(connectorResultMaxChars)),
                 "capture_truncated": .bool(run.stdoutTruncated),
                 "capture_byte_limit": .int(Int64(captureLimit)),
+                "gap_count": .int(Int64(gapCount)),
+                "gaps_omitted": .int(Int64(gapCount - gaps.count)),
             ]),
+            "gaps": .array(gaps),
         ]
-        if limitReached || outputClipped || run.stdoutTruncated {
+        if limitReached || outputClipped || run.stdoutTruncated || gapCount > 0 {
             result["coverage_note"] = .string("Matches is the selected line count, not the total number of occurrences. More evidence may be omitted; narrow path/pattern or raise max_results up to 50. Read an identified file with file_excerpt for surrounding lines. Do not infer absence from this limited result.")
         }
         return .object(result)
     }
 
-    /// Both engines emit `filename NUL line:text LF`. Only complete records
-    /// count; a capture cut anywhere in a filename or match is discarded.
-    static func grepMatchRecords(_ output: String) -> [(path: String, match: String)] {
-        var remaining = output.utf8[...]
-        var records: [(path: String, match: String)] = []
-        while let separator = remaining.firstIndex(of: 0) {
-            let path = String(decoding: remaining[..<separator], as: UTF8.self)
+    /// Grep supports basename exclusion globs, not Git's ordered path language.
+    /// Read the repository's rules once for this call; never cache a second truth.
+    /// A negation that might re-include a basename prevents its exclusion.
+    /// The work tree a search runs in: the nearest directory at or above it holding `.git`.
+    private static func enclosingRepository(_ path: URL) -> URL? {
+        var directory = NativeAgentWorkspaceRoot.canonicalFileURL(path)
+        while true {
+            if FileManager.default.fileExists(atPath: directory.appendingPathComponent(".git").path) { return directory }
+            let parent = directory.deletingLastPathComponent()
+            if parent.path == directory.path { return nil }
+            directory = parent
+        }
+    }
+
+    private static func grepIgnoreArguments(at root: URL) -> Result<[String], FileReadFailure> {
+        let url = root.appendingPathComponent(".gitignore")
+        let data: Data
+        switch FileBytes().readbackData(at: url, maxBytes: 65_537, fromEnd: false) {
+        case .absent: return .success([])
+        case .unavailable(let error):
+            return .failure(FileReadFailure(message: "Could not read repository ignore rules at \(url.path): \(error.localizedDescription)", code: "grep_ignore_unavailable"))
+        case .present(let bytes): data = bytes
+        }
+        guard data.count <= 65_536, let text = String(data: data, encoding: .utf8) else {
+            return .failure(FileReadFailure(message: "Repository .gitignore exceeds 65536 bytes or is not valid UTF-8; search exclusions are unavailable.", code: "grep_ignore_unavailable"))
+        }
+        let rules = text.components(separatedBy: .newlines).filter { !$0.isEmpty && !$0.hasPrefix("#") }
+        var arguments: [String] = []
+        for (index, rule) in rules.enumerated() {
+            guard !rule.hasPrefix("!"), !rule.contains("\\"), !rule.hasSuffix(" ") else { continue }
+            let directoryOnly = rule.hasSuffix("/")
+            let pattern = directoryOnly ? String(rule.dropLast()) : rule
+            guard !pattern.isEmpty, !pattern.contains("/"), !pattern.contains("**") else { continue }
+            let mayReinclude = rules.dropFirst(index + 1).contains { later in
+                guard later.hasPrefix("!") else { return false }
+                let name = String(later.dropFirst()).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                // Wildcard/escaped negations cannot be safely translated into
+                // grep's unordered excludes. Keep that earlier rule searchable.
+                if name.contains(where: { "*?[\\".contains($0) }) { return true }
+                #if canImport(Darwin)
+                return fnmatch(pattern, (name as NSString).lastPathComponent, 0) == 0
+                #else
+                return true
+                #endif
+            }
+            guard !mayReinclude else { continue }
+            arguments.append("--exclude-dir=\(pattern)")
+            arguments.append("--exclude-dir=*/\(pattern)")
+            if !directoryOnly {
+                arguments.append("--exclude=\(pattern)")
+                arguments.append("--exclude=*/\(pattern)")
+            }
+        }
+        return .success(arguments)
+    }
+
+    /// macOS grep emits `filename NUL line:text LF`. Framing happens before
+    /// decoding, including filenames containing LF. A known capture cap or
+    /// search deadline permits a partial final body; a cut filename is a gap.
+    static func grepMatchRecords(_ output: Data, capped: Bool) -> [(path: Data?, body: Data, partial: Bool, offset: Int)] {
+        var remaining = output[...]
+        var records: [(path: Data?, body: Data, partial: Bool, offset: Int)] = []
+        while !remaining.isEmpty {
+            let offset = remaining.startIndex
+            guard let separator = remaining.firstIndex(of: 0) else {
+                records.append((nil, Data(), false, offset))
+                break
+            }
+            let path = Data(remaining[..<separator])
             let body = remaining[remaining.index(after: separator)...]
-            guard let end = body.firstIndex(of: 10) else { break }
+            guard let end = body.firstIndex(of: 10) else {
+                records.append((path, capped ? Data(body) : Data(), capped, offset))
+                break
+            }
             var match = body[..<end]
             if match.last == 13 { match = match.dropLast() }
-            guard !path.isEmpty, let colon = match.firstIndex(of: 58),
-                  colon != match.startIndex,
-                  match[..<colon].allSatisfy({ (48...57).contains($0) }) else { break }
-            records.append((path, String(decoding: match, as: UTF8.self)))
+            records.append((path, Data(match), false, offset))
             remaining = body[body.index(after: end)...]
         }
         return records
+    }
+
+    /// Remove only an unfinished UTF-8 scalar at a known byte cap. Invalid
+    /// bytes elsewhere still fail that line's strict decode; never replace them.
+    static func grepIncompleteUTF8SuffixCount(_ data: Data) -> Int {
+        let tail = Array(data.suffix(4))
+        guard !tail.isEmpty else { return 0 }
+        var start = tail.count - 1
+        while start > 0 && (0x80...0xBF).contains(tail[start]) { start -= 1 }
+        let lead = tail[start]
+        let width: Int
+        switch lead {
+        case 0xC2...0xDF: width = 2
+        case 0xE0...0xEF: width = 3
+        case 0xF0...0xF4: width = 4
+        default: return 0
+        }
+        let count = tail.count - start
+        guard count < width, tail[(start + 1)...].allSatisfy({ (0x80...0xBF).contains($0) }) else { return 0 }
+        if count > 1 {
+            let second = tail[start + 1]
+            if (lead == 0xE0 && second < 0xA0) || (lead == 0xED && second > 0x9F)
+                || (lead == 0xF0 && second < 0x90) || (lead == 0xF4 && second > 0x8F) { return 0 }
+        }
+        return count
     }
 
     // MARK: - git_status
@@ -401,6 +608,7 @@ extension FileSystemActions {
             "since": since.isEmpty ? .null : .string(since),
             "files": .array(files.sorted().map(JSONValue.string)),
             "has_more": .bool(records.count > limit),
+            "history_state": .string(result.historyState ?? "committed"),
             "coverage": .string(since.isEmpty
                 ? "Files across returned commits only; has_more means older commit details and files were omitted. Git quotes unusual filenames."
                 : "Files across every matching commit in the period; has_more means older commit details were omitted, not their files. Git quotes unusual filenames."),
@@ -415,7 +623,7 @@ extension FileSystemActions {
 
     // MARK: - repo_dirty_summary
     //
-    // Parsed status plus a short log; a nonzero log exit leaves the commit list empty.
+    // Parsed status plus a checked short log; only an observed unborn HEAD has no history.
 
     static func repoDirtySummary(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         guard let cwd = gitResolveCwd(input, ctx, tool: "repo_dirty_summary") else {
@@ -424,7 +632,7 @@ extension FileSystemActions {
         let parsed = safeInt(input["log_limit"], default: 5)
         let logLimit = min((parsed == nil || parsed == 0) ? 5 : parsed!, 20)
 
-        // Status failure aborts; process-level log failures also abort the summary.
+        // Every failed status or history read aborts the summary.
         let statusRun = runGit(["status", "--short", "--branch"], cwd: cwd, timeout: 15,
                                label: "git status", context: ctx)
         switch statusRun {
@@ -432,7 +640,7 @@ extension FileSystemActions {
         case .success(let status):
             let logRun = runGit(["log", "-n\(logLimit)", "--format=%h|%s"], cwd: cwd, timeout: 15,
                                 label: "git log", context: ctx)
-            if case .failure(let lf) = logRun, isProcessLevelFailure(logRun) { return lf }
+            if case .failure(let lf) = logRun { return lf }
 
             var commits: [JSONValue] = []
             if case .success(let log) = logRun {
@@ -446,6 +654,7 @@ extension FileSystemActions {
             }
             var fields = gitStatusFields(status.stdout)
             fields["commits"] = .array(commits)
+            if case .success(let log) = logRun { fields["history_state"] = .string(log.historyState ?? "committed") }
             fields["cwd"] = .string(cwd.path)
             return .object(fields)
         }
@@ -458,7 +667,11 @@ extension FileSystemActions {
         case success(GitResult)
         case failure(JSONValue)
     }
-    package struct GitResult: Sendable { package let stdout: String; let status: Int32 }
+    package struct GitResult: Sendable {
+        package let stdout: String
+        let status: Int32
+        var historyState: String? = nil
+    }
 
     /// Resolve cwd (or repo_root) against allowed roots; nil means gitCwdBlocked.
     static func gitResolveCwd(_ input: [String: JSONValue], _ ctx: ConnectorActionContext, tool: String) -> URL? {
@@ -493,42 +706,12 @@ extension FileSystemActions {
         "PATH": gitSanitizedSearchPath,
     ]
 
-    /// The ONLY PATH a read-tier git child sees, and the only directories
-    /// `gitExecutablePath` will resolve the binary from.
+    /// The ONLY PATH a read-tier git child sees for Git's own helpers.
     static let gitSanitizedSearchPath = "/usr/bin:/bin:/usr/sbin:/sbin"
 
-    /// Resolve Git from a fixed path or the developer toolchain, never inherited PATH.
+    /// The supported Git executable is the system's developer-tools entry point.
     static func gitExecutablePath() -> String? {
-        if FileManager.default.isExecutableFile(atPath: "/usr/bin/git") {
-            return "/usr/bin/git"
-        }
-        let xcrun = "/usr/bin/xcrun"
-        guard FileManager.default.isExecutableFile(atPath: xcrun) else { return nil }
-        // Give xcrun PATH alone and admit only developer-tools locations.
-        let run = runProcess(
-            xcrun, ["--find", "git"], timeout: 10,
-            environment: ["PATH": gitSanitizedSearchPath]
-        )
-        guard run.launched, !run.timedOut, run.status == 0 else { return nil }
-        let found = run.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isDeveloperToolchainPath(found),
-              FileManager.default.isExecutableFile(atPath: found) else { return nil }
-        return found
-    }
-
-    /// The only locations a toolchain binary may be taken from: Xcode's own
-    /// bundle in /Applications, or the developer-tools tree (which is where
-    /// the Command Line Tools install and every `xcode-select` root live).
-    /// Both are root-owned; anywhere else is a path a user or an inherited
-    /// environment could have arranged.
-    static func isDeveloperToolchainPath(_ path: String) -> Bool {
-        guard path.hasPrefix("/") else { return false }
-        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
-        if standardized.hasPrefix("/Library/Developer/") { return true }
-        let parts = standardized.split(separator: "/", omittingEmptySubsequences: true)
-        guard parts.count > 2, parts[0] == "Applications" else { return false }
-        let bundle = String(parts[1])
-        return bundle.hasPrefix("Xcode") && bundle.hasSuffix(".app")
+        FileManager.default.isExecutableFile(atPath: "/usr/bin/git") ? "/usr/bin/git" : nil
     }
 
     /// Environment variables that name a command for git to execute. Removed
@@ -635,7 +818,7 @@ extension FileSystemActions {
         captureByteLimit: Int? = nil
     ) -> GitRun {
         guard let git = gitExecutablePath() else {
-            return .failure(errResult("git not found", code: "git_unavailable"))
+            return .failure(errResult("/usr/bin/git is unavailable. Install or repair Apple's Command Line Tools (xcode-select --install), then request this read again.", code: "git_unavailable"))
         }
         let directoryFD: Int32
         do { directoryFD = try VerifiedPath.open(cwd, flags: O_RDONLY | O_DIRECTORY) }
@@ -647,38 +830,43 @@ extension FileSystemActions {
         guard FileManager.default.isExecutableFile(atPath: sandbox) else {
             return .failure(errResult("Git read-only protection is unavailable.", code: "git_unavailable"))
         }
-        let run = runProcess(sandbox, ["-p", gitReadOnlySandboxProfile(context), git] + gitReadOnlyConfigOverrideArgs + args,
-                             cwdDescriptor: directoryFD, timeout: timeout,
-                             environment: gitReadOnlyEnvironment, captureByteLimit: captureByteLimit)
-        if run.timedOut {
-            return .failure(errResult("\(label) timed out", code: "git_unavailable"))
+        func execute(_ arguments: [String], label: String, accepted: [Int32]) -> GitRun {
+            let run = runProcess(sandbox, ["-p", gitReadOnlySandboxProfile(context), git] + gitReadOnlyConfigOverrideArgs + arguments,
+                                 cwdDescriptor: directoryFD, timeout: timeout,
+                                 environment: gitReadOnlyEnvironment, captureByteLimit: captureByteLimit)
+            if run.timedOut { return .failure(errResult("\(label) timed out", code: "git_unavailable")) }
+            if !run.launched {
+                return .failure(errResult("Git could not be started with read-only access: \(run.stderr)", code: "git_unavailable"))
+            }
+            if run.stdoutTruncated || run.stderrTruncated || run.captureReadFailed {
+                return .failure(errResult("\(label) output is incomplete: \(run.stderr)", code: "git_unavailable"))
+            }
+            if !accepted.contains(run.status) {
+                let err = (run.stderr.isEmpty ? run.stdout : run.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
+                return .failure(errResult(err.isEmpty ? "\(label) exited \(run.status)" : err, code: "git_unavailable"))
+            }
+            return .success(GitResult(stdout: run.stdout, status: run.status))
         }
-        if !run.launched {
-            return .failure(errResult("Git could not be started with read-only access.", code: "git_unavailable"))
+        if args.first == "log" {
+            // Git's porcelain-v2 branch header explicitly names an unborn HEAD.
+            // A failed log, missing output or a broken ref is never that evidence.
+            let head = execute(["status", "--porcelain=v2", "--branch", "--untracked-files=no"],
+                label: "git history state", accepted: [0])
+            switch head {
+            case .failure(let failure): return .failure(failure)
+            case .success(let result):
+                let headers = result.stdout.split(separator: "\n").filter { $0.hasPrefix("# branch.oid ") }
+                guard headers.count == 1 else {
+                    return .failure(errResult("Git did not report its history state; repair the repository's HEAD before reading history.", code: "git_unavailable"))
+                }
+                if headers[0] == "# branch.oid (initial)" {
+                    return .success(GitResult(stdout: "", status: 0, historyState: "unborn"))
+                }
+            }
         }
-        if run.stdoutTruncated || run.stderrTruncated || run.captureReadFailed {
-            return .failure(errResult("\(label) output is incomplete", code: "git_unavailable"))
-        }
-        if !okStatuses.contains(run.status) {
-            let err = (run.stderr.isEmpty ? run.stdout : run.stderr)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let msg = err.isEmpty ? "\(label) exited \(run.status)" : err
-            return .failure(errResult(msg, code: "git_unavailable"))
-        }
-        return .success(GitResult(stdout: run.stdout, status: run.status))
+        return execute(args, label: label, accepted: okStatuses)
     }
 
-    /// Missing, timed-out or incomplete reads abort the repository summary.
-    static func isProcessLevelFailure(_ run: GitRun) -> Bool {
-        guard case .failure(let v) = run, case .object(let o) = v else { return false }
-        // Launch/protection failures and timeouts abort the whole summary.
-        if case .string(let msg)? = o["error"] {
-            return msg == "git not found" || msg.hasSuffix("timed out") || msg.hasSuffix("output is incomplete")
-                || msg == "Git read-only protection is unavailable."
-                || msg == "Git could not be started with read-only access."
-        }
-        return false
-    }
 }
 
 /// Universal newlines, without a trailing empty element for the final newline.

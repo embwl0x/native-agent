@@ -11,10 +11,9 @@ public protocol NativeOAuthPlatformPort: Sendable {
 
 public extension NativeOAuthPlatformPort {
     @MainActor
-    static func makeLoopbackSession(preferredPort: UInt16, path: String, displayName: String, allowsPortFallback: Bool) throws -> NativeOAuthLoopbackCallbackServer {
+    static func makeLoopbackSession(preferredPort: UInt16, path: String, displayName: String) throws -> NativeOAuthLoopbackCallbackServer {
         try NativeOAuthLoopbackCallbackServer(
-            preferredPort: preferredPort, path: path, displayName: displayName,
-            allowsPortFallback: allowsPortFallback
+            preferredPort: preferredPort, path: path, displayName: displayName
         )
     }
 

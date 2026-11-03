@@ -6,8 +6,7 @@ import ProviderRouting
 import CloudKit
 // Blueprint: | `EngineRouteError.swift` | Engine route failures and shared UserFacingError interpretation; POSIX error codes compare at NSError's full integer width |
 #endif
-// Local errors for Swift-native app routes. Retired-route callers either use a
-// native implementation or throw an explicit notImplemented envelope.
+// Remaining approval-transaction caller owns retirement of this error type.
 public enum DaemonError: Error, LocalizedError, Sendable {
     case notFound(String)
 

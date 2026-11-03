@@ -11,7 +11,7 @@ extension VoiceInputCapture {
         VoiceInputCapture(
             recognitionContext: { [AgentVoice.live.name] },
             requestSpeechAuthorization: {
-                NSApp.activate(ignoringOtherApps: true)
+                NSApp.activate()
                 return await SystemPermissionPreflight.awaitSpeechAuthorization()
             },
             failureMessage: { UserFacingError.message($0, action: $1) }

@@ -4,7 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
 import os
-// Blueprint: | `LLMProviderStatusFeed.swift` | live provider status feed; byte-checked receipt decode reuse, verdict age checked at use |
+// Blueprint: | `LLMProviderStatusFeed.swift` | live provider status feed; checked receipt writes preserve unreadable rows, byte-checked decode reuse, exact credential binding and verdict age checked at use |
 
 /// The durable, last-observed result of a user-initiated native provider
 /// reachability check. This is intentionally a single bounded record rather
@@ -37,7 +37,6 @@ public enum LLMProviderStatusFeed {
         // Readiness preserves the saved spelling and unbounded failure detail.
         var savedStatus: String? = nil
         var savedDetail: String? = nil
-        var savedCausePresent = false
     }
 
     public enum Reading: Sendable, Equatable {
@@ -98,10 +97,16 @@ public enum LLMProviderStatusFeed {
     /// A short hash of the credential a test ran against (a sign-in's access
     /// token, else the saved key), so only a new credential clears that test's
     /// failure, never another save of the account's file.
-    public static func credentialFingerprint(providerID: String, dataRoot: URL) -> String? {
-        guard let key = SwiftNativeProviderRouting.signedInAccessToken(providerID: providerID, dataRoot: dataRoot)
-                ?? LLMCredentialResolver.resolveAPIKey(providerConfigFile: "\(providerID).json", dataRoot: dataRoot),
-              !key.isEmpty else { return nil }
+    public static func credentialFingerprint(providerID: String, dataRoot: URL) throws -> String? {
+        let key: String?
+        switch SwiftNativeProviderRouting.connectionProbe(providerID, authMode: nil) {
+        case .oauth:
+            key = try SwiftNativeProviderRouting.signedInAccessToken(providerID: providerID, dataRoot: dataRoot)
+        case .apiKey:
+            key = try LLMCredentialResolver.checkedAPIKey(providerConfigFile: "\(providerID).json", dataRoot: dataRoot)
+        case .unsupported: return nil
+        }
+        guard let key, !key.isEmpty else { return nil }
         return fingerprint(key)
     }
 
@@ -114,7 +119,6 @@ public enum LLMProviderStatusFeed {
     /// is reused by exact bytes; verdict age is evaluated at each use.
     public struct Receipts: Sendable {
         let rows: [String: Reading]
-        var legacy: [String: Reading] = [:]
         var diagnostic: Reading? = nil
         /// Why the file could not be read; nil when it was read or is absent.
         public let unreadable: String?
@@ -129,14 +133,18 @@ public enum LLMProviderStatusFeed {
         /// What this provider's last check found for exactly `key`. A row
         /// that kept no key hash, or hashed another key, proves nothing here.
         public func verdict(providerID: String, key: String) -> Verdict {
+            if case .failed(let why)? = rows[providerID] { return .failed(why) }
             guard case .current(let record)? = rows[providerID], record.tested,
                   record.credential == fingerprint(key) else { return .unchecked }
+            guard record.checkedAt.timeIntervalSinceNow <= allowedClockSkew else {
+                return .failed("Provider check timestamp is too far in the future.")
+            }
             switch record.savedStatus {
             case "ok"?:
                 return Date().timeIntervalSince(record.checkedAt) > staleAfter ? .unchecked : .proven(record.checkedAt)
             case "error"?:
                 let cause = record.cause.flatMap(ProviderFailure.decoded)
-                if cause == .authExpired || (!record.savedCausePresent && record.savedDetail == keyRejected) { return .rejected }
+                if cause == .authExpired { return .rejected }
                 return .failed(record.savedDetail ?? "the check failed")
             default: return .unchecked
             }
@@ -149,43 +157,76 @@ public enum LLMProviderStatusFeed {
 
     public static func receipts(dataRoot: URL) -> Receipts {
         let url = path(in: dataRoot)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            return Receipts(rows: [:], diagnostic: .unavailable("Provider status has not been written yet."), unreadable: nil)
-        }
-        guard let data = try? Data(contentsOf: url) else {
-            return Receipts(rows: [:], diagnostic: .failed("Provider status file \(url.path) could not be read."), unreadable: "\(url.path) could not be read")
+        let data: Data
+        do {
+            guard let present = try ProviderStateValidation.dataIfPresent(at: url) else {
+                return Receipts(rows: [:], diagnostic: .unavailable("Provider status has not been written yet."), unreadable: nil)
+            }
+            data = present
+        } catch {
+            let why = "Provider status file \(url.path): \(error.localizedDescription)"
+            return Receipts(rows: [:], diagnostic: .failed(why), unreadable: why)
         }
         return receiptGeneration.withLock { generation in
             if let generation, generation.path == url, generation.bytes == data { return generation.receipts }
-            guard case .object(let file)? = try? JSONValue.parse(data) else {
-                return Receipts(rows: [:], diagnostic: .failed("Provider status file \(url.path) is not valid JSON."), unreadable: "\(url.path) could not be read")
-            }
-            func decode(_ row: [String: JSONValue]) -> Reading {
-                let strings = row.compactMapValues { if case .string(let value) = $0 { value } else { nil as String? } }
-                guard let raw = strings["status"],
-                      let status = Status(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
-                    return .failed("Provider status file \(url.path) has an unknown or missing status.")
+            do {
+                let envelope = try envelope(data, at: url)
+                var rows: [String: Reading] = [:]
+                for (id, value) in envelope {
+                    do { rows[id] = .current(try decode(value, at: url, providerID: id)) }
+                    catch { rows[id] = .failed(error.localizedDescription) }
                 }
-                guard let checked = strings["checkedAt"], let date = NativeTimestampFormat.parseISO8601FractionalFirst(checked) else {
-                    return .failed("Provider status file \(url.path) has no valid check timestamp.")
-                }
-                return .current(Record(status: status, checkedAt: date,
-                    detail: bounded(strings["detail"], maximum: 240) ?? "Provider check produced no detail.",
-                    providerID: bounded(strings["providerId"], maximum: 120),
-                    model: bounded(strings["model"], maximum: 160), tested: row["tested"] == .bool(true),
-                    cause: strings["cause"], credential: strings["credential"],
-                    savedStatus: raw, savedDetail: strings["detail"], savedCausePresent: row["cause"] != nil))
+                let receipts = Receipts(rows: rows, unreadable: nil)
+                generation = (url, data, receipts)
+                return receipts
+            } catch {
+                let why = error.localizedDescription
+                return Receipts(rows: [:], diagnostic: .failed(why), unreadable: why)
             }
-            var rows: [String: Reading] = [:]
-            if case .object(let byProvider)? = file["byProvider"] {
-                for (id, value) in byProvider { if case .object(let row) = value { rows[id] = decode(row) } }
-            }
-            let legacy: [String: Reading]
-            if case .string(let id)? = file["providerId"], rows[id] == nil { legacy = [id: decode(file)] } else { legacy = [:] }
-            let receipts = Receipts(rows: rows, legacy: legacy, unreadable: nil)
-            generation = (url, data, receipts)
-            return receipts
         }
+    }
+
+    /// Validate the shared channel only. Each provider owns its row's damage;
+    /// the latest-check copy must not gate reads or writes of sibling rows.
+    private static func envelope(_ data: Data, at url: URL) throws -> [String: JSONValue] {
+        guard case .object(let file) = try JSONValue.parse(data),
+              file["schema"] == .string("llm.provider_status.v2"),
+              case .object(let rows)? = file["byProvider"] else {
+            throw invalid(url, "requires schema llm.provider_status.v2 and a byProvider object")
+        }
+        return rows
+    }
+
+    private static func invalid(_ url: URL, _ why: String) -> ProviderRoutingError {
+        .underlying("Provider status at \(url.path) \(why); repair the saved checks before replacing them.")
+    }
+
+    private static func decode(_ value: JSONValue, at url: URL, providerID: String? = nil) throws -> Record {
+        let location = providerID.map { "row \($0)" } ?? "latest check"
+        guard case .object(let row) = value,
+              case .string(let raw)? = row["status"], let status = Status(rawValue: raw),
+              case .string(let checked)? = row["checkedAt"],
+              let date = NativeTimestampFormat.parseISO8601FractionalFirst(checked),
+              case .string(let detail)? = row["detail"], !detail.isEmpty,
+              case .bool(let tested)? = row["tested"] else {
+            throw invalid(url, "has an invalid \(location) (status, checkedAt, detail or tested)")
+        }
+        func optionalString(_ key: String, nullable: Bool = false) throws -> String? {
+            guard let value = row[key] else { return nil }
+            if nullable && value == .null { return nil }
+            guard case .string(let text) = value, !text.isEmpty else {
+                throw invalid(url, "has an invalid \(location).\(key)")
+            }
+            return text
+        }
+        let id = try optionalString("providerId", nullable: true)
+        if let providerID, providerID.isEmpty || id != providerID {
+            throw invalid(url, "has a mismatched \(location).providerId")
+        }
+        return Record(status: status, checkedAt: date, detail: String(detail.prefix(240)),
+            providerID: id, model: try optionalString("model", nullable: true), tested: tested,
+            cause: try optionalString("cause"), credential: try optionalString("credential"),
+            savedStatus: raw, savedDetail: detail)
     }
 
     public static func write(_ record: Record, to url: URL, credential: String? = nil) async throws {
@@ -204,38 +245,34 @@ public enum LLMProviderStatusFeed {
             // Each provider's own last check too, so a failed one stays on its
             // row after another provider is checked.
             var byProvider: [String: JSONValue] = [:]
-            if case .object(let previous)? = (try? Data(contentsOf: url)).flatMap({ try? JSONValue.parse($0) }),
-               case .object(let rows)? = previous["byProvider"] {
-                byProvider = rows
+            if let data = try ProviderStateValidation.dataIfPresent(at: url) {
+                byProvider = try envelope(data, at: url)
             }
-            if let id = record.providerID { byProvider[id] = .object(object.filter { $0.key != "schema" }) }
+            let row = JSONValue.object(object.filter { $0.key != "schema" })
+            _ = try decode(row, at: url, providerID: record.providerID)
+            if let id = record.providerID { byProvider[id] = row }
             object["byProvider"] = .object(byProvider)
             try await SwiftNativePersistenceCore.writeJSON(.object(object), to: url)
         }
-    }
-
-    private static func credentialMatches(providerID: String, tested: String?, checkedAt: Date, dataRoot: URL) -> Bool {
-        if let tested { return credentialFingerprint(providerID: providerID, dataRoot: dataRoot) == tested }
-        // A row from before the key's hash was kept: a save after it is a new key.
-        let credential = dataRoot.appendingPathComponent("providers", isDirectory: true)
-            .appendingPathComponent("\(providerID).json")
-        if let saved = (try? FileManager.default.attributesOfItem(atPath: credential.path))?[.modificationDate] as? Date,
-           saved > checkedAt {
-            return false
-        }
-        return true
     }
 
     public static func read(providerID: String, dataRoot: URL, now: Date = Date()) -> Reading {
         let url = path(in: dataRoot)
         let saved = receipts(dataRoot: dataRoot)
         if let diagnostic = saved.diagnostic { return diagnostic }
-        guard let own = saved.rows[providerID] ?? saved.legacy[providerID] else {
+        guard let own = saved.rows[providerID] else {
             return .unavailable("The active provider has no saved connection check.")
         }
         guard case .current(let record) = own else { return own }
-        guard credentialMatches(providerID: providerID, tested: record.credential, checkedAt: record.checkedAt, dataRoot: dataRoot) else {
-            return .unavailable("The active provider's credential changed after its connection check.")
+        guard let tested = record.credential else {
+            return .unavailable("The active provider has no credential-bound connection check.")
+        }
+        do {
+            guard try credentialFingerprint(providerID: providerID, dataRoot: dataRoot) == tested else {
+                return .unavailable("The active provider's credential changed after its connection check.")
+            }
+        } catch {
+            return .failed(ProviderFailure.diagnosticDescription(error))
         }
         if record.checkedAt.timeIntervalSince(now) > allowedClockSkew {
             return .failed("Provider status file \(url.path) has a check timestamp too far in the future.")

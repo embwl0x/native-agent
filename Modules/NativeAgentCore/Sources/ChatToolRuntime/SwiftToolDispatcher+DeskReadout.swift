@@ -18,18 +18,16 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
-// Blueprint: | `SwiftToolDispatcher+DeskReadout.swift` | `SwiftToolDispatcher`: live and archive Desk reading through the existing store; canonical row paging retains all fields independent of sort and carries archive continuations |
+// Blueprint: | `SwiftToolDispatcher+DeskReadout.swift` | `SwiftToolDispatcher`: live and archive Desk reading through the existing store; canonical row paging retains all fields independent of sort and carries archive continuations; query reaches a queued step by its words |
 
 extension SwiftToolDispatcher {
     /// Page the live Desk or search by handle/alias/text, optionally including archived records.
     func impl_desk_read(input: [String: JSONValue]) async throws -> JSONValue {
+        try ToolArguments.requireDeclaredKeys(input, descriptor: BuiltInToolSchemaFactory(requestedNames: ["desk_read"]).deskSchemas().compactMap { $0 }.first)
         let store = deskStore()
         let state = try await store.liveState()
         // MY QUEUE is on her home and remains reachable by handle or query.
-        guard input["handle"] == nil || input["id"] == nil || input["handle"] == input["id"] else {
-            throw ToolFailureError("handle and id must agree.", argumentPath: "$.id", effects: .none, code: "invalid_input")
-        }
-        for key in ["handle", "id", "query", "sort", "updated_on"] where input[key] != nil {
+        for key in ["handle", "query", "sort", "updated_on"] where input[key] != nil {
             guard case .string? = input[key] else {
                 throw ToolFailureError("\(key) must be a string.", argumentPath: "$.\(key)", effects: .none, code: "invalid_input")
             }
@@ -42,7 +40,7 @@ extension SwiftToolDispatcher {
         if let sort = optionalString(input, "sort"), !["stale", "recent"].contains(sort) {
             throw ToolFailureError("sort must be recent or stale.", argumentPath: "$.sort", effects: .none, code: "invalid_input")
         }
-        let handle = (optionalString(input, "handle") ?? optionalString(input, "id"))?
+        let handle = optionalString(input, "handle")?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if handle == "" {
             throw ToolFailureError("handle must not be empty.", argumentPath: "$.handle", effects: .none, code: "invalid_input")
@@ -88,7 +86,8 @@ extension SwiftToolDispatcher {
             rawMatches = exact.filter { matchesDate($0.updatedAt) }
         } else if query?.isEmpty == false || day != nil {
             rawMatches = state.items.filter { item in
-                matchesDate(item.updatedAt) && matchesText([item.alias, item.handle, item.project, item.title, item.summary ?? ""])
+                matchesDate(item.updatedAt) && matchesText([item.alias, item.handle, item.project, item.title, item.summary ?? ""]
+                    + (item.step.map { [$0.words, $0.source ?? ""] } ?? []))
             }
         } else {
             rawMatches = []
@@ -124,7 +123,6 @@ extension SwiftToolDispatcher {
                 if let handle, !handle.isEmpty { args["handle"] = .string(handle) }
                 if let query, !query.isEmpty { args["query"] = .string(query) }
                 args["updated_on"] = input["updated_on"]
-                if input["structured"] == .bool(true) { args["structured"] = .bool(true) }
                 nextArchiveRead = .object(["tool": .string("app"), "input": .object([
                     "action": .string("desk.read"), "args": .object(args)])])
             }

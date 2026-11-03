@@ -37,9 +37,9 @@ extension NativeAgentEngine {
                         NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
                     }
                 },
-                botEventIntake: { channelId, text, userId in
-                    await BotEventIntake.slackMessage(channelId: channelId, text: text,
-                                                     userId: userId, dataRoot: dataRoot,
+                botEventIntake: { channelId, text, userId, eventId in
+                    try await BotEventIntake.slackMessage(channelId: channelId, text: text,
+                                                     userId: userId, eventId: eventId, dataRoot: dataRoot,
                                                      isAutonomyEnabled: {
                         await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot)
                     })
@@ -125,10 +125,9 @@ extension NativeAgentEngine {
                 })
             ),
             compactionHandler: { sessionId in
-                let model = await providerRouting.modelStringForSurface("compaction") ?? ""
                 let outcome = try await client.compactSession(
                     sessionId: sessionId,
-                    model: model,
+                    model: "",
                     surface: "telegram",
                     force: true
                 )

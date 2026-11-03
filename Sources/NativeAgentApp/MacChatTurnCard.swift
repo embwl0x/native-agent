@@ -410,7 +410,6 @@ struct MacChatTurnCardMetaText: View {
 struct MacChatTurnThinkingTitle: View {
     let since: Date
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var sweep = false
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.xs) {
@@ -418,20 +417,21 @@ struct MacChatTurnThinkingTitle: View {
                 .foregroundStyle(NativeAgentShell.secondary)
                 .overlay {
                     if !reduceMotion {
-                        GeometryReader { geometry in
-                            let band = max(24, geometry.size.width * 0.6)
-                            LinearGradient(
-                                colors: [.clear, NativeAgentShell.text, .clear],
-                                startPoint: .leading, endPoint: .trailing
-                            )
-                            .frame(width: band)
-                            .offset(x: sweep ? geometry.size.width : -band)
+                        // Drawn from the clock: SwiftUI's repeatForever trapped in layout (10-31 crash).
+                        TimelineView(.animation(minimumInterval: 1.0 / 30)) { context in
+                            GeometryReader { geometry in
+                                let band = max(24, geometry.size.width * 0.6)
+                                let phase = NativeAgentMotion.loopPhase(at: context.date, period: 2)
+                                LinearGradient(
+                                    colors: [.clear, NativeAgentShell.text, .clear],
+                                    startPoint: .leading, endPoint: .trailing
+                                )
+                                .frame(width: band)
+                                .offset(x: -band + phase * (geometry.size.width + band))
+                            }
                         }
                         .mask { Text("Thinking\u{2026}") }
                     }
-                }
-                .onAppear {
-                    withAnimation(.linear(duration: 2).repeatForever(autoreverses: false)) { sweep = true }
                 }
             Text(timerInterval: since...Date.distantFuture, countsDown: false)
                 .foregroundStyle(NativeAgentShell.secondary)

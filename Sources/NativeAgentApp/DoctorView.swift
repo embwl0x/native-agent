@@ -21,7 +21,7 @@ import CoreSpotlight
 import CloudKit
 #endif
 
-// Blueprint: | `DoctorView.swift` | `DoctorView`: measured report rows/footer, run/repair/support actions and explicit action failure presentation |
+// Blueprint: | `DoctorView.swift` | `DoctorView`: measured report rows/footer and latest-run availability headline, run/repair/support actions and explicit action failure presentation |
 
 /// The bottom-of-report summary is a receipt view: it describes the checks we
 /// have and when their full Doctor pass completed. It intentionally derives
@@ -461,15 +461,16 @@ struct DoctorView: View {
         ) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline) {
-                    InlineStatusDot(status: checkSummary.statusText)
-                    Text(DoctorPlainCopy.headline(for: checkSummary))
+                    InlineStatusDot(status: appModel.engine.doctor.reportAvailabilityIssue == nil ? checkSummary.statusText : "unknown")
+                    Text(appModel.engine.doctor.reportAvailabilityIssue == nil
+                        ? DoctorPlainCopy.headline(for: checkSummary) : "Current health checks are unavailable.")
                         .font(NativeAgentFont.section)
                     Spacer()
                     if let diagnostics = appModel.supportDiagnostics {
                         StatusBadge(text: "Support \(diagnostics.version)", status: diagnostics.doctorStatus)
                     }
                 }
-                Text(DoctorPlainCopy.detail(for: checkSummary))
+                Text(appModel.engine.doctor.reportAvailabilityIssue ?? DoctorPlainCopy.detail(for: checkSummary))
                     .font(NativeAgentFont.body)
                     .foregroundStyle(.secondary)
                 if let report = appModel.engine.doctor.report {

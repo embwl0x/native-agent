@@ -4,7 +4,7 @@ import Observation
 import NativeAgentShared
 import PersistenceCore
 import PersonaEngine
-// Blueprint: | `EnginePersona.swift` | PersonaFacade owns profile/documents and retained read availability for Mac, editors and DeviceSync over unchanged PersonaEngine content readers/writers. LatestRead orders reads/failures, committed profile/name/document saves use write; chat/settlement scaffolding keeps its existing effect without discarded diagnostic compilation. |
+// Blueprint: | `EnginePersona.swift` | PersonaFacade owns checked identity display (blank until available, errors separate), profile/documents and retained read availability for Mac, editors and DeviceSync over PersonaEngine content readers/writers. LatestRead orders reads/failures, committed profile/name/document saves use write; chat/settlement reads retain their own document failure independently of committed reply/save effects. |
 
 /// The saved profile and editable documents for this root. Mac presentation
 /// and phone publication share these reads; PersonaEngine owns their content.
@@ -18,6 +18,12 @@ public final class PersonaFacade {
     public private(set) var documents: [PersonaDocSpec] = []
     public private(set) var profileError: String?
     public private(set) var documentsError: String?
+    /// No identity label until a checked profile is available. The error has
+    /// its own field; it must never become a person's or agent's name.
+    public var displayName: String {
+        guard profileError == nil, let profile else { return "" }
+        return NativeAgentIdentity.displayName(profile.name)
+    }
     @ObservationIgnored private let profileRead = LatestRead()
     @ObservationIgnored private let documentsRead = LatestRead()
 
@@ -55,13 +61,6 @@ public final class PersonaFacade {
         return try result.get()
     }
 
-    /// Chat arrival and turn settlement retain their existing scaffold effect;
-    /// no diagnostic packet is compiled and discarded for that effect.
-    @discardableResult
-    public nonisolated func prepareDocuments() async throws -> [String] {
-        try await owner.scaffoldMissingDocs()
-    }
-
     public func saveProfile(_ value: PersonalityProfile) async throws {
         let saved = try await owner.savePersonality(value).sharedProfile
         profileRead.write { profile = saved; profileError = nil }
@@ -84,7 +83,7 @@ public final class PersonaFacade {
                 documents.append(saved)
             }
         }
-        _ = try? await prepareDocuments()
+        _ = try? await loadDocuments()
         return saved
     }
 }

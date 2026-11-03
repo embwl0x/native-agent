@@ -5,7 +5,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `Browser.swift` | Browser status delegates run decoding to the operation owner and retains its existing malformed-feed error; operation/capture paths and status projection; WebKit owns website data, with no advertised data-root profile |
+// Blueprint: | `Browser.swift` | Browser status reads owner recovery and named damaged runs alongside valid siblings; operation/capture paths; WebKit owns website data, with no advertised data-root profile |
 
 public struct SwiftNativeBrowserClient: Sendable {
     /// Absolute path to `<dataRoot>/native_power/browser/runs.json`.
@@ -65,6 +65,8 @@ public struct SwiftNativeBrowserClient: Sendable {
         async let runsRead = Self.readCanonicalRuns(at: runsPath, malformed: PersistenceCoreError.ioFailure("The browser run feed is malformed."))
         async let receiptsRead = SwiftNativePersistenceCore.tailJSONLReadReceipt(receiptsPath, limit: 20, maxBytes: 1_048_576)
         let runs = try await runsRead
+        let recoveryIssue = self.recoveryIssue
+        let admissionIssues = runs.filter { $0.objectValue?["blocksNewEffects"] == .bool(true) }
 
         let activeRuns: [JSONValue] = runs.filter { run in
             guard case .object(let obj) = run, case .string(let s)? = obj["status"] else {
@@ -94,7 +96,10 @@ public struct SwiftNativeBrowserClient: Sendable {
 
         // createdAt timestamps this status response.
         return .object([
-            "status": .string("ready"),
+            "status": .string(recoveryIssue == nil && admissionIssues.isEmpty ? "ready" : "unavailable"),
+            "recoveryIssue": recoveryIssue.map(JSONValue.string) ?? .null,
+            "admissionIssues": .array(admissionIssues),
+            "unavailableRuns": .array(runs.filter { $0.objectValue?["status"] == .string("unavailable") }),
             "sourcePath": .string(sourcesDir.path),
             "screenshotPath": .string(screenshotsDir.path),
             "activeRuns": .array(activeRuns),

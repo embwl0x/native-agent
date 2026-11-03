@@ -152,8 +152,9 @@ public extension MacChatTurnPresentationPort {
         let requestTurnID = queuedTurnID ?? TurnTraceContext.mintTurnId()
         let continuation = fromQueue ? queuedContinuation
             : await captureMacWorkContinuation(text, taskReference: requestTurnID)
-        let envelope = continuation.map { TurnEnvelope.current(surface: "chat").withMacContinuation($0) }
-            ?? ChatToolSessionContext.envelope
+        // This is the native Mac send owner, so its local origin is explicit here.
+        let nativeOrigin = ChatToolSessionContext.envelope ?? TurnEnvelope(surface: "chat")
+        let envelope = continuation.map { nativeOrigin.withMacContinuation($0) } ?? nativeOrigin
         // Await Stop's flag write before the busy guards and this turn's flag-clear.
         await awaitPendingCancelFlagWrite(for: targetSessionId)
         let repairAvailable = await repairChatTurnLifecyclesIfNeeded(

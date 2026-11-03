@@ -1,4 +1,5 @@
 import AppToolRuntime
+import Foundation
 import SwiftUI
 import NativeAgentShared
 
@@ -19,7 +20,7 @@ enum NavigateMenuPresentation {
         var title: String { item.shellRailTitle }
     }
 
-    static func entries(_ layout: SurfaceLayout) -> [Entry] {
+    static func entries(_ layout: SurfaceLayoutAvailability) -> [Entry] {
         SidebarItem.rail(layout).compactMap { $0 }.enumerated().map { index, item in
             Entry(item: item, shortcut: index < 9 ? Character("\(index + 1)") : nil)
         }
@@ -51,9 +52,13 @@ extension SidebarItem {
     /// the rail's blocks by their page ids): a page, or nil for the line
     /// between its groups. The Navigate menu's digits and ⌘K's pages read its
     /// pages, so ⌘N is the Nth rail row.
-    static func rail(_ layout: SurfaceLayout) -> [SidebarItem?] {
-        layout.shown("rail", profile: SimpleViewMode.advanced).map { block in
-            QuietPages.all.first { $0.id == block.name && $0.tab == nil }?.item
+    static func rail(_ layout: SurfaceLayoutAvailability) -> [SidebarItem?] {
+        layout.contentNames("rail", profile: SimpleViewMode.advanced).filter { name in
+            // An unreadable document cannot override the person's Helpers switch.
+            layout.failure == nil || name != "bots"
+                || (UserDefaults.standard.object(forKey: "uiBotsShelfPreview") as? Bool) != false
+        }.map { name in
+            QuietPages.all.first { $0.id == name && $0.tab == nil }?.item
         }
     }
 }

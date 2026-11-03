@@ -53,9 +53,7 @@ extension BuiltInToolSchemaFactory {
                         ("provenance", ToolSchema.enumStringSchema(ContextMemoryProvenance.Kind.allCases.map(\.rawValue), "How you know this: verified (you checked it yourself), told (someone told you — also set provenance_by), inferred (you worked it out).")),
                         ("provenance_by", ToolSchema.strSchema("Who told you, when provenance=told. A name, e.g. \"Sam\".")),
                         ("source", ToolSchema.strSchema("Alias of provenance_by: who told you, when provenance=told. Prefer provenance_by if supplying both.")),
-                        // A string, never an enum: a strict provider would refuse any other
-                        // word. The vocabulary is offered; the save normalizes the rest.
-                        ("kind", ToolSchema.strSchema("What it is about, one of: " + MemoryKindStamp.writerKinds.joined(separator: ", ") + ". About the person: identity, location, employment, schedule (when they sleep, work, are free), preference (likes, rules for how you work for them), relationship. Correction is a standing correction. Omit when none fits; any other word is classified for you.")),
+                        ("kind", ToolSchema.enumStringSchema(MemoryKindStamp.commitKinds, "What it is about. Correction is a standing correction; instruction is an agreement. Omit when none fits. Unsupported supplied kinds are refused.")),
                         ("tags", stringArraySchema("Optional free-form tags.")),
                         ("confidence", numSchema("How confident this fact is true, 0..1. Default 0.8.")),
                         ("importance", numSchema("How important this fact is to retain, 0..1. Default 0.5.")),
@@ -68,7 +66,7 @@ extension BuiltInToolSchemaFactory {
                         // minItems of 1 would make that legal placeholder
                         // unsendable. The 1-8 floor is stated in prose and
                         // enforced by the validator instead.
-                        ("context_topics", stringArraySchema("Read for kind correction or preference, or with no kind; ignored for other kinds. Up to 8 explicit subject/scope phrases, each non-empty and at most 120 characters. Use only the agreement's stated scope, including the named program when it is program-specific. A save returns existing agreements with that same declared scope for your judgment; nothing is retired without explicit supersedes or corrects. Omit for global boundaries; never invent a scope to weaken them. This limits automatic injection, not explicit recall.", maxItems: 8, maxItemLength: 120)),
+                        ("context_topics", stringArraySchema("For correction, instruction, preference, note or an omitted kind. Up to 8 explicit subject/scope phrases, each non-empty and at most 120 characters. Every supplied entry is validated; invalid scope is refused. Use only the agreement's stated scope. A save returns existing agreements with that same scope; nothing is retired without explicit supersedes or corrects. Omit or use [] for global boundaries. This limits automatic injection, not explicit recall.", maxItems: MemoryCommitArguments.topicLimit, maxItemLength: MemoryCommitArguments.topicCharacterLimit)),
                     ],
                     required: ["text"]
                 )

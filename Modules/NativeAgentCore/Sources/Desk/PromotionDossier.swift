@@ -8,30 +8,33 @@ public struct DeskNote: Sendable, Equatable {
     public var ts: String
     public var text: String
     public var author: String?
+    /// Exact condition satisfied by a system release; ordinary notes have none.
+    public var releaseCondition: String?
 
-    var legacyFindingKey: String? {
-        let line = text.prefix { $0 != "\n" }
-        return line.hasPrefix("harness-key ") ? String(line.dropFirst("harness-key ".count)) : nil
-    }
-
-    public init(ts: String, text: String, author: String? = nil) {
+    public init(ts: String, text: String, author: String? = nil, releaseCondition: String? = nil) {
         self.ts = ts
-        // Normalize colon-delimited finding labels for display without rewriting stored ops.
-        self.text = text.hasPrefix("harness-key:") ? "harness-key " + text.dropFirst("harness-key:".count) : text
+        self.text = text
         self.author = author
+        self.releaseCondition = releaseCondition
     }
 
     public func toJSON() -> JSONValue {
         var fields: [String: JSONValue] = ["ts": .string(ts), "text": .string(text)]
         if let author { fields["author"] = .string(author) }
+        if let releaseCondition { fields["releaseCondition"] = .string(releaseCondition) }
         return .object(fields)
     }
 
     public static func fromJSON(_ value: JSONValue) -> DeskNote? {
         guard case .object(let obj) = value,
               let ts = obj["ts"]?.stringValue,
-              let text = obj["text"]?.stringValue else { return nil }
-        return DeskNote(ts: ts, text: text, author: obj["author"]?.stringValue)
+              DeskClock.parseISO(ts) != nil,
+              let text = obj["text"]?.stringValue,
+              DeskJSON.optionalStringsAreValid(obj, keys: ["author", "releaseCondition"]) else { return nil }
+        if let condition = obj["releaseCondition"]?.stringValue {
+            guard obj["author"] == .string("system"), MyQueue.When(condition) != nil else { return nil }
+        }
+        return DeskNote(ts: ts, text: text, author: obj["author"]?.stringValue, releaseCondition: obj["releaseCondition"]?.stringValue)
     }
 }
 
@@ -42,9 +45,7 @@ public struct DeskNote: Sendable, Equatable {
 /// One typed evidence citation. `traceFriction` is the ONLY friction source and never qualifies a pursuit by itself (source-mix rule).
 public enum DossierSource: Sendable, Equatable {
     case care(id: String)
-    case standingView(id: String)
     case dreamDigest(id: String)
-    case openQuestionSeed(id: String)
     case feltSalience(dates: [String])
     case chatObservation(noteIds: [String], distinctDays: Int)
     case traceFriction(count: Int, window: String)
@@ -53,9 +54,7 @@ public enum DossierSource: Sendable, Equatable {
     public var token: String {
         switch self {
         case .care: return "care"
-        case .standingView: return "standing_view"
         case .dreamDigest: return "dream_digest"
-        case .openQuestionSeed: return "open_question_seed"
         case .feltSalience: return "felt_salience"
         case .chatObservation: return "chat_observation"
         case .traceFriction: return "trace_friction"
@@ -68,15 +67,19 @@ public enum DossierSource: Sendable, Equatable {
     /// Structural validity of THIS citation in isolation. Returns a human reason on failure (ids non-empty, dates parseable + recurrent, counts positive).
     public func structuralError() -> String? {
         switch self {
-        case .care(let id), .standingView(let id), .dreamDigest(let id), .openQuestionSeed(let id):
+        case .care(let id), .dreamDigest(let id):
             return id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "\(token): id is empty" : nil
         case .feltSalience(let dates):
             let clean = dates.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            guard clean.count == dates.count else { return "felt_salience: an entry is empty" }
             guard clean.allSatisfy({ DeskClock.isParseableDate($0) }) else { return "felt_salience: an entry is not a parseable date (yyyy-MM-dd)" }
             // Normalize dates so timestamps on one calendar day count as one day.
             return Set(clean.compactMap { DeskClock.normalizedDay($0) }).count >= 2 ? nil : "felt_salience: needs ≥2 distinct calendar days"
         case .chatObservation(let noteIds, let distinctDays):
+            guard noteIds.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+                return "chat_observation: a note id is empty"
+            }
             let clean = Set(noteIds.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
             guard !clean.isEmpty else { return "chat_observation: noteIds is empty" }
             // Claimed distinct days cannot exceed distinct cited notes.
@@ -88,6 +91,7 @@ public enum DossierSource: Sendable, Equatable {
             guard !w.isEmpty else { return "trace_friction: window is empty" }
             // Duration syntax is unsigned digits followed by a unit.
             let ok = w.range(of: #"^[0-9]+[smhdw]$"#, options: .regularExpression) != nil
+                && Int(w.dropLast()).map { $0 > 0 } == true
             return ok ? nil : "trace_friction: window must be a positive duration (e.g. 7d, 24h)"
         }
     }
@@ -96,11 +100,7 @@ public enum DossierSource: Sendable, Equatable {
         switch self {
         case .care(let id):
             return .object(["source": .string(token), "id": .string(id)])
-        case .standingView(let id):
-            return .object(["source": .string(token), "id": .string(id)])
         case .dreamDigest(let id):
-            return .object(["source": .string(token), "id": .string(id)])
-        case .openQuestionSeed(let id):
             return .object(["source": .string(token), "id": .string(id)])
         case .feltSalience(let dates):
             return .object(["source": .string(token), "dates": .array(dates.map { .string($0) })])
@@ -115,32 +115,32 @@ public enum DossierSource: Sendable, Equatable {
         }
     }
 
-    /// Tolerant decode — an unknown `source` token → nil (skipped by the caller, exactly like DeskRef). A dropped citation can only WEAKEN a dossier, never strengthen it, so tolerance can't launder evidence.
+    /// Every citation retains its current source and complete evidence.
     public static func fromJSON(_ value: JSONValue) -> DossierSource? {
         guard case .object(let obj) = value, let token = obj["source"]?.stringValue else { return nil }
+        let citation: DossierSource
         switch token {
         case "care":
             guard let id = obj["id"]?.stringValue else { return nil }
-            return .care(id: id)
-        case "standing_view":
-            guard let id = obj["id"]?.stringValue else { return nil }
-            return .standingView(id: id)
+            citation = .care(id: id)
         case "dream_digest":
             guard let id = obj["id"]?.stringValue else { return nil }
-            return .dreamDigest(id: id)
-        case "open_question_seed":
-            guard let id = obj["id"]?.stringValue else { return nil }
-            return .openQuestionSeed(id: id)
+            citation = .dreamDigest(id: id)
         case "felt_salience":
-            return .feltSalience(dates: (obj["dates"]?.arrayValue?.compactMap(\.stringValue) ?? []))
+            guard let dates = DeskJSON.strings(obj["dates"], defaultWhenAbsent: false) else { return nil }
+            citation = .feltSalience(dates: dates)
         case "chat_observation":
-            return .chatObservation(noteIds: (obj["noteIds"]?.arrayValue?.compactMap(\.stringValue) ?? []), distinctDays: jsonInt(obj, "distinctDays") ?? 0)
+            guard let noteIds = DeskJSON.strings(obj["noteIds"], defaultWhenAbsent: false),
+                  case .int(let raw)? = obj["distinctDays"], let days = Int(exactly: raw) else { return nil }
+            citation = .chatObservation(noteIds: noteIds, distinctDays: days)
         case "trace_friction":
-            guard let window = obj["window"]?.stringValue else { return nil }
-            return .traceFriction(count: jsonInt(obj, "count") ?? 0, window: window)
+            guard let window = obj["window"]?.stringValue,
+                  case .int(let raw)? = obj["count"], let count = Int(exactly: raw) else { return nil }
+            citation = .traceFriction(count: count, window: window)
         default:
             return nil
         }
+        return citation.structuralError() == nil ? citation : nil
     }
 }
 
@@ -166,10 +166,10 @@ public struct PromotionDossier: Sendable, Equatable {
         .object(["citations": .array(citations.map { $0.toJSON() })])
     }
 
-    public static func fromJSON(_ value: JSONValue) -> PromotionDossier {
-        guard case .object(let obj) = value, case .array(let arr)? = obj["citations"] else {
-            return PromotionDossier(citations: [])
-        }
-        return PromotionDossier(citations: arr.compactMap { DossierSource.fromJSON($0) })
+    public static func fromJSON(_ value: JSONValue) -> PromotionDossier? {
+        guard case .object(let obj) = value, case .array(let arr)? = obj["citations"],
+              let citations = DeskJSON.collection(JSONValue.array(arr), decode: DossierSource.fromJSON) else { return nil }
+        let dossier = PromotionDossier(citations: citations)
+        return dossier.isValid ? dossier : nil
     }
 }

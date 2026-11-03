@@ -7,7 +7,7 @@ import ApplicationServices
 #endif
 #if canImport(AppKit)
 import AppKit
-// Blueprint: | `MacAccessibilityReader.swift` | Shared AX walker and node/depth/time budgets; package-native window/subtree and direct-child reads use that walker with topology-only snapshots and optional caller-scoped descent, report incomplete reads with search purpose, visited count, unseen floor and reasons, and never collect credential values; passive native reads share its deadline and cancellation; native reply text requires readable static AXValues and checked topology subroles; `SystemMacAXElementSource` owns exact native window inventory and transient menu roots |
+// Blueprint: | `MacAccessibilityReader.swift` | Shared AX walker and node/depth/time budgets; package-native window/subtree and direct-child reads use that walker with topology-only snapshots and optional caller-scoped descent, report incomplete reads with search purpose, visited count, unseen floor, reasons and bounded unreadable paths/native AX errors, and never collect credential values; recipe content-region discovery uses bounded topology-only search, reports unreadable paths and finds readable siblings without treating failed searches as absence; passive native reads share its deadline and cancellation; native reply text requires readable static AXValues and checked topology subroles; `SystemMacAXElementSource` owns exact native window inventory and transient menu roots |
 #endif
 //
 // Accessibility-first perception: macOS already hands every app's UI to the
@@ -15,11 +15,17 @@ import AppKit
 // available AX actions). Reading that tree is the alternative to the
 // screenshot→vision→guess-coordinates loop. This file is the read half only:
 // there is deliberately NO CGEvent, no AXUIElementPerformAction, no
-// AXUIElementSetAttributeValue anywhere in it. Perception cannot mutate.
+// AXUIElementSetAttributeValue anywhere in the walker. The live AX source may
+// prepare an advertised renderer mode before reading; it emits no UI input.
 //
 // `MacAXElementSource` supplies elements; `MacAccessibilityReader` owns the bounded
 // walk, honest truncation accounting, string capping and ax_find ranking.
 public enum MacAccessibilityReader {
+    package struct NativeReadFailure: Error, LocalizedError {
+        package let detail: String
+        package init(detail: String) { self.detail = detail }
+        package var errorDescription: String? { detail }
+    }
     private actor NativeReads {
         func read<Value: Sendable>(_ body: @Sendable () throws -> Value) throws -> Value {
             try Task.checkCancellation()
@@ -27,9 +33,16 @@ public enum MacAccessibilityReader {
         }
     }
     private static let nativeReads = NativeReads()
-    package static func withReadBudget<Value>(_ body: () throws -> Value) rethrows -> Value {
-        try MacAXLimits.$readDeadline.withValue(
+    package static func withReadBudget<Value>(_ body: () throws -> Value) throws -> Value {
+        #if canImport(ApplicationServices) && os(macOS)
+        return try MacAXAttributeRead.checked {
+            try MacAXLimits.$readDeadline.withValue(
+                MacAXLimits.readDeadline ?? Date().addingTimeInterval(MacAXLimits.readSeconds), operation: body)
+        }
+        #else
+        return try MacAXLimits.$readDeadline.withValue(
             MacAXLimits.readDeadline ?? Date().addingTimeInterval(MacAXLimits.readSeconds), operation: body)
+        #endif
     }
     /// Passive native clients share the hands' deadline and cancellation.
     /// Only Sendable results leave it; native AX handles stay in the read.
@@ -71,11 +84,6 @@ public enum MacAccessibilityReader {
             return rendered[[]] ?? ""
         }
     }
-    package struct NativeReadFailure: Error, LocalizedError {
-        package let detail: String
-        package init(detail: String) { self.detail = detail }
-        package var errorDescription: String? { detail }
-    }
     /// A native window/subtree read through the ordinary hands walker. Read
     /// topology only: credential values are never collected into a snapshot.
     /// A caller may exclude a known unrelated region (such as a chat log).
@@ -86,18 +94,31 @@ public enum MacAccessibilityReader {
     }
     package static func nativeSnapshot(in root: AXUIElement, searching: String,
         descendInto: @escaping (AXUIElement) -> Bool = { _ in true }) throws -> (SystemMacAXElementSource, MacAXTreeSnapshot) {
+        try MacAXAttributeRead.checked { try nativeSnapshotRead(in: root, searching: searching, descendInto: descendInto) }
+    }
+    private static func nativeSnapshotRead(in root: AXUIElement, searching: String,
+        descendInto: @escaping (AXUIElement) -> Bool) throws -> (SystemMacAXElementSource, MacAXTreeSnapshot) {
         try Task.checkCancellation()
         let deadline = MacAXLimits.readDeadline ?? Date().addingTimeInterval(MacAXLimits.readSeconds)
         return try MacAXLimits.$readDeadline.withValue(deadline) {
+            try SystemMacAXElementSource.ensureRenderer(root, refresh: true)
             let source = SystemMacAXElementSource()
+            var failures: [Int: String] = [:], unreadable: [String] = []
             let snapshot = walk(source: source, root: source.mint(root), limits: .deepPage,
-                read: source.topologyAttributes, deadline: deadline, descendInto: { ref in
+                read: { ref in
+                    do { return try source.checkedTopologyAttributes(of: ref) }
+                    catch { failures[ref.id] = error.localizedDescription; return nil }
+                }, deadline: deadline, descendInto: { ref in
                     source.element(ref).map(descendInto) ?? false
+                }, onUnreadable: { ref, path in
+                    unreadable.append("window/subtree path \(path): \(failures[ref.id] ?? "AX attributes unavailable")")
                 })
             try Task.checkCancellation()
             guard !snapshot.truncated else {
                 let budget = snapshot.truncationReasons.contains { ["node_cap", "depth_cap", "time_budget"].contains($0) }
-                throw NativeReadFailure(detail: "Accessibility search for \(searching) \(budget ? "exhausted the shared reader budget" : "was incomplete"): read \(snapshot.nodes.count) elements; at least \(snapshot.skippedAtLeast) elements unexamined; reasons: \(snapshot.truncationReasons.joined(separator: ", ")). Limits: \(MacAXLimits.deepPage.maxNodes) elements, depth \(MacAXLimits.deepPage.maxDepth), \(MacAXLimits.readSeconds) seconds. \(budget ? "Narrow the search to the intended section before continuing." : "Check the app's Accessibility tree before continuing.")")
+                throw NativeReadFailure(detail: "Accessibility search for \(searching) \(budget ? "exhausted the shared reader budget" : "was incomplete"): read \(snapshot.nodes.count) elements; at least \(snapshot.skippedAtLeast) elements unexamined; reasons: \(snapshot.truncationReasons.joined(separator: ", ")). Limits: \(MacAXLimits.deepPage.maxNodes) elements, depth \(MacAXLimits.deepPage.maxDepth), \(MacAXLimits.readSeconds) seconds. "
+                    + (unreadable.isEmpty ? "" : "Unreadable: " + unreadable.prefix(4).joined(separator: "; ") + ". ")
+                    + (budget ? "Narrow the search to the intended section before continuing." : "Check the app's Accessibility tree before continuing."))
             }
             return (source, snapshot)
         }
@@ -107,12 +128,37 @@ public enum MacAccessibilityReader {
     package static func childElements(in root: AXUIElement, searching: String) throws -> [AXUIElement] {
         Array(try elements(in: root, searching: searching, descendInto: { CFEqual($0, root) }).dropFirst())
     }
-    #endif
-    public static func captureContinuation(pid: Int32?, taskReference: String) -> MacWorkContinuation {
-        #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
-        return MacAXExecutionLane.sync {
-            SystemMacAXElementSource().captureContinuation(pid: pid, taskReference: taskReference)
+    /// Find a positively identified content region before reading its subtree.
+    /// Unreadable window chrome cannot make a readable region disappear; no
+    /// match after an incomplete search is still a read failure, never absence.
+    package static func contentRegion(in root: AXUIElement, role: String) throws -> AXUIElement {
+        try withReadBudget {
+            try SystemMacAXElementSource.ensureRenderer(root, refresh: true)
+            let source = SystemMacAXElementSource()
+            var failures: [Int: String] = [:]
+            let result = findFirst(source: source, root: source.mint(root),
+                maxDepth: MacAXLimits.deepPage.maxDepth, nodeBudget: MacAXLimits.deepPage.maxNodes,
+                read: { ref in
+                    do { return try source.checkedTopologyAttributes(of: ref) }
+                    catch { failures[ref.id] = error.localizedDescription; return nil }
+                },
+                onUnreadable: { ref, path in
+                    nativeLog("Desktop content region search could not read window path %@: %@; that element remains unreadable, not empty.", String(describing: path), failures[ref.id] ?? "AX attributes unavailable")
+                },
+                shouldStop: { Task.isCancelled || MacAXLimits.readDeadline.map { Date() >= $0 } == true }) { _, attributes in
+                    attributes.role == role
+                }
+            try Task.checkCancellation()
+            if let hit = result.hit, let region = source.element(hit.ref) { return region }
+            throw NativeReadFailure(detail: "Accessibility search for the desktop content region \(role) "
+                + (result.truncationReason.map { "was incomplete: \($0)." } ?? "found no matching region.")
+                + " Check the app's Accessibility tree before continuing.")
         }
+    }
+    #endif
+    public static func captureContinuation(pid: Int32?, taskReference: String) async -> MacWorkContinuation {
+        #if canImport(ApplicationServices) && canImport(AppKit) && os(macOS)
+        return await SystemMacAXElementSource().captureContinuation(pid: pid, taskReference: taskReference)
         #else
         return .unsupported("accessibility_unsupported", taskReference: taskReference)
         #endif
@@ -138,10 +184,11 @@ public enum MacAccessibilityReader {
         root: MacAXElementRef,
         limits: MacAXLimits = MacAXLimits(),
         complete: Bool = false,
-        read: ((MacAXElementRef) -> MacAXAttributes?)? = nil,
+        read: ((MacAXElementRef) throws -> MacAXAttributes?)? = nil,
         deadline: Date? = nil,
         stopAtCut: Bool = false,
         descendInto: ((MacAXElementRef) -> Bool)? = nil,
+        onUnreadable: ((MacAXElementRef, [Int]) -> Void)? = nil,
         shouldStop: () -> Bool = { Task.isCancelled }
     ) -> MacAXTreeSnapshot {
         let limits = complete ? MacAXLimits.deepPage : limits
@@ -149,6 +196,7 @@ public enum MacAccessibilityReader {
         var nodes: [MacAXNode] = []
         var skipped = 0
         var reasons: Set<String> = []
+        var readFailures: [String] = []
         // Explicit stack so a deep tree cannot blow the Swift stack, and so
         // the node cap is enforced BEFORE any further child enumeration.
         var stack: [(ref: MacAXElementRef, path: [Int], depth: Int)] = [(root, [], 1)]
@@ -173,9 +221,18 @@ public enum MacAccessibilityReader {
             let hash = source.elementHash(item.ref) ?? item.ref.id
             if seen[hash]?.contains(where: { source.sameElement($0, item.ref) }) == true { continue }
             seen[hash, default: []].append(item.ref)
-            guard let attributes = read.map({ $0(item.ref) }) ?? source.attributes(of: item.ref) else {
+            let readAttributes: MacAXAttributes?
+            do {
+                if let read { readAttributes = try read(item.ref) }
+                else { readAttributes = try source.checkedAttributes(of: item.ref) }
+            } catch {
+                readAttributes = nil
+                if readFailures.count < 8 { readFailures.append("path \(item.path): \(error.localizedDescription)") }
+            }
+            guard let attributes = readAttributes else {
                 skipped += 1
                 reasons.insert("unreadable_element")
+                onUnreadable?(item.ref, item.path)
                 continue
             }
             if attributes.isHiddenMenuItem { continue }
@@ -187,8 +244,11 @@ public enum MacAccessibilityReader {
             if shouldStop() { reasons.insert("interrupted"); break }
             // An element whose children the app did not report (an AX error
             // or the per-message timeout) is a cut, never an empty subtree.
-            guard let total = source.childCount(of: item.ref) else {
+            let total: Int
+            do { total = try source.checkedChildCount(of: item.ref) }
+            catch {
                 reasons.insert("ax_error")
+                if readFailures.count < 8 { readFailures.append("path \(item.path): \(error.localizedDescription)") }
                 continue
             }
             if item.depth >= limits.maxDepth {
@@ -207,7 +267,14 @@ public enum MacAccessibilityReader {
             // the un-fetched remainder without materializing it.
             let budget = max(0, limits.maxNodes - nodes.count - stack.count)
             if shouldStop() { reasons.insert("interrupted"); break }
-            let children = source.children(of: item.ref, limit: min(total, budget))
+            let children: [MacAXElementRef]
+            do { children = try source.checkedChildren(of: item.ref, limit: min(total, budget)) }
+            catch {
+                reasons.insert("ax_error")
+                skipped += total
+                if readFailures.count < 8 { readFailures.append("path \(item.path): \(error.localizedDescription)") }
+                continue
+            }
             if total > children.count {
                 skipped += total - children.count
                 // Fewer than the budget allowed is the copy failing, not the cap.
@@ -223,7 +290,8 @@ public enum MacAccessibilityReader {
             nodes: nodes,
             truncated: !reasons.isEmpty,
             truncationReasons: reasons.sorted(),
-            skippedAtLeast: skipped
+            skippedAtLeast: skipped,
+            readFailures: readFailures
         )
     }
     /// Targeted descent uses the shared read-only source and stops at the first role match.
@@ -281,9 +349,18 @@ public enum MacAccessibilityReader {
         root: MacAXElementRef,
         maxDepth: Int,
         nodeBudget: Int,
+        read: ((MacAXElementRef) -> MacAXAttributes?)? = nil,
+        onUnreadable: ((MacAXElementRef, [Int]) -> Void)? = nil,
         shouldStop: () -> Bool = { false },
         where matches: (MacAXElementRef, MacAXAttributes) -> Bool
     ) -> FindFirstResult {
+        func node<Value>(_ body: () throws -> Value) throws -> Value {
+            #if canImport(ApplicationServices) && os(macOS)
+            return try MacAXAttributeRead.node(body)
+            #else
+            return try body()
+            #endif
+        }
         var queue: [(ref: MacAXElementRef, path: [Int], depth: Int)] = [(root, [], 1)]
         var visited = 0
         var index = 0
@@ -293,8 +370,12 @@ public enum MacAccessibilityReader {
         var hitDepthCap = false
         var hitNodeCap = false
         var hitAXError = false
+        func count(_ ref: MacAXElementRef) -> Int? {
+            do { return try node { try source.checkedChildCount(of: ref) } }
+            catch { hitAXError = true; return nil }
+        }
         while index < queue.count {
-            if shouldStop() { return .interrupted }
+            if shouldStop() || Task.isCancelled || MacAXLimits.readDeadline.map({ Date() >= $0 }) == true { return .interrupted }
             let item = queue[index]
             index += 1
             visited += 1
@@ -306,25 +387,35 @@ public enum MacAccessibilityReader {
             // It stays as the loop's own hard stop: a runaway search is worse
             // than a redundant comparison.
             if visited > max(1, nodeBudget) { return .nodeCap }
-            if let attributes = source.attributes(of: item.ref), matches(item.ref, attributes) {
+            let attributes: MacAXAttributes?
+            do {
+                attributes = try node {
+                    if let read { return read(item.ref) }
+                    return try source.checkedAttributes(of: item.ref)
+                }
+            } catch { attributes = nil }
+            if attributes == nil { hitAXError = true; onUnreadable?(item.ref, item.path) }
+            if let attributes, matches(item.ref, attributes) {
                 // The ROOT itself matching is a real answer — a window that IS
                 // the web area needs no descent.
                 return .found(ref: item.ref, path: item.path)
             }
             if shouldStop() { return .interrupted }
             guard item.depth < max(1, maxDepth) else {
-                if source.childCount(of: item.ref) != 0 { hitDepthCap = true }
+                if count(item.ref) != 0 { hitDepthCap = true }
                 continue
             }
             let remaining = max(0, max(1, nodeBudget) - visited - (queue.count - index))
             guard remaining > 0 else {
-                if source.childCount(of: item.ref) != 0 { hitNodeCap = true }
+                if count(item.ref) != 0 { hitNodeCap = true }
                 continue
             }
             // An unanswered child list leaves the search unfinished, never "not found".
-            guard let total = source.childCount(of: item.ref) else { hitAXError = true; continue }
+            guard let total = count(item.ref) else { continue }
             if shouldStop() { return .interrupted }
-            let children = source.children(of: item.ref, limit: remaining)
+            let children: [MacAXElementRef]
+            do { children = try node { try source.checkedChildren(of: item.ref, limit: remaining) } }
+            catch { hitAXError = true; continue }
             // Fewer than the budget allowed is the copy failing, not the cap.
             if children.count < min(total, remaining) { hitAXError = true }
             else if total > children.count { hitNodeCap = true }

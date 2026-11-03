@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
@@ -13,6 +14,9 @@ import PersistenceCore
 /// first-party Anthropic / OpenAI calls.
 public final class OpenRouterTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
+    /// This transport sends no output-cap field.
+    public func requestOutputTokens(model: String) throws -> Int { 0 }
+
     public let providerId: String = "openrouter"
     private let session: URLSession
     private let endpoint: URL
@@ -43,21 +47,22 @@ public final class OpenRouterTransport: LLMTransport {
         Task.detached { _ = await OpenRouterModelCatalog.models(dataRoot: dataRoot, session: session, refresh: true) }
     }
 
-    /// OpenRouter reasoning sends low/medium/high, maps xhigh/max/ultra to high, and disables on none.
-    static func applyReasoningControls(to body: inout [String: Any]) {
-        guard let raw = LLMCallContext.reasoningEffort?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(), !raw.isEmpty else { return }
-        switch raw {
-        case "none":
-            body["reasoning"] = ["enabled": false]
-        case "low", "medium", "high":
-            body["reasoning"] = ["effort": raw]
-        case "xhigh", "max", "ultra":
-            body["reasoning"] = ["effort": "high"]
-        default:
-            return
+    /// Send the exact admitted effort from this route's current catalog.
+    static func applyReasoningControls(to body: inout [String: Any], model: String, dataRoot: URL) throws {
+        let catalog = try SwiftNativeProviderRouting(dataRoot: dataRoot).checkedCatalogModels(for: "openrouter")
+        guard let row = catalog.first(where: { $0.id == model }) else {
+            throw ProviderRoutingError.configurationFailed("OpenRouter has no current controls for \(model). Refresh its model catalog in Providers.")
         }
+        if row.supported_reasoning_efforts == [],
+           LLMCallContext.reasoningEffort == nil || LLMCallContext.reasoningEffort == "" || LLMCallContext.reasoningEffort == "default" { return }
+        guard let requested = LLMCallContext.reasoningEffort ?? row.default_reasoning_effort else {
+            throw ProviderRoutingError.configurationFailed("OpenRouter's default Think control for \(model) is unknown. Refresh its model catalog in Providers.")
+        }
+        let effort = try SwiftNativeProviderRouting.normalizeReasoningEffortStatic(
+            requested, model: model, providerID: "openrouter",
+            supportedReasoningEfforts: row.supported_reasoning_efforts)
+        guard effort != "default" else { return }
+        body["reasoning"] = effort == "none" ? ["enabled": false] : ["effort": effort]
     }
 
     private func resolveKey() throws -> String? {
@@ -75,8 +80,8 @@ public final class OpenRouterTransport: LLMTransport {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        try await LLMMessageStreamEvent.reply(collecting:
-            streamMessages(messages: [.user(prompt)], system: system, model: model, tools: tools))
+        return try await LLMMessageStreamEvent.reply(collecting:
+            self.streamMessages(messages: [.user(prompt)], system: system, model: model, tools: tools), using: telemetry)
     }
 
     /// Preserve images and assistant-tool/result turns on OpenRouter's OpenAI-compatible wire.
@@ -87,8 +92,8 @@ public final class OpenRouterTransport: LLMTransport {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        try await LLMMessageStreamEvent.reply(collecting:
-            streamMessages(messages: messages, system: system, model: model, tools: tools))
+        return try await LLMMessageStreamEvent.reply(collecting:
+            self.streamMessages(messages: messages, system: system, model: model, tools: tools), using: telemetry)
     }
 
     public func streamMessages(
@@ -116,11 +121,11 @@ public final class OpenRouterTransport: LLMTransport {
                     applyStreamingLLMHeaders(to: &req)
                     var body: [String: Any] = [
                         "model": model,
-                        "messages": OpenAITransport.chatMessages(messages: messages, system: system),
+                        "messages": try OpenAITransport.chatMessages(messages: messages, system: system),
                         "stream": true,
                         "stream_options": ["include_usage": true],
                     ]
-                    Self.applyReasoningControls(to: &body)
+                    try Self.applyReasoningControls(to: &body, model: model, dataRoot: dataRoot)
                     try OpenAITransport.applyTools(to: &body, tools: tools)
                     req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
@@ -140,7 +145,7 @@ public final class OpenRouterTransport: LLMTransport {
                             throw LLMError.modelUnavailable(provider: "openrouter", model: model)
                         }
                     }
-                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenRouter")
+                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenRouter", diagnosticDataRoot: telemetry.diagnosticDataRoot)
                     try await decoder.consume(
                         SSEEventStream(bytes), continuation: continuation,
                         request: req, providerID: providerId, model: model, idPrefix: "openrouter",
@@ -157,6 +162,7 @@ public final class OpenRouterTransport: LLMTransport {
                     ))
                 }
             }
+            ProviderReplyWork.current?.own(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }

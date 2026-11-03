@@ -4,7 +4,7 @@ import JavaScriptCore
 import Senses
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `Sources/NativeAgentSenseHost/JavaScriptSenseRuntime.swift` | Persistent sense/resident-part contexts with fresh frozen input per call; native rehearsal requests reset context/body/input references between fixtures in one helper; synchronous run/face entries, fresh projection helpers, shared Swift fragment-redaction binding and SenseWire validation, JSC execution watchdog with ProgramProgressWindow arithmetic |
+// Blueprint: | `Sources/NativeAgentSenseHost/JavaScriptSenseRuntime.swift` | Persistent sense/resident-part contexts with fresh frozen input per call; exact-source turn leases retain evaluated bodies and report actual body reuse; rehearsal resets context/body/input references; run/face results settle thenables in the JSC API microtask drain, rejecting pending Promises; fresh projection helpers, shared Swift fragment-redaction binding and SenseWire validation, JSC execution watchdog with ProgramProgressWindow arithmetic |
 
 /// One program per helper. Resident parts retain their context; rehearsal
 /// passes create fresh contexts in that helper. All kinds use the same
@@ -69,6 +69,7 @@ final class JavaScriptProgramRuntime {
     private var progressCell: UnsafeMutableRawPointer { Unmanaged.passUnretained(progress).toOpaque() }
     private var context: JSContext?
     private var body: JSValue?
+    private var callProgram: JSValue?
     private var updateInput: JSValue?
     private var record: SenseRecord?
     private var program: OwnedProgram?
@@ -219,16 +220,43 @@ final class JavaScriptProgramRuntime {
         setTimeLimit(group, 0.25, Self.expired, progressCell)
         let result = created.evaluateScript(sdk, withSourceURL: URL(string: kind == .sense ? "sense-sdk.js" : "app-prelude.js"))
         if inputJSON != nil { updateInput = result }
+        if kind != .sense, thrown == nil {
+            // A plain value is the result as it stands. A thenable gets both
+            // handlers inside the same API call as the entry: JSC drains its
+            // microtasks as that call returns to Swift, so the state read
+            // afterwards holds the settled value or error.
+            callProgram = created.evaluateScript("""
+                (function (resolve) {
+                  return function (entry, args) {
+                    var state = {status: 0};
+                    try {
+                      var out = entry.apply(undefined, args);
+                      if (out === null || (typeof out !== "object" && typeof out !== "function") || typeof out.then !== "function") {
+                        state.value = out; state.status = 1;
+                      } else {
+                        resolve(out).then(function (value) {
+                          state.value = value; state.status = 1;
+                        }, function (error) {
+                          state.error = error; state.status = 2;
+                        });
+                      }
+                    } catch (error) { state.error = error; state.status = 2; }
+                    return state;
+                  };
+                })(Promise.resolve.bind(Promise))
+                """)
+        }
         for name in ["__senseCall", "__senseRedactText", "__call", "__log", "__input", "__home", "__workspace", "__dataRoot", "__measurementSystem"] { created.globalObject.deleteProperty(name) }
         return created
     }
 
     private func runProgram(_ program: OwnedProgram, message: [String: Any]) throws {
-        // A rehearsal shares its process, never its fixture's globals or input.
+        // Rehearsals reset their realm; live resident turn leases keep the
+        // opened exact-source program. Every call still replaces frozen input.
         // The app supplies this flag; the exact program identity was checked above.
         if message["freshContext"] as? Bool == true {
             if let context, let group = JSContextGetGroup(context.jsGlobalContextRef) { Self.clearTimeLimit?(group) }
-            body = nil; updateInput = nil; thrown = nil; context = nil
+            body = nil; callProgram = nil; updateInput = nil; thrown = nil; context = nil
         }
         guard (context == nil || program.isResident), let runID = message["id"] as? Int, let ids = message["actionIDs"] as? [String] else {
             throw failure("bad_input", "Program requires an available helper, an integer id and admitted action names.")
@@ -249,9 +277,9 @@ final class JavaScriptProgramRuntime {
         if !fresh, let inputJSON { updateInput?.call(withArguments: [inputJSON]) }
         try checkExecution()
         if let thrown {
-            try io.send(["id": id, "type": "program_done", "exception": ["message": "The script engine did not start: \(thrown)"]])
-            return
+            throw failure("engine_start_failed", "The script engine did not start: \(thrown)")
         }
+        let programReused = body != nil
         if body == nil, program.entry == .functionBody {
             body = context.evaluateScript("(function () {" + program.source + "\n})", withSourceURL: URL(string: "app-script.js"))
         } else if body == nil {
@@ -262,21 +290,32 @@ final class JavaScriptProgramRuntime {
                 throw failure("bad_output", "Owned program must define \(entry)(input).")
             }
         }
-        let value = thrown == nil ? body?.call(withArguments: [.run, .face].contains(program.entry)
-            ? [context.objectForKeyedSubscript("input")!] : []) : nil
+        let settled: JSValue?
+        if thrown == nil, let body, let callProgram {
+            let arguments: [Any] = [.run, .face].contains(program.entry) ? [context.objectForKeyedSubscript("input")!] : []
+            settled = callProgram.call(withArguments: [body, arguments])
+        } else { settled = nil }
         try checkExecution()
         var done: [String: Any] = ["id": id, "type": "program_done"]
+        if program.kind == .turn { done["programReused"] = programReused }
+        if thrown == nil, settled?.objectForKeyedSubscript("status")?.toInt32() == 2 {
+            thrown = settled?.objectForKeyedSubscript("error")
+        }
         if let thrown {
             done["exception"] = exception(thrown)
             try io.send(done); return
         }
+        guard let settled else { throw failure("bad_output", "The program entry returned no settlement state.") }
+        guard settled.objectForKeyedSubscript("status")?.toInt32() == 1 else {
+            done["unreadableReturn"] = "Its Promise never settled: only app and host calls, which answer at once, can be awaited here."
+            try io.send(done); return
+        }
+        let value = settled.objectForKeyedSubscript("value")
         if let value, !value.isUndefined {
-            let promise = value.isObject && value.objectForKeyedSubscript("then").map { isFunction($0, in: context) } == true
-            let json = promise ? nil : context.objectForKeyedSubscript("JSON")?.invokeMethod("stringify", withArguments: [value])
+            let json = context.objectForKeyedSubscript("JSON")?.invokeMethod("stringify", withArguments: [value])
             try checkExecution()
-            if thrown != nil || promise || json?.isString != true {
-                let detail = promise ? "Sync-only: define function run(input), use synchronous host/app calls and return plain JSON. Async functions and Promises are unsupported."
-                    : thrown != nil ? "The returned value could not be read: \((thrown?.toString() ?? "").prefix(300))"
+            if thrown != nil || json?.isString != true {
+                let detail = thrown != nil ? "The returned value could not be read: \((thrown?.toString() ?? "").prefix(300))"
                     : "The returned value has no JSON form (a function or a symbol)."
                 done["unreadableReturn"] = detail
                 try io.send(done); return

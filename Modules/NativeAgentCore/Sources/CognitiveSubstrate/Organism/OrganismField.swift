@@ -137,10 +137,10 @@ public struct OrganismField: Codable, Sendable, Equatable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.init(
-            nodes: try container.decodeIfPresent([String: OrganismNode].self, forKey: .nodes) ?? [:],
-            edges: try container.decodeIfPresent([String: OrganismEdge].self, forKey: .edges) ?? [:],
+            nodes: try container.decode([String: OrganismNode].self, forKey: .nodes),
+            edges: try container.decode([String: OrganismEdge].self, forKey: .edges),
             lastUpdatedAt: try container.decodeIfPresent(Date.self, forKey: .lastUpdatedAt),
-            mutationGeneration: try container.decodeIfPresent(UInt64.self, forKey: .mutationGeneration) ?? 0
+            mutationGeneration: try container.decode(UInt64.self, forKey: .mutationGeneration)
         )
     }
 
@@ -282,7 +282,7 @@ public enum OrganismPlasticity {
     private static func learningSign(for kind: SomaticSignalKind) -> LearningSign {
         switch kind {
         case .toolSucceeded, .providerSucceeded, .providerRecovered, .phoneDeliveryReceived,
-             .deskItemClosed, .memoryCommitted, .memoryHygieneCompleted,
+             .deskItemClosed, .memoryCommitted,
              .dreamCompleted, .remIntegrated, .iPhoneReachable,
              .approvalResolved, .assistantSpoke:
             return .strengthen(1.2)
@@ -373,7 +373,7 @@ public enum OrganismPlasticity {
             return ["body:provider:\(bodySchema.providersHealthy ? "healthy" : "brittle")"]
         case .toolStarted, .toolSucceeded, .toolFailed, .toolCancelled:
             return ["body:tools:\(bodySchema.toolHandsAvailable ? "available" : "unavailable")"]
-        case .memoryCommitted, .memoryCorrected, .memoryHygieneCompleted:
+        case .memoryCommitted, .memoryCorrected:
             return ["body:memory:\(bodySchema.memoryHealthy ? "healthy" : "brittle")"]
         case .dreamCompleted, .remIntegrated:
             return ["body:dream:\(bodySchema.dreamHealthy ? "healthy" : "brittle")"]
@@ -441,7 +441,7 @@ public enum OrganismPlasticity {
 
     private static func isRepairSignal(_ kind: SomaticSignalKind) -> Bool {
         switch kind {
-        case .appSleep, .dreamCompleted, .remIntegrated, .memoryHygieneCompleted:
+        case .appSleep, .dreamCompleted, .remIntegrated:
             return true
         default:
             return false

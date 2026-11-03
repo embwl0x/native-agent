@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TelegramPollLoop+Transport.swift` | `TelegramPollLoop`: `answerRecordedCallback`, `_tgDestinationFields`, `_tgDestinationBody` |
+// Blueprint: | `TelegramPollLoop+Transport.swift` | `TelegramPollLoop`: `answerRecordedCallback`, `_tgDestinationFields`, `_tgDestinationBody`, `defaultEditRichMessage` edits retained group replies; photo transport carries the reply's silent notification policy |
 
 extension TelegramPollLoop {
     func answerRecordedCallback(
@@ -88,6 +88,21 @@ extension TelegramPollLoop {
             return try JSONValue.object(fields).serializedData(pretty: false)
         }
         return result.value.messageId
+    }
+
+    static let defaultEditRichMessage: @Sendable (
+        String, TelegramDestination, Int, TelegramInputRichMessage
+    ) async throws -> Void = { token, destination, messageId, richMessage in
+        try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
+            _ = try await _tgPostJSON(token: token, method: "editMessageText",
+                resultType: TelegramAPIMessageResult.self, allowMessageNotModified: true) {
+                try JSONValue.object([
+                    "chat_id": .int(Int64(destination.chatId)),
+                    "message_id": .int(Int64(messageId)),
+                    "rich_message": richMessage.jsonValue,
+                ]).serializedData(pretty: false)
+            }
+        }
     }
 
     public static let defaultSendMessageWithReplyMarkupReturningId:
@@ -190,6 +205,13 @@ extension TelegramPollLoop {
     }
 
     public static let defaultSendPhoto: @Sendable (String, TelegramDestination, String, Data, String?) async throws -> Void = { token, destination, imagePath, imageData, caption in
+        try await sendPhoto(token: token, destination: destination, imagePath: imagePath, imageData: imageData, caption: caption)
+    }
+
+    static func sendPhoto(
+        token: String, destination: TelegramDestination, imagePath: String,
+        imageData: Data, caption: String?, silent: Bool = false
+    ) async throws {
         try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
             guard let url = _tgBuildBotURL(token: token, method: "sendPhoto") else {
                 throw TelegramBotError.invalidRequest
@@ -207,6 +229,9 @@ extension TelegramPollLoop {
 
             var body = Data()
             _tgAppendMultipartField(name: "chat_id", value: String(destination.chatId), boundary: boundary, to: &body)
+            if silent {
+                _tgAppendMultipartField(name: "disable_notification", value: "true", boundary: boundary, to: &body)
+            }
             if let threadId = destination.threadId {
                 _tgAppendMultipartField(
                     name: "message_thread_id",
@@ -533,7 +558,7 @@ actor TelegramChatSendLane {
 
     private struct Waiter {
         let id: UUID
-        let continuation: CheckedContinuation<Void, Error>
+        let done: ScopedWaiter
     }
 
     private var busy: Set<Int> = []
@@ -570,23 +595,16 @@ actor TelegramChatSendLane {
             return
         }
         let waiterId = UUID()
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                waiting[chatId, default: []].append(Waiter(id: waiterId, continuation: continuation))
-            }
-        } onCancel: {
-            Task { await self.abandon(chatId, waiterId: waiterId) }
+        let done = ScopedWaiter()
+        waiting[chatId, default: []].append(Waiter(id: waiterId, done: done))
+        await done.park()
+        // If still queued, cancellation won. Otherwise run owns the handed
+        // off lane and releases it through its defer, including on Stop.
+        if let index = waiting[chatId]?.firstIndex(where: { $0.id == waiterId }) {
+            waiting[chatId]?.remove(at: index)
+            if waiting[chatId]?.isEmpty == true { waiting[chatId] = nil }
+            throw CancellationError()
         }
-    }
-
-    /// Drop a cancelled waiter. A no-op when `release` already handed it the
-    /// lane — that task owns the lane and releases it itself.
-    private func abandon(_ chatId: Int, waiterId: UUID) {
-        guard var queue = waiting[chatId],
-              let index = queue.firstIndex(where: { $0.id == waiterId }) else { return }
-        let waiter = queue.remove(at: index)
-        waiting[chatId] = queue.isEmpty ? nil : queue
-        waiter.continuation.resume(throwing: CancellationError())
     }
 
     private func release(_ chatId: Int) {
@@ -598,7 +616,7 @@ actor TelegramChatSendLane {
         let next = queue.removeFirst()
         waiting[chatId] = queue.isEmpty ? nil : queue
         // The lane stays held: ownership passes straight to the next waiter.
-        next.continuation.resume()
+        next.done.resume()
     }
 
     private func cooldownNanoseconds(_ chatId: Int) throws -> UInt64? {

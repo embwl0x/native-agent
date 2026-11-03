@@ -24,22 +24,21 @@ extension BuiltInToolSchemaFactory {
             // SwiftNativeDeskStore. Reached through app actions, never extra
             // always-on model tools.
             requestedSchema(name: "desk_read", toolClass: .read,
-                description: "Read your durable Desk as rows with status, summary, notes, refs and dates. Numbers are permanent. limit (default 25, maximum 100) and offset page every list; total and has_more say what remains. sort changes order only. handle (stable or visible alias) also returns one exact live item's full summary, refs, dependencies/blockees, parts and ordered notes. query searches title/summary/project/alias/handle across the full live store. include_archived appends closed-out archived items. Read-only.",
+                description: "Read your durable Desk as rows with status, summary, notes, refs and dates. Numbers are permanent. limit (default 25, maximum 100) and offset page every list; total and has_more say what remains. sort changes order only. handle (stable or visible alias) also returns one exact live item's full summary, refs, dependencies/blockees, parts and ordered notes. query searches title/summary/project/alias/handle, and a queued step's own words, across the full live store (query \"my queue\" lists MY QUEUE). include_archived appends closed-out archived items. Read-only.",
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("include_archived", ToolSchema.boolSchema("Also page archived items matching the same handle or query, with their own total/has_more. Exact archived reads require the stable handle. Default false.")),
                         ("archived_offset", ToolSchema.intSchema("Archived row offset: copy from next_archive_read; initially uses offset. Archives have their own total/has_more in archives.")),
                         ("handle", ToolSchema.strSchema("Optional exact live Desk handle or visible alias; returns that item's full record (notes, refs, dependencies) as well as the board. Mutually exclusive with query.")),
-                        ("query", ToolSchema.strSchema("Optional case-insensitive text search across the full live Desk. Mutually exclusive with handle; limit/offset page the matches.")),
+                        ("query", ToolSchema.strSchema("Optional case-insensitive text search across the full live Desk, including a queued step's words (query \"my queue\" lists MY QUEUE). Mutually exclusive with handle; limit/offset page the matches.")),
                         ("updated_on", ToolSchema.strSchema("Filter items updated on today or YYYY-MM-DD in the Mac's local timezone. With include_archived, filters archives by their closed date. Can combine with query.")),
-                        ("structured", ToolSchema.boolSchema("Accepted for workspace compatibility; all reads return the same canonical rows and page continuations.")),
                         ("sort", ToolSchema.strSchema("recent (default) or stale (oldest first). Changes order only; fields and matching items are unchanged.")),
                         ("limit", ToolSchema.intSchema("Rows per page, 1–100; default 25.")),
                         ("offset", ToolSchema.intSchema("Row offset, default zero. Copy next_read for continuation.")),
                         ("notes_offset", ToolSchema.intSchema("Structured selected-record continuation: note offset; omit initially.")),
                         ("refs_offset", ToolSchema.intSchema("Structured selected-record continuation: linked-evidence offset; omit initially.")),
                         ("detail_offset", ToolSchema.intSchema("Read a bounded window of the complete selected record, including full notes. Omit for the selectable overview; start at zero.")),
-                        ("detail_version", ToolSchema.strSchema("Exact complete-record version returned by the owner. Required for a nonzero detail_offset; changed records must restart.")),
+                        ("detail_version", ToolSchema.versionSchema("Exact complete-record version returned by the owner. Required for a nonzero detail_offset; changed records must restart.")),
                     ],
                     required: []
                 )
@@ -102,10 +101,10 @@ extension BuiltInToolSchemaFactory {
                 description: "Put a Desk item in 'waiting on <person>' with one call: handle, on (for example User or owner), and optional note. A person wait appears in the Desk status; owner waits contribute to the page's waiting-on-owner count. on also accepts an observed Desk handle/number or experience id (card, message, delivery, repair); a list waits on those dependencies until they settle. Unknown identifier-shaped inputs are refused.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("handle", ToolSchema.strSchema("The item's handle or visible Desk number; id is accepted as an alias.")),
+                        ("handle", ToolSchema.strSchema("The item's handle or visible Desk number.")),
                         ("on", ToolSchema.obj([
                             ("anyOf", .array([
-                                ToolSchema.strSchema("A person's name, or one observed Desk/experience id."),
+                                ToolSchema.strSchema("A person's or agent's name, a conversation id (its next message), or one observed Desk/experience id."),
                                 ToolSchema.obj([("type", .string("array")), ("items", ToolSchema.strSchema("An observed Desk/experience id.")), ("minItems", .int(1))]),
                             ])),
                         ])),
@@ -193,7 +192,7 @@ extension BuiltInToolSchemaFactory {
                         ("summary", ToolSchema.strSchema("What the outcome was.")),
                         ("canceled", ToolSchema.boolSchema("Close as cancelled instead of done. Default false.")),
                         ("subtree", ToolSchema.boolSchema("Also close every open descendant in this call. Returns closed count + handles. Default false.")),
-                        ("expected_updated_at", ToolSchema.strSchema("Optional row version from a just-read Desk projection. When supplied, refuses if the item changed before this close.")),
+                        ("expected_updated_at", ToolSchema.versionSchema("Optional row version from a just-read Desk projection. When supplied, refuses if the item changed before this close.")),
                     ],
                     required: ["handle", "summary"]
                 )

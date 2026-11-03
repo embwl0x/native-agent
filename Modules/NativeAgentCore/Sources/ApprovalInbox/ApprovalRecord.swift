@@ -6,7 +6,7 @@ import AuthoredCapabilities
 import Experiences
 import NativeAgentCore
 import TrustCenter
-// Blueprint: | `ApprovalRecord.swift` | `ApprovalRecord`, `ApprovalFilter`, `ApprovalDecision` and `ApprovalResolutionProvenance`; approval presentation, tolerant saved JSON reads and nullable-versus-omitted wire fields; typed decision origin without queue authority |
+// Blueprint: | `ApprovalRecord.swift` | `ApprovalRecord`, `ApprovalFilter`, `ApprovalDecision` and `ApprovalResolutionProvenance`; approval presentation including displaced REM content from the retained payload (old cards: not recorded), strict current stored-record decoding and nullable-versus-omitted wire fields; typed decision origin without queue authority |
 
 /// One record in the autonomy approval queue. Preserves the stable
 /// `create_approval_request` shape plus NativeAgent's durable typed resolution
@@ -25,7 +25,26 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     public var reason: String
     public var status: String            // "pending" | "resolved" | "denied" | "canceled" | "orphaned"
     public var payload: JSONValue        // arbitrary JSON dict
-    public var payloadPreview: String
+    private var recordedPayloadPreview: String
+    /// Render from the retained proposal payload, including old cards. Never
+    /// rewrite history merely to add missing-history wording to its display.
+    public var payloadPreview: String {
+        get {
+            guard action == "rem.proposal" else { return recordedPayloadPreview }
+            let replacement: REMReplacement?
+            if case .object(let fields) = payload,
+               case .object(let proposal)? = fields["proposal"],
+               case .object(let replaced)? = proposal["replaced"],
+               case .string(let source)? = replaced["source"],
+               case .string(let text)? = replaced["text"] {
+                replacement = REMReplacement(source: source, text: text)
+            } else { replacement = nil }
+            let description = REMReplacement.describe(replacement)
+            return recordedPayloadPreview.hasSuffix(description)
+                ? recordedPayloadPreview : recordedPayloadPreview + "\n\n" + description
+        }
+        set { recordedPayloadPreview = newValue }
+    }
     public var createdAt: String         // ISO-8601
     /// When an identical pending request was last re-asked; nil until its first repeat.
     public var lastRequestedAt: String?  // ISO-8601 or nil
@@ -160,7 +179,7 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         self.reason = reason
         self.status = status
         self.payload = payload
-        self.payloadPreview = payloadPreview
+        self.recordedPayloadPreview = payloadPreview
         self.createdAt = createdAt
         self.lastRequestedAt = lastRequestedAt
         self.resolvedAt = resolvedAt
@@ -210,48 +229,67 @@ extension ApprovalRecord {
 }
 
 extension ApprovalRecord {
-    /// Build a record from its saved JSON object, tolerating missing keys.
+    /// Decode the current stored record. Invalid evidence never becomes an
+    /// invented empty field or a changed authority flag.
     public init?(json: JSONValue) {
         guard case .object(let obj) = json else { return nil }
-        let idStr = obj["id"]?.stringValue ?? ""
-        if idStr.isEmpty { return nil }
-        self.id = idStr
-        self.title = obj["title"]?.stringValue ?? ""
-        self.action = obj["action"]?.stringValue ?? ""
-        self.risk = obj["risk"]?.stringValue ?? ""
-        self.reason = obj["reason"]?.stringValue ?? ""
-        self.status = obj["status"]?.stringValue ?? ""
-        self.payload = obj["payload"] ?? .object([:])
-        self.payloadPreview = obj["payloadPreview"]?.stringValue ?? ""
-        self.createdAt = obj["createdAt"]?.stringValue ?? ""
+        guard case .string(let savedID)? = obj["id"], !savedID.isEmpty,
+              case .string(let title)? = obj["title"], !title.isEmpty,
+              case .string(let action)? = obj["action"], !action.isEmpty,
+              case .string(let risk)? = obj["risk"],
+              case .string(let reason)? = obj["reason"],
+              case .object(let payload)? = obj["payload"],
+              case .string(let preview)? = obj["payloadPreview"],
+              case .string(let created)? = obj["createdAt"],
+              NativeTimestampFormat.parseISO8601FractionalFirst(created) != nil,
+              case .bool(let remoteResolvable)? = obj["remoteResolvable"],
+              case .bool(let localOnly)? = obj["localOnly"],
+              case .string(let status)? = obj["status"],
+              status == "pending" || SwiftNativeApprovalInbox.terminalApprovalStatuses.contains(status)
+        else { return nil }
+        for key in ["lastRequestedAt", "decidedBy", "detail", "cause"] {
+            if let value = obj[key] {
+                guard case .string = value else { return nil }
+            }
+        }
+        if case .string(let last)? = obj["lastRequestedAt"],
+           NativeTimestampFormat.parseISO8601FractionalFirst(last) == nil { return nil }
+        for key in ["executedAction", "chatContinuation", "chatCard"] {
+            if let value = obj[key] {
+                guard case .object = value else { return nil }
+            }
+        }
+        if status == "pending" || status == "orphaned" {
+            guard obj["decision"] == .null, obj["resolvedAt"] == .null,
+                  obj["decidedBy"] == nil, obj["resolutionProvenance"] == nil else { return nil }
+        } else {
+            guard case .string(let decision)? = obj["decision"], ApprovalDecision(rawValue: decision) != nil,
+                  case .string(let resolved)? = obj["resolvedAt"],
+                  NativeTimestampFormat.parseISO8601FractionalFirst(resolved) != nil,
+                  case .string(let decider)? = obj["decidedBy"], !decider.isEmpty,
+                  let provenanceJSON = obj["resolutionProvenance"],
+                  let provenance = ApprovalResolutionProvenance(json: provenanceJSON),
+                  provenance.decidedBy == decider else { return nil }
+            if status == "denied", decision != "denied" { return nil }
+            if status == "canceled", decision != "canceled" { return nil }
+        }
+        self.id = savedID
+        self.title = title
+        self.action = action
+        self.risk = risk
+        self.reason = reason
+        self.status = status
+        self.payload = .object(payload)
+        self.recordedPayloadPreview = preview
+        self.createdAt = created
         self.lastRequestedAt = obj["lastRequestedAt"]?.stringValue
         self.resolvedAt = obj["resolvedAt"]?.stringValue
         self.decision = obj["decision"]?.stringValue
         self.decidedBy = obj["decidedBy"]?.stringValue
-        if let value = obj["resolutionProvenance"], case .null = value {
-            self.resolutionProvenance = nil
-        } else if let value = obj["resolutionProvenance"] {
-            self.resolutionProvenance = ApprovalResolutionProvenance(json: value)
-        } else {
-            self.resolutionProvenance = nil
-        }
-        // Pending owner-review cards allow phone replies; terminal rows keep their saved flags.
-        if self.status == "pending",
-           SwiftNativeApprovalInbox.ownerReviewActions.contains(self.action) {
-            self.remoteResolvable = true
-            self.localOnly = false
-        } else {
-            self.remoteResolvable = obj["remoteResolvable"]?.boolValue ?? false
-            self.localOnly = obj["localOnly"]?.boolValue ?? false
-        }
-        // Preserve the saved execution outcome's shape.
-        if let v = obj["executedAction"], case .null = v {
-            self.executedAction = nil
-        } else if let v = obj["executedAction"] {
-            self.executedAction = v
-        } else {
-            self.executedAction = nil
-        }
+        self.resolutionProvenance = obj["resolutionProvenance"].flatMap(ApprovalResolutionProvenance.init(json:))
+        self.remoteResolvable = remoteResolvable
+        self.localOnly = localOnly
+        self.executedAction = obj["executedAction"]
         self.executionDetail = obj["detail"]?.stringValue
         self.cause = obj["cause"]?.stringValue
         self.chatContinuation = obj["chatContinuation"]
@@ -262,7 +300,7 @@ extension ApprovalRecord {
     ///
     /// `executedAction` and `detail` are OMITTED when nil (not written as
     /// null) — these keys are added after action execution.
-    public func toJSON() -> JSONValue {
+    public func toJSON(forStorage: Bool = false) -> JSONValue {
         var obj: [String: JSONValue] = [
             "id": .string(id),
             "title": .string(title),
@@ -271,7 +309,7 @@ extension ApprovalRecord {
             "reason": .string(reason),
             "status": .string(status),
             "payload": payload,
-            "payloadPreview": .string(payloadPreview),
+            "payloadPreview": .string(forStorage ? recordedPayloadPreview : payloadPreview),
             "createdAt": .string(createdAt),
             "remoteResolvable": .bool(remoteResolvable),
             "localOnly": .bool(localOnly),

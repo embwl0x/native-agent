@@ -8,11 +8,6 @@ extension MemoryStorage {
     // Repair and cursor commit together; every row is visited without advancing past failed repairs.
     public func repairSupersededTombstones() async throws {
         try await dbPool.write { db in
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS proposal_repair_cursor (singleton INTEGER PRIMARY KEY, stamp TEXT NOT NULL, id TEXT NOT NULL);
-                CREATE INDEX IF NOT EXISTS proposals_repair_order ON proposals
-                (COALESCE(json_extract(metadata_json, '$.supersededAt'), resolved_at, staged_at), id);
-                """)
             let cursor = try Row.fetchOne(db, sql: "SELECT stamp, id FROM proposal_repair_cursor WHERE singleton = 1")
             let stamp: String = cursor?["stamp"] ?? ""
             let id: String = cursor?["id"] ?? ""
@@ -171,6 +166,7 @@ extension MemoryStorage {
                     UPDATE proposals SET metadata_json = ?
                     WHERE id = ? AND status = 'pending'
                 """, arguments: [Self.encodeMetadata(merged), existing.id])
+                try Self.recordProposedCorrection(proposal, on: existing.id, in: db)
                 return try Row.fetchOne(
                     db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [existing.id]
                 ).map(Self.decodeProposal)
@@ -194,6 +190,7 @@ extension MemoryStorage {
                 Self.encodeMetadata(proposal.metadata),
                 proposal.embeddingEpoch
             ])
+            try Self.recordProposedCorrection(proposal, on: proposal.id, in: db)
             try Self.pruneTerminalProposals(in: db)
             return proposal
         }
@@ -218,6 +215,7 @@ extension MemoryStorage {
             guard proposal.status == "pending" else {
                 throw MemoryStorageError.alreadyResolved(id)
             }
+            let stampedConfidence = try MemoryProposalEvidence.confidence(in: proposal.metadata)
             let provenance = MemorySenseProvenance.merging(existing: proposal.metadata, incoming: turnProvenance)
             if !provenance.isEmpty {
                 var metadata: [String: JSONValue] = [:]
@@ -244,9 +242,9 @@ extension MemoryStorage {
             if let pe = proposal.embedding,
                try Self.tombstoneMatch(
                    db: db,
+                   content: proposal.content,
                    query: pe,
-                   queryEpoch: proposal.embeddingEpoch,
-                   threshold: memoryNearVerbatimSimilarity
+                   queryEpoch: proposal.embeddingEpoch
                ) {
                 try db.execute(sql: """
                     UPDATE proposals SET status = 'rejected', resolved_at = ?, rejection_reason = ?
@@ -256,7 +254,7 @@ extension MemoryStorage {
                 return .tombstoned
             }
             let now = Self.nowISO8601()
-            // Preserve the proposal's confidence and kind, defaulting absent confidence to 1.0.
+            // Preserve the checked proposal confidence and its recorded kind.
             let proposalMeta: [String: JSONValue] = {
                 if case .object(let o)? = proposal.metadata { return o }
                 return [:]
@@ -284,19 +282,6 @@ extension MemoryStorage {
                     }
                 }
             }
-            let stampedConfidence: Double = {
-                // Accept double, int and numeric-string confidence, clamp to 0...1; absent or unparseable defaults to 1.0.
-                let raw: Double? = {
-                    switch proposalMeta["confidence"] {
-                    case .double(let d)?: return d
-                    case .int(let i)?: return Double(i)
-                    case .string(let s)?: return Double(s.trimmingCharacters(in: .whitespaces))
-                    default: return nil
-                    }
-                }()
-                guard let raw else { return 1.0 }
-                return min(max(raw, 0.0), 1.0)
-            }()
             let mem = StoredMemory(
                 id: proposal.id,
                 content: proposal.content,
@@ -308,16 +293,26 @@ extension MemoryStorage {
                 embedding: proposal.embedding,
                 embeddingEpoch: proposal.embeddingEpoch,
                 status: "active",
-                validFrom: Self.metadataString(proposalMeta, "valid_from", fallback: "validFrom"),
-                validTo: Self.metadataString(proposalMeta, "valid_to", fallback: "validTo"),
-                observedAt: Self.metadataString(proposalMeta, "observed_at", fallback: "observedAt"),
+                validFrom: proposalMeta["valid_from"]?.stringValue,
+                validTo: proposalMeta["valid_to"]?.stringValue,
+                observedAt: proposalMeta["observed_at"]?.stringValue,
                 evidence: proposalMeta["evidence"],
                 // Promotion preserves supplied kinds and defaults missing kinds to "general" (no decay or supersession).
                 // Keep the writer's named date as supplied in the proposal.
                 metadata: MemoryKindStamp.stampingDefaultKind(proposal.metadata)
             )
             try Self.validateTemporalEvidence(mem)
-            try Self.executeMemoryInsert(mem, in: db)
+            try Self.recordProposedCorrection(proposal, on: proposal.id, in: db)
+            try Self.executeMemoryInsert(mem, in: db, recordCorrection: false)
+            // Pending merges keep every incoming origin. Acceptance transfers
+            // that full evidence, not recurrence_count or the latest metadata.
+            try db.execute(sql: """
+                INSERT INTO correction_occurrences (memory_id, origin_id, at, occurred_at, session_id, history)
+                SELECT ?, origin_id, at, occurred_at, session_id, history
+                FROM correction_proposal_occurrences WHERE proposal_id = ?
+                ON CONFLICT(memory_id, origin_id) DO NOTHING
+                """, arguments: [mem.id, proposal.id])
+            try db.execute(sql: "DELETE FROM correction_proposal_occurrences WHERE proposal_id = ?", arguments: [proposal.id])
             try db.execute(sql: """
                 UPDATE proposals SET status = 'accepted', resolved_at = ? WHERE id = ?
             """, arguments: [now, id])

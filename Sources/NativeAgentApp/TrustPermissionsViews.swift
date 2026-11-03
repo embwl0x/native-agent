@@ -42,7 +42,7 @@ struct ChromeControlPermissionsView: View {
                     Text("Chrome control")
                         .font(ShellType.rowTitle)
                         .foregroundStyle(NativeAgentShell.text)
-                    Text("I use Chrome while you are signed in. I can open background tabs or work in a selected tab. I stop using a tab when you interact with it and check this permission before every action.")
+                    Text("I use Chrome while you are signed in, working in inactive tabs owned by my tab group. Selecting a tab or interacting with it gives it back to you. I check this permission before every action.")
                         .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)

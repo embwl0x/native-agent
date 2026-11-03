@@ -14,7 +14,7 @@ import AppToolRuntime
 import DeviceSync
 import AttentionRouting
 import MacIntegration
-// Blueprint: | `ConnectorActions.swift` | `ConnectorActions` struct; `runConnectorAction` uses shared admission, input values and approval replay; native work journal/handoff reads, redaction before display bounds and original Git reads; work snapshots return directly without unused latest.json/codex_daily.jsonl copies; credential-bearing text never enters a part |
+// Blueprint: | `ConnectorActions.swift` | `ConnectorActions` uses shared admission, input values and approval replay; CodexHandoff owns handoff identity, direct read failures throw while work journals retain project rows with a named handoff gap and partial status; native reads redact before display bounds; work snapshots return directly without unused copies; credential-bearing text never enters a part |
 
 /// Connector action policy, orchestration and receipts. Platform effects are supplied by the host.
 public struct ConnectorActions: Sendable {
@@ -156,7 +156,7 @@ public struct ConnectorActions: Sendable {
     }
 
     public func runMacSpotlightSearch(input: [String: JSONValue], toolName: String = "mac.spotlight_search") async throws -> JSONValue {
-        let query = (input["query"] ?? input["q"])?.scalarText ?? ""
+        let query = input["query"]?.scalarText ?? ""
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NSError(domain: "NativeAgentSwiftOnly", code: -400, userInfo: [
                 NSLocalizedDescriptionKey: "\(toolName) requires query"
@@ -191,7 +191,7 @@ public struct ConnectorActions: Sendable {
         var obj = receipt.deliveryFields()
         obj.merge([
             "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "messagePreview": .string(NativeAppSecretRedactor.redactText(String(message.prefix(200)))),
+            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
         ]) { _, new in new }
         return .object(obj)
     }
@@ -222,7 +222,7 @@ public struct ConnectorActions: Sendable {
     }
 
     public static func runSchedulerCancelJob(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
-        let jobId = (input["jobId"] ?? input["job_id"] ?? input["id"])?.scalarText?
+        let jobId = input["jobId"]?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let writer = makeSchedulerJobWriter(dataRoot: dataRoot)
         let result = try await writer.cancelJob(jobId: jobId)
@@ -238,12 +238,12 @@ public struct ConnectorActions: Sendable {
 
     public static func readCodexHandoff(input: [String: JSONValue]) throws -> JSONValue {
         let includeText = ConnectorInputValue.bool(input["includeText"], default: false)
-        let maxChars = max(500, min(Self.connectorInputInt(input["maxChars"], default: 8_000), 50_000))
-        let maxEntries = max(1, min(Self.connectorInputInt(input["maxEntries"], default: 5), 25))
-        let maxEntryChars = max(500, min(Self.connectorInputInt(input["maxEntryChars"], default: 2_000), 10_000))
-        let path = Self.codexHandoffPath()
+        let maxChars = max(500, min(try Self.connectorInputInt(input["maxChars"], default: 8_000), 50_000))
+        let maxEntries = max(1, min(try Self.connectorInputInt(input["maxEntries"], default: 5), 25))
+        let maxEntryChars = max(500, min(try Self.connectorInputInt(input["maxEntryChars"], default: 2_000), 10_000))
+        let path = CodexHandoff.path
         var entry = stat()
-        let exists = lstat(path.path, &entry) == 0
+        let exists = stat(path.path, &entry) == 0
         if !exists, errno != ENOENT {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: path.path])
         }
@@ -254,7 +254,8 @@ public struct ConnectorActions: Sendable {
             "status": .string(exists ? "available" : "missing"),
             "path": .string(path.path),
             "exists": .bool(exists),
-            "updatedAt": .string(Self.fileModifiedISO(path) ?? ""),
+            "updatedAt": exists ? .string(SwiftNativeManifestSigner.isoTimestamp(Date(
+                timeIntervalSince1970: Double(entry.st_mtimespec.tv_sec) + Double(entry.st_mtimespec.tv_nsec) / 1_000_000_000))) : .null,
             "entryCount": .int(Int64(entries.count)),
             "entries": .array(entries.map { .string($0) }),
         ]
@@ -265,9 +266,9 @@ public struct ConnectorActions: Sendable {
     }
 
     public func runCodexWorkJournal(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
-        let days = max(1, min(Self.connectorInputInt(input["days"], default: 1), 30))
-        let maxProjects = max(1, min(Self.connectorInputInt(input["maxProjects"], default: 40), 100))
-        let maxCommits = max(1, min(Self.connectorInputInt(input["maxCommitsPerProject"], default: 8), 25))
+        let days = max(1, min(try Self.connectorInputInt(input["days"], default: 1), 30))
+        let maxProjects = max(1, min(try Self.connectorInputInt(input["maxProjects"], default: 40), 100))
+        let maxCommits = max(1, min(try Self.connectorInputInt(input["maxCommitsPerProject"], default: 8), 25))
         let roots = try await Self.codexJournalRoots(input: input, maxProjects: maxProjects, dataRoot: dataRoot)
 
         var projectRows: [JSONValue] = []
@@ -285,13 +286,17 @@ public struct ConnectorActions: Sendable {
                 "maxEntryChars": .int(1200),
             ])
         } catch {
-            handoff = .object(["status": .string("unavailable"),
-                               "error": .string(NativeAppSecretRedactor.redactText(error.localizedDescription))])
+            // This source's failure does not invalidate the collected Git evidence.
+            handoff = .object([
+                "status": .string("unavailable"),
+                "path": .string(CodexHandoff.path.path),
+                "error": .string(error.localizedDescription),
+            ])
         }
         let generatedAt = SwiftNativeManifestSigner.isoTimestamp(Date())
         let snapshot = NativeAppSecretRedactor.redactValue(.object([
             "id": .string("codex-work-\(UUID().uuidString.lowercased())"),
-            "status": .string("completed"),
+            "status": .string(handoff.objectValue?["status"] == .string("available") ? "completed" : "partial"),
             "generatedAt": .string(generatedAt),
             "days": .int(Int64(days)),
             "projectCount": .int(Int64(projectRows.count)),
@@ -301,28 +306,6 @@ public struct ConnectorActions: Sendable {
         ]))
 
         return snapshot
-    }
-
-    private static func codexHandoffPath() -> URL {
-        let fm = FileManager.default
-        if let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_CODEX_HANDOFF_PATH"],
-           !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return URL(fileURLWithPath: raw)
-        }
-        let home = fm.homeDirectoryForCurrentUser
-        let generic = home.appendingPathComponent("CODEX_HANDOFF.md")
-        if fm.fileExists(atPath: generic.path) {
-            return generic
-        }
-        if let entries = try? fm.contentsOfDirectory(atPath: home.path) {
-            let candidates = entries
-                .filter { $0.hasPrefix("CODEX_HANDOFF_FOR_") && $0.hasSuffix(".md") }
-                .sorted()
-            if let first = candidates.first {
-                return home.appendingPathComponent(first)
-            }
-        }
-        return generic
     }
 
     public static func codexJournalRoots(
@@ -343,11 +326,11 @@ public struct ConnectorActions: Sendable {
         if ConnectorInputValue.bool(input["includeProjectsDirectory"], default: true) {
             let projects = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Projects", isDirectory: true)
-            let children = (try? FileManager.default.contentsOfDirectory(
+            let children = try FileManager.default.contentsOfDirectory(
                 at: projects,
                 includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles]
-            )) ?? []
+            )
             for child in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
                 if FileManager.default.fileExists(atPath: child.appendingPathComponent(".git").path) {
                     candidates.append(child)
@@ -422,7 +405,7 @@ public struct ConnectorActions: Sendable {
         let statusLines = status.stdout
             .split(whereSeparator: \.isNewline)
             .map { NativeAppSecretRedactor.redactText(String($0)) }
-        let commits = Self.parseCodexJournalCommits(log.stdout)
+        let commits = try Self.parseCodexJournalCommits(log.stdout)
 
         return .object([
             "name": .string(repoRoot.lastPathComponent),
@@ -437,11 +420,13 @@ public struct ConnectorActions: Sendable {
         ])
     }
 
-    public static func parseCodexJournalCommits(_ raw: String) -> [JSONValue] {
-        raw.split(whereSeparator: \.isNewline).compactMap { line in
+    public static func parseCodexJournalCommits(_ raw: String) throws -> [JSONValue] {
+        try raw.split(whereSeparator: \.isNewline).map { line in
             let parts = String(line).split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
-            guard parts.count >= 5 else { return nil }
-            let epoch = TimeInterval(parts[2]) ?? 0
+            guard parts.count == 5, let epoch = TimeInterval(parts[2]), epoch.isFinite else {
+                throw NSError(domain: "NativeAgentJournal", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Git returned a malformed commit row. Repair the journal's git-output reader before using these dates."])
+            }
             return .object([
                 "sha": .string(parts[0]),
                 "shortSha": .string(parts[1]),
@@ -463,20 +448,8 @@ public struct ConnectorActions: Sendable {
         }
     }
 
-    public static func fileModifiedISO(_ path: URL) -> String? {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
-              let date = attrs[.modificationDate] as? Date else { return nil }
-        return SwiftNativeManifestSigner.isoTimestamp(date)
-    }
-
-    public static func connectorInputInt(_ raw: JSONValue?, default defaultValue: Int) -> Int {
-        switch raw {
-        case .int(let i): return Int(i)
-        case .double(let d): return Int(exactly: d.rounded(.towardZero)) ?? defaultValue
-        case .string(let s): return Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) ?? defaultValue
-        case .bool(let b): return b ? 1 : 0
-        default: return defaultValue
-        }
+    public static func connectorInputInt(_ raw: JSONValue?, default defaultValue: Int) throws -> Int {
+        try MacAppleScriptBridge.clampedInt(raw, defaultValue: defaultValue, min: Int.min, max: Int.max)
     }
 
     public static func connectorInputStringArray(_ raw: JSONValue?) -> [String] {
@@ -485,7 +458,7 @@ public struct ConnectorActions: Sendable {
     }
 
     public func connectorStatusActionOutput(_ descriptor: ConnectorActionDescriptor) async throws -> JSONValue {
-        let action = await platform.statusEvidence(actionID: descriptor.id)
+        let action = try await platform.statusEvidence(actionID: descriptor.id)
         return .object([
             "actionId": .string(descriptor.id),
             "connectorId": .string(descriptor.connectorId),

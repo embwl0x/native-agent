@@ -29,7 +29,9 @@ enum MacIntegrationPermissionLoadPresentation: Equatable {
     case controlsAvailable
     case unavailable(detail: String, retrying: Bool)
 
-    static func resolve(isLoading: Bool, loadError: String?) -> Self {
+    /// A refresh with switches already on screen keeps them there: swapping the
+    /// list for a loading line collapses the page and jumps its scroll.
+    static func resolve(isLoading: Bool, loadError: String?, hasLoaded: Bool = false) -> Self {
         if let loadError {
             let detail = loadError.trimmingCharacters(in: .whitespacesAndNewlines)
             return .unavailable(
@@ -39,7 +41,7 @@ enum MacIntegrationPermissionLoadPresentation: Equatable {
                 retrying: isLoading
             )
         }
-        return isLoading ? .loading : .controlsAvailable
+        return isLoading && !hasLoaded ? .loading : .controlsAvailable
     }
 }
 
@@ -157,7 +159,8 @@ struct MacIntegrationView: View {
 
                 switch MacIntegrationPermissionLoadPresentation.resolve(
                     isLoading: isLoading,
-                    loadError: permissionLoadError
+                    loadError: permissionLoadError,
+                    hasLoaded: !permissions.isEmpty
                 ) {
                 case .loading:
                     HStack(spacing: 8) {
@@ -452,8 +455,10 @@ struct MacIntegrationView: View {
     }
 
     private func requestPermissions(_ ids: [String]) async {
-        let problems = await SystemPermissionPreflight.requestMacOSAccess(ids)
-        permissionRequestError = problems.isEmpty ? nil : problems.joined(separator: " ")
+        do {
+            let problems = try await SystemPermissionPreflight.requestMacOSAccess(ids)
+            permissionRequestError = problems.isEmpty ? nil : problems.joined(separator: " ")
+        } catch { permissionRequestError = error.localizedDescription }
         await projection.refresh()
     }
 

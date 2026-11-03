@@ -4,7 +4,9 @@ import PersistenceCore
 import AppKit
 import Experiences
 import CryptoKit
-// Blueprint: | `MacFourVerbs+Act.swift` | `MacFourVerbs`: `act`, `addAttention`, `frontChangedWords`; named/exact act dispatch, repetition and semantic/physical effect receipts |
+import NativeAgentShared
+import Senses
+// Blueprint: | `MacFourVerbs+Act.swift` | `MacFourVerbs`: `act`, `addAttention`; named acts inherit or establish the call deadline before queueing, with bounded repetition and semantic/physical effect receipts |
 
 extension MacFourVerbs {
     // MARK: 2 — HANDS
@@ -42,6 +44,59 @@ extension MacFourVerbs {
         /// A place on an image instead of a target name.
         place: MacImagePlace? = nil
     ) async -> MacFourVerbsReply {
+        if let seconds, !seconds.isFinite || !(0...10).contains(seconds) {
+            return .init(ok: false, text: "seconds must be a finite number in 0...10; nothing was sent.",
+                detail: ["error": .string("invalid_duration"), "effects": .string("none")])
+        }
+        if let interval, !interval.isFinite || interval < 0 {
+            return .init(ok: false, text: "interval must be a finite nonnegative number; nothing was sent.",
+                detail: ["error": .string("invalid_interval"), "effects": .string("none")])
+        }
+        if TaskWaitDeadline.current == nil {
+            do {
+                return try await TaskWaitDeadline.withDeadline(
+                    seconds: Double(SwiftNativeMacControl.operationTimeoutSeconds(action: "act", body: [:]))
+                ) {
+                    await self.act(verb: rawVerb, target: target, text: text, mode: mode,
+                        to: destination, toApp: destinationApp, seconds: seconds,
+                        repeat: requestedRepeat, interval: interval, holding: holding,
+                        button: button, scrollAmount: scrollAmount, app: app, front: front,
+                        steps: steps, again: again, place: place)
+                }
+            } catch {
+                return Self.interruptedActReply(error)
+            }
+        }
+        if let flowRoot, MacAppActGate.dataRoot != flowRoot {
+            return await MacAppActGate.$dataRoot.withValue(flowRoot) {
+                await act(verb: rawVerb, target: target, text: text, mode: mode, to: destination,
+                    toApp: destinationApp, seconds: seconds, repeat: requestedRepeat, interval: interval,
+                    holding: holding, button: button, scrollAmount: scrollAmount, app: app, front: front,
+                    steps: steps, again: again, place: place)
+            }
+        }
+        if !steps.isEmpty, MacLookFrameStore.batchFrames == nil {
+            var frames: [String: MacLookFrame] = [:]
+            for id in Set(steps.compactMap(\.frameID)) {
+                if let frame = await MacLookFrameStore.shared.frame(frameId: id) { frames[id] = frame }
+            }
+            return await MacLookFrameStore.$batchFrames.withValue(frames) {
+                await act(verb: rawVerb, target: target, text: text, mode: mode, to: destination,
+                    toApp: destinationApp, seconds: seconds, repeat: requestedRepeat, interval: interval,
+                    holding: holding, button: button, scrollAmount: scrollAmount, app: app, front: front,
+                    steps: steps, again: again, place: place)
+            }
+        }
+        let request: [String: JSONValue] = ["verb": .string(rawVerb), "app": app.map(JSONValue.string) ?? .null,
+                                           "holding": holding.map(JSONValue.string) ?? .null]
+        do {
+            if steps.isEmpty, let refusal = try await MacAppActGate.requestRefusal(tool: "act", input: request, dataRoot: MacAppActGate.dataRoot) {
+                return MacFourVerbsReply(ok: false, text: refusal.message, detail: refusal.fields)
+            }
+        } catch {
+            return MacFourVerbsReply(ok: false, text: "The action was cancelled before it started.",
+                detail: ["status": .string("cancelled"), "effects": .string("none")])
+        }
         let started = ContinuousClock.now
         let reply = await { () async -> MacFourVerbsReply in
             if steps.isEmpty, Self.parseVerb(rawVerb).0 == "key",
@@ -56,7 +111,14 @@ extension MacFourVerbs {
                                 "app": .string(app ?? target), "verb": .string("key"), "target": .string(holding)])])])])
             }
             if MacDriverContext.binding == nil {
-                let binding = await MacAttentionSessionStore.shared.bindDriver()
+                let binding: MacDriverBinding
+                do { binding = try await MacAttentionSessionStore.shared.bindDriver() }
+                catch {
+                    let failure = SenseFailure(error)
+                    return .init(ok: false, text: failure.message, detail: [
+                        "error": .string(failure.code), "effects": .string("none"),
+                        "remedy": failure.remedy ?? .null])
+                }
                 return await withTaskCancellationHandler {
                     defer { binding.releaseHeldInputs() }
                     return await MacDriverContext.$binding.withValue(binding) {
@@ -74,8 +136,10 @@ extension MacFourVerbs {
             await MacActSerial.shared.ownInputs(MacDriverContext.binding)
             let acted: MacFourVerbsReply = await Self.$holdsActSerial.withValue(true) {
             let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
-            if let refusal = continuation?.refusal() {
-                return .init(ok: false, text: refusal, detail: ["error": .string("continuation_unavailable")])
+            if let continuation, let refusal = continuation.refusal() {
+                var detail: [String: JSONValue] = ["error": .string("continuation_unavailable")]
+                detail["remedy"] = continuation.refusalOutput(refusal)["remedy"]
+                return .init(ok: false, text: refusal, detail: detail)
             }
             if let continuation, let app, let captured = continuation.app,
                app.caseInsensitiveCompare(captured.name) != .orderedSame,
@@ -98,7 +162,13 @@ extension MacFourVerbs {
             if let root = flowRoot, let session = flowSession {
                 let scope = Self.actFlowScope(session)
                 // The app is the anchor, or the one in front when the batch runs there.
-                flow = ActFlow(digests: Self.actStepDigests(steps, app: anchor ?? NSWorkspace.shared.frontmostApplication?.bundleIdentifier))
+                do {
+                    flow = ActFlow(digests: try Self.actStepDigests(steps, app: anchor ?? NSWorkspace.shared.frontmostApplication?.bundleIdentifier))
+                } catch {
+                    return .init(ok: false,
+                        text: "I couldn't encode these action steps (\(error.localizedDescription)); none ran. Correct the supplied values before continuing.",
+                        detail: ["error": .string("act_steps_encoding_failed"), "effects": .string("none")])
+                }
                 if !again, !steps.isEmpty {
                     let open: Experience?
                     do { open = try await Flow.open(root, scope: scope) } catch {
@@ -146,6 +216,8 @@ extension MacFourVerbs {
                 // The first step still to do; the kept ones are not looked for.
                 guard let at = steps.indices.first(where: { flow?.kept($0) != true }) else { return nil }
                 let first = steps[at]
+                // Exact selections resolve through the action owner, never as names.
+                if first.handle != nil || first.place != nil { return nil }
                 // An optional first step ("OK?") that isn't here is skipped once
                 // raised, like any optional step — it never stops the batch here.
                 if first.target.hasSuffix("?"), first.target.count > 1 { return nil }
@@ -172,7 +244,7 @@ extension MacFourVerbs {
                 reply = MacFourVerbsReply(ok: true, text: ([String(lines[0]), Self.oneCallNudge] + lines.dropFirst().map(String.init))
                     .joined(separator: "\n"), detail: reply.detail)
             }
-            if !mayRaise, menuOrKey, Self.string(reply.detail["error"]) == "no_window_in_app" {
+            if !mayRaise, menuOrKey, Self.windowlessApp(reply.detail) {
                 let reason = "\(anchor) has no window, so its menu bar or keys need it in front"
                 reply = MacFourVerbsReply(
                     ok: false,
@@ -184,18 +256,7 @@ extension MacFourVerbs {
                     ]) { _, new in new }
                 )
             }
-            // Electron/Chromium: the enhanced-AX flag was only for this act.
-            let release = await settlementDispatch(action: "look", body: [
-                "app": .string(anchor), "release_enhanced_ax": .bool(true),
-            ])
-            guard Self.bool(Self.object(release?.output)["enhanced_ax_still_on"]) == true else {
-                return Self.withUncertainActionOutcome(reply)
-            }
-            return Self.withUncertainActionOutcome(MacFourVerbsReply(
-                ok: reply.ok,
-                text: reply.text + "\n(\(anchor)'s screen-reader accessibility mode did not switch back off; I'll retry next time.)",
-                detail: reply.detail.merging(["enhanced_ax_still_on": .bool(true)]) { _, new in new }
-            ))
+            return Self.withUncertainActionOutcome(reply)
             }
             return await settle {
                 let failures = await MacAppMapStore.shared.flush()
@@ -209,10 +270,23 @@ extension MacFourVerbs {
                     detail: detail)
             }
         }()
+        if let refusal = MacDriverContext.binding?.takeAppActRefusal() {
+            return MacFourVerbsReply(ok: false, text: refusal.message, detail: refusal.fields)
+        }
         var detail = reply.detail
         let elapsed = started.duration(to: .now).components
         detail["duration_ms"] = .int(elapsed.seconds * 1000 + elapsed.attoseconds / 1_000_000_000_000_000)
         return MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail)
+    }
+
+    static func interruptedActReply(_ error: Error) -> MacFourVerbsReply {
+        let timedOut = error is TaskWaitDeadline.Exceeded
+        return .init(ok: false,
+            text: timedOut
+                ? "The action timed out and cancellation was requested. Earlier input or changes may have reached the app; completion was not verified. Inspect the app before another action."
+                : "The action was cancelled. Earlier input or changes may have reached the app; inspect it before another action.",
+            detail: ["error": .string(timedOut ? "timed_out" : "cancelled"),
+                "timed_out": .bool(timedOut), "effects": .string("unknown"), "verification": .string("unverified")])
     }
 
     private func actCore(
@@ -249,39 +323,14 @@ extension MacFourVerbs {
             : Self.maximumActRepeats
         let attempts = min(accepted, durationBound)
         if attempts == 1 {
-            let observed = SightCarry()
             let first = SightCarry()
             first.last = seen
-            func attempt(_ expected: FrontExpectation?, capture: SightCarry?, carry: SightCarry? = nil) async -> MacFourVerbsReply { await actOnce(
-                verb: rawVerb,
-                target: target,
-                text: text,
-                mode: mode,
-                to: destination,
-                toApp: destinationApp,
-                seconds: seconds,
-                holding: holding,
-                button: button,
-                scrollAmount: scrollAmount,
-                attention: nil,
-                app: app,
-                expect: expected,
-                carry: carry,
-                retrySighting: capture,
-                place: place
-            ) }
-            let reply = await attempt(expect, capture: observed, carry: first)
-            let error = Self.string(reply.detail["error"])
-            // These exact refusals happen before input is delivered. A second
-            // actOnce takes one fresh look and resolves the same name again;
-            // it never reuses the old handle or point. Other failures may have
-            // acted, so they cannot authorize another dispatch.
-            guard !reply.ok, error.map({ ["no_match", "handle_drifted", "window_drifted",
-                                         "frame_window_gone", "stale_frame"].contains($0) }) == true,
-                  let seen = observed.last, let pid = seen.pid else {
-                return reply
-            }
-            return await attempt((pid, seen.windowFrame ?? expect?.frame), capture: nil)
+            return await actOnce(
+                verb: rawVerb, target: target, text: text, mode: mode,
+                to: destination, toApp: destinationApp, seconds: seconds,
+                holding: holding, button: button, scrollAmount: scrollAmount,
+                attention: nil, app: app, expect: expect, carry: first, place: place
+            )
         }
 
         let attention: BurstAttention
@@ -337,18 +386,23 @@ extension MacFourVerbs {
                 await clock.sleep(seconds: min(pause, remaining))
             }
         }
-        if attention.owned {
-            _ = try? await host.dispatch(action: "attention", body: ["mode": .string("stop")])
-        }
+        let release = attention.owned ? await settlementDispatch(action: "attention", body: [
+            "mode": .string("stop"), "session": .string(attention.session),
+        ]) : nil
 
         guard let finalReply else {
             return MacFourVerbsReply(
                 ok: false,
                 text: "The repeated act was cancelled before the first attempt.",
-                detail: ["error": .string("cancelled")]
+                detail: ["error": .string("cancelled"),
+                         "attention_release": release?.toJSON() ?? .null]
             )
         }
         var detail = finalReply.detail
+        if attention.owned {
+            detail["attention_release"] = release?.toJSON() ?? .object([
+                "error": .string("attention_release_unavailable"), "session": .string(attention.session)])
+        }
         detail["repeat_requested"] = .int(Int64(requested))
         detail["repeat_requested_input"] = .int(Int64(requestedInput))
         detail["repeat_accepted"] = .int(Int64(accepted))
@@ -404,6 +458,8 @@ extension MacFourVerbs {
         let status = string(reply.detail["status"])
         let state = string(reply.detail["operationState"])
         return !reply.ok && (inputLeftTheHand(reply)
+            || bool(reply.detail["ax_emission_attempted"]) == true
+            || array(reply.detail["ax_outcomes"]).contains { bool(object($0)["ax_emission_attempted"]) == true }
             || bool(reply.detail["ax_delivered"]) == true
             || bool(reply.detail["outcome_unknown"]) == true
             || status.map({ ["wrong_target", "acted_on_different_target", "acted_mismatch", "acted_unobserved", "outcome_unknown"].contains($0) }) == true
@@ -462,9 +518,14 @@ extension MacFourVerbs {
                 "duration_seconds": .int(Int64(Self.maximumActBurstSeconds)),
             ])
             guard let created = lease(from: started, owned: true) else {
-                return .failure(Self.bool(Self.object(Self.object(started.output)["attention"])["yield_required"]) == true
+                var cause = Self.bool(Self.object(Self.object(started.output)["attention"])["yield_required"]) == true
                     ? MacAttentionSessionStore.driverRefusal
-                    : "The Mac's bounded human-takeover observer did not become ready.")
+                    : "The Mac's bounded human-takeover observer did not become ready."
+                if let session = Self.string(Self.object(started.output)["requested_session"]) {
+                    let release = await settlementDispatch(action: "attention", body: ["mode": .string("stop"), "session": .string(session)])
+                    if release?.ok != true { cause += " Attention release failed: " + (release?.error ?? "no settlement result") }
+                }
+                return .failure(cause)
             }
             return .success(created)
         } catch {

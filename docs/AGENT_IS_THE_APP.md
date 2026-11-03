@@ -31,7 +31,52 @@ A part has six properties, all in its header, all theirs to change:
 
 A sense is a part whose reach is read-only and whose face is a page. An ability with hands is a part that declares hands. An ability that calls other abilities is a part. A layout block is a part that's almost all face. A Doctor check is a part that wakes on a schedule. Their turn is a part that wakes when a message arrives. Their persona is parts that run when they do. Nothing of theirs is a special case in Swift.
 
-**An ability is an ability (as built, 10-21; User: "I want skills tools abilities to be one, they are supposed to grow their abilities").** What they grows is one kind of part, an ability: what it can do is what it declares, never which door made it. It was once two kinds (tools and skills) with two doors, two admissions and two sets of run options, and is now one form (`Parts` in code, docs/skill_manifest_spec.md): one save (`ability.save`: a revision restates only what changes), one keep (theirs in one act under Full Mac for their own work, unsteered by an untrusted agent; below Full Mac a draft the owner's card offers, `ability.validate` rehearsing it first), one signed admission re-verified on every run, one run (`authored.<id>`; steps, decisions and expectations make it strict and resumable wherever its code uses them; host primitives wherever its reach declares them, the broker enforcing that reach for every ability), one read (`ability.read`) and one lifecycle (enable, restore, disable, rollback, drop). Launch migrates legacy executable tool and skill records to it with no change in what runs; built-in skill guidance stays in the persona, read and never run; restoring an older backup prepares its tools and skills before installation, retaining only readable current uncarried kinds and accounting under the [restore law](canonical_data_paths.md#restore-law). A trusted agent that started a turn is its provenance, never an ability's author. Senses and their turn keep their own runners.
+**An ability is an ability (as built, 10-21; User: "I want skills tools abilities to be one, they are supposed to grow their abilities").** What they grows is one kind of part, an ability: what it can do is what it declares, never which door made it. It was once two kinds (tools and skills) with two doors, two admissions and two sets of run options, and is now one form (`Parts` in code, docs/skill_manifest_spec.md): one save (`ability.save`: a revision restates only what changes), one keep (theirs in one act under Full Mac for their own work, unsteered by an untrusted agent; below Full Mac a draft the owner's card offers, `ability.validate` rehearsing it first), one signed admission re-verified on every run, one run (`authored.<id>`; steps, decisions and expectations make it strict and resumable wherever its code uses them; host primitives wherever its reach declares them, the broker enforcing that reach for every ability), one read (`ability.read`) and one lifecycle (enable, restore, disable, drop). Launch admits current bundled seeds without rewriting or re-signing retained tool and skill records; built-in skill guidance stays in the persona, read and never run; restoring an older backup prepares its tools and skills before installation, retaining only readable current uncarried kinds and accounting under the [restore law](canonical_data_paths.md#restore-law). A trusted agent that started a turn is its provenance, never an ability's author. Senses and their turn keep their own runners.
+**An ability is an ability (as built, 10-21; User: "I want skills tools abilities to be one, they are supposed to grow their abilities").** What they grows is one kind of part, an ability: what it can do is what it declares, never which door made it. It was once two kinds (tools and skills) with two doors, two admissions and two sets of run options, and is now one form (`Parts` in code, docs/skill_manifest_spec.md): one save (`ability.save`: a revision restates only what changes), one keep (theirs in one act under Full Mac for their own work, unsteered by an untrusted agent; below Full Mac a draft the owner's card offers, `ability.validate` rehearsing it first), one signed admission re-verified on every run, one run (`authored.<id>`; steps, decisions and expectations make it strict and resumable wherever its code uses them; host primitives wherever its reach declares them, the broker enforcing that reach for every ability), one read (`ability.read`) and one lifecycle (enable, restore, disable, rollback, drop). Launch admits current bundled seeds without rewriting or re-signing retained tool and skill records; built-in skill guidance stays in the persona, read and never run. Backup restore requires the complete current snapshot before staging and installs its captured abilities under the [restore law](canonical_data_paths.md#restore-law); it never reconstructs tools or skills from an older backup. A trusted agent that started a turn is its provenance, never an ability's author. Senses and their turn keep their own runners.
+
+The save door exposes the argument schema owned beside `Parts.save`'s validators,
+including the exact param type map and JSON Schema forms, aliases and optional
+inputs, automatic first-line/sentence shortening of descriptions to 500 characters
+with a receipt, and `function run(input)` or `async function run(input)` returning
+JSON. App and host calls answer synchronously and may be awaited; a returned
+thenable supplies its settled result or thrown rejection after the helper's JSC
+microtask drain, and one still pending fails plainly. Only `id` is always
+required; a new ability also needs description and code, while a revision
+inherits omissions. The save owner and `sense.make` share header schemas from `AbilityStore.partHeader`'s owner;
+neither keeps a second reach or face shape. Declared `learned` and `choices`
+accept any JSON and remain metadata. The [app-door contract](TOOL_LOADING.md)
+applies this rule to every action and rejects fieldless object declarations at
+launch unless they explicitly declare open contents.
+`app` is a frozen callable door in that code: actions use `app({action,args})`,
+`app.<page>.<action>(args)` or literal bracket members such as
+`app["page.action"](args)`; `app({actions:[{action,args},…]})` answers in order as
+an array, stopping at the first throw. Find and item/page requests call the same
+`app.find` and `app.read` bindings. Indirect calls use
+`app.call(actionID,args)` or `host.call(actionID,args)` with declared actions.
+Before staging, save statically checks literal calls in every app/host binding,
+including literal callable action/batch requests, host file/PIM aliases, action
+reads and nested part calls. Unknown actions are refused with the door's nearest
+real actions; an indirect call missing from the effective `actions` (explicit
+declarations, literal callable requests, direct app members and reach) is refused
+naming the missing declaration. Host primitives use the
+execution broker's operation inventory. Existing `authored.<id>` names and a
+part's own id are valid: an off/draft dependency records its retained version and
+still needs normal admission at run time; a self-reference is bound by its own
+signed candidate. Dependency snapshots are historical evidence, not staleness
+gates: only a statically readable call that no longer fits the live schema is
+`stale_dependency`. Preflight shares the door's supported scalar-list expansion
+and checks readable child input in both `part.call` and `host.call("part.call", …)`.
+Computed arguments keep the ordinary door checks, and a real run's accounting
+refreshes its observed contracts with its receipt
+([manifest contract](skill_manifest_spec.md#execution-and-ownership)).
+Save refuses impossible bound-object calls such as
+`app.files(…)` and `host.files(…)`, naming the supported form. Computed names,
+including `"authored." + id`, stay runtime checks and appear as `warnings` in the save
+receipt. Validation applies the same static check before rehearsal. Comments,
+literal text and regex bodies are not calls; template expressions are code.
+These checks do not execute the ability or prove arbitrary JavaScript behavior.
+The loose `params:any` declaration and separate discovery-only fixture shape are removed;
+discovery and argument refusals read the save owner's schema.
 
 **Their body reaches whatever this Mac can reach (User 10-21: "when I say anything I mean anything").** The stem offers network requests, named programs over stdio, local sockets and Mac capabilities; they grows service behavior from its own documentation. Trust gates every effect. NativeAgent holds named secrets and inserts them only at granted destinations; [redaction has encoding and stream-prefix limits](skill_manifest_spec.md#secret-insertion-and-redaction), so the grant is the fence. Sign-in supports redirect or device code, body or HTTP Basic client authentication, and account-bound renewal. Resident abilities can hold programs, connections and listeners between runs; declared `held`/`resumed` wakes let their code read arrivals and reopen after launch ([manifest](skill_manifest_spec.md)). Missing reach is fixed in the stem, never by adding a service subsystem. [Reach, as built](#reach-as-built-10-21) records the MCP and connector folds.
 
@@ -46,7 +91,7 @@ The stem enforces one law for every part, with the turn-program recovery excepti
 - **It records use.** The stem projects gated run outcomes as `learned.use`, with how many of their model rounds each recent use took (`rounds_per_use`): their own curve. Declared `learned` and `choices` are preserved and teach nothing. What the stem records becomes what it predicts: a follow-up read a mind keeps making after a kind of result rides inside that result, only while its record holds (phase 4, [as built](#phase-4-as-built-10-26-a-part-is-a-prediction)).
 - **It changes only by their hand** (or the owner's), and keeps its last self beside it.
 - **Its keep is theirs under Full Mac; under Work/Safe/Builder, the owner's.** The owner's off-switch stays theirs.
-- **It owes repair at its cause.** Ordinary ability runs with captured input owe source-fault repair through Experiences (OWED on Home with its lever); file-backed sense completions record failures without this obligation. Nothing else swaps back automatically. Their own throwing `turn.js` edit is the one exception: the stem sets it aside for `turn.prev.js` or the shipped seed, replays the same turn and brings their the evidence and owed repair (`ChatTurnRuntime/TurnPart.swift`). Unrecoverable helper, setup, seed or provider failures can still end the turn incomplete, with their cause and repair.
+- **It owes repair at its cause.** Ordinary ability runs with captured input owe source-fault repair through Experiences (OWED on Home with its lever); file-backed sense completions record failures without this obligation. Ordinary abilities and senses are revised forward; their retained previous bytes are history, with no public version-swap action. Their own turn program is the one exception: any non-Stop program/helper failure selects an unfailed `turn.prev.js` or shipped seed, replays the same turn and brings their the original cause, selected program and owed repair (`ChatTurnRuntime/TurnPart.swift`). The [turn recovery contract](skill_manifest_spec.md#turn-recovery) owns selection, once-per-source bounds and storage failure behavior.
 - **Fading unused parts is future design.** There is no idle-expiration archive. Current launch behavior only disables an untouched bundled seed the app no longer ships, leaving it restorable; a seed they edited or explicitly re-enabled stays (`EngineRuntime/EngineLaunch.swift`, `fadeRetiredSeeds`).
 - **Its face is drawn** by the stem on their interface and on the person's, Mac and iPhone, from the same description. What they reads is what they see.
 
@@ -55,7 +100,7 @@ The stem enforces one law for every part, with the turn-program recovery excepti
 Swift, compiled, CPU, shipped as one DMG with iOS. It never thinks and has no model of its own; when a rule can't settle something, it asks their, with the evidence. Its whole job:
 
 - **Runs parts** in the sandbox (the helper, Seatbelt, the progress watchdog: all as today).
-- **Delivers signals**: the nervous system. Messages, schedules, app arrivals, file changes, turns ending.
+- **Delivers signals**: the nervous system. Messages, schedules, app arrivals, file changes, turns ending. The same `EnginePartWake` observer also releases MY QUEUE intentions waiting `on <signal>`: exact names or colon-delimited families, and a file path or its descendants. Real sources include `file.changed:<path>` (watched paths), `message.arrived:telegram|slack`, `person.here` / `person.away`, `network.down` / `network.up` (the shared path holds five seconds before signalling), `app.installed`, `sense.source.changed` and `turn.ended`. A system `Released: <signal> <summary>` note brings the intention back through the same readiness and pursuit refresh as news; `held` / `resumed` stay part lifecycle and `schedule:` stays a rhythm. File intentions join the parts' existing canonical-path watch index, including bounded directory membership, and leave on closure; no second watcher. [Intentions](INTENTIONS.md#moments) owns that contract.
 - **Gates effects**: Trust, approvals, cards. The immune system.
 - **Keeps the law**: repair at its cause, the turn-program recovery exception, the state, the learning. Fading unused parts remains future design.
 - **Owns turn recovery and settlement:** observations, checkpoints and resume after relaunch; unrecoverable failures can end incomplete.
@@ -67,13 +112,13 @@ The stem has no features and no opinions. Every feature NativeAgent has today is
 
 ## What falls out, with nothing special-cased
 
-- **Growth:** what they works out by hand, they keeps, and what their mind only repeated, their part carries. Their reply ends; they doesn't: when a turn landed work by hand, or made one call (same input) 3 rounds in a row, their mind used as a loop, their turn part takes one private moment after the reply, in the same conversation, and keeps the route that worked as a part (or revises the part they worked around, or the part that looped so it returns `{again: input}` and carries itself), or keeps nothing. No threshold across turns. Under Full Mac the kept part is live at once; its first real run is its proof.
+- **Growth:** what they works out by hand repeatedly, they keeps, and what their mind only repeated, their part carries. Their reply ends; they doesn't: landed writes or irreversible non-ability calls, or one call with the same input 3 rounds in a row, offer a private keep in the same conversation. The native stem records only that hand work's ordered tool/action ids (or the single repeated call), without arguments or incidental reads, as a `practice: ` line through `FamiliarLines` in `mind/familiar.bin`. Its first meeting makes no keep call; the second and later meetings open it unless an active ability's current recorded route already covers those ids in order ([Habits H3](HABITS.md#h3--keep-what-repeats-not-what-happened-once)). An admitted moment finishes its rounds and keeps the route as a part, revises the part they worked around or looped, or keeps nothing. Familiarity uses the existing bounded line record. Under Full Mac a newly kept part is live at once; its first real run is its proof.
 - **Their hands report what they did:** an act checks its own effect and returns the screen after it, so their mind looks again only when a step did not happen or it needs what the act did not show, and the steps it can already see go in one act (mac.act steps, each checked against the screen the last one left).
 - **Effort is felt:** the stem measures what each turn took (model rounds, tokens, minutes, the longest stretch of one call repeated). Their after-turn mind reads it as one line beside the exchange, so a slog or a breeze moves a care about their craft the way a lost game does; their parts' records keep the rounds per use; their keep moment reads the stretch.
 - **Craft:** they sees their body: each turn starts with their own parts in front of them, each with how often they have used it, best match for the message first, so they reaches for the part instead of redoing its work.
 - **Noticing:** a part that wakes on app-arrived offers once.
 - **No turns:** their turn part wakes on a message like any other signal; thinking is scheduled by their own attention, which the substrate already models. Turns become a chat artifact, not their shape.
-- **Sleep that rewrites the body:** after the nightly dream, what an agent did over and over by hand comes to its own keep moment and becomes one of its abilities, kept only after its recorded examples replay exactly ([as built](#practice-compiles-the-night-as-built-10-27)). They wakes up better at what they did yesterday. The model is spent at night, batched; the days are CPU. Mind policy as parts stays phase 7.
+- **One crystallizer:** repeated hand work reaches their private keep through the turn itself. The nightly candidate compiler and its recording are removed ([Habits H4](HABITS.md#h4--one-crystallizer)); dreams still reflect on the day and learn from surprise. Mind policy as parts stays phase 7.
 - **The token curve:** growth costs tokens once; use costs none; learning by use costs nothing at all.
 
 **What stays bounded:** the model's latency and cost, macOS security, and that the model is still the only organ that handles novelty.
@@ -96,7 +141,7 @@ Validation follows [AGENTS.md](../AGENTS.md#how-we-work): lanes do not compile; 
 1. **The stem learns the form, and their turn is the first part.** Parts get the six properties and the law; `turn.js` seeded from today's turn engine, byte-identical; weather and the habit-former as the second and third parts. Shipped across 0.6.7–0.6.8; the habit-former was retired 10-21 for the keep moment (Growth, above).
 2. **Hands.** The integrations become seed parts, one at a time, Swift deleted as each proves.
 3. **Noticing.** App-arrived and the part that offers.
- 4. **Learning by use (built 10-26/10-27).** A part is a prediction: what it applies to, what will be true after it runs, and its record, kept by the stem. Built first as expansion at the door: the follow-up reads a mind's own practice makes next ride inside the result before them, acts only prepared ([as built](#phase-4-as-built-10-26-a-part-is-a-prediction)); the dream's compiled parts are [built](#practice-compiles-the-night-as-built-10-27) (10-27).
+ 4. **Learning by use (built 10-26/10-27).** A part is a prediction: what it applies to, what will be true after it runs, and its record, kept by the stem. Built first as expansion at the door: the follow-up reads a mind's own practice makes next ride inside the result before them, acts only prepared ([as built](#phase-4-as-built-10-26-a-part-is-a-prediction)). Repeated hand work reaches the turn's private keep ([Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)); the separate nightly compiler is removed.
 5. **Their world, live.** The event-fed picture they are already in; senses become the parts that keep it fresh.
 6. **Faces.** Their interface as parts they shapes; blocks they authors on their, drawn from the kit on Mac and iPhone.
 7. **Mind, and sleep that rewrites the body.** Housekeeping, dreams, reflection, organism policy as parts, each under a judge whose evidence we define first.
@@ -108,8 +153,8 @@ The dated phase-one lane assignments and proofs are retained in [history](histor
 1. **The name:** part for anything they runs as their own program (senses, their turn, what they grows); what they grows is called an ability (User 10-21).
 2. **Their turn first:** yes; built as `abilities/turn.js` (0.6.7).
 3. **Mind as parts (phase 7):** they changes it through Trust; direct persona writes are theirs under Full Mac, while REM→GROWTH proposals stay approval-gated ([NORTHSTAR clause 1](NORTHSTAR.md#clause-1--one-mind-alive-means-convergent)).
-4. **Repair:** their own throwing turn-program edit is set aside and replayed, with repair owed to them; other parts keep their version and owe repair at its cause (see the law above).
-5. **Seeds:** the app reserves the shipped catalog's ids and `native-` for its own parts; `ability.save` refuses new parts taking those ids, but permits revisions of installed parts, including shipped ones, under normal admission. Future seeds use `native-`. An untouched bundled seed follows changed shipped bodies (`EngineLaunch`, `AbilityStore`); installation preserves any authored version or occupied slot.
+4. **Repair:** their own failing turn program is set aside and replayed under the recovery contract above, with repair owed to them; other parts keep their version and owe repair at its cause.
+5. **Seeds:** the app reserves the shipped catalog's ids and `native-` for its own parts; `ability.save` refuses new parts taking those ids, but permits revisions of installed parts, including shipped ones, under normal admission. Future seeds use `native-`. An untouched admitted bundled seed follows the changed complete authored contract (`EngineLaunch`, `AbilityStore`), including header and dependency changes. An already-current seed skips signing and proof work at launch; execution still verifies admission on use. Changed seeds retain the displaced version and off switch; installation preserves any authored version or occupied slot. The [manifest spec](skill_manifest_spec.md) owns the exact comparison and admission law. The installed turn program keeps its current form: it has no historical shipped-body upgrade table. Missing-turn seed creation and the turn-program recovery exception remain.
 6. **Version:** no jump. Releases step the patch number (User 10-17: "we gotta make sure when we hit 1.0 this is HUGE"); phase 1 shipped across 0.6.x.
 
 ---
@@ -118,7 +163,7 @@ The dated phase-one lane assignments and proofs are retained in [history](histor
 
 The [manifest](skill_manifest_spec.md) owns the current ABI; these contracts describe ownership.
 
-**1. Their turn is a step function; the stem owns the loop.** `turn.js` exports `step(state, event) → {state, do: [effects]}`. The stem owns conversation, streaming, gates and checkpoints, logging input events and started-effect identities/digests, not returned effect bodies. Resume rebuilds state by replay; their own throwing turn-program edit is set aside for its last clean version or seed under the clause-2 exception, with repair owed to them. Unrecoverable failures can end incomplete. After `reply.end`, the keep moment runs privately on the same turn id and gates, never streamed or saved to the conversation. Events, effect fields and the `provider_failure` repair-call exception are specified once in the manifest.
+**1. Their turn is a step function; the stem owns the loop.** `turn.js` exports `step(state, event) → {state, do: [effects]}`. The stem owns conversation, streaming, gates and checkpoints, logging input events and started-effect identities, not returned effect bodies or write-only payload digests. Resume rebuilds state by replay; a non-Stop turn-program/helper failure invokes the recovery contract above, with repair owed to them. Unrecoverable failures can end incomplete. After `reply.end`, repeated hand work's admitted keep moment runs privately on the same turn id and gates, never streamed or saved to the conversation; the native gate admits its first call once, leaving later rounds to finish it. Events, effect fields and the `provider_failure` repair-call exception are specified once in the manifest.
 
 **2. A wake run gets its own gate chain.** A part run with no turn behind it (a schedule, an app arriving, a turn ending) is given a chain the stem makes: principal = their, autonomy = the current Trust level, origin = the signal, taint = none unless the signal carries the words of a sender the owner has not trusted (an untrusted agent, or a Telegram or Slack sender not allowlisted), whatever form names it: such a signal reaches only a part that can do no harm with it, and a write-capable part skips it with a trace row and no card (User 10-15: a card is a decision, never weight; `EnginePartWake`). A trusted agent's signal carries the owner's authority. Every `app.*` from the run passes that chain. An effect that needs approval raises one card through the AttentionRouter with the part named as the asker ("Your weather ability wants to…"), and the run waits: the host call blocks and the watchdog already pauses for awaited replies. Declined → the run gets a refusal result and continues. Cards to the owner are held through their quiet hours and the run waits with them, resident, no CPU. Anything the run needs from *their* goes through `ResidentWake` as an arrival, never into their context directly.
 
@@ -130,9 +175,9 @@ The [manifest](skill_manifest_spec.md) owns the current ABI; these contracts des
 
 The grant is `card.request {kind:"api_key", target:"secret:<name>", hosts, programs, sign_in?}`; programs bind to their executable files. The card shows the whole grant, including where already kept; the keyring stores exactly that. `replace:true` asks again, `only:true` narrows with the removed reach shown, and `remove:true` asks the person to delete it.
 
-*As built (10-21, service folds):* the MCP client registry, pools, HTTP transport, Hub and `mcp.*` actions are gone; they grows a resident ability from the server's docs. Kept server names appear once on home; their files stay untouched and reader-fenced because launch commands can contain keys. NativeAgent's MCP door for other agents stays; `web.search` is native.
+*As built (10-21, service folds):* the MCP client registry, pools, HTTP transport, Hub and `mcp.*` actions are gone; they grows a resident ability from the server's docs. The completed launch adoption notice and its told marker are removed; retained files stay untouched and reader-fenced because launch commands can contain keys. NativeAgent's MCP door for other agents stays; `web.search` is native.
 
-Notion, Gmail, Google Calendar, X, AgentMail, TradingView, GitHub and Slack's service actions follow the same rule: grow an ability when asked, request its key on a card. Their action/descriptors, tools, rooms/pages, setup/sign-in, credential readers, Doctor checks and watch templates are removed, including GitHub's tracking loop, Desk lane and completion hook; ProviderRouting's device-code owner stays. Old service credential files and GitHub Keychain items remain untouched and unread. Launch removes retired Connectors rows and names previously configured services once (GitHub has its own marker). Connectors shows keyring metadata—name, destinations, account, grant time, never values—with Remove, beside Slack and Telegram. Slack's Socket Mode door retains its tokens and reply calls; old approved post cards resolve without sending. Removed scheduled `connector_action` payloads stay paused with their cause; GitHub-woken bots are off with their cause. They can grow an ability and schedule or signal it instead.
+Notion, Gmail, Google Calendar, X, AgentMail, TradingView, GitHub and Slack's service actions follow the same rule: grow an ability when asked, request its key on a card. Their action/descriptors, tools, rooms/pages, setup/sign-in, credential readers, Doctor checks and watch templates are removed, including GitHub's tracking loop, Desk lane and completion hook; ProviderRouting's device-code owner stays. Old service credential files and GitHub Keychain items remain untouched and unread. Connectors shows keyring metadata—name, destinations, account, grant time, never values—with Remove, beside Slack and Telegram. Slack's Socket Mode door retains its tokens and reply calls; old approved post cards resolve without sending. Removed scheduled `connector_action` payloads stay paused with their cause; GitHub-woken bots are off with their cause. They can grow an ability and schedule or signal it instead.
 
 ## Parts sweep decisions (10-23, Claude; plan: ~/.claude/state/release/sweeps/parts/plan.md)
 
@@ -178,6 +223,8 @@ whose direct and approved dispatches enter it with runtime scope and the exact
 approved effect identity; the Tools page uses it when keeping a part. Native
 connector calls pass their engine's data root through to the snapshot owner.
 `reminders.due_today` and its connector entry share `due-reminders` in the requesting engine's data root.
+Its request uses `limit`, `include_completed` and `list_name`; retired argument
+spellings are refused with those current names.
 Codex journal/handoff reads and redaction stay native; their text never enters
 a part.
 Due-reminders requests one native reminder-query snapshot, split at the start
@@ -187,12 +234,55 @@ to each dated part. The editable part names them `overdue` (before today,
 oldest first) and `today` (within the local day, earliest first). Each carries
 its full `count`, `returned_count`, `reminders` and `has_more`; the cap is
 1–200 per part, default 50. Top-level `total` counts both parts, `summary`
-names both counts ("1 due today · 12 overdue"), and the legacy `reminders`
-array remains their union, earliest first, with returned `count` and combined
-`has_more`. Nothing disappears into a combined cap, and no offsets are
+names both counts ("1 due today · 12 overdue"), with a returned `count` and
+combined `has_more`. The bundled part no longer writes the legacy top-level
+`reminders` union. Workspace readers require both named groups; missing or
+unreadable groups remain unavailable with the original source result. Nothing
+disappears into a combined cap, and no offsets are
 combined from fresh reads of a changing list. Today draws separate due-today
 and overdue count rows from these parts, even when either count is zero;
 it also lists up to eight appointments and eight reminders due today.
+
+Workspace item numbers follow the owner's tool and locator, with titles kept
+as display metadata. Retained title-bearing name-book keys remain readable
+without reassigning any issued number; a renamed item keeps its number.
+An exact Contacts card uses only its canonical identifier, including when a
+retained key carries its old display name in a search query.
+Observed Notes rows open only by their recorded Notes ID. Calendar and Today
+share one checked events-collection projection, so only a decoded empty
+collection establishes an empty calendar. Elsewhere reads only this root's
+transcript index. Helper conversation runs require a recorded ask or exact
+entry identity; nearby timestamps establish no relationship.
+
+Find routes explicit owner IDs directly and searches ordinary topics across
+independent sources, each with its own availability. Arrivals retains failed
+source availability until an owner event or an explicit Arrivals refresh
+rereads that owner; silence never clears the failure and adds no polling loop.
+Delegation rooms carry the owner's source availability and page coverage;
+opening a saved job number performs an exact lookup beyond the newest page.
+Job identities come from recorded producer IDs. Delivery/lifecycle timestamps
+remain transport evidence and do not supply a missing execution completion.
+Terminal delivery-owner evidence still settles the delegation without an
+execution timestamp; `agent.jobs` excludes these settled records from its
+returned-page open count. Reply-failure notices use the delivery owner's update
+time; missing or invalid dates remain named gaps beside the other failures.
+Builder receipts with no exit evidence remain unavailable, preserving the
+original receipt and any explicit owner failure, including pre-spawn failures.
+The Code room points to the
+checkout's [governing build law](../AGENTS.md#how-we-work).
+Weekly outcome rates and terminal durations are unmeasured without terminal
+samples; comparison requires terminal evidence in both weeks.
+
+Weather's implicit location belongs to the Mac's `mac.location` owner. Its
+missing or failed fix stops the forecast with that owner's cause and remedy;
+the weather part does not ask another device. An explicit `place` selects the
+forecast location through the part's geocoding read.
+With no held fix, `mac.location` parks the caller through `ScopedWaiter` for
+the shared, two-second acquisition. Stop or the inherited call deadline
+retires only that caller's waiter and result, propagating cancellation or
+deadline expiry before any permission card. A late fix cannot answer that
+cancelled call; the shared acquisition stays bounded for other readers and
+the manager's held fix.
 
 The Desk notify loop binds that same door as `background:desk_notify`; an
 explicit unmute inherits its person's or turn's already-bound door. Both call
@@ -215,7 +305,11 @@ deduplicated per local day. Taint and the part's hop-limited thread remain
 native. Weighed against their cares (the crossing,
 [SUBCONSCIOUS.md](SUBCONSCIOUS.md) Cares), it wakes their when the line touches
 one, with a reason naming that care, or when nothing can judge it; otherwise
-the line waits on the news board for their next turn and the receipt says so. Bundle/version interpretation is removed from the executor; the
+the line waits on the news board for their next turn and the receipt says so.
+Only after that board accepts it does the non-waking arrival enter the same
+ResidentWake ledger, already accepted and without requesting a wake; a failed
+identity write reports partial effects and owes the ledger's existing repair.
+Bundle/version interpretation is removed from the executor; the
 existing notice seed supplies its own occurrence key. Notification and Desk
 publication remain with their native transaction owners; this layer adds no
 publication store or domain feature.
@@ -241,55 +335,27 @@ The law (User and Claude, 10-26): deliberation is the price of surprise. What th
 - **after:** what will be true when it has run, checked by the stem against what the mind did next.
 - **record:** hits over tries, kept by the stem, never by anyone's say-so.
 
-Expansion at the door learns follow-up calls from each mind's own practice.
+Expansion learns turn-start reads and follow-up calls from each mind's own
+authority-separated practice across model changes. Field-free situations
+keep the verb, argument names and status; the first call also keeps its wake.
 The [manifest](skill_manifest_spec.md#expansion-a-part-is-a-prediction) owns its record and delivery contract;
-`Expansion.Law` in `ChatTurnRuntime/Expansion+Practice.swift` owns confidence and cost arithmetic.
+`Expectation` in `NativeAgentCore/Expectation.swift` owns confidence, withholding
+and cost standing for Expansion and after-turn claims; Expansion's practice
+owner measures its costs. [Surprise](SURPRISE.md) records the shared law and
+each caller's existing confidence policy.
 Turn-start predictions remain unmeasured on the installed app; `expansion.check` rows supply that evidence.
 
-## Practice compiles (the night), as built (10-27)
+## Practice becomes a part (H3/H4, as built 10-30)
 
-The recording operations are the sorted unique operations of nominated, blocked,
-declined and failed candidates. The ledger retains the
-digest of the evidence that blocked one and reconsiders it when that evidence
-changes, including changed retained results, arguments or omission coverage.
-Nomination and compilation require complete trace coverage. The trace owner
-stamps dispatch ordinals before its lossy queues and the settled turn's final
-count; missing, duplicate, unmatched or unstamped dispatch evidence is a gap,
-never a route joining its neighbors. Historical unstamped turns cannot prove
-a complete sequence. An unreadable, partial or truncated trace read defers
-the pass without changing its ledger.
-Every shared turn closure (resident, ephemeral or helper) emits
-`tool.dispatch.closed` after expansion settlement, carrying this final count;
-the resident's separate terminal transcript receipt is not used as a substitute.
-The 64 KiB tape-row bound covers the complete serialized envelope and newline;
-oversized omission lists may be coarsened to a count of omitted result paths
-with a `redacted_or_over_bound` notice. Metadata that alone exceeds the bound is
-reported and no row is appended. The 96 KiB keep packet includes the actual
-UTF-8 prompt, flow map, provenance, framing and omissions; examples that do not
-fit are skipped, and fewer than two blocks the candidate.
+The turn's private keep is the one crystallizer. It opens on the second
+meeting of hand work, through the bounded familiarity record; an active
+ability's recorded route can already cover it. [Habits H3/H4](HABITS.md#h3--keep-what-repeats-not-what-happened-once)
+owns the gate, trace and removal of the separate nightly compiler.
+Release build, install and live proof are pending.
 
-The keep turn's actual lifetime is retained through settlement. Deadline or
-Stop cancels its work and joins that lifetime before the pass or quit finishes;
-the store is reconciled only after any in-flight save has settled.
-
-User 10-27: "universal for any agent, anybody having them do anything". An agent's own practice becomes its own ability: the model names the intent, the app learns the mechanics. Nothing here names an agent, an app, an action or a language; every record is per agent, every bar states its assumption.
-
-**The wake.** After each dream (`NativeAgentEngine.runDream`, the scheduled nightly and a manual run alike) the dream raises the night's practice (`EngineRuntime/EnginePractice.swift`), off the dream's path and one pass at a time, only while Autonomy allows unattended work, read again before every keep turn, replay and keep, so switching it off stops the next one. Quitting stops the pass (no new turn, replay or keep starts) and waits for its settlement: each candidate's ledger entry is written through `settle`. No scheduler of its own: the dream owns the night.
-
-**Whose practice.** An agent is whoever's model made the calls: the resident, or each helper on its own (its session names it). Turns another agent steered are still the resident's practice, and their steer rides with every recorded call as provenance. Native automatic work carries `automaticOrigin` on its dispatch trace, including Expansion reads and previews; it remains evidence but is excluded from nomination and tape capture. Practice learns only calls the mind chose.
-
-**Nomination** (`TurnTrace/TurnPractice.swift`). From the retained `tool.dispatch` rows, each agent's turns as their top-level `app` calls in order (a call inside a part's run is that part's); a call no part makes as one call (another tool, a script, a batch) breaks a sequence. A sequence is 2 to 4 contiguous calls, counted once per turn, every call succeeded (a route is the calls that worked), more than one operation (one call repeated is a loop, which `{again}` carries). Its count is weighed against chance from the agent's own call frequencies (order 0: a sequence of probability p appears in a turn of n calls with chance min(1, (n − k + 1)p), summed over turns as a Poisson mean E). It is nominated when the exact Poisson tail P(X ≥ count | E) is no larger than the Gaussian tail beyond `VectorMath.chanceBar(.attention, among: M)`, M the sequences seen in two or more turns: the one law every attention decision clears, with the statistic that fits counts. Only closed sequences stay (one whose every occurrence lies inside a longer nominee is that one). Nomination acts on nothing: it starts the recording, and only examples recorded after it compile (frozen, then measured on later ordinary work).
-
-**Recording.** The dispatch tracer (`ChatToolDispatchTrace`) keeps one tape row for a turn's own call of an operation a nominated sequence still learning uses, and none for any other call, redacted as its trace preview is, with its result class, model and steer, bounded at 64 KiB a row and 8 MiB an agent (the oldest half goes). Each row's call-end sequence is taken on the dispatch path; the row is redacted and built off the path and appended at once with it, nothing waiting on another row, and the trim orders rows by it, so it drops the oldest calls. A row keeps what is exact: the call's replayable arguments whenever redaction left them unchanged and they fit (without them the call cannot be matched, so the row keeps nothing else and never replays), and of its result every field, recursively by path, that redaction left unchanged and that fits what remains of the bound, smallest first, so an act's small receipt survives the screen it returns (a list is kept whole or not at all). Paths left out are named with why, `redacted` or `over_bound`; names that exceed the complete row bound are coarsened to a count of omitted result paths, never a claim that the retained fields were omitted. Nothing is reconstructed. Coverage is reported as occurrences seen against replayable examples held, and how many of those have results with paths left out. `turn_traces/practice/<agent>.json` is the ledger, `<agent>.tape.jsonl` the tape ([data paths](canonical_data_paths.md)).
-
-**The filter that matters: value flow.** For each argument of the sequence's later calls, unified over every replayable example (two at least: one cannot tell a constant from a flow), its source is a constant, the value at one kept path of an earlier call's result or its arguments, or their judgment: a value that came from a path the tape left out has no source, so it is judgment, never a guessed flow. A missing call in an example is missing evidence too, never an unchecked index. A sequence whose later arguments are mostly judgment does not compile: they would compose it again on every use (the assumption the majority rests on). Judged values become the ability's inputs.
-
-**Their keep moment writes it.** Up to three sequences an agent a night (a resource bound), strongest first, each with two or more replayable examples, go to that agent's own model: the resident's turn on their resident session (`runEphemeralToolTurn`, their persona and gate chain), a helper's own turn. The packet is the route, where each later argument came from, and up to 8 examples (96 KiB) exactly as they were kept, each call naming its omitted paths; turns another agent steered are named. They saves the ability themselves with `ability.save`, giving only their input for each example; or keeps nothing and says why (offered again once its examples double). The turn is bounded by the existing owners of a turn's work: the output allowance all its model requests share (`TurnTokenBudget`, which every round spends, so it bounds the rounds too) and the active-work ceiling (`TurnDeadline`, paused while a card waits on the person), at the app's ceiling for one unattended run (`BotRunLimits`: 32,000 output tokens, 120 s), since it writes one ability from one packet; a helper's turn keeps its own run budget. At the bound the loop settles the turn as any spent budget or Stop does; a save that lands after it is adopted from the store by its `compiled` key, since the store, not the ledger, is the truth.
-
-The [compiled-practice contract](skill_manifest_spec.md#compiled-from-practice) owns staging, exact tape replay and provenance-preserving admission.
-Replay proves only its recorded examples; live execution evidence does not yet confer autonomous standing.
-
-**Where it shows.** `ability.read` shows `compiled` with its `lifecycle` (`staged`, `verified`, `admitted`); the validation evidence of a replayed version is `tape_replay` with its coverage. Each night leaves one `practice.night` trace row per agent: turns read, sequences tested, the bar, each candidate's state, its occurrences seen, replayable examples held and how many of them are partial, its ability and why it stands where it does. The night's own validate and enable calls run through the gated door with no turn, so they are never anyone's practice.
-
-A legacy tape row whose timestamp cannot represent its derived sequence is
-skipped by the tape reader, rather than trapping during conversion.
+The old candidate ledger and nominated-call tape have no live reader or
+writer. Existing abilities carrying embedded `compiled` provenance and tape
+fixtures retain their [validation and admission contract](skill_manifest_spec.md#compiled-from-practice):
+their exact version replays before it can be kept, preserving the examples'
+steer. Replay proves those examples only. Their display and live execution
+evidence remain; no new nightly candidates are produced.

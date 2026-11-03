@@ -5,7 +5,7 @@ import TrustCenter
 import AVFoundation
 import Observation
 import os
-// Blueprint: | `MultimodalTTS+VoiceSelection.swift` | voice authority/routing, native/cloud playback, generations/cancellation; `VoicePreference`: `quiet`, `name`; auto-read decision |
+// Blueprint: | `MultimodalTTS+VoiceSelection.swift` | Voice authority/routing, native/cloud playback and cancellation; VoicePreference resolves one Apple voice identity for Mac playback and the phone snapshot, plus quiet/name authority |
 
 /// An unreadable Trust policy prevents read-aloud and reports why.
 public enum VoiceOutputModeResolution: Equatable {
@@ -80,6 +80,13 @@ public enum VoicePreference {
     public static func name(in defaults: UserDefaults = .standard) -> String {
         (defaults.string(forKey: nameKey) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Resolve the captured selection once for playback or the phone snapshot.
+    /// Only an explicitly empty selection asks Apple for the system default.
+    public static func nativeVoice(identifier: String) -> AVSpeechSynthesisVoice? {
+        if identifier.isEmpty { return AVSpeechSynthesisVoice(language: nil) }
+        return AVSpeechSynthesisVoice(identifier: identifier)
     }
 
     public static func cloudVoice(in defaults: UserDefaults = .standard) -> String {
@@ -224,19 +231,16 @@ public final class VoiceOutputController: NSObject {
 
     private func speakLocal(text: String) {
         let utterance = GenerationTaggedUtterance(string: text, generation: speechGeneration)
-        // An unset name leaves `voice` nil: the Mac's own chosen system voice.
-        // A named voice this Mac lacks says so; it never reads in another one.
+        // Resolve the same native identity that the phone snapshot carries.
         let chosenVoice = VoicePreference.name()
-        if !chosenVoice.isEmpty {
-            guard let voice = AVSpeechSynthesisVoice(identifier: chosenVoice)
-                ?? AVSpeechSynthesisVoice(language: chosenVoice) else {
-                let owner = speechOwnerID
-                stop()
-                errorMessage = "The read-aloud voice \"\(chosenVoice)\" is not on this Mac, so nothing was read aloud. Set chat.voice_name to an installed voice, or leave it empty for the Mac's own voice."
-                errorOwnerID = owner
-                return
-            }
+        if let voice = VoicePreference.nativeVoice(identifier: chosenVoice) {
             utterance.voice = voice
+        } else {
+            let owner = speechOwnerID
+            stop()
+            errorMessage = "The read-aloud voice \"\(chosenVoice.isEmpty ? "system default" : chosenVoice)\" is not on this Mac, so nothing was read aloud. Set chat.voice_name to an installed voice identifier, or leave it empty for the Mac's own voice."
+            errorOwnerID = owner
+            return
         }
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         utterance.pitchMultiplier = 1.0
@@ -277,9 +281,7 @@ public final class VoiceOutputController: NSObject {
             player.delegate = self
             audioPlayer = player
             guard player.play() else {
-                errorMessage = "Audio playback could not start. Try reading aloud again."
-                errorOwnerID = speechOwnerID
-                stop()
+                finishPlayback(playerID: ObjectIdentifier(player), failure: "Audio playback could not start. Try reading aloud again.")
                 return
             }
             isSpeaking = true
@@ -301,7 +303,18 @@ public final class VoiceOutputController: NSObject {
         }
     }
 
-
+    /// Both callback outcomes and a refused start settle only their current player.
+    private func finishPlayback(playerID: ObjectIdentifier, failure: String? = nil) {
+        guard audioPlayer.map(ObjectIdentifier.init) == playerID else { return }
+        audioPlayer?.delegate = nil
+        audioPlayer = nil
+        if let failure {
+            errorOwnerID = speechOwnerID
+            errorMessage = failure
+        }
+        isSpeaking = false
+        speechOwnerID = nil
+    }
 }
 // Utterances carry their generation so stale synthesizer callbacks cannot clear newer speech.
 private final class GenerationTaggedUtterance: AVSpeechUtterance {
@@ -347,9 +360,7 @@ extension VoiceOutputController: AVAudioPlayerDelegate {
         // Delegate detachment cannot retract a callback already queued.
         let playerID = ObjectIdentifier(player)
         Task { @MainActor in
-            guard self.audioPlayer.map(ObjectIdentifier.init) == playerID else { return }
-            self.audioPlayer = nil
-            self.isSpeaking = false
+            self.finishPlayback(playerID: playerID, failure: flag ? nil : "The audio couldn't be played.")
         }
     }
 
@@ -357,12 +368,7 @@ extension VoiceOutputController: AVAudioPlayerDelegate {
         let playerID = ObjectIdentifier(player)
         if let error { Logger(subsystem: "com.nativeagent.app", category: "MultimodalTTS").error("[voice] audio decode failed: \(String(describing: error), privacy: .public)") }
         Task { @MainActor in
-            guard self.audioPlayer.map(ObjectIdentifier.init) == playerID else { return }
-            self.audioPlayer = nil
-            self.errorOwnerID = self.speechOwnerID
-            self.errorMessage = "The audio couldn't be played."
-            self.isSpeaking = false
-            self.speechOwnerID = nil
+            self.finishPlayback(playerID: playerID, failure: "The audio couldn't be played.")
         }
     }
 }

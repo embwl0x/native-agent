@@ -14,7 +14,7 @@ import AttentionRouting
 import AppToolRuntime
 import ChatToolRuntime
 import ProviderRouting
-// Blueprint: | `InteractionCardDelivery.swift` | `InteractionCardDelivery`: `answer`, `act`; shared card transactions with native navigation; `AppInlineInteractionPlatformPort`, `AppInlineInteractionControlPort`, `InteractionInboxCard` |
+// Blueprint: | `InteractionCardDelivery.swift` | `InteractionCardDelivery`: `answer`, `act`; shared card transactions with native navigation; `AppInlineInteractionPlatformPort` routes Mail readiness to the root's Mac Integration facade; `AppInlineInteractionControlPort`, `InteractionInboxCard` |
 
 /// The Mac door into shared card transactions; navigation remains native.
 enum InteractionCardDelivery {
@@ -36,7 +36,7 @@ enum InteractionCardDelivery {
             }
             await appModel.refreshChatSessionIndex()
             guard let session = appModel.engine.transcripts.sessions.first(where: { $0.id == pointer.sessionID }),
-                  await InlineInteractionResolver.interaction(id: pointer.interactionID,
+                  try await InlineInteractionResolver.interaction(id: pointer.interactionID,
                     sessionID: pointer.sessionID, dataRoot: dataRoot) != nil else {
                 throw NSError(domain: "InteractionCard", code: 1, userInfo: [
                     NSLocalizedDescriptionKey: "This request is unavailable. Refresh Activity and try again."
@@ -60,12 +60,8 @@ struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
         ApplicationLifetime.shared.appModel.map(AppInlineInteractionControlPort.init)
     }
 
-    func probeAppleEventApp(_ name: String) async -> String {
-        await AppleScriptExecution.automationStatus(app: name, ask: false)
-    }
-
-    func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue {
-        try await MacAppleScriptBridge.mailListRecent(input: input)
+    func mailReadiness(root: URL, check: Bool) async -> (status: String, word: String, next: String?) {
+        await NativeAgentEngine.forRoot(root).macIntegration.mailReadiness(check: check)
     }
 
     func chromeConnectionStatus() async -> (enabled: Bool, connected: Bool) {
@@ -75,7 +71,7 @@ struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
 
     var chromeSteps: String { InlineCards.chromeSteps }
 
-    func pairedPhoneCount() async -> Int {
+    func pairedPhoneCount() async -> Int? {
         await NativeAgentEngine.liveDeviceSync.pairedPhones.pairedCount()
     }
 
@@ -204,19 +200,30 @@ extension AppInlineInteractionPlatformPort {
         }
     }
 
-    func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> Bool {
-        await SystemPermissionPreflight.askMacOSForCard(ids, mode: mode)
+    func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async throws -> Bool {
+        try await SystemPermissionPreflight.askMacOSForCard(ids, mode: mode)
     }
 
     func writeInteractionSnapshots() async { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() }
 
-    func openInteractionCards() async -> [(id: String, sessionID: String)] {
-        let rows = (try? await NativeAgentEngine.live.inbox.list()) ?? []
-        return rows.compactMap { row in
-            guard row.id.hasPrefix("interaction:"), ["unread", "read"].contains(row.status),
-                  let pointer = try? InlineInteractionDelivery.Pointer(item: row) else { return nil }
-            return (id: pointer.interactionID, sessionID: pointer.sessionID)
+    func openInteractionCards() async throws -> [(id: String, sessionID: String)] {
+        let reads = try await LiveNotificationInbox.live(dataRoot: PersistenceCore.defaultDataRoot()).cardReads()
+        var cards: [(id: String, sessionID: String)] = []
+        for read in reads {
+            do {
+                let row = try read.get()
+                guard row.id.hasPrefix("interaction:"), ["unread", "read"].contains(row.status) else { continue }
+                do {
+                    let pointer = try InlineInteractionDelivery.Pointer(item: row)
+                    cards.append((id: pointer.interactionID, sessionID: pointer.sessionID))
+                } catch {
+                    ModuleLog.app("[interaction-notification] card %@ unavailable: %@", row.id, error.localizedDescription)
+                }
+            } catch {
+                ModuleLog.app("[interaction-notification] card unavailable: %@", error.localizedDescription)
+            }
         }
+        return cards
     }
 
     func refreshInteractionInbox() async {

@@ -13,9 +13,14 @@ public struct SpeechUtterance: Codable, Hashable, Sendable {
             public let duration: TimeInterval
             public let confidence: Float
             public let alternatives: [String]
+            public init(text: String, timestamp: TimeInterval, duration: TimeInterval, confidence: Float, alternatives: [String]) {
+                self.text = text; self.timestamp = timestamp; self.duration = duration
+                self.confidence = confidence; self.alternatives = alternatives
+            }
         }
         public let text: String
         public let segments: [Segment]
+        public init(text: String, segments: [Segment]) { self.text = text; self.segments = segments }
     }
     public let text: String
     /// The person's submitted wording; recognition hypotheses remain original.
@@ -25,6 +30,12 @@ public struct SpeechUtterance: Codable, Hashable, Sendable {
     public let hypotheses: [Hypothesis]
     /// Non-nil when the original remains with another device's chat attachment.
     public var audioReference: String?
+
+    public init(text: String, isFinal: Bool, hypotheses: [Hypothesis]) {
+        self.text = text
+        self.isFinal = isFinal
+        self.hypotheses = hypotheses
+    }
 
     public init(_ result: SFSpeechRecognitionResult) {
         text = result.bestTranscription.formattedString
@@ -81,6 +92,12 @@ public struct SpeechUtterance: Codable, Hashable, Sendable {
             }
             return MultimodalAttachment(type: "audio", base64: bytes.base64EncodedString(),
                 mime: "audio/x-caf", name: "voice.caf", byteSize: bytes.count, utterance: utterance)
+        }
+
+        /// Borrow the closed original for compression without materializing raw
+        /// PCM/base64 in memory. Keep this Recording alive until export settles.
+        public func closeForExport() -> URL {
+            lock.withLock { file = nil; return url }
         }
 
         deinit { try? FileManager.default.removeItem(at: url) }

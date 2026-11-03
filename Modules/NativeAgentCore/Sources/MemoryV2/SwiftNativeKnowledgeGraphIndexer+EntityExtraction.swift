@@ -56,11 +56,13 @@ extension SwiftNativeKnowledgeGraphIndexer {
     ) -> [(String, String)] {
         let tagger = NLTagger(tagSchemes: [.nameType])
         tagger.string = content
-        // A two-line memory is too short for language detection; without a
-        // language the tagger returns nothing. Detect, and fall back to English.
+        // Short rows may not establish a language. Leave it unknown rather
+        // than teaching the tagger an English interpretation without evidence.
         let recognizer = NLLanguageRecognizer()
         recognizer.processString(content)
-        tagger.setLanguage(recognizer.dominantLanguage ?? .english, range: content.startIndex..<content.endIndex)
+        if let language = recognizer.dominantLanguage {
+            tagger.setLanguage(language, range: content.startIndex..<content.endIndex)
+        }
         var found: [(String, String)] = []
         tagger.enumerateTags(
             in: content.startIndex..<content.endIndex,

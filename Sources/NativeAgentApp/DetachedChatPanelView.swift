@@ -205,7 +205,7 @@ struct DetachedChatPanelView: View {
         // mounted so every surface appears live without an idle refresh loop.
         .task(id: "detached-transcript:\(sessionId)") {
             await appModel.engine.transcripts.watchChanges(sessionID: sessionId) {
-                await appModel.refreshDetachedChatMessagesAfterTurn(sessionId: sessionId)
+                await appModel.readDetachedTranscript(sessionId: sessionId)
             }
         }
         // AppKit owns the titlebar; pass title changes to the window controller.
@@ -228,18 +228,6 @@ struct DetachedChatPanelView: View {
             Task { await inlineCards.verifyOnReturn() }
         }
         .inlineCardSetup(inlineCards)
-        .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
-            guard let completedSessionId = note.object as? String,
-                  completedSessionId == sessionId
-            else { return }
-            let alreadyRefreshed = (note.userInfo?["messagesAlreadyRefreshed"] as? Bool) == true
-            Task {
-                await appModel.refreshDetachedChatMessagesAfterTurn(
-                    sessionId: sessionId,
-                    messagesAlreadyRefreshed: alreadyRefreshed
-                )
-            }
-        }
         .onDisappear {
             // Closing the panel also cancels dictation awaiting permission.
             endPanelDictation()
@@ -278,7 +266,6 @@ struct DetachedChatPanelView: View {
                         ChatMessageListView(
                             messages: messages,
                             sessionId: sessionId,
-                            isStreaming: isBusy,
                             highlightedMessageID: showTranscriptSearch
                                 ? transcriptSearch.selectedMessageID
                                 : nil,
@@ -527,13 +514,16 @@ struct DetachedChatPanelView: View {
         let sentDraftEditedAt = panelDraft.editedAt
         let attachments = pendingAttachments
         guard !isCapturing, (!text.isEmpty || !attachments.isEmpty) else { return }
-        // Recognized commands say where they work; other slash text reaches the agent.
+        // Commands name their supported surface; unknown command words say so.
         switch ChatSlashCommandRouting.decide(
             text: text,
             supportsDispatch: false
         ) {
         case .unsupportedHere(let command):
             showToast(ChatSlashCommandRouting.unsupportedMessage(command: command))
+            return
+        case .unknownCommand(let command):
+            showToast(ChatSlashCommandRouting.unknownMessage(command: command))
             return
         case .dispatch, .sendAsMessage:
             break

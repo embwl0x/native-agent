@@ -76,6 +76,7 @@ public enum MacKeySyntaxError: Error, Equatable, LocalizedError {
     case unknownKey(String, chord: String)
     case keyCodeOutOfRange(String)
     case tooManyChords(Int, limit: Int)
+    case textTooLong(Int, limit: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -95,6 +96,8 @@ public enum MacKeySyntaxError: Error, Equatable, LocalizedError {
             return "invalid_keystroke_syntax: unknown key \"\(key)\" in \"\(chord)\""
         case .keyCodeOutOfRange(let raw):
             return "invalid_keystroke_syntax: key code \"\(raw)\" is outside 0…127"
+        case .textTooLong(let count, let limit):
+            return "invalid_text_length: \(count) characters exceeds the \(limit)-character literal text limit"
         case .tooManyChords(let count, let limit):
             return "invalid_keystroke_syntax: \(count) chords exceeds the \(limit)-chord cap"
         }
@@ -151,29 +154,38 @@ public enum MacKeySyntax {
     /// Resolve a glyph in one stroke; dead-key sequences are not key chords.
     private static func characterKey(_ glyph: String, command: Bool) -> (UInt16, MacKeyModifiers)? {
         #if canImport(Carbon) && os(macOS)
-        guard let retained = TISCopyCurrentKeyboardLayoutInputSource() else { return nil }
-        let source = retained.takeRetainedValue()
-        defer { withExtendedLifetime(source) {} }
-        guard let raw = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return nil }
-        let data = Unmanaged<CFData>.fromOpaque(raw).takeUnretainedValue()
-        guard CFDataGetLength(data) >= MemoryLayout<UCKeyboardLayout>.size,
-              let bytes = CFDataGetBytePtr(data) else { return nil }
-        let layout = UnsafeRawPointer(bytes).assumingMemoryBound(to: UCKeyboardLayout.self)
-        let variants: [(UInt32, MacKeyModifiers)] = [(0, []), (UInt32(shiftKey), .shift),
-            (UInt32(optionKey), .option), (UInt32(shiftKey | optionKey), [.shift, .option])]
-        for (flags, implied) in variants {
-            for code in UInt16(0)...UInt16(127) {
-                var dead: UInt32 = 0, length = 0
-                var text = [UniChar](repeating: 0, count: 8)
-                let status = UCKeyTranslate(layout, code, UInt16(kUCKeyActionDown),
-                    (flags | (command ? UInt32(cmdKey) : 0)) >> 8, UInt32(LMGetKbdType()),
-                    OptionBits(kUCKeyTranslateNoDeadKeysMask), &dead, text.count, &length, &text)
-                if status == noErr, length <= text.count,
-                   String(decoding: text.prefix(Int(length)), as: UTF16.self) == glyph { return (code, implied) }
-            }
+        // The input-source manager asserts the main queue (10-31: her typing in
+        // Calculator from a hand's thread crashed the app), so the layout's bytes
+        // are copied there and translated here.
+        let read = { () -> (Data, UInt8)? in
+            guard let retained = TISCopyCurrentKeyboardLayoutInputSource() else { return nil }
+            let source = retained.takeRetainedValue()
+            guard let raw = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return nil }
+            return (Unmanaged<CFData>.fromOpaque(raw).takeUnretainedValue() as Data, LMGetKbdType())
         }
-        #endif
+        guard let (data, keyboardType) = Thread.isMainThread ? read() : DispatchQueue.main.sync(execute: read),
+              data.count >= MemoryLayout<UCKeyboardLayout>.size else { return nil }
+        return data.withUnsafeBytes { buffer -> (UInt16, MacKeyModifiers)? in
+            guard let base = buffer.baseAddress else { return nil }
+            let layout = base.assumingMemoryBound(to: UCKeyboardLayout.self)
+            let variants: [(UInt32, MacKeyModifiers)] = [(0, []), (UInt32(shiftKey), .shift),
+                (UInt32(optionKey), .option), (UInt32(shiftKey | optionKey), [.shift, .option])]
+            for (flags, implied) in variants {
+                for code in UInt16(0)...UInt16(127) {
+                    var dead: UInt32 = 0, length = 0
+                    var text = [UniChar](repeating: 0, count: 8)
+                    let status = UCKeyTranslate(layout, code, UInt16(kUCKeyActionDown),
+                        (flags | (command ? UInt32(cmdKey) : 0)) >> 8, UInt32(keyboardType),
+                        OptionBits(kUCKeyTranslateNoDeadKeysMask), &dead, text.count, &length, &text)
+                    if status == noErr, length <= text.count,
+                       String(decoding: text.prefix(Int(length)), as: UTF16.self) == glyph { return (code, implied) }
+                }
+            }
+            return nil
+        }
+        #else
         return nil
+        #endif
     }
 
     static func modifier(_ token: String) -> MacKeyModifiers? {
@@ -289,7 +301,7 @@ public enum MacKeySyntax {
     public static func validateText(_ text: String) throws -> String {
         guard !text.isEmpty else { throw MacKeySyntaxError.empty }
         guard text.count <= maxTextCharacters else {
-            throw MacKeySyntaxError.tooManyChords(text.count, limit: maxTextCharacters)
+            throw MacKeySyntaxError.textTooLong(text.count, limit: maxTextCharacters)
         }
         return text
     }

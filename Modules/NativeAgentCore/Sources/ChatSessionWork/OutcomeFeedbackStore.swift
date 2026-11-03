@@ -378,14 +378,7 @@ public struct OutcomeFeedbackStore: Sendable {
                     throw OutcomeFeedbackError.feedbackStoreCorrupt
                 }
             } else {
-                // Additive compatibility for rows written by the former Mac
-                // seam. They remain observational and are never upgraded into
-                // exact feedback because they lack transcript validation.
-                guard case .string? = object["message_id"],
-                      case .string? = object["rating"],
-                      case .string? = object["logged_at"] else {
-                    throw OutcomeFeedbackError.feedbackStoreCorrupt
-                }
+                throw OutcomeFeedbackError.feedbackStoreCorrupt
             }
             // Match readJSONL's UTF-8 admission after validating every row.
             return String(data: Data(line), encoding: .utf8) == nil ? nil : value

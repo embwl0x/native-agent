@@ -6,7 +6,7 @@ import TrustCenter
 #if canImport(CoreGraphics)
 import CoreGraphics
 #endif
-// Blueprint: | `MacControlSettlement.swift` | Desktop operation settlement and byte-compatible refusal audit receipts |
+// Blueprint: | `MacControlSettlement.swift` | Desktop operation settlement and current refusal audit receipts; incomplete process channels retain output with unknown effects; an unanswered deadline/Stop records unknown effects, never an invented body acknowledgement |
 
 extension SwiftNativeMacControl {
     enum OperationSettlementTrigger: Equatable {
@@ -19,17 +19,19 @@ extension SwiftNativeMacControl {
         _ executionResult: Result<MacControlResult, Error>,
         action: String,
         operationId: String,
-        trigger: OperationSettlementTrigger
+        trigger requestedTrigger: OperationSettlementTrigger
     ) async throws -> MacControlResult {
         guard let operationStore else {
             return try executionResult.get()
         }
-        if let current = try await operationStore.record(operationId: operationId),
-           current.state.isTerminal {
-            if current.state == .outcomeUnknown {
-                return Self.unknownResult(action: action, record: current)
+        let current = try await operationStore.record(operationId: operationId)
+        let trigger: OperationSettlementTrigger = current?.outcomeCode == "deadline_effect_unknown" ? .deadline : requestedTrigger
+        if let current,
+           current.state.isTerminal, current.terminalAt != nil {
+            if current.state == .cancelAcknowledged, current.startedAt == nil {
+                return Self.cancelledResult(action: action, record: current)
             }
-            return Self.replayResult(current)
+            return Self.attachingOperation(try executionResult.get(), record: current)
         }
 
         switch executionResult {
@@ -40,7 +42,7 @@ extension SwiftNativeMacControl {
                     to: .timedOut,
                     verification: .failed,
                     expectedNextEvidence: nil,
-                    outcomeCode: "timeout"
+                    outcomeCode: "timeout", settlingActualExit: true
                 )
                 return Self.attachingOperation(result, record: record)
             }
@@ -52,11 +54,35 @@ extension SwiftNativeMacControl {
                 expectedNextEvidence: result.ok && verification != .satisfied
                     ? "Separate observation of intended effect"
                     : nil,
-                outcomeCode: Self.exitOutcomeCode(result) ?? (result.ok ? "completed" : "handler_failed")
+                outcomeCode: Self.exitOutcomeCode(result) ?? (result.ok ? "completed" : "handler_failed"), settlingActualExit: true
             )
             return Self.attachingOperation(result, record: record)
 
         case .failure(let error):
+            if error is TaskWaitDeadline.Exceeded {
+                let record = try await operationStore.transition(operationId: operationId,
+                    to: .outcomeUnknown, verification: .unverified,
+                    expectedNextEvidence: "Inspect the affected app before another action",
+                    outcomeCode: "deadline_effect_unknown", settlingActualExit: true)
+                return Self.attachingOperation(Self.deadlineResult(action: action), record: record)
+            }
+            if let incomplete = error as? ProcessRunIOFailure {
+                let record = try await operationStore.transition(
+                    operationId: operationId, to: .outcomeUnknown, verification: .unverified,
+                    expectedNextEvidence: "Inspect the affected system before another command",
+                    outcomeCode: "process_io_incomplete", settlingActualExit: true)
+                return Self.attachingOperation(MacControlResult(ok: false, action: action,
+                    output: .object([
+                        "status": .string("process_io_incomplete"), "effects": .string("unknown"),
+                        "stdout": .string(incomplete.result.stdout), "stderr": .string(incomplete.result.stderr),
+                        "stdout_truncated": .bool(incomplete.result.stdoutTruncated),
+                        "stderr_truncated": .bool(incomplete.result.stderrTruncated),
+                        "exit_code": .int(Int64(incomplete.result.exitCode)),
+                        "timed_out": .bool(incomplete.result.timedOut),
+                        "channel_errors": .array(incomplete.channels.map(JSONValue.string)),
+                        "message": .string(incomplete.localizedDescription)
+                    ]), error: "process_io_incomplete", durationMs: 0), record: record)
+            }
             if error is CancellationError || error is ProcessRunCancellation {
                 let produced = (error as? ProcessRunCancellation).map { stopped in
                     MacControlResult(ok: false, action: action, output: .object([
@@ -64,7 +90,8 @@ extension SwiftNativeMacControl {
                         "stdout_truncated": .bool(stopped.result.stdoutTruncated),
                         "stderr_truncated": .bool(stopped.result.stderrTruncated),
                         "exit_code": .int(Int64(stopped.result.exitCode)),
-                        "cancelled": .bool(true), "timed_out": .bool(stopped.result.timedOut)
+                        "cancelled": .bool(true), "timed_out": .bool(stopped.result.timedOut),
+                        "channel_errors": .array(stopped.channels.map(JSONValue.string))
                     ]), error: "process_cancelled", durationMs: 0)
                 }
                 if trigger == .deadline {
@@ -73,124 +100,60 @@ extension SwiftNativeMacControl {
                         to: .timedOut,
                         verification: .failed,
                         expectedNextEvidence: nil,
-                        outcomeCode: "deadline_exceeded_after_stop"
+                        outcomeCode: "deadline_exceeded_after_stop", settlingActualExit: true
                     )
                     return produced.map { Self.attachingOperation($0, record: record) }
                         ?? Self.timeoutResult(action: action, record: record)
-                }
-                if try await operationStore.record(operationId: operationId)?.state == .started {
-                    _ = try await operationStore.transition(
-                        operationId: operationId,
-                        to: .cancelRequested,
-                        verification: .pending,
-                        expectedNextEvidence: "Cancellation acknowledgement",
-                        outcomeCode: "cancel_requested"
-                    )
                 }
                 let record = try await operationStore.transition(
                     operationId: operationId,
                     to: .cancelAcknowledged,
                     verification: .failed,
                     expectedNextEvidence: nil,
-                    outcomeCode: "cancelled_before_effect_completion"
+                    outcomeCode: "cancelled_before_effect_completion", settlingActualExit: true
                 )
                 return produced.map { Self.attachingOperation($0, record: record) }
                     ?? Self.cancelledResult(action: action, record: record)
             }
-            _ = try await operationStore.transition(
+            let record = try await operationStore.transition(
                 operationId: operationId,
                 to: .failed,
                 verification: .failed,
                 expectedNextEvidence: nil,
-                outcomeCode: "execution_failed"
+                outcomeCode: "execution_failed", settlingActualExit: true
             )
-            throw error
+            return Self.attachingOperation(MacControlResult(ok: false, action: action,
+                output: .object(["status": .string("execution_failed"), "message": .string(error.localizedDescription)]),
+                error: error.localizedDescription, durationMs: 0), record: record)
         }
     }
 
     // MARK: blocked-receipt audit append
 
-    /// Preserve the audit format's legacy method names for renamed actions. Actions without a historical alias keep their dispatch name.
-    private static func daemonMethodName(forAction action: String, body: [String: JSONValue]) -> String {
-        switch action {
-        case "applescript":   return "run_applescript"
-        case "jxa":           return "run_jxa"
-        case "shortcut",
-             "shortcut/run":  return "run_shortcut"
-        case "click":         return "click_at"
-        case "system":        return systemMethodName(body: body)
-        case "file/read":     return "read_file"
-        case "file/write":    return "write_file"
-        case "file/list":     return "list_directory"
-        case "file/move":     return "move_file"
-        case "file/trash":    return "trash_file"
-        case "notify":        return "post_notification"
-        case "shell":         return "run_shell"
-        case "spotlight":     return "spotlight_search"
-        default:              return action
-        }
-    }
-
-    /// System dispatch records the concrete operation; unknown actions retain the generic system label.
-    private static func systemMethodName(body: [String: JSONValue]) -> String {
-        let action: String = {
-            if case .string(let s)? = body["action"] { return s }
-            return ""
-        }()
-        switch action {
-        case "volume", "set_volume": return "set_volume"
-        case "brightness":           return "set_brightness"
-        case "sleep_display":        return "sleep_display"
-        case "lock_screen":          return "lock_screen"
-        case "focus_mode":           return "set_focus_mode"
-        default:                     return "system"
-        }
-    }
-
-    /// Legacy receipt metadata only: an absent list records shell, an empty list none.
-    private static func receiptApprovalRequired(forCategory category: String, policy: MacControlPolicy) -> Bool {
-        guard let list = policy.approvalRequiredFor else {
-            return category == "shell"
-        }
-        return list.contains(category)
-    }
-
     /// Append a refusal under the shared cross-process lock. A failed audit must not turn a refused action into an executed one. Local JSONL evidence: off-disk backup only; no local backup/export/phone copy; PrivacyMap: mac_control_audit.
-    /// Preserve the legacy receipt's insertion order, Python JSON separators, and UTC microsecond timestamp. Do not add fields or pass through the ordinary sorted-key JSON serializer: consumers retain these exact bytes.
     func emitBlockedAudit(
         action: String,
         category: String,
         reason: String,
         trigger: String,
-        policy: MacControlPolicy,
-        body: [String: JSONValue]
+        policy _: MacControlPolicy,
+        body _: [String: JSONValue]
     ) async {
         guard let path = auditAppendPath else { return }
-        // EXACT make_receipt(...) insertion order. Emitting via serializeOrderedObjectPython preserves this order (no sort) and uses Python's default compact separators `(', ', ': ')`.
-        let orderedPairs: [(String, JSONValue)] = [
-            // Receipt UUIDs are lowercase.
-            ("id", .string(UUID().uuidString.lowercased())),
-            ("method", .string(Self.daemonMethodName(forAction: action, body: body))),
-            ("category", .string(category)),
-            // make_receipt sets args_hash="sha256:none" when args is None; _blocked_receipt passes no args, so this matches.
-            ("args_hash", .string("sha256:none")),
-            ("trigger", .string(trigger)),
-            ("trigger_source", .string(trigger)),
-            ("approval_required", .bool(Self.receiptApprovalRequired(forCategory: category, policy: policy))),
-            ("approved", .null),
-            ("exit_code", .int(0)),
-            ("stdout", .string("")),
-            ("stderr", .string("")),
-            ("duration_ms", .int(0)),
-            ("executed_at", .string(Self.iso8601(now()))),
-            ("blocked", .bool(true)),
-            ("block_reason", .string(reason)),
-        ]
+        let receipt = JSONValue.object([
+            "id": .string(UUID().uuidString.lowercased()),
+            "method": .string(action),
+            "category": .string(category),
+            "trigger": .string(trigger),
+            "executed_at": .string(NativeTimestampFormat.plainZulu(now())),
+            "blocked": .bool(true),
+            "block_reason": .string(reason),
+        ])
         do {
-            let line = try JSONValue.serializeOrderedObjectPython(orderedPairs)
+            let line = try receipt.serialize(pretty: false)
             try await SwiftNativePersistenceCore.withFileLock(path) {
                 try await SwiftNativePersistenceCore.appendAuditLineRaw(line, to: path)
-                // Retention shares the append lock and preserves the raw audit format.
+                // Retention shares the append lock.
                 let dropped = try enforceJSONLRetention(at: path, maxLines: JSONLLineCaps.macControlAudit)
                 if dropped > 0 {
                     nativeLog("MacControl.audit: %@ cap dropped %d oldest line(s)",
@@ -202,10 +165,5 @@ extension SwiftNativeMacControl {
             nativeLog("MacControl.audit: refusal record failed (%@)",
                 String(error.localizedDescription.prefix(512)))
         }
-    }
-
-    /// Preserve the saved audit format: UTC +00:00, six fractional digits except at whole seconds, where the fraction is omitted. Both calendar components and microseconds derive from one floored epoch value.
-    private static func iso8601(_ date: Date) -> String {
-        NativeTimestampFormat.flooredOptionalMicrosecondUTCOffset(date)
     }
 }

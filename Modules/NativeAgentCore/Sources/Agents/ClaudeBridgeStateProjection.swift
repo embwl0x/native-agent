@@ -69,12 +69,13 @@ public enum ClaudeBridgeReadout {
     }
 
     static func contextFlowHealthJSON(
-        mode: ContextFlowMode,
-        health: ContextFlowCoordinatorHealth?
+        mode: ContextFlowMode?,
+        health: ContextFlowCoordinatorHealth?,
+        unavailableReason: String?
     ) -> [String: Any] {
-        guard let health else {
+        guard unavailableReason == nil, let health else {
             return [
-                "mode": mode.rawValue,
+                "mode": mode.map { $0.rawValue as Any } ?? NSNull(),
                 "started": false,
                 "storeGeneration": NSNull(),
                 "arenaGeneration": NSNull(),
@@ -85,7 +86,7 @@ public enum ClaudeBridgeReadout {
                 "pressure": NSNull(),
                 "prewarmingAllowed": false,
                 "lastReconciledAt": NSNull(),
-                "lastError": NSNull(),
+                "lastError": unavailableReason.map { $0 as Any } ?? NSNull(),
             ]
         }
         return [
@@ -245,7 +246,7 @@ public enum ClaudeBridgeReadout {
             "dreamHealthy": body.dreamHealthy,
             "toolHandsAvailable": body.toolHandsAvailable,
             "approvalChannelsOpen": body.approvalChannelsOpen,
-            "notificationPathHealthy": body.notificationPathHealthy,
+            "notificationPathHealthy": body.notificationPathHealthy.map { $0 as Any } ?? NSNull(),
             "resourcePressure": body.resourcePressure.rawValue,
         ]
     }
@@ -337,7 +338,12 @@ extension ClaudeBridgeReadout {
         }
         let activeModel = routing?.preferences["chat"]?.model
         let activeProvider = routing?.activeProviders["chat"]
-        let activePersona = readActivePersona(dataRoot: dataRoot, preferred: port.preferredPersona)
+        let activePersona: String?
+        do { activePersona = try readActivePersona(dataRoot: dataRoot, preferred: port.preferredPersona) }
+        catch {
+            activePersona = nil
+            readErrors.note(PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot), error.localizedDescription)
+        }
         let (activeSessionId, _) = readBridgeActiveSession(dataRoot: dataRoot, preferred: { port.preferredSessionID }, errors: readErrors)
         let recentInbox = readRecentInbox(dataRoot: dataRoot, limit: 10, errors: readErrors)
 
@@ -365,17 +371,18 @@ extension ClaudeBridgeReadout {
             "readErrors": readErrors.messages,
             "recentInbox": recentInbox,
             "recentToolCalls": recentToolCallsJSON,
-            "buildVersion": buildIdentity.version,
+            "buildVersion": buildIdentity.unavailableReason == nil ? buildIdentity.version as Any : NSNull(),
             "buildIdentity": buildIdentity.bridgePayload,
             "uptimeSeconds": uptime,
         ]
         let organism = await port.cognition.organismSnapshot()
         payload["organism"] = Self.organismSnapshotJSON(organism)
-        let contextFlowMode = await port.contextFlow.contextFlowMode()
+        let contextFlowStatus = await port.contextFlow.modeStatus()
         let contextFlowHealth = await port.contextFlow.health()
         payload["contextFlow"] = Self.contextFlowHealthJSON(
-            mode: contextFlowMode,
-            health: contextFlowHealth
+            mode: contextFlowStatus.effectiveMode,
+            health: contextFlowHealth,
+            unavailableReason: contextFlowStatus.unavailableReason
         )
         let capsule = await port.cognition.lastInjectedCapsuleBridgeSummary()
         let microcycle = await port.cognition.microcycleTelemetrySnapshot()
@@ -408,17 +415,18 @@ extension ClaudeBridgeReadout {
         }
     }
 
-    public static func readActivePersona(dataRoot: URL, preferred: String?) -> String? {
+    public static func readActivePersona(dataRoot: URL, preferred: String?) throws -> String? {
         if let s = preferred, !s.isEmpty { return s }
         let root = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-        return try? PersonaCompiler.selectedPersonaID(root: root, personaOverride: nil)
+        return try PersonaCompiler.selectedPersonaID(root: root, personaOverride: nil)
     }
 
     public static func readBridgeActiveSession(
         dataRoot: URL,
         preferred: () -> String?
-    ) -> (id: String?, updatedAt: String?) {
-        readBridgeActiveSession(dataRoot: dataRoot, preferred: preferred, errors: nil)
+    ) throws -> (id: String?, updatedAt: String?) {
+        let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: dataRoot.appendingPathComponent("chat/sessions.json"))
+        return bridgeActiveSession(preferred: preferred(), rows: rows.map { $0.mapValues(\.foundationObject) })
     }
 
     private static func readBridgeActiveSession(
@@ -446,13 +454,8 @@ extension ClaudeBridgeReadout {
            let selected = live.first(where: { ($0["id"] as? String) == preferred }) {
             return (selected["id"] as? String, selected["updatedAt"] as? String)
         }
-        let sorted = live.sorted { (a, b) in
-            let ta = (a["updatedAt"] as? String) ?? ""
-            let tb = (b["updatedAt"] as? String) ?? ""
-            return ta > tb
-        }
-        guard let top = sorted.first else { return (nil, nil) }
-        return (top["id"] as? String, top["updatedAt"] as? String)
+        // Selection belongs to the app. Activity elsewhere cannot select a chat.
+        return (nil, nil)
     }
 
     private static func readRecentInbox(

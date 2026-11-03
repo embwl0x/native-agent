@@ -5,24 +5,13 @@ import UniformTypeIdentifiers
 // Blueprint: | `MacAppleScriptBridge+MailMessageBytes.swift` | `MacAppleScriptBridge`: paired-identity .emlx reads, contained attachments and bounded MIME/HTML decoding |
 
 extension MacAppleScriptBridge {
-    /// Single and batch reads refuse account mismatches and report other local failures as attachment status.
-    static func mailLocalRead(_ input: [String: JSONValue], batch: Bool = false) -> (row: [String: JSONValue]?, attachments: String, accountMismatch: String?) {
-        do {
-            return (try mailFileRead(input: input, batch: batch), "", nil)
-        } catch let error as NSError where error.domain == "MailFileRead" && error.code == 10 {
-            return (nil, "", error.localizedDescription)
-        } catch {
-            return (nil, "Attachments unavailable: \(error.localizedDescription)", nil)
-        }
-    }
-
     /// ROWID locates the file; the index and RFC header must both match the paired identity.
     static func mailFileRead(input: [String: JSONValue], batch: Bool = false) throws -> [String: JSONValue] {
         let message = try mailFileMessage(input: input)
         let parts = try mailMessageParts(message.source, attachmentsRoot: message.attachmentsRoot)
         let plain = parts.plain.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
         guard let body = plain ?? parts.html.map(mailHTMLText) ?? (parts.attachments.isEmpty ? nil : "") else { throw mailMIMEError() }
-        let offset = clampedInt(input["body_offset"], defaultValue: 0, min: 0, max: 2_000_000)
+        let offset = try clampedInt(input["body_offset"], defaultValue: 0, min: 0, max: 2_000_000)
         let end = min(body.count, offset + (batch ? 4000 : 16000))
         var row = message.row
         row.merge(["body": .string(offset < end ? String(body.dropFirst(offset).prefix(end - offset)) : ""),
@@ -96,22 +85,7 @@ extension MacAppleScriptBridge {
         guard identity(text(1)) == identity(locator.messageID) else { throw mismatch }
         let root = URL(fileURLWithPath: String(cString: indexPath)).deletingLastPathComponent().deletingLastPathComponent()
         let components = mailbox.path.split(separator: "/").map { String($0) + ".mbox" }
-        var boxes = [mailbox.isFileURL ? mailbox : components.reduce(root.appendingPathComponent(mailbox.host ?? "")) { $0.appendingPathComponent($1) }]
-        // Mail can put a label's backing store in a differently named directory.
-        // Search directory names only, never the messages in a huge mailbox.
-        if !FileManager.default.fileExists(atPath: boxes[0].path), let name = components.last {
-            var pending = [(root, 0)], visited = 0
-            while let (directory, depth) = pending.popLast(), visited < 2048 {
-                visited += 1
-                for entry in try FileManager.default.contentsOfDirectory(at: directory,
-                    includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles]) {
-                    let values = try entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-                    guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
-                    if entry.lastPathComponent.caseInsensitiveCompare(name) == .orderedSame { boxes.append(entry) }
-                    else if depth < 8, !["Data", "Messages", "MailData"].contains(entry.lastPathComponent) { pending.append((entry, depth + 1)) }
-                }
-            }
-        }
+        let boxes = [mailbox.isFileURL ? mailbox : components.reduce(root.appendingPathComponent(mailbox.host ?? "")) { $0.appendingPathComponent($1) }]
         let shard = String(locator.id / 1000).reversed().map(String.init).joined(separator: "/")
         var otherEmail = false
         for box in boxes where FileManager.default.fileExists(atPath: box.path) {
@@ -147,7 +121,7 @@ extension MacAppleScriptBridge {
             }
         }
         if otherEmail { throw mismatch }
-        throw mailFileError(9, "No local copy of this message is on disk. Download the message in Mail to list or save attachments.")
+        throw mailFileError(9, "No local copy of this message is on disk at its indexed mailbox. Download the message in Mail, then refresh its locator before reading its body or attachments.")
     }
 
     /// `body_tables` accompanies the unchanged body: uniform width 2–10, at most 30 rows and 200 cells; multiline cells omit the table.

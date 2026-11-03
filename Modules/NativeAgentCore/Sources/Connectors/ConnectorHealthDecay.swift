@@ -3,7 +3,7 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `ConnectorHealthDecay.swift` | `ConnectorHealthDecay` and `ConnectorProofLedger`: credential-backed health from latest actual receipts, decayed by age without polling |
+// Blueprint: | `ConnectorHealthDecay.swift` | `ConnectorHealthDecay` and checked `ConnectorProofLedger`: credential-backed health from latest actual receipts, decayed by age without polling; unreadable UTF-8/schema evidence is unavailable, never an empty ledger |
 
 // Credential-backed health follows the latest real action receipt. A failure
 // of authorization or transport supersedes success; proof decays without polling.
@@ -124,28 +124,26 @@ public enum ConnectorProofLedger {
     public static func latestByConnector(
         root: URL,
         maxTailBytes: Int = maxTailBytes
-    ) -> [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)] {
-        latestByConnector(receiptsPath: ConnectorActionReceipt.receiptsPath(root: root), maxTailBytes: maxTailBytes)
+    ) throws -> [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)] {
+        try latestByConnector(receiptsPath: ConnectorActionReceipt.receiptsPath(root: root), maxTailBytes: maxTailBytes)
     }
 
     public static func latestByConnector(
         receiptsPath path: URL,
         maxTailBytes: Int = maxTailBytes
-    ) -> [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)] {
+    ) throws -> [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)] {
         var newest: [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)] = [:]
-        guard let read = try? SwiftNativePersistenceCore.tailPhysicalLines(path, limit: .max, maxBytes: maxTailBytes) else { return newest }
-        let encoding: String.Encoding = read.lines.allSatisfy { String(data: $0, encoding: .utf8) != nil } ? .utf8 : .isoLatin1
-        // A truncated byte window conservatively discards its first row, even when whole.
-        for line in read.lines.dropFirst(read.truncatedToByteWindow ? 1 : 0) {
-            guard let text = String(data: line, encoding: encoding),
-                  let data = text.data(using: .utf8),
-                  case .object(let row)? = try? JSONValue.parse(data) else { continue }
+        guard let read = try SwiftNativePersistenceCore.tailPhysicalLines(path, limit: .max, maxBytes: maxTailBytes) else { return newest }
+        // Only a real leading fragment is omitted by the physical-line owner.
+        for line in read.lines.dropFirst(read.leadingFragment ? 1 : 0) {
+            guard String(data: line, encoding: .utf8) != nil,
+                  case .object(let row) = try JSONValue.parse(line) else { throw ledgerUnavailable(path) }
             guard let connector = row["connectorId"]?.stringValue.map(canonicalID),
-                  !connector.isEmpty else { continue }
+                  !connector.isEmpty else { throw ledgerUnavailable(path) }
             // A dry run proves nothing about the live integration.
             if case .bool(true)? = row["dryRun"] { continue }
-            guard let status = row["status"]?.stringValue?.lowercased(),
-                  successStatuses.contains(status) || status == "failed" else { continue }
+            guard let status = row["status"]?.stringValue?.lowercased() else { throw ledgerUnavailable(path) }
+            guard successStatuses.contains(status) || status == "failed" else { continue }
             let rejection = connectionRejection(row["output"])
             if status == "failed", rejection == nil { continue }
             // Local status success proves no transport; a failed credential
@@ -155,11 +153,16 @@ public enum ConnectorProofLedger {
                 continue
             }
             guard let created = row["createdAt"]?.stringValue,
-                  let date = NativeTimestampFormat.parseISO8601FractionalFirst(created) else { continue }
+                  let date = NativeTimestampFormat.parseISO8601FractionalFirst(created) else { throw ledgerUnavailable(path) }
             if let existing = newest[connector], existing.at > date { continue }
             newest[connector] = (date, successStatuses.contains(status), status == "failed" && rejection == true)
         }
         return newest
+    }
+
+    private static func ledgerUnavailable(_ path: URL) -> NSError {
+        NSError(domain: "NativeAgentConnectorProof", code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "Connector evidence is unreadable or malformed at \(path.path). Repair the receipt ledger before trusting connection health."])
     }
 
     /// True for rejected authorization, false for a failed transport, nil for

@@ -54,6 +54,17 @@ extension ExistingCornersSourceProvider {
                 let result = try await FileReadSourceMaterial.$metadataOnly.withValue(true) {
                     try await rawRead("read_file", readerInput)
                 }
+                if case .object(let object) = result, object["ok"] == .bool(false),
+                   object["error_code"] == .string("file_not_found"), object["path_kind"] == .string("missing"),
+                   case .string(let resolved)? = object["path"] {
+                    guard URL(fileURLWithPath: resolved).standardizedFileURL.path
+                        == URL(fileURLWithPath: NativeAgentWorkspaceRoot.fileSpelling(path)).standardizedFileURL.path else {
+                        throw SenseFailure(code: "source_unavailable", message: "File observation must retain its requested path.")
+                    }
+                    try SenseSandboxProfile.requirePublicPath(resolved, dataRoot: dataRoot,
+                        personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot))
+                    throw SenseFailure(code: "source_absent", message: "Watched path is absent: \(resolved)")
+                }
                 guard case .object(let object) = result, object["ok"] == .bool(true),
                       case .string(let resolved)? = object["path"], case .int(let bytes)? = object["bytes"],
                       let count = Int(exactly: bytes), count >= 0 else {
@@ -197,7 +208,7 @@ extension ExistingCornersSourceProvider {
                 } catch let error as ChromeControlRuntimeError {
                     throw SenseFailure(code: "source_unavailable", message: error.localizedDescription, remedy: error.remedy)
                 }
-                let pair = AsyncStream<SenseMaterial>.makeStream(bufferingPolicy: .bufferingNewest(1))
+                let pair = AsyncStream<SenseSourceChange>.makeStream(bufferingPolicy: .bufferingNewest(1))
                 let task = Task.detached(priority: .utility) {
                     defer { pair.continuation.finish() }
                     func report(_ reason: String) async {
@@ -210,7 +221,7 @@ extension ExistingCornersSourceProvider {
                                 await report(reason)
                                 continue
                             }
-                            pair.continuation.yield(.pageSnapshot(snapshot))
+                            pair.continuation.yield(.changed(.pageSnapshot(snapshot)))
                         }
                     } catch {
                         guard !Task.isCancelled else { return }
@@ -230,13 +241,18 @@ extension ExistingCornersSourceProvider {
             let observationAddress = try JSONValue.object(route.merging(["__sense_app_observation": .bool(true)]) { _, new in new }).serialize(pretty: false)
             _ = try await provider.material(for: corner, address: observationAddress)
             let events = try MacAppSourceEvents(bundleID: bundleID)
-            let pair = AsyncStream<SenseMaterial>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            let pair = AsyncStream<SenseSourceChange>.makeStream(bufferingPolicy: .bufferingNewest(1))
             let task = Task.detached(priority: .utility) {
                 defer { events.cancel(); pair.continuation.finish() }
                 do {
                     for try await _ in events.stream {
                         try Task.checkCancellation()
-                        pair.continuation.yield(try await provider.material(for: corner, address: observationAddress))
+                        let material = try await provider.material(for: corner, address: observationAddress)
+                        guard case .accessibility(.object(var fields)) = material else {
+                            throw SenseFailure(code: "source_unavailable", message: "The app reader returned no accessibility object.")
+                        }
+                        fields["ax_watch_coverage"] = events.coverage
+                        pair.continuation.yield(.changed(.accessibility(.object(fields))))
                     }
                 } catch {
                     guard !Task.isCancelled else { return }
@@ -262,6 +278,7 @@ actor NativeChromeNews {
         var url: String
         var view: String
         var snapshot: [String: JSONValue]
+        var pendingNews: (news: SenseNews, snapshot: [String: JSONValue], version: String)?
         let chrome: ChromeControlRuntime
         let senseVersion: Int
     }
@@ -288,7 +305,12 @@ actor NativeChromeNews {
         defer { NotificationCenter.default.post(name: SenseNewsBoard.presentationDidChange, object: nil) }
         for (tab, watch) in watches {
             let host = URL(string: watch.url)?.host ?? "*"
-            let current = try? await SenseDoor.selectedRecord(for: .site(host: host))
+            let current: SenseRecord?
+            do { current = try await SenseDoor.selectedRecord(for: .site(host: host)) }
+            catch {
+                await watch.chrome.recordCaptureError(error.localizedDescription, tabID: tab)
+                continue
+            }
             guard watches[tab]?.id == watch.id else { continue }
             if current?.id != "builtin-chrome" || current?.status != .on || current?.version != watch.senseVersion {
                 watches.removeValue(forKey: tab)?.task.cancel()
@@ -344,7 +366,7 @@ actor NativeChromeNews {
         do {
             let changes = try await chrome.pageChanges(host: "*", tabID: tab)
             let host = URL(string: ExistingCornersReaders.string(fields["url"]) ?? "")?.host ?? "*"
-            let record = try? await SenseDoor.selectedRecord(for: .site(host: host))
+            let record = try await SenseDoor.selectedRecord(for: .site(host: host))
             let task = Task { [weak self] in
                 do {
                     for try await changed in changes {
@@ -400,6 +422,11 @@ actor NativeChromeNews {
                 NotificationCenter.default.post(name: SenseNewsBoard.presentationDidChange, object: nil)
                 return
             }
+            // A rejected delivery remains the exact source change, even if
+            // the next source edge has moved to a different viewport.
+            if let pending = watches[tab]?.pendingNews {
+                guard await accept(pending.news, snapshot: pending.snapshot, version: pending.version, tab: tab, id: id) else { return }
+            }
             guard let version = Self.version(snapshot) else { return }
             let moved = watches[tab]?.url != url || Self.newDocument(watches[tab]?.snapshot ?? [:], fields)
             let sameView = watches[tab]?.view == Self.view(fields)
@@ -416,14 +443,27 @@ actor NativeChromeNews {
             let address = SenseNativePages.chromeAddress(host: ContextSecretContentPolicy.redactedFragment(host),
                 url: ContextSecretContentPolicy.redactedFragment(url))
             let summary = try Self.delta(previous, fields)
-            // A failed capture/delta never consumes the successful baseline.
-            watches[tab]?.version = version
-            watches[tab]?.url = url
-            watches[tab]?.view = Self.view(fields)
-            watches[tab]?.snapshot = fields
-            await SenseNewsBoard.shared.post(SenseNews(senseID: record.id, version: record.version, address: address,
-                summary: summary, at: Date(), observationID: String(tab), changeID: previousVersion + "→" + version))
+            let news = SenseNews(senseID: record.id, version: record.version, address: address,
+                summary: summary, at: Date(), observationID: String(tab), changeID: previousVersion + "→" + version)
+            _ = await accept(news, snapshot: fields, version: version, tab: tab, id: id)
         } catch { await unavailable(error.localizedDescription, tab: tab) }
+    }
+
+    private func accept(_ news: SenseNews, snapshot: [String: JSONValue], version: String, tab: Int64, id: UUID) async -> Bool {
+        guard watches[tab]?.id == id else { return false }
+        watches[tab]?.pendingNews = (news, snapshot, version)
+        guard await SenseNewsBoard.shared.post(news) else {
+            guard !Task.isCancelled else { return false }
+            await unavailable("The page change was not accepted by private news storage; its delivery baseline and pending change are retained.", tab: tab)
+            return false
+        }
+        guard watches[tab]?.id == id else { return false }
+        watches[tab]?.version = version
+        watches[tab]?.url = ExistingCornersReaders.string(snapshot["url"]) ?? ""
+        watches[tab]?.view = Self.view(snapshot)
+        watches[tab]?.snapshot = snapshot
+        watches[tab]?.pendingNews = nil
+        return true
     }
 
     private static func delta(_ before: [String: JSONValue], _ after: [String: JSONValue]) throws -> String {
@@ -564,7 +604,7 @@ private enum ExistingCornersReaders {
         case .stream(let id) where id == "connectors":
             if address == nil { return ("app", ["page": .string("connectors")]) }
             guard let actionID = string(input.removeValue(forKey: "action")),
-                  let action = AppActions.action(actionID), action.read,
+                  let action = try AppActions.action(actionID), action.read,
                   connectorPages.contains(action.page), !action.tool.isEmpty else {
                 throw SenseFailure(code: "unsupported", message: "A connector source needs an existing read action.")
             }

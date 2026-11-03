@@ -75,7 +75,7 @@ extension ApprovalExecution {
         from record: ApprovalRecord,
         dataRoot: URL
     ) async -> Bool {
-        let owners = ChatToolApprovalExecutionOwners.shared
+        let owners = ApprovalExecutionOwners.shared
         guard owners.acquire(root: dataRoot, approvalID: record.id) else { return false }
         var receiptOwnsRelease = false
         defer { if !receiptOwnsRelease { owners.release(root: dataRoot, approvalID: record.id) } }
@@ -149,7 +149,7 @@ extension ApprovalExecution {
             )
             return false
         }
-        let settlement: ChatToolApprovalExecutionOwners.Settlement
+        let settlement: ApprovalExecutionOwners.Settlement
         let succeeded: Bool
         do {
             let receipt = try await effects.runConnectorAction(

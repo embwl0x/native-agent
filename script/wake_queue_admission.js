@@ -13,15 +13,12 @@ function createCodexQueueAdmission({
   canonicalCodexThreadId,
   copyWakeCompletionOrigin,
   copyWakeProducerIdentity,
-  currentProcessStartIdentity,
   deadLetterPath,
-  dirLockOwnerAlive,
   isCodexNonThreadSentinel,
   markInboxTerminal,
   nowISO,
   pendingPath,
   queueLockDir,
-  sleep,
   unicodePrefix,
   wakeConcurrencyCap,
   wakeLaneKey,
@@ -32,7 +29,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { AsyncLocalStorage } = require("async_hooks");
-const { dataRootLife } = require("./wake_worker_common.js");
+const { dataRootLife, lifeOf, readWakeJSON, withWakeLock } = require("./wake_worker_common.js");
 const heldCapacitySlot = new AsyncLocalStorage();
 
 function pendingKey(payload, threadId) {
@@ -80,64 +77,6 @@ function sanitizePayload(payload) {
   return clean;
 }
 
-async function withDirLock(lockDir, fn, options = {}) {
-  const waitMs = options.waitMs == null ? 2000 : options.waitMs;
-  const staleMs = options.staleMs == null ? 10 * 60 * 1000 : options.staleMs;
-  const preserveLiveOwner = options.preserveLiveOwner === true;
-  const ownerAlive = options.dirLockOwnerAlive || dirLockOwnerAlive;
-  const deadline = Date.now() + waitMs;
-  while (true) {
-    try {
-      fs.mkdirSync(lockDir, { mode: 0o700 });
-      fs.writeFileSync(
-        path.join(lockDir, "pid"),
-        `${process.pid}\n${nowISO()}\n${currentProcessStartIdentity() || ""}\n`,
-        { mode: 0o600 }
-      );
-      break;
-    } catch (error) {
-      if (error && error.code === "EEXIST") {
-        try {
-          const stat = fs.statSync(lockDir);
-          if (preserveLiveOwner) {
-            // Reply waits are configurable and may legitimately exceed
-            // `staleMs`; stealing from a live owner can dispatch the same
-            // completion twice. A dead/invalid owner is safe to recover now.
-            // EXCEPT a just-created lock with no pid file yet: its owner is
-            // between mkdir and the pid write — stealing there removes a
-            // LIVE contender's lock (review dcf9cf804931 finding 1). Give
-            // that window a short mtime grace; a genuinely dead owner's
-            // lock ages past it immediately.
-            const pidMissing = !fs.existsSync(path.join(lockDir, "pid"));
-            const withinAcquireGrace = pidMissing && Date.now() - stat.mtimeMs < 2000;
-            if (!withinAcquireGrace && !ownerAlive(lockDir)) {
-              fs.rmSync(lockDir, { recursive: true, force: true });
-              continue;
-            }
-          } else if (Date.now() - stat.mtimeMs > staleMs) {
-            fs.rmSync(lockDir, { recursive: true, force: true });
-            continue;
-          }
-        } catch {}
-        if (Date.now() >= deadline) {
-          const lockError = new Error("lock_busy");
-          lockError.lockDir = lockDir;
-          throw lockError;
-        }
-        await sleep(50);
-        continue;
-      }
-      throw error;
-    }
-  }
-
-  try {
-    return await fn();
-  } finally {
-    fs.rmSync(lockDir, { recursive: true, force: true });
-  }
-}
-
 async function withWakeCapacity(laneKey, config, fn, options = {}) {
   const capacityRoot = options.capacityRoot || WAKE_CAPACITY_DIR;
   const requestedCap = options.cap == null ? wakeConcurrencyCap(config) : Number(options.cap);
@@ -153,7 +92,7 @@ async function withWakeCapacity(laneKey, config, fn, options = {}) {
 
   // Spread independent lanes across the fixed slot set so simultaneous
   // processes do not all contend for slot zero first. Every slot is still
-  // attempted, and mkdir remains the cross-process admission authority.
+  // attempted, and the kernel lock remains the cross-process authority.
   const seed = Number.parseInt(
     crypto.createHash("sha256").update(String(laneKey)).digest("hex").slice(0, 8),
     16
@@ -163,12 +102,9 @@ async function withWakeCapacity(laneKey, config, fn, options = {}) {
     const index = (seed + offset) % cap;
     const slotDir = path.join(capacityRoot, `slot-${index}.lock`);
     try {
-      return await withDirLock(slotDir,
+      return await withWakeLock(slotDir,
         () => heldCapacitySlot.run(slotDir, fn), {
         waitMs: 0,
-        staleMs: 60 * 60 * 1000,
-        preserveLiveOwner: true,
-        dirLockOwnerAlive: options.dirLockOwnerAlive,
       });
     } catch (error) {
       if (!error || error.message !== "lock_busy") throw error;
@@ -190,8 +126,8 @@ async function withAllWakeCapacity(fn) {
     const slotDir = path.join(WAKE_CAPACITY_DIR, `slot-${index}.lock`);
     // Foreground cwd healing can already own one admission slot.
     if (heldCapacitySlot.getStore() === slotDir) return await acquire(index + 1);
-    return await withDirLock(slotDir, () => acquire(index + 1),
-      { waitMs: 0, preserveLiveOwner: true });
+    return await withWakeLock(slotDir, () => acquire(index + 1),
+      { waitMs: 0 });
   }
   return await acquire(0);
 }
@@ -204,16 +140,13 @@ async function withWakeExecutionLane(laneKey, config, fn, options = {}) {
   fs.mkdirSync(path.dirname(lockDir), { recursive: true, mode: 0o700 });
   try { fs.chmodSync(path.dirname(lockDir), 0o700); } catch {}
   try {
-    return await withDirLock(lockDir, async () => withWakeCapacity(
+    return await withWakeLock(lockDir, async () => withWakeCapacity(
       laneKey,
       config,
       fn,
       options
     ), {
       waitMs: options.laneWaitMs == null ? 0 : options.laneWaitMs,
-      staleMs: 60 * 60 * 1000,
-      preserveLiveOwner: true,
-      dirLockOwnerAlive: options.dirLockOwnerAlive,
     });
   } catch (error) {
     if (error && error.message === "lock_busy" && !error.reason) {
@@ -226,15 +159,40 @@ async function withWakeExecutionLane(laneKey, config, fn, options = {}) {
 }
 
 function readPendingAtPath(pendingPath) {
-  let raw;
-  try {
-    raw = fs.readFileSync(pendingPath, "utf8");
-  } catch (error) {
-    if (error && error.code === "ENOENT") return [];
-    throw error;
-  }
-  const parsed = JSON.parse(raw);
+  const parsed = readWakeJSON(pendingPath, []);
   if (!Array.isArray(parsed)) throw new Error(`pending_queue_not_array: ${pendingPath}`);
+  const ids = new Set();
+  const keys = new Set();
+  for (const [index, row] of parsed.entries()) {
+    const source = `${pendingPath}[${index}]`;
+    const nonempty = (value) => typeof value === "string" && value.trim().length > 0;
+    const object = (value) => value != null && typeof value === "object" && !Array.isArray(value);
+    if (!row || typeof row !== "object" || Array.isArray(row)
+        || !nonempty(row.id) || !nonempty(row.key) || !nonempty(row.laneKey)
+        || ![FRESH_THREAD_MODE, PINNED_THREAD_MODE].includes(row.mode)
+        || (row.mode === PINNED_THREAD_MODE && !canonicalCodexThreadId(row.threadId))
+        || (row.mode === FRESH_THREAD_MODE && row.threadId !== null)
+        || !nonempty(row.addedAt) || !Number.isFinite(Date.parse(row.addedAt))
+        || !Number.isInteger(row.attempts) || row.attempts < 0
+        || !row.payload || typeof row.payload !== "object" || Array.isArray(row.payload)
+        || !nonempty(row.payload.messageId) || !nonempty(row.payload.text)
+        || (row.terminalDisposition !== undefined && (!object(row.terminalDisposition)
+          || !nonempty(row.terminalDisposition.deadLetteredAt) || !Number.isFinite(Date.parse(row.terminalDisposition.deadLetteredAt))
+          || !nonempty(row.terminalDisposition.reason)))
+        || (row.freshAdmission !== undefined && (!object(row.freshAdmission)
+          || !nonempty(row.freshAdmission.threadId) || !nonempty(row.freshAdmission.clientUserMessageId)
+          || !nonempty(row.freshAdmission.jobPath)
+          || (row.freshAdmission.turnId !== undefined && !nonempty(row.freshAdmission.turnId))))
+        || Object.keys(row).some((key) => ![
+          "lifeID", "id", "key", "threadId", "mode", "laneKey", "payload", "addedAt", "attempts", "launch",
+          "terminalDisposition", "lastAttemptAt", "lastError", "freshAdmission", "staleRecoveryCount", "requeuedAt", "staleRecovery",
+        ].includes(key))
+        || ids.has(row.id) || keys.has(row.key)) {
+      throw new Error(`Pending wake schema unavailable at ${source}; retained source was not rewritten.`);
+    }
+    lifeOf(row.lifeID, source);
+    ids.add(row.id); keys.add(row.key);
+  }
   return parsed;
 }
 
@@ -258,7 +216,7 @@ async function appendPending(payload, threadId, options = {}) {
     mode
   );
   const key = pendingKey(cleanPayload, canonicalThread);
-  return await withDirLock(queueLockDir(), async () => {
+  return await withWakeLock(queueLockDir(), async () => {
     const queue = readPendingUnlocked();
     const existing = queue.find((entry) => entry.key === key);
     if (existing) {
@@ -298,7 +256,7 @@ async function appendPending(payload, threadId, options = {}) {
 
 async function removePending(ids) {
   const idSet = new Set(ids);
-  return await withDirLock(queueLockDir(), async () => {
+  return await withWakeLock(queueLockDir(), async () => {
     const queue = readPendingUnlocked();
     const next = queue.filter((entry) => !idSet.has(entry.id));
     writePendingUnlocked(next);
@@ -319,9 +277,6 @@ const TERMINAL_WAKE_ERROR_RE =
 const MAX_WAKE_ATTEMPTS = 25;
 
 function isTerminalWakeFailure(entry, errorText) {
-  // Old hang requeues have already started work. Retain them in the existing
-  // dead letters for effect reconciliation rather than admitting a replay.
-  if (entry && (entry.hungTurnId || Number(entry.hangRetryCount || 0) > 0)) return true;
   // The app-server's own words are authoritative: a parse failure or an
   // unloadable thread is the same answer on attempt 1 and attempt 741.
   if (TERMINAL_WAKE_ERROR_RE.test(String(errorText || ""))) return true;
@@ -344,7 +299,7 @@ function isTerminalWakeFailure(entry, errorText) {
 async function deadLetterPendingEntry(entry, errorText, reason) {
   // Checkpoint terminal state before either projection. If storage is
   // unavailable, retain the brief without letting it execute again.
-  const terminalEntry = await withDirLock(queueLockDir(), async () => {
+  const terminalEntry = await withWakeLock(queueLockDir(), async () => {
     const queue = readPendingUnlocked();
     const current = queue.find((candidate) => candidate.id === entry.id && candidate.key === entry.key);
     if (!current) return null;
@@ -361,14 +316,14 @@ async function deadLetterPendingEntry(entry, errorText, reason) {
   let persisted = false;
   try {
     const path = deadLetterPath();
-    await withDirLock(`${path}.append.lock`, async () => {
+    await withWakeLock(`${path}.append.lock`, async () => {
       appendJSONLineAtomicUnlocked(path, {
         deadLetteredAt,
         reason: terminalReason,
         lastError,
         entry: terminalEntry,
       });
-    }, { waitMs: 5000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+    }, { waitMs: 5000 });
     persisted = true;
   } catch (error) {
     console.error(`dead-letter write failed: ${error && error.message}`);
@@ -382,7 +337,7 @@ async function deadLetterPendingEntry(entry, errorText, reason) {
 }
 
 async function bumpPendingAttempt(id, errorText) {
-  return await withDirLock(queueLockDir(), async () => {
+  return await withWakeLock(queueLockDir(), async () => {
     const queue = readPendingUnlocked();
     const next = queue.map((entry) => {
       if (entry.id !== id) return entry;
@@ -399,7 +354,7 @@ async function bumpPendingAttempt(id, errorText) {
 }
 
 async function checkpointPendingAdmission(entries, admission, options = {}) {
-  return await withDirLock(queueLockDir(), async () => {
+  return await withWakeLock(queueLockDir(), async () => {
     const queue = readPendingUnlocked();
     for (const entry of entries) {
       const current = queue.find((candidate) => candidate.id === entry.id && candidate.key === entry.key);
@@ -423,18 +378,14 @@ async function checkpointPendingAdmission(entries, admission, options = {}) {
 }
 
 function entryLaneKey(entry) {
-  if (entry && typeof entry.laneKey === "string" && entry.laneKey) return entry.laneKey;
-  return wakeLaneKey(
-    entry && entry.payload || {},
-    entry && entry.threadId || null,
-    entry && entry.mode || (entry && entry.threadId ? PINNED_THREAD_MODE : FRESH_THREAD_MODE)
-  );
+  if (!entry || typeof entry.laneKey !== "string" || !entry.laneKey) throw new Error("Pending wake lane identity unavailable");
+  return entry.laneKey;
 }
 
 function firstPendingPerLane(queue) {
   const byLane = new Map();
   for (const entry of queue) {
-    if (!entry || entry.terminalDisposition || !entry.payload || !entry.payload.text) continue;
+    if (entry.terminalDisposition) continue;
     const laneKey = entryLaneKey(entry);
     if (!byLane.has(laneKey)) byLane.set(laneKey, entry);
   }
@@ -442,7 +393,7 @@ function firstPendingPerLane(queue) {
 }
 
 async function pendingHeadForLane(entryId, laneKey) {
-  return await withDirLock(queueLockDir(), async () => {
+  return await withWakeLock(queueLockDir(), async () => {
     const queue = readPendingUnlocked();
     const head = queue.find((entry) => !entry.terminalDisposition && entryLaneKey(entry) === laneKey) || null;
     return {
@@ -450,11 +401,11 @@ async function pendingHeadForLane(entryId, laneKey) {
       head,
       pendingCount: queue.length,
     };
-  }, { waitMs: 2000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+  }, { waitMs: 2000 });
 }
 
 async function markPendingStaleRecovery(entry, recovery) {
-  return await withDirLock(queueLockDir(), async () => {
+  return await withWakeLock(queueLockDir(), async () => {
     const queue = readPendingUnlocked();
     const index = queue.findIndex((candidate) => candidate.id === entry.id);
     if (index < 0) return { status: "missing", entry: null };
@@ -474,12 +425,12 @@ async function markPendingStaleRecovery(entry, recovery) {
     queue[index] = updated;
     writePendingUnlocked(queue);
     return { status: "requeued", entry: updated, pendingCount: queue.length };
-  }, { waitMs: 2000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+  }, { waitMs: 2000 });
 }
 
 return {
   sanitizePayload,
-  withDirLock,
+  withWakeLock,
   withWakeCapacity,
   withAllWakeCapacity,
   withWakeExecutionLane,

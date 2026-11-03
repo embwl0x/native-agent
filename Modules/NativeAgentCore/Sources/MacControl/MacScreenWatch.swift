@@ -82,6 +82,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     public let height: Int
     let app: String
     private let dataRoot: URL
+    public var handRefusal: MacAppActRefusal? { MacAppActGate.refusal(pid: pid, dataRoot: dataRoot) }
     private let enclosingAct = Experience.currentAct
     let pid: Int32
     let windowNumber: Int
@@ -94,7 +95,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     let verbs: (@Sendable () async throws -> MacFourVerbs)?
     /// Screen control still allowed: Full Mac active and the accessibility
     /// category on, as the four verbs read it.
-    private let authority: @Sendable () async -> Bool
+    private let authority: @Sendable () async throws -> Bool
     let binding: MacDriverBinding?
     let started = ProcessInfo.processInfo.systemUptime
     fileprivate let queue = DispatchQueue(label: "nativeagent.screen.watch")
@@ -139,7 +140,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
 
     fileprivate init(app: String, dataRoot: URL, pid: Int32, window: SCWindow, region: MacAXFrame, width: Int, height: Int,
                      sighting: MacFourVerbs.Sighting, verbs: (@Sendable () async throws -> MacFourVerbs)?,
-                     authority: @escaping @Sendable () async -> Bool, binding: MacDriverBinding?) {
+                     authority: @escaping @Sendable () async throws -> Bool, binding: MacDriverBinding?) {
         let frame = MacAXFrame(x: window.frame.minX, y: window.frame.minY, w: window.frame.width, h: window.frame.height)
         generation = Self.generations.withLock { $0 += 1; return $0 }
         self.app = app; self.dataRoot = dataRoot; self.pid = pid; self.windowNumber = Int(window.windowID)
@@ -154,7 +155,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
 
     static func start(app: String, dataRoot: URL, pid: Int32, window frame: MacAXFrame, sighting: MacFourVerbs.Sighting, request: Request,
                       verbs: (@Sendable () async throws -> MacFourVerbs)?,
-                      authority: @escaping @Sendable () async -> Bool) async throws -> MacScreenWatch {
+                      authority: @escaping @Sendable () async throws -> Bool) async throws -> MacScreenWatch {
         guard CGPreflightScreenCaptureAccess() else {
             throw SenseFailure(code: "screen_recording_not_trusted", message: "Screen Recording is off for NativeAgent. System Settings > Privacy & Security > Screen Recording > NativeAgent switch on.",
                                remedy: MacFourVerbsReply.privacyRemedy("screen_recording_not_trusted"))
@@ -189,7 +190,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.ignoreShadowsSingleWindow = true
         configuration.showsCursor = false
-        let binding = verbs == nil ? nil : await MacAttentionSessionStore.shared.bindDriver()
+        let binding = verbs == nil ? nil : try await MacAttentionSessionStore.shared.bindDriver()
         let watch = MacScreenWatch(app: app, dataRoot: dataRoot, pid: pid, window: window, region: region, width: configuration.width,
                                    height: configuration.height, sighting: sighting, verbs: verbs, authority: authority, binding: binding)
         // Establish complete pre-capture masks before the stream's first frame.
@@ -292,7 +293,12 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
     /// watch ends ("authority_revoked").
     func allowed() async -> Bool {
         guard lock.withLock({ ended == nil }) else { return false }
-        guard await authority() else { end("authority_revoked"); return false }
+        do {
+            guard try await authority() else { end("authority_revoked"); return false }
+        } catch {
+            end("authority_unavailable", failure: SenseFailure(error))
+            return false
+        }
         return lock.withLock { ended == nil } && !Task.isCancelled
     }
 
@@ -313,6 +319,7 @@ public final class MacScreenWatch: NSObject, SCStreamOutput, SCStreamDelegate, @
             if let failure = lock.withLock({ failure }) { throw failure }
             if lock.withLock({ spent }) { return .null }
             _ = await allowed()
+            if let failure = lock.withLock({ failure }) { throw failure }
             try Task.checkCancellation()
             let answer = lock.withLock { () -> JSONValue? in
                 if ended != nil || spent { return .null }
@@ -465,7 +472,7 @@ extension MacFourVerbs {
     /// `hands` builds the verbs each hand runs on; nil watches without hands.
     /// `authority` answers whether screen control is still allowed.
     public func watch(_ request: MacScreenWatch.Request, dataRoot: URL, hands: (@Sendable () async throws -> MacFourVerbs)?,
-                      authority: @escaping @Sendable () async -> Bool) async throws -> MacScreenWatch {
+                      authority: @escaping @Sendable () async throws -> Bool) async throws -> MacScreenWatch {
         let seen: Sighting
         switch await sight(part: nil, app: request.app) {
         case .blind(let reply):

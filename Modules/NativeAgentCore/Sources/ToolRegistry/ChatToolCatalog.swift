@@ -14,8 +14,8 @@ public struct ChatCatalogTool: Identifiable, Codable, Hashable, Sendable {
     public var description: String
     public var parametersPreview: String?
     public var dispatchableVia: String?
-    /// Legacy manifest field: floor membership (`loaded`/`hidden`), not a loading lifecycle.
-    public var loadState: String?
+    /// Whether this schema is carried to the model by the current request contract.
+    public var modelVisible: Bool?
     public var effectiveAutonomy: String?
     public var availableNow: Bool?
     /// Typed runtime category emitted by the dispatcher registry. Unlike tags,
@@ -31,7 +31,7 @@ public struct ChatCatalogTool: Identifiable, Codable, Hashable, Sendable {
         description: String,
         parametersPreview: String? = nil,
         dispatchableVia: String? = nil,
-        loadState: String? = nil,
+        modelVisible: Bool? = nil,
         effectiveAutonomy: String? = nil,
         availableNow: Bool? = nil,
         catalogBucket: String? = nil,
@@ -41,7 +41,7 @@ public struct ChatCatalogTool: Identifiable, Codable, Hashable, Sendable {
         self.description = description
         self.parametersPreview = parametersPreview
         self.dispatchableVia = dispatchableVia
-        self.loadState = loadState
+        self.modelVisible = modelVisible
         self.effectiveAutonomy = effectiveAutonomy
         self.availableNow = availableNow
         self.catalogBucket = catalogBucket
@@ -52,8 +52,8 @@ public struct ChatCatalogTool: Identifiable, Codable, Hashable, Sendable {
 /// Full Mac lanes the Trust Center has open or locked.
 public struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
     public var tools: [ChatCatalogTool]
-    /// Legacy manifest field: the always-on floor intersected with the model-visible catalog.
-    public var currentlyLoaded: Set<String>
+    /// The current always-on schemas, intersected with this catalog.
+    public var alwaysOnTools: Set<String>
     public var builderAvailable: [String]
     public var builderPolicyLocked: [String]
     public var macAppAvailable: [String]
@@ -96,8 +96,8 @@ public struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
                 }()
                 var dispatchVia: String?
                 if case .string(let dv)? = r["dispatchable_via"] { dispatchVia = dv }
-                var loadState: String?
-                if case .string(let state)? = r["load_state"] { loadState = state }
+                var modelVisible: Bool?
+                if case .bool(let visible)? = r["model_visible"] { modelVisible = visible }
                 var effectiveAutonomy: String?
                 if case .string(let autonomy)? = r["effective_autonomy"] {
                     effectiveAutonomy = autonomy
@@ -132,7 +132,7 @@ public struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
                     description: desc,
                     parametersPreview: paramsPreview,
                     dispatchableVia: dispatchVia,
-                    loadState: loadState,
+                    modelVisible: modelVisible,
                     effectiveAutonomy: effectiveAutonomy,
                     availableNow: availableNow,
                     catalogBucket: catalogBucket,
@@ -142,7 +142,7 @@ public struct ChatToolCatalogSnapshot: Codable, Hashable, Sendable {
         }
 
         self.tools = tools
-        self.currentlyLoaded = Set(stringArray("currently_loaded"))
+        self.alwaysOnTools = Set(stringArray("always_on_tools"))
         self.builderAvailable = stringArray("builder_available_tools")
         self.builderPolicyLocked = stringArray("builder_policy_locked_tools")
         self.macAppAvailable = stringArray("mac_app_available_tools")

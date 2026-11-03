@@ -83,11 +83,10 @@ extension ActivityWatcher {
             seedFromFrontmostApplication()
         case .sessionResignedActive:
             sessionInactive = true
-            feed(.lock(at: safeNow()))
+            _ = reconcileLocked()
             standDownCapture()
         case .sessionBecameActive:
             sessionInactive = false
-            feed(.unlock(at: safeNow()))
             seedFromFrontmostApplication()
         }
     }
@@ -101,7 +100,7 @@ extension ActivityWatcher {
             self?.onCaptureThread { [weak self] in
                 guard let self else { return }
                 self.screenLockedByNotification = true
-                self.feed(.lock(at: self.safeNow()))
+                _ = self.reconcileLocked()
                 self.standDownCapture()
             }
         })
@@ -111,7 +110,6 @@ extension ActivityWatcher {
             self?.onCaptureThread { [weak self] in
                 guard let self else { return }
                 self.screenLockedByNotification = false
-                self.feed(.unlock(at: self.safeNow()))
                 // Re-read; never assume unlocked just because a note said so.
                 self.seedFromFrontmostApplication()
             }
@@ -135,14 +133,16 @@ extension ActivityWatcher {
     /// it on start, on wake, on every tick, and before every span open. A missed
     /// notification must degrade to "no span", never to "a confident wrong span".
     private func reconcileLocked() -> Bool {
-        if screensAsleep || sessionInactive || screenLockedByNotification {
-            return true
-        }
         let front = NSWorkspace.shared.frontmostApplication
-        return Self.isLockSignal(
+        let locked = screensAsleep || sessionInactive || screenLockedByNotification || Self.isLockSignal(
             bundleId: front?.bundleIdentifier,
             localizedName: front?.localizedName
         )
+        // Both directions come from this same reconciled snapshot. In
+        // particular a previously missing/loginwindow front can clear its gate
+        // without relying on an unlock notification that may never arrive.
+        feed(locked ? .lock(at: safeNow()) : .unlock(at: safeNow()))
+        return locked
     }
 
     /// A missing frontmost identity is treated as locked.
@@ -156,8 +156,9 @@ extension ActivityWatcher {
     // MARK: - Span handling (capture thread)
 
     func seedFromFrontmostApplication() {
+        guard isCaptureEnabled, !isStopping else { return }
+        startTickTimer()
         if reconcileLocked() {
-            feed(.lock(at: safeNow()))
             standDownCapture()
             return
         }
@@ -173,6 +174,13 @@ extension ActivityWatcher {
         // Check the current capture flag because the engine's policy update is queued.
         guard isCaptureEnabled else { return }
         guard !isStopping else { return }
+        startTickTimer()
+
+        // Reconcile before motor attribution or any opening path.
+        if reconcileLocked() {
+            standDownCapture()
+            return
+        }
 
         // An activation immediately following NativeAgent's own bounded motor
         // epoch is agent-driven provenance, not evidence that the person chose
@@ -184,20 +192,15 @@ extension ActivityWatcher {
                 at: safeNow()
             ))
             detachObserver()
-            stopTickTimer()
+            idleResumeWatch = true
             // Observe without opening a span. The first later AX event outside
             // the bounded motor epoch is evidence the human took over this app;
             // it will seed a fresh human span below. This avoids permanently
             // losing the app until the next app switch.
-            if let pid, pid != ownProcessID { attachObserver(pid: pid) }
-            return
-        }
-
-        // Lock gate FIRST — while locked AX answers with plausible garbage.
-        let locked = Self.isLockSignal(bundleId: bundleId, localizedName: appName) || reconcileLocked()
-        if locked {
-            feed(.lock(at: safeNow()))
-            standDownCapture()
+            if let bundleId, let pid, pid != ownProcessID,
+               engine.shouldCapture(bundleID: bundleId) {
+                _ = attachCheckedObserver(pid: pid)
+            }
             return
         }
 
@@ -209,6 +212,7 @@ extension ActivityWatcher {
                 bundleId: ActivityPolicy.selfProcessBundleID, appName: "excluded", at: safeNow()
             ))
             standDownCapture()
+            observationAvailable()
             return
         }
 
@@ -218,14 +222,20 @@ extension ActivityWatcher {
         }
 
         detachObserver()
-
-        // Open the span before attaching its observer so attachment cannot delay capture.
+        // End the prior app at its observed activation boundary before waiting
+        // on a different application's attachment. Its failure is not a quit
+        // or an observation loss in the previous app.
+        if let span = engine.openSpan, span.bundleId != bundleId {
+            feed(.activate(bundleId: ActivityPolicy.selfProcessBundleID,
+                           appName: "app-change", at: safeNow()))
+        }
+        // Required observation must be available before claiming a new span.
+        guard attachCheckedObserver(pid: pid) else { return }
         feed(.activate(bundleId: bundleId, appName: appName ?? bundleId, at: clock.wallNow()))
 
         // A span is open again: the timer is a heartbeat once more.
         idleResumeWatch = false
         startTickTimer()
-        attachObserver(pid: pid)
 
         // Only NOW, with the span already open, is a title read attempted — and
         // only if policy allows it for this specific app.
@@ -236,7 +246,6 @@ extension ActivityWatcher {
         guard let pid, pid == observedPID else { return }
         feed(.terminate(at: safeNow()))
         detachObserver()
-        stopTickTimer()
     }
 
     /// One processed AX event. Runs on the capture thread (run-loop source);
@@ -254,9 +263,7 @@ extension ActivityWatcher {
         // Check the current capture flag because the engine's policy update is queued.
         guard isCaptureEnabled else { return }
         if reconcileLocked() {
-            feed(.lock(at: safeNow()))
             detachObserver()
-            stopTickTimer()
             return
         }
         guard let bundleID = engine.openSpan?.bundleId, let pid = observedPID else { return }
@@ -279,22 +286,28 @@ extension ActivityWatcher {
         guard engine.shouldReadTitle(bundleID: bundleID) else { return }
         // Recheck lock state before reading AX; locked AX titles can look valid.
         guard !reconcileLocked() else {
-            feed(.lock(at: safeNow()))
             detachObserver()
-            stopTickTimer()
             return
         }
         // Recheck capture immediately before AX so disabling also prevents the title read.
         guard isCaptureEnabled else { return }
-        let raw = Self.frontmostWindowTitle(pid: pid)
-        // `raw` is handed straight to the engine, which redacts it before it can
-        // reach a span. It is never logged, never stored, never returned.
-        feed(.titleChange(raw: raw, at: safeNow()))
+        switch Self.frontmostWindowTitle(pid: pid) {
+        case .observed(let raw):
+            // Raw text goes only to the source redactor, never to diagnostics.
+            feed(.titleChange(raw: raw, at: safeNow()))
+        case .unavailable(let detail):
+            observationIssue?("Activity title observation unavailable for PID \(pid): \(detail). The previous title evidence is unchanged.")
+        }
+    }
+
+    private enum TitleObservation {
+        case observed(String?)
+        case unavailable(String)
     }
 
     /// Reads `kAXTitle` off the focused window. NEVER `kAXValue`, for any role —
     /// that rule is categorical, not conditional on what the element is.
-    private static func frontmostWindowTitle(pid: pid_t) -> String? {
+    private static func frontmostWindowTitle(pid: pid_t) -> TitleObservation {
         let appElement = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(appElement, 0.25)
 
@@ -302,18 +315,27 @@ extension ActivityWatcher {
         let windowErr = AXUIElementCopyAttributeValue(
             appElement, kAXFocusedWindowAttribute as CFString, &windowRef
         )
-        guard windowErr == .success, let windowRef else { return nil }
-        // The app may die mid-read; `.invalidUIElement` / `.cannotComplete`
-        // return nil here rather than throwing the capture thread off course.
-        guard CFGetTypeID(windowRef) == AXUIElementGetTypeID() else { return nil }
+        if windowErr == .noValue { return .observed(nil) }
+        guard windowErr == .success else {
+            return .unavailable("focused-window AX error \(windowErr.rawValue)")
+        }
+        guard let windowRef, CFGetTypeID(windowRef) == AXUIElementGetTypeID() else {
+            return .unavailable("focused-window result has no AX element")
+        }
         let window = unsafeDowncast(windowRef, to: AXUIElement.self)
 
         var titleRef: CFTypeRef?
         let titleErr = AXUIElementCopyAttributeValue(
             window, kAXTitleAttribute as CFString, &titleRef
         )
-        guard titleErr == .success, let title = titleRef as? String else { return nil }
-        return title
+        if titleErr == .noValue || titleErr == .attributeUnsupported { return .observed(nil) }
+        guard titleErr == .success else {
+            return .unavailable("title AX error \(titleErr.rawValue)")
+        }
+        guard let title = titleRef as? String else {
+            return .unavailable("title result is not a string")
+        }
+        return .observed(title)
     }
 
     // MARK: - The one timer, three jobs
@@ -349,14 +371,13 @@ extension ActivityWatcher {
 
         // (3) reconcile lock state — a missed notification self-heals in <= 60 s.
         if reconcileLocked() {
-            feed(.lock(at: safeNow()))
             standDownCapture()
             return
         }
         guard let span = engine.openSpan else {
             // Fresh input resumes the same app through normal activation and its policy gates.
             guard idleResumeWatch else {
-                stopTickTimer()
+                seedFromFrontmostApplication()
                 return
             }
             // Capture starts without Input Monitoring and must resume without
@@ -395,7 +416,8 @@ extension ActivityWatcher {
     /// Capture boundaries do not decide whether the person is here.
     private func standDownCapture() {
         detachObserver()
-        stopTickTimer()
+        // Keep the one reconciliation tick: a missed unlock or unavailable AX
+        // attachment must not need another workspace notification to recover.
     }
 
     private func idleSecondsSinceLastInput() -> Double {
@@ -418,10 +440,39 @@ extension ActivityWatcher {
 
     // MARK: - AX observer (capture thread only)
 
-    private func attachObserver(pid: pid_t) {
+    private enum AttachmentOutcome {
+        case attached
+        case terminated
+        case unavailable(String)
+    }
+
+    private func attachCheckedObserver(pid: pid_t) -> Bool {
+        switch attachObserver(pid: pid) {
+        case .attached:
+            observationAvailable()
+            return true
+        case .terminated:
+            feed(.terminate(at: safeNow()))
+            detachObserver()
+            return false
+        case .unavailable(let detail):
+            observationUnavailable("Activity AX observation unavailable for PID \(pid): \(detail).")
+            return false
+        }
+    }
+
+    private func attachObserver(pid: pid_t) -> AttachmentOutcome {
+        func failed(_ detail: String) -> AttachmentOutcome {
+            if let app = NSRunningApplication(processIdentifier: pid), app.isTerminated {
+                return .terminated
+            }
+            return .unavailable(detail)
+        }
         var created: AXObserver?
         let createErr = AXObserverCreate(pid, activityAXObserverCallback, &created)
-        guard createErr == .success, let created else { return }
+        guard createErr == .success, let created else {
+            return failed("observer creation AX error \(createErr.rawValue)")
+        }
 
         let appElement = AXUIElementCreateApplication(pid)
         // Belt-and-braces; the global timeout set at startup is the real gate.
@@ -436,20 +487,22 @@ extension ActivityWatcher {
             kAXFocusedWindowChangedNotification,
             kAXTitleChangedNotification,
         ]
+        var registered = 0
+        var unsupported: [String] = []
         for notification in notifications {
             let err = AXObserverAddNotification(created, appElement, notification as CFString, refcon)
             switch err {
             case .success, .notificationAlreadyRegistered:
-                continue
-            case .invalidUIElement, .cannotComplete:
-                // The target app may die mid-registration. Close and bail —
-                // never leave a half-attached observer behind.
-                feed(.terminate(at: safeNow()))
-                stopTickTimer()
-                return
+                registered += 1
+            case .notificationUnsupported:
+                unsupported.append(notification as String)
             default:
-                continue
+                return failed("\(notification) registration AX error \(err.rawValue)")
             }
+        }
+        guard registered > 0 else { return failed("no requested AX notification is supported") }
+        if !unsupported.isEmpty {
+            observationIssue?("Activity AX observation for PID \(pid) does not support: \(unsupported.joined(separator: ", ")). Other registered notifications remain active.")
         }
 
         CFRunLoopAddSource(
@@ -460,6 +513,7 @@ extension ActivityWatcher {
         observer = created
         observerContext = context
         observedPID = pid
+        return .attached
     }
 
     func detachObserver() {

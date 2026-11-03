@@ -138,15 +138,6 @@ public enum MacControlSensitivePathFence {
         PersistenceCore.defaultDataRoot().path
     }
 
-    /// NATIVE_AGENT_DATA extends protected-path coverage only; it never selects configuration.
-    private static var legacyDaemonDataRootPath: String? {
-        let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_DATA"]
-        guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
-        }
-        return (raw as NSString).expandingTildeInPath
-    }
-
     /// Returns nil when path is allowed, or a rejection reason string.
     public static func reason(forPath rawPath: String) -> String? {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -172,7 +163,6 @@ public enum MacControlSensitivePathFence {
         let ownedStores = ["mac_control", "her_screen", "activity_watch", "experiences",
                            "mac_control_audit.jsonl", "mac_control_audit.jsonl.lock"]
         let roots = [swiftDataRootPath, NSHomeDirectory() + "/Library/Application Support/NativeAgent"]
-            + (legacyDaemonDataRootPath.map { [$0] } ?? [])
         let prefixes = (protectedSystemMutationPrefixes + (write ? roots.flatMap { root in
             ownedStores.map { (root as NSString).appendingPathComponent($0) }
         } : [])).map { (raw: $0, normalized: normalizedPath($0)) }
@@ -204,14 +194,11 @@ public enum MacControlSensitivePathFence {
             }
         }
 
-        // Relocated, default and legacy data roots receive the same fence.
-        var dataRootCandidates: [String] = [
+        // The current process root and the default root receive the same fence.
+        let dataRootCandidates: [String] = [
             swiftDataRootPath,
             (home as NSString).appendingPathComponent("Library/Application Support/NativeAgent"),
         ]
-        if let legacy = legacyDaemonDataRootPath {
-            dataRootCandidates.append(legacy)
-        }
         for rootRaw in dataRootCandidates {
             for file in bannedDataRootFiles {
                 let full = normalizedPath((rootRaw as NSString).appendingPathComponent(file))

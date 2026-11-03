@@ -5,15 +5,16 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import Transcripts
-// Blueprint: | `SwiftToolDispatcher+HumanConversations.swift` | `HumanConversationSnapshot` struct |
+import ChatTurnContracts
+// Blueprint: | `SwiftToolDispatcher+HumanConversations.swift` | Transcript/index-owned human conversation reads; explicit replies require the latest user row's human route, while session delivery reads local source from the index and remote provenance from one bounded backward read, skipping explicit peer/mechanical rows |
 
 /// A read model over the existing index and transcript, never another session store.
 public struct HumanConversationSnapshot: Sendable {
     public let sessionID: String
     public let title: String
-    public let source: String
-    public let revision: String
-    public let sourceRevision: String
+    public let source: String?
+    public let revision: String?
+    public let sourceRevision: String?
     public let lastMessageID: String?
     public let route: TurnEnvelope?
     public let messages: [ChatMessage]
@@ -23,6 +24,36 @@ public struct HumanConversationSnapshot: Sendable {
 public enum HumanConversationReader {
     public static func rows(dataRoot: URL) throws -> [[String: JSONValue]] { try HumanConversationIndex.rows(dataRoot: dataRoot) }
     public static func read(sessionID: String, dataRoot: URL, replyBefore: Date? = nil, surface: String? = nil) async throws -> HumanConversationSnapshot {
+        try await readSnapshot(sessionID: sessionID, dataRoot: dataRoot, replyBefore: replyBefore, surface: surface)
+    }
+
+    /// A queued peer/mechanical row does not replace the person's session destination.
+    /// Explicit replies keep their stricter latest-user-row rule through `read`.
+    public static func readForSessionDelivery(sessionID: String, dataRoot: URL) async throws -> ChatToolSessionContext.ReplyRoute? {
+        guard NativeAgentChatSessionID.normalizedPathComponent(sessionID) != nil,
+              let row = try rows(dataRoot: dataRoot).first(where: { $0["id"]?.stringValue == sessionID }),
+              let source = row["source"]?.stringValue else { return nil }
+        // The index owns local presentation; transcript size is irrelevant.
+        if ["app", "chat", "mac"].contains(source) { return .init(surface: source) }
+        // Only remote destinations need historical provenance. One bounded
+        // backward read never interprets an exhausted window as a destination.
+        let path = dataRoot.appendingPathComponent("chat/messages/\(sessionID).jsonl")
+        guard let tail = try SwiftNativePersistenceCore.tailPhysicalLines(path, limit: 2048, maxBytes: 1024 * 1024) else { return nil }
+        for data in tail.lines.dropFirst(tail.leadingFragment ? 1 : 0).reversed() {
+            guard case .object(let fields) = try JSONValue.parse(data),
+                  let role = fields["role"]?.stringValue else { return nil }
+            guard role == "user" else { continue }
+            let metadata = fields["metadata"]?.objectValue ?? [:]
+            let envelope = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
+            if metadata["mechanicalKind"] != nil || !(metadata["origin"]?.objectValue ?? [:]).isEmpty
+                || envelope?.agent != nil || envelope?.surface.hasSuffix("-bridge") == true { continue }
+            guard routeAvailable(envelope) else { return nil }
+            return envelope?.replyRoute
+        }
+        return nil
+    }
+
+    private static func readSnapshot(sessionID: String, dataRoot: URL, replyBefore: Date?, surface: String?) async throws -> HumanConversationSnapshot {
         guard NativeAgentChatSessionID.normalizedPathComponent(sessionID) != nil,
               let row = try rows(dataRoot: dataRoot).first(where: { $0["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) == sessionID }) else {
             throw AutonomyGateError.toolDenied(reason: "This conversation is unavailable. Open the conversation list again.")
@@ -41,7 +72,10 @@ public enum HumanConversationReader {
         let lastID = result.messages.last.flatMap { ($0.extras?.objectValue ?? [:])["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) }
         // With `surface`, the thread's latest message from that surface (one thread, many doors).
         let human = result.messages.last { message in
-            message.role == "user" && (replyBefore.map {
+            guard message.role == "user" else { return false }
+            // An unmarked row with missing/invalid routing remains the latest
+            // candidate and makes the route unavailable; absence is not a reason to skip it.
+            return (replyBefore.map {
                 (DeskClock.parseISO(message.timestamp) ?? .distantFuture) <= $0
             } ?? true) && (surface.map { wanted in
                 TurnEnvelope.fromPersistedMetadata(((message.extras?.objectValue ?? [:])["metadata"]?.objectValue ?? [:])["envelope"])?.surface == wanted
@@ -60,9 +94,9 @@ public enum HumanConversationReader {
                 route = candidate
             }
         }
-        let generation = ChatSessionIndexFile.transcriptGeneration(in: row).map(String.init) ?? "legacy"
+        let generation = ChatSessionIndexFile.transcriptGeneration(in: row).map(String.init)
         return .init(sessionID: sessionID, title: row["title"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "Conversation",
-                     source: row["source"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "app", revision: generation + ":" + (lastID ?? "unavailable"), sourceRevision: generation,
+                     source: row["source"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }), revision: generation.flatMap { generation in lastID.map { generation + ":" + $0 } }, sourceRevision: generation,
                      lastMessageID: lastID, route: route, messages: visible, complete: complete)
     }
     /// One conversation's latest messages (8, up to 16) and whether
@@ -97,8 +131,8 @@ public enum HumanConversationReader {
         }
         var result: [String: JSONValue] = ["status": .string(snapshot.complete ? "ok" : "unavailable"),
             "conversation_session_id": .string(id), "title": .string(snapshot.title),
-            "surface": .string(snapshot.source), "revision": .string(snapshot.revision),
-            "source_revision": .string(snapshot.sourceRevision),
+            "surface": snapshot.source.map(JSONValue.string) ?? .null, "revision": snapshot.revision.map(JSONValue.string) ?? .null,
+            "source_revision": snapshot.sourceRevision.map(JSONValue.string) ?? .null,
             "last_message_id": snapshot.lastMessageID.map(JSONValue.string) ?? .null,
             "reply_available": .bool(canReply),
             "reply_kind": .string(current ? "current_turn" : (canReply ? "saved_route" : "unavailable")),

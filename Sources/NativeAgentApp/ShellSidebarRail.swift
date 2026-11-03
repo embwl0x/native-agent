@@ -4,6 +4,20 @@ import SwiftUI
 
 // Blueprint: | `ShellSidebarRail.swift` | `ShellSidebarRail`: canonical rail item presentation, selection and focus-ring rendering |
 
+/// Both shells keep the retained conversation list's unavailable cause visible.
+struct ConversationReadNotice: View {
+    let detail: String?
+    var body: some View {
+        if let detail {
+            Label(detail, systemImage: "exclamationmark.triangle")
+                .font(ShellType.caption)
+                .foregroundStyle(NativeAgentShell.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("conversations.read-unavailable")
+        }
+    }
+}
+
 /// One word in the rail, with the bar when it is the place you are.
 struct ShellRailItem: View {
     var item: SidebarItem
@@ -12,6 +26,7 @@ struct ShellRailItem: View {
     /// no number, no pill. The rail says THAT there is something; the page
     /// says what it is.
     var needsYou: Bool = false
+    var attentionUnavailable = false
     var onSelect: () -> Void
     /// Shared with every other row so the selection bar can travel between
     /// them instead of blinking off one row and on at the next.
@@ -39,6 +54,11 @@ struct ShellRailItem: View {
                         .fill(NativeAgentShell.needsYou)
                         .frame(width: 6, height: 6)
                         .accessibilityHidden(true)
+                } else if attentionUnavailable {
+                    Image(systemName: "questionmark.circle")
+                        .font(ShellType.caption)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .help("Attention unavailable. Open Today to inspect the source read problem.")
                 }
                 Spacer(minLength: 0)
             }
@@ -75,7 +95,7 @@ struct ShellRailItem: View {
         .onHover { hovering = $0 }
         .help(item.displayName)
         .accessibilityIdentifier("sidebar.item.\(item.rawValue)")
-        .accessibilityLabel(needsYou ? "\(item.shellRailTitle), waiting for you" : item.shellRailTitle)
+        .accessibilityLabel(attentionUnavailable ? "\(item.shellRailTitle), attention unavailable" : needsYou ? "\(item.shellRailTitle), waiting for you" : item.shellRailTitle)
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
     }
 }
@@ -110,7 +130,8 @@ struct ShellSidebarRail: View {
     @Binding var selection: SidebarItem
     /// The places that have something waiting on him. A dot, never a count —
     /// the caller does the counting and this rail only says whether.
-    var needsYou: Set<SidebarItem> = []
+    var needsYou: Set<SidebarItem>? = []
+    var attentionItem: SidebarItem? = nil
 
     /// The one id the travelling selection bar is known by.
     static let selectionBarID = "shell.rail.selection-bar"
@@ -121,8 +142,10 @@ struct ShellSidebarRail: View {
     var body: some View {
         // Every row but the last renders at the top; the last is pushed to the
         // bottom, so the setup door is never mistaken for a place to work.
-        let rail = SidebarItem.rail(appModel.engine.layout.layout)
+        SurfaceLayoutContent(appModel.engine.layout.availability) { layout in
+        let rail = SidebarItem.rail(layout)
         VStack(spacing: 4) {
+            ConversationReadNotice(detail: appModel.engine.transcripts.navigationReadIssue)
             ForEach(rail.dropLast(), id: \.self) { row(item: $0) }
             Spacer(minLength: 8)
             if let last = rail.last { row(item: last) }
@@ -133,6 +156,7 @@ struct ShellSidebarRail: View {
             NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: selection
         )
+        }
         // Rail words share the shell header's baseline at window y 72; Settings keeps the same bottom inset.
         .padding(.top, 14 - NativeAgentShellLayout.railPlateInset)
         .padding(.bottom, 14 - NativeAgentShellLayout.railPlateInset)
@@ -156,7 +180,9 @@ struct ShellSidebarRail: View {
     private func row(item: SidebarItem?) -> some View {
         if let item {
             ShellRailItem(item: item, isSelected: selection.normalized == item.normalized,
-                          needsYou: needsYou.contains(item.normalized), onSelect: { selection = item },
+                          needsYou: needsYou?.contains(item.normalized) == true,
+                          attentionUnavailable: needsYou == nil && attentionItem?.normalized == item.normalized,
+                          onSelect: { selection = item },
                           barNamespace: selectionBar)
         } else {
             Rectangle()

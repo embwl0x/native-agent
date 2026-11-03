@@ -23,7 +23,7 @@ extension CognitiveSubstrate {
         // Restore runs once: a mind already read (or cleared) in this process
         // is the resident truth, and re-reading the disk over it would lose
         // what it has not saved yet (map risk 6).
-        guard !persistenceRestored else { return }
+        guard !persistenceRestored else { await restoreSelfKnowledge(); return }
         restoreInFlight = true
         defer {
             restoreInFlight = false
@@ -76,15 +76,14 @@ extension CognitiveSubstrate {
                 failureStage: stage,
                 failureDetail: detail
             )
-            try? await store.appendReceipt(
+            await recordReceipt(
                 kind: "lifecycle.restore_degraded",
                 payload: .object([
                     "status": .string("degraded"),
                     "failureStage": .string(stage),
                     "error": .string(detail),
                     "writesBlocked": .bool(true),
-                ]),
-                at: attemptAt
+                ])
             )
             throw error
         }
@@ -154,8 +153,12 @@ extension CognitiveSubstrate {
             lastSuccessfulRestoreAt: dependencies.now()
         )
         publishAttentionProjection(at: dependencies.now())
+        // Resolve only the resident reads, after reconciliation: no migration
+        // write of existing relationship keys. Later lived writes save normally.
+        await refreshCarePeople()
+        await restoreSelfKnowledge()
         await establishCares(retiredViews: retiredViews, retiredSeeds: retiredSeeds)
-        try? await store.appendReceipt(
+        await recordReceipt(
             kind: "lifecycle.restore",
             payload: .object([
                 "nodeCount": .int(Int64(field.peekNodes().count)),
@@ -165,8 +168,7 @@ extension CognitiveSubstrate {
                 "reflectionCount": .int(Int64(reflectionReceipts.count)),
                 "status": .string(previouslyDegraded ? "recovered" : "restored"),
                 "writesBlocked": .bool(false),
-            ]),
-            at: dependencies.now()
+            ])
         )
     }
 
@@ -193,7 +195,7 @@ extension CognitiveSubstrate {
         if residentRestoreIsAuthoritative || disposition != CognitiveDisposition() {
             rows["disposition"] = [dispositionArtifactPayload(at: disposition.updatedAt)]
         }
-        if residentRestoreIsAuthoritative || dreamResidueClaimKey != nil || dreamResidue != nil {
+        if residentRestoreIsAuthoritative || !dreamResidueClaims.isEmpty || dreamResidue != nil {
             rows["dream_residue"] = [dreamResidueArtifactPayload(at: now)]
         }
         if residentRestoreIsAuthoritative || !associationSuppressions.isEmpty || dispositionUndo != nil {
@@ -230,7 +232,9 @@ extension CognitiveSubstrate {
                 var score = object["confidence"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? object["score"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0
                 switch family {
                 case "episode", "developmental_timeline": status = "recorded"; score = 0.5
-                case "reflection_receipt": status = object["cancelled"] == .bool(true) ? "cancelled" : "recorded"
+                case "reflection_receipt":
+                    status = object["careIntegrationPending"] == .bool(true) || object["dispositionSaveFailed"] == .bool(true)
+                        || object["journalPending"] == .bool(true) ? "owed" : (object["cancelled"] == .bool(true) ? "cancelled" : "recorded")
                 case "care": status = (object["fadedAt"] ?? .null) == .null ? "live" : "faded"
                 case "disposition": score = ((object["valence"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0) + 1) / 2
                 case "affect": score = object["arousal"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0
@@ -322,6 +326,14 @@ extension CognitiveSubstrate {
                 )
             }
             for (index, payload) in payloads.enumerated() {
+                if ["episode", "schema_proposal", "developmental_timeline", "reflection_receipt", "capsule_presentation",
+                    "affect", "disposition", "dream_residue", "mind_ledger", "emotional_consolidation"].contains(family.key) {
+                    do { try CognitiveArtifactCodec.validate(payload, family: family.key) }
+                    catch {
+                        throw CognitivePersistenceError.invalidRestoreArtifact(
+                            family: family.key, index: index, detail: String(describing: error))
+                    }
+                }
                 let valid: Bool
                 switch family.key {
                 case "episode":
@@ -372,9 +384,10 @@ extension CognitiveSubstrate {
             return dateValue(object["updatedAt"]) != nil
         case "disposition":
             return dateValue(object["updatedAt"]) != nil
-                && object["valence"]?.numberValue(coercingStrings: false, finiteOnly: false) != nil
+                && object["valence"]?.numberValue(coercingStrings: false, finiteOnly: true) != nil
+                && validDreamClaims(object["dreamNights"])
         case "dream_residue":
-            return dateValue(object["updatedAt"]) != nil
+            return dateValue(object["updatedAt"]) != nil && validDreamClaims(object["claimKeys"])
         case "emotional_consolidation":
             return dateValue(object["ranAt"]) != nil
         case "mind_ledger":
@@ -386,6 +399,17 @@ extension CognitiveSubstrate {
             return true
         default:
             return false
+        }
+    }
+
+    /// Missing sets belong to retained single-claim artifacts. A present set
+    /// must be complete: dropping one unreadable claim would permit re-dose.
+    private func validDreamClaims(_ value: JSONValue?) -> Bool {
+        guard let value else { return true }
+        guard case .array(let rows) = value else { return false }
+        return rows.allSatisfy { row in
+            guard case .string(let key) = row else { return false }
+            return !key.isEmpty
         }
     }
 

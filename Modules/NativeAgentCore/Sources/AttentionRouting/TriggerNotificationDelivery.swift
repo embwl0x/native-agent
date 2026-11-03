@@ -29,8 +29,14 @@ public enum TriggerNotificationDelivery {
                 body: note.body,
                 userInfo: userInfo
             )
-            guard let receipt = outcome.receipt else {
-                let projection = outcome.deliveryProjection
+            let projection = outcome.deliveryProjection
+            if let receipt = outcome.receipt {
+                var fields = receipt.deliveryFields()
+                fields["delivered"] = .bool(projection.reachedAChannel)
+                fields["delivery"] = .string(projection.rawValue)
+                fields["mirrored"] = .bool(true)
+                return .object(fields)
+            } else {
                 if !projection.reachedAChannel {
                     nativeLog("trigger_notify: %@ mirrored but no channel accepted the knock (%@)",
                           note.triggerName, projection.rawValue)
@@ -53,7 +59,6 @@ public enum TriggerNotificationDelivery {
                 }
                 return .object(fields)
             }
-            return .object(receipt.deliveryFields())
         } catch {
             nativeLog("trigger_notify: paired-device push failed for \(note.triggerName): \(error)")
             return .object([

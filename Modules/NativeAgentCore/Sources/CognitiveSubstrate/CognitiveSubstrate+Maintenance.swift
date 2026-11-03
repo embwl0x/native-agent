@@ -30,7 +30,9 @@ extension CognitiveSubstrate {
         // ownership directly to a waiting caller so its dirty follow-up is not
         // dropped and maintenance cannot enter between holders.
         if maintenanceCommitInFlight {
-            await withCheckedContinuation { microcycleWaiters.append($0) }
+            let done = ScopedWaiter()
+            microcycleWaiters.append(done)
+            await Task { await done.park() }.value
         } else {
             maintenanceCommitInFlight = true
         }
@@ -85,6 +87,11 @@ extension CognitiveSubstrate {
                     )],
                     at: workspace.generatedAt
                 )
+                if flushedPresentation {
+                    // This transaction durably saved the same cadence ledger
+                    // as a direct flush; settle its existing stage too.
+                    await notingPersistence("capsule_presentation") { }
+                }
             }
         } catch {
             if dirtySince == nil { dirtySince = priorDirtySince }
@@ -97,10 +104,6 @@ extension CognitiveSubstrate {
     /// Overnight consolidation runs at most once per 20 hours on the maintenance cadence.
     static let emotionalConsolidationInterval: TimeInterval = 20 * 60 * 60
 
-    public func runMaintenance(reason: String) async {
-        _ = try? await runMaintenanceChecked(reason: reason)
-    }
-
     /// Pure, mutation-free deadline projection over the existing cognition
     /// owners. Continuous decay is already analytic at every read. Maintenance
     /// is due at the existing 20-hour emotional consolidation boundary.
@@ -109,12 +112,12 @@ extension CognitiveSubstrate {
     }
 
     @discardableResult
-    public func runMaintenanceChecked(reason: String) async throws -> Bool {
+    public func runMaintenanceChecked(reason: String, satisfyWait: Bool = false) async throws -> Bool {
         guard configuration.enabled else { return false }
         // Maintenance and microcycles exclude each other across their commits.
         guard !maintenanceRunInFlight, !maintenanceCommitInFlight else { return false }
         let now = dependencies.now()
-        guard currentMaintenanceOpportunity(at: now).isDue else { return false }
+        guard satisfyWait || currentMaintenanceOpportunity(at: now).isDue else { return false }
         beginMaintenanceTransition()
         defer { endMaintenanceTransition() }
         let previousField = field
@@ -132,7 +135,7 @@ extension CognitiveSubstrate {
         var artifacts = affectCheckpoint(at: now)
         var receipts: [CognitiveReceiptWrite] = []
         var stagedTimelineEvents: [CognitiveDevelopmentalTimelineEvent] = []
-        if let consolidation = consolidateEmotionalArousalIfDueInMemory(reason: reason, at: now) {
+        if let consolidation = consolidateEmotionalArousalIfDueInMemory(reason: reason, at: now, satisfyWait: satisfyWait) {
             artifacts.append(contentsOf: consolidation.artifacts)
             receipts.append(contentsOf: consolidation.receipts)
             stagedTimelineEvents.append(contentsOf: consolidation.timelineEvents)
@@ -171,8 +174,10 @@ extension CognitiveSubstrate {
                 resolutionPatternNudgeDay = previousPatternNudgeDay
             }
             publishAttentionProjection(at: dependencies.now())
+            await notingPersistence("maintenance") { throw error }
             throw error
         }
+        await notingPersistence("maintenance") { }
         return true
     }
 
@@ -209,10 +214,11 @@ extension CognitiveSubstrate {
     /// Consolidates arousal only every ~20h with affect enabled; zero-count sweeps omit timeline events.
     private func consolidateEmotionalArousalIfDueInMemory(
         reason: String,
-        at now: Date
+        at now: Date,
+        satisfyWait: Bool = false
     ) -> EmotionalConsolidationTransition? {
         guard configuration.enabled else { return nil }
-        if let last = lastEmotionalConsolidationAt,
+        if !satisfyWait, let last = lastEmotionalConsolidationAt,
            now.timeIntervalSince(last) < Self.emotionalConsolidationInterval {
             return nil
         }

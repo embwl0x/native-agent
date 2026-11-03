@@ -21,6 +21,8 @@ import Desk
 import Transcripts
 import ProviderRouting
 import TurnTrace
+import MultimodalTTS
+import AVFoundation
 // Blueprint: | `MacSyncEngine+Snapshots.swift` | Revisioned snapshots retain exact payload/wire digests; phone Inspector reads its host; chat snapshots carry HerScreen's read-only other-room exchanges as an additive field |
 
 extension MacSyncEngine {
@@ -96,7 +98,10 @@ extension MacSyncEngine {
         await Task.yield()
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
         let heavy = forceHeavy || snapshotWriteQueuedNeedsHeavy
-        if republish || snapshotWriteQueuedNeedsRepublish { snapshotFileDigests.removeAll() }
+        if republish || snapshotWriteQueuedNeedsRepublish {
+            snapshotFileDigests.removeAll()
+            sync.bridge.invalidateMobileSnapshotPublication()
+        }
         let memories = includeMemories || snapshotWriteQueuedNeedsMemories
         let transcripts = includeChatTranscripts || snapshotWriteQueuedNeedsChatTranscripts
         let mergedScope = scope.including(snapshotWriteQueuedScope)
@@ -153,9 +158,7 @@ extension MacSyncEngine {
             }()
             async let memoriesTask: [MemoryRecord]? = {
                 guard includeHeavySnapshots || includeMemories else { return nil }
-                return try await Self.retryingCancelledGroupRead("memories") {
-                    try await api.activeMemories().map(MemoryRecord.init(phoneRow:))
-                }
+                return try await api.activeMemories().map(MemoryRecord.init(phoneRow:))
             }()
             async let connectorsTask: [MobileConnectorSnapshot]? = {
                 guard includeHeavySnapshots else { return nil }
@@ -324,6 +327,11 @@ extension MacSyncEngine {
                 recordFetchFailure("mac_integration_permissions", error)
             }
             await write(sync.host.surfaceLayout(), to: "ui_layout.json")
+            let voiceName = VoicePreference.name()
+            let nativeVoice = VoicePreference.nativeVoice(identifier: voiceName)
+            await write(MobileVoicePreference(name: voiceName, quiet: VoicePreference.quiet(),
+                        nativeIdentifier: nativeVoice?.identifier, nativeName: nativeVoice?.name, nativeLanguage: nativeVoice?.language),
+                        to: "voice_preference.json")
             if let personalityProfile {
                 await write(personalityProfile, to: "personality.json")
             } else {
@@ -377,15 +385,6 @@ extension MacSyncEngine {
                 } else {
                     recordGroupSkip("runs", "run ledger unavailable or unreadable")
                 }
-                // Remove unconsumed snapshot files from the synced container.
-                for retired in [
-                    "capabilities.json",
-                    "agent_map.json",
-                    "coordination_summary.json",
-                    "command_palette.json",
-                ] {
-                    try? FileManager.default.removeItem(at: snapshotDir.appendingPathComponent(retired))
-                }
             }
             if let connectors { await write(connectors, to: "connectors.json") }
             // Pinned/transcript snapshots derive
@@ -396,11 +395,15 @@ extension MacSyncEngine {
                 let navigation = sync.host.sessionNavigation(for: sessions)
                 await write(navigation, to: "pinned_chat_sessions.json")
                 if includeTranscriptSnapshots {
-                    let transcriptSessions = transcriptSnapshotSessions(from: sessions, navigation: navigation)
-                    let transcripts: [ChatTranscriptSnapshot] = transcriptSessions.isEmpty
-                        ? []
-                        : await chatTranscriptSnapshots(for: transcriptSessions, api: api)
-                    await write(transcripts, to: "chat_transcripts.json")
+                    do {
+                        let transcriptSessions = try transcriptSnapshotSessions(from: sessions, navigation: navigation)
+                        let transcripts: [ChatTranscriptSnapshot] = transcriptSessions.isEmpty
+                            ? []
+                            : await chatTranscriptSnapshots(for: transcriptSessions, api: api)
+                        await write(transcripts, to: "chat_transcripts.json")
+                    } catch {
+                        recordGroupSkip("chat_transcripts", error.localizedDescription)
+                    }
                 }
             }
             if let health { await write(health, to: "health.json") }
@@ -460,8 +463,13 @@ extension MacSyncEngine {
             await write(sessions, filename: "sessions.json")
             await write(navigation, filename: "pinned_chat_sessions.json")
             if includeTranscripts {
-                let selected = transcriptSnapshotSessions(from: sessions, navigation: navigation)
-                await write(await chatTranscriptSnapshots(for: selected, api: api), filename: "chat_transcripts.json")
+                do {
+                    let selected = try transcriptSnapshotSessions(from: sessions, navigation: navigation)
+                    await write(await chatTranscriptSnapshots(for: selected, api: api), filename: "chat_transcripts.json")
+                } catch {
+                    attempted.insert("chat_transcripts")
+                    skipped["chat_transcripts"] = "transcripts unavailable: \(error.localizedDescription)"
+                }
             }
         } catch {
             attempted = ["sessions", "pinned_chat_sessions"]
@@ -633,7 +641,8 @@ extension MacSyncEngine {
         }
     }
 
-    private func transcriptSnapshotSessions(from sessions: [ChatSession], navigation: ChatSessionNavigation) -> [ChatSession] {
+    private func transcriptSnapshotSessions(from sessions: [ChatSession], navigation: ChatSessionNavigation) throws -> [ChatSession] {
+        let mobileSourceKey = try NativeAgentICloudBridgeConstants.mobileSourceKey
         var seen = Set<String>()
         var out: [ChatSession] = []
         func append(_ session: ChatSession?) {
@@ -651,7 +660,7 @@ extension MacSyncEngine {
                 && $0.archived != true
         }))
         append(sessions.first(where: {
-            (NativeAgentICloudBridgeConstants.isMobileSourceKey($0.sourceKey)
+            ($0.sourceKey?.trimmingCharacters(in: .whitespacesAndNewlines) == mobileSourceKey
                 || (($0.source ?? "").lowercased() == "ios" && ($0.sourceKey ?? "").isEmpty))
                 && $0.archived != true
         }))
@@ -733,11 +742,18 @@ extension MacSyncEngine {
             used = size
             out = candidates
         }
-        // Publish only still-present sessions with unchanged generations; present rows without a counter remain eligible.
-        if let generationsAfter = try? await api.getChatTranscriptGenerations() {
+        // The final index read is required evidence for every transcript.
+        do {
+            let generationsAfter = try await api.getChatTranscriptGenerations()
             out = out.filter { snapshot in
                 guard let after = generationsAfter[snapshot.sessionId] else { return false }
                 return after == snapshot.transcriptGeneration
+            }
+        } catch {
+            out = out.map { snapshot in
+                var unavailable = ChatTranscriptSnapshot(sessionId: snapshot.sessionId, messages: [], transcriptGeneration: nil)
+                unavailable.readError = "Transcript generation is unavailable: \(error.localizedDescription)"
+                return unavailable
             }
         }
         // Keep the highest-priority sessions that fit the actual compressed
@@ -821,9 +837,10 @@ extension MacSyncEngine {
         guard expectedLifecycleGeneration == snapshotLifecycleGeneration, isActive else { return .unchanged }
         let url = snapshotDir.appendingPathComponent(filename)
         // A saved digest cannot suppress recreation of a missing file.
-        if snapshotFileDigests[filename]?.payload == digest,
-           await VolumeIO.run({ FileManager.default.fileExists(atPath: url.path) }) {
-            return .unchanged
+        if snapshotFileDigests[filename]?.payload == digest {
+            do {
+                if try await VolumeIO.run({ FileManager.default.fileExists(atPath: url.path) }) { return .unchanged }
+            } catch { return .failed(error.localizedDescription) }
         }
         guard expectedLifecycleGeneration == snapshotLifecycleGeneration, isActive else { return .unchanged }
         if Self.revisionedSnapshotFiles.contains(filename) {
@@ -832,8 +849,13 @@ extension MacSyncEngine {
         }
         let wireDigest = MacSyncSnapshotIntegrity.digest(data)
         // Await the coordinated write before recording its digest or admitting another snapshot pass.
-        let writeError = await VolumeIO.run { [data, url] in
+        let writeResult = await VolumeIO.result { [data, url] in
             Self.coordinatedWriteReturningError(data: data, to: url)
+        }
+        let writeError: String?
+        switch writeResult {
+        case .success(let error): writeError = error
+        case .failure(let error): writeError = "Snapshot commit is unverified: \(error.localizedDescription). Reconcile this file before publishing."
         }
         // The coordinated filesystem write itself cannot be cancelled once it
         // has entered Foundation. It still targets the captured old cache URL;
@@ -846,6 +868,8 @@ extension MacSyncEngine {
             return .unchanged
         }
         if let writeError {
+            snapshotFileDigests.removeValue(forKey: filename)
+            await saveSnapshotDigests()
             syncError = "Snapshot write failed for \(filename): \(writeError)"
             return .failed(writeError)
         }
@@ -929,9 +953,7 @@ extension MacSyncEngine {
 
     private func nativeKnowledgeGraphSnapshotData() async -> SnapshotGroupBuild {
         do {
-            return .built(try await Self.retryingCancelledGroupRead("knowledge_graph") {
-                try await sync.host.knowledgeGraphSnapshotData()
-            })
+            return .built(try await sync.host.knowledgeGraphSnapshotData())
         } catch {
             nativeLog(
                 "[MacSyncEngine] canonical knowledge graph unreadable — keeping last good snapshot: %@",
@@ -984,14 +1006,8 @@ extension MacSyncEngine {
             counters: OrganismLivingCountersFile(
                 fieldNodes: snapshot.fieldSummary.nodeCount,
                 pendingPredictions: snapshot.predictionSummary.pendingCount,
-                dreamRepairs: snapshot.dreamRepairSummary.receiptCount,
-                // Preserve shared fields for iPhone decoding compatibility.
-                reflexCandidates: 0,
-                reflexesNeedReview: 0,
-                approvedReflexBiases: nil,
-                standingViewProposals: nil
+                dreamRepairs: snapshot.dreamRepairSummary.receiptCount
             ),
-            standingViewProposals: nil,
             availability: snapshot.enabled ? .live : .disabled
         )
     }
@@ -1030,12 +1046,11 @@ extension MacSyncEngine {
 }
 
 extension MemoryRecord {
-    /// The phone's memories.json row, in the shape the Mac browsing list
-    /// has always sent: importance 0, pinned spelled out, no tags.
+    /// A reading copy of canonical memory values; missing values stay missing.
     init(phoneRow r: MemoryV2.MemoryRecord) {
         self.init(
-            id: r.id, layer: r.layer ?? "semantic", text: r.text, sourceRunId: r.sourceRunId,
-            importance: 0, confidence: r.confidence ?? 0, status: r.status, pinned: r.pinned ?? false,
+            id: r.id, layer: r.layer, text: r.text, sourceRunId: r.sourceRunId,
+            importance: r.importance, confidence: r.confidence, status: r.status, pinned: r.pinned, tags: r.tags,
             createdAt: r.createdAt, updatedAt: r.updatedAt
         )
     }

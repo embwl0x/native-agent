@@ -15,9 +15,15 @@ import Carbon
 import OSAKit
 import os
 import NativeAgentShared
+
+@MainActor
+private final class ApplicationLaunchResult {
+    let done = ScopedWaiter()
+    var result: Result<NSRunningApplication, Error>?
+}
 #endif
 
-// Blueprint: | `MacAppNavigation.swift` | `MacApplications`, `AppControlRunResult` and `OpenTarget`: exact application resolution, launch, measured focus, quit and URL/file opening under the existing driver authority |
+// Blueprint: | `MacAppNavigation.swift` | `MacApplications`, `AppControlRunResult`, `OpenTarget`: explicit bundle/path and exact bundle filename before display-name resolution from one checked index snapshot; matching unavailable platform/install evidence reports its causes instead of a miss; async Workspace launch with deadline/Stop-aware caller wait, ordinary launch/focus/quit authority and measured outcomes |
 
 public struct AppControlRunResult: Sendable, Equatable {
     public let requestedName: String
@@ -86,14 +92,14 @@ public final class MacApplications: Sendable {
         #endif
     }
 
-    public func isApplicationRunning(matching name: String) async -> Bool {
+    public func isApplicationRunning(matching name: String) async throws -> Bool {
         let query = normalizedAppQuery(name)
-        guard !query.isEmpty else { return false }
+        guard !query.isEmpty else { throw MacControlError.missingField("app") }
         #if canImport(AppKit)
         let indexedURL = await Self.indexedApplicationURL(named: query)
-        return await Self.isApplicationRunningOnMain(matching: query, indexedURL: indexedURL)
+        return try await Self.isApplicationRunningOnMain(matching: query, indexedURL: indexedURL)
         #else
-        return false
+        throw MacControlError.appControlFailed("AppKit unavailable on this platform")
         #endif
     }
 
@@ -103,8 +109,8 @@ public final class MacApplications: Sendable {
 
     #if canImport(AppKit)
     @MainActor
-    private static func isApplicationRunningOnMain(matching query: String, indexedURL: Result<URL?, Error>) -> Bool {
-        (try? runningApplications(matching: query, indexedURL: indexedURL).isEmpty) == false
+    private static func isApplicationRunningOnMain(matching query: String, indexedURL: Result<URL?, Error>) throws -> Bool {
+        try !runningApplications(matching: query, indexedURL: indexedURL).isEmpty
     }
 
     @MainActor
@@ -182,6 +188,7 @@ public final class MacApplications: Sendable {
         var terminated = false
         for app in running {
             try Task.checkCancellation()
+            if let refusal = MacAppActGate.refusal(pid: app.processIdentifier) { throw refusal }
             guard MacDriverContext.binding?.allowsEmission == true else {
                 throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal)
             }
@@ -204,23 +211,27 @@ public final class MacApplications: Sendable {
                 owner: "Mac attention", tap: "NativeAgent Mac chat > composer controls > Let [agent name] use the Mac",
                 personDecides: true)
         }
-        return try await withCheckedThrowingContinuation { continuation in
-            let config = NSWorkspace.OpenConfiguration()
-            config.activates = activates
-            config.allowsRunningApplicationSubstitution = false
-            NSWorkspace.shared.openApplication(at: url, configuration: config) { app, error in
-                if let error {
-                    let cause = error as NSError
-                    continuation.resume(throwing: ToolFailureError("\(cause.domain) (\(cause.code)): \(cause.localizedDescription)",
-                        effects: .unknown, owner: "macOS Launch Services", tap: "Finder > \(url.path) > Open"))
-                } else if let app {
-                    continuation.resume(returning: app)
-                } else {
-                    continuation.resume(throwing: ToolFailureError("Workspace returned no application for \(url.path)",
-                        effects: .unknown, owner: "macOS Launch Services", tap: "Finder > \(url.path) > Open"))
-                }
+        let response = ApplicationLaunchResult()
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = activates
+        config.allowsRunningApplicationSubstitution = false
+        // The async SDK bridge owns callback entry. The launch still runs to
+        // its real result if Stop/deadline ends only the caller's wait below.
+        Task { @MainActor in
+            do {
+                response.result = .success(try await NSWorkspace.shared.openApplication(at: url, configuration: config))
+            } catch {
+                let cause = error as NSError
+                response.result = .failure(ToolFailureError("\(cause.domain) (\(cause.code)): \(cause.localizedDescription)",
+                    effects: .unknown, owner: "macOS Launch Services", tap: "Finder > \(url.path) > Open"))
             }
+            response.done.resume()
         }
+        let done = response.done
+        await done.park()
+        try Task.checkCancellation()
+        guard let result = response.result else { throw TaskWaitDeadline.cancellationError }
+        return try result.get()
     }
 
     @MainActor
@@ -256,9 +267,19 @@ public final class MacApplications: Sendable {
             let exactBundle = running.filter { ($0.bundleIdentifier ?? "").caseInsensitiveCompare(query) == .orderedSame }
             if !exactBundle.isEmpty { return preferRegular(exactBundle) }
         }
+        let indexed = try indexedURL.get()
+        // A stopped exact bundle file wins over another running app that
+        // happens to publish the same display name.
+        if let indexed,
+           indexed.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(appName) == .orderedSame {
+            return running.filter { $0.bundleURL?.standardizedFileURL == indexed.standardizedFileURL }
+        }
+        let exactFile = running.filter {
+            $0.bundleURL?.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(appName) == .orderedSame
+        }
+        if !exactFile.isEmpty { return exactFile }
         let exactName = running.filter {
             ($0.localizedName ?? "").caseInsensitiveCompare(appName) == .orderedSame
-                || $0.bundleURL?.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(appName) == .orderedSame
         }
         if !exactName.isEmpty { return preferRegular(exactName) }
         let exactBundle = running.filter { ($0.bundleIdentifier ?? "").caseInsensitiveCompare(query) == .orderedSame }
@@ -276,17 +297,7 @@ public final class MacApplications: Sendable {
 
     @MainActor
     private static func applicationURL(matching query: String, indexedURL: Result<URL?, Error>) throws -> URL? {
-        if let url = try indexedURL.get() { return url }
-        if looksLikeBundleIdentifier(query), let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: query) {
-            nativeLog("MacApplications: Launch Services resolved %@ to %@", query, url.path)
-            return url
-        }
-        // Anywhere else Launch Services knows an app by exactly this name.
-        guard !query.contains("/") else { return nil }
-        let name = query.hasSuffix(".app") ? String(query.dropLast(4)) : query
-        guard let path = NSWorkspace.shared.fullPath(forApplication: name) else { return nil }
-        let url = URL(fileURLWithPath: path)
-        return url.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(name) == .orderedSame ? url : nil
+        try indexedURL.get()
     }
 
     /// Exact name, bundle id or bundle path from the Mac's own app index.
@@ -297,13 +308,11 @@ public final class MacApplications: Sendable {
     /// Gather before the MainActor application transaction. Keep a failure as
     /// data until lookup is needed: an exact running app still wins as before.
     private static func indexedApplicationURL(named query: String) async -> Result<URL?, Error> {
-        // An app already running under its exact name or bundle id needs no
-        // index: its own bundle answers, so a stalled Spotlight never holds it.
+        // A running explicit bundle id/path needs no name census. A name does:
+        // another installed bundle can publish that display name or filename.
         let runningExactly = await MainActor.run {
             NSWorkspace.shared.runningApplications.contains {
-                let appName = query.lowercased().hasSuffix(".app") ? String(query.dropLast(4)) : query
-                return ($0.localizedName ?? "").caseInsensitiveCompare(appName) == .orderedSame
-                    || ($0.bundleIdentifier ?? "").caseInsensitiveCompare(query) == .orderedSame
+                return ($0.bundleIdentifier ?? "").caseInsensitiveCompare(query) == .orderedSame
                     || (query.contains("/") && $0.bundleURL?.resolvingSymlinksInPath().standardizedFileURL
                         == URL(fileURLWithPath: NativeAgentWorkspaceRoot.fileSpelling(query)).resolvingSymlinksInPath().standardizedFileURL)
             }
@@ -337,11 +346,21 @@ public final class MacApplications: Sendable {
             throw ToolFailureError(error.localizedDescription, effects: .none,
                 owner: "macOS Spotlight app index", tap: "System Settings > Spotlight")
         }
-        let matches = MacAppIndex.installed(apps).filter {
-            $0.bundleID?.caseInsensitiveCompare(query) == .orderedSame
-                || $0.name.caseInsensitiveCompare(name) == .orderedSame
+        let unresolved = apps.filter {
+            $0.installationUncertain && (
+                $0.bundleID?.caseInsensitiveCompare(query) == .orderedSame
                 || $0.url.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(name) == .orderedSame
+                || $0.name.caseInsensitiveCompare(name) == .orderedSame)
         }
+        guard unresolved.isEmpty else {
+            throw ToolFailureError("app_classification_unavailable: " + unresolved.flatMap(\.classificationFailures).joined(separator: "; "),
+                effects: .none, owner: "macOS Spotlight app index", tap: "System Settings > Spotlight")
+        }
+        let installed = MacAppIndex.installed(apps)
+        let bundleMatches = installed.filter { $0.bundleID?.caseInsensitiveCompare(query) == .orderedSame }
+        let fileMatches = installed.filter { $0.url.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(name) == .orderedSame }
+        let displayMatches = installed.filter { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+        let matches = !bundleMatches.isEmpty ? bundleMatches : !fileMatches.isEmpty ? fileMatches : displayMatches
         guard matches.count <= 1 else {
             let candidates = matches.map { "\($0.name) [\($0.bundleID ?? "no bundle id")] \($0.url.path)" }.joined(separator: "; ")
             throw ToolFailureError("app_query_ambiguous: \(query) matches \(candidates). Choose an exact .app path.",

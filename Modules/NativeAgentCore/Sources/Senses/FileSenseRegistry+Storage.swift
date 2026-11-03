@@ -2,7 +2,7 @@ import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `FileSenseRegistry+Storage.swift` | Registry validation, candidate/version-folder source resolution, bounded code manifests and path/symlink fences. Persisted sense timestamps validate within the supported Date range; built-in and shared records may omit an unknown creation date. |
+// Blueprint: | `FileSenseRegistry+Storage.swift` | Registry validation, sealed candidate or bundled source resolution, bounded JavaScript manifests and path/symlink fences. Persisted sense timestamps validate within the supported Date range; built-in and shared records may omit an unknown creation date. |
 
 extension FileSenseRegistry {
     public func sourceFiles(_ record: SenseRecord) throws -> [String: Data] {
@@ -28,16 +28,6 @@ extension FileSenseRegistry {
             }
             result[entry] = Data(candidate.program.source.utf8)
             return result
-        }
-        for slot in [AbilityStore.Slot.current, .previous, .next] {
-            if let file = try abilities.read(id: record.id, slot: slot),
-               case .object(let saved)? = file.metadata["record"], saved["version"] == .int(Int64(record.version)),
-               let entry = record.entry {
-                var files: [String: Data] = [:]
-                if let value = file.metadata["sourceFiles"] { files = try JSONDecoder().decode([String: Data].self, from: value.serializedData(pretty: false)) }
-                files[entry] = Data(file.body.utf8)
-                return files
-            }
         }
         guard record.origin == .builtIn, let entry = record.entry else { throw Self.failure("Sense source is unavailable in its ability file.") }
         return [entry: try Data(contentsOf: BuiltInSenses.resourceRoot().appendingPathComponent(entry))]
@@ -65,9 +55,9 @@ extension FileSenseRegistry {
 
     static func validateCode(_ path: String, bytes: Data) throws {
         try validatePath(path)
-        guard ["js", "swift"].contains(URL(fileURLWithPath: path).pathExtension.lowercased()),
+        guard URL(fileURLWithPath: path).pathExtension.lowercased() == "js",
               bytes.count <= maximumCodeBytes, !bytes.contains(0), String(data: bytes, encoding: .utf8) != nil else {
-            throw failure("A sense bundle may contain only bounded UTF-8 JavaScript or Swift source files.")
+            throw failure("A sense bundle may contain only bounded UTF-8 JavaScript source files.")
         }
     }
 
@@ -86,19 +76,25 @@ extension FileSenseRegistry {
               record.enabledAt.map(valid) != false,
               record.lastUsedAt.map(valid) != false,
               record.disabledBy == nil || CapabilityLifecycle.offActors.contains(record.disabledBy!),
-              let corner = SenseCorner(key: record.corner.key), corner == record.corner,
-              version.files.count <= 128,
-              Set(version.files.map { $0.precomposedStringWithCanonicalMapping.lowercased() }).count == version.files.count else {
+              let corner = SenseCorner(key: record.corner.key), corner == record.corner else {
             throw failure("Sense metadata or code manifest is invalid.")
         }
-        for path in version.files { try validateCode(path, bytes: Data()) }
+        guard let files = version.files else {
+            guard version.sourceFailure != nil else { throw failure("Sense source membership has not been checked.") }
+            return
+        }
+        guard files.count <= 128,
+              Set(files.map { $0.precomposedStringWithCanonicalMapping.lowercased() }).count == files.count else {
+            throw failure("Sense code manifest is invalid.")
+        }
+        for path in files { try validateCode(path, bytes: Data()) }
         if record.language == .native {
-            guard record.origin == .builtIn, record.entry == nil, version.files.isEmpty else {
+            guard record.origin == .builtIn, record.entry == nil, files.isEmpty else {
                 throw failure("Native senses must be built-in and have no portable entry file.")
             }
         } else {
-            guard let entry = record.entry, version.files.contains(entry),
-                  URL(fileURLWithPath: entry).pathExtension.lowercased() == (record.language == .javascript ? "js" : "swift") else {
+            guard let entry = record.entry, files.contains(entry),
+                  URL(fileURLWithPath: entry).pathExtension.lowercased() == "js" else {
                 throw failure("Sense entry file is missing from its code manifest or has the wrong language.")
             }
         }
@@ -116,7 +112,7 @@ extension FileSenseRegistry {
                 guard version.record.id == entry.id else { throw failure("Sense version belongs to a different id.") }
                 try validate(version)
             }
-            let record = entry.current.record
+            let record = entry.current.presentationRecord
             if record.status == .on, !activeCorners.insert(record.corner.key).inserted { throw failure("More than one sense is on for the same corner.") }
         }
     }

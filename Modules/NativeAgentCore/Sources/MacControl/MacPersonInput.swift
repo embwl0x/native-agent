@@ -5,7 +5,7 @@ import PersistenceCore
 import CoreGraphics
 import Darwin
 #endif
-// Blueprint: | `MacPersonInput.swift` | `MacPersonInput` owns exact person/synthetic input provenance and canonical presence; motor-fenced session activity permits capture resumption without Input Monitoring and never asserts presence; `NativeAgentMacEventIdentity`, `ScriptedInputSources` and `NativeAgentMotorEpoch` identify their input and motor output |
+// Blueprint: | `MacPersonInput.swift` | `MacPersonInput` owns exact person/synthetic input provenance and Mac presence transitions consumed by PersonPresence and hardware safety; `observeReturn` arms the first physical return after phone departure even before Mac idle, without changing raw hardware presence; motor-fenced session activity permits capture resumption without Input Monitoring and never asserts presence; `NativeAgentMacEventIdentity`, `ScriptedInputSources` and `NativeAgentMotorEpoch` identify their input and motor output |
 
 /// Identifies input synthesized by NativeAgent itself.
 ///
@@ -161,6 +161,13 @@ public enum MacPersonInput {
     private nonisolated(unsafe) static var port: CFMachPort?
     /// Whether the last transition said away. Only the person-input thread touches it.
     private nonisolated(unsafe) static var away = false
+    /// The latest settled transition, read under `clock`; input while here
+    /// changes its time only for an armed phone return. Unknown is no arrival.
+    private nonisolated(unsafe) static var presenceTransition: (here: Bool, since: Date)?
+    /// An evidenced phone departure awaits the next physical input even if
+    /// the Mac's own five-minute absence has not begun. This is an input wake,
+    /// not another here/away fact; only observed input can settle the return.
+    private nonisolated(unsafe) static var returnAfter: Date?
     /// Due when the person would be away, set from the fact each time; never a poll.
     private nonisolated(unsafe) static var awayDue: CFRunLoopTimer?
     private nonisolated(unsafe) static var inputRunLoop: CFRunLoop?
@@ -171,7 +178,8 @@ public enum MacPersonInput {
 
     /// Posted once per transition, on the person-input thread: userInfo
     /// `signal` is "person.away" (idle `awayAfter`) or "person.here" (their own
-    /// input again, never hers), `idle_seconds` the fact's.
+    /// input again, including an armed phone return, never hers),
+    /// `idle_seconds` the fact's. PersonPresence supplies the combined reading.
     public static let presenceChanged = Notification.Name("NativeAgent.personPresence")
 
     /// Whether the tap runs. Touched once at launch: macOS applies an Input
@@ -234,7 +242,7 @@ public enum MacPersonInput {
                         MacPersonInput.port.map { CGEvent.tapEnable(tap: $0, enable: true) }
                     }
                 } else if MacPersonInput.note(event),
-                          MacPersonInput.away {
+                          MacPersonInput.away || MacPersonInput.clock.withLock({ MacPersonInput.returnAfter != nil }) {
                     MacPersonInput.settle()
                 }
                 return Unmanaged.passUnretained(event)
@@ -311,14 +319,25 @@ public enum MacPersonInput {
     }
 
     /// The fact's transition, posted once: away once the person has been idle
-    /// `awayAfter`, here again on their own input. Then due when they would be away.
+    /// `awayAfter`, here again on their own input (also after an armed phone
+    /// departure). Then due when they would be away.
     private static func settle() {
         clock.withLock { settleAgain = false }
         let fact = presence()
-        if let fact, fact.here == away {
-            away = !fact.here
-            NotificationCenter.default.post(name: presenceChanged, object: nil, userInfo: [
-                "signal": away ? "person.away" : "person.here", "idle_seconds": fact.seconds.rounded()])
+        if let fact {
+            let since = Date().addingTimeInterval((fact.here ? 0 : awayAfter) - fact.seconds)
+            let changed = clock.withLock {
+                let returned = fact.here && (returnAfter.map { since > $0 } ?? false)
+                guard fact.here == away || returned else { return false }
+                away = !fact.here
+                if returned || !fact.here { returnAfter = nil }
+                presenceTransition = (fact.here, since)
+                return true
+            }
+            if changed {
+                NotificationCenter.default.post(name: presenceChanged, object: nil, userInfo: [
+                    "signal": away ? "person.away" : "person.here", "idle_seconds": fact.seconds.rounded()])
+            }
         }
         // Away, nothing is due until their own input says here.
         let wait = away ? 315_360_000 : awayAfter - min(fact?.seconds ?? idleAtLeast() ?? 0, awayAfter)
@@ -421,13 +440,41 @@ public enum MacPersonInput {
     /// Idle this long, the person is away.
     public static let awayAfter: TimeInterval = 300
 
-    /// The one presence fact home, her abilities and the presence wakes read:
+    /// Preserve the first physical return from a phone-evidenced absence.
+    /// Repeated reads cannot move an armed return or replay a settled one.
+    public static func observeReturn(after departure: Date) {
+        #if canImport(CoreGraphics) && os(macOS)
+        guard listening else { return }
+        let armed = clock.withLock {
+            if let settled = presenceTransition,
+               !settled.here || settled.since >= departure { return false }
+            if let pending = returnAfter, pending <= departure { return false }
+            returnAfter = departure
+            return true
+        }
+        // Also catches input that arrived between reading the phone evidence
+        // and arming this wake; Secure Event Input follows settleSoon too.
+        if armed { settleSoon() }
+        #endif
+    }
+
+    /// The Mac input fact PersonPresence and hardware safety read:
     /// here or away and seconds since the person's own input (hers never
     /// counts). While their own clock is unknown, the floor nobody has touched
     /// the Mac for still says away, never here; nil while unknown.
     public static func presence() -> (here: Bool, seconds: Double)? {
         let seconds = idle()?.seconds ?? idleAtLeast().flatMap { $0 >= awayAfter ? $0 : nil }
         return seconds.map { ($0 < awayAfter, $0) }
+    }
+
+    /// The current presence only when its transition was settled by the input
+    /// owner. A read cannot invent an arrival or advance its timestamp.
+    public static func presenceChange() -> (here: Bool, since: Date)? {
+        guard let fact = presence() else { return nil }
+        return clock.withLock {
+            guard let transition = presenceTransition, transition.here == fact.here else { return nil }
+            return transition
+        }
     }
 
     /// `presence()` as an action carries it.

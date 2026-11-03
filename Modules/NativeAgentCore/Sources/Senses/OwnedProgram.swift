@@ -51,7 +51,7 @@ public struct OwnedProgram: Codable, Sendable, Equatable {
     /// A part whose code uses steps, decisions or expectations runs strict:
     /// each call journaled for a resume, and its receipt read exactly.
     public var isStrict: Bool {
-        isPart && Self.code(source).range(of: #"\bapp\s*\.\s*(step|decide|expect|expect_fail)\s*\("#, options: .regularExpression) != nil
+        isPart && Self.calls(source).usesStrictVerbs
     }
 
     public func validate() throws {
@@ -82,38 +82,25 @@ extension OwnedProgram {
     /// The runner's own verbs on `app`, which are never actions.
     public static let verbs: Set<String> = ["read", "find", "log", "expect", "expect_fail", "decide", "step"]
 
-    /// The app actions a part's code calls by name, app.<page>.<action>(…),
+    /// The app actions a part's code calls by name through app members or literal door requests,
     /// read outside its strings and comments. An id it builds at run time
     /// can't be seen here, and the run's allowlist still stops it.
     public static func calledActions(_ source: String) -> [String] {
-        guard let regex = try? NSRegularExpression(pattern: #"\bapp\s*\.\s*(\w+)\s*\.\s*(\w+)\s*\("#) else { return [] }
-        let code = OwnedProgram.code(source)
-        var found: [String] = []
-        for match in regex.matches(in: code, range: NSRange(code.startIndex..., in: code)) {
-            let parts = (1...2).compactMap { Range(match.range(at: $0), in: code).map { String(code[$0]) } }
-            guard parts.count == 2, !verbs.contains(parts[0]) else { continue }
-            let id = parts.joined(separator: ".").lowercased()
-            if !found.contains(id) { found.append(id) }
-        }
-        return found
-    }
-
-    /// Why a part's code can't run here, read outside its strings and comments:
-    /// the executor is sync-only, so an async run hands back a Promise only
-    /// after its effects already landed. Save, enable and run refuse it first.
-    public static func asyncRefusal(_ source: String) -> String? {
-        let code = OwnedProgram.code(source)
-        guard let found = code.range(of: #"(?<![.$\w])(async|await)(?![\w$])|(?<![$\w])Promise(?![\w$])"#,
-                                     options: .regularExpression) else { return nil }
-        let line = code[..<found.lowerBound].utf8.filter { $0 == 10 }.count + 1
-        return "Its code uses \(code[found]) at line \(line). Here async, await and Promise are refused anywhere in code (strings and comments aside; rename a key that uses one): an async run's effects land before its result can be read. "
-            + "Define function run(input) synchronously, drop await and Promises (app and host calls already return their answer), and return plain JSON."
+        var seen: Set<String> = []
+        return calls(source).literal.filter { $0.inferred && !$0.primitive }.map(\.id).filter { seen.insert($0).inserted }
     }
 
     /// Keep offsets and lines while hiding literal text; template expressions are code.
     public static func code(_ source: String) -> String {
+        lexed(source).code
+    }
+
+    /// The same lexical pass supplies call inspection with literal boundaries;
+    /// comments and regular expressions can never become calls or action names.
+    static func lexed(_ source: String) -> (code: String, literals: [Range<Int>]) {
         let text = Array(source.utf16)
         var masked = text, i = 0
+        var literals: [Range<Int>] = []
         func word(_ c: UInt16) -> Bool { c >= 128 || (48...57).contains(c) || (65...90).contains(c) || (97...122).contains(c) || c == 95 || c == 36 }
         func hide(_ start: Int) { for n in start..<i where text[n] != 10 && text[n] != 13 { masked[n] = 32 } }
         func literal(_ delimiter: UInt16) {
@@ -128,6 +115,7 @@ extension OwnedProgram {
                 if c == delimiter, !bracket { break }
             }
             if delimiter == 47 { while i < text.count, word(text[i]) { i += 1 } }
+            if delimiter != 47 { literals.append(start..<i) }
             hide(start)
         }
         func code(_ interpolation: Bool = false) {
@@ -151,9 +139,9 @@ extension OwnedProgram {
                     var start = i; i += 1
                     while i < text.count {
                         if text[i] == 92 { i = min(i + 2, text.count); continue }
-                        if text[i] == 96 { i += 1; hide(start); break }
+                        if text[i] == 96 { i += 1; literals.append(start..<i); hide(start); break }
                         if text[i] == 36, i + 1 < text.count, text[i + 1] == 123 {
-                            i += 2; hide(start); code(true); start = i; continue
+                            i += 2; literals.append(start..<i); hide(start); code(true); start = i; continue
                         }
                         i += 1
                     }
@@ -182,7 +170,7 @@ extension OwnedProgram {
             }
         }
         code()
-        return String(decoding: masked, as: UTF16.self)
+        return (String(decoding: masked, as: UTF16.self), literals)
     }
 
 }
@@ -230,11 +218,11 @@ public struct OwnedProgramReceiptEvidence: Sendable {
 /// source-bound adapter on the same OwnedProgramProcess, without turn authority.
 /// Host profiles do not publish versions, expand Trust, or execute fallback code.
 public protocol OwnedProgramHostProfile: Sendable {
-    var actionIDs: [String] { get }
+    var actionIDs: [String] { get throws }
     var floorReasons: Set<String> { get }
     var scriptKey: String { get }
-    func action(_ id: String) -> OwnedProgramAction?
-    func canonicalAction(_ id: String) -> String
+    func action(_ id: String) throws -> OwnedProgramAction?
+    func canonicalAction(_ id: String) throws -> String
     func doorInput(id: String, given: [JSONValue]) -> Result<[String: JSONValue], OwnedProgramRunner.ScriptError>
     func opensHomeItem(_ input: [String: JSONValue]) -> Bool
     func secretLine(_ text: String) -> Bool

@@ -29,12 +29,9 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
     public var confidence: Double?
     public var importance: Double?
     public var tags: [String]?
-    public var schemaVersion: Int?
-    public var sourceQuality: Double?
     public var lastUsedAt: String?
     public var decay: JSONValue?
     public var correction: JSONValue?
-    public var correctionHistory: JSONValue?
     public var provenance: JSONValue?
     /// Optional bitemporal/evidence semantics. These fields are descriptive
     /// canonical data with provenance; they do not grant authority or change
@@ -60,12 +57,9 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
         confidence: Double? = nil,
         importance: Double? = nil,
         tags: [String]? = nil,
-        schemaVersion: Int? = nil,
-        sourceQuality: Double? = nil,
         lastUsedAt: String? = nil,
         decay: JSONValue? = nil,
         correction: JSONValue? = nil,
-        correctionHistory: JSONValue? = nil,
         provenance: JSONValue? = nil,
         validFrom: String? = nil,
         validTo: String? = nil,
@@ -87,12 +81,9 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
         self.confidence = confidence
         self.importance = importance
         self.tags = tags
-        self.schemaVersion = schemaVersion
-        self.sourceQuality = sourceQuality
         self.lastUsedAt = lastUsedAt
         self.decay = decay
         self.correction = correction
-        self.correctionHistory = correctionHistory
         self.provenance = provenance
         self.validFrom = validFrom
         self.validTo = validTo
@@ -104,8 +95,8 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
     private static let knownKeys: Set<String> = [
         "id", "text", "layer", "memoryKind", "personaId", "lifecycle", "createdAt", "updatedAt",
         "sourceRunId", "status", "pinned", "confidence", "importance", "tags",
-        "schemaVersion", "sourceQuality", "lastUsedAt", "decay", "correction",
-        "correctionHistory", "provenance", "validFrom", "validTo", "observedAt", "evidence", "extras",
+        "lastUsedAt", "decay", "correction",
+        "provenance", "validFrom", "validTo", "observedAt", "evidence", "extras",
     ]
 
     public init(from decoder: Decoder) throws {
@@ -115,9 +106,6 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
         }
         func dbl(_ k: String) throws -> Double? {
             return try c.decodeIfPresent(Double.self, forKey: JSONKey(k))
-        }
-        func intV(_ k: String) throws -> Int? {
-            return try c.decodeIfPresent(Int.self, forKey: JSONKey(k))
         }
         func boolV(_ k: String) throws -> Bool? {
             return try c.decodeIfPresent(Bool.self, forKey: JSONKey(k))
@@ -143,12 +131,9 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
         self.confidence = try dbl("confidence")
         self.importance = try dbl("importance")
         self.tags = try arr("tags")
-        self.schemaVersion = try intV("schemaVersion")
-        self.sourceQuality = try dbl("sourceQuality")
         self.lastUsedAt = try str("lastUsedAt")
         self.decay = try jv("decay")
         self.correction = try jv("correction")
-        self.correctionHistory = try jv("correctionHistory")
         self.provenance = try jv("provenance")
         self.validFrom = try str("validFrom")
         self.validTo = try str("validTo")
@@ -183,12 +168,9 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
         try c.encodeIfPresent(confidence, forKey: JSONKey("confidence"))
         try c.encodeIfPresent(importance, forKey: JSONKey("importance"))
         try c.encodeIfPresent(tags, forKey: JSONKey("tags"))
-        try c.encodeIfPresent(schemaVersion, forKey: JSONKey("schemaVersion"))
-        try c.encodeIfPresent(sourceQuality, forKey: JSONKey("sourceQuality"))
         try c.encodeIfPresent(lastUsedAt, forKey: JSONKey("lastUsedAt"))
         try c.encodeIfPresent(decay, forKey: JSONKey("decay"))
         try c.encodeIfPresent(correction, forKey: JSONKey("correction"))
-        try c.encodeIfPresent(correctionHistory, forKey: JSONKey("correctionHistory"))
         try c.encodeIfPresent(provenance, forKey: JSONKey("provenance"))
         try c.encodeIfPresent(validFrom, forKey: JSONKey("validFrom"))
         try c.encodeIfPresent(validTo, forKey: JSONKey("validTo"))
@@ -208,7 +190,6 @@ public struct MemoryRecallHit: Sendable, Codable, Equatable {
     /// Sentence-safe capped full memory text; nil when the producer supplies only a preview.
     public var content: String?
     public var source: String?
-    public var rankingSignals: JSONValue?
     public var extras: JSONValue?
 
     public init(
@@ -219,7 +200,6 @@ public struct MemoryRecallHit: Sendable, Codable, Equatable {
         preview: String,
         content: String? = nil,
         source: String? = nil,
-        rankingSignals: JSONValue? = nil,
         extras: JSONValue? = nil
     ) {
         self.score = score
@@ -229,7 +209,6 @@ public struct MemoryRecallHit: Sendable, Codable, Equatable {
         self.preview = preview
         self.content = content
         self.source = source
-        self.rankingSignals = rankingSignals
         self.extras = extras
     }
 
@@ -241,7 +220,6 @@ public struct MemoryRecallHit: Sendable, Codable, Equatable {
         case preview
         case content
         case source
-        case rankingSignals
         case extras
     }
 
@@ -254,7 +232,6 @@ public struct MemoryRecallHit: Sendable, Codable, Equatable {
         self.preview = try c.decodeIfPresent(String.self, forKey: .preview) ?? ""
         self.content = try c.decodeIfPresent(String.self, forKey: .content)
         self.source = try c.decodeIfPresent(String.self, forKey: .source)
-        self.rankingSignals = try c.decodeIfPresent(JSONValue.self, forKey: .rankingSignals)
         self.extras = try c.decodeIfPresent(JSONValue.self, forKey: .extras)
     }
 }
@@ -357,7 +334,7 @@ public actor SwiftNativeMemoryV2 {
         }
     }
     // Reuse candidates only while their provider epoch and canonical content match.
-    private var embeddingRetryVectors: [EmbeddingRetryKey: [Float]] = [:]
+    private var embeddingRetryItems: [EmbeddingRetryKey: MemoryEmbeddingItem] = [:]
     private var embeddingReindexID: UUID?
     var embeddingEpochReconcile: Task<Bool, Never>?
     var embeddingEpochDirty = false
@@ -489,9 +466,13 @@ public actor SwiftNativeMemoryV2 {
     }
 
     /// Vectors from the already-resident model, or nil; never loads.
-    public func embedIfWarm(_ texts: [String], requireFullText: Bool = false) async -> [[Float]]? {
+    public func embedIfWarm(_ texts: [String], requireFullText: Bool = false) async throws -> [[Float]]? {
+        try await embedIfWarmWithEpoch(texts, requireFullText: requireFullText)?.vectors
+    }
+
+    public func embedIfWarmWithEpoch(_ texts: [String], requireFullText: Bool = false) async throws -> MemoryEmbeddingBatch? {
         guard let managed = embedder as? ManagedEmbeddingProvider else { return nil }
-        return await managed.embedIfResident(texts, requireFullText: requireFullText)
+        return try await managed.embedIfResidentWithEpoch(texts, requireFullText: requireFullText)
     }
 
     func coversCompleteTextsIfWarm(_ texts: [String]) -> Bool? {
@@ -568,6 +549,11 @@ public actor SwiftNativeMemoryV2 {
         return try await embedder.embedWithEpoch(texts)
     }
 
+    public func embedForDerivedContextItemsWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingItemBatch {
+        guard let embedder else { throw MemoryV2Error.storageUnavailable }
+        return try await embedder.embedItemsWithEpoch(texts)
+    }
+
     /// A turn's message (and its other voice) as a search query: the model's
     /// query form, scored against vectors from `embedForDerivedContextWithEpoch`.
     public func embedQueriesWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
@@ -616,8 +602,8 @@ public actor SwiftNativeMemoryV2 {
         }
         let invocation = UUID()
         embeddingReindexID = invocation
-        var reusable = embeddingRetryVectors
-        embeddingRetryVectors = [:]
+        var reusable = embeddingRetryItems
+        embeddingRetryItems = [:]
         try Task.checkCancellation()
         let corpus = try await concreteStorage.embeddingCorpusSnapshot()
         try Task.checkCancellation()
@@ -628,44 +614,51 @@ public actor SwiftNativeMemoryV2 {
         var staged: [MemoryEmbeddingStagedRow] = []
         staged.reserveCapacity(corpus.count)
         var candidateEpoch: MemoryEmbeddingEpoch?
+        var activationProbe: [Float]?
         let providerEpoch = embedder.embeddingEpoch
         let liveKeys = Set(corpus.map { EmbeddingRetryKey(epoch: providerEpoch, row: $0) })
         reusable = reusable.filter { liveKeys.contains($0.key) }
 
         if corpus.isEmpty {
-            let probe = try await embedder.embedWithEpoch(["NativeAgent embedding epoch activation"])
+            let probe = try await embedder.embedWithEpoch([MemoryEmbeddingEpoch.activationProbeText])
             try Task.checkCancellation()
+            guard probe.vectors.count == 1 else {
+                throw MemoryV2Error.underlying("The memory search model did not return its activation probe vector.")
+            }
+            try VectorMath.requireUsable(probe.vectors[0], dimensions: embedder.dimensions)
+            activationProbe = probe.vectors[0]
             candidateEpoch = probe.epoch
         } else {
             let missing = corpus.filter {
                 reusable[EmbeddingRetryKey(epoch: providerEpoch, row: $0)] == nil
             }
-            var vectors = reusable
+            var items = reusable
             candidateEpoch = providerEpoch
             for start in stride(from: 0, to: missing.count, by: boundedBatch) {
                 try Task.checkCancellation()
                 let end = min(missing.count, start + boundedBatch)
                 let rows = Array(missing[start..<end])
-                let batch = try await embedder.embedWithEpoch(rows.map(\.content))
+                let batch = try await embedder.embedItemsWithEpoch(rows.map(\.content))
                 try Task.checkCancellation()
-                guard batch.vectors.count == rows.count else {
+                guard batch.items.count == rows.count else {
                     throw MemoryV2Error.underlying(
-                        "The memory search model returned \(batch.vectors.count)/\(rows.count) candidate vectors."
+                        "The memory search model returned \(batch.items.count)/\(rows.count) candidate outcomes."
                     )
                 }
                 if let candidateEpoch, candidateEpoch != batch.epoch {
                     throw MemoryV2Error.underlying("The memory search model changed vector spaces while building the index.")
                 }
                 candidateEpoch = batch.epoch
-                for (row, vector) in zip(rows, batch.vectors) {
-                    vectors[EmbeddingRetryKey(epoch: batch.epoch, row: row)] = vector
+                for (row, item) in zip(rows, batch.items) {
+                    if case .vector(let vector) = item { try VectorMath.requireUsable(vector, dimensions: embedder.dimensions) }
+                    items[EmbeddingRetryKey(epoch: batch.epoch, row: row)] = item
                 }
             }
             staged = try corpus.map { row in
-                guard let vector = vectors[EmbeddingRetryKey(epoch: providerEpoch, row: row)] else {
+                guard let item = items[EmbeddingRetryKey(epoch: providerEpoch, row: row)] else {
                     throw MemoryV2Error.underlying("A staged memory embedding is missing for \(row.id).")
                 }
-                return MemoryEmbeddingStagedRow(row: row, vector: vector)
+                return MemoryEmbeddingStagedRow(row: row, result: item)
             }
         }
         guard let candidateEpoch else {
@@ -676,12 +669,18 @@ public actor SwiftNativeMemoryV2 {
             throw MemoryV2Error.underlying("The memory search model changed vector spaces while building the index.")
         }
         do {
-            return try await concreteStorage.activateEmbeddingEpoch(candidateEpoch, staged: staged)
+            let report = try await concreteStorage.activateEmbeddingEpoch(candidateEpoch, dimensions: embedder.dimensions, staged: staged, activationProbe: activationProbe)
+            for item in staged {
+                if case .unembeddable(let reason) = item.result {
+                    nativeLog("[memory-epoch] unembeddable %@ %@: %@", item.row.kind.rawValue, item.row.id, reason)
+                }
+            }
+            return report
         } catch let error as MemoryStorageError {
             if case .embeddingActivationInvalid(.corpusDrift, _) = error,
                embeddingReindexID == invocation, !Task.isCancelled {
-                embeddingRetryVectors = Dictionary(uniqueKeysWithValues: staged.map {
-                    (EmbeddingRetryKey(epoch: candidateEpoch, row: $0.row), $0.vector)
+                embeddingRetryItems = Dictionary(uniqueKeysWithValues: staged.map {
+                    (EmbeddingRetryKey(epoch: candidateEpoch, row: $0.row), $0.result)
                 })
             }
             throw error

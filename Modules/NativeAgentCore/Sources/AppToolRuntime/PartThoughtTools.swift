@@ -45,7 +45,7 @@ actor PartThoughtTools: ToolDispatchClient {
         if !host.scriptKey.isEmpty { input[host.scriptKey] = .bool(true) }
         let args = if case .object(let args)? = input["args"] { args } else { [String: JSONValue]() }
         let read = if let id = input["action"]?.stringValue {
-            host.action(id)?.readOnly(args) == true
+            try host.action(id)?.readOnly(args) == true
         } else { input["page"] != nil || input["find"] != nil }
         inFlight += 1
         let receipt = await ChatToolSessionContext.$userText.withValue(userText) { await host.perform(input) }

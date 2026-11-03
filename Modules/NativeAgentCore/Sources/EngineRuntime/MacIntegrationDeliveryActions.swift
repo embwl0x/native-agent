@@ -281,7 +281,7 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
 
 
     public static func phoneRequest(input: [String: JSONValue], deviceSync: DeviceSync) async throws -> JSONValue {
-        guard let kindName = input["kind"]?.stringValue, let kind = PhoneRequest.Kind(rawValue: kindName) else {
+        guard let kindName = input["kind"]?.stringValue, let kind = PhoneRequest.Kind(rawValue: kindName), !kind.isSettings else {
             throw DeviceSyncError.underlying(message: "kind must be location.current, photo.pick, or photo.capture.")
         }
         if let params = input["params"], params != .null, params != .object([:]) {
@@ -339,6 +339,11 @@ public struct MacNotificationPosting: NotificationPosting {
         let result = await NativeAgentNotifications.postMessage(
             title: title, body: message, soundName: soundName)
         guard result.posted else {
+            if case .unknown(_, let reason) = result.notificationOutcome {
+                throw ToolFailureError("Mac notification outcome is unknown: " + reason, effects: .unknown,
+                    owner: "notify/deliveries.json", code: "notification_unconfirmed",
+                    instruction: "Reconcile this notification's retained occurrence before asking for another banner.", recovery: .reconcile)
+            }
             throw MacControlError.notificationFailed(result.error ?? result.delivery)
         }
         return NotificationPostReceipt(

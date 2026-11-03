@@ -10,6 +10,10 @@ struct ContentView: View {
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(HazeColor.key) private var hazeColorRaw = HazeColor.defaultValue.rawValue
     @EnvironmentObject private var pairingStore: PairingStore
+    @EnvironmentObject private var bridgeClient: MacBridgeClient
+    @Environment(VoiceInputController.self) private var voiceInput
+    @EnvironmentObject private var voiceOutput: VoiceOutputController
+    private let talk = TalkModeController.shared
     private let sync = iCloudSyncEngine.shared
 
     // Shared stores so the tab badges stay in sync with the views' stores
@@ -27,9 +31,14 @@ struct ContentView: View {
     @State private var notifiedSessionID: String?
     @State private var notifiedDeskHandle: String?
     @State private var deskTaskNavigationTarget: NativeAgentNotificationLaunchIntent?
+    @State private var opensMemories = {
+        let args = ProcessInfo.processInfo.arguments
+        guard let index = args.firstIndex(of: "-initialTab"), args.indices.contains(index + 1) else { return false }
+        return ["memory", "memories"].contains(args[index + 1].lowercased())
+    }()
 
     enum Tab: Hashable {
-        case chat, activity, memories, desk, more
+        case chat, activity, desk, settings, more
     }
 
     private var activityBadgeCount: Int? {
@@ -37,7 +46,7 @@ struct ContentView: View {
         return overview.needsYouCount
     }
 
-    /// Parse `-initialTab <name>`, retaining legacy screen aliases.
+    /// Parse the current `-initialTab <name>` destinations.
     private static func initialTabFromLaunchArgs() -> Tab {
         initialTab(fromLaunchArguments: ProcessInfo.processInfo.arguments)
     }
@@ -59,16 +68,28 @@ struct ContentView: View {
 
     var body: some View {
         tabContent
-            .sheet(item: Binding(get: { phoneRequests.active }, set: { _ in })) { request in
+            .fullScreenCover(isPresented: Binding(get: { talk.isPresented }, set: { if !$0 { talk.end() } })) {
+                TalkModeView(talk: talk)
+            }
+            .onAppear { consumePendingTalk() }
+            .onReceive(NotificationCenter.default.publisher(for: MobileTalkRoute.notification)) { _ in consumePendingTalk() }
+            .onChange(of: chatStore.isSwitchingSession) { _, switching in if !switching { consumePendingTalk() } }
+            .onChange(of: pairingStore.iCloudPairingSecret) { _, _ in
+                talk.end(reason: "Talk ended because the Mac pairing changed.")
+            }
+            .onChange(of: sync.voicePreference) { _, preference in
+                if preference?.quiet == true { voiceOutput.stop(); talk.quietPreferenceChanged() }
+            }
+            .sheet(item: Binding(get: { phoneRequests.presented }, set: { _ in })) { request in
                 PhoneRequestSheet(request: request)
             }
             .task { await phoneRequests.resume() }
             .onChange(of: selection, initial: true) { before, after in
                 sync.foregroundSnapshotGroup = switch after {
                 case .chat: .chat
-                case .activity, .memories: .activity
+                case .activity: .activity
                 case .desk: .desk
-                case .more: .advanced
+                case .settings, .more: .advanced
                 }
                 if before != after, after == .more {
                     Task {
@@ -78,13 +99,28 @@ struct ContentView: View {
                 }
             }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .active { Task { await phoneRequests.resume() } }
+                if phase == .active {
+                    consumePendingTalk()
+                    Task { await phoneRequests.resume() }
+                }
             }
             .alert("Phone request", isPresented: Binding(
                 get: { phoneRequests.errorMessage != nil },
                 set: { if !$0 { phoneRequests.errorMessage = nil } }
             )) { Button("OK") { phoneRequests.errorMessage = nil } }
             message: { Text(phoneRequests.errorMessage ?? "") }
+    }
+
+    private func consumePendingTalk() {
+        guard scenePhase == .active, !chatStore.isSwitchingSession, MobileTalkRoute.consume() else { return }
+        selection = .chat
+        voiceInput.cancel(); voiceOutput.stop()
+        let model = sync.surfaceModels["ios"]
+        let controls = ChatRuntimeControls(model: model?.model ?? "", reasoningEffort: model?.reasoningEffort ?? "high",
+            serviceTier: model?.serviceTier ?? "default",
+            fileAccess: ChatRuntimeControlPresentation.normalizedFileAccessID(UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto"),
+            providerId: model?.providerID ?? "")
+        talk.begin(client: bridgeClient, controls: controls)
     }
 
     private var tabContent: some View {
@@ -110,13 +146,6 @@ struct ContentView: View {
                 .badge(activityBadgeCount.flatMap { $0 > 0 ? String($0) : nil })
                 .tag(Tab.activity)
 
-            MemoryView()
-                .tabItem {
-                    Label("Memories", systemImage: "brain")
-                    .environment(\.symbolVariants, .none)
-                }
-                .tag(Tab.memories)
-
             NavigationStack {
                 // More → Desk pushes WorkshopView inside More's navigation stack
                 // for directed work; this tab opens the canonical Desk board.
@@ -129,8 +158,15 @@ struct ContentView: View {
                 }
                 .tag(Tab.desk)
 
+            NavigationStack { SettingsViewFull() }
+                .tabItem {
+                    Label("Settings", systemImage: "gearshape")
+                    .environment(\.symbolVariants, .none)
+                }
+                .tag(Tab.settings)
+
             // AdvancedView's own title names the page; no second label above it.
-            AdvancedView(deskTaskNavigationTarget: $deskTaskNavigationTarget)
+            AdvancedView(deskTaskNavigationTarget: $deskTaskNavigationTarget, opensMemories: $opensMemories)
                 .tabItem {
                     Label("More", systemImage: "ellipsis.circle")
                     .environment(\.symbolVariants, .none)
@@ -215,11 +251,12 @@ struct ContentView: View {
     private static func tab(forScreen screen: String) -> Tab? {
         switch screen.lowercased() {
         case "chat": return .chat
-        case "memories", "memory": return .memories
+        case "memories", "memory": return .more
         case "desk": return .desk
         case "skills": return .more
-        case "workshop", "missions": return .more
-        case "more", "settings", "advanced": return .more
+        case "workshop": return .more
+        case "settings": return .settings
+        case "more": return .more
         case "mac_integration", "macintegration", "mac-integration": return .more
         case "activity", "approvals", "inbox": return .activity
         default: return nil
@@ -230,6 +267,7 @@ struct ContentView: View {
     private func openActivityFromNotification(_ destination: NativeAgentNotificationLaunchIntent) {
         let screen = destination.screen
         let target = Self.tab(forScreen: screen) ?? .activity
+        if ["memory", "memories"].contains(screen.lowercased()) { opensMemories = true }
         notifiedSessionID = destination.sessionID
         notifiedDeskHandle = screen == "desk" ? destination.taskID : nil
         if screen == "workshop" { deskTaskNavigationTarget = destination }

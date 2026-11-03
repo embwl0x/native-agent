@@ -308,7 +308,7 @@ public struct ChatCompactionDistiller: Sendable {
         let blocks: [Block]
         let model: String
         let promptCharsPerPass: [Int]
-        let thirdPerson: Bool
+        let thirdPerson: Bool?
     }
 
     /// `stillWanted` false before a pass ends the work with `goneStatus`: the
@@ -346,7 +346,7 @@ public struct ChatCompactionDistiller: Sendable {
         var promptChars = 0
         let blocks: [Block]
         do {
-            let plan = Self.buildPlan(
+            let plan = try Self.buildPlan(
                 from: rows,
                 budget: try Self.promptBudgetChars(forModel: model, providerID: route.providerId, dataRoot: dataRoot)
             )
@@ -370,13 +370,11 @@ public struct ChatCompactionDistiller: Sendable {
                         let output = try await self.callLLM(route: route, prompt: prompt)
                         let text = output.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !text.isEmpty else { throw DistillError.empty }
-                        // The minimum is the prompt's ask, not a verdict: a short block is still her
-                        // recollection, and refusing it threw away every chunk and left the whole span
-                        // unremembered (10-29: 27 chunks dropped over one 144-character block).
-                        guard text.count <= chunk.maximumBlockChars else {
-                            throw DistillError.oversized(chunk: index + 1, characters: text.count,
-                                                        maximum: chunk.maximumBlockChars)
-                        }
+                        // The length allowance is the prompt's ask, not a verdict, at either end: a
+                        // short or long block is still her recollection. Refusing one threw away every
+                        // chunk, left the span pending, and every turn re-ran the whole distill
+                        // (10-29: 27 chunks over one 144-character block; 11-01: 38 over-allowance
+                        // retries, each turn showing "Compacting this chat").
                         return (index, Block(text: text, source: chunk.source))
                     }
                 }
@@ -395,9 +393,17 @@ public struct ChatCompactionDistiller: Sendable {
         }
 
         // Voice flags are advisory and appear only in the receipt.
-        let thirdPersonLines = Self.configuredAgentName(dataRoot: dataRoot)
-            .map { name in blocks.reduce(0) { $0 + Self.thirdPersonSubjectCount($1.text, agentName: name) } } ?? 0
-        let thirdPerson = thirdPersonLines > Self.thirdPersonFlagThreshold
+        let thirdPerson: Bool?
+        do {
+            thirdPerson = try Self.checkedAgentName(dataRoot: dataRoot).map { name in
+                blocks.reduce(0) { $0 + Self.thirdPersonSubjectCount($1.text, agentName: name) } > Self.thirdPersonFlagThreshold
+            }
+        } catch {
+            thirdPerson = nil
+            await emitDistillTrace(sessionId: sessionId, surface: surface, model: model,
+                charsIn: promptChars, charsOut: blocks.reduce(0) { $0 + $1.text.count },
+                runId: runId, status: "diagnostic_unavailable", failure: error)
+        }
 
         return PreparedRecollection(
             blocks: blocks, model: model, promptCharsPerPass: promptCharsPerPass,
@@ -428,7 +434,6 @@ public struct ChatCompactionDistiller: Sendable {
     private enum DistillError: Error, Equatable {
         case routeUnavailable
         case empty
-        case oversized(chunk: Int, characters: Int, maximum: Int)
         case sourceChanged
     }
 
@@ -485,7 +490,7 @@ public struct ChatCompactionDistiller: Sendable {
         charsOut: Int,
         runId: String?,
         status: String,
-        thirdPerson: Bool = false,
+        thirdPerson: Bool? = nil,
         promptCharsPerPass: [Int] = [],
         failure: (any Error)? = nil
     ) async {
@@ -510,8 +515,8 @@ public struct ChatCompactionDistiller: Sendable {
             )
             payload["distill.cancelled"] = .bool(failure is CancellationError)
         }
-        if thirdPerson {
-            payload["distill.thirdPerson"] = .bool(true)
+        if let thirdPerson {
+            payload["distill.thirdPerson"] = .bool(thirdPerson)
         }
         // This is the plan, including on failure/cancellation before every
         // child has dispatched. Never count planned work as completed calls.

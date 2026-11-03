@@ -17,11 +17,11 @@ extension ChatCompactionDistiller {
     private static let promptWindowFraction = 0.45
 
     /// ContextBudgetPolicy owns the verified window and chars-per-token convention.
-    /// Unknown windows allow 32k source characters; known windows reserve instructions.
+    /// A missing window is unavailable; known windows reserve instructions.
     static func promptBudgetChars(forModel model: String, providerID: String?, dataRoot: URL) throws -> Int {
         guard let windowTokens = ContextBudgetPolicy.windowTokens(
             forModel: model, providerID: providerID, dataRoot: dataRoot
-        ) else { return maxSourceChunkChars }
+        ) else { throw ProviderRoutingError.configurationFailed("The recollection model's context window is unavailable. Refresh its catalog in Providers before distilling this conversation.") }
         let derived = Int(
             Double(windowTokens) * ContextBudgetPolicy.charactersPerToken * promptWindowFraction
         )
@@ -75,13 +75,13 @@ extension ChatCompactionDistiller {
     /// Stored recollections enter only when selected for a rollup or pending work.
     static func buildPlan(
         from rows: [JSONValue], budget: Int
-    ) -> PromptPlan {
+    ) throws -> PromptPlan {
         let maximum = min(maxSourceChunkChars, budget)
         guard maximum > 0 else { return PromptPlan(chunks: []) }
         var renderedRows: [(row: JSONValue, line: String)] = []
         for row in rows {
             guard case .object(let obj) = row,
-                  let rendered = ChatCompactionRowRendering.summaryBody(
+                  let rendered = try ChatCompactionRowRendering.summaryBody(
                     obj, collapseNewlines: false,
                     toolSummaryCap: ChatCompactionRowRendering.distillerToolResultSummaryMaximumCharacters
                   ) else { continue }

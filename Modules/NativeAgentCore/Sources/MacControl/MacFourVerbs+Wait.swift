@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacFourVerbs+Wait.swift` | `MacFourVerbs`: `wait`; app-level signals prompt bounded screen re-reads; action verification uses its owning bounded polling waits without additional subscriptions |
+// Blueprint: | `MacFourVerbs+Wait.swift` | `MacFourVerbs.wait`: required AX/app subscriptions prompt bounded screen reads; unavailable subscriptions refuse without coarse polling; text rechecks and settle reads retain the caller's deadline |
 
 extension MacFourVerbs {
     // MARK: 4 — PATIENCE
@@ -21,6 +21,13 @@ extension MacFourVerbs {
             MacFourVerbsReply(ok: false, text: "Waiting was cancelled.", detail: ["outcome": .string("cancelled"), "status": .string("cancelled"),
                 "error": .string("cancelled"), "effects": .string("unknown"),
                 "remedy": Repair.terminal(instruction: "The wait was cancelled; no further observation runs for this request.")])
+        }
+        func observationUnavailable(_ detail: String) -> MacFourVerbsReply {
+            MacFourVerbsReply(ok: false, text: detail + " Read this app again after repairing its Accessibility observation; no watch was started.",
+                detail: ["outcome": .string("unavailable"), "error": .string("observation_unavailable"),
+                    "message": .string(detail), "effects": .string("none"),
+                    "remedy": Repair.reconcile(instruction: "Inspect the app's Accessibility access and read the app again before waiting.",
+                        nextCall: .object(["tool": .string("app"), "input": .object(["page": .string("mac")])]))])
         }
         func refusal(_ reply: MacFourVerbsReply) async -> MacFourVerbsReply {
             guard reply.detail["status"] == .string("in_process_route") else { return reply }
@@ -82,6 +89,7 @@ extension MacFourVerbs {
             pid: first.pid
         )
         defer { signals.stop() }
+        if let failure = signals.installationFailure { return observationUnavailable(failure) }
 
         while true {
             guard !Task.isCancelled else { return cancelled() }
@@ -89,7 +97,7 @@ extension MacFourVerbs {
             if remaining <= 0 { break }
             let window = min(
                 remaining,
-                signals.isObserving && !waitingForText ? Self.settleQuietSeconds : Self.fallbackPollSeconds
+                !waitingForText ? Self.settleQuietSeconds : Self.textRecheckSeconds
             )
             // Rate-limit signal-driven renders to `settleQuietSeconds`, within the deadline.
             let fired = await awaitSignal(
@@ -117,6 +125,7 @@ extension MacFourVerbs {
                 signals.stop()
                 observedPID = last.pid
                 signals = MacWaitSignals(effects: effectObserverSource, activation: appActivationSource, pid: last.pid)
+                if let failure = signals.installationFailure { return observationUnavailable(failure) }
             }
             if !waitingForText, !needsReconciliation, previous == last.effectRender {
                 // Two identical reads of the screen's content: it has settled.
@@ -155,7 +164,7 @@ extension MacFourVerbs {
     static let maxWaitSeconds: Double = 60
     /// Capture-rate floor and quiet interval before a settling read.
     static let settleQuietSeconds: Double = 0.5
-    /// Coarse recheck interval for text waits or unavailable AX observation.
-    static let fallbackPollSeconds: Double = 5.0
+    /// Bounded content recheck for text conditions while observation is installed.
+    static let textRecheckSeconds: Double = 5.0
 
 }

@@ -36,8 +36,12 @@ enum ContextFillPresentation {
         return String(format: "%.0f%%", value.rounded())
     }
 
-    /// The status's own percent, which holds a previous model's receipt at
-    /// 100% on the smaller window just switched to instead of reading 250%.
+    static func compactionPercent(_ status: SessionContextStatus) -> String {
+        guard status.budget > 0 else { return "unavailable" }
+        return roundedPercent(Double(status.auto_compact_threshold) / Double(status.budget) * 100)
+    }
+
+    /// The owner's measured or estimated share of the selected model window.
     static func usage(_ status: SessionContextStatus) -> Usage {
         let percent = status.budget > 0 ? status.percent : 0
         return Usage(
@@ -232,20 +236,16 @@ struct ContextFillBar: View {
 
     private func contextHelp(_ s: SessionContextStatus) -> String {
         let mode = s.context_mode ?? "none"
-        let prompt = s.prompt_tokens ?? 0
-        let transcript = s.transcript_tokens ?? 0
         let deltaDescription = s.turn_delta_tokens.map {
             " Change from the preceding turn's final provider request: \(formatSignedTokens($0)) tokens."
         } ?? ""
         let window = s.budget > 0 ? "your \(s.budget)-token window" : "a window no catalog states for this model"
-        let usageDescription = s.context_loaded == true
-            ? "Exact last provider request: \(s.used_tokens) input tokens of \(window). Stored transcript estimate: \(transcript); remainder after that estimate: \(prompt).\(deltaDescription)"
-            : "No matching provider receipt yet. Transcript estimate: \(transcript) tokens of \(window)."
-        return "\(usageDescription) Mode: \(mode). Compaction is based on reducible transcript growth and becomes available at \(s.auto_compact_threshold) transcript tokens. A lower provider-request count on a later turn does not by itself mean compaction occurred."
+        let usageDescription = "The last matching provider request recorded \(s.used_tokens) input tokens of \(window). Transcript and other-input shares were not measured.\(deltaDescription)"
+        return "\(usageDescription) Mode: \(mode). Compaction separately sizes the next built request. Effective compact trigger: \(ContextFillPresentation.compactionPercent(s)) (\(s.auto_compact_threshold) tokens). The trigger and target leave room for the response. The fold aims for 55% of the window at default, lowered when output needs more room; background aging uses the same trigger. A completed fold is checked against its target; protected history or a fold that cannot reduce it reports the cause."
     }
 
     private func contextAccessibilityLabel(_ s: SessionContextStatus) -> String {
-        let source = s.context_loaded == true ? "exact provider input" : "transcript estimate"
+        let source = "last observed provider input"
         let fill = s.budget > 0 ? "of \(s.budget) tokens, \(formatPercent(s.percent))" : "tokens, window unknown"
         return "Context: \(s.used_tokens) \(fill), \(source). Stored chat \(ContextFillPresentation.transcriptTokens(s.transcript_tokens)) tokens; automatic compaction at \(s.auto_compact_threshold)."
     }
@@ -297,25 +297,32 @@ struct ComposerContextRing: View {
     }
 
     private var helpText: String {
-        guard let status else { return "Context used this conversation" }
+        guard let status else { return appModel.engine.providers.sessions[sessionId]?.error ?? "Context usage unavailable; no matching provider measurement has loaded." }
         let used = NumberFormatter.localizedString(from: NSNumber(value: status.used_tokens), number: .decimal)
         guard let window = ContextFillPresentation.window(status.budget) else { return "Context: \(used) tokens; window unknown" }
-        return "Context: \(used) of \(window) tokens (\(ContextFillPresentation.roundedPercent(usage.percent)))"
+        let source = "last observed provider input"
+        return "Context: \(used) of \(window) tokens (\(ContextFillPresentation.roundedPercent(usage.percent))); \(source). Effective compact trigger: \(ContextFillPresentation.compactionPercent(status)) (\(status.auto_compact_threshold) tokens); the target leaves room for output; aging uses the same effective trigger."
     }
 
     var body: some View {
         HStack(spacing: 5) {
-            ZStack {
-                Circle().stroke(NativeAgentShell.hairline, lineWidth: 1.5)
-                Circle()
-                    .trim(from: 0, to: usage.fillFraction)
-                    .stroke(ringColor, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-                    .animation(NativeAgentMotion.standard, value: usage.fillFraction)
+            if status == nil {
+                Image(systemName: "questionmark.circle")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            } else {
+                ZStack {
+                    Circle().stroke(NativeAgentShell.hairline, lineWidth: 1.5)
+                    Circle()
+                        .trim(from: 0, to: usage.fillFraction)
+                        .stroke(ringColor, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .animation(NativeAgentMotion.standard, value: usage.fillFraction)
+                }
+                .frame(width: 11, height: 11)
             }
-            .frame(width: 11, height: 11)
             if let status, status.budget > 0 {
-                Text(ContextFillPresentation.roundedPercent(usage.percent))
+                Text((status.context_loaded == true ? "" : "~") + ContextFillPresentation.roundedPercent(usage.percent))
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .monospacedDigit()

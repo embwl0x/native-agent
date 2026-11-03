@@ -14,6 +14,13 @@ public enum ProviderStateValidation {
             if errno == ENOENT { return nil }
             throw invalid("provider file is unreadable")
         }
+        // Inspect the directory entry first so a dangling link is an unreadable
+        // credential, not an absent one. Then admit its regular-file target.
+        if (info.st_mode & S_IFMT) == S_IFLNK {
+            guard stat(path.path, &info) == 0 else {
+                throw invalid("provider symlink target is unreadable")
+            }
+        }
         guard (info.st_mode & S_IFMT) == S_IFREG else {
             throw invalid("provider file must be a regular file")
         }
@@ -54,9 +61,9 @@ public enum ProviderStateValidation {
     }
 
     public static func credentialFields(_ fields: [String: JSONValue]) throws {
-        try strings(fields, ["provider_id", "auth_mode", "authMode", "api_key", "apiKey", "key",
-            "access_token", "accessToken", "setup_token", "token", "refresh_token", "id_token", "account_id",
-            "default_model", "defaultModel", "model", "client_id", "scope", "base_url",
+        try strings(fields, ["provider_id", "auth_mode", "api_key",
+            "access_token", "setup_token", "token", "refresh_token", "id_token", "account_id",
+            "default_model", "model", "client_id", "scope", "base_url",
             "redirect_uri", "token_type", "last_refresh", "email",
             "oauth_account_identity", "refresh_token_account_identity"])
         if let value = fields[ProviderAPIKeyStore.referenceField] {
@@ -72,7 +79,7 @@ public enum ProviderStateValidation {
         if let value = fields["OPENAI_API_KEY"], value != .null {
             try strings(["OPENAI_API_KEY": value], ["OPENAI_API_KEY"])
         }
-        for key in ["expires_at", "expires_in", "expiresAt"] {
+        for key in ["expires_at", "expires_in"] {
             if let value = fields[key] {
                 if key == "expires_in" {
                     switch value {
@@ -113,7 +120,7 @@ public enum ProviderStateValidation {
         var matchingIndex: Int?
         for (index, row) in rows.enumerated() {
             guard case .object(let fields) = row else { continue }
-            let id = ["id", "provider_id", "providerId"].compactMap { key -> String? in
+            let id = ["id"].compactMap { key -> String? in
                 if case .string(let value)? = fields[key] { return value }
                 return nil
             }.first

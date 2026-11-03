@@ -2,12 +2,13 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `MemoryEmbeddingEpoch.swift` | `MemoryEmbeddingEpoch`, `MemoryEmbeddingBatch`; engine-stopped epoch reconciliation on the canonical memory owner, including same-epoch vector-pending tombstones before active memory admission; admission retained through actual flight exit |
+// Blueprint: | `MemoryEmbeddingEpoch.swift` | Embedding epoch and batch/item outcomes; engine-stopped reconciliation on the canonical memory owner; owed memory/tombstone fills retain per-text failures and land usable siblings; admission retained through actual flight exit |
 
 /// Immutable identity of one vector space. Dimensions alone are deliberately
 /// insufficient: backend, model/tokenizer artifacts, preprocessing, pooling,
 /// normalization, and sequence length all participate in compatibility.
 public struct MemoryEmbeddingEpoch: RawRepresentable, Sendable, Codable, Equatable, Hashable {
+    public static let activationProbeText = "NativeAgent embedding epoch activation"
     public let rawValue: String
 
     public init(rawValue: String) {
@@ -59,15 +60,9 @@ public struct MemoryEmbeddingEpoch: RawRepresentable, Sendable, Codable, Equatab
 
     static func sha256(directory url: URL) throws -> String {
         let keys: [URLResourceKey] = [.isRegularFileKey]
-        guard let enumerator = FileManager.default.enumerator(
-            at: url,
-            includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles]
-        ) else {
-            throw CocoaError(.fileReadNoSuchFile)
-        }
-        let files = enumerator.compactMap { $0 as? URL }
-            .filter { (try? $0.resourceValues(forKeys: Set(keys)).isRegularFile) == true }
+        let files = try FileManager.default.subpathsOfDirectory(atPath: url.path)
+            .map { url.appendingPathComponent($0) }
+            .filter { try $0.resourceValues(forKeys: Set(keys)).isRegularFile == true }
             .sorted { $0.path < $1.path }
         var hasher = SHA256()
         for file in files {
@@ -91,6 +86,36 @@ public struct MemoryEmbeddingBatch: Sendable, Equatable {
     public init(epoch: MemoryEmbeddingEpoch, vectors: [[Float]]) {
         self.epoch = epoch
         self.vectors = vectors
+    }
+}
+
+/// A prediction can be unusable for one text without losing its siblings.
+/// Transport, model and output-contract failures still throw for the call.
+public enum MemoryEmbeddingItem: Sendable, Equatable {
+    case vector([Float])
+    case unembeddable(reason: String)
+}
+
+public struct MemoryEmbeddingItemBatch: Sendable {
+    public let epoch: MemoryEmbeddingEpoch
+    public let items: [MemoryEmbeddingItem]
+
+    public init(epoch: MemoryEmbeddingEpoch, items: [MemoryEmbeddingItem]) {
+        self.epoch = epoch
+        self.items = items
+    }
+
+    /// Callers requiring every vector get an explicit indexed error, never a
+    /// shortened batch or a manufactured vector.
+    func requireVectors() throws -> [[Float]] {
+        try items.enumerated().map { index, item in
+            switch item {
+            case .vector(let vector): return vector
+            case .unembeddable(let reason):
+                throw MemoryStorageError.searchFailure("Text at batch index \(index) is unembeddable: \(reason)",
+                    code: "memory_text_unembeddable", instruction: "Inspect the named text and model output; no replacement vector was used.")
+            }
+        }
     }
 }
 
@@ -126,21 +151,31 @@ extension SwiftNativeMemoryV2 {
         guard let embedder, let disk = storage else { throw MemoryV2Error.storageUnavailable }
         try checkEmbeddingConvergence()
         while true {
-            let owed = try await disk.memoriesOwingVectors(limit: 32)
+            let owed = try await disk.memoriesOwingVectors(limit: 32, epoch: embedder.embeddingEpoch)
             try checkEmbeddingConvergence()
             guard !owed.isEmpty else { return }
-            let batch = try await embedder.embedWithEpoch(owed.map(\.content))
+            let batch = try await embedder.embedItemsWithEpoch(owed.map(\.content))
             try checkEmbeddingConvergence()
-            guard batch.vectors.count == owed.count else {
-                throw MemoryV2Error.underlying("embedder returned \(batch.vectors.count)/\(owed.count) owed vectors")
+            guard batch.items.count == owed.count else {
+                throw MemoryV2Error.underlying("embedder returned \(batch.items.count)/\(owed.count) owed outcomes")
             }
             var moved = 0
-            for (row, vector) in zip(owed, batch.vectors) where !vector.isEmpty {
-                let outcome = try await disk.landOwedVector(id: row.id, content: row.content, vector: vector, epoch: batch.epoch)
-                try checkEmbeddingConvergence()
-                if case .archived(let reason) = outcome { nativeLog("[memory-epoch] archived %@: %@", row.id, reason) }
-                if case .superseded = outcome { continue }
-                moved += 1
+            for (row, item) in zip(owed, batch.items) {
+                switch item {
+                case .unembeddable(let reason):
+                    if try await disk.recordUnembeddable(MemoryEmbeddingCorpusRow(kind: .memory, id: row.id, content: row.content), epoch: batch.epoch, reason: reason) {
+                        nativeLog("[memory-epoch] unembeddable memory %@: %@", row.id, reason)
+                        moved += 1
+                    }
+                    try checkEmbeddingConvergence()
+                case .vector(let vector):
+                    try VectorMath.requireUsable(vector, dimensions: embedder.dimensions)
+                    let outcome = try await disk.landOwedVector(id: row.id, content: row.content, vector: vector, epoch: batch.epoch)
+                    try checkEmbeddingConvergence()
+                    if case .archived(let reason) = outcome { nativeLog("[memory-epoch] archived %@: %@", row.id, reason) }
+                    if case .superseded = outcome { continue }
+                    moved += 1
+                }
             }
             // Nothing moved: newer writes own these rows; their own request fills them.
             guard moved > 0 else { return }
@@ -153,17 +188,30 @@ extension SwiftNativeMemoryV2 {
         guard let embedder, let disk = storage else { throw MemoryV2Error.storageUnavailable }
         while true {
             try checkEmbeddingConvergence()
-            let owed = try await disk.tombstonesOwingVectors(limit: 32)
-            guard !owed.isEmpty else { return }
-            let batch = try await embedder.embedWithEpoch(owed.map(\.content))
+            let owed = try await disk.tombstonesOwingVectors(limit: 32, epoch: embedder.embeddingEpoch)
             try checkEmbeddingConvergence()
-            guard batch.vectors.count == owed.count, batch.vectors.allSatisfy({ !$0.isEmpty }) else {
-                throw MemoryV2Error.underlying("embedder did not return every owed tombstone vector")
+            guard !owed.isEmpty else { return }
+            let batch = try await embedder.embedItemsWithEpoch(owed.map(\.content))
+            try checkEmbeddingConvergence()
+            guard batch.items.count == owed.count else {
+                throw MemoryV2Error.underlying("embedder did not return every owed tombstone outcome")
             }
-            for (row, vector) in zip(owed, batch.vectors) {
-                _ = try await disk.landOwedTombstoneVector(hash: row.hash, content: row.content, vector: vector, epoch: batch.epoch)
-                try checkEmbeddingConvergence()
+            var moved = 0
+            for (row, item) in zip(owed, batch.items) {
+                switch item {
+                case .unembeddable(let reason):
+                    if try await disk.recordUnembeddable(MemoryEmbeddingCorpusRow(kind: .tombstone, id: row.hash, content: row.content), epoch: batch.epoch, reason: reason) {
+                        nativeLog("[memory-epoch] unembeddable tombstone %@: %@", row.hash, reason)
+                        moved += 1
+                    }
+                    try checkEmbeddingConvergence()
+                case .vector(let vector):
+                    try VectorMath.requireUsable(vector, dimensions: embedder.dimensions)
+                    if try await disk.landOwedTombstoneVector(hash: row.hash, content: row.content, vector: vector, epoch: batch.epoch) { moved += 1 }
+                    try checkEmbeddingConvergence()
+                }
             }
+            guard moved > 0 else { return }
         }
     }
 
@@ -177,10 +225,11 @@ extension SwiftNativeMemoryV2 {
             guard let providerEpoch = embeddingEpoch() else {
                 return false
             }
-            if state.activeEpoch != providerEpoch.rawValue,
+            if state.activeEpoch != providerEpoch.rawValue || state.dimensions != embedder?.dimensions
+                || state.activationFailure?.epoch == providerEpoch.rawValue,
                let report = try await reconcileMemoryEmbeddingEpoch() {
                 try checkEmbeddingConvergence()
-                nativeLog("[memory-epoch] activated %@ across %d canonical rows", report.epoch, report.total)
+                nativeLog("[memory-epoch] activated %@ across %d canonical rows; %d unembeddable", report.epoch, report.total, report.unembeddable)
             }
             try await fillOwedTombstoneVectors()
             try await fillOwedMemoryVectors()
@@ -189,7 +238,7 @@ extension SwiftNativeMemoryV2 {
         } catch is CancellationError {
             return false
         } catch {
-            nativeLog("[memory-epoch] activation failed; prior corpus retained: %@", String(describing: error))
+            nativeLog("[memory-epoch] convergence failed: %@", String(describing: error))
             return false
         }
     }

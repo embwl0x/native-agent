@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Senses
-// Blueprint: | `MacFourVerbs+ScreenFusion.swift` | `MacSightCaptureBinding` and `MacFourVerbs.sight`: call-local compiler percept, complete AX read and pixel fusion bound to window identity and frame generation; preserve redaction and natural target addresses |
+// Blueprint: | `MacFourVerbs+ScreenFusion.swift` | Call-local sight binding retains AX reference sessions across look/pixel dispatches; percept and pixel fusion bind to window/frame identity; partial derives from percept truncation; natural targets and named read gaps survive, and empty looks supply no act window |
 
 /// Call-local proof supplied by the canonical view capture, never
 /// by app-name matching. Pixels that cannot bind to this look are discarded.
@@ -13,6 +13,22 @@ final class MacSightCaptureBinding: @unchecked Sendable {
     private var validate: (@Sendable () async -> Bool)?
     private var read: (read: MacAXRead, seam: [String: JSONValue])?
     private var compiledPercept: MacLookPercept?
+    private var capturedForeground: MacForegroundSnapshot?
+    var foreground: MacForegroundSnapshot? {
+        get { lock.withLock { capturedForeground } }
+        set { lock.withLock { capturedForeground = newValue } }
+    }
+    private var axSessions: [ObjectIdentifier: SwiftNativeMacControl.AXSession] = [:]
+    func axSession(for owner: ObjectIdentifier) -> SwiftNativeMacControl.AXSession? {
+        lock.withLock { axSessions[owner] }
+    }
+    func retainAXSession(_ session: SwiftNativeMacControl.AXSession) -> SwiftNativeMacControl.AXSession {
+        lock.withLock {
+            if let held = axSessions[session.owner] { return held }
+            axSessions[session.owner] = session
+            return session
+        }
+    }
     init(frameID: String) { self.frameID = frameID }
     /// A complete uncapped walk and its seam; replacing it clears its percept.
     var walked: (read: MacAXRead, seam: [String: JSONValue])? {
@@ -37,8 +53,9 @@ final class MacSightCaptureBinding: @unchecked Sendable {
 extension MacFourVerbs {
     /// `seek`: a name the caller is about to act on. When the ordinary walk
     /// stops short of it, the look searches deeper and frames it (`seekScoped`).
+    /// `requiresWindow`: acts need targets; a plain look can observe their absence.
     func sight(part: String?, app: String? = nil, seek: String? = nil,
-               observed: MacSightCaptureBinding? = nil) async -> Sighted {
+               observed: MacSightCaptureBinding? = nil, requiresWindow: Bool = true) async -> Sighted {
         let captureBinding = observed ?? MacSightCaptureBinding(frameID: UUID().uuidString)
         let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
         let app = continuation?.app?.bundleIdentifier ?? continuation?.app?.name ?? app
@@ -60,6 +77,21 @@ extension MacFourVerbs {
             ))
         }
         let output = Self.object(result.output)
+        if result.ok, output["status"] == .string("ok"),
+           output["running"] == .bool(false) || Self.windowlessApp(output) {
+            var detail = Self.operationDetail(result).merging(output) { _, new in new }
+            if requiresWindow {
+                // A successful empty observation supplies no window targets.
+                // Keep that fact, but refuse a caller that needs one to act.
+                detail["status"] = .string("refused")
+                detail["error"] = .string(output["running"] == .bool(false) ? "app_not_running" : "no_window_in_app")
+            }
+            return .blind(MacFourVerbsReply(
+                ok: !requiresWindow,
+                text: Self.string(output["message"]) ?? "There is no readable window.",
+                detail: detail
+            ))
+        }
         if result.error == "self_inspection_unsupported" {
             let route = Self.ownAppRoute()
             return .blind(MacFourVerbsReply(ok: route.ok, text: route.text,
@@ -94,8 +126,11 @@ extension MacFourVerbs {
             ))
         }
 
-        // Unanchored looks describe the front app; anchored looks use the host's front verdict, with true for hosts that omit it.
-        let isFront = Self.bool(output["front"]) ?? true
+        guard let isFront = Self.bool(output["front"]) else {
+            return .blind(MacFourVerbsReply(ok: false,
+                text: "The screen read did not establish whether this window is in front. Read the app again before acting.",
+                detail: ["error": .string("foreground_evidence_unavailable")]))
+        }
         let (rows, controls) = Self.partition(percept)
         var targets: [ActTarget] = []
         var rowRoleOrdinals: [String: Int] = [:]
@@ -158,7 +193,7 @@ extension MacFourVerbs {
                 kind: landmark.kind,
                 ordinal: nil,
                 roleOrdinal: roleOrdinal,
-                enabled: true,
+                enabled: landmark.enabled,
                 frame: frame,
                 regionOnly: true,
                 sourceAXPath: landmark.path
@@ -286,7 +321,7 @@ extension MacFourVerbs {
                     secret: MacScreenViewBuilder.isSecretField(role: focus.role, subrole: nil, label: focus.label),
                     ordinal: nil,
                     roleOrdinal: Self.nextRoleOrdinal(for: kind, among: targets),
-                    enabled: true,
+                    enabled: focus.enabled,
                     frame: nil,
                     viewId: nil,
                     mark: nil,
@@ -313,7 +348,7 @@ extension MacFourVerbs {
             ? "partial: the app didn't answer every accessibility read; this is only the content read so far."
             : percept.truncationReasons.contains(where: { ["depth_cap", "node_cap", "time_budget"].contains($0) })
             ? "partial: budget reached; this is only the accessibility content read so far."
-            : nil
+            : "partial: some accessibility content was not read (\(percept.truncationReasons.joined(separator: ", ")))."
         let rendererNote = Self.string(Self.object(output["seam"])["renderer_wait_note"])
         // Native blocks own AX presentation; the pixel renderer adds only
         // independently recognized regions and canvas evidence.
@@ -386,14 +421,30 @@ extension MacFourVerbs {
                     nativePage = page
                     nativeZoomNote = "Read the observed visual surface; its existing name and region targets are unchanged."
                 } else {
-                    nativeZoomNote = "No native section is named \"\(part)\"; this is the whole page."
+                    return .blind(MacFourVerbsReply(ok: false,
+                        text: "No readable native section is named \"\(part)\". Read mac.look without a section to discover its current names.",
+                        detail: ["error": .string("section_not_found"), "section": .string(part)]))
                 }
             }
         }
         let pixelText = zoom.pixelText
         let fullPixelText = zoom.fullPixelText
         let pageText = (nativeZoomNote.map { $0 + "\n" } ?? "") + nativePage.text + pixelText
+        let actionGapNote: String? = {
+            let seam = Self.object(output["seam"])
+            guard let count = Self.int(seam["actions_unreadable_count"]), count > 0,
+                  let reason = Self.string(seam["actions_unreadable_first_error"]) else { return nil }
+            return "Action names unreadable for \(count) observed element(s): \(reason)"
+        }()
+        let attributeGapNote: String? = {
+            let seam = Self.object(output["seam"])
+            guard let count = Self.int(seam["attribute_gaps_count"]), count > 0,
+                  let reason = Self.string(seam["attribute_gaps_first_error"]) else { return nil }
+            return "Optional attributes unreadable (\(count) observed gap(s)): \(reason)"
+        }()
         let renderedText = (rendererNote.map { $0 + "\n" } ?? "")
+            + (actionGapNote.map { $0 + "\n" } ?? "")
+            + (attributeGapNote.map { $0 + "\n" } ?? "")
             + Self.runningAppsLine(output)
             + pageText
             + (cutLine.map { $0 + "\n" } ?? "") + (pointerLine.map { "\n" + $0 } ?? "")
@@ -439,21 +490,18 @@ extension MacFourVerbs {
             ]),
             detail: [
                 "frame_id": .string(frameId),
-                "partial": .bool(cutLine != nil),
+                "partial": .bool(percept.truncated),
                 "truncation_reasons": .array(percept.truncationReasons.map(JSONValue.string)),
+                "read_failures": .array(percept.readFailures.map(JSONValue.string)),
                 "bytes": .int(Int64(renderedText.utf8.count)),
                 "rows_dropped": .int(0),
                 "controls_dropped": .int(0),
                 "semantic_targets_omitted": .int(Int64(percept.affordancesOmitted)),
+                "renderer_activation": Self.object(output["seam"])["renderer_activation"] ?? .null,
+                "seam": output["seam"] ?? .null,
             ].merging(pageDetail) { _, new in new }
                 .merging(rendererNote.map { ["renderer_wait_note": JSONValue.string($0)] } ?? [:]) { current, _ in current }
                 .merging(supplementalDiagnostics) { current, _ in current },
-            frontmostApp: {
-                let front = Self.object(output["frontmost_app"])
-                guard let name = Self.string(front["name"]),
-                      let pid = Self.int(front["pid"]).flatMap(Int32.init(exactly:)), pid > 0 else { return nil }
-                return (name, pid, front["window"])
-            }(),
             windowKind: windowKind,
             focusPath: percept.focus?.path,
             editableHandles: {

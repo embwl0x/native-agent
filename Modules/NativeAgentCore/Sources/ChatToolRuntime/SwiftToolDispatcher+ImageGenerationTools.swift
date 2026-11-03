@@ -6,7 +6,7 @@ import ProviderRouting
 import Dispatcher
 import ImageIO
 import TrustCenter
-// Blueprint: | `SwiftToolDispatcher+ImageGenerationTools.swift` | `SwiftToolDispatcher`: image generation, display and references; checked routing failures propagate without a model-choice card; Codex settlement preserves captured output and produced images through Stop, then writes one terminal receipt; successful responses normalize to ok for Make registration while stopped receipts stay stopped |
+// Blueprint: | `SwiftToolDispatcher+ImageGenerationTools.swift` | `SwiftToolDispatcher`: route-owned image generation, strict format admission, display and references; both backends settle per-file committed rows and failures into one terminal receipt attempt; receipt-write failure retains rows in the response; completed responses normalize to ok for Make, stopped and partial results retain artifacts without claiming completion |
 
 // Admission is bound only around an explicitly requested image tool call.
 // Backend clients keep their default-deny policy for callers outside that turn.
@@ -16,19 +16,26 @@ enum ImageGenerationAdmission {
     static func allowed(dataRoot: URL) async throws -> Bool {
         if ImageGenerationAdmission.fullMacAdmitted { return true }
         let authority = SavedTrustPolicyAuthority.read(dataRoot: dataRoot)
-        if case .damaged = authority {
-            throw ToolFailureError("Saved Trust policy could not be read or validated. Preserve the damaged file and ask the owner to repair it.",
-                effects: .none, owner: SavedTrustPolicyAuthority.policyURL(dataRoot: dataRoot).path,
-                tap: "Trust > Access and policy > Preserve damaged policy and authorize Safe",
-                code: "trust_policy_unavailable", instruction: "Ask the owner to preserve the damaged policy and authorize Safe.")
-        }
-        return authority.flag(block: "multimodalPolicy", key: "image_generation_openai", default: false)
+        return try authority.flag(block: "multimodalPolicy", key: "image_generation_openai", default: false)
     }
 
     static func clippedPrompt(_ prompt: String) -> String {
         let scalars = prompt.unicodeScalars
         guard scalars.count > 16_000 else { return prompt }
         return String(String.UnicodeScalarView(scalars.prefix(16_000)))
+    }
+}
+
+/// Shared by dispatch and the Codex request normalizer. Only omission defaults.
+enum ImageGenerationOutputFormat {
+    static func decode(_ raw: String?) throws -> String {
+        guard let raw else { return "png" }
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "png": return "png"
+        case "jpg", "jpeg": return "jpeg"
+        case "webp": return "webp"
+        default: throw ImageGenerationToolError.unsupportedControl("output_format must be png, jpeg or webp.")
+        }
     }
 }
 
@@ -56,7 +63,7 @@ enum ImageGenerationToolError: Error, Equatable, Sendable, LocalizedError {
         case .missingPrompt:
             return "prompt is required"
         case .unsupportedProvider(let provider):
-            return "[image_generation_unsupported_provider] Use provider='codex', provider='codex_cli', or provider='openai_api', not '\(provider)'."
+            return "[image_generation_unsupported_provider] Work resolved to unsupported image backend '\(provider)'. Select an image-capable Work route in Providers."
         case .codexUnavailable:
             return "[image_generation_codex_unavailable] Codex image generation is unavailable. It requires the Codex command-line tool installed on this Mac and signed in with an account that can use Codex image generation. Install the Codex command-line tool if needed, then run `codex login` in Terminal. Signing in to ChatGPT chat in NativeAgent alone does not complete this setup."
         case .codexFailed(let exitCode, let message):
@@ -100,21 +107,24 @@ extension SwiftToolDispatcher {
     }
 
     private func impl_admitted_image_generate(input: [String: JSONValue], surface: String) async -> JSONValue {
-        let input = input.filter {
-            if case .string(let text) = $0.value { return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            return true
-        }
-        let prompt = input["prompt"]?.stringValue ?? input["description"]?.stringValue ?? ""
-        let requestedProvider = normalizedImageProvider((input["provider"] ?? input["backend"])?.stringValue)
-        let outputFormat = normalizedImageOutputFormat((input["output_format"] ?? input["format"])?.stringValue)
+        let prompt = input["prompt"]?.stringValue ?? ""
         var admittedRoute: (providerID: String, controllerModel: String,
             route: FirstPartyModelCatalog.FirstPartyImageRoute?, snapshot: ProviderRoutingSnapshot)?
         do {
+            for key in ["description", "provider", "backend", "model", "format", "count"] where input[key] != nil {
+                throw ImageGenerationToolError.unsupportedControl("\(key) is not an image.generate argument. Use the current action's fields; Work owns provider and model.")
+            }
+            if let value = input["output_format"] {
+                guard case .string = value else {
+                    throw ImageGenerationToolError.unsupportedControl("output_format must be a string when supplied.")
+                }
+            }
+            let outputFormat = try ImageGenerationOutputFormat.decode(input["output_format"]?.stringValue)
             for key in ["reasoning_effort", "reasoning", "image_reasoning_effort"]
             where input[key] != nil && input[key] != .null {
                 throw ImageGenerationToolError.unsupportedControl("\(key) is not an image quality control and is not exposed by image_generate.")
             }
-            // Check Trust first; supplied provider/model names must match the Work route, which must support images.
+            // Validate input before admission; Work alone owns provider/model.
             guard try await ImageGenerationAdmission.allowed(dataRoot: dataRoot) else {
                 throw ImageGenerationToolError.trustDenied
             }
@@ -125,25 +135,8 @@ extension SwiftToolDispatcher {
             }
             let provider = route.backend
             let controllerModel = resolved.controllerModel
-            if let requestedProvider, requestedProvider != provider,
-               !(provider == "codex" && requestedProvider == "codex_cli") {
-                throw ImageGenerationToolError.unsupportedControl(
-                    "image_generate cannot choose its own provider: it runs on the route picked for"
-                        + " Work (\(provider)). Remove provider/backend, or change the Work group in"
-                        + " Providers. Requested: \(requestedProvider)."
-                )
-            }
             let model = route.model
-            if let requestedModel = input["model"]?.stringValue?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-               !requestedModel.isEmpty,
-               requestedModel.caseInsensitiveCompare(model) != .orderedSame {
-                throw ImageGenerationToolError.unsupportedControl(
-                    "image_generate cannot choose its own image model: the \(provider) route names"
-                        + " \(model). Remove model. Requested: \(requestedModel)."
-                )
-            }
-            if provider != "codex" && provider != "codex_cli" {
+            if provider != "codex" {
                 for key in ["referenced_image_paths", "action", "previous_response_id", "num_last_images_to_include", "mask", "background", "input_fidelity", "output_compression"] where input[key] != nil && input[key] != .null {
                     // Strict schemas may supply empty optional reference arrays.
                     if key == "referenced_image_paths", input[key] == .array([]) { continue }
@@ -151,12 +144,12 @@ extension SwiftToolDispatcher {
                 }
             }
             switch provider {
-            case "codex", "codex_cli":
+            case "codex":
                 // Trust precedes file reads as well as OAuth/network access.
                 guard try await ImageGenerationAdmission.allowed(dataRoot: dataRoot) else {
                     throw ImageGenerationToolError.trustDenied
                 }
-                for key in ["prompt", "description", "provider", "backend", "model", "size", "quality", "output_format", "format", "action", "background"] {
+                for key in ["prompt", "size", "quality", "output_format", "action", "background"] {
                     if let value = input[key], value != .null, case .string = value { continue }
                     if let value = input[key], value != .null {
                         throw ImageGenerationToolError.unsupportedControl("\(key) must be a string.")
@@ -170,8 +163,8 @@ extension SwiftToolDispatcher {
                     prompt: prompt,
                     size: input["size"]?.stringValue,
                     quality: input["quality"]?.stringValue,
-                    outputFormat: (input["output_format"] ?? input["format"])?.stringValue ?? "png",
-                    count: Self.jsonInt(input["n"] ?? input["count"]) ?? 1,
+                    outputFormat: outputFormat,
+                    count: Self.jsonInt(input["n"]) ?? 1,
                     timeoutSeconds: Self.jsonInt(input["timeout_seconds"]) ?? SwiftCodexImageGenerationClient.defaultTimeoutSeconds,
                     action: input["action"]?.stringValue ?? "auto",
                     references: references,
@@ -197,15 +190,17 @@ extension SwiftToolDispatcher {
                     size: input["size"]?.stringValue,
                     quality: input["quality"]?.stringValue,
                     outputFormat: outputFormat,
-                    count: Self.jsonInt(input["n"] ?? input["count"]) ?? 1
+                    count: Self.jsonInt(input["n"]) ?? 1
                 )
                 let client = SwiftOpenAIImageGenerationClient(dataRoot: dataRoot)
                 let result = try await client.generate(request)
-                return showGeneratedImages(in: try await persistOpenAIImageGenerationResult(
-                    result,
-                    request: request,
-                    prompt: prompt
-                ))
+                let receipt = try await settle { [self] in
+                    do {
+                        return Result<JSONValue, Error>.success(try await persistOpenAIImageGenerationResult(
+                            result, request: request, prompt: prompt))
+                    } catch { return Result<JSONValue, Error>.failure(error) }
+                }.get()
+                return showGeneratedImages(in: receipt)
             default:
                 throw ImageGenerationToolError.unsupportedProvider(provider)
             }
@@ -259,7 +254,7 @@ extension SwiftToolDispatcher {
         }
         var references: [CodexImageReference] = []
         var bytes = 0
-        let fullMacReadAllowed = await fullMacToolAccess(surface: surface).fileOpsAllowed
+        let fullMacReadAllowed = try await fullMacToolAccess(surface: surface).fileOpsAllowed
         for path in paths {
             guard case .string(let rawPath) = path, !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw ImageGenerationToolError.unsupportedControl("Each referenced_image_paths entry must be a nonempty local path.")
@@ -304,10 +299,20 @@ extension SwiftToolDispatcher {
     private func finalizeImageGenerationReceipt(_ receipt: [String: JSONValue], message: String) async throws -> JSONValue {
         let id = try JSONRow(.object(receipt)).string("id")
         let path = dataRoot.appendingPathComponent("generated_images/receipts/\(id).json")
-        try await SwiftNativePersistenceCore.writeJSON(.object(receipt), to: path)
         var response = receipt
-        response["status"] = receipt["status"] == .string("completed") ? .string("ok") : receipt["status"] ?? .string("ok")
-        response["receiptPath"] = .string(path.path)
+        do {
+            try await SwiftNativePersistenceCore.writeJSON(.object(receipt), to: path)
+            response["receiptPath"] = .string(path.path)
+            response["receiptPersistence"] = .string("committed")
+        } catch {
+            response["status"] = .string("partial")
+            response["receiptPersistence"] = .string("failed")
+            response["receiptWriteFailure"] = .object([
+                "path": .string(path.path), "error": .string(error.localizedDescription)
+            ])
+            response["detail"] = .string("\(message) The terminal receipt write reported an error: \(error.localizedDescription). Inspect receiptWriteFailure.path for its current state. Committed image paths remain in images; do not repeat generation to repair the receipt.")
+        }
+        if response["status"] == .string("completed") { response["status"] = .string("ok") }
         response["message"] = .string(message)
         return .object(response)
     }
@@ -319,30 +324,47 @@ extension SwiftToolDispatcher {
     ) async throws -> JSONValue {
         let runId = UUID().uuidString.lowercased()
         let createdAt = ISO8601DateFormatter().string(from: Date())
-        let baseDir = try imageGenerationDirectory()
+        let baseDir = dataRoot.appendingPathComponent("generated_images", isDirectory: true)
 
         var imageRows: [JSONValue] = []
+        var failures = result.failures
         for image in result.images {
-            let filename = result.images.count == 1
-                ? "\(runId).\(request.outputFormat)"
-                : "\(runId)-\(image.index + 1).\(request.outputFormat)"
-            let path = baseDir.appendingPathComponent(filename, isDirectory: false)
-            try image.data.write(to: path, options: .atomic)
-            _ = chmod(path.path, 0o600)
-            var row: [String: JSONValue] = [
-                "index": .int(Int64(image.index)),
-                "path": .string(path.path),
-                "filename": .string(filename),
-                "byteSize": .int(Int64(image.data.count)),
-            ]
-            if let revised = image.revisedPrompt, !revised.isEmpty {
-                row["revisedPrompt"] = .string(String(ChatSecretRedactor.redactText(revised).prefix(1_000)))
+            var path: URL?
+            do {
+                _ = try imageGenerationDirectory()
+                guard let raster = CodexImageRaster.inspect(image.data) else { throw ImageGenerationToolError.invalidImageData }
+                let filename = result.images.count == 1
+                    ? "\(runId).\(raster.format)"
+                    : "\(runId)-\(image.index + 1).\(raster.format)"
+                let destination = baseDir.appendingPathComponent(filename, isDirectory: false)
+                path = destination
+                try image.data.write(to: destination, options: .withoutOverwriting)
+                _ = chmod(destination.path, 0o600)
+                var row: [String: JSONValue] = [
+                    "index": .int(Int64(image.index)),
+                    "path": .string(destination.path),
+                    "filename": .string(filename),
+                    "byteSize": .int(Int64(image.data.count)),
+                    "actualFormat": .string(raster.format),
+                    "actualWidth": .int(Int64(raster.width)),
+                    "actualHeight": .int(Int64(raster.height)),
+                    "actualHasAlpha": .bool(raster.hasAlpha),
+                    "requestedOutputFormat": .string(request.outputFormat),
+                    "formatFulfillment": .string(raster.format == request.outputFormat ? "fulfilled" : "not_fulfilled"),
+                ]
+                if let revised = image.revisedPrompt, !revised.isEmpty {
+                    row["revisedPrompt"] = .string(String(ChatSecretRedactor.redactText(revised).prefix(1_000)))
+                }
+                imageRows.append(.object(row))
+            } catch {
+                failures.append(.object(["index": .int(Int64(image.index)), "path": path.map { .string($0.path) } ?? .null,
+                                         "error": .string(error.localizedDescription)]))
             }
-            imageRows.append(.object(row))
         }
 
         var receipt: [String: JSONValue] = [
             "id": .string(runId),
+            "status": .string(failures.isEmpty ? "completed" : "partial"),
             "tool": .string("image_generate"),
             "provider": .string("openai_api"),
             "model": .string(result.model),
@@ -351,15 +373,16 @@ extension SwiftToolDispatcher {
             "size": request.size.map { .string($0) } ?? .null,
             "quality": request.quality.map { .string($0) } ?? .null,
             "outputFormat": .string(request.outputFormat),
-            "count": .int(Int64(result.images.count)),
+            "count": .int(Int64(imageRows.count)),
             "images": .array(imageRows),
+            "failures": .array(failures),
         ]
         if let usage = result.usage {
             receipt["usage"] = usage
         }
 
         return try await finalizeImageGenerationReceipt(receipt,
-            message: "Generated \(result.images.count) image\(result.images.count == 1 ? "" : "s") with \(result.model).")
+            message: "Saved \(imageRows.count) image(s) with \(result.model); \(failures.count) item(s) could not be decoded or committed. Inspect images and failures.")
     }
 
     func persistCodexImageGenerationResult(
@@ -369,31 +392,41 @@ extension SwiftToolDispatcher {
         provider: String = "codex"
     ) async throws -> JSONValue {
         let createdAt = ISO8601DateFormatter().string(from: Date())
-        let baseDir = try imageGenerationDirectory()
+        let baseDir = dataRoot.appendingPathComponent("generated_images", isDirectory: true)
 
         var imageRows: [JSONValue] = []
+        var failures = result.failures
         for (idx, source) in result.sourceImages.enumerated() {
-            guard result.evidence.indices.contains(idx), case .object(let measured) = result.evidence[idx],
-                  case .string(let ext)? = measured["actualFormat"] else { throw ImageGenerationToolError.invalidImageData }
-            let filename = result.runId + (result.sourceImages.count == 1 ? "" : "-\(idx + 1)") + ".\(ext)"
-            let destination = baseDir.appendingPathComponent(filename, isDirectory: false)
-            if FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.removeItem(at: destination)
+            let measured = result.evidence.indices.contains(idx) ? result.evidence[idx].objectValue : nil
+            let index = measured?["index"]
+            do {
+                _ = try imageGenerationDirectory()
+                guard let measured, case .int(let originalIndex)? = index,
+                      case .string(let ext)? = measured["actualFormat"] else { throw ImageGenerationToolError.invalidImageData }
+                let filename = result.runId + (result.sourceImages.count == 1 ? "" : "-\(originalIndex + 1)") + ".\(ext)"
+                let destination = baseDir.appendingPathComponent(filename, isDirectory: false)
+                let byteSize = try source.resourceValues(forKeys: [.fileSizeKey]).fileSize
+                guard let byteSize, byteSize > 0 else { throw ImageGenerationToolError.invalidImageData }
+                try FileManager.default.moveItem(at: source, to: destination)
+                _ = chmod(destination.path, 0o600)
+                var row = measured
+                row.merge([
+                    "index": .int(originalIndex),
+                    "path": .string(destination.path),
+                    "filename": .string(filename),
+                    "byteSize": .int(Int64(byteSize)),
+                ]) { _, committed in committed }
+                imageRows.append(.object(row))
+            } catch {
+                failures.append(.object(["index": index ?? .null, "sourcePath": .string(source.path),
+                                         "error": .string(error.localizedDescription)]))
             }
-            try FileManager.default.moveItem(at: source, to: destination)
-            _ = chmod(destination.path, 0o600)
-            let byteSize = (try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            imageRows.append(.object([
-                "index": .int(Int64(idx)),
-                "path": .string(destination.path),
-                "filename": .string(filename),
-                "byteSize": .int(Int64(byteSize)),
-            ]))
         }
 
         var receipt: [String: JSONValue] = [
             "id": .string(result.runId),
-            "status": .string(result.stopped ? "stopped" : "completed"),
+            "status": .string(failures.isEmpty ? (result.stopped ? "stopped" : "completed") : "partial"),
+            "generationStopped": .bool(result.stopped),
             "tool": .string("image_generate"),
             "provider": .string(provider),
             "model": .string(result.model),
@@ -406,11 +439,12 @@ extension SwiftToolDispatcher {
             "durationMs": .int(Int64(result.durationMs)),
             "exitCode": .int(Int64(result.exitCode)),
             "images": .array(imageRows),
+            "failures": .array(failures),
             "providerToolReceipts": .array(result.evidence),
             "requestedAction": .string(request.action),
             "referenceCount": .int(Int64(request.references.count)),
         ]
-        if provider == "codex" || provider == "codex_cli" {
+        if provider == "codex" {
             func uniformEvidence(_ key: String) -> String {
                 let values = result.evidence.map { value -> String in
                     guard case .object(let row) = value, case .string(let text)? = row[key], !text.isEmpty else { return "unknown" }
@@ -459,8 +493,10 @@ extension SwiftToolDispatcher {
         }
 
         let message: String
-        let providerName = provider == "codex_cli" ? "Codex CLI" : "Codex OAuth"
-        if result.stopped {
+        let providerName = "Codex OAuth"
+        if !failures.isEmpty {
+            message = "Saved \(imageRows.count) image(s) with \(failures.count) collection, worker or commit failure(s). Inspect images and failures; uncommitted sources remain in the run folder."
+        } else if result.stopped {
             message = "Stopped image generation. Saved \(imageRows.count) image(s) produced before Stop; the captured output remains in the run folder."
         } else if case .array(let warnings)? = receipt["controlWarnings"], !warnings.isEmpty {
             message = "Generated \(imageRows.count) image(s) through \(providerName), but some requested controls were not fulfilled. Inspect controlWarnings and providerToolReceipts."
@@ -503,9 +539,14 @@ extension SwiftToolDispatcher {
             // A one-image choice never rewrites the Work group's saved route.
             guard let providerID, let snapshot else { return nil }
             // The Providers catalog supplies choices; an empty list directs the person to Providers.
-            let options = InlineInteractionRegistry.imageCapableModelOptions(
-                providerIDs: imageCandidateProviderIDs(snapshot: snapshot)
-            )
+            let options: [InlineInteraction.Option]
+            do {
+                options = try InlineInteractionRegistry.imageCapableModelOptions(
+                    providerIDs: imageCandidateProviderIDs(snapshot: snapshot), dataRoot: dataRoot
+                )
+            } catch {
+                return imageGenerationErrorEnvelope(error)
+            }
             return InlineInteractionNeed.envelope(
                 InlineInteractionRegistry.modelChoice(
                     group: ProviderSurfaceGroups.work.id,
@@ -553,22 +594,6 @@ extension SwiftToolDispatcher {
         ])
     }
 
-    /// An omitted backend leaves selection to the Work route.
-    private func normalizedImageProvider(_ raw: String?) -> String? {
-        switch raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case nil, "":
-            return nil
-        case "codex", "codex_oauth", "codex-oauth", "chatgpt", "subscription":
-            return "codex"
-        case "codex_cli", "codex-cli", "cli":
-            return "codex_cli"
-        case "openai", "openai_api", "openai-api", "api", "platform":
-            return "openai_api"
-        case let other?:
-            return other
-        }
-    }
-
     /// Resolve Work at dispatch, retaining its provider id even when that route cannot make images.
     func workGroupImageRoute() async throws -> (
         providerID: String,
@@ -605,7 +630,6 @@ extension SwiftToolDispatcher {
 
     /// Accounts used by active routes or saved model picks; the catalog decides which can draw.
     func imageCandidateProviderIDs(snapshot: ProviderRoutingSnapshot) -> [String] {
-        let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
         var ids: [String] = []
         var seen: Set<String> = []
         func add(_ raw: String?) {
@@ -613,17 +637,7 @@ extension SwiftToolDispatcher {
             ids.append(raw)
         }
         for active in snapshot.activeProviders.values { add(active) }
-        for preference in snapshot.preferences.values {
-            add(router.inferProviderForModel(preference.model))
-        }
         return ids
     }
 
-    private func normalizedImageOutputFormat(_ raw: String?) -> String {
-        switch raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "jpeg", "jpg": return "jpeg"
-        case "webp": return "webp"
-        default: return "png"
-        }
-    }
 }

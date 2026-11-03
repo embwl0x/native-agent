@@ -240,9 +240,10 @@ extension NativeAgentEngine {
             // chat that is not on the allowlist — replayed as a trusted local
             // call. The envelope the raising turn wrote on the card's own row is
             // bound here instead, including its surface.
-            // Absent (a card older than the envelope) keeps the Mac default,
-            // which is the only honest reading of a local-only transcript.
-            let originSurface = origin?.surface ?? NativeAgentAppChatSurfaceProfile.mac.rawValue
+            guard let origin else {
+                return .failed("The blocked call has no recorded origin. Review this card on its originating surface before continuing.")
+            }
+            let originSurface = origin.surface
             let approvalFiler = NativeAgentChatApprovalFiler(dataRoot: dataRoot)
             let gated = makeGatedToolDispatchClient(
                 tools: NativeAgentEngine.live.toolDispatchClient(
@@ -266,14 +267,14 @@ extension NativeAgentEngine {
                     // from the same identities the first attempt was judged on.
                     try await ChatToolSessionContext.$envelope.withValue(origin) {
                     try await ChatToolSessionContext.$verifiedChatId
-                        .withValue(origin?.verifiedChatId) {
+                        .withValue(origin.verifiedChatId) {
                     try await ChatToolSessionContext.$verifiedUserId
-                        .withValue(origin?.verifiedUserId) {
+                        .withValue(origin.verifiedUserId) {
                     try await ChatToolSessionContext.$commandSignatureVerified
-                        .withValue(origin?.commandSignatureVerified) {
+                        .withValue(origin.commandSignatureVerified) {
                     try await ChatToolSessionContext.$verifiedSessionId.withValue(sessionID) {
                         try await ChatToolSessionContext.$replyRoute
-                            .withValue(origin?.deliveryRoute) {
+                            .withValue(origin.deliveryRoute) {
                                 try await gated.dispatch(
                                     tool: toolName, input: input, surface: originSurface
                                 )

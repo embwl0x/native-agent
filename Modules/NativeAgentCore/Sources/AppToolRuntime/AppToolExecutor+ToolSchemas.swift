@@ -42,7 +42,7 @@ extension AppToolExecutor {
                 toolClass: .read, capabilities: ["app_data_write", "safe_read", "tool_call"],
                 description: "NativeAgent itself, worked in process: your home, its pages, settings and buttons, and every tool you have. Nothing comes forward on the owner's screen unless an action says screen. {} is your home first, where you left off (open agent windows, work in progress, what waits and what arrived, each with a name like desk.4, mail or an agent's name), then a line per page and the action ids that work on every page. item alone opens a name or ref from home or one of its rooms; its text or fields go in args. page (+item) reads one: what it shows, its settings, its version, and its actions as id(args) label; the owner's ones say why and where they do them. action + args does one; the receipt says what changed and what else the app did. preview:true performs no proposed effects: native preflight reports checks, would_card and approver; authored preview runs live reads with writes previewed; resume preview only inspects stopped work; script previews describe only calls reached. expected_version refuses if the page changed since that read. find takes words (\"disconnect telegram\") and returns matching pages and actions, one line each as id(args) label; an action id named in the words (\"mail.search\") returns its args_schema and example. script runs a JavaScript function body that finishes a task in one call; app.* calls return synchronously and top-level await is not supported: app.<page>.<action>(args) for any action, as app.inbox.archive({ids, reason}), plus app.read(page, item) (a home item opens only outside a script), app.find(words) and app.log(text); return what you want back. Each call passes the turn's gates and gets its own ledger row. A call needing approval waits for the card: approved returns its real result. A call that fails or is declined throws AppError (reason, receipt), which code can catch and continue. A shell or bash command that ran has answered: exit_code, stdout, stderr and timed_out come back as data whatever the exit code; it throws only when the command didn't run. card.request waits and returns the person's answer. Full Mac writes need no approval card. Owner-only or blocked calls still stop at that line; earlier calls stay done. "
                     + "Permitted reads need no permission: do them.mac.go opens apps, files and folders; content readers only read. "
-                    + "One action uses app {action:\"files.read\",args:{path:\"README.md\"}}. Put its arguments inside args; page selects a reader, not an action id. find always discovers actions, including with page:\"home\"; use work.context {query} or chat.search {query} for saved work and history. Call these without a read first: " + AppActions.hot.map(\.hotLine).joined(separator: "; ") + ".",
+                    + "One action uses app {action:\"files.read\",args:{path:\"README.md\"}}. Put its arguments inside args; page selects a reader, not an action id. find always discovers actions, including with page:\"home\"; use work.context {query} or chat.search {query} for saved work and history. These action ids need no guide read: " + AppActions.hotActionIDs.joined(separator: "; ") + ".",
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("page", ToolSchema.strSchema("A page id from {}, such as inbox, chat or providers.")),
@@ -55,7 +55,8 @@ extension AppToolExecutor {
                         ("preview", ToolSchema.boolSchema("With action or script: report proposed effects without performing them; authored reads run live, resume only inspects. Native preflight reports checks, would_card and approver. Script previews describe only calls reached.")),
                         ("expected_version", ToolSchema.strSchema("With action: the version a read returned. Refused, with nothing done, if that page changed since. It hashes what the page shows, so a page changed and changed back has its old version again.")),
                         ("find", ToolSchema.strSchema("What you want done, in words. Discovers actions on every page, including home, one line each as id(args) label, with the best match's example. Name an action's id in the words for its args_schema and example. Search history explicitly with work.context or chat.search.")),
-                        ("script", ToolSchema.strSchema("JavaScript function body: app.* calls return synchronously; top-level await is not supported. No direct network or file APIs; use eligible app actions. Up to 512 KB, 50 actions, 100 reads and 60 seconds of script time; time waiting on app calls does not count.")),
+                        // OwnedProgram.seconds / ProgramProgressWindow own this renewable stall window.
+                        ("script", ToolSchema.strSchema("JavaScript function body: app.* calls return synchronously; top-level await is not supported. No direct network or file APIs; use eligible app actions. Up to 512 KB, 50 actions and 100 reads. A 60-second no-progress window renews after each non-state host reply; time waiting on host calls does not count.")),
                     ],
                     required: []
                 )
@@ -100,7 +101,7 @@ extension AppToolExecutor {
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("dry_run", ToolSchema.boolSchema("If true, record a dry-run receipt without reading the page. Defaults false.")),
-                    ],
+                    ] + ToolSchema.senseViewProperties,
                     required: []
                 )
             ),
@@ -111,7 +112,7 @@ extension AppToolExecutor {
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("dry_run", ToolSchema.boolSchema("If true, record a dry-run receipt without reading links. Defaults false.")),
-                    ],
+                    ] + ToolSchema.senseViewProperties,
                     required: []
                 )
             ),
@@ -164,7 +165,7 @@ extension AppToolExecutor {
             LLMToolSchema(
                 name: "browser.chrome_navigate",
                 toolClass: .read, capabilities: ["network_read", "tool_call"],
-                description: "Open/read a URL in this conversation's last tab if it is still in the NativeAgent group; otherwise open a new tab there. The owner's tabs are never used. Chrome's completed tab and landed URL verify arrival, including internal pages and PDFs. Returns main content as numbered rows, or the displayed picture with a no-DOM note for PDFs/pages without DOM access; HTTP PDFs keep the independent unverified text transcript beside the verified picture. Internal pages return one title/URL/no-reader line with read_mode none. Unsupported schemes such as javascript: and data: refuse before any tab changes. url back/forward moves through this tab's history. fields + submit fills/sends a form in this call.",
+                description: "Open/read a URL in this conversation's last tab if it is still in the NativeAgent group; otherwise open a new tab there. The owner's tabs are never used. Chrome's completed tab and landed URL verify arrival, including internal pages and PDFs. Returns main content as numbered rows, or the displayed picture with a no-DOM note for PDFs/pages without DOM access; PDF text remains unavailable from this picture reader. Internal pages return one title/URL/no-reader line with read_mode none. Unsupported schemes such as javascript: and data: refuse before any tab changes. url back/forward moves through this tab's history. fields + submit fills/sends a form in this call.",
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
@@ -180,7 +181,7 @@ extension AppToolExecutor {
             LLMToolSchema(
                 name: "browser.chrome_snapshot",
                 toolClass: .read,
-                description: "Read Chrome's ready rendered document in reading order, including inline links; a read says when the tab is still loading. Internal pages return one title/URL/no-reader line with read_mode none. Other pages and PDFs without DOM access return the displayed picture with read_mode picture and an explicit reason. HTTP PDFs retain an independent text transcript in the same receipt: unverified against Chrome's displayed document, without Chrome cookies/authentication. DOM reads carry url, title, snapshot_id, version, captured_at, bytes and has_more; act with node_id (row number as a string or label). Read folded sections with the supplied more address; scrolling remains an action. scope page adds site nav.",
+                description: "Read Chrome's ready rendered document in reading order, including inline links; a read says when the tab is still loading. Internal pages return one title/URL/no-reader line with read_mode none. Other pages and PDFs without DOM access return the displayed picture with read_mode picture and an explicit reason; PDF text remains unavailable from this picture reader. DOM reads carry url, title, snapshot_id, version, captured_at, bytes and has_more; act with node_id (row number as a string or label). Read folded sections with the supplied more address; scrolling remains an action. scope page adds site nav.",
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
@@ -189,7 +190,7 @@ extension AppToolExecutor {
                         ("max_text_chars", ToolSchema.intSchema("Maximum readable text characters, 1 through 40000. Defaults 12000.")),
                         ("scope", ToolSchema.enumStringSchema(["page", "main_content"], "Rendered page or main_content: declared main regions, else article bodies, else the document body, excluding navigation. Reports when no main/article region was declared; scope page includes navigation.")),
                         ("more", ToolSchema.strSchema("Structural cursor from the page's More address (the more string in next); reads the current snapshot of the same URL without scrolling.")),
-                    ],
+                    ] + ToolSchema.senseViewProperties,
                     required: []
                 )
             ),
@@ -237,7 +238,7 @@ extension AppToolExecutor {
             LLMToolSchema(
                 name: "browser.chrome_fill",
                 toolClass: .write, capabilities: ["browser_interaction", "tool_call"],
-                description: "Fill the current Chrome form: fields {label or row: value} sets text boxes/selects/checkboxes in page order, then submit clicks a button (true presses Enter). Finds all fields before typing. For one row use node_id + value. Returns filled fields and fresh page; never retries ambiguous dispatch.",
+                description: "Fill the current Chrome form: fields {label or row: value} sets text boxes/selects/checkboxes in page order, then submit clicks a button (true presses Enter). Finds all fields before typing. For one row use node_id + value. Returns filled fields and, on success, a fresh page. A stale or failed attempt stops without retry; read the tab again before continuing and do not repeat fields already sent.",
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
@@ -254,7 +255,7 @@ extension AppToolExecutor {
             LLMToolSchema(
                 name: "browser.chrome_type",
                 toolClass: .write, capabilities: ["browser_interaction", "tool_call"],
-                description: "Append text to an editable row (number or label), up to 20 s; returns typed progress and the fresh page. On partial progress send only the rest, never the whole text again.",
+                description: "Append text to a sequential text-editing row (number or label) through Chrome's trusted input, up to 20 s. Returns acknowledged input progress, the actual field readback and the fresh page. Assess changed-by-page text before continuing; never automatically replay uncertain input. Atomic date/time/color/range/file controls use fill.",
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),

@@ -191,7 +191,8 @@ struct TelegramView: View {
     }
 
     private var telegramModelOptions: [ModelCatalogItem] {
-        ProvidersFacade.modelOptions(from: appModel.engine.providers.catalog, current: appModel.telegramModel, limit: 40)
+        ProvidersFacade.modelOptions(providers: appModel.engine.providers.connections,
+            providerID: appModel.engine.providers.selection(for: "telegram").provider, current: appModel.telegramModel, limit: 40)
     }
 
     private var tokenConfigured: Bool { appModel.engine.telegram.status?.tokenConfigured == true }
@@ -334,7 +335,7 @@ struct TelegramView: View {
                                     Task { @MainActor in
                                         requestingVoicePermission = true
                                         defer { requestingVoicePermission = false }
-                                        NSApp.activate(ignoringOtherApps: true)
+                                        NSApp.activate()
                                         let permission = await SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined()
                                         switch permission {
                                         case .granted:
@@ -480,7 +481,10 @@ struct TelegramView: View {
                     )
                     TelegramField(title: "How hard it thinks") {
                         Picker("Think level", selection: Bindable(appModel).telegramReasoningEffort) {
-                            ForEach(ProvidersFacade.reasoningOptions(from: appModel.engine.providers.catalog, model: appModel.telegramModel)) { effort in
+                            ForEach(ProvidersFacade.reasoningOptions(from: appModel.engine.providers.catalog,
+                                providers: appModel.engine.providers.connections,
+                                providerID: appModel.engine.providers.selection(for: "telegram").provider,
+                                model: appModel.telegramModel)) { effort in
                                 Text(effort.label).tag(effort.id)
                             }
                         }
@@ -491,6 +495,8 @@ struct TelegramView: View {
                         .onChange(of: appModel.telegramModel) { _, model in
                             appModel.telegramReasoningEffort = ProvidersFacade.normalizedReasoningEffort(
                                 from: appModel.engine.providers.catalog,
+                                providers: appModel.engine.providers.connections,
+                                providerID: appModel.engine.providers.selection(for: "telegram").provider,
                                 model: model,
                                 selected: appModel.telegramReasoningEffort
                             )
@@ -498,6 +504,8 @@ struct TelegramView: View {
                     }
                     if let mismatch = telegramReasoningEffortMismatch(
                         from: appModel.engine.providers.catalog,
+                        providers: appModel.engine.providers.connections,
+                        providerID: appModel.engine.providers.selection(for: "telegram").provider,
                         model: appModel.telegramModel,
                         selected: appModel.telegramReasoningEffort
                     ) {

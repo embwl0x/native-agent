@@ -5,24 +5,44 @@ import WidgetKit
 @available(macOS 27, *)
 private struct StatusEntry: TimelineEntry {
     let date: Date
-    let snapshot: NativeAgentWidgetSnapshot?
+    enum Content: Sendable {
+        case placeholder
+        case snapshot(NativeAgentWidgetSnapshot)
+        case unavailable(String)
+    }
+    let content: Content
+    var snapshot: NativeAgentWidgetSnapshot? {
+        if case .snapshot(let snapshot) = content { return snapshot }
+        return nil
+    }
+    var status: String {
+        switch content {
+        case .placeholder: "Her status"
+        case .snapshot(let snapshot): snapshot.status(at: date)
+        case .unavailable(let cause): "Status unavailable: \(cause). Open NativeAgent to repair or republish its widget snapshot."
+        }
+    }
+    static func read(at date: Date = .now) -> Self {
+        do { return Self(date: date, content: .snapshot(try NativeAgentWidgetSnapshot.read())) }
+        catch { return Self(date: date, content: .unavailable(error.localizedDescription)) }
+    }
 }
 
 @available(macOS 27, *)
 private struct StatusProvider: TimelineProvider {
     func placeholder(in context: Context) -> StatusEntry {
-        StatusEntry(date: .now, snapshot: nil)
+        StatusEntry(date: .now, content: .placeholder)
     }
 
     func getSnapshot(in context: Context, completion: @escaping (StatusEntry) -> Void) {
-        completion(StatusEntry(date: .now, snapshot: try? NativeAgentWidgetSnapshot.read()))
+        completion(StatusEntry.read())
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<StatusEntry>) -> Void) {
-        let entry = StatusEntry(date: .now, snapshot: try? NativeAgentWidgetSnapshot.read())
+        let entry = StatusEntry.read()
         var entries = [entry]
         if let expiry = entry.snapshot?.activityExpiresAt, expiry > entry.date {
-            entries.append(StatusEntry(date: expiry, snapshot: entry.snapshot))
+            entries.append(StatusEntry(date: expiry, content: entry.content))
         }
         completion(Timeline(entries: entries, policy: .never))
     }
@@ -39,9 +59,9 @@ private struct StatusView: View {
                 .foregroundStyle(NativeAgentBrand.accentDeep)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
-            Text(entry.snapshot?.status(at: entry.date) ?? "Status unavailable. Open NativeAgent.")
+            Text(entry.status)
                 .font(NativeAgentFont.body)
-                .lineLimit(3)
+                .lineLimit(nil)
             if let count = entry.snapshot?.waitingCount {
                 Text("\(count) waiting on you")
                     .font(NativeAgentFont.label)

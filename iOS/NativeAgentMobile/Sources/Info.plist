@@ -30,15 +30,23 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Take a photo to share with your agent when you accept a camera request.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>Let your agent know when you arrive at or leave places you enable, even while NativeAgent is closed.</string>
+	<string>Share enabled place transitions and wake brief phone-presence readings when you move, even while NativeAgent is closed. Coordinates for these senses stay on this phone.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Share your current location with your agent when you accept a phone request.</string>
+	<string>Save a place on this phone or share your current location when you accept a phone request.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>Share motion estimates (stationary, walking, running, cycling or driving) and confidence with your paired Mac and its selected AI provider when you enable Motion.</string>
+	<key>NSFocusStatusUsageDescription</key>
+	<string>Share whether Focus is on with your paired Mac when you enable Focus.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Listen to push-to-talk so you can dictate messages to your agent.</string>
+	<string>Use the microphone for hands-free talk while a talk session is active, voice notes, and dictation to your agent.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>NativeAgentMobile lets you attach photos from your library so your agent can see them in chat.</string>
+	<string>Attach photos you choose to chat, or enable Photos today to share only a count of visible photos dated today with your paired Mac and its selected AI provider. Limited Access is enough for counting.</string>
+	<key>NSAppleMusicUsageDescription</key>
+	<string>When you enable Apple Music, share the Music app's playback state and available song title and artist with your paired Mac and its selected AI provider. No audio is shared.</string>
+	<key>PHPhotoLibraryPreventAutomaticLimitedAccessAlert</key>
+	<true/>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Convert your voice to text so your agent can read what you said.</string>
+	<string>Recognize your words on this device during hands-free talk. Also transcribe voice notes and dictation for your agent.</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<key>NSUserActivityTypes</key>
@@ -62,6 +70,7 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>
+		<string>audio</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>

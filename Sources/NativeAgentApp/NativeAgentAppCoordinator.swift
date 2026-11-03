@@ -5,12 +5,14 @@ import MemoryV2
 import Observation
 import PersistenceCore
 
-// Blueprint: | `NativeAgentAppCoordinator.swift` | `ApplicationLifetime`: process bootstrap and queued scene navigation; delivery receipts prove scene acceptance, not finished rendering or work |
+// Blueprint: | `NativeAgentAppCoordinator.swift` | `ApplicationLifetime`: process bootstrap and queued scene navigation including exact saved identities and chat shortcut panels; delivery receipts prove scene acceptance, not finished rendering or work |
 
 enum NativeAgentNavigationDestination: Equatable, Sendable {
     case sidebar(SidebarItem)
     case activity(ActivitySection)
     case skillsTools(SkillsToolsSection)
+    case chatShortcut(ChatSlashPage)
+    case savedThing(PaletteSavedDestination)
 
     static func route(_ rawRoute: String?) -> Self? {
         guard var route = rawRoute?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -33,13 +35,11 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
             return .sidebar(.chat)
         case "activity":
             return .sidebar(.activity)
-        case "memories", "memory":
+        case "memories":
             return .sidebar(.memories)
         case "skills":
             return .skillsTools(.skills)
-        case "workshop", "missions", "desk", "command":
-            // Retired Workshop/Command Center names remain compatibility
-            // aliases; every route lands on the agent's canonical Desk.
+        case "desk":
             return .sidebar(.desk)
         case "personality":
             return .sidebar(.personality)
@@ -65,8 +65,6 @@ enum NativeAgentNavigationDestination: Equatable, Sendable {
             return .sidebar(.telegram)
         case "inboxpolicy":
             return .sidebar(.inboxPolicy)
-        case "panels":
-            return .sidebar(.diagnostics)
         case "tools":
             return .skillsTools(.tools)
         case "inspector", "turn_inspector", "readout":
@@ -125,7 +123,7 @@ final class ApplicationLifetime {
     func configureMainWindowOpening(_ open: @escaping @MainActor () -> Void) {
         openMainWindow = open
         if !pendingDestinations.isEmpty {
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp.activate()
             open()
         }
     }
@@ -163,7 +161,7 @@ final class ApplicationLifetime {
     @discardableResult
     func request(_ destination: NativeAgentNavigationDestination) -> NativeAgentNavigationRequestReceipt {
         pendingDestinations.append(destination)
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         openMainWindow()
         return drainPendingDestinations()
             ? .deliveredToMountedScene
@@ -179,6 +177,9 @@ final class ApplicationLifetime {
     /// ambush the person the next time a window happened to open.
     func deliverQuietly(_ destination: NativeAgentNavigationDestination) -> Bool {
         guard let deliver = mountedScene?.deliver else { return false }
+        // Explicit page.show selects an Advanced page. Ordinary chat entry
+        // uses request and keeps the person's saved view.
+        UserDefaults.standard.set(SimpleViewMode.advanced, forKey: SimpleViewMode.key)
         deliver(destination)
         return true
     }

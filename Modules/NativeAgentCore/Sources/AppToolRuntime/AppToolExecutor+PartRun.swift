@@ -6,6 +6,7 @@ import ChatToolParsing
 import Desk
 import Dispatcher
 import Foundation
+import Experiences
 import NativeAgentShared
 import Privacy
 import NativeAgentCore
@@ -16,47 +17,13 @@ import ToolRegistry
 import TrustCenter
 import Transcripts
 import TurnTrace
-// Blueprint: | `AppToolExecutor+PartRun.swift` | `AppToolExecutor`: a part's own run (`doorPart`: Desk holds, the gated `authored.<id>` with its in-flight turn's arrival check (a message or that turn's Stop), `afterPartRun`: MY QUEUE upgrade line, runner-owned effect reconciliation and action-owned version recovery, with fresh-run calls only for no effects, a strict stop kept to resume), `doorPartPreview` retains nested value-call version pins, `doorPartResume` (optional bare/action ability id checked before claiming its checkpoint; receipts name the bare id), `partAlias` (the older skill.*/tool.* doors and older spellings of a part's action, until the release after the one that ships one-part), `doorWouldCard`; stopped checkpoints delegate to Desk’s `PartRunStore` |
+// Blueprint: | `AppToolExecutor+PartRun.swift` | `AppToolExecutor`: a part's own run (`doorPart`: Desk holds, the gated `authored.<id>` with its in-flight turn's arrival check (a message or that turn's Stop), `afterPartRun`: MY QUEUE upgrade line, runner-owned effect reconciliation and action-owned version recovery, with fresh-run calls only for no effects, a strict stop kept to resume), `doorPartPreview` retains nested value-call version pins, `doorPartResume` (optional bare/action ability id checked before claiming its checkpoint; receipts name the bare id); holds and bookkeeping failures retain the result and owe their owner repair, `doorWouldCard`; stopped checkpoints delegate to Desk’s `PartRunStore` |
 
 /// A part's run through its own action (`authored.<id>`): every call keeps
 /// the turn's gates. Its preview runs its code with every write previewed;
 /// a strict run that stops to ask is kept to resume; the run's own words
 /// about the part (an upgrade it owes) reach MY QUEUE.
 extension AppToolExecutor {
-    /// The older doors, skill.* and tool.*, and a part's own action by an older
-    /// spelling of its id or its name, as the one form's call: each answers
-    /// through it and its receipt names the new call. The one place they
-    /// resolve, for a turn's call and a part's code alike (`AppScriptRunner.Host`).
-    /// Delete in the release after the one that ships one-part.
-    static func partAlias(_ id: String, _ args: [String: JSONValue], root: URL, aliases: [String: String]? = nil) -> (id: String, args: [String: JSONValue])? {
-        let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        func partID(_ named: String) -> String? {
-            if let aliases { return aliases[named.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] }
-            return (try? Parts(root: root).row(named)).flatMap { $0?["id"] }?.scalarText
-        }
-        if let named = ToolNameAliases.authoredTool(id),
-           let part = partID(named), part.lowercased() != named.lowercased() {
-            return ("authored." + part, args)
-        }
-        let doors = ["skill.save": "ability.save", "tool.propose": "ability.save", "skill.read": "ability.read", "skill.list": "ability.list",
-            "skill.validate": "ability.validate", "tool.validate": "ability.validate", "skill.enable": "ability.enable", "tool.approve": "ability.enable",
-            "skill.restore": "ability.restore", "tool.restore": "ability.restore", "skill.disable": "ability.disable", "skill.quarantine": "ability.disable",
-            "tool.quarantine": "ability.disable", "skill.rollback": "ability.rollback", "tool.rollback": "ability.rollback", "skill.drop": "ability.drop",
-            "skill.delete": "ability.drop", "tool.drop": "ability.drop", "tool.reject": "ability.drop", "skill.resume": "ability.resume", "skill.run": "authored"]
-        guard let door = doors[key] else { return nil }
-        var out = door == "ability.save" ? Parts.saveArguments(args) : args
-        for key in ["tool_id", "name"] where out["id"] == nil { if let named = out.removeValue(forKey: key) { out["id"] = named } }
-        switch key {
-        case "skill.read": for field in ["source", "content"] { out.removeValue(forKey: field) }
-        case "tool.reject": out["pending"] = .bool(true)
-        case "skill.run":
-            let part = partID(doorText(out["id"])) ?? doorText(out["id"])
-            return ("authored." + part, partFields(args["input"] ?? args["args"]))
-        default: break
-        }
-        return (door, out)
-    }
-
     /// Why a run that used the outside world (any primitive call) is never resumed.
     static let unresumable = "This run used a host primitive (network, screen, hands, model, fetch or another part) before it stopped, so it can't be resumed; run the ability again and give it your answer as an input."
 
@@ -90,7 +57,7 @@ extension AppToolExecutor {
         if let session {
             let store = SwiftNativeDeskStore(dataRoot: root)
             for ref in Self.deskRefs(.object(given)) {
-                guard let by = (try? await store.hold(ref, session: session)) ?? nil else { continue }
+                guard let by = try await store.hold(ref, session: session) else { continue }
                 return Self.doorRefusal("held_by", "\(ref) is held by \(by), which is working it. Nothing ran.",
                     remedy: "none", "Leave it to that one, or pick it up there.", extra: ["held_by": .string(by)])
             }
@@ -122,7 +89,7 @@ extension AppToolExecutor {
                 })
             }
             // Its own gate too: a part whose reach needs the owner's card says so.
-            if await doorWouldCard(action, call: args, input: input, surface: surface) { out["would_card"] = .bool(true) }
+            if try await doorWouldCard(action, call: args, input: input, surface: surface) { out["would_card"] = .bool(true) }
             return .object(out)
         } catch { return ChatToolOutcome.failure(error: error, tool: action.tool) }
     }
@@ -136,14 +103,25 @@ extension AppToolExecutor {
         // A part that carried itself names the input its last run ran on.
         let input = if case .object(let last)? = out["ran_on"] { last } else { given }
         let calls: [JSONValue]? = if case .array(let calls)? = out.removeValue(forKey: "journal") { calls } else { nil }
-        let row = (try? Parts(root: root).row(id)) ?? nil
+        let row: [String: JSONValue]?
+        do { row = try Parts(root: root).row(id) }
+        catch {
+            if let calls { out["unsettled_journal"] = .array(calls) }
+            return .object(partSettlementFailure(out, error: error, operation: "ability.metadata", id: id, root: root))
+        }
         let name = row.flatMap { Parts.fields(.object($0))["name"] }?.scalarText ?? id
         let voices = row.map(Parts.voices) ?? []
         out["name"] = .string(name)
-        if case .string(let upgrade)? = out.removeValue(forKey: "upgrade") {
+        if case .string(let upgrade)? = out["upgrade"] {
             let parts = upgrade.split(separator: "@", maxSplits: 1).map(String.init)
-            _ = try? await MyQueue.add(DeskStep(words: "\(name) stopped on \(parts[0])\(parts.count > 1 && !parts[1].isEmpty ? " at \(parts[1])" : "") "
-                + "in 2 of its last 3 runs; upgrade it?", when: "quiet", peers: voices, origin: "self"), store: SwiftNativeDeskStore(dataRoot: root))
+            do {
+                guard let target = parts.first, !target.isEmpty else {
+                    throw ToolFailureError("The run's upgrade evidence has no target. Inspect its result before creating the upgrade intention.", effects: .none, code: "upgrade_target_unavailable")
+                }
+                _ = try await MyQueue.add(DeskStep(words: "\(name) stopped on \(target)\(parts.count > 1 && !parts[1].isEmpty ? " at \(parts[1])" : "") "
+                    + "in 2 of its last 3 runs; upgrade it?", when: "quiet", peers: voices, origin: "self"), store: SwiftNativeDeskStore(dataRoot: root))
+                out.removeValue(forKey: "upgrade")
+            } catch { out = partSettlementFailure(out, error: error, operation: "ability.upgrade_queue", id: id, root: root) }
         }
         let reason = doorText(out["reason"])
         // The runner carries the action owner's remedy, including sense-version reads.
@@ -171,20 +149,21 @@ extension AppToolExecutor {
                                                  peerID: ChatToolSessionContext.envelope?.verifiedUserId),
         ]
         sealed["wake"] = OwnedProgramRunner.wake
-        let kept = await PartRunStore.save(sealed, id: runID, root: root)
-        guard kept else {
-            out["resume_note"] = .string("The stopped run could not be saved; the store did not report a cause. Resume is unavailable. Inspect the affected state before starting a new run; completed effects must not be repeated.")
-            out["resume_failure"] = .object(["status": .string("failed"), "reason": .string("run_save_failed"),
-                "effects": .string("unknown"), "remedy": Repair.reconcile(
-                    instruction: "Read the ability and compare its journal with the affected state before choosing a new run.",
-                    nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("ability.read"), "args": .object(["id": .string(id)])])]))])
-            return .object(out)
+        do { try await PartRunStore.save(sealed, id: runID, root: root) }
+        catch {
+            out["saved_run_id"] = .string(runID)
+            out["resume_failure"] = ChatToolOutcome.failure(error: error, tool: "ability.run_checkpoint")
+            return .object(partSettlementFailure(out, error: error, operation: "ability.run_checkpoint", id: runID, root: root))
         }
         // The Desk items it touched stay its own until it is resumed or dropped:
         // another conversation that works one is told "held by run <id>".
         var held: [String] = []
         if let owner = session?.scalarText ?? ChatToolSessionContext.verifiedSessionId {
-            held = (try? await SwiftNativeDeskStore(dataRoot: root).hold(deskRefs(calls), run: runID, session: owner)) ?? []
+            do { held = try await SwiftNativeDeskStore(dataRoot: root).hold(try deskRefs(calls), run: runID, session: owner) }
+            catch {
+                out["saved_run_id"] = .string(runID)
+                return .object(partSettlementFailure(out, error: error, operation: "ability.run_holds", id: runID, root: root))
+            }
         }
         out["resume"] = .object(["run_id": .string(runID), "question": .string(question), "held": .array(held.map(JSONValue.string))])
         let took = out["changed"] == nil ? "" : "The calls in changed took effect; don't run them again. "
@@ -202,6 +181,20 @@ extension AppToolExecutor {
         return .object(out)
     }
 
+    /// Bookkeeping follows a completed run; retain its result and owe the
+    /// failed owner repair without claiming that the effect should run again.
+    static func partSettlementFailure(_ result: [String: JSONValue], error: Error, operation: String, id: String, root: URL) -> [String: JSONValue] {
+        var out = result
+        let failure = ChatToolOutcome.failure(error: error, tool: operation)
+        var failures = out["settlement_failures"]?.arrayValue ?? []
+        failures.append(failure)
+        out["settlement_failures"] = .array(failures)
+        out["settlement_note"] = .string("The run's result is retained, but \(operation) failed: \(error.localizedDescription). Repair this owner and reconcile the saved run and Desk holds before continuing; do not repeat completed effects.")
+        RepairOwed.owe(root, id: operation + ":" + id, kind: .run, operation: operation,
+            owner: root.appendingPathComponent("abilities").path, words: out["settlement_note"]?.scalarText ?? error.localizedDescription)
+        return out
+    }
+
     /// `ability.resume` claims once, rechecks sealed admission, active version and input, and inherits steer and wake.
     /// Live replay rereads prior reads and continues only while they match.
     /// Preview only inspects: it claims no run, transfers no holds and closes no queued step.
@@ -214,6 +207,7 @@ extension AppToolExecutor {
         }
         // An optional ability reference binds the requested run without claiming
         // it on a typo or a different ability. run_id remains the exact checkpoint.
+        var requestedAbility: String?
         if let named = args["id"]?.scalarText {
             do {
                 let parts = Parts(root: root)
@@ -221,20 +215,50 @@ extension AppToolExecutor {
                     let refusal = try parts.unknown(named)
                     return .object(refusal.fields.merging(["status": .string("refused")]) { $1 })
                 }
-                if let waiting = await PartRunStore.read(runID, root: root),
-                   Self.doorText(waiting["skill"]) != id {
+                requestedAbility = id
+                let waiting = try await PartRunStore.read(runID, root: root)
+                if Self.doorText(waiting["skill"]) != id {
                     return Self.doorRefusal("wrong_ability", "\(runID) is not a stopped run of \(id). Nothing was claimed or run.",
                         remedy: "select_run", "Read the saved run ids and choose this ability's run_id.",
                         next: ["page": .string("tools")], extra: ["id": .string(id), "run_id": .string(runID)])
                 }
             } catch { return ChatToolOutcome.failure(error: error, tool: "ability.resume") }
         }
-        guard let run = await (preview ? PartRunStore.read(runID, root: root) : PartRunStore.take(runID, root: root)) else {
-            return Self.doorRefusal("not_found",
-                "No readable, valid stopped run was available for \(runID). The store did not distinguish absent, unreadable or invalid evidence. The ability did not run.",
-                remedy: "inspect", "Read the saved run ids and the affected state before choosing a new run; do not repeat completed effects.",
-                next: ["page": .string("tools")], extra: ["run_id": .string(runID), "execution": .string("not_run"),
-                    "effects": .string(preview ? "none" : "unknown")])
+        let run: [String: JSONValue]
+        let claim: PartRunStore.Claim?
+        do {
+            if preview { claim = nil; run = try await PartRunStore.read(runID, root: root) }
+            else {
+                let taken = try await PartRunStore.take(runID, root: root)
+                claim = taken; run = taken.run
+            }
+        } catch { return ChatToolOutcome.failure(error: error, tool: "ability.resume") }
+        func checkpoint(_ result: JSONValue, consume: Bool) -> JSONValue {
+            guard let claim else { return result }
+            if consume, Self.partFields(result)["settlement_failures"] != nil {
+                var out = Self.partFields(result)
+                out["unsettled_checkpoint"] = .string(claim.path)
+                return .object(out)
+            }
+            do {
+                if consume { try claim.consume() } else { try claim.release() }
+                return result
+            } catch {
+                return .object(Self.partSettlementFailure(Self.partFields(result), error: error,
+                    operation: consume ? "ability.consume_checkpoint" : "ability.release_checkpoint", id: runID, root: root))
+            }
+        }
+        if let requestedAbility, Self.doorText(run["skill"]) != requestedAbility {
+            return checkpoint(Self.doorRefusal("wrong_ability", "\(runID) is not a stopped run of \(requestedAbility). Nothing ran.",
+                remedy: "select_run", "Read the saved run ids and choose this ability's run_id.",
+                next: ["page": .string("tools")], extra: ["id": .string(requestedAbility), "run_id": .string(runID)]), consume: false)
+        }
+        let steer: (sources: [String], elevated: [String])
+        do { steer = try PeerDataTaint.steer(in: run["steer"]) }
+        catch {
+            let failure = Self.partFields(ChatToolOutcome.failure(error: error, tool: "ability.resume", effects: ToolFailureError.Effects.none))
+            if preview { return .object(failure) }
+            return checkpoint(.object(Self.partSettlementFailure(failure, error: error, operation: "ability.resume_provenance", id: runID, root: root)), consume: false)
         }
         let name = Self.doorText(run["name"]), id = Self.doorText(run["skill"])
         if run["status"] == .string("stopped"), run["reason"] == .string(DataRootLife.stoppedReason) {
@@ -244,28 +268,66 @@ extension AppToolExecutor {
                 "run_id": .string(runID), "id": .string(id), "ability": .string(id), "input": .object(input)]) }
             do {
                 let result = try await Parts(root: root).run(id: id, input: .object(input))
-                return await Self.afterPartRun(result, id: id, input: input, session: session, surface: surface, root: root)
-            } catch { return ChatToolOutcome.failure(error: error, tool: id) }
+                let out = await Self.afterPartRun(result, id: id, input: input, session: session, surface: surface, root: root)
+                return checkpoint(out, consume: !OwnedProgramRunner.turnedAway(result))
+            } catch { return checkpoint(ChatToolOutcome.failure(error: error, tool: id), consume: false) }
         }
         // Claimed in this life: its holds pass to the resuming conversation.
         let store = SwiftNativeDeskStore(dataRoot: root)
         let owner = preview ? nil : session?.scalarText ?? ChatToolSessionContext.verifiedSessionId
         var passed: [String: DeskHold] = [:]
-        if let owner { passed = (try? await store.passHolds(run: runID, to: owner)) ?? [:] }
-        // Its queued step closes once the run is taken up or closed; a resume turned away
-        // busy leaves it open, so the run, its step and its holds wait on together.
-        func closeStep() async {
-            guard !preview, let state = try? await store.liveState() else { return }
-            for entry in MyQueue.entries(state) where entry.step.words.hasPrefix(MyQueue.skillRunPrefix(skill: name, run: runID)) {
-                try? await MyQueue.finish(entry, dropped: false, why: "resumed", store: store)
+        if let owner {
+            do {
+                passed = try await store.passHolds(run: runID, to: owner)
+                guard case .array(let heldJournal)? = run["journal"] else {
+                    throw ToolFailureError("The stopped run has no readable journal for Desk ownership. Inspect its checkpoint before resuming.", effects: .none, code: "run_journal_unavailable")
+                }
+                // Re-establish the journal's entire hold set through the
+                // current owner, including a stopped run whose original
+                // hold settlement failed. A missing saved hold is no grant.
+                if let by = try await store.hold(try Self.deskRefs(heldJournal), session: owner) {
+                    try await store.returnHolds(passed, from: owner)
+                    return checkpoint(Self.doorRefusal("held_by", "Run \(runID) did not resume: its Desk work is held by \(by).",
+                        remedy: "inspect", "Leave it to that conversation and inspect the saved run before continuing; completed effects must not be repeated.",
+                        extra: ["run_id": .string(runID), "held_by": .string(by)]), consume: false)
+                }
+            }
+            catch {
+                var failure = Self.partFields(ChatToolOutcome.failure(error: error, tool: "ability.resume", effects: ToolFailureError.Effects.none))
+                do { try await store.returnHolds(passed, from: owner) }
+                catch { failure = Self.partSettlementFailure(failure, error: error, operation: "ability.return_holds", id: runID, root: root) }
+                failure["run_id"] = .string(runID)
+                return checkpoint(.object(Self.partSettlementFailure(failure, error: error, operation: "ability.resume_holds", id: runID, root: root)), consume: false)
             }
         }
-        func closed(_ reason: String, _ why: String) -> JSONValue {
-            Self.doorRefusal(reason, why + (preview ? " Resuming run \(runID) would close it; nothing was claimed or run."
-                : " Run \(runID) is closed; nothing ran."), remedy: "none", "Read the ability and affected state before choosing what remains; do not repeat completed effects.",
-                extra: ["id": .string(id)])
+        // Its queued step closes once the run is taken up or closed; a resume turned away
+        // busy leaves it open, so the run, its step and its holds wait on together.
+        var closeFailure: Error?
+        func closeStep() async {
+            guard !preview else { return }
+            do {
+                let state = try await store.liveState()
+                for entry in MyQueue.entries(state) where entry.step.words.hasPrefix(MyQueue.skillRunPrefix(skill: name, run: runID)) {
+                    try await MyQueue.finish(entry, dropped: false, why: "resumed", store: store)
+                }
+            } catch { closeFailure = error }
         }
-        let row = (try? Parts(root: root).row(id)) ?? nil
+        func settled(_ result: JSONValue) -> JSONValue {
+            guard let closeFailure else { return result }
+            return .object(Self.partSettlementFailure(Self.partFields(result), error: closeFailure,
+                operation: "ability.resume_queue", id: runID, root: root))
+        }
+        func closed(_ reason: String, _ why: String) -> JSONValue {
+            checkpoint(settled(Self.doorRefusal(reason, why + (preview ? " Resuming run \(runID) would close it; nothing was claimed or run."
+                : " Run \(runID) is closed; nothing ran."), remedy: "none", "Read the ability and affected state before choosing what remains; do not repeat completed effects.",
+                extra: ["id": .string(id)])), consume: true)
+        }
+        let row: [String: JSONValue]?
+        do { row = try Parts(root: root).row(id) }
+        catch {
+            let failure = Self.partFields(ChatToolOutcome.failure(error: error, tool: "ability.resume", effects: ToolFailureError.Effects.none))
+            return checkpoint(.object(Self.partSettlementFailure(failure, error: error, operation: "ability.resume_metadata", id: runID, root: root)), consume: false)
+        }
         guard let row, row["status"] == .string("active"), row["codeFingerprint"] == run["digest"],
               run["hostRevision"] == .string(OwnedProgramStore.hostRevision), case .array(let journal)? = run["journal"] else {
             await closeStep()
@@ -289,7 +351,7 @@ extension AppToolExecutor {
             ])
         }
         // Who steered it steers the rest, as trusted as the owner holds it now; whom the person answered for stays answered.
-        let steer = PeerDataTaint.steer(in: run["steer"]), taint = PeerDataTaint.current ?? PeerDataTaint()
+        let taint = PeerDataTaint.current ?? PeerDataTaint()
         steer.sources.forEach { taint.mark(peer: $0) }
         steer.elevated.forEach { taint.elevate(peer: $0) }
         do {
@@ -299,25 +361,30 @@ extension AppToolExecutor {
                         replay: OwnedProgramRunner.Replay(journal: journal, answer: args["answer"] ?? .null))
                 }
                 // Turned away, its slot busy: nothing of it ran, so it waits as it was, to resume once that call ends.
-                if OwnedProgramRunner.turnedAway(result), await PartRunStore.save(run, id: runID, root: root) {
-                    if let owner { try? await store.returnHolds(passed, from: owner) }
+                if OwnedProgramRunner.turnedAway(result) {
                     var out = Self.partFields(await Self.afterPartRun(result, id: id, input: input, session: session, surface: surface, root: root))
+                    if let owner {
+                        do { try await store.returnHolds(passed, from: owner) }
+                        catch { return checkpoint(.object(Self.partSettlementFailure(out, error: error, operation: "ability.return_holds", id: runID, root: root)), consume: false) }
+                    }
                     out["resume"] = .object(["run_id": .string(runID), "question": run["question"] ?? .null,
-                                             "held": .array(Self.deskRefs(journal).map(JSONValue.string))])
+                                             "held": .array(try Self.deskRefs(journal).map(JSONValue.string))])
                     out["resume_note"] = .string("Run \(runID) still waits; nothing of it ran. Resume it again once that call finishes.")
-                    return .object(out)
+                    return checkpoint(.object(out), consume: false)
                 }
                 await closeStep()
-                return await Self.afterPartRun(result, id: id, input: input, session: session, surface: surface, root: root)
+                return checkpoint(settled(await Self.afterPartRun(result, id: id, input: input, session: session, surface: surface, root: root)), consume: true)
             }
-        } catch { await closeStep(); return closed("integrity", error.localizedDescription) }
+        } catch {
+            return checkpoint(ChatToolOutcome.failure(error: error, tool: "ability.resume"), consume: false)
+        }
     }
 
     /// Whether the real call would file a card for User, read now and changing
     /// nothing: SecurityCenter's own reading of it, explicit card requests,
     /// and the peer floor on a turn a peer steered.
     @MainActor
-    func doorWouldCard(_ action: AppAction, call: [String: JSONValue], input: [String: JSONValue], surface: String) async -> Bool {
+    func doorWouldCard(_ action: AppAction, call: [String: JSONValue], input: [String: JSONValue], surface: String) async throws -> Bool {
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         // A folded action re-enters under its tool's own name; the rest are the app call's.
         let tool = action.isFold ? action.tool : "app"
@@ -331,7 +398,7 @@ extension AppToolExecutor {
            InlineInteractionNeed.interaction(in: await SwiftToolDispatcher.requestedInteraction(input: call, dataRoot: root)) != nil {
             return true
         }
-        let protectedAction = PeerTurnEffectPolicy.requiresPeerApproval(tool, input: args)
+        let protectedAction = try PeerTurnEffectPolicy.requiresPeerApproval(tool, input: args)
         return PeerDataTaintDispatcher.peerApproval(surface: surface, protectedAction: protectedAction).required
     }
 }
@@ -351,13 +418,18 @@ extension AppToolExecutor {
         }
     }
 
-    static func deskRefs(_ journal: [JSONValue]) -> [String] {
-        journal.flatMap { entry -> [String] in
+    static func deskRefs(_ journal: [JSONValue]) throws -> [String] {
+        try journal.flatMap { entry -> [String] in
             guard case .object(let fields) = entry, case .array(let call)? = fields["call"], call.count > 2,
-                  call[0] == .string("action"), case .string(let id) = call[1], case .string(let raw) = call[2],
-                  let action = AppActions.action(id), action.page == "desk", !action.read,
-                  case .array(let given)? = try? JSONValue.parse(Data(raw.utf8)),
-                  case .success(let input) = AppScriptRunner.doorInput(id: id, given: given) else { return [] }
+                  call[0] == .string("action"), case .string(let id) = call[1], case .string(let raw) = call[2] else { return [] }
+            guard let action = try AppActions.action(id) else {
+                throw ToolFailureError("Stopped-run action \(id) is not in the checked catalog. Read its journal before reconciling Desk holds.", effects: .none, code: "run_action_unavailable")
+            }
+            guard action.page == "desk", !action.read else { return [] }
+            guard case .array(let given) = try JSONValue.parse(Data(raw.utf8)) else {
+                throw ToolFailureError("Stopped-run Desk arguments are not an array. Repair its journal before reconciling holds.", effects: .none, code: "run_arguments_unavailable")
+            }
+            let input = try AppScriptRunner.doorInput(id: id, given: given).get()
             let args = partFields(input["args"])
             return [args["handle"], args["id"]].compactMap { $0?.scalarText }
         }

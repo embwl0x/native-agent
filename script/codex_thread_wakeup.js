@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 "use strict";
+const http = require("http");
 // The agent and the user are addressed by their configured names; nothing in
 // this file names a specific person.
 const AGENT_NAME = process.env.NATIVE_AGENT_AGENT_NAME || "the agent";
@@ -9,16 +10,14 @@ const {
   jsonOut, nowISO, redactDiagnosticText, processStartIdentity,
   dataRootLife,
   lifeOf,
-  createProcessStartIdentityReader, safeFilePart: sharedSafeFilePart,
-  postWakeCompletion, unicodePrefix, dirLockOwnerAlive, fsyncDirectorySync, writeSyncedAndClose,
+  safeFilePart: sharedSafeFilePart,
+  postWakeCompletion, unicodePrefix, wakeLockHeld, fsyncDirectorySync, writeSyncedAndClose,
   copyWakeProducerIdentity, copyWakeCompletionOrigin, readWakeJSON,
   appendSyncedWakeLine, createWakeEventWaiter, readWakeJSONLines, sleep, readWakeBridgeToken, createWakeLivePoster,
 } = require("./wake_worker_common.js");
 
 const {
   extractTurnResultFromRollout,
-  extractTurnResultFromTurn,
-  extractTurnResultFromThread,
 } = require("./codex_turn_result.js");
 
 const {
@@ -52,7 +51,7 @@ const CONFIG_PATH = process.env.NATIVE_AGENT_CODEX_WAKEUP_CONFIG ||
 const SOCKET_PATH = process.env.CODEX_APP_SERVER_SOCKET ||
   path.join(CODEX_HOME, "app-server-control", "app-server-control.sock");
 const {
-  daemonVersionsMismatch, socketOwnerPid, captureAppServerIdentity,
+  daemonVersionsMismatch, daemonVersionsAligned, socketOwnerPid, captureAppServerIdentity,
   parseLsofWorkingDirectory, daemonWorkingDirectoryMismatch, daemonWorkingDirectoryState,
 } = require("./codex_wake_daemon_probe.js").createCodexWakeDaemonProbe({
   socketPath: SOCKET_PATH, processStartIdentity,
@@ -123,7 +122,34 @@ function fail(reason, extra = {}) {
 }
 
 function loadJSON(file) {
-  return readWakeJSON(file, {});
+  const value = readWakeJSON(file, {});
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Wake JSON at ${file} must be an object. Repair this file before retrying.`);
+  }
+  return value;
+}
+
+// Validate the complete saved policy before any queue/launch admission. Omitted
+// current keys retain genesis defaults; invalid present keys never choose them.
+function loadWakePolicy() {
+  const config = loadJSON(CONFIG_PATH);
+  for (const key of ["mode", "freshThread", "pendingPath", "drainTimeoutMs", "drainerHeartbeatStaleMs"]) {
+    if (config[key] !== undefined) throw new Error(`Retired wake setting ${key}; repair ${CONFIG_PATH} using deliveryMode and the canonical NATIVE_AGENT_CODEX_PENDING_PATH before retrying.`);
+  }
+  normalizeWakeupMode(config.deliveryMode);
+  const positive = ["requestTimeoutMs", "activeStaleMs", "replyWaitTimeoutMs", "stallProbeRpcTimeoutMs", "hangWatchdogMs", "stallIdleMs", "stallWedgedIdleMs", "stallWedgedWindows", "stallProbeConfirmDelayMs", "staleWakeAgeMs", "staleWakeProbeConfirmDelayMs", "drainFailureRetryBaseMs", "drainerHeartbeatMs", "bridgeReplyTimeoutMs", "bridgeDeliveryMaxAttempts", "bridgeDeliveryRetryBaseMs", "bridgeDeliveryRetryCapMs"];
+  for (const key of positive) {
+    if (config[key] !== undefined && (typeof config[key] !== "number" || !Number.isFinite(config[key]) || config[key] <= 0)) throw new Error(`Invalid positive numeric wake setting ${key} in ${CONFIG_PATH}.`);
+  }
+  for (const key of ["deliverReplies", "disableDrain", "hangAutoRecover"]) {
+    if (config[key] !== undefined && typeof config[key] !== "boolean") throw new Error(`Invalid boolean wake setting ${key} in ${CONFIG_PATH}.`);
+  }
+  for (const key of ["cwd", "threadId", "model", "reasoningEffort", "serviceTier", "modelProvider", "threadSource", "serviceName", "bridgeHost", "bridgeDescriptorPath", "bridgeTokenPath", "drainerHeartbeatPath", "hangWatchdogReceiptsPath", "staleWakeRecoveriesPath", "rolloutPath"]) {
+    if (config[key] !== undefined && (typeof config[key] !== "string" || !config[key].trim())) throw new Error(`Invalid string wake setting ${key} in ${CONFIG_PATH}.`);
+  }
+  if (config.wakeConcurrency !== undefined && (!Number.isInteger(config.wakeConcurrency) || config.wakeConcurrency < 1 || config.wakeConcurrency > DEFAULT_WAKE_CONCURRENCY)) throw new Error(`wakeConcurrency must be an integer from 1 through ${DEFAULT_WAKE_CONCURRENCY}.`);
+  if (config.bridgePort !== undefined && (!Number.isInteger(config.bridgePort) || config.bridgePort < 1 || config.bridgePort > 65535)) throw new Error("bridgePort must be an integer from 1 through 65535.");
+  return Object.freeze(config);
 }
 
 function readBridgeDescriptor(file = BRIDGE_DESCRIPTOR_PATH) {
@@ -194,48 +220,49 @@ function wakeConcurrencyCap(config = {}) {
   );
 }
 
-const currentProcessStartIdentity = createProcessStartIdentityReader();
 
 function boolSetting(config, key, envName, fallback) {
   const env = process.env[envName];
-  if (env != null) return ["1", "true", "yes", "on"].includes(env.toLowerCase());
-  if (typeof config[key] === "boolean") return config[key];
-  return fallback;
+  if (env != null) {
+    if (["1", "true", "yes", "on"].includes(env.toLowerCase())) return true;
+    if (["0", "false", "no", "off"].includes(env.toLowerCase())) return false;
+    throw new Error(`Invalid boolean setting ${envName}; use true or false.`);
+  }
+  if (config[key] === undefined) return fallback;
+  if (typeof config[key] !== "boolean") throw new Error(`Invalid boolean wake setting ${key}.`);
+  return config[key];
 }
 
 function numberSetting(config, key, envName, fallback) {
   const env = process.env[envName];
   const raw = env != null ? env : config[key];
+  if (raw === undefined) return fallback;
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+  if ((typeof raw !== "number" && !(typeof raw === "string" && raw.trim())) || !Number.isFinite(n) || n <= 0) throw new Error(`Invalid positive wake setting ${key} (${envName}).`);
+  return n;
 }
 
 function nonnegativeIntegerSetting(config, key, envName, fallback) {
   const env = process.env[envName];
   const raw = env != null ? env : config[key];
+  if (raw === undefined) return fallback;
   const n = Number(raw);
-  return Number.isInteger(n) && n >= 0 ? n : fallback;
+  if ((typeof raw !== "number" && !(typeof raw === "string" && raw.trim())) || !Number.isInteger(n) || n < 0) throw new Error(`Invalid nonnegative integer wake setting ${key} (${envName}).`);
+  return n;
 }
 
 function stringSetting(config, key, envName, fallback) {
   const env = process.env[envName];
-  if (env != null && env !== "") return env;
-  if (typeof config[key] === "string" && config[key] !== "") return config[key];
-  return fallback;
+  const raw = env !== undefined ? env : config[key];
+  if (raw === undefined) return fallback;
+  if (typeof raw !== "string" || !raw.trim()) throw new Error(`Invalid string wake setting ${key} (${envName}).`);
+  return raw;
 }
 
 function normalizeWakeupMode(value) {
-  const raw = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/-/g, "_");
-  if (["fresh", "fresh_thread", "new", "new_thread", "new_session", "fresh_session"].includes(raw)) {
-    return FRESH_THREAD_MODE;
-  }
-  if (["pinned", "pinned_thread", "configured", "configured_thread", "thread", "legacy"].includes(raw)) {
-    return PINNED_THREAD_MODE;
-  }
-  return null;
+  if (value === undefined) return null;
+  if (value === FRESH_THREAD_MODE || value === PINNED_THREAD_MODE) return value;
+  throw new Error("Invalid wake deliveryMode; use fresh_thread or pinned_thread.");
 }
 
 function wakeupMode(config, payload = {}) {
@@ -247,30 +274,21 @@ function wakeupMode(config, payload = {}) {
   if (process.env.NATIVE_AGENT_CODEX_THREAD_ID) {
     return PINNED_THREAD_MODE;
   }
-  const envMode = process.env.NATIVE_AGENT_CODEX_WAKEUP_MODE || process.env.NATIVE_AGENT_CODEX_DELIVERY_MODE;
-  const configured = normalizeWakeupMode(envMode || config.deliveryMode || config.mode);
+  const envMode = process.env.NATIVE_AGENT_CODEX_WAKEUP_MODE ?? process.env.NATIVE_AGENT_CODEX_DELIVERY_MODE;
+  const configured = normalizeWakeupMode(envMode ?? config.deliveryMode);
   if (configured) return configured;
-  if (typeof config.freshThread === "boolean") {
-    return config.freshThread ? FRESH_THREAD_MODE : PINNED_THREAD_MODE;
-  }
   return FRESH_THREAD_MODE;
 }
 
 function codexCandidates() {
   // The app names the program to run (under Full Mac, the approved file);
   // a named one is never swapped for another install.
-  if (process.env.CODEX_BIN) return [process.env.CODEX_BIN];
-  const home = os.homedir();
-  return [
-    path.join(CODEX_HOME, "packages", "standalone", "current", "codex"),
-    "/opt/homebrew/bin/codex",
-    path.join(home, "Desktop", "Codex.app", "Contents", "Resources", "codex"),
-  ].filter(Boolean);
+  return [process.env.CODEX_BIN || path.join(CODEX_HOME, "packages", "standalone", "current", "codex")];
 }
 
 function startDaemon() {
   for (const candidate of codexCandidates()) {
-    if (!fs.existsSync(candidate)) continue;
+    fs.accessSync(candidate, fs.constants.X_OK);
     const result = spawnSync(candidate, ["app-server", "daemon", "start"], {
       encoding: "utf8",
       timeout: 8000,
@@ -278,26 +296,19 @@ function startDaemon() {
       stdio: ["ignore", "pipe", "pipe"],
     });
     if (result.status === 0 && fs.existsSync(SOCKET_PATH)) return;
+    throw new Error(`Codex app-server start failed for ${candidate}: ${result.error?.message || result.stderr || result.status}. Repair this installation or explicitly set CODEX_BIN.`);
   }
-}
-
-function ensureDaemon() {
-  if (!fs.existsSync(SOCKET_PATH)) {
-    startDaemon();
-    return;
-  }
-  ensureDaemonVersionAligned();
 }
 
 // Check the running app-server version against the installed CLI after upgrades.
 // This socket serves only bridge wakeups, not interactive Codex sessions.
-const daemonHealState = { checked: false, record: null };
+const daemonHealState = { record: null };
 
-function daemonControlStart(candidate) {
+function daemonControlStart(candidate, timeoutMs = 4000) {
   // Leave room for the 12s RPC budget within the app's 20s helper deadline.
   const result = spawnSync(candidate, ["app-server", "daemon", "start"], {
     encoding: "utf8",
-    timeout: 4000,
+    timeout: Math.max(1, Math.min(4000, timeoutMs)),
     // spawnSync waits for exit after timeout; SIGTERM can leave it blocked.
     killSignal: "SIGKILL",
     stdio: ["ignore", "pipe", "pipe"],
@@ -401,59 +412,88 @@ async function restartIdleDaemon(candidate) {
   });
 }
 
-/// Foreground: detect drift cheaply and hand the actual restart to a
-/// DETACHED background healer. The current wakeup proceeds against the old
-/// daemon (one more empty, outcome-unknown turn at worst); the next invocation
-/// lands on the healed daemon. The domain owner must not replay that turn just
-/// because no final assistant text was returned.
-function ensureDaemonVersionAligned() {
-  if (daemonHealState.checked) return daemonHealState.record;
-  daemonHealState.checked = true;
+/// Restart stays detached, through the existing idle/capacity-checked owner.
+/// The foreground waits only within its budget; no turn reaches a stale server.
+async function ensureDaemonVersionAligned(deadline = Date.now() + 8000) {
   // Foreground worst case is bounded: at most TWO control-start attempts
   // (4s timeout each), so a directory of broken installs cannot stack hung
   // spawns ahead of the 12s RPC budget under the app's 20s helper deadline.
   let attempts = 0;
   for (const candidate of codexCandidates()) {
     if (!candidate || !fs.existsSync(candidate)) continue;
-    if (attempts >= 2) return null;
+    if (attempts >= 2 || Date.now() >= deadline) break;
     attempts += 1;
-    const info = daemonControlStart(candidate);
+    const info = daemonControlStart(candidate, deadline - Date.now());
     // Unparseable control output from one install must not disable healing —
     // try the next candidate.
     if (!info) continue;
-    if (!daemonVersionsMismatch(info)) return null;
+    if (daemonVersionsAligned(info)) return null;
+    if (!daemonVersionsMismatch(info)) continue;
     const record = {
       action: "heal_scheduled",
       staleAppServerVersion: info.appServerVersion,
       cliVersion: info.cliVersion,
       at: nowISO(),
     };
-    // Only a live owner means a heal is in flight. Dead-owner locks pass to
-    // the healer's withDirLock recovery rather than blocking its spawn.
+    // Watch before spawning, so a quick restart cannot lose its completion edge.
+    const waiter = createWakeEventWaiter();
+    ensureBridgeDir();
+    try {
+      const watcher = fs.watch(BRIDGE_DIR, (_event, file) => {
+        if (String(file) === path.basename(HEAL_LOG_PATH)) waiter.signal({ source: "daemon_heal" });
+      });
+      waiter.cleanup.push(() => watcher.close());
+      watcher.on("error", () => watcher.close());
+    } catch { /* The bounded wait still ends with an authoritative version read. */ }
+    // Only the held kernel lock means a heal is in flight. A retained sidecar
+    // by itself says nothing about an owner.
     if (fs.existsSync(HEAL_LOCK_DIR)) {
-      if (dirLockOwnerAlive(HEAL_LOCK_DIR)) {
+      if (wakeLockHeld(HEAL_LOCK_DIR)) {
         record.action = "heal_already_in_flight";
-        daemonHealState.record = record;
-        return record;
       }
-      record.orphanedHealLock = true;
     }
     try {
-      const child = spawn(process.execPath, [__filename, "--heal-daemon"], {
-        detached: true,
-        stdio: "ignore",
-        env: { ...process.env, NATIVE_AGENT_CODEX_WAKEUP_CONFIG: CONFIG_PATH },
-      });
-      child.unref();
-      record.healerPid = child.pid || null;
+      if (record.action !== "heal_already_in_flight") {
+        const child = spawn(process.execPath, [__filename, "--heal-daemon"], {
+          detached: true,
+          stdio: "ignore",
+          env: { ...process.env, NATIVE_AGENT_CODEX_WAKEUP_CONFIG: CONFIG_PATH },
+        });
+        child.unref();
+        record.healerPid = child.pid || null;
+        child.on("error", (error) => {
+          record.action = "heal_spawn_failed";
+          record.error = String(error.message || error);
+          waiter.signal({ source: "heal_spawn_failed" });
+        });
+      }
     } catch (error) {
       record.action = "heal_spawn_failed";
       record.error = String((error && error.message) || error);
+      waiter.signal({ source: "heal_spawn_failed" });
     }
     daemonHealState.record = record;
-    return record;
+    // Reserve time for the second (and final) control-start reading. A deadline
+    // ends this wait only; it never cancels the detached restart.
+    const remaining = Math.max(0, deadline - Date.now());
+    waiter.startTimeout({ source: "foreground_budget" }, Math.max(0, remaining - Math.min(1000, remaining / 2)));
+    await waiter.promise;
+    waiter.close();
+    if (attempts < 2 && Date.now() < deadline) {
+      attempts += 1;
+      const after = daemonControlStart(candidate, deadline - Date.now());
+      record.restart = after;
+      record.healed = daemonVersionsAligned(after);
+      if (record.healed) return record;
+    }
+    record.healed = false;
+    const error = new Error("Codex is restarting; try again. The server version is not yet aligned.");
+    error.detail = { reason: "codex_restarting", daemonHeal: record };
+    throw error;
   }
-  return null;
+  const error = new Error("Codex's server version could not be verified; try again after Codex restarts.");
+  error.detail = { reason: "codex_version_unavailable" };
+  throw error;
 }
 
 /// Background healer (--heal-daemon): serialized by a cross-process lock;
@@ -462,16 +502,17 @@ function ensureDaemonVersionAligned() {
 /// started by someone else must not lose its pathname).
 async function healDaemonVersionDrift() {
   try {
-    return await withDirLock(HEAL_LOCK_DIR, async () => {
+    return await withWakeLock(HEAL_LOCK_DIR, async () => {
       for (const candidate of codexCandidates()) {
         if (!candidate || !fs.existsSync(candidate)) continue;
         const info = daemonControlStart(candidate);
         if (!info) continue;
-        if (!daemonVersionsMismatch(info)) {
+        if (daemonVersionsAligned(info)) {
           const record = { action: "heal_noop_already_aligned", at: nowISO(), versions: info };
           appendHealLog(record);
           return record;
         }
+        if (!daemonVersionsMismatch(info)) continue;
         const record = {
           action: "heal",
           staleAppServerVersion: info.appServerVersion,
@@ -487,7 +528,7 @@ async function healDaemonVersionDrift() {
         }
         const restarted = restart.restarted;
         record.restart = restarted;
-        record.healed = Boolean(restarted && !daemonVersionsMismatch(restarted));
+        record.healed = daemonVersionsAligned(restarted);
         if (!record.healed) record.reason = "restart_version_still_mismatched";
         appendHealLog(record);
         return record;
@@ -495,7 +536,7 @@ async function healDaemonVersionDrift() {
       const record = { action: "heal_no_codex_candidate", at: nowISO() };
       appendHealLog(record);
       return record;
-    }, { waitMs: 0, preserveLiveOwner: true });
+    }, { waitMs: 0 });
   } catch (error) {
     if (error && error.message === "lock_busy") {
       const record = { action: "heal_lock_busy", at: nowISO() };
@@ -509,14 +550,14 @@ async function healDaemonVersionDrift() {
 }
 
 /// Foreground repair for an app-server whose cwd inode was removed beneath
-/// it. Unlike version drift, this must heal before the current `thread/start`:
-/// the stale daemon cannot execute even one useful turn. The socket is the
+/// it. This must heal before the current `thread/start`, alongside version
+/// alignment: the stale daemon cannot execute even one useful turn. The socket is the
 /// bridge-dedicated app-server daemon, never an interactive Codex session.
 async function ensureDaemonWorkingDirectoryAligned() {
   const initial = daemonWorkingDirectoryState();
   if (!initial.mismatch) return null;
   try {
-    return await withDirLock(HEAL_LOCK_DIR, async () => {
+    return await withWakeLock(HEAL_LOCK_DIR, async () => {
       const state = daemonWorkingDirectoryState();
       if (!state.mismatch) {
         return { action: "cwd_heal_noop_already_aligned", at: nowISO(), state };
@@ -553,7 +594,7 @@ async function ensureDaemonWorkingDirectoryAligned() {
       appendHealLog(record);
       daemonHealState.record = record;
       return record;
-    }, { waitMs: 8000, preserveLiveOwner: true });
+    }, { waitMs: 8000 });
   } catch (error) {
     const record = {
       action: "cwd_heal_failed",
@@ -583,33 +624,22 @@ function recoverableSocketStartupError(error) {
     || message === "app_server_socket_closed";
 }
 
-async function connectRpc(timeoutMs) {
-  ensureDaemon();
-  // A public reinstall can recreate NativeAgent's workspace while the
-  // bridge-dedicated Codex daemon survives. Repair that stale cwd inode before
-  // initializing RPC; no user restart or second codex_message should be
-  // required for the first fresh thread to work.
-  await ensureDaemonWorkingDirectoryAligned();
+async function connectRpcTransport(timeoutMs) {
+  if (!fs.existsSync(SOCKET_PATH)) startDaemon();
   try {
     return await connectRpcOnce(timeoutMs);
   } catch (error) {
     if (!recoverableSocketStartupError(error)) throw error;
-
     if (error && (error.code === "ECONNREFUSED" || error.code === "ENOENT")) {
-      // Owner-aware (same rule as the healer): a replacement daemon may have
-      // bound the pathname between our failed connect and this cleanup —
-      // unlinking a LIVE socket would strand that daemon. Only orphaned
-      // sockets are removed.
+      // Never unlink a replacement daemon's live socket.
       if (socketOwnerPid() == null) removeStaleSocket();
     }
     startDaemon();
-
     try {
       return await connectRpcOnce(timeoutMs);
     } catch (retryError) {
       retryError.detail = {
-        ...(retryError.detail || {}),
-        retryAfterDaemonStart: true,
+        ...(retryError.detail || {}), retryAfterDaemonStart: true,
         firstError: String(error && error.message || error),
         firstCode: error && error.code ? String(error.code) : undefined,
         socketPath: SOCKET_PATH,
@@ -620,8 +650,32 @@ async function connectRpc(timeoutMs) {
   }
 }
 
+async function connectRpc(timeoutMs, { launching = false } = {}) {
+  const deadline = Date.now() + 8000;
+  // A public reinstall can recreate NativeAgent's workspace while the
+  // bridge-dedicated Codex daemon survives. Repair that stale cwd inode before
+  // initializing RPC; no user restart or second codex_message should be
+  // required for the first fresh thread to work.
+  await ensureDaemonWorkingDirectoryAligned();
+  let client = await connectRpcTransport(timeoutMs);
+  // Existing turns must remain observable while an old server drains. Only
+  // connections that can start work need to wait for the version restart.
+  if (!launching) return client;
+  try {
+    const restarted = await ensureDaemonVersionAligned(deadline);
+    if (restarted) {
+      client.close();
+      client = await connectRpcTransport(timeoutMs);
+    }
+    return client;
+  } catch (error) {
+    client.close();
+    throw error;
+  }
+}
+
 async function withRpc(fn, timeoutMs = 12000) {
-  const client = await connectRpc(timeoutMs);
+  const client = await connectRpc(timeoutMs, { launching: true });
   try {
     return await fn(client);
   } finally {
@@ -685,11 +739,19 @@ async function startTurnForEntries(
 }
 
 async function startFreshThreadForEntries(client, entries, config) {
-  const params = freshThreadStartParams(config, entries);
   const saved = entries[0] && entries[0].freshAdmission;
-  const threadResponse = saved
-    ? await client.request("thread/resume", { threadId: saved.threadId })
-    : await client.request("thread/start", params);
+  let threadResponse;
+  let launched = entries;
+  if (saved) {
+    threadResponse = await client.request("thread/resume", { threadId: saved.threadId });
+  } else {
+    // Only a real launch asks; resuming a thread already started binds what runs.
+    const capped = await launchCapped(entries, config);
+    if (!capped.entries) return capped;
+    launched = capped.entries;
+    threadResponse = await client.request("thread/start", freshThreadStartParams(config, launched));
+  }
+  const params = freshThreadStartParams(config, launched);
   const thread = threadResponse && threadResponse.thread;
   const threadId = thread && thread.id ? thread.id : null;
   if (!threadId) {
@@ -727,7 +789,7 @@ async function startFreshThreadForEntries(client, entries, config) {
   if (admitted.status !== "sent") return admitted;
   const turn = admitted.turn;
   const requestedBrain = brainControlsForEntries(entries, config);
-  const execution = executionPolicyForEntries(entries, config);
+  const execution = executionPolicyForEntries(launched, config);
   return {
     status: "sent",
     delivery: "codex_app_server_fresh_thread_turn_start",
@@ -795,9 +857,12 @@ function writeAtomic(file, contents) {
 
 function readJSONLines(file) {
   try {
-    return Array.from(readWakeJSONLines(fs.readFileSync(file, "utf8")), ({ value }) => value);
-  } catch {
-    return [];
+    const raw = new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(file));
+    if (raw && !raw.endsWith("\n")) throw new Error("Wake ledger has an incomplete line");
+    return Array.from(readWakeJSONLines(raw, null, file), ({ value }) => value);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw new Error(`Wake ledger unavailable at ${file}: ${error.message}`, { cause: error });
   }
 }
 
@@ -811,44 +876,20 @@ function appendJSONLineAtomicUnlocked(file, record) {
 }
 
 async function appendReplyDeliveryReceipt(receipt) {
-  fs.mkdirSync(path.dirname(REPLY_DELIVERIES_PATH), { recursive: true, mode: 0o700 });
-  const lock = `${REPLY_DELIVERIES_PATH}.lock`;
-  // Descriptor mode leaves the flock on fd 3 through exec into the writer.
-  await new Promise((resolve, reject) => {
-    const child = spawn("/bin/sh", ["-c",
-      'umask 077; exec 3>>"$1"; shift; /usr/bin/lockf 3 && exec "$@"',
-      "reply-ledger", lock, process.execPath, "-e",
-      'require(process.argv[1]).appendReplyDeliveryReceiptUnlocked(JSON.parse(require("fs").readFileSync(0, "utf8")))',
-      __filename], { stdio: ["pipe", "ignore", "pipe"] });
-    let detail = "";
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => { detail += chunk; });
-    child.once("error", reject);
-    child.once("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`Reply receipt append failed: ${detail.trim() || code}`));
-    });
-    child.stdin.on("error", reject);
-    child.stdin.end(JSON.stringify(receipt));
-  });
+  return await withWakeLock(`${REPLY_DELIVERIES_PATH}.lock`, async () => {
+    appendReplyDeliveryReceiptUnlocked(receipt);
+  }, { waitMs: 30000 });
 }
 
 function appendReplyDeliveryReceiptUnlocked(receipt) {
-  // An orphan reaper may unlink the sidecar while lockf waits on its inode.
-  const held = fs.fstatSync(3, { bigint: true });
-  const atPath = fs.statSync(`${REPLY_DELIVERIES_PATH}.lock`, { bigint: true });
-  if (held.dev !== atPath.dev || held.ino !== atPath.ino) {
-    throw new Error("Reply receipt lock sidecar replaced while waiting; retry the delivery");
-  }
+  // Validate existing evidence before either producer append or compaction.
+  // An unreadable/torn ledger stays byte-preserved even for a single receipt.
+  const existing = readJSONLines(REPLY_DELIVERIES_PATH);
   // Swift supplies settlement candidates, never writes this ledger. Compare
   // under the same lock as producer appends and rotation, then append once.
   if (Array.isArray(receipt)) {
-    const raw = fs.existsSync(REPLY_DELIVERIES_PATH)
-      ? new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(REPLY_DELIVERIES_PATH)) : "";
-    if (raw && !raw.endsWith("\n")) throw new Error("Reply receipt ledger has an incomplete line");
     const latest = new Map();
-    for (const line of raw.split("\n").filter((line) => line.trim())) {
-      const row = JSON.parse(line);
+    for (const row of existing) {
       if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error("Reply receipt ledger has a non-object row");
       if (typeof row.jobId === "string") latest.set(row.jobId, row);
     }
@@ -861,10 +902,7 @@ function appendReplyDeliveryReceiptUnlocked(receipt) {
   appendJSONL(REPLY_DELIVERIES_PATH, receipt);
   const maxBytes = 16 * 1024 * 1024;
   if (fs.statSync(REPLY_DELIVERIES_PATH).size <= maxBytes) return;
-  let lines = fs.readFileSync(REPLY_DELIVERIES_PATH, "utf8")
-    .split("\n")
-    .filter((line) => line.trim() !== "")
-    .slice(-5000);
+  let lines = [...existing, receipt].slice(-5000).map((row) => JSON.stringify(row));
   while (lines.length > 1 && Buffer.byteLength(`${lines.join("\n")}\n`) > maxBytes) {
     lines.shift();
   }
@@ -893,35 +931,10 @@ async function appendStaleWakeRecoveryReceipt(receipt, config) {
 
 async function appendLockedWakeReceipt(receiptsPath, receipt) {
   fs.mkdirSync(path.dirname(receiptsPath), { recursive: true, mode: 0o700 });
-  await withDirLock(`${receiptsPath}.append.lock`, async () => {
+  await withWakeLock(`${receiptsPath}.append.lock`, async () => {
     appendJSONL(receiptsPath, receipt);
-  }, { waitMs: 10000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+  }, { waitMs: 10000 });
   return receiptsPath;
-}
-
-function summarizeExecutionAttempts(attempts) {
-  return (Array.isArray(attempts) ? attempts : []).map((attempt) => {
-    const result = attempt && attempt.turnResult;
-    return {
-      threadId: attempt && attempt.threadId || null,
-      turnId: attempt && attempt.turnId || null,
-      ...(attempt && attempt.brain ? { brain: attempt.brain } : {}),
-      turnResult: result ? {
-        status: result.status || null,
-        completedAt: result.completedAt || null,
-        durationMs: result.durationMs || null,
-        execution: result.execution || "codex_app_server",
-        waitSource: result.waitSource || null,
-        messageLength: typeof result.message === "string" ? result.message.length : 0,
-        messageDigest: typeof result.message === "string"
-          ? crypto.createHash("sha256").update(result.message).digest("hex")
-          : null,
-        errorMessage: result.errorMessage || null,
-        codexErrorInfo: result.codexErrorInfo || null,
-        noWorkObserved: result.noWorkObserved ?? null,
-      } : null,
-    };
-  });
 }
 
 function startDrainProcess(config) {
@@ -982,7 +995,6 @@ function replyAdmissionJob(config, threadId, entries, priorTurnIds = [], options
   }
   const jobsDir = options.jobsDir || REPLY_JOBS_DIR;
   const clientUserMessageId = clientUserMessageIdForEntries(entries);
-  const hangRetryCount = Math.max(0, ...entries.map((entry) => Number(entry && entry.hangRetryCount || 0)));
   const id = stableUUID(`codex-reply:${threadId}:${clientUserMessageId}`);
   const jobPath = path.join(jobsDir, `${safeFilePart(clientUserMessageId)}-${safeFilePart(id)}.json`);
   return {
@@ -997,13 +1009,11 @@ function replyAdmissionJob(config, threadId, entries, priorTurnIds = [], options
       threadId,
       turnId: null,
       clientUserMessageId,
-      hangRetryCount,
       priorTurnIds: [...new Set(priorTurnIds.filter(Boolean))],
       entries: entries.map((entry) => ({
         lifeID: entry.lifeID,
         id: entry.id || null,
         key: entry.key || null,
-        hangRetryCount: Number(entry.hangRetryCount || 0),
         payload: sanitizePayload(entry.payload || {}),
         launch: entry.launch || null,
         ...(entry.freshAdmission ? { freshAdmission: entry.freshAdmission } : {}),
@@ -1022,7 +1032,9 @@ async function startTurnWithDurableReplyAdmission(
 ) {
   const reservation = replyAdmissionJob(config, threadId, entries, priorTurnIds, options);
   if (reservation.status === "skipped") {
-    const turnResponse = await client.request("turn/start", turnStartParams(threadId, entries, config));
+    const capped = await launchCapped(entries, config);
+    if (!capped.entries) return capped;
+    const turnResponse = await client.request("turn/start", turnStartParams(threadId, capped.entries, config));
     return {
       status: "sent",
       turn: turnResponse && turnResponse.turn,
@@ -1032,7 +1044,7 @@ async function startTurnWithDurableReplyAdmission(
   const spawnJob = options.spawnJob || spawnReplyJob;
   fs.mkdirSync(path.dirname(reservation.jobPath), { recursive: true, mode: 0o700 });
   const lockDir = `${reservation.jobPath}.admission.lock`;
-  return await withDirLock(lockDir, async () => {
+  return await withWakeLock(lockDir, async () => {
     let job = reservation.job;
     let existed = false;
     try {
@@ -1045,7 +1057,10 @@ async function startTurnWithDurableReplyAdmission(
       }
       writeJSONAtomic(reservation.jobPath, job);
     }
-    if (lifeOf(job.lifeID) !== dataRootLife()) return { status: "stopped", reason: "restored", jobPath: reservation.jobPath };
+    if (!job || job.schemaVersion !== 2) return { status: "failed", reason: "reply_admission_schema_unavailable", jobPath: reservation.jobPath };
+    if (!Array.isArray(job.entries)) return { status: "failed", reason: "reply_admission_schema_unavailable", jobPath: reservation.jobPath };
+    for (const [index, entry] of job.entries.entries()) lifeOf(entry && entry.lifeID, `${reservation.jobPath}.entries[${index}]`);
+    if (lifeOf(job.lifeID, reservation.jobPath) !== dataRootLife()) return { status: "stopped", reason: "restored", jobPath: reservation.jobPath };
     if (job.id !== reservation.job.id || job.threadId !== threadId
         || job.clientUserMessageId !== reservation.job.clientUserMessageId) {
       return { status: "failed", reason: "reply_admission_identity_conflict" };
@@ -1065,18 +1080,21 @@ async function startTurnWithDurableReplyAdmission(
         return { status: "failed", reason: "reply_admission_outcome_unknown" };
       }
       if (candidates.length === 1) turn = candidates[0];
-      if (!turn && (job.schemaVersion !== 2 || job.phase !== "turn_start_reserved")) {
+      if (!turn && job.phase !== "turn_start_reserved") {
         return { status: "failed", reason: "reply_admission_outcome_unknown" };
       }
     }
     if (!turn) {
+      // A retained job's entries ask at this launch too, before it is marked dispatched.
+      const launchable = await launchCapped(job.entries, config);
+      if (!launchable.entries) return launchable;
       // The reservation is durable before this call. If the RPC response is
       // lost, recovery rereads the exact thread and binds the one new turn;
       // it never blindly starts a second Codex task.
       job.phase = "turn_start_dispatched";
       writeJSONAtomic(reservation.jobPath, job);
       const response = await client.request(
-        "turn/start", turnStartParams(threadId, job.entries, config)
+        "turn/start", turnStartParams(threadId, launchable.entries, config)
       );
       turn = response && response.turn;
     }
@@ -1110,56 +1128,16 @@ async function startTurnWithDurableReplyAdmission(
         recoveredAdmission: existed,
       },
     };
-  }, { waitMs: 2000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
-}
-
-function startReplyWatcher(config, threadId, turnId, entries) {
-  if (!turnId) {
-    return { status: "skipped", reason: "turn_id_missing" };
-  }
-  if (!boolSetting(config, "deliverReplies", "NATIVE_AGENT_CODEX_DELIVER_REPLIES", true)) {
-    return { status: "skipped", reason: "reply_delivery_disabled" };
-  }
-  try {
-    ensureBridgeDir();
-    fs.mkdirSync(REPLY_JOBS_DIR, { recursive: true, mode: 0o700 });
-    const job = {
-      lifeID: entries[0] && entries[0].lifeID,
-      id: stableUUID(`codex-reply:${threadId}:${turnId}`),
-      createdAt: nowISO(),
-      threadId,
-      turnId,
-      hangRetryCount: Math.max(0, ...entries.map((entry) => Number(entry && entry.hangRetryCount || 0))),
-      appServer: captureAppServerIdentity(),
-      entries: entries.map((entry) => ({
-        lifeID: entry.lifeID,
-        id: entry.id || null,
-        key: entry.key || null,
-        hangRetryCount: Number(entry.hangRetryCount || 0),
-        payload: sanitizePayload(entry.payload || {}),
-      })),
-    };
-    const jobPath = path.join(REPLY_JOBS_DIR, `${safeFilePart(turnId)}-${safeFilePart(job.id)}.json`);
-    writeJSONAtomic(jobPath, job);
-    const watcher = spawnReplyJob(jobPath);
-    return {
-      status: "watcher_started",
-      delivery: "nativeagent_bridge_message_after_codex_turn",
-      pid: watcher.pid,
-      jobPath,
-      deliveriesPath: REPLY_DELIVERIES_PATH,
-    };
-  } catch (error) {
-    return { status: "failed", reason: "reply_watcher_spawn_failed", error: String(error.message || error) };
-  }
+  }, { waitMs: 2000 });
 }
 
 async function attachConsumeAndReplyDelivery(result, entries, config, options = {}) {
   if (result && result.status === "sent") {
-    const startWatcher = options.startReplyWatcher || startReplyWatcher;
     const consume = options.markInboxConsumed || markInboxConsumed;
-    result.replyDelivery = result.replyDelivery
-      || startWatcher(config, result.threadId, result.turnId, entries);
+    if (!result.replyDelivery || typeof result.replyDelivery.status !== "string") {
+      return { ...result, status: "failed", reason: "reply_delivery_contract_unavailable",
+        executionOutcome: "unknown", consume: { status: "deferred", reason: "reply_job_not_durable" } };
+    }
     // The inbox remains recoverable until the completion job itself is durable.
     // An explicit no-reply policy is the sole exception because no job is
     // expected by configuration. Spawn/preflight failures leave it unconsumed.
@@ -1186,9 +1164,7 @@ async function inspectBridgeThread(threadId, config = {}, connect = connectRpcOn
     if (!thread || thread.id !== canonicalId) throw new Error("thread_identity_mismatch");
     const state = threadStateFromThread(thread, canonicalId);
     const turn = Array.isArray(thread.turns) ? thread.turns.at(-1) : null;
-    const rolloutPath = turn ? findThreadRolloutPath(canonicalId, config) : null;
-    const terminal = turn && (extractTurnResultFromThread(thread, turn.id, rolloutPath)
-      || (rolloutPath && extractTurnResultFromRollout(rolloutPath, turn.id)));
+    const terminal = turn ? await readCanonicalTurnResult(client, canonicalId, turn.id, config) : null;
     return {
       status: "ok",
       source: "bridge_app_server",
@@ -1236,8 +1212,9 @@ async function waitForPendingDrainInvalidation(
     12000
   );
   let client = clientOverride === undefined ? null : clientOverride;
+  let channelFailure = null;
   if (clientOverride === undefined && states.length > 0) {
-    try { client = await connectRpc(requestTimeoutMs); } catch {}
+    try { client = await connectRpc(requestTimeoutMs); } catch (error) { channelFailure = error.message; }
   }
 
   const waiter = createWakeEventWaiter(() => {
@@ -1246,8 +1223,8 @@ async function waitForPendingDrainInvalidation(
   });
   const { cleanup, promise, close } = waiter;
 
-  function signal(source) {
-    waiter.signal({ source });
+  function signal(source, error = null) {
+    waiter.signal({ source, ...(error ? { error } : {}) });
   }
 
   const stateByThread = new Map(states
@@ -1270,20 +1247,21 @@ async function waitForPendingDrainInvalidation(
 
   function watchFile(filePath, source) {
     if (!filePath || !fs.existsSync(filePath)) return;
-    const initial = safeFileStat(filePath);
     try {
-      const watcher = fs.watch(filePath, { persistent: false }, () => {
-        const current = safeFileStat(filePath);
+      const initial = safeFileStat(filePath);
+      const watcher = fs.watch(filePath, { persistent: true }, () => {
+        let current;
+        try { current = safeFileStat(filePath); }
+        catch (error) { signal("source_metadata_unavailable", error.message); return; }
         if (sameFileStat(initial, current)) return;
         signal(source);
       });
       cleanup.push(() => watcher.close());
-    } catch {}
+      watcher.on("error", (error) => signal("source_watch_unavailable", error.message));
+    } catch (error) { channelFailure = error.message; }
   }
 
-  const watchedPendingPath = typeof config.pendingPath === "string" && config.pendingPath
-    ? config.pendingPath
-    : pendingPath();
+  const watchedPendingPath = pendingPath();
   watchFile(watchedPendingPath, "pending_queue_event");
 
   const watchedRollouts = new Set();
@@ -1301,23 +1279,23 @@ async function waitForPendingDrainInvalidation(
     const sessionsRoot = path.join(CODEX_HOME, "sessions");
     if (fs.existsSync(sessionsRoot)) {
       try {
-        const watcher = fs.watch(sessionsRoot, { persistent: false, recursive: true }, (_event, filename) => {
+        const watcher = fs.watch(sessionsRoot, { persistent: true, recursive: true }, (_event, filename) => {
           const changed = filename == null ? "" : String(filename);
           if (changed && ![...unresolvedThreadIds].some((threadId) => changed.includes(threadId))) return;
           signal("rollout_file_event");
         });
         cleanup.push(() => watcher.close());
-      } catch {}
+        watcher.on("error", (error) => signal("source_watch_unavailable", error.message));
+      } catch (error) { channelFailure = error.message; }
     }
   }
 
-  const remaining = Math.max(0, deadline - Date.now());
-  const retryDelay = Math.max(0, Number(failureRetryMs) || 0);
-  const delay = retryDelay > 0 ? Math.min(remaining, retryDelay) : remaining;
-  const timerSource = retryDelay > 0 && retryDelay < remaining
-    ? "failure_retry_deadline"
-    : "drain_timeout";
-  waiter.startTimeout({ source: timerSource }, delay);
+  const remaining = deadline == null ? null : Math.max(0, deadline - Date.now());
+  const retryDelay = Math.max(0, Number(failureRetryMs) || (channelFailure ? 30_000 : 0));
+  if (retryDelay > 0 || remaining != null) {
+    const delay = remaining == null ? retryDelay : retryDelay > 0 ? Math.min(remaining, retryDelay) : remaining;
+    waiter.startTimeout({ source: retryDelay > 0 ? "failure_retry_deadline" : "caller_wait_deadline" }, delay);
+  }
 
   // Close registration races once. Further reads happen only after an exact
   // queue/rollout/RPC event or a failure-specific retry deadline.
@@ -1350,6 +1328,17 @@ async function waitForPendingDrainInvalidation(
     }
   }
 
+  if (client && !waiter.settled) {
+    for (const threadId of stateByThread.keys()) {
+      try { await client.request("thread/resume", { threadId, excludeTurns: true }); }
+      catch (error) {
+        // An unavailable notification subscription reattaches after a failure
+        // backoff; it cannot turn a healthy busy lane into a hot admission loop.
+        waiter.startTimeout({ source: "thread_subscription_unavailable", error: error.message }, 30_000);
+        break;
+      }
+    }
+  }
   const event = await promise;
   close();
   return event;
@@ -1370,14 +1359,17 @@ async function deliverReplyJobUnlocked(jobPath, config) {
     }
     return quarantineReplyJob(jobPath, error);
   }
-  if (lifeOf(job.lifeID) !== dataRootLife()) {
+  if (!job || job.schemaVersion !== 2 || typeof job.id !== "string" || !job.id
+      || typeof job.threadId !== "string" || !Array.isArray(job.entries)) {
+    return { status: "failed", reason: "reply_job_schema_unavailable", jobPath,
+      error: "Repair the current reply admission record; execution effects remain unknown." };
+  }
+  for (const [index, entry] of job.entries.entries()) lifeOf(entry && entry.lifeID, `${jobPath}.entries[${index}]`);
+  if (lifeOf(job.lifeID, jobPath) !== dataRootLife()) {
     writeJSONAtomic(jobPath, { ...job, phase: "stopped", status: "stopped", reason: "restored" });
     return { status: "stopped", reason: "restored", jobPath };
   }
   if (!job.turnId) {
-    if ((job.entries || []).some((entry) => entry.hungTurnId || Number(entry.hangRetryCount || 0) > 0)) {
-      return { status: "failed", reason: "hang_effect_reconciliation_required", jobPath };
-    }
     let admission;
     try {
       admission = await withRpc(
@@ -1408,12 +1400,6 @@ async function deliverReplyJobUnlocked(jobPath, config) {
     }
     job = JSON.parse(fs.readFileSync(jobPath, "utf8"));
   }
-  if (!job.id || typeof job.id !== "string") {
-    job.id = job.threadId && job.turnId
-      ? stableUUID(`codex-reply:${job.threadId}:${job.turnId}`)
-      : crypto.randomUUID();
-    writeJSONAtomic(jobPath, job);
-  }
   const entries = Array.isArray(job.entries) ? job.entries : [];
   let execution = job.completedExecution && job.completedExecution.turnResult
     ? job.completedExecution
@@ -1439,19 +1425,35 @@ async function deliverReplyJobUnlocked(jobPath, config) {
   });
   if (!execution) {
     live.started();
-    execution = await waitForDurableTerminalExecution(job, config, async (observed) => {
+    try {
+      execution = await waitForDurableTerminalExecution(job, config, async (observed) => {
       // Wait intervals and rollout edges are observations, not evidence that
       // the Codex turn ended. Persist and resubscribe to exact events; never
       // synthesize a terminal reply or delete the job.
       job.lastWait = {
         observedAt: nowISO(),
-        status: "pending",
+        status: observed.turnResult.status === "observation_unavailable" ? "observation_unavailable" : "pending",
         waitSource: observed.turnResult.waitSource || "exact_timeout",
         threadId: observed.threadId,
         turnId: observed.turnId,
       };
+      if (observed.turnResult.status === "observation_unavailable") {
+        job.observationFailure = { at: nowISO(), error: redactDiagnosticText(observed.turnResult.errorMessage) };
+      } else {
+        delete job.observationFailure;
+      }
       writeJSONAtomic(jobPath, job);
-    }, { live });
+      }, { live });
+      delete job.observationFailure;
+    } catch (error) {
+      job.observationFailure = { at: nowISO(), code: error.code, error: redactDiagnosticText(String(error.message || error)) };
+      job.lastWait = { observedAt: nowISO(), status: "observation_unavailable",
+        waitSource: "durable_rollout_read_failed",
+        threadId: job.threadId, turnId: job.turnId };
+      job.liveProgress = await live.finished("completion evidence unavailable; repair the recorded source before observing this turn again");
+      writeJSONAtomic(jobPath, job);
+      throw error;
+    }
   }
   if (execution.turnResult.status === "failed_hung" && !execution.turnResult.hangRecovery) {
     // Retain the observed result before any process mutation. A recovery crash
@@ -1470,18 +1472,13 @@ async function deliverReplyJobUnlocked(jobPath, config) {
     delete job.stallProbe;
     writeJSONAtomic(jobPath, job);
   }
-  live.finished(execution.turnResult.status);
+  job.liveProgress = await live.finished(execution.turnResult.status);
+  writeJSONAtomic(jobPath, job);
   if (!job.completedExecution) {
     job.completedExecution = execution;
     job.phase = "execution_completed";
     delete job.lastWait;
     delete job.stallProbe;
-    writeJSONAtomic(jobPath, job);
-  } else if (job.phase === "watching_turn") {
-    // Legacy/recovered jobs could already carry the terminal execution while
-    // retaining the pre-terminal watcher label. The execution is finished;
-    // only bridge delivery remains unsettled.
-    job.phase = "execution_completed";
     writeJSONAtomic(jobPath, job);
   }
   const turnResult = execution.turnResult;
@@ -1496,7 +1493,6 @@ async function deliverReplyJobUnlocked(jobPath, config) {
   const text = receiptOnly ? "" : formatCodexReplyForNativeAgent({
     ...job,
     turnId: execution.turnId,
-    attemptCount: execution.attempts.length,
   }, turnResult);
   const completionMetadata = {
     lifeID: job.lifeID,
@@ -1507,7 +1503,6 @@ async function deliverReplyJobUnlocked(jobPath, config) {
       codexStatus: turnResult.status,
       threadId: execution.threadId,
       turnId: execution.turnId,
-      attemptCount: execution.attempts.length,
       execution: turnResult.execution || "codex_app_server",
       waitSource: turnResult.waitSource || null,
       errorMessage: turnResult.errorMessage || null,
@@ -1562,7 +1557,7 @@ async function deliverReplyJobUnlocked(jobPath, config) {
     topics: entries.map((entry) => entry && entry.payload && entry.payload.topic).filter(Boolean),
     sessionId: sessionId || null,
     origin,
-    attempts: summarizeExecutionAttempts(execution.attempts),
+    liveProgress: job.liveProgress,
     turnResult: {
       status: turnResult.status,
       completedAt: turnResult.completedAt || null,
@@ -1602,7 +1597,6 @@ async function deliverReplyJobUnlocked(jobPath, config) {
     initialTurnId: job.turnId,
     sessionId: sessionId || null,
     origin,
-    attemptCount: execution.attempts.length,
     turnResult: turnResult.status,
     execution: turnResult.execution || "codex_app_server",
     waitSource: turnResult.waitSource || null,
@@ -1643,10 +1637,10 @@ async function deliverReplyJob(jobPath, config, options = {}) {
   const lockDir = `${jobPath}.delivery.lock`;
   const deliver = options.deliver || (() => deliverReplyJobUnlocked(jobPath, config));
   try {
-    return await withDirLock(
+    return await withWakeLock(
       lockDir,
       deliver,
-      { waitMs: 0, staleMs: 2 * 60 * 60 * 1000, preserveLiveOwner: true }
+      { waitMs: 0 }
     );
   } catch (error) {
     if (error && error.message === "lock_busy") {
@@ -1685,9 +1679,14 @@ async function consumePendingEntry(entry, config, options = {}) {
   const remove = options.removePending || removePending;
   const recoverStale = options.recoverStaleQueuedWake || recoverStaleQueuedWake;
   const laneOptions = options.laneOptions || {};
+  const timeoutMs = numberSetting(
+    config, "requestTimeoutMs", "NATIVE_AGENT_CODEX_WAKEUP_REQUEST_TIMEOUT_MS", 12000
+  );
 
   try {
-    return await runInLane(laneKey, config, async () => {
+    // Connect and wait for version repair BEFORE taking a capacity slot: the
+    // detached idle-daemon restart must acquire all slots to protect live work.
+    return await connect(async (client) => runInLane(laneKey, config, async () => {
       // The filesystem lane lock decides exclusivity; the queue lock decides
       // order. Re-read the head only after owning the lane so a later process
       // cannot win an OS scheduling race over an earlier durable row.
@@ -1699,20 +1698,11 @@ async function consumePendingEntry(entry, config, options = {}) {
         });
       }
       let current = head.head;
-      if (current.hungTurnId || Number(current.hangRetryCount || 0) > 0) {
-        return { status: "failed", reason: "hang_effect_reconciliation_required", threadId: current.threadId };
-      }
       if (options.executeEntry) return await options.executeEntry(current);
 
       const mode = current.mode === FRESH_THREAD_MODE || !current.threadId
         ? FRESH_THREAD_MODE
         : PINNED_THREAD_MODE;
-      const timeoutMs = numberSetting(
-        config,
-        "requestTimeoutMs",
-        "NATIVE_AGENT_CODEX_WAKEUP_REQUEST_TIMEOUT_MS",
-        12000
-      );
       let ignoredTurnIds = [];
       let staleRecovery = null;
 
@@ -1740,7 +1730,7 @@ async function consumePendingEntry(entry, config, options = {}) {
         }
       }
 
-      const result = await connect(async (client) => {
+      const result = await (async () => {
         if (mode === FRESH_THREAD_MODE) {
           return await startFreshThreadForEntries(client, [current], config);
         }
@@ -1777,7 +1767,7 @@ async function consumePendingEntry(entry, config, options = {}) {
           true,
           ignoredTurnIds
         );
-      }, timeoutMs);
+      })();
 
       if (result.status !== "sent") return result;
       const sent = await attach(result, [current], config);
@@ -1786,7 +1776,7 @@ async function consumePendingEntry(entry, config, options = {}) {
         sent.staleRecovery = staleRecovery.recovery;
       }
       return sent;
-    }, laneOptions);
+    }, laneOptions), timeoutMs);
   } catch (error) {
     if (error && error.message === "lock_busy") {
       return pendingBusyResult(entry, null, error.reason || "wake_lane_lock_busy", {
@@ -1881,36 +1871,31 @@ async function requestFreshThreadTurnStart(payload, config, launch) {
 }
 
 async function drainPending(config, options = {}) {
-  const drainTimeoutMs = numberSetting(config, "drainTimeoutMs", "NATIVE_AGENT_CODEX_DRAIN_TIMEOUT_MS", 30 * 60 * 1000);
+  const ownerPath = `${pendingPath()}.drainer.lock`;
+  try {
+    return await withWakeLock(ownerPath, () => drainPendingOwned(config, options), { waitMs: 0 });
+  } catch (error) {
+    if (error.message === "lock_busy" && error.lockDir === ownerPath) return { status: "already_running", reason: "queue_owner_busy" };
+    throw error;
+  }
+}
+
+async function drainPendingOwned(config, options = {}) {
   const failureRetryBaseMs = numberSetting(
     config,
     "drainFailureRetryBaseMs",
     "NATIVE_AGENT_CODEX_DRAIN_FAILURE_RETRY_BASE_MS",
     1000
   );
-  const deadline = Date.now() + drainTimeoutMs;
   let delivered = 0;
-  let lastBusy = null;
-  let lastFailure = null;
-  let lastReplyDelivery = null;
-  let lastWakeSource = null;
   const heartbeat = options.heartbeat || createDrainerHeartbeat(config, options.heartbeatOptions || {});
   heartbeat.update(readPendingAtPath(pendingPath()).length, null);
-  const heartbeatStartup = await heartbeat.start();
-  if (heartbeatStartup.status === "refused") {
-    return {
-      status: "already_running",
-      reason: "live_drainer_heartbeat",
-      heartbeatPath: heartbeatStartup.heartbeatPath,
-      priorPid: heartbeatStartup.prior && heartbeatStartup.prior.pid || null,
-      receipt: heartbeatStartup.receipt,
-    };
-  }
+  await heartbeat.start();
   const consume = options.consumePendingEntry || consumePendingEntry;
 
   try {
-    while (Date.now() < deadline) {
-      const queue = await withDirLock(queueLockDir(), async () => readPendingUnlocked(), { waitMs: 2000 });
+    while (true) {
+      const queue = await withWakeLock(queueLockDir(), async () => readPendingUnlocked(), { waitMs: 2000 });
       heartbeat.update(queue.length, null);
       if (queue.length === 0) {
         return { status: "drained", delivered, pendingCount: 0 };
@@ -1941,7 +1926,6 @@ async function drainPending(config, options = {}) {
       for (const item of results) {
         const { entry } = item;
         if (item.error) {
-          lastFailure = rpcFailure(item.error, entry.threadId);
           iterationFailure = true;
           retryAttempt = Math.max(retryAttempt, Number(entry.attempts || 0) + 1);
           {
@@ -1962,7 +1946,6 @@ async function drainPending(config, options = {}) {
         const result = item.result;
         if (result.status === "stopped") { madeProgress = true; continue; }
         if (result.status === "busy") {
-          lastBusy = result;
           busyStates.push(result);
           heartbeat.update(queue.length, result.inProgressTurnIds && result.inProgressTurnIds[0] || null);
           if (result.reason === "wake_capacity_busy" || result.reason === "wake_lane_lock_busy") {
@@ -1975,12 +1958,10 @@ async function drainPending(config, options = {}) {
           continue;
         }
         if (result.status === "sent") {
-          lastReplyDelivery = result.replyDelivery || null;
           delivered += 1;
           madeProgress = true;
           continue;
         }
-        lastFailure = result;
         iterationFailure = true;
         retryAttempt = Math.max(retryAttempt, Number(entry.attempts || 0) + 1);
         {
@@ -2004,33 +1985,179 @@ async function drainPending(config, options = {}) {
       const retryDelayMs = capacityRetryMs || (iterationFailure
           ? Math.min(30_000, failureRetryBaseMs * (2 ** Math.min(5, Math.max(0, retryAttempt - 1))))
           : 0);
-      const event = await waitForPendingDrainInvalidation(
+      await waitForPendingDrainInvalidation(
         busyStates,
-        queueFingerprint(await withDirLock(queueLockDir(), async () => readPendingUnlocked())),
+        queueFingerprint(await withWakeLock(queueLockDir(), async () => readPendingUnlocked())),
         config,
-        deadline,
+        null,
         retryDelayMs
       );
-      lastWakeSource = event.source;
-      if (event.source === "drain_timeout") break;
     }
-
-    const remaining = await withDirLock(queueLockDir(), async () => readPendingUnlocked().length, { waitMs: 2000 });
-    heartbeat.update(remaining, lastBusy && lastBusy.inProgressTurnIds && lastBusy.inProgressTurnIds[0] || null);
-    return {
-      status: "pending",
-      reason: "drain_timeout",
-      delivered,
-      pendingCount: remaining,
-      pendingPath: pendingPath(),
-      lastBusy,
-      lastFailure,
-      lastReplyDelivery,
-      lastWakeSource,
-    };
   } finally {
     await heartbeat.stop();
   }
+}
+
+// Bridge readiness retains this supervisor through ProcessExecution. Queue and
+// job mutexes remain the only execution authorities; file events attach new
+// work and a failure-only retry reattaches a helper that exited without an edge.
+async function recoverWakeWork(config) {
+  ensureBridgeDir();
+  fs.mkdirSync(REPLY_JOBS_DIR, { recursive: true, mode: 0o700 });
+  return await withWakeLock(path.join(BRIDGE_DIR, ".wake-owner.lock"), async () => {
+    const tasks = new Map();
+    const finished = new Map();
+    let wake = null;
+    let watchFailure = null;
+    const gaps = new Map();
+    let publishedObservation = false;
+    const observationPath = path.join(BRIDGE_DIR, "wake-owner-observation.json");
+    const recordGap = (source, error = null) => {
+      const cause = error == null ? null : redactDiagnosticText(String(error.message || error));
+      if (publishedObservation && (gaps.get(source) || null) === cause && fs.existsSync(observationPath)) return;
+      if (cause == null) gaps.delete(source); else gaps.set(source, cause);
+      // This owner's observation availability only, never execution/completion
+      // authority copied from jobs. Keep queue schema faults visible in-app.
+      writeJSONAtomic(observationPath, { observedAt: nowISO(), pid: process.pid,
+        status: gaps.size ? "unavailable" : "attached", gaps: Object.fromEntries(gaps) });
+      publishedObservation = true;
+    };
+    const signal = () => { if (wake) wake.signal({ source: "wake_owner_change" }); };
+    // Watch parent directories so atomic replacement cannot strand an inode watch.
+    const watchers = new Map();
+    let watchRetryAt = null;
+    const attachWatchers = () => {
+      watchRetryAt = null;
+      for (const directory of new Set([path.dirname(pendingPath()), REPLY_JOBS_DIR])) {
+        if (watchers.has(directory)) continue;
+        try {
+          fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+          const watcher = fs.watch(directory, (_event, name) => {
+            if (name == null || (directory === path.dirname(pendingPath()) && String(name) === path.basename(pendingPath()))
+                || (directory === REPLY_JOBS_DIR && String(name).endsWith(".json"))) signal();
+          });
+          watcher.on("error", (error) => {
+            watcher.close(); watchers.delete(directory);
+            watchFailure = error; watchRetryAt = Date.now() + 30_000; signal();
+          });
+          watchers.set(directory, watcher);
+        } catch (error) { watchFailure = error; watchRetryAt = Date.now() + 30_000; }
+      }
+    };
+    attachWatchers();
+    const signature = (file) => {
+      try { return JSON.stringify(safeFileStat(file)); }
+      catch (error) {
+        // An unavailable cache key is named, never treated as file absence.
+        // The job's checked reader still records the actual source failure.
+        return JSON.stringify({ unavailable: String(error.message || error) });
+      }
+    };
+    const launch = (key, file, run) => {
+      if (tasks.has(key)) return;
+      const prior = finished.get(key);
+      // A live detached observer updates this same job as it reads rollout
+      // activity. Those content writes are not loss of its kernel ownership.
+      if (prior && prior.ownershipBusy && Date.now() < prior.retryAt) return;
+      const current = signature(file);
+      if (prior && prior.signature === current && (prior.retryAt == null || Date.now() < prior.retryAt)) return;
+      const task = Promise.resolve().then(run).then((result) => {
+        const retry = result && ["already_running", "failed", "unavailable"].includes(result.status);
+        finished.set(key, { signature: signature(file), ownershipBusy: result?.status === "already_running",
+          retryAt: retry ? Date.now() + 30_000 : null });
+        if (retry) jsonOut({ kind: "wake_owner_reattach", key, result });
+      }, (error) => {
+        finished.set(key, { signature: signature(file), retryAt: Date.now() + 30_000 });
+        jsonOut({ kind: "wake_owner_unavailable", key, error: redactDiagnosticText(String(error.message || error)) });
+      }).finally(() => { tasks.delete(key); signal(); });
+      tasks.set(key, task);
+    };
+    try {
+      while (true) {
+        wake = createWakeEventWaiter();
+        if (watchRetryAt != null && Date.now() >= watchRetryAt) attachWatchers();
+        if (watchFailure) {
+          recordGap("directory_watch", watchFailure);
+          jsonOut({ kind: "wake_watch_unavailable", error: String(watchFailure.message || watchFailure) });
+          watchFailure = null;
+        } else if (watchers.size === new Set([path.dirname(pendingPath()), REPLY_JOBS_DIR]).size) recordGap("directory_watch");
+        // Register before reading: a new row/job racing this inventory wakes it.
+        await new Promise((resolve) => setImmediate(resolve));
+        // Each damaged item keeps its source and reports its own gap; it cannot
+        // prevent sibling reply jobs from attaching.
+        const present = new Set();
+        try {
+          const queue = readPendingAtPath(pendingPath());
+          recordGap(pendingPath());
+          if (!boolSetting(config, "disableDrain", "NATIVE_AGENT_CODEX_WAKEUP_NO_DRAIN", false) && queue.length > 0) {
+            present.add("pending");
+            launch("pending", pendingPath(), () => drainPending(config));
+          }
+        } catch (error) {
+          recordGap(pendingPath(), error);
+          jsonOut({ kind: "wake_queue_unavailable", path: pendingPath(), error: String(error.message || error) });
+        }
+        let jobFiles = [];
+        try { jobFiles = fs.readdirSync(REPLY_JOBS_DIR, { withFileTypes: true }); recordGap(REPLY_JOBS_DIR); }
+        catch (error) {
+          recordGap(REPLY_JOBS_DIR, error);
+          jsonOut({ kind: "wake_jobs_unavailable", path: REPLY_JOBS_DIR, error: String(error.message || error) });
+          watchRetryAt = Date.now() + 30_000;
+        }
+        for (const entry of jobFiles) {
+          if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+          const file = path.join(REPLY_JOBS_DIR, entry.name);
+          present.add(file);
+          launch(file, file, () => deliverReplyJob(file, config));
+        }
+        for (const key of finished.keys()) if (!present.has(key)) finished.delete(key);
+        const retryTimes = [...finished.entries()].filter(([key, value]) => !tasks.has(key) && value.retryAt != null)
+          .map(([, value]) => value.retryAt);
+        if (watchRetryAt != null) retryTimes.push(watchRetryAt);
+        if (retryTimes.length) wake.startTimeout({ source: "wake_owner_failure_retry" }, Math.max(1, Math.min(...retryTimes) - Date.now()));
+        await wake.promise;
+        wake.close();
+      }
+    } finally {
+      if (wake) wake.close();
+      for (const watcher of watchers.values()) watcher.close();
+      // A fatal shared-source failure exits this helper (main's error boundary).
+      // The app reattaches the same durable records; it does not replay effects.
+    }
+  }, { waitMs: 0 });
+}
+
+/// A queued stamp never outranks NativeAgent's answer at the moment of launch:
+/// each launch asks the app's bridge for the Mac's current ceiling, so a Trust
+/// downgrade governs the next launch, queued or not. No answer launches nothing.
+async function launchCapped(entries, config) {
+  const unavailable = (detail) => ({ status: "failed", reason: "launch_decision_unavailable", detail: `Nothing was launched: ${detail}.` });
+  const endpoint = codexReturnBridgeEndpoint(config);
+  if (!endpoint) return unavailable("NativeAgent's bridge is not published");
+  const tokenPath = stringSetting(config, "bridgeTokenPath", "NATIVE_AGENT_CODEX_BRIDGE_TOKEN_PATH", BRIDGE_TOKEN_PATH);
+  const { token, failure } = readWakeBridgeToken(tokenPath, (error) => String(error.message || error));
+  if (failure) return unavailable(`NativeAgent's bridge token is unreadable (${failure.reason})`);
+  const answer = await new Promise((resolve) => {
+    const request = http.get({ host: endpoint.host, port: endpoint.port, path: "/codex/launch", timeout: 5000,
+      headers: { "Authorization": `Bearer ${token}` } }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { body += chunk; });
+      response.on("end", () => {
+        try { resolve(response.statusCode === 200 ? JSON.parse(body) : null); } catch { resolve(null); }
+      });
+    });
+    request.on("timeout", () => request.destroy(new Error("launch decision timed out")));
+    request.on("error", () => resolve(null));
+  });
+  if (!answer) return unavailable("NativeAgent did not answer its launch decision");
+  if (answer.status !== "ok") {
+    return { status: "failed", reason: "launch_blocked", detail: `Nothing was launched: ${answer.reason || "NativeAgent refused the launch"}.` };
+  }
+  const ceiling = launchFromArgv(["--sandbox", answer.sandbox, "--approval-policy", answer.approvalPolicy]);
+  if (!ceiling) return unavailable("NativeAgent's launch answer is not a known launch");
+  return { entries: entries.map((entry) => entry && entry.launch && entry.launch.sandbox === "danger-full-access"
+    && ceiling.sandbox !== "danger-full-access" ? { ...entry, launch: ceiling } : entry) };
 }
 
 /// NativeAgent's finished launch decision for this request, from this
@@ -2059,7 +2186,11 @@ async function main() {
     catch (error) { jsonOut({ status: "failed", reason: "inbox_write_failed", detail: String(error.message || error) }); }
     return;
   }
-  const config = loadJSON(CONFIG_PATH);
+  const config = loadWakePolicy();
+  if (process.argv.includes("--recover-wakes")) {
+    await recoverWakeWork(config);
+    return;
+  }
   const readThreadIndex = process.argv.indexOf("--read-thread");
   if (readThreadIndex >= 0) {
     jsonOut(await inspectBridgeThread(process.argv[readThreadIndex + 1], config));
@@ -2232,7 +2363,7 @@ const { appendInbox, markInboxConsumed, markInboxTerminal, messageIdForPayload }
     BRIDGE_DIR,
     inboxLockDir,
     // Queue admission supplies the lock and consumes terminal projection; defer the lookup.
-    withDirLock: (...args) => withDirLock(...args),
+    withWakeLock: (...args) => withWakeLock(...args),
     nowISO,
     writeJSONAtomic,
     writeTextAtomic,
@@ -2240,7 +2371,7 @@ const { appendInbox, markInboxConsumed, markInboxTerminal, messageIdForPayload }
 
 const {
   sanitizePayload,
-  withDirLock,
+  withWakeLock,
   withWakeCapacity,
   withAllWakeCapacity,
   withWakeExecutionLane,
@@ -2267,9 +2398,7 @@ const {
   canonicalCodexThreadId,
   copyWakeCompletionOrigin,
   copyWakeProducerIdentity,
-  currentProcessStartIdentity,
   deadLetterPath,
-  dirLockOwnerAlive,
   isCodexNonThreadSentinel,
   markInboxTerminal,
   nowISO,
@@ -2287,9 +2416,7 @@ const { createDrainerHeartbeat } = require("./codex_wake_heartbeat.js").createCo
   DRAINER_HEARTBEAT_PATH,
   stringSetting,
   numberSetting,
-  pidAlive,
-  withDirLock,
-  readJSONLines,
+  withWakeLock,
   appendJSONLineAtomicUnlocked,
 });
 
@@ -2300,7 +2427,7 @@ const {
   sameFileStat,
   readCanonicalTurnResult,
   waitForTurnResultEventFirst,
-  waitForTurnResultWithEmptyRetry,
+  observeTurnResult,
   probeTurnLiveness,
   waitForDurableTerminalExecution
 } = require("./wake_turn_observation.js").createCodexTurnObservation({
@@ -2309,8 +2436,6 @@ const {
   connectRpc,
   createWakeEventWaiter,
   extractTurnResultFromRollout,
-  extractTurnResultFromThread,
-  extractTurnResultFromTurn,
   nowISO,
   numberSetting,
   sleep
@@ -2352,9 +2477,6 @@ const {
   repairConsumedFromDeliveries,
   repairTerminalFromDeadLetters
 } = require("./wake_recovery.js").createCodexRecovery({
-  DEFAULT_WAKE_CONCURRENCY,
-  WAKE_CAPACITY_DIR,
-  PINNED_THREAD_MODE,
   REPLY_DELIVERIES_PATH,
   REPLY_JOBS_DIR,
   REPLY_RECOVERY_LOCK_DIR,
@@ -2364,40 +2486,29 @@ const {
   connectRpcOnce,
   deadLetterPath,
   deliverReplyJob,
-  dirLockOwnerAlive,
   entryLaneKey,
-  isUnhealthyThreadState,
   markInboxConsumed,
   markInboxTerminal,
   markPendingStaleRecovery,
   messageIdForPayload,
   numberSetting,
-  pidAlive,
   probeTurnLiveness,
   readCanonicalTurnResult,
-  processStartIdentity,
   readWakeJSONLines,
   redactDiagnosticText,
-  removeStaleSocket,
   sleep,
-  socketOwnerPid,
-  startDaemon,
-  threadStateFromThread,
   unicodePrefix,
-  wakeLaneKey,
-  wakeLaneLockPath,
-  withDirLock
+  withWakeLock
 });
 
 if (require.main === module) {
   main().catch((error) => {
     jsonOut({ status: "failed", reason: "uncaught_error", error: String(error && error.message || error) });
-    process.exit(0);
+    process.exit(1);
   });
 }
 
 module.exports = {
-  appendReplyDeliveryReceiptUnlocked,
   appendPending,
   attachConsumeAndReplyDelivery,
   brainControlsForEntries,
@@ -2416,12 +2527,9 @@ module.exports = {
   daemonWorkingDirectoryState,
   parseLsofWorkingDirectory,
   deliverReplyJob,
-  dirLockOwnerAlive,
   drainPending,
   entryLaneKey,
   extractTurnResultFromRollout,
-  extractTurnResultFromThread,
-  extractTurnResultFromTurn,
   inspectBridgeThread,
   formatCodexReplyForNativeAgent,
   unicodePrefix,
@@ -2456,12 +2564,12 @@ module.exports = {
   unattendedServerRequestReply,
   waitForPendingDrainInvalidation,
   waitForDurableTerminalExecution,
-  waitForTurnResultWithEmptyRetry,
+  observeTurnResult,
   waitForTurnResultEventFirst,
   wakeConcurrencyCap,
   wakeLaneKey,
   wakeLaneLockPath,
   withWakeCapacity,
   withWakeExecutionLane,
-  withDirLock,
+  withWakeLock,
 };

@@ -101,21 +101,25 @@ extension ChatSessionRetention {
     }
 
     /// Restore the newest archived row and copy its bytes into the hot tier, retaining the archive.
-    /// Nil means no restorable archive. Caller holds the sessions lock before the transcript lock.
+    /// Nil means no archive row. Known history with unavailable bytes throws.
+    /// Caller holds the sessions lock before the transcript lock.
     public static func restoreArchivedRow(
         sessionId: String,
         dataRoot: URL
     ) async throws -> [String: JSONValue]? {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
-            return nil
+            throw CocoaError(.fileReadInvalidFileName)
         }
         let chat = dataRoot.appendingPathComponent("chat", isDirectory: true)
-        guard var row = try archiveIndexRows(dataRoot: dataRoot).last(where: { $0["id"] == .string(sessionId) }),
-              case .string(let relative)? = row["messagesArchivePath"] else { return nil }
+        guard var row = try archiveIndexRows(dataRoot: dataRoot).last(where: { $0["id"] == .string(sessionId) }) else { return nil }
+        guard case .string(let relative)? = row["messagesArchivePath"] else {
+            throw PersistenceCoreError.ioFailure("The archived conversation has no transcript path. Its saved history must be repaired before opening it.")
+        }
         let archivedBytes: Data
         do { archivedBytes = try Data(contentsOf: dataRoot.appendingPathComponent(relative)) }
-        // Missing archive bytes are not restorable.
-        catch CocoaError.fileReadNoSuchFile { return nil }
+        catch {
+            throw PersistenceCoreError.ioFailure("The archived conversation’s transcript could not be read: \(error.localizedDescription). Its saved history must be repaired before opening it.")
+        }
         let messagesPath = chat
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeSessionId).jsonl")

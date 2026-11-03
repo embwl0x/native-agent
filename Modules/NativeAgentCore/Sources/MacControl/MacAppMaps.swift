@@ -6,9 +6,8 @@ import PersistenceCore
 
 // After a VERIFIED act (the closed loop saw the effect, and the element acted
 // on answered the name asked), the app remembers where that named control
-// lives: `data/her_screen/app_maps/<bundle id>.json`. `screen` lists the
-// remembered controls its text render cut (KNOWN), and when a name misses by
-// resolution, `act` uses a remembered path ONLY if the live element there
+// lives: `data/her_screen/app_maps/<bundle id>.json`. When fresh name
+// resolution misses, `act` uses a remembered path ONLY if the live element there
 // still answers the name — role and label, the same `answers()` rule. A map entry is a hint about WHERE to look, never a license
 // to act: nothing here is ever clicked without a live read agreeing.
 //
@@ -58,12 +57,7 @@ public struct MacAppMap: Codable, Sendable, Equatable {
 
     public init() {}
 
-    /// A map written before `learned` existed is the bare controls array.
     public init(from decoder: Decoder) throws {
-        if let controls = try? decoder.singleValueContainer().decode([MacAppMapEntry].self) {
-            self.controls = controls
-            return
-        }
         let container = try decoder.container(keyedBy: CodingKeys.self)
         controls = try container.decode([MacAppMapEntry].self, forKey: .controls)
         learned = try container.decodeIfPresent([String: String].self, forKey: .learned) ?? [:]

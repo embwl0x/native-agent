@@ -3,7 +3,6 @@ import SwiftUI
 import WidgetKit
 import NativeAgentShared
 
-@main
 struct PhoneTurnWidget: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: PhoneTurnAttributes.self) { context in
@@ -45,5 +44,13 @@ struct PhoneTurnWidget: Widget {
         case .stopped: return "stop.fill"
         case .working: return "ellipsis"
         }
+    }
+}
+
+@main
+struct NativeAgentActivityWidgets: WidgetBundle {
+    var body: some Widget {
+        PhoneTurnWidget()
+        PhoneTalkWidget()
     }
 }

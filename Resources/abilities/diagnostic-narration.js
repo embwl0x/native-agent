@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id":"diagnostic-narration","kind":"tool","version":1,"reach":{"capabilities":[]},"face":{"page":"diagnostics"},"record":{"description":"Narrate checked Desk and Activity facts. Native owners retain measured status, corruption detection, reconciliation and repair authority.","actions":[],"inputSchema":{"type":"object","readOnly":true,"properties":{},"additionalProperties":true}}}
+{"id":"diagnostic-narration","kind":"ability","version":1,"reach":{"capabilities":[]},"face":{"page":"diagnostics"},"record":{"description":"Narrate checked Desk and Activity facts. Native owners retain measured status, corruption detection, reconciliation and repair authority.","actions":[],"inputSchema":{"type":"object","readOnly":true,"properties":{},"additionalProperties":true}}}
 */
 function labels(group) {
     return group.aliases.slice(0, 5).map(alias => "#" + alias).join(", ") +

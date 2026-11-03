@@ -5,7 +5,7 @@ import TurnTrace
 import ProviderRouting
 import ToolRegistry
 import Synchronization
-// Blueprint: | `ToolLoopSupport.swift` | `ToolLoopTraceObservation` retains prose and dispatch evidence across every loop throw and owns failed-attempt classification; legacy failed-slot counting stays separate; `ToolDispatchDeadline` |
+// Blueprint: | `ToolLoopSupport.swift` | `ToolLoopTraceObservation` retains prose and dispatch evidence across every loop throw and owns failed-attempt classification; failed-slot counting stays separate; `ToolDispatchDeadline` |
 
 /// Retains loop evidence across a throw without changing the public error carriers.
 final class ToolLoopTraceObservation: Sendable {
@@ -62,9 +62,9 @@ extension TurnEngineResult.LoopCounters {
 
 // MARK: - Per-tool-dispatch deadline
 //
-// runSingleDispatch races each call against a deadline and returns ToolDispatchTimedOut as that slot's error.
+// runSingleDispatch bounds the response wait; the original tool retains its actual receipt and checkpoint settlement.
 // Interactive and unattended calls have backstops; explicit timeout_seconds retains its window plus cleanup margin.
-// Structured concurrency cannot preempt a non-cooperative synchronous child and awaits it at scope exit.
+// Expiry never cancels the write. Stop requests cancellation; neither signal proves the effect stopped.
 public enum ToolDispatchDeadline {
     /// Env override for the universal backstop, in seconds. <=0 / non-finite
     /// disables it on every surface.
@@ -131,18 +131,13 @@ public enum ToolDispatchDeadline {
         return UInt64(capped * 1_000_000_000)
     }
 
-    /// Thrown by the deadline task when a dispatch exceeds its backstop.
-    /// CustomStringConvertible so the existing
-    /// `String(describing:)` catch yields a clean, model-readable message.
-    struct ToolDispatchTimedOut: Error, CustomStringConvertible {
-        let tool: String
-        let seconds: TimeInterval
-        var description: String {
-            // ms/s label so a sub-second deadline doesn't render as "0s"
-            // (loop #1's diagnostic lesson).
-            let label = seconds >= 1 ? "\(Int(seconds))s" : "\(Int(seconds * 1000))ms"
-            return "tool '\(tool)' exceeded the \(label) dispatch deadline; the outcome is uncertain and effects may already have occurred. Inspect the original receipt and current state before retrying. After reconciliation, any authorized new attempt can use narrower work, an explicit timeout_seconds value, or the asynchronous message tool"
-        }
+    /// A wait expiry is not the tool's terminal outcome.
+    static func timeoutError(tool: String, seconds: TimeInterval) -> ToolFailureError {
+        let label = seconds >= 1 ? "\(Int(seconds))s" : "\(Int(seconds * 1000))ms"
+        return ToolFailureError("The wait for tool '\(tool)' exceeded \(label). Its original work continues to its own limit; effects are unknown until its receipt arrives.",
+            effects: .unknown, owner: tool, code: "tool_dispatch_wait_expired", status: .timeout,
+            instruction: "Read this turn's tool.dispatch.settled receipt and inspect the affected state before proposing another action. A missing receipt is an unknown outcome, never permission to repeat the write.",
+            recovery: .reconcile)
     }
 }
 
@@ -214,11 +209,11 @@ enum ProviderToolResultPage {
     ) async -> String {
         let limit = maxUTF8Bytes(for: toolName)
         guard content.utf8.count > limit else { return content }
-
+        do {
         let parsed = try? JSONValue.parse(Data(content.utf8))
         let originalResultClass = originalResultClass ?? (content.utf8.count <= ProviderToolResultRecoveryStore.maxEntryBytes
             ? parsed.map(ChatToolOutcome.exactResultClass) ?? .unknown : .unknown)
-        let recovery = await ProviderToolResultRecoveryStore.shared.store(
+        let recovery = try await ProviderToolResultRecoveryStore.shared.store(
             content: content,
             parsed: parsed,
             toolName: toolName,
@@ -241,7 +236,7 @@ enum ProviderToolResultPage {
             }
             fields["retained_bytes"] = .int(Int64(recovery.bytes))
         } else {
-            fields = ["sections": .array(ToolResultSections.pages(sections: ToolResultSections.projection(content: content, value: parsed, budget: budget), query: "", budget: budget)[0]),
+            fields = ["sections": .array(ToolResultSections.pages(sections: try ToolResultSections.projection(content: content, value: parsed, budget: budget), query: "", budget: budget)[0]),
                 "detail": .string("Only the displayed whole sections are included. The original could not be retained. Inspect an existing saved result; missing output does not establish failure.")]
         }
         fields["provider_projection"] = .string("bounded_tool_result")
@@ -267,6 +262,9 @@ enum ProviderToolResultPage {
                 fields = candidate
             }
         }
-        return (try? JSONValue.object(fields).serialize(pretty: false)) ?? "{}"
+        return try JSONValue.object(fields).serialize(pretty: false)
+        } catch {
+            return "Tool result projection is unavailable because its values could not be encoded: \(error.localizedDescription). This does not establish whether the tool's effects occurred. Inspect the saved result and repair its producing owner before repeating an action."
+        }
     }
 }

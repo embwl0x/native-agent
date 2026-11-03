@@ -1,6 +1,22 @@
 import SwiftUI
 import UIKit
 import NativeAgentShared
+// Blueprint: | `ChatStore+ICloudReplies.swift` | Signed correlation evidence acknowledges delivery before offscreen/terminal/sequence early returns; terminal receipts and snapshot settlement clear delivery uncertainty, preserving Error/Stop partial words; original and live incomplete endings stay incomplete, and omitted terminal kind never proves success |
+
+/// Chat and cold Siri/Shortcuts waits interpret the same signed endings.
+enum MobileChatTerminal: Equatable {
+    case completed, failed, stopped, incomplete
+
+    static func classify(_ kind: String?) -> Self? {
+        switch kind {
+        case "reply", "final": .completed
+        case "error": .failed
+        case "cancelled": .stopped
+        case nil, "incomplete": .incomplete
+        default: nil
+        }
+    }
+}
 
 extension ChatStore {
     /// Dispatch signed Mac events; terminal receipts share one settlement path.
@@ -14,7 +30,7 @@ extension ChatStore {
             steeringQueuedIDs.remove(queued.id)
             if kind == "steer_returned" {
                 if let client = pendingRetryClient {
-                    sendAsOwnMessage(queued.id, client: client, rowWritten: msg.metadata?["rowWritten"] == "true")
+                    sendAsOwnMessage(queued.id, client: client)
                 }
                 return
             }
@@ -26,9 +42,14 @@ extension ChatStore {
             messages.append(contentsOf: [ChatMessage(id: queued.id, role: .user, text: queued.text, awaitingMacTranscript: true, runId: msg.correlationID), note])
             return
         }
+        // Verification belongs to the bridge. Apply its evidence before
+        // terminal, offscreen and sequence early returns can skip it.
+        if let correlationID = msg.correlationID {
+            noteEvidencedActivity(correlationID: correlationID, activity: nil)
+        }
         let kind = msg.metadata?["kind"]
         if msg.metadata?["live"] != "true",
-           [nil, "reply", "final", "error", "cancelled"].contains(kind) {
+           MobileChatTerminal.classify(kind) != nil {
             receiveTerminalReply(msg)
             return
         }
@@ -41,7 +62,7 @@ extension ChatStore {
                 correlationID: correlationID,
                 reason: msg.metadata?["reason"] ?? msg.text
             )
-            if rejection.isExpiredRequest, record.request != nil {
+            if rejection.isExpiredRequest {
                 markPendingExchangeExpired(
                     correlationID: correlationID,
                     message: rejection.userMessage
@@ -82,10 +103,15 @@ extension ChatStore {
     /// detached exchange still settles even though its conversation is hidden.
     private func receiveTerminalReply(_ msg: BridgeMessage) {
         let kind = msg.metadata?["kind"]
-        let failed = kind == "error"
-        let stopped = kind == "cancelled"
-        let pendingId = msg.correlationID.flatMap { $0.isEmpty ? nil : $0 }
-            ?? (!failed && !stopped ? pendingICloudPlaceholders.first?.key : nil)
+        let terminal = MobileChatTerminal.classify(kind) ?? .incomplete
+        let failed = terminal == .failed
+        let stopped = terminal == .stopped
+        let incomplete = terminal == .incomplete
+        guard let correlationID = msg.correlationID, !correlationID.isEmpty else {
+            errorBanner = "A Mac reply has no request identity, so it could not be matched. Pending exchanges are retained. Refresh this conversation to read the Mac's transcript."
+            return
+        }
+        let pendingId: String? = correlationID
         let record = pendingId.flatMap { pendingExchanges[$0] }
         let offscreen = record.map { $0.sessionID != Self.cleanSessionID(selectedSessionID) } ?? false
         let placeholderId = pendingId.flatMap {
@@ -115,9 +141,14 @@ extension ChatStore {
                              sessionID: record?.sessionID, visibleEffects: !offscreen, live: false)
         if let pendingId { settlePendingReply(pendingId, placeholderId: placeholderId) }
         if !offscreen {
+            if let pendingId {
+                onTalkReply?(pendingId, msg.text, true, failed ? Self.errorExplanation(msg) : stopped ? "Reply stopped. Listening to you." : incomplete ? msg.metadata?["status"] ?? "Reply ending is unconfirmed." : nil)
+            }
             if failed { errorBanner = msg.metadata?["errorDetail"].flatMap { $0.isEmpty ? nil : $0 } ?? msg.text }
-            if !failed && !stopped {
-                onReply?(msg.text)
+            if stopped { errorBanner = "Stopped. Any partial reply has been kept." }
+            if incomplete { errorBanner = msg.metadata?["status"] ?? "Reply ending is unconfirmed." }
+            if !failed && !stopped && !incomplete {
+                onReply?(msg.text, pendingId)
                 if wasLate {
                     requestScrollToBottom()
                     SystemToastCenter.shared.push(info: "Reply arrived")
@@ -130,13 +161,18 @@ extension ChatStore {
     private func receiveTerminalReply(_ msg: BridgeMessage, runID: String?, placeholderID: UUID?,
                                       sessionID: String?, visibleEffects: Bool, live: Bool) {
         let kind = msg.metadata?["kind"]
-        let failed = kind == "error", stopped = kind == "cancelled"
+        let terminal = MobileChatTerminal.classify(kind) ?? .incomplete
+        let failed = terminal == .failed, stopped = terminal == .stopped
+        let incomplete = terminal == .incomplete
+        let hasPartialReply = msg.metadata?["partialReply"] == "true"
+            && !msg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let key = sessionID ?? Self.nilQueueSessionKey
         var transcript = iCloudSyncEngine.shared.chatTranscripts[key]
             ?? .init(records: [], messages: [], generation: nil)
         var rows = visibleEffects ? messages : transcript.messages
-        let failure = live ? (failed ? msg.metadata?["errorDetail"] ?? msg.text : msg.metadata?["status"]) : nil
-        let state = failed ? "failed" : stopped || (live && kind == "incomplete") ? "incomplete" : "completed"
+        let failure = failed ? msg.metadata?["errorDetail"] ?? msg.text
+            : incomplete ? msg.metadata?["status"] ?? "Reply ending is unconfirmed." : live ? msg.metadata?["status"] : nil
+        let state = failed ? "failed" : stopped || incomplete ? "incomplete" : "completed"
         let publishedIDs = live ? transcript.publishedIDs : []
         let saved = live ? rows.firstIndex {
             $0.runId == runID && $0.isTerminalReply && publishedIDs.contains($0.id)
@@ -147,7 +183,7 @@ extension ChatStore {
         }
         if live && (saved != nil || (msg.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && failure == nil)) {
             if let placeholderID, !publishedIDs.contains(placeholderID) { rows.removeAll { $0.id == placeholderID } }
-        } else if placeholderID != nil || live || (!failed && !stopped) {
+        } else if placeholderID != nil || live || (!failed && !stopped) || hasPartialReply {
             let index = placeholderID.flatMap { id in rows.firstIndex { $0.id == id } }
             var reply = index.map { rows[$0] } ?? ChatMessage(
                 id: placeholderID ?? UUID(), role: .assistant,
@@ -160,8 +196,11 @@ extension ChatStore {
                 reply.text = msg.text
                 reply.failureDetail = failure
                 reply.completionState = state
-            } else if failed || stopped {
-                Self.end(&reply, lifecycle: failed ? Self.errorExplanation(msg) : "Stopped", state: state)
+            } else if failed || stopped || incomplete {
+                // The terminal may arrive before any streamed snapshot.
+                // Apply its accumulated words before retiring the correlation.
+                if hasPartialReply || incomplete { reply.text = msg.text }
+                Self.end(&reply, lifecycle: failed ? Self.errorExplanation(msg) : stopped ? "Stopped" : failure ?? "Reply ending is unconfirmed.", state: state)
             } else {
                 reply.text = msg.text
                 reply.attachments = (msg.attachments ?? []).map {
@@ -175,7 +214,7 @@ extension ChatStore {
         if visibleEffects {
             messages = rows
             if let placeholderID { streamingHintsByMessageId.removeValue(forKey: placeholderID) }
-            if !live && !failed && !stopped && placeholderID != nil {
+            if !live && !failed && !stopped && !incomplete && placeholderID != nil {
                 errorBanner = nil
                 Haptics.replyFinalized()
             }
@@ -187,13 +226,14 @@ extension ChatStore {
 
     /// Snapshot recovery and terminal bridge receipts share retirement.
     func settlePendingReply(_ pendingId: String, placeholderId: UUID?) {
+        noteDeliveryAccepted(pendingId)
         markICloudReplyResolved(pendingId)
         closePendingExchange(pendingId)
         if let placeholderId {
             streamingHintsByMessageId.removeValue(forKey: placeholderId)
             releaseLoading(for: placeholderId)
         }
-        isPollingFallback = false
+        showsReplyWaitHint = false
     }
 
     /// A turn another door (the Mac, Telegram) started in this conversation,
@@ -277,7 +317,8 @@ extension ChatStore {
         if let correlationID = rejection.correlationID, !correlationID.isEmpty {
             match = pendingICloudPlaceholders[correlationID].map { (correlationID, $0) }
         } else {
-            match = pendingICloudPlaceholders.first
+            errorBanner = "A Mac rejection has no request identity. Pending exchanges are retained; refresh the conversation and check pairing."
+            return
         }
 
         guard let (pendingId, placeholderId) = match else {
@@ -286,7 +327,7 @@ extension ChatStore {
         }
 
         // A signed expiry proves the request never started; retain it for "Send now".
-        if rejection.isExpiredRequest, pendingExchanges[pendingId]?.request != nil {
+        if rejection.isExpiredRequest, pendingExchanges[pendingId] != nil {
             failPendingReply(
                 pendingId: pendingId,
                 placeholderId: placeholderId,
@@ -378,6 +419,7 @@ extension ChatStore {
         if let index { messages[index] = reply } else { messages.append(reply) }
         if live { liveTurnBubbles[correlationID] = reply.id }
         else {
+            onTalkReply?(correlationID, text, false, nil)
             noteEvidencedActivity(correlationID: correlationID, activity: nil, partialText: text)
             streamingHintsByMessageId.removeValue(forKey: reply.id)
             armTimeout(for: correlationID, placeholderId: reply.id)
@@ -388,7 +430,7 @@ extension ChatStore {
         if let hint = streamingHintsByMessageId[message.id], !hint.isEmpty {
             return hint
         }
-        if isPollingFallback {
+        if showsReplyWaitHint {
             // No evidenced activity to repeat — say only what this phone knows.
             return ChatWaitStatusPresentation.unacknowledged
         }
@@ -400,8 +442,8 @@ extension ChatStore {
     func cancelReplyWaits(for pendingId: String) {
         pendingTimeouts.removeValue(forKey: pendingId)?.cancel()
         if pendingICloudPlaceholders.isEmpty {
-            replyCatchUpTask?.cancel()
-            replyCatchUpTask = nil
+            replyStatusTask?.cancel()
+            replyStatusTask = nil
         }
     }
 
@@ -418,63 +460,23 @@ extension ChatStore {
         pendingTimeouts[pendingId] = task
     }
 
-    /// Catch up transport while replies remain outstanding.
+    /// Intent waits use this bounded wake interval; chat does not add another reader.
     static let iCloudReplyNudgeFloorSeconds: TimeInterval = 8
-    /// Snapshot reads backstop push delivery at a slower cadence.
-    static let iCloudReplySnapshotBackstopSeconds: TimeInterval = 30
-    static let iCloudReplyPollingHintAfterSeconds: TimeInterval = 10
+    static let iCloudReplyStatusDelaySeconds: TimeInterval = 10
 
-    func armReplyPoll(client: MacBridgeClient) {
-        guard replyCatchUpTask == nil, !pendingICloudPlaceholders.isEmpty else { return }
-        replyCatchUpTask = Task { [weak self, weak client] in
-            let startedAt = Date()
-            var nextSnapshotPollAt = startedAt.addingTimeInterval(Self.iCloudReplySnapshotBackstopSeconds)
-
-            while !Task.isCancelled {
-                // A stalled drain must not hold up per-exchange silence deadlines.
-                Task { await client?.pollICloudRepliesNow() }
-                try? await Task.sleep(
-                    nanoseconds: UInt64(Self.iCloudReplyNudgeFloorSeconds * 1_000_000_000)
-                )
-
-                guard !Task.isCancelled, let self else { return }
-                if self.pendingICloudPlaceholders.isEmpty {
-                    self.isPollingFallback = false
-                    self.replyCatchUpTask = nil
-                    return
-                }
-
-                let now = Date()
-                if now.timeIntervalSince(startedAt) >= Self.iCloudReplyPollingHintAfterSeconds {
-                    self.isPollingFallback = true
-                    for correlationID in self.pendingICloudPlaceholders.keys {
-                        self.showWaitStatus(correlationID: correlationID)
-                    }
-                }
-
-                if now >= nextSnapshotPollAt, let client {
-                    nextSnapshotPollAt = now.addingTimeInterval(Self.iCloudReplySnapshotBackstopSeconds)
-
-                    await self.forceRefresh(using: client)
-                }
+    func armReplyStatus() {
+        guard replyStatusTask == nil, !pendingICloudPlaceholders.isEmpty else { return }
+        replyStatusTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(Self.iCloudReplyStatusDelaySeconds)) }
+            catch { return }
+            guard !Task.isCancelled, let self else { return }
+            self.replyStatusTask = nil
+            guard !self.pendingICloudPlaceholders.isEmpty else { return }
+            self.showsReplyWaitHint = true
+            for correlationID in self.pendingICloudPlaceholders.keys {
+                self.showWaitStatus(correlationID: correlationID)
             }
         }
-    }
-
-    // MARK: - iCloud Snapshot Force Refresh
-
-    /// Like `refresh(using:)` but bypasses the 2-second throttle. Intended only for
-    /// active-send polling — not for user-driven or scenePhase refreshes.
-    /// Updates `lastRefreshAt` so throttled callers are debounced afterwards.
-    func forceRefresh(using client: MacBridgeClient) async {
-        lastRefreshAt = Date()
-        let sessionID = Self.cleanSessionID(selectedSessionID ?? mainSessionID)
-        let generation = sessionSwitchGeneration
-        let read = await client.readChatTranscript(sessionID: sessionID)
-        guard !Task.isCancelled,
-              generation == sessionSwitchGeneration,
-              sessionID == Self.cleanSessionID(selectedSessionID ?? mainSessionID) else { return }
-        applyMacTranscriptRead(read, sessionID: sessionID)
     }
 
     /// Silence changes status while preserving the partial answer and observation of the original request.
@@ -495,13 +497,14 @@ extension ChatStore {
     ) {
         pendingICloudPlaceholders.removeValue(forKey: pendingId)
         cancelReplyWaits(for: pendingId)
-        isPollingFallback = false
+        showsReplyWaitHint = false
         timedOutPendingIds[pendingId] = placeholderId
         streamingHintsByMessageId.removeValue(forKey: placeholderId)
         // Failure retires the placeholder and its sequence tracker, excluding straggler deltas.
         maxDeltaSeqByCorrelation.removeValue(forKey: pendingId)
         endPlaceholder(id: placeholderId, lifecycle: placeholderText, state: "failed", awaitingMacTranscript: awaitingMacTranscript)
         errorBanner = banner
+        onTalkReply?(pendingId, "", true, banner)
         releaseLoading(for: placeholderId)
     }
 

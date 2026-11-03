@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `ContextArena.swift` | `ContextArena`: bounded resident generations, immutable snapshot leases, serialized publication and pressure trimming |
+// Blueprint: | `ContextArena.swift` | `ContextArena`: bounded resident generations, immutable snapshot leases, serialized publication and honest pressure accounting |
 
 public enum ContextArenaBudget: Int, CaseIterable, Sendable, Codable {
     case mib32 = 32
@@ -52,7 +52,7 @@ public enum ContextArenaEntryError: Error, Equatable, Sendable {
     case logicalByteOverflow
 }
 
-/// A budget and eviction descriptor; content stays in the typed generation.
+/// A logical admission descriptor; content stays in the typed generation.
 public struct ContextArenaEntry: Sendable, Equatable {
     public let key: ContextArenaEntryKey
     public let tier: ContextArenaTier
@@ -173,16 +173,6 @@ public struct ContextGenerationSnapshot: Sendable, Equatable {
         self.logicalByteCount = totalBytes
     }
 
-    fileprivate func retainingWarmEntries(_ retained: [ContextArenaEntry]) throws -> Self {
-        try Self(
-            generationID: generationID,
-            sourceFingerprint: sourceFingerprint,
-            requiredDocumentMirrors: requiredDocumentMirrors,
-            hotEntries: hotEntries,
-            warmEntries: retained,
-            selectionIndex: selectionIndex
-        )
-    }
 }
 
 public enum ContextArenaPublicationFailure: Error, Equatable, Sendable {
@@ -343,9 +333,9 @@ public final class ContextArena: @unchecked Sendable {
         )
     }
 
-    /// Restores evicted warm entries without inventing a new durable store
-    /// generation. This is valid only for the exact currently published source
-    /// fingerprint and while normal-pressure prewarming is allowed.
+    /// Replaces resident mirrors/index metadata without inventing a durable
+    /// generation. Valid only for the exact published source fingerprint and
+    /// while normal-pressure prewarming is allowed.
     @discardableResult
     public func rehydrate(
         _ candidate: ContextGenerationSnapshot
@@ -427,43 +417,14 @@ public final class ContextArena: @unchecked Sendable {
 
         state.pressure = pressure
         state.prewarmingAllowed = pressure == .normal
-        let before = current.snapshot
-        let retainedWarm: [ContextArenaEntry]
-
-        switch pressure {
-        case .normal:
-            retainedWarm = before.warmEntries
-        case .warning:
-            let target = budget.byteLimit / 2
-            var projectedBytes = before.logicalByteCount
-            var retainedKeys = Set(before.warmEntries.map(\.key))
-            let evictionOrder = before.warmEntries.sorted(by: Self.shouldEvictBefore)
-            for entry in evictionOrder where projectedBytes > target {
-                retainedKeys.remove(entry.key)
-                projectedBytes -= entry.logicalByteCount
-            }
-            retainedWarm = before.warmEntries.filter { retainedKeys.contains($0.key) }
-        case .critical:
-            retainedWarm = []
-        }
-
-        let retainedKeys = Set(retainedWarm.map(\.key))
-        let evicted = before.warmEntries
-            .filter { !retainedKeys.contains($0.key) }
-            .map(\.key)
-        let after: ContextGenerationSnapshot
-        if evicted.isEmpty {
-            after = before
-        } else {
-            after = try before.retainingWarmEntries(retainedWarm)
-            state.current = makePublishedSnapshot(after)
-        }
-
+        // Entries describe payload retained by the generation owner; removing
+        // descriptors cannot free it. Pressure closes optional prewarming only.
+        let snapshot = current.snapshot
         return ContextArenaTrimReceipt(
             pressure: pressure,
-            beforeLogicalBytes: before.logicalByteCount,
-            afterLogicalBytes: after.logicalByteCount,
-            evictedWarmEntryKeys: evicted,
+            beforeLogicalBytes: snapshot.logicalByteCount,
+            afterLogicalBytes: snapshot.logicalByteCount,
+            evictedWarmEntryKeys: [],
             pinnedGenerations: pinnedGenerationsLocked()
         )
     }
@@ -535,10 +496,4 @@ public final class ContextArena: @unchecked Sendable {
         }
     }
 
-    private static func shouldEvictBefore(_ lhs: ContextArenaEntry, _ rhs: ContextArenaEntry) -> Bool {
-        if lhs.retentionPriority != rhs.retentionPriority {
-            return lhs.retentionPriority < rhs.retentionPriority
-        }
-        return lhs.key < rhs.key
-    }
 }

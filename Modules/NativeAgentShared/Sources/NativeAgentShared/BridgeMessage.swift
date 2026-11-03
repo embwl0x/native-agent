@@ -24,9 +24,9 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
     /// companion to send camera-roll images through iCloud to the Mac.
     public let attachments: [MultimodalAttachment]?
     /// HMAC-SHA256 (lowercase hex) over canonical JSON body
-    /// (keys sorted, "signature" key excluded). Optional for backward-compat
-    /// with older builds; receivers may reject unsigned messages once both sides
-    /// are upgraded.
+    /// (keys sorted, "signature" key excluded). Nil while constructing a
+    /// message and for the narrowly validated unsigned pairing resync hint;
+    /// receivers reject unsigned action and conversation envelopes.
     public var signature: String?
 
     public static func make(

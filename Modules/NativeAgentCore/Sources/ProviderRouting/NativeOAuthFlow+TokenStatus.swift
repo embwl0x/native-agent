@@ -77,22 +77,8 @@ extension NativeOAuthFlow {
         }
     }
 
-    /// The adapter's effective expiry, including its JWT/persisted precedence.
-    public static func expiresAt(providerId: String, dataRoot: URL? = nil) -> Date? {
-        try? credentialHealth(providerId: providerId, dataRoot: dataRoot)?.expiresAt
-    }
-
-    /// Format `expires_at` as a short status string for the OAuth badge.
-    /// For ChatGPT, a sign-in adopted from the shared Codex CLI home is
-    /// labeled as such: the reader must be able to tell WHOSE credentials
-    /// are live and that they did not come from an in-app sign-in.
-    public static func signInStatusDetail(providerId: String, dataRoot: URL? = nil) -> String? {
-        guard let health = try? credentialHealth(providerId: providerId, dataRoot: dataRoot) else { return nil }
-        return signInStatusDetail(providerId: providerId, health: health)
-    }
-
     fileprivate static func signInStatusDetail(providerId: String, health: OAuthCredentialHealth) -> String? {
-        guard health.configured else { return nil }
+        guard health.configured else { return health.detail.isEmpty ? nil : health.detail }
         let base = expiryStatusText(providerId: providerId, health: health)
         if normalizedOAuthProviderId(providerId) == "openai_oauth_direct",
            let path = health.authPath,
@@ -143,11 +129,11 @@ extension NativeOAuthFlow {
         activeAuthPath: URL? = nil,
         sharedCLIHome: URL = ChatGPTTransport.defaultUserCodexHome(),
         dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> String? {
-        guard let path = activeAuthPath
+    ) throws -> String? {
+        guard let path = try activeAuthPath
             ?? openAIStatusAuthPath(dataRoot: dataRoot, sharedCLIHome: sharedCLIHome)
         else { return nil }
-        guard ChatGPTTransport.hasAccessToken(at: path) else { return nil }
+        guard try ChatGPTTransport.hasAccessToken(at: path) else { return nil }
         return openAIAdoptedCLISessionDetail(activeAuthPath: path, accountEmail: openAIAccountEmail(at: path), sharedCLIHome: sharedCLIHome)
     }
 
@@ -188,11 +174,6 @@ extension NativeOAuthFlow {
         return nil
     }
 
-    /// The adapter can use or renew this root's credential.
-    public static func isSignedIn(providerId: String, dataRoot: URL? = nil) -> Bool {
-        (try? credentialHealth(providerId: providerId, dataRoot: dataRoot))?.configured == true
-    }
-
     // MARK: - Paths (shared with the read-side adapters)
 
     /// App-owned ChatGPT auth WRITE target (`<dataRoot>/codex_home/auth.json`).
@@ -212,9 +193,9 @@ extension NativeOAuthFlow {
     public static func openAIStatusAuthPath(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         sharedCLIHome: URL = ChatGPTTransport.defaultUserCodexHome()
-    ) -> URL? {
+    ) throws -> URL? {
         let path = ChatGPTTransport.preferredAuthPath(dataRoot: dataRoot, userCodexHome: sharedCLIHome)
-        return ChatGPTTransport.hasAccessToken(at: path) ? path : nil
+        return try ChatGPTTransport.hasAccessToken(at: path) ? path : nil
     }
 
     public static func anthropicTokenPath(dataRoot: URL? = nil) -> URL {
@@ -231,37 +212,18 @@ extension NativeOAuthFlow {
         _ tokens: [String: Any],
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) throws {
-        guard let rawAccess = tokens["access_token"] as? String,
-              !rawAccess.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw NSError(
-                domain: "NativeOAuthFlow",
-                code: -21,
-                userInfo: [NSLocalizedDescriptionKey: "Anthropic OAuth response is missing access_token."]
-            )
-        }
-
+        let answer = try OAuthGrantOperations.validateTokenResponse(tokens, requiringRefreshToken: true)
         let path = anthropicTokenPath(dataRoot: dataRoot)
-        try ProviderStateValidation.credential(tokens)
         try OAuthGrantOperations.updateProviderCredential(at: path) { existing in
             for key in ["tokens", "id_token", "account", "oauth_account_identity", "refresh_token_account_identity"] {
                 existing.removeValue(forKey: key)
             }
             existing["client_id"] = ProviderOAuthConfig.anthropic.clientId
-            existing["access_token"] = rawAccess
+            existing["access_token"] = answer.accessToken
             // A new sign-in replaces the previous account's identity.
-            existing["refresh_token"] = (tokens["refresh_token"] as? String) ?? ""
-            let expiresIn: Int
-            if let integer = tokens["expires_in"] as? Int {
-                expiresIn = integer
-            } else if let floating = tokens["expires_in"] as? Double {
-                expiresIn = Int(exactly: floating.rounded(.towardZero)) ?? 3_600
-            } else if let string = tokens["expires_in"] as? String,
-                      let integer = Int(string) {
-                expiresIn = integer
-            } else {
-                expiresIn = 3_600
-            }
-            existing["expires_at"] = NativeTimestampFormat.basicZulu(Date().addingTimeInterval(TimeInterval(expiresIn)))
+            existing["refresh_token"] = answer.refreshToken
+            existing.removeValue(forKey: "expires_in")
+            existing["expires_at"] = answer.expiresIn.map { NativeTimestampFormat.basicZulu(Date().addingTimeInterval($0)) }
             existing["scope"] = (tokens["scope"] as? String) ?? ""
             existing["token_type"] = (tokens["token_type"] as? String) ?? "Bearer"
             existing["user_info"] = (tokens["user_info"] as? [String: Any]) ?? [:]
@@ -285,7 +247,11 @@ extension NativeOAuthFlow {
         }
         guard consentState != .allowed else { return nil }
         let auth = ChatGPTTransport.preferredAuthPath(userCodexHome: sharedCLIHome, source: .sharedCLI)
-        guard ChatGPTTransport.hasAccessToken(at: auth) else { return nil }
+        do {
+            guard try ChatGPTTransport.hasAccessToken(at: auth) else { return nil }
+        } catch {
+            return .unavailable(reason: ProviderFailure.diagnosticDescription(error))
+        }
         return .available(
             email: openAIAccountEmail(at: auth),
             alreadyDeclined: consentState == .declined
@@ -296,10 +262,10 @@ extension NativeOAuthFlow {
     public static func sharedCodexCLISessionRemains(
         providerId: String,
         sharedCLIHome: URL = ChatGPTTransport.defaultUserCodexHome()
-    ) -> Bool {
+    ) throws -> Bool {
         let id = providerId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard id == "openai_oauth_direct" || id == "codex" else { return false }
-        return ChatGPTTransport.hasAccessToken(
+        return try ChatGPTTransport.hasAccessToken(
             at: ChatGPTTransport.preferredAuthPath(userCodexHome: sharedCLIHome, source: .sharedCLI)
         )
     }
@@ -356,21 +322,13 @@ extension NativeOAuthFlow {
             guard let health = try NativeOAuthFlow.credentialHealth(providerId: providerID, dataRoot: dataRoot) else {
                 return SignInStatus(isSignedIn: false, detail: nil, error: nil)
             }
-            if providerID == "anthropic_oauth_direct", !health.configured {
-                return SignInStatus(isSignedIn: false, detail: nil,
-                    error: "Anthropic OAuth credentials unavailable: \(health.detail)")
-            }
             return SignInStatus(isSignedIn: health.configured,
                 detail: NativeOAuthFlow.signInStatusDetail(providerId: providerID, health: health), error: nil)
+        } catch CocoaError.fileReadNoSuchFile {
+            return SignInStatus(isSignedIn: false, detail: "No saved sign-in. Sign in through Providers.", error: nil)
         } catch {
-            guard providerID == "anthropic_oauth_direct",
-                  FileManager.default.fileExists(atPath: NativeOAuthFlow.anthropicTokenPath(dataRoot: dataRoot).path) else {
-                return SignInStatus(isSignedIn: false, detail: nil, error: nil)
-            }
-            let detail = (error as? CocoaError)?.code == .fileReadCorruptFile
-                ? "saved credentials are not a JSON object"
-                : "saved credentials could not be read: \(error.localizedDescription)"
-            return SignInStatus(isSignedIn: false, detail: nil, error: "Anthropic OAuth credentials unavailable: \(detail)")
+            return SignInStatus(isSignedIn: false, detail: nil,
+                error: "\(providerID) credentials are unavailable: \(ProviderFailure.diagnosticDescription(error)). Repair the saved credential before reconnecting.")
         }
     }
 

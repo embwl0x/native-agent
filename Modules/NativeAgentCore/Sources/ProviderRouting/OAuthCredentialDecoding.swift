@@ -51,7 +51,7 @@ public enum OAuthRefreshBinding {
 
     static func tokenSet(_ object: [String: Any], provider: String) -> [String: Any] {
         // Read a complete token set, never mix top-level access with nested refresh.
-        if provider == "openai_oauth_direct" || (object["access_token"] == nil && object["refresh_token"] == nil) {
+        if provider == "openai_oauth_direct" {
             return object["tokens"] as? [String: Any] ?? [:]
         }
         return object

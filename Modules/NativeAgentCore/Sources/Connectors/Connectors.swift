@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `Connectors.swift` | Canonical workspace-array read and tilde-expanded string paths for search and journal roots; typed workspace search results and checked identity metadata; empty queries echo their original input |
+// Blueprint: | `Connectors.swift` | Canonical workspace-array read and tilde-expanded string paths for search and journal roots; typed search stop reasons disclose capped and unvisited workspace coverage in results and activity; checked identity metadata; empty queries echo their original input |
 
 // Searches saved workspaces with a 2,000-file limit per workspace and 50 results overall.
 // Each directory's files are searched before descending into its subdirectories.
@@ -50,6 +50,10 @@ public final class SwiftNativeConnectorsClient: Sendable {
                 unexamined.append("a workspace entry has no path")
                 continue
             }
+            if results.count >= maxResults {
+                unexamined.append("\(wsRoot.path): workspace was not searched because the overall \(maxResults)-result limit was reached")
+                continue
+            }
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: wsRoot.path, isDirectory: &isDir), isDir.boolValue else {
                 unexamined.append("\(wsRoot.path): workspace folder is missing or not a folder")
@@ -57,14 +61,16 @@ public final class SwiftNativeConnectorsClient: Sendable {
             }
 
             var scanned = 0
-            // A capped workspace does not prevent searching the next one.
-            if !walkDirectory(wsRoot, root: wsRoot, ws: ws, query: query,
-                              results: &results, scanned: &scanned, unexamined: &unexamined),
-               results.count < maxResults {
+            // A per-workspace scan cap does not prevent searching the next one.
+            switch walkDirectory(wsRoot, root: wsRoot, ws: ws, query: query,
+                                 results: &results, scanned: &scanned, unexamined: &unexamined) {
+            case .finished:
+                break
+            case .resultLimit:
+                unexamined.append("\(wsRoot.path): the rest of this workspace was not searched because the overall \(maxResults)-result limit was reached")
+            case .scanLimit:
                 unexamined.append("\(wsRoot.path): stopped after \(maxScanned) files; the rest of this workspace was not searched")
             }
-
-            if results.count >= maxResults { break }
         }
 
         try await recordSearchActivity(query: query, resultCount: results.count, unexamined: unexamined)
@@ -103,7 +109,14 @@ public final class SwiftNativeConnectorsClient: Sendable {
         NativeTimestampFormat.fractionalUTCOffset(date)
     }
 
-    /// Stops at either bound; recursion shares the workspace's scan count.
+    /// A finished traversal may still have I/O gaps recorded in `unexamined`.
+    private enum WalkOutcome {
+        case finished
+        case resultLimit
+        case scanLimit
+    }
+
+    /// Stops at either bound, preserving its reason through recursion.
     private func walkDirectory(
         _ dir: URL,
         root: URL,
@@ -112,7 +125,8 @@ public final class SwiftNativeConnectorsClient: Sendable {
         results: inout [Result<WorkspaceSearchResult, Error>],
         scanned: inout Int,
         unexamined: inout [String]
-    ) -> Bool {
+    ) -> WalkOutcome {
+        if results.count >= maxResults { return .resultLimit }
         let skipDirs: Set<String> = [".git", ".build", "node_modules", "__pycache__"]
 
         let entries: [URL]
@@ -124,7 +138,7 @@ public final class SwiftNativeConnectorsClient: Sendable {
             )
         } catch {
             unexamined.append("\(dir.path): folder could not be listed: \(error.localizedDescription)")
-            return true
+            return .finished
         }
 
         var files: [URL] = []
@@ -146,9 +160,9 @@ public final class SwiftNativeConnectorsClient: Sendable {
         }
 
         for file in files {
-            if results.count >= maxResults { return false }
+            if results.count >= maxResults { return .resultLimit }
+            if scanned >= maxScanned { return .scanLimit }
             scanned += 1
-            if scanned > maxScanned { return false }
 
             let filename = file.lastPathComponent
             let rel = Self.relativePath(of: file, under: root)
@@ -162,10 +176,13 @@ public final class SwiftNativeConnectorsClient: Sendable {
                 // searched by name only, which is its ordinary scope.
                 let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
                 if let size, size <= maxContentBytes {
-                    // Text decoding tolerates non-UTF8 bytes.
+                    // Content matches require a supported text encoding.
                     do {
                         let data = try Data(contentsOf: file)
-                        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
+                        guard let text = String(data: data, encoding: .utf8) else {
+                            unexamined.append("\(file.path): contents are not UTF-8; encoding is unavailable, so contents were not searched")
+                            continue
+                        }
                         if text.lowercased().contains(query) { matchReason = "content" }
                     } catch {
                         unexamined.append("\(file.path): contents could not be read: \(error.localizedDescription)")
@@ -187,12 +204,16 @@ public final class SwiftNativeConnectorsClient: Sendable {
 
         // Sorted subdirectories keep cap truncation reproducible.
         for sub in subdirs.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-            if !walkDirectory(sub, root: root, ws: ws, query: query,
-                              results: &results, scanned: &scanned, unexamined: &unexamined) {
-                return false
+            let outcome = walkDirectory(sub, root: root, ws: ws, query: query,
+                                        results: &results, scanned: &scanned, unexamined: &unexamined)
+            switch outcome {
+            case .finished:
+                continue
+            case .resultLimit, .scanLimit:
+                return outcome
             }
         }
-        return true
+        return .finished
     }
 
     // MARK: - helpers

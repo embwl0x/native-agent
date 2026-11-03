@@ -1,5 +1,58 @@
 import Foundation
-// Blueprint: | `SurfaceLayout.swift` | `SurfaceLayout` struct: the layout document's shape, vocabulary and seed; `addMissing`, `shown`, `arranged` for the Mac and the phone; `QuietToolPage` owns the shared page definitions including inbox/unindexed reads; `AppDoorNames` shares page/item aliases, the door's page resolution (`step`, `place`: alias, `page/item` split, home rooms) and derives accepted part face pages from those definitions |
+// Blueprint: | `SurfaceLayout.swift` | `SurfaceLayout` owns the document shape, vocabulary and seed; `SurfaceLayoutAvailability` carries its checked value or `SurfaceLayoutFailure` path/detail/repair across Mac and phone, and exposes shipped content names through their shipped profiles without supplying a substitute layout. `addMissing`, `shown`, `arranged` project validated layouts; `QuietToolPage` owns shared page definitions including inbox/unindexed reads; `AppDoorNames` shares page/item aliases and door resolution (`step`, `place`, home rooms), deriving accepted part face pages from those definitions |
+
+/// The layout owner publishes either its checked document or its repair, including to the phone.
+public enum SurfaceLayoutAvailability: Codable, Sendable, Equatable {
+    case available(SurfaceLayout)
+    case unavailable(SurfaceLayoutFailure)
+
+    public func get() throws -> SurfaceLayout {
+        switch self {
+        case .available(let layout): return layout
+        case .unavailable(let failure): throw failure
+        }
+    }
+
+    public var value: SurfaceLayout? {
+        if case .available(let layout) = self { return layout }
+        return nil
+    }
+
+    public var failure: SurfaceLayoutFailure? {
+        if case .unavailable(let failure) = self { return failure }
+        return nil
+    }
+
+    /// Layout controls presentation, never whether shipped content exists.
+    /// An unavailable document exposes the vocabulary with its failure; it
+    /// supplies no saved layout, fold state or writable version. The shipped
+    /// profile still determines which content belongs in this view.
+    public func contentNames(_ surface: String, profile: String?) -> [String] {
+        switch self {
+        case .available(let layout): return layout.shown(surface, profile: profile).map(\.name)
+        case .unavailable:
+            let off = Set(profile.flatMap { SurfaceLayout.shippedProfiles[$0]?.hidden } ?? [])
+            return (SurfaceLayout.vocabulary.first { $0.surface == surface }?.blocks ?? [])
+                .filter { !off.contains(surface + "." + $0.name) }.map(\.name)
+        }
+    }
+
+    public func arranged<Item>(_ surface: String, profile: String?, _ items: [Item], name: (Item) -> String) -> [Item] {
+        contentNames(surface, profile: profile).compactMap { key in items.first { name($0) == key } }
+    }
+}
+
+public struct SurfaceLayoutFailure: Codable, Sendable, Equatable, LocalizedError {
+    public let path: String
+    public let detail: String
+    public let instruction: String
+
+    public init(path: String, detail: String, instruction: String) {
+        self.path = path; self.detail = detail; self.instruction = instruction
+    }
+
+    public var errorDescription: String? { "\(path): \(detail) \(instruction)" }
+}
 
 public struct QuietToolPage: Sendable, Equatable {
     public let id: String
@@ -35,7 +88,7 @@ public struct QuietToolPage: Sendable, Equatable {
         QuietToolPage(id: "mac_integration", title: "Mac Integration",
                   summary: "Read and write access per Mac app: Calendar, Mail, Messages, Notes and the rest."),
         QuietToolPage(id: "pairing", title: "iPhone pairing",
-                  summary: "Paired phones and the iCloud pairing status."),
+                  summary: "Paired phones and the iCloud pairing status. item:phone-senses reads each phone sense's setup, missing steps and the Phone senses guide."),
         QuietToolPage(id: "agents", title: "Agents",
                   summary: "Agent contacts and coding helpers: message, read, connect, stop, recipes, bridge jobs, and Claude's worklog of what she has been doing and working on, newest first."),
         // Each Mac app and connector her actions reach is a page of its own:
@@ -108,6 +161,7 @@ public enum AppDoorNames {
         "trust center": "trust", "trust_center": "trust", "permissions": "trust",
         "setup": "settings", "preferences": "settings", "iphone": "pairing", "phone": "pairing",
         "pair": "pairing", "pairing devices": "pairing", "iphone pairing": "pairing", "chrome": "browser",
+        "phone senses": "pairing/phone-senses",
         "ongoing": "desk", "computer": "mac", "skill": "skills", "agent": "agents", "abilities": "tools", "ability": "tools",
         "bot": "bots", "helpers": "bots", "connector": "connectors", "mac integration": "mac_integration",
         "skills & tools": "skills",
@@ -163,6 +217,7 @@ public enum AppDoorNames {
                  + "Resolve with chat.list; older history: chat.search {session_id, sort:newest, limit:12}, no query; follow next_call. chat.message expands clipped bodies. Screen controls are separate actions."],
         "inbox": ["all": "compact notes newest first, archived and dismissed too, up to 200; read a note id for details and actions"],
         "desk": ["<exact title or handle>": "the matching Desk record; duplicate titles require the exact desk number"],
+        "pairing": ["phone-senses": "Phone senses guide: last reported per-sense on/off, iOS permission, missing setup and exact phone Settings steps; observations with source/time"],
         "diagnostics": ["doctor": "Doctor's last report; run doctor.run for fresh checks"],
         "telegram": ["status": "the poller's health, config and log freshness; never tokens or ids"],
         "skills": ["<skill name>": "the built-in guidance, as ability.read reads it",
@@ -261,6 +316,11 @@ public struct SurfaceLayout: Codable, Sendable, Equatable {
 
     public static let profilesAbout = "simple, advanced and agent are the window's views (settings.view_mode shows one); each hides surface.block names in that view only. phone is the profile the iPhone shows."
 
+    public static let shippedProfiles: [String: Profile] = [
+        "simple": Profile(hidden: ["chat.rows", "chat.briefs", "chat.working"]),
+        "advanced": Profile(hidden: []), "agent": Profile(hidden: []),
+    ]
+
     /// Today's hardcoded orders. Simple shows no conversations column.
     public static func seed(from build: String, at: String, hidden: Set<String> = []) -> SurfaceLayout {
         var surfaces: [String: [Block]] = [:]
@@ -271,8 +331,7 @@ public struct SurfaceLayout: Codable, Sendable, Equatable {
             }
         }
         return SurfaceLayout(layoutVersion: 1, seededFrom: build, updatedAt: at, source: "seed", digest: "", surfaces: surfaces,
-                             profiles: ["simple": Profile(hidden: ["chat.rows", "chat.briefs", "chat.working"]),
-                                        "advanced": Profile(hidden: []), "agent": Profile(hidden: [])],
+                             profiles: shippedProfiles,
                              phone: "simple")
     }
 

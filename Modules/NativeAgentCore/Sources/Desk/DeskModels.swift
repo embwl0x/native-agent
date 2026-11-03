@@ -39,11 +39,6 @@ public enum ArchiveFinalStatus: String, Sendable, CaseIterable, Equatable {
 public enum DeskOrigin: String, Sendable, CaseIterable, Equatable {
     case owner, agent, system
 
-    /// Persisted compatibility for Desk feeds written before the self-authored role was made identity-neutral. New writes always emit `agent`; the former private-name value remains read-only migration vocabulary.
-    public static func decodePersisted(_ rawValue: String) -> DeskOrigin? {
-        let retiredPrivateValue = ["ay", "ala"].joined()
-        return rawValue == retiredPrivateValue ? .agent : DeskOrigin(rawValue: rawValue)
-    }
 }
 
 // MARK: - Desk model and operation JSONValue read helpers
@@ -52,4 +47,39 @@ func jsonInt(_ obj: [String: JSONValue], _ key: String) -> Int? {
     if case .int(let i)? = obj[key] { return Int(i) }
     if case .string(let s)? = obj[key], let i = Int(s) { return i }
     return nil
+}
+
+/// A missing collection is the writer's omitted empty collection. A present
+/// collection must decode completely; no journal or snapshot drops a member.
+func deskStoredCollection<T>(_ value: JSONValue?, decode: (JSONValue) -> T?) -> [T]? {
+    guard let value else { return [] }
+    guard case .array(let rows) = value else { return nil }
+    var result: [T] = []
+    for row in rows {
+        guard let decoded = decode(row) else { return nil }
+        result.append(decoded)
+    }
+    return result
+}
+
+enum DeskJSON {
+    static func optionalStringsAreValid(_ object: [String: JSONValue], keys: [String]) -> Bool {
+        keys.allSatisfy { key in
+            guard let value = object[key] else { return true }
+            if case .string = value { return true }
+            return false
+        }
+    }
+
+    static func strings(_ value: JSONValue?, defaultWhenAbsent: Bool = true) -> [String]? {
+        guard let value else { return defaultWhenAbsent ? [] : nil }
+        return deskStoredCollection(value) { value in
+            guard case .string(let string) = value else { return nil }
+            return string
+        }
+    }
+
+    static func collection<T>(_ value: JSONValue?, decode: (JSONValue) -> T?) -> [T]? {
+        deskStoredCollection(value, decode: decode)
+    }
 }

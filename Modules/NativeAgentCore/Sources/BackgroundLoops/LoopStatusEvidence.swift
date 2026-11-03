@@ -4,7 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `LoopStatusEvidence.swift` | WatchdogStatus wire encoding, scheduler LoopState, LoopStatus and event-listener health evidence |
 
-/// Watchdog wire keys remain stable for persisted and surface-facing compatibility.
+/// Live app-owned runtime and execution evidence.
 public struct WatchdogStatus: Sendable, Encodable, Equatable {
     public var uptimeSeconds: Double
     public var runtimeLifecycleStatus: String
@@ -36,11 +36,9 @@ public struct WatchdogStatus: Sendable, Encodable, Equatable {
     }
 
     private static let knownKeys: Set<String> = [
-        "daemon",
         "uptimeSeconds",
-        "daemonLifecycleStatus", "daemonLifecycleDetail",
-        "launchAgentStatus", "launchAgentDetail",
-        "runningImprovements", "runningMissions",
+        "runtimeLifecycleStatus", "runtimeLifecycleDetail",
+        "runningImprovements", "runningExecutions",
         "lastActivity",
         "repairAvailable",
         "extras",
@@ -48,14 +46,11 @@ public struct WatchdogStatus: Sendable, Encodable, Equatable {
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: JSONKey.self)
-        try c.encode("swift", forKey: JSONKey("daemon"))
         try c.encode(uptimeSeconds, forKey: JSONKey("uptimeSeconds"))
-        try c.encode(runtimeLifecycleStatus, forKey: JSONKey("daemonLifecycleStatus"))
-        try c.encode(runtimeLifecycleDetail, forKey: JSONKey("daemonLifecycleDetail"))
-        try c.encode("not_applicable", forKey: JSONKey("launchAgentStatus"))
-        try c.encode("NativeAgent.app owns background loops; legacy daemon launch agents are retired.", forKey: JSONKey("launchAgentDetail"))
+        try c.encode(runtimeLifecycleStatus, forKey: JSONKey("runtimeLifecycleStatus"))
+        try c.encode(runtimeLifecycleDetail, forKey: JSONKey("runtimeLifecycleDetail"))
         try c.encode(runningImprovements, forKey: JSONKey("runningImprovements"))
-        try c.encode(runningExecutions, forKey: JSONKey("runningMissions"))
+        try c.encode(runningExecutions, forKey: JSONKey("runningExecutions"))
         try c.encodeIfPresent(lastActivity, forKey: JSONKey("lastActivity"))
         try c.encode(repairAvailable, forKey: JSONKey("repairAvailable"))
         try c.encodeUnknownFields(extras, excluding: Self.knownKeys)

@@ -9,25 +9,90 @@ import CryptoKit
 import NativeAgentShared
 import PersonaEngine
 import Privacy
-// Blueprint: | `Parts+Creation.swift` | Parts saving and rehearsal with staged-write settlement, inherited input contracts and ratcheting provenance; save receipts retain validate/proof/write milliseconds |
+// Blueprint: | `Parts+Creation.swift` | Parts saving and rehearsal with staged-write settlement, inherited input contracts and ratcheting provenance; owns save argument schema, parameter spellings and first-line/sentence description shortening with receipts; preflights literal prelude calls and declarations before staging/rehearsal, warns on dynamic names; save receipts retain validate/proof/write milliseconds |
 
 extension Parts {
+    static let descriptionLimit = 500
+    static let parameterNamePattern = "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+    static let parameterTypes = ["string": "string", "int": "int", "integer": "int", "number": "number",
+                                 "bool": "bool", "boolean": "bool", "list": "list", "array": "list", "object": "object"]
+
+    /// The save door's shape lives with its validators. Required-on-create fields stay optional here because a revision inherits them.
+    /// Cross-field and retained-version checks (including required param names) remain the save owner's.
+    public static let saveArgumentsSchema: JSONValue = {
+        func text(_ description: String) -> JSONValue { .object(["type": .string("string"), "description": .string(description)]) }
+        func object(_ properties: [String: JSONValue], required: [String] = []) -> JSONValue {
+            .object(["type": .string("object"), "properties": .object(properties),
+                     "required": .array(required.map(JSONValue.string)), "additionalProperties": .bool(false)])
+        }
+        func list(_ items: JSONValue, _ description: String) -> JSONValue {
+            .object(["type": .string("array"), "items": items, "description": .string(description)])
+        }
+        let spellings = parameterTypes.keys.sorted().flatMap { [$0, $0 + "?"] }.map(JSONValue.string)
+        let type: JSONValue = .object(["type": .string("string"), "enum": .array(spellings)])
+        let nonempty: JSONValue = .object(["type": .string("string"), "pattern": .string(#"\S"#)])
+        let parameter: JSONValue = .object(["anyOf": .array([type, object(["type": type, "description": nonempty], required: ["type"])])])
+        let map: JSONValue = .object(["type": .string("object"),
+            "propertyNames": .object(["pattern": .string(parameterNamePattern)]), "additionalProperties": parameter])
+        let strings = list(.object(["type": .string("string")]), "A list of strings.")
+        let schema = object(["type": .object(["const": .string("object")]), "properties": map,
+            "required": strings, "additionalProperties": .object(["const": .bool(false)]),
+            "readOnly": .object(["type": .string("boolean")])], required: ["type", "properties"])
+        let fixtures: JSONValue = .object(["type": .string("array"), "maxItems": .int(16),
+            "description": .string("At most 16 cases in 256 KiB. Omit to inherit; [] clears. Hand-written cases supply input and expected, with optional calls and answers. Recorded tape fixtures on older compiled abilities may only be inherited."),
+            "items": .object(["anyOf": .array([
+                .object(["type": .string("object"), "properties": .object(["input": .object([:]), "expected": .object([:])]),
+                    "required": .array([.string("input"), .string("expected")])]),
+                object(["input": .object(["type": .string("object")])], required: ["input"])
+            ])])])
+        return object(AbilityStore.partArgumentSchemas.merging([
+            "id": text("Required: a new id, or an existing ability's id or name. New ids normalize to 2–64 lowercase letters, digits, - and _, a letter first."),
+            "description": text("Required for a new ability; omitted on revision it inherits. Nonempty after trimming. Save keeps the first line within \(descriptionLimit) characters, ending at its last sentence when possible, and says when it shortened it; details belong in params descriptions or code."),
+            "code": text("Required for a new ability. JavaScript defining function run(input) or async function run(input), returning JSON; at most \(AbilityStore.sourceLimit) UTF-8 bytes. Both app.<page>.<action>(args) and app({action:'page.action',args}) work; app({actions:[…]}), app({find:'words'}) and app({item:…}) also work. app and host calls answer synchronously and may be awaited; a returned Promise must settle in the helper's microtask drain. Omit on revision to inherit, or use edits instead."),
+            "edits": .object(["type": .string("array"), "minItems": .int(1),
+                "description": .string("Revision only, instead of code: ordered replacements, each old occurring exactly once in the latest code after earlier edits."),
+                "items": .object(["type": .string("object"), "properties": .object([
+                    "old": .object(["type": .string("string"), "minLength": .int(1)]), "new": .object(["type": .string("string")])]),
+                    "required": .array([.string("old"), .string("new")])])]),
+            "params": .object(["description": .string("Input name → type or {type,description?}; integer/boolean/array alias int/bool/list, and ? makes an input optional. Or {type:\"object\",properties:<same map>,required?:[names],additionalProperties?:false,readOnly?:bool}. Only type and description are accepted per param; name allowed values in description. Omit to inherit; null or {} clears."),
+                "anyOf": .array([map, schema, .object(["type": .string("null")])])]),
+            "actions": list(.object(["type": .string("string")]), "App actions reached through host.call, app.call, app.read(actionID) or part.call, whether their names are literal or computed. Literal callable app requests, direct app dot/bracket members and reach derive the other dependencies. Unknown literals and missing declarations refuse save; computed names retain runtime checks and produce warnings."),
+            "fixtures": fixtures,
+            "name": text("Display name; omitted it inherits or uses the id."),
+            "triggers": .object(["type": .string("array"), "description": .string("Retained trigger metadata; omit to inherit.")]),
+            "converts": list(.object(["type": .string("string"), "pattern": .string("^[0-9a-f]{64}$")]), "Original source SHA-256 digests from the conversion census."),
+            "create_only": .object(["type": .string("boolean"), "description": .string("Refuse an occupied id or name instead of revising it.")])
+        ]) { _, value in value }, required: ["id"])
+    }()
+
     /// `ability.save`, a new part or a revision. A revision restates only what changes: its code (or edits to it) and each declaration it
     /// leaves out are its latest version's; an explicit empty value drops one. Under Full Mac her own save is kept and on in this one act;
     /// otherwise it waits as a draft. `origin` is a pack's, for a pack's install.
     public func save(_ input: [String: JSONValue], steer: [String], fullMac: Bool, origin given: JSONValue? = nil) async throws -> [String: JSONValue] {
         let started = ContinuousClock.now
         var validateMS = 0.0, proofMS = 0.0
+        var descriptionNote: String?
         func milliseconds(since start: ContinuousClock.Instant) -> Double {
             let elapsed = start.duration(to: .now).components
             return Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15
         }
         func timed(_ receipt: [String: JSONValue]) -> [String: JSONValue] {
-            receipt.merging(["timing": .object(["validate_ms": .double(validateMS),
+            var receipt = receipt
+            if let descriptionNote {
+                receipt["description_note"] = .string(descriptionNote)
+                receipt["detail"] = .string((Self.string(receipt, "detail").map { $0 + " " } ?? "") + descriptionNote + ".")
+            }
+            return receipt.merging(["timing": .object(["validate_ms": .double(validateMS),
                 "proof_ms": .double(proofMS),
                 "write_ms": .double(max(0, milliseconds(since: started) - validateMS - proofMS))])]) { _, value in value }
         }
         func refuse(_ why: String) -> PartError { .invalid(why + " Nothing was saved.") }
+        guard case .object(let declaredArguments)? = Self.fields(Self.saveArgumentsSchema)["properties"] else {
+            throw refuse("The installed ability.save schema has no argument properties. Repair that schema before saving.")
+        }
+        if let unknown = input.keys.sorted().first(where: { !$0.hasPrefix("__") && !["verb", "preview"].contains($0) && declaredArguments[$0] == nil }) {
+            throw refuse("\(unknown) is not an ability.save argument. Read ability.save's current schema; declare input with params and authority with reach.capabilities.")
+        }
         guard OwnedProgramInvocation.host != nil else {
             throw refuse("ability.save needs the gated app door of a conversation or wake run to check dependencies.")
         }
@@ -59,16 +124,23 @@ extension Parts {
             }
         }
         guard let source = code ?? base?.program.source, !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw refuse("code is required: sync JavaScript defining function run(input).")
+            throw refuse("code is required: JavaScript defining function run(input) or async function run(input).")
         }
-        if let why = OwnedProgram.asyncRefusal(source) { throw SenseFailure(code: "async_code", message: why + " Nothing was saved.") }
-        let description = (Self.string(input, "description") ?? Self.string(was, "description") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !description.isEmpty else { throw refuse("description is required: one line saying when and why this ability helps.") }
-        if input["description"] != nil, description.count > 500 || description.rangeOfCharacter(from: .newlines) != nil {
-            throw refuse(description.count > 500 ? "description is \(description.count) characters; keep it to one line of at most 500 and put the details in params descriptions or the code."
-                : "description is one line; remove its line breaks.")
+        let suppliedDescription = (Self.string(input, "description") ?? Self.string(was, "description") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !suppliedDescription.isEmpty else { throw refuse("description is required: one line saying when and why this ability helps.") }
+        var description = String(suppliedDescription.prefix { !$0.isNewline }).trimmingCharacters(in: .whitespaces)
+        if description.count > Self.descriptionLimit {
+            let head = String(description.prefix(Self.descriptionLimit))
+            let sentence = head.indices.last { index in
+                let next = head.index(after: index)
+                return ".!?…。！？".contains(head[index]) && (next == head.endIndex || head[next].isWhitespace)
+            }
+            description = sentence.map { String(head[...$0]) } ?? String(head.prefix(Self.descriptionLimit - 1)).trimmingCharacters(in: .whitespaces) + "…"
         }
-        // Inputs: params (a type map, {type, description?} each, or a JSON Schema object), or a legacy input_schema kept as given.
+        if description != suppliedDescription {
+            descriptionNote = "description kept to its first \(description.count) characters"
+        }
+        // Inputs use params: a type map, {type, description?} each, or a JSON Schema object.
         // Unrestated, its latest version's: its program's schema, and its params (a skill's older version declared them inside its script).
         var params = was["params"] ?? Self.fields(was["script"] ?? .null)["params"]
         var schema = base?.program.schema ?? .object(["type": .string("object"), "properties": .object([:])])
@@ -79,29 +151,23 @@ extension Parts {
                 let read = try Self.params(declared)
                 params = .object(read.params); schema = Self.inputSchema(read.params, readOnly: read.readOnly)
             }
-        } else if let legacy = input["input_schema"] {
-            guard case .object = legacy else { throw refuse("input_schema is a JSON Schema object; params is the one form.") }
-            params = nil; schema = legacy
         }
         var header = input.filter { AbilityStore.partKeys.contains($0.key) }
-        if header["reach"] == nil, let legacy = input["permissions"] { header["permissions"] = legacy }
-        for key in AbilityStore.partKeys where header[key] == nil && !(key == "reach" && header["permissions"] != nil) { header[key] = was[key] }
-        let part = try AbilityStore.partHeader(header, saving: true)
+        for key in AbilityStore.partKeys where header[key] == nil { header[key] = was[key] }
+        let part = try AbilityStore.partHeader(header)
         let permissions = try Self.declaredStrings(Self.fields(part["reach"] ?? .null)["capabilities"], name: "reach.capabilities")
-        // What it calls is read off its code and derived from its reach; actions names only what it reaches dynamically (host.call).
+        // Direct app members, literal door requests and reach derive dependencies; indirect calls declare theirs in actions.
         let reached = AbilityStore.reachActions(permissions)
-        let called = OwnedProgram.calledActions(source)
-        // Resolve the complete dependency set once when building the candidate; dependencyShapes supplies the same unknown-action refusal
-        // for all calls.
-        if let bare = Self.bareCalls(source).first {
-            throw refuse("app.\(bare)() calls nothing: an action is app.<page>.<action>(…), and app's own verbs are read, find, log, step, decide, expect and expect_fail.")
-        }
-        if Self.callsAppAsFunction(source) {
-            throw refuse("app(…) is the chat spelling, not the program's: in code an action is app.<page>.<action>(args), e.g. app.agent.message({agent: \"Claude Desktop\", text: note}); app's own verbs are read, find, log, step, decide, expect and expect_fail.")
-        }
+        let calls = OwnedProgram.calls(source)
+        let called = calls.literal.filter { $0.inferred && !$0.primitive }.map(\.id)
         let declared: [String]
         if let given = input["actions"] {
-            declared = try Self.declaredStrings(given, name: "actions").compactMap(Self.dependencyID)
+            declared = try Self.declaredStrings(given, name: "actions").map { spelled in
+                guard let action = Self.dependencyID(spelled) else {
+                    throw refuse("actions entry \"\(spelled)\" is not an app action id. Use a current dotted action id; app's own read/find/log/step/decide/expect/expect_fail verbs need no declaration.")
+                }
+                return action
+            }
         } else {
             let earlier = Self.strings(was["declaredActions"] ?? was["actions"] ?? Self.fields(was["script"] ?? .null)["actions"])
             let derived = Set(AbilityStore.reachActions(try Self.declaredStrings(Self.fields(was["reach"] ?? .null)["capabilities"], name: "reach.capabilities"))
@@ -111,20 +177,18 @@ extension Parts {
         var actions: [String] = []
         for id in declared + called + reached where !actions.contains(id) { actions.append(id) }
         guard actions.count <= OwnedProgramRunner.actionLimit else { throw refuse("An ability calls at most \(OwnedProgramRunner.actionLimit) app actions.") }
-        // The night's keep moment saves against its recorded tape; a tape is never anyone's to write by hand.
-        let compiling = Self.compiling
-        try compiling?.admit(id: id, actions: actions)
-        let suppliedFixtures = input["fixtures"] ?? input["tests"]
-        let fixtures = try compiling?.fixtures(input["fixtures"]) ?? suppliedFixtures ?? base?.fixtures ?? .array([])
-        if compiling == nil, let suppliedFixtures, case .array(let given) = suppliedFixtures, given.contains(where: { Self.fields($0)["tape"] != nil }) {
+        let shapes = try await checkedCallShapes(calls, id: id, actions: actions, selfSchema: schema)
+        // Older compiled abilities may inherit their tape; callers cannot author one.
+        let suppliedFixtures = input["fixtures"]
+        let fixtures = suppliedFixtures ?? base?.fixtures ?? .array([])
+        if let suppliedFixtures, case .array(let given) = suppliedFixtures, given.contains(where: { Self.fields($0)["tape"] != nil }) {
             throw refuse("A fixture's tape comes only from recorded practice; give input, calls, answers and expected.")
         }
         guard case .array(let cases) = fixtures, cases.count <= 16, try fixtures.serializedData(pretty: false).count <= 256 * 1024 else {
             throw refuse("fixtures is a list of at most 16 {input, expected} cases in 256 KiB; omit it to capture during ability.validate.")
         }
         let name = Self.string(input, "name") ?? existing.flatMap { Self.string($0, "name") } ?? Self.referenceID(named)
-        // Compiled from turns other agents steered, it is theirs as much as hers.
-        let origin = given ?? Self.merged([Self.origin(steeredBy: steer + (compiling?.steer ?? []))] + Self.recorded(existing) + (base.map { [Self.fields($0.manifest)["origin"]] } ?? []))
+        let origin = given ?? Self.merged([Self.origin(steeredBy: steer)] + Self.recorded(existing) + (base.map { [Self.fields($0.manifest)["origin"]] } ?? []))
         let guidance = defaultPersonaRoot(dataRoot: root).appendingPathComponent("skills/bodies/\(id).md")
         var manifest: [String: JSONValue] = [
             "id": .string(id), "name": .string(name), "description": .string(description), "language": .string("javascript"),
@@ -132,7 +196,7 @@ extension Parts {
             "origin": origin, "converts": try OwnedProgramStore.conversionSources(input["converts"] ?? was["converts"]),
         ]
         if let params { manifest["params"] = params }
-        manifest["compiled"] = compiling?.record ?? was["compiled"]
+        manifest["compiled"] = was["compiled"]
         if given != nil, let pack = input["capabilityPackInstallId"] { manifest["capabilityPackInstallId"] = pack }
         if let triggers = input["triggers"] ?? was["triggers"] { manifest["triggers"] = triggers }
         if FileManager.default.fileExists(atPath: guidance.path) || was["overrides"] == .string("built_in") { manifest["overrides"] = .string("built_in") }
@@ -140,7 +204,7 @@ extension Parts {
         let candidate = try OwnedProgramStore.Candidate(
             program: OwnedProgram(kind: .part, id: id, version: "candidate", source: source, entry: .run, schema: schema,
                                   dependencies: actions, permissions: permissions, resident: part["resident"] == .bool(true)),
-            manifest: .object(manifest), fixtures: fixtures, dependencyShapes: try dependencyShapes(actions),
+            manifest: .object(manifest), fixtures: fixtures, dependencyShapes: shapes,
             prior: OwnedProgramStore.selection(existing.map(JSONValue.object)))
         let stamp = Self.now()
         enum Staging { case none, attempted, committed }
@@ -164,15 +228,7 @@ extension Parts {
             }
             var receipt: [String: JSONValue] = ["status": .string("saved"), "id": .string(id), "name": .string(name),
                 "candidate_digest": .string(candidate.digest), "actions": .array(actions.map(JSONValue.string))]
-            if let compiling {
-                // Staged, Full Mac included: its tape replays it before anything keeps it.
-                compiling.save(id: id, digest: candidate.digest)
-                receipt["ability_status"] = try row(id)?["status"] ?? .null
-                receipt["next_call"] = .object(["action": .string("ability.validate"), "args": .object(["id": .string(id)])])
-                receipt["detail"] = .string("\(name) is staged from your recorded practice. ability.validate replays its \(compiling.examples.count) examples exactly "
-                    + "(every call answered from the tape, nothing runs); once they pass, ability.enable keeps it.")
-                return timed(receipt)
-            }
+            if !calls.warnings.isEmpty { receipt["warnings"] = .array(calls.warnings.map(JSONValue.string)) }
             if manifest["compiled"] == nil, given == nil, fullMac, Self.keepRefusal(origin: origin, name: name, fullMac: true) == nil {
                 // Kept by her under Full Mac: a rehearsal proves no live behavior, so its first real run is its proof.
                 let proving = ContinuousClock.now
@@ -212,6 +268,9 @@ extension Parts {
             }
             var fields: [String: JSONValue] = ["id": .string(id), "name": .string(name), "candidate_digest": .string(candidate.digest),
                 "effects": .string("none"), "effect": .string("none"), "read_only": .bool(true), "execution": .string("rehearsed")]
+            let calls = OwnedProgram.calls(candidate.program.source)
+            _ = try await checkedCallShapes(calls, id: id, actions: candidate.program.dependencies, selfSchema: candidate.program.schema)
+            if !calls.warnings.isEmpty { fields["warnings"] = .array(calls.warnings.map(JSONValue.string)) }
             do {
                 attempted = true
                 let proof = try await rehearse(candidate, capture: capture, input: input)
@@ -279,8 +338,14 @@ extension Parts {
         for given in origins.isEmpty ? [nil] : origins {
             // A tool's older spellings: "self", or the steer of the turn that proposed it.
             let steer = Self.fields(given ?? .null)["steer"]
-            let spelled = given == .string("self") ? Self.origin(steeredBy: [])
-                : steer != nil && Self.fields(given ?? .null)["by"] == nil ? Self.origin(steeredBy: strings(steer)) : given
+            let spelled: JSONValue?
+            if given == .string("self") { spelled = Self.origin(steeredBy: []) }
+            else if let steer, Self.fields(given ?? .null)["by"] == nil {
+                guard case .array(let entries) = steer, entries.allSatisfy({
+                    if case .string(let peer) = $0 { !peer.isEmpty } else { false }
+                }) else { peers.append("unrecorded"); continue }
+                spelled = Self.origin(steeredBy: strings(steer))
+            } else { spelled = given }
             guard let kind = originKind(spelled) else { peers.append("unrecorded"); continue }
             let recorded = Self.fields(spelled ?? .null)
             if kind == "peer" { peers += strings(recorded["peers"]).filter { !CapabilityLifecycle.ownerTrusts($0) } }
@@ -322,13 +387,12 @@ extension Parts {
         func read(_ fields: [String: JSONValue]) throws -> [String: JSONValue] {
             var params: [String: JSONValue] = [:]
             for (name, value) in fields.sorted(by: { $0.key < $1.key }) {
-                guard name.range(of: "^[A-Za-z_][A-Za-z0-9_]{0,63}$", options: .regularExpression) != nil else {
+                guard name.range(of: parameterNamePattern, options: .regularExpression) != nil else {
                     throw refuse("params.\(name): a param name is a letter or _ then up to 63 letters, digits or _.")
                 }
                 let given = parameterType(value) ?? "", optional = given.hasSuffix("?")
                 let base = optional ? String(given.dropLast()) : given
-                let type = ["integer": "int", "boolean": "bool", "array": "list"][base] ?? base
-                guard ["string", "int", "number", "bool", "list", "object"].contains(type) else {
+                guard let type = parameterTypes[base] else {
                     throw refuse("params.\(name)'s type is " + (given.isEmpty ? "missing" : "\"\(given)\"") + ". " + shape)
                 }
                 let spelled = type + (optional ? "?" : "")
@@ -400,40 +464,9 @@ extension Parts {
     /// The action id an `actions` entry spells; nil for a runner verb or no id's shape.
     public static func dependencyID(_ spelled: String) -> String? {
         let id = spelled.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if id == "find" { return id }
         let bare = id.hasPrefix("app.") ? String(id.dropFirst(4)) : id
         return !OwnedProgram.verbs.contains(bare) && id.range(of: "^[a-z0-9_-]+(\\.[a-z0-9_-]+)+$", options: .regularExpression) != nil ? id : nil
     }
 
-    /// `app(` — the chat tool's request-object spelling, which the program door never had; refused at save so it never reaches a run as
-    /// "app is not a function".
-    static func callsAppAsFunction(_ source: String) -> Bool {
-        OwnedProgram.code(source).range(of: #"(^|[^\w.$])app\s*\("#, options: .regularExpression) != nil
-    }
-
-    /// `app.<name>(` that is no runner verb: a call to nothing (app.call is not the API).
-    static func bareCalls(_ source: String) -> [String] {
-        guard let regex = try? NSRegularExpression(pattern: #"\bapp\s*\.\s*(\w+)\s*\("#) else { return [] }
-        let code = OwnedProgram.code(source)
-        return regex.matches(in: code, range: NSRange(code.startIndex..., in: code)).compactMap { match in
-            Range(match.range(at: 1), in: code).map { String(code[$0]) }
-        }.filter { !OwnedProgram.verbs.contains($0) }
-    }
-
-    // MARK: - Older doors
-
-    /// A skill.save's or a tool.propose's arguments, as ability.save's.
-    public static func saveArguments(_ args: [String: JSONValue]) -> [String: JSONValue] {
-        var out = args
-        if let id = out.removeValue(forKey: "tool_id") { out["id"] = id }
-        if out["id"] == nil, let name = args["name"] { out["id"] = name }
-        if case .object(let script)? = out.removeValue(forKey: "script") {
-            out["code"] = out["code"] ?? script["source"]
-            if out["params"] == nil, let params = script["params"] { out["params"] = params }
-            if out["actions"] == nil, let actions = script["actions"] { out["actions"] = actions }
-        }
-        if let tests = out.removeValue(forKey: "tests"), out["fixtures"] == nil { out["fixtures"] = tests }
-        // A tool's inline rehearsal is ability.validate's now; a built-in's marker is the save's own.
-        for key in ["input", "capture", "overrides"] { out.removeValue(forKey: key) }
-        return out
-    }
 }

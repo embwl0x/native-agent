@@ -67,6 +67,10 @@ struct PairingView: View {
 
                     stepsCard
 
+                    if let failure = pairingStore.secretStorageError {
+                        Text(failure).foregroundStyle(.red).font(.callout)
+                    }
+
                     if let error = errorMessage {
                         Text(error)
                             .foregroundStyle(.red)
@@ -122,8 +126,7 @@ struct PairingView: View {
                 if pairingStore.isICloudSigned {
                     await connectViaICloud()
                 } else {
-                    await pairingStore.refreshFromKVS(allowDuringRepair: !bridge.usesCloudKitDeviceTransport)
-                    await bridge.drainDeviceTransport()
+                    await pairingStore.refreshFromCloudKit()
                 }
             }
         }
@@ -175,8 +178,7 @@ struct PairingView: View {
         Task {
             isCheckingForMac = true
             iCloudSecretError = nil
-            await pairingStore.refreshFromKVS(allowDuringRepair: !bridge.usesCloudKitDeviceTransport)
-            await bridge.drainDeviceTransport()
+            await pairingStore.refreshFromCloudKit()
             isCheckingForMac = false
             if !pairingStore.isICloudSigned {
                 iCloudSecretError = bridge.available

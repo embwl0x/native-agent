@@ -179,7 +179,6 @@ extension SwiftToolDispatcher {
             "detail": .string(fullDetail ? "full" : "compact"),
             "invoked_as": .string("agent_introspect"),
             "runtime": .string("swift-native"),
-            "python_daemon": .string("retired"),
             "provider": provider,
             "dispatch": .object([
                 "provider_tools_field": .bool(true),
@@ -198,23 +197,18 @@ extension SwiftToolDispatcher {
             "tool_state": .string("app is your one tool; app {find} finds an action by what you want done. Request detail=full for diagnostic roots and outcome population health"),
         ]
         if case .object(let stamp) = provider, case .string(let model)? = stamp["model"] {
-            var window = ChatSessionAutocompactionConfig.productionDefault().contextWindowReadout(
+            var window = try await ChatSessionAutocompactionConfig.productionDefault().contextWindowReadout(
                 forModel: model, providerID: stamp["name"]?.stringValue, dataRoot: dataRoot)
             window["route"] = .object(stamp.filter { ["name", "model", "surface", "reasoning_effort", "source"].contains($0.key) })
             window["owner"] = .string("The surface's provider/model/effort route selects the model. ProviderRouting's verified model catalog supplies its native window; Settings > Context window and ChatSessionAutocompactionConfig set the effective history budget. Effort is reported as routing context, not a separate window multiplier.")
             response["context_window"] = .object(window)
         }
         if !sessionId.isEmpty {
-            // session_id stays as a compatibility alias, but now names the
-            // same authoritative conversation scope used by traces,
-            // scratchpads, and lazy tool activation. The process-scoped
-            // identity is separate above and must never masquerade as chat.
             response["conversation_session_id"] = .string(sessionId)
-            response["session_id"] = .string(sessionId)
         }
         guard fullDetail else { return .object(response) }
 
-        let catalog = await catalogSnapshot(includeSchemas: false)
+        let catalog = try await catalogSnapshot(includeSchemas: false)
         let availableTools = Set(catalog.names.filter { !Self.isModelHidden($0) })
         let modelVisibleAvailableTools = Self.modelVisibleCatalogToolNames(availableTools)
         let activeTools = Self.alwaysOnCoreNames
@@ -222,7 +216,7 @@ extension SwiftToolDispatcher {
             .intersection(modelVisibleAvailableTools)
             .sorted()
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-        let trustedRoots = await trustedWorkspaceRoots()
+        let trustedRoots = try await trustedWorkspaceRoots()
         let outcomeDimensionHealth: JSONValue
         do {
             let audit = try await OutcomeDimensionStatePopulationReader(
@@ -247,12 +241,9 @@ extension SwiftToolDispatcher {
         response["available_tool_count"] = .int(Int64(modelVisibleAvailableTools.count))
         response["tool_count_semantics"] = .object([
             "active_tool_count": .string("Tools advertised to the model this turn: always-on core + turn-scoped, intersected with the model-visible catalog."),
-            "available_tool_count": .string("Every model-visible tool in the catalog, loaded or not."),
+            "available_tool_count": .string("Every model-visible tool in the catalog."),
         ])
         response["discovery"] = .string("every capability is an app action: app {} is home and the pages, app {find} finds an action")
-        response["compatibility"] = .object([
-            "recall_search": .string("alias_for_recall_memory"),
-        ])
         response["build"] = Self.buildStamp(identity: .current)
         return .object(response)
     }
@@ -266,11 +257,12 @@ extension SwiftToolDispatcher {
     /// the honest answer, never a bare `sourceRevision` promoted to proof.
     static func buildStamp(identity: NativeAgentBuildIdentity) -> JSONValue {
         .object([
-            "version": .string(identity.version),
-            "build": .string(identity.build),
+            "version": identity.unavailableReason == nil ? .string(identity.version) : .null,
+            "build": identity.unavailableReason == nil ? .string(identity.build) : .null,
             "exactSourceRevision": identity.exactSourceRevision.map(JSONValue.string) ?? .null,
-            "sourceDirty": .bool(identity.sourceDirty),
+            "sourceDirty": identity.sourceDirty.map(JSONValue.bool) ?? .null,
             "sourceContentID": identity.sourceContentID.map(JSONValue.string) ?? .null,
+            "unavailableReason": identity.unavailableReason.map(JSONValue.string) ?? .null,
         ])
     }
 
@@ -286,47 +278,39 @@ extension SwiftToolDispatcher {
             // Report the exact transport admitted with this turn. Model-family
             // inference cannot distinguish API-key, OAuth-direct, Codex, or an
             // OpenRouter route serving the same upstream model.
-            let snapshot = try? await router.checkedRoutingSnapshot()
-            let surfaceActiveProvider = snapshot.flatMap {
-                ProviderRoutingSurfaceLookup.value($0.activeProviders, turn.surface)
-            }
             return .object([
-                "name": .string(
-                    turn.providerID
-                        ?? router.inferProviderForModel(turn.model)
-                        ?? surfaceActiveProvider
-                        ?? "unknown"
-                ),
+                "name": turn.providerID.map(JSONValue.string) ?? .null,
                 "model": .string(turn.model),
                 "surface": .string(turn.surface),
                 "reasoning_effort": LLMCallContext.reasoningEffort.map(JSONValue.string) ?? .null,
-                "surface_active_provider": surfaceActiveProvider.map { JSONValue.string($0) } ?? .null,
-                "source": .string("live_turn"),
+                "source": .string(turn.providerID == nil ? "unavailable" : "live_turn"),
+                "error": turn.providerID == nil ? .string("The admitted turn provider identity is unavailable; repair the turn context producer.") : .null,
             ])
         }
         // Outside a turn there is no turn model in play; report the chat-surface
         // configured model as the best available answer.
-        if let snapshot = try? await router.checkedRoutingSnapshot(),
-           let pref = ProviderRoutingSurfaceLookup.value(snapshot.preferences, "chat")
-                ?? snapshot.preferences["chat"],
-           !pref.model.isEmpty {
+        do {
+            let snapshot = try await router.checkedRoutingSnapshot()
+            guard let pref = ProviderRoutingSurfaceLookup.value(snapshot.preferences, "chat"), !pref.model.isEmpty else {
+                return .object(["name": .null, "model": .null, "source": .string("unconfigured")])
+            }
             let surfaceActiveProvider = ProviderRoutingSurfaceLookup.value(
                 snapshot.activeProviders,
                 "chat"
             )
             return .object([
-                "name": .string(surfaceActiveProvider ?? router.inferProviderForModel(pref.model) ?? "unknown"),
+                "name": surfaceActiveProvider.map(JSONValue.string) ?? .null,
                 "model": .string(pref.model),
                 "surface": .string("chat"),
                 "reasoning_effort": .string(pref.reasoningEffort),
                 "surface_active_provider": surfaceActiveProvider.map { JSONValue.string($0) } ?? .null,
                 "source": .string("configured"),
             ])
-        }
-        return .object([
-            "name": .string("unknown"),
+        } catch { return .object([
+            "name": .null,
             "model": .null,
-            "source": .string("unresolved"),
-        ])
+            "source": .string("unavailable"),
+            "error": .string(error.localizedDescription),
+        ]) }
     }
 }

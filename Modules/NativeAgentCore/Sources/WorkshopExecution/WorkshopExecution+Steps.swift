@@ -8,7 +8,7 @@ import TrustCenter
 import MacIntegration
 import ToolRegistry
 import ChatToolParsing
-// Blueprint: | `WorkshopExecution+Steps.swift` | WorkshopExecutorLoop step progression, approval gating, dispatch and declared-read coverage |
+// Blueprint: | `WorkshopExecution+Steps.swift` | WorkshopExecutorLoop step progression, approval gating, dispatch and declared-read coverage; checked action contracts refuse admission when unavailable; failed reads continue without an optional flag |
 
 extension WorkshopExecutorLoop {
     func runClaimedWorkshopExecution(_ claimed: WorkshopExecutionRecord) async {
@@ -198,7 +198,19 @@ extension WorkshopExecutorLoop {
         var law = "auto"
         // The call that actually runs: a folded door action is its tool, as
         // the gate resolves it. It is judged, carded and replayed as itself.
-        let call = Self.resolvedStepCall(step, execution: execution)
+        let call: (tool: String, args: JSONValue, sourceArgs: JSONValue, readOnly: Bool)
+        do { call = try Self.resolvedStepCall(step, execution: execution) }
+        catch {
+            return WorkshopStepOutcome(stepId: step.id, status: "failed",
+                error: "The action contract could not be read, so this step did not run: \(error.localizedDescription)", executedAt: nowStr)
+        }
+        do {
+            if let refusal = try await MacAppActGate.requestRefusal(tool: ToolNameAliases.canonical(call.tool), input: call.args.objectValue ?? [:], dataRoot: root) {
+                return WorkshopStepOutcome(stepId: step.id, status: "failed", error: refusal.message, executedAt: nowStr)
+            }
+        } catch {
+            return WorkshopStepOutcome(stepId: step.id, status: "cancelled", error: "The action was cancelled before admission.", executedAt: nowStr)
+        }
         if !Self.llmStepKinds.contains(step.toolOrAction) {
             do {
                 law = try await SwiftNativeTrustCenter(dataRoot: root).autonomyLevel(forTool: call.tool, input: call.args.objectValue ?? [:])
@@ -262,12 +274,12 @@ extension WorkshopExecutorLoop {
 
     /// Dispatch and verification resolve aliases and step references identically.
     static func resolvedStepCall(_ step: WorkshopExecutionStep, execution: WorkshopExecutionRecord,
-                                 resolveReferences: Bool = true) -> (tool: String, args: JSONValue, sourceArgs: JSONValue, readOnly: Bool) {
+                                 resolveReferences: Bool = true) throws -> (tool: String, args: JSONValue, sourceArgs: JSONValue, readOnly: Bool) {
         let args = resolveReferences ? Self.resolveStepReferences(in: step.args, execution: execution) : step.args
         guard case .object(let fields) = args else { return (step.toolOrAction, args, args, false) }
         let call = ToolNameAliases.ranCall(step.toolOrAction, input: fields)
-        let readOnly = AppActionBinding.action(tool: call.tool, input: call.input)?.read == true
-            || PermissionLaw.toolClass(call.tool, input: call.input) == .read
+        let readOnly = try (AppActionBinding.action(tool: call.tool, input: call.input)?.read == true
+            || PermissionLaw.toolClass(call.tool, input: call.input) == .read)
         return (call.tool, .object(call.input), args, readOnly)
     }
 
@@ -281,7 +293,12 @@ extension WorkshopExecutorLoop {
         if tool.isEmpty {
             return WorkshopStepOutcome(stepId: step.id, status: "failed", error: "Empty tool_or_action", executedAt: nowStr)
         }
-        let call = Self.resolvedStepCall(step, execution: execution, resolveReferences: approvalId == nil)
+        let call: (tool: String, args: JSONValue, sourceArgs: JSONValue, readOnly: Bool)
+        do { call = try Self.resolvedStepCall(step, execution: execution, resolveReferences: approvalId == nil) }
+        catch {
+            return WorkshopStepOutcome(stepId: step.id, status: "failed",
+                error: "The action contract could not be read, so this step did not run: \(error.localizedDescription)", executedAt: nowStr)
+        }
         let readOnly = call.readOnly
         if step.optional == true && !readOnly {
             return WorkshopStepOutcome(stepId: step.id, status: "failed",
@@ -367,7 +384,7 @@ extension WorkshopExecutorLoop {
                         result = .object(fields)
                     }
                     try binding?.validateAfterDispatch(tool: tool, result: result)
-                    let resultState = Self.toolStepResultState(result, tool: call.tool, readOnly: readOnly, optional: step.optional == true)
+                    let resultState = Self.toolStepResultState(result, tool: call.tool, readOnly: readOnly)
                     let output: JSONValue = {
                         if case .object = result { return result }
                         return .object(["output": result])
@@ -387,12 +404,12 @@ extension WorkshopExecutorLoop {
             return outcome
         } catch let timeout as WorkshopStepTimedOut {
             // The deadline stays selected, but any returned receipt is retained.
-            // Effects and required reads fail; optional reads retain unavailability.
+            // A failed effect stops; an unavailable read leaves the next step to decide.
             let label = timeout.seconds >= 1
                 ? "\(Int(timeout.seconds))s"
                 : "\(Int(timeout.seconds * 1000))ms"
             return WorkshopStepOutcome(
-                stepId: step.id, status: readOnly && step.optional == true ? "skipped" : "failed",
+                stepId: step.id, status: readOnly ? "skipped" : "failed",
                 output: timeout.returned.map { .object(["settled_outcome": $0.toJSON()]) } ?? .null,
                 error: "\(call.tool) step_timeout_exceeded_\(label)" + (timeout.cause.map { ": \($0)" } ?? ""),
                 executedAt: nowStr,
@@ -407,14 +424,14 @@ extension WorkshopExecutorLoop {
             // caller's post-step re-read decides what sticks on disk.
             return WorkshopStepOutcome(stepId: step.id, status: "cancelled", error: "execution_cancelled", executedAt: nowStr)
         } catch {
-            return WorkshopStepOutcome(stepId: step.id, status: readOnly && step.optional == true ? "skipped" : "failed",
+            return WorkshopStepOutcome(stepId: step.id, status: readOnly ? "skipped" : "failed",
                 error: "\(call.tool): \(error)", executedAt: nowStr, readCoverage: readOnly ? .unavailable : nil)
         }
     }
 
-    /// Shared verdicts own finality; Workshop decides whether the retained evidence permits continuation.
+    /// Shared verdicts own finality; read evidence continues without an optional flag.
     static func toolStepResultState(
-        _ result: JSONValue, tool: String, readOnly: Bool = false, optional: Bool = false
+        _ result: JSONValue, tool: String, readOnly: Bool = false
     ) -> (status: String, error: String, readCoverage: WorkshopReadCoverage?) {
         let object = result.objectValue ?? [:]
         let rawStatus = object["status"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
@@ -442,7 +459,7 @@ extension WorkshopExecutorLoop {
             let absent = result == .null || ["error_code", "failure_code", "status"].contains {
                 object[$0] == .string("file_not_found") || object[$0] == .string("not_found")
             }
-            return (optional ? "skipped" : "failed", detail, absent ? .absent : .unavailable)
+            return ("skipped", detail, absent ? .absent : .unavailable)
         }
         if DeskContinuation.receiptIsUnresolved(result) || (!failed && verdict == .unknown) {
             return ("blocked_on_reconciliation", "\(tool) outcome remains unresolved; inspect its retained owner receipt before continuing.", nil)

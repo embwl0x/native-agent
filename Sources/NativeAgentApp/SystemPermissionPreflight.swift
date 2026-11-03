@@ -13,58 +13,58 @@ import MacControl
 import NativeAgentCore
 import NativeAgentShared
 import Photos
+import PersistenceCore
 import UserNotifications
 
-// Blueprint: | `SystemPermissionPreflight.swift` | `SystemPermissionPreflight`: shared card and Settings consent acquisition, checked unresolved-grant handoff and Bluetooth prompt lifecycle |
+// Blueprint: | `SystemPermissionPreflight.swift` | Shared card and Settings consent acquisition collects item authorization errors and remedies while continuing unrelated grants; three-second foreground activation and task-cancellable thirty-second Bluetooth answer bounds release their observers/managers without inventing a grant verdict |
 
 extension SystemPermissionPreflight {
     /// From a card tap, with the person there: fire macOS's own prompt where
     /// it has one, and open the right System Settings pane for what is still
     /// off. True when the card should wait for that pane.
     @MainActor
-    static func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> Bool {
-        !(await requestMacOSAccess(ids, mode: mode)).isEmpty
+    static func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async throws -> Bool {
+        !(try await requestMacOSAccess(ids, mode: mode)).isEmpty
     }
 
     /// Both permission cards and Settings request through this owner. A grant
     /// that succeeds stays in NativeAgent; only unresolved access opens a pane.
+    /// Item failures are reported together after unrelated grants are requested.
     @MainActor
     static func requestMacOSAccess(
         _ ids: [String], mode: InlineInteraction.AccessMode? = nil
-    ) async -> [String] {
+    ) async throws -> [String] {
         var problems: [String] = []
+        var requestFailed = false
         var openedPanes: Set<SystemPermissionCapability> = []
         defer { NotificationCenter.default.post(name: permissionDidChange, object: nil) }
         for id in ids {
             guard let gate = cardSettingsCapability(id),
                   await cardBlockReason([id], mode: mode) != nil else { continue }
-            if !NSApp.isActive {
-                let activation = AsyncStream<Void>(bufferingPolicy: .bufferingNewest(1)) { continuation in
-                    nonisolated(unsafe) let token = NotificationCenter.default.addObserver(
-                        forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
-                    ) { _ in continuation.yield(()); continuation.finish() }
-                    continuation.onTermination = { _ in NotificationCenter.default.removeObserver(token) }
-                }
-                NSApp.activate(ignoringOtherApps: true)
-                for await _ in activation {}
+            if let problem = await activationProblem() {
+                problems.append(problem)
+                break
             }
-            guard NSApp.isActive, !Task.isCancelled else {
-                return problems + ["The macOS permission request was interrupted."]
-            }
+            do {
             if let bundleID = AppleScriptExecution.automationTarget(id) {
-                _ = await AppleScriptExecution.automationPermission(bundleID: bundleID, ask: true)
+                let result = await AppleScriptExecution.automationPermission(bundleID: bundleID, ask: true)
+                if result.objectValue?["state"] == .string("unavailable") {
+                    throw ToolFailureError(try result.serialize(pretty: false), effects: .none)
+                }
             } else if gate == .notifications {
                 if await NativeAgentNotifications.notificationSettings().authorizationStatus == .notDetermined {
-                    _ = await NativeAgentNotifications.requestAuthorizationError()
+                    if let error = await NativeAgentNotifications.requestAuthorizationError() {
+                        throw ToolFailureError(error, effects: .none)
+                    }
                 }
             } else {
                 switch gate {
                 case .calendars where mode == .write:
-                    _ = try? await LocalPIMConnectorActions.requestCalendarWriteAccessIfNeeded(store: EKEventStore())
-                case .calendars: _ = await LocalPIMConnectorActions.requestCalendarAccess()
-                case .reminders: _ = await LocalPIMConnectorActions.requestReminderAccess()
+                    _ = try await LocalPIMConnectorActions.requestCalendarWriteAccessIfNeeded(store: EKEventStore())
+                case .calendars: _ = try await LocalPIMConnectorActions.requestCalendarAccess()
+                case .reminders: _ = try await LocalPIMConnectorActions.requestReminderAccess()
                 case .contacts where status(gate) == .notDetermined:
-                    _ = try? await CNContactStore().requestAccess(for: .contacts)
+                    _ = try await CNContactStore().requestAccess(for: .contacts)
                 case .speechRecognition: _ = await requestSpeechRecognitionIfNotDetermined()
                 case .location: MacLocationReader.requestAuthorization()
                 case .microphone where status(gate) == .notDetermined:
@@ -73,7 +73,10 @@ extension SystemPermissionPreflight {
                     _ = await AVCaptureDevice.requestAccess(for: .video)
                 case .photos where status(gate) == .notDetermined:
                     _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-                case .bluetooth where status(gate) == .notDetermined: await BluetoothPrompt.ask()
+                case .bluetooth where status(gate) == .notDetermined:
+                    if let unresolved = await BluetoothPrompt.ask() {
+                        throw ToolFailureError(unresolved, effects: .none)
+                    }
                 // These two list the app in their pane on first ask, so the
                 // person has a switch to turn on.
                 case .accessibility:
@@ -85,6 +88,21 @@ extension SystemPermissionPreflight {
                 default: break
                 }
             }
+            } catch {
+                let cause = "\(gate.displayName) (\(id)) permission request could not complete: \(error.localizedDescription)"
+                // A cancelled caller never opens another pane. Other request
+                // failures retain their cause alongside the existing remedy.
+                let handoff = Task.isCancelled || TaskWaitDeadline.expired || !openedPanes.insert(gate).inserted ? nil : openSettings(gate)
+                let remedy = " Open System Settings > Privacy & Security > \(gate.displayName), allow NativeAgent, then return here and refresh."
+                problems.append(cause + remedy + (handoff.map { " " + $0 } ?? ""))
+                requestFailed = true
+                if Task.isCancelled || TaskWaitDeadline.expired { break }
+                continue
+            }
+            guard !Task.isCancelled else {
+                problems.append("The macOS permission request was interrupted; its grant is unconfirmed.")
+                break
+            }
             if let reason = await cardBlockReason([id], mode: mode) {
                 problems.append(reason)
                 if openedPanes.insert(gate).inserted, let failure = openSettings(gate) {
@@ -92,7 +110,38 @@ extension SystemPermissionPreflight {
                 }
             }
         }
+        if requestFailed {
+            throw ToolFailureError(problems.joined(separator: " "), effects: .none,
+                owner: "macOS permissions", tap: "System Settings",
+                code: "system_permission_request_unresolved", instruction: "For each unresolved permission, allow NativeAgent in the named pane, then return to the permission card or Settings and refresh.")
+        }
         return problems
+    }
+
+    /// Activation is a request macOS may decline. Waking is not proof: read
+    /// AppKit's current state before asking for any grant, on every exit.
+    @MainActor
+    private static func activationProblem() async -> String? {
+        guard !Task.isCancelled else { return "The macOS permission request was interrupted." }
+        guard !NSApp.isActive else { return nil }
+        let activated = ScopedWaiter()
+        let observer = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: NSApp, queue: .main
+        ) { _ in activated.resume() }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        let deadline = Task {
+            do { try await Task.sleep(for: .seconds(3)) }
+            catch { return }
+            activated.resume()
+        }
+        defer { deadline.cancel() }
+        NSApp.activate()
+        await activated.park()
+        guard !Task.isCancelled else { return "The macOS permission request was interrupted." }
+        guard NSApp.isActive else {
+            return "NativeAgent could not become active to request macOS permission. Bring NativeAgent to the front and try again."
+        }
+        return nil
     }
 
     /// Retain a failed handoff as a visible request error in Settings.
@@ -114,20 +163,32 @@ extension SystemPermissionPreflight {
 @MainActor
 private final class BluetoothPrompt: NSObject, @preconcurrency CBCentralManagerDelegate {
     private var manager: CBCentralManager?
-    private var answered: CheckedContinuation<Void, Never>?
+    private let answered = ScopedWaiter()
 
-    static func ask() async {
+    static func ask() async -> String? {
         let prompt = BluetoothPrompt()
-        await withCheckedContinuation { continuation in
-            prompt.answered = continuation
-            prompt.manager = CBCentralManager(delegate: prompt, queue: .main)
+        prompt.manager = CBCentralManager(delegate: prompt, queue: .main)
+        let done = prompt.answered
+        let deadline = Task {
+            do { try await Task.sleep(for: .seconds(30)) }
+            catch { return }
+            done.resume()
         }
-        prompt.manager = nil
+        defer {
+            deadline.cancel()
+            prompt.manager?.delegate = nil
+            prompt.manager = nil
+        }
+        await done.park()
+        if Task.isCancelled { return "The Bluetooth permission wait was interrupted; macOS has not confirmed an answer." }
+        guard CBManager.authorization != .notDetermined else {
+            return "The Bluetooth permission wait ended without a macOS answer; access remains unconfirmed."
+        }
+        return nil
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         guard CBManager.authorization != .notDetermined else { return }
-        answered?.resume()
-        answered = nil
+        answered.resume()
     }
 }

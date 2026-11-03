@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `MacFourVerbs+TargetResolution.swift` | `MacFourVerbs`: `resolve`, `answers`, `bareNumberNote` |
+// Blueprint: | `MacFourVerbs+TargetResolution.swift` | `MacFourVerbs`: name/ordinal resolution and targetless main-content scroll selection from live visible geometry |
 
 // Pure name, role, ordinal, motion-identity, and aim-point resolution for the
 // already observed targets. Observation and dispatch stay in MacFourVerbs.swift.
@@ -309,7 +309,7 @@ extension MacFourVerbs {
             .filter { $0 != "moving" && $0 != "stationary" }.joined(separator: " ")
         func identity(_ targets: [ActTarget]) -> String? {
             guard case .hit(let candidate) = resolve(appearance, among: targets),
-                  candidate.physicalOnly, candidate.motionUncertain, candidate.enabled,
+                  candidate.physicalOnly, candidate.motionUncertain, candidate.enabled == true,
                   candidate.observedFrame != nil, let label = candidate.label, !label.isEmpty else { return nil }
             return candidate.handle + "|" + label
         }
@@ -337,7 +337,7 @@ extension MacFourVerbs {
         var handles = Set<String>()
         let fields = seen.targets.filter { candidate in
             // A field phrase never names a password field.
-            !candidate.isSupplemental && candidate.enabled && candidate.kind != "secure text"
+            !candidate.isSupplemental && candidate.enabled == true && candidate.kind != "secure text"
                 && seen.editableHandles.contains(candidate.handle)
                 && handles.insert(candidate.handle).inserted
         }
@@ -366,7 +366,29 @@ extension MacFourVerbs {
     /// Scroll names commonly combine a page title with the region kind. Kind
     /// is the decisive part: a browser can expose the same title on a radio,
     /// window, and web area, but only the web area is a scroll destination.
-    static func resolveScrollTarget(_ target: String, among targets: [ActTarget]) -> Resolution {
+    static func resolveScrollTarget(_ target: String, among targets: [ActTarget], viewport: MacAXFrame? = nil) -> Resolution {
+        if target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // The largest visible content region is the window's main body.
+            // Sidebar/toolbar landmarks and scrollbar furniture do not compete.
+            let contents = targets.filter {
+                $0.enabled == true && $0.kind != "scroll bar" && physicalScrollKinds.contains($0.kind)
+                    && visiblePortion(of: $0.frame, within: viewport) != nil
+            }.sorted {
+                func area(_ target: ActTarget) -> Double {
+                    guard let frame = visiblePortion(of: target.frame, within: viewport) else { return 0 }
+                    return frame.w * frame.h
+                }
+                return area($0) > area($1)
+            }
+            if let main = contents.first { return .hit(main) }
+            // A canvas with no AX scroll container still receives the wheel
+            // over its observed window. No off-window pointer is guessed.
+            if let viewport {
+                return .hit(ActTarget(handle: "", label: "main content", kind: "window", ordinal: nil,
+                    enabled: true, frame: viewport, regionOnly: true))
+            }
+            return .none(nearest: [])
+        }
         let phrase = normalize(target)
         for kind in physicalScrollKinds.sorted(by: { $0.count > $1.count })
         where phrase.contains(normalize(kind)) {
@@ -376,6 +398,8 @@ extension MacFourVerbs {
         }
         return resolve(target, among: targets, actionable: false)
     }
+
+    public static func isScrollVerb(_ raw: String) -> Bool { parseVerb(raw).0 == "scroll" }
 
     /// What she DID see, so a miss is a fact she can act on rather than a dead
     /// end. Labels only — an unnamed control is not a suggestion.

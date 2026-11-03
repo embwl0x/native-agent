@@ -5,6 +5,23 @@ import NativeAgentShared
 // Blueprint: | `iCloudSyncEngine+Transactions.swift` | Pending signed envelopes, pairing reconciliation, response mailbox recovery and deadline-bound transaction persistence with striped locking and exact-byte readback |
 
 extension iCloudSyncEngine {
+    /// The response and pending-envelope owners share one absence boundary.
+    /// Only an actual missing file is optional; unreadable bytes throw.
+    nonisolated static func readActionMailboxFile(at file: URL) throws -> Data? {
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: file.path)
+        } catch {
+            let failure = error as NSError
+            if failure.domain == NSCocoaErrorDomain,
+               failure.code == NSFileNoSuchFileError || failure.code == NSFileReadNoSuchFileError { return nil }
+            throw error
+        }
+        if FileManager.default.isUbiquitousItem(at: file) {
+            try FileManager.default.startDownloadingUbiquitousItem(at: file)
+        }
+        return try coordinatedRead(file, options: [.withoutChanges])
+    }
+
     nonisolated static func reconcileActionsForConnectionRepair(
         transactions: URL?, responses: URL?, inbox: URL?, currentSecret: Data? = nil
     ) async throws {
@@ -22,7 +39,7 @@ extension iCloudSyncEngine {
             let pendingDirectory = transactions?.appendingPathComponent("pending-actions", isDirectory: true)
             let pendingFiles = try files(in: pendingDirectory)
             let pendingActions = try pendingFiles.map { file in
-                let data = try Data(contentsOf: file)
+                let data = try VolumeIO.contents(of: file)
                 let action = try JSONDecoder().decode(InboxAction.self, from: data)
                 guard let signature = action.signature else {
                     throw SyncError.persistence("A pending action has no verifiable pairing signature.")
@@ -31,7 +48,7 @@ extension iCloudSyncEngine {
             }
             let ledgerFiles = try files(in: transactions)
             let records = try ledgerFiles.map {
-                try JSONDecoder().decode(ICloudTransactionRecord.self, from: Data(contentsOf: $0))
+                try JSONDecoder().decode(ICloudTransactionRecord.self, from: VolumeIO.contents(of: $0))
             }
             guard let currentSecret else { return }
             var staleMessageIDs = Set<String>()
@@ -70,55 +87,86 @@ extension iCloudSyncEngine {
     ) async -> Bool {
         guard UUID(uuidString: actionID) != nil,
               let responsesDir,
-              let data = text.data(using: .utf8),
-              let response = try? JSONDecoder().decode([String: String].self, from: data) else {
+              let data = text.data(using: .utf8) else {
+            syncError = "CloudKit action response has no valid mailbox identity or initialized storage."
             return false
         }
         let url = responsesDir.appendingPathComponent("\(actionID).json")
         do {
+            let response = try JSONDecoder().decode([String: String].self, from: data)
+            guard let action = response["action"], !action.isEmpty else {
+                throw SyncError.persistence("CloudKit action response omitted its action identity.")
+            }
             try await VolumeIO.run {
                 try data.write(to: url, options: .atomic)
             }
             // Wake response waiters only after the bytes are durable.
             ActionResponseWaiters.shared.signal(actionID)
-            if let action = response["action"], Self.isUnobservedAction(action) {
-                _ = await pollResponse(msgId: actionID, expectedAction: action,
-                                       settlesAnswersFromPreviousPairing: true)
-            }
+            _ = try await pollResponse(msgId: actionID, expectedAction: action,
+                                   settlesAnswersFromPreviousPairing: true)
             return true
         } catch {
-            syncError = "CloudKit action response could not be persisted: \(error.localizedDescription)"
+            syncError = "CloudKit action response could not be read or settled: \(error.localizedDescription)"
             return false
         }
     }
 
-    private nonisolated static func isUnobservedAction(_ action: String) -> Bool {
-        action == "recordNotificationReceipt" || action == "pairDevice"
+    /// Retained sends may outlive their UI waiter. Recover at most 64 ledger
+    /// entries at launch; arrivals settle their exact identity independently.
+    func settleUnobservedActionResponses() async {
+        let ceiling = ContinuousClock.now.advanced(by: .seconds(5))
+        let deadline = min(TaskWaitDeadline.current ?? ceiling, ceiling)
+        do {
+            try await TaskWaitDeadline.$current.withValue(deadline) {
+                try await TaskWaitDeadline.withDeadline(seconds: 5) { @MainActor in
+                    await self.recoverUnobservedActionResponses()
+                }
+            }
+        } catch {
+            syncError = "Action mailbox recovery did not finish: \(error.localizedDescription). Unsettled responses remain retained."
+        }
     }
 
-    /// These automatic sends have no UI waiter. Recover their replies at launch
-    /// and on legacy response nudges, including replies delivered after a quit.
-    func settleUnobservedActionResponses() async {
+    private func recoverUnobservedActionResponses() async {
         guard let transactionDir else { return }
         let generation = lifecycleGeneration
-        let pending = await VolumeIO.run {
-            let files = (try? FileManager.default.contentsOfDirectory(
-                at: transactionDir, includingPropertiesForKeys: nil
-            )) ?? []
-            return files.compactMap { file -> (String, String)? in
-                guard file.pathExtension == "json",
-                      let data = try? Data(contentsOf: file),
-                      let record = try? JSONDecoder().decode(ICloudTransactionRecord.self, from: data),
-                      record.direction == "ios_to_mac",
-                      Self.isUnobservedAction(record.action),
-                      !Self.isTerminalTransactionState(record.state) else { return nil }
-                return (record.msgId ?? record.id, record.action)
+        let recovered: (pending: [(String, String)], gaps: [String])
+        do { recovered = try await VolumeIO.run {
+            let enumerator = try FileManager.default.contentsOfDirectory(atPath: transactionDir.path)
+            var pending: [(String, String)] = []
+            var gaps: [String] = []
+            let candidates = enumerator.filter { $0.hasSuffix(".json") }.sorted()
+            for name in candidates.prefix(64) {
+                do {
+                    let file = transactionDir.appendingPathComponent(name)
+                    let record = try JSONDecoder().decode(ICloudTransactionRecord.self, from: VolumeIO.contents(of: file))
+                    guard record.direction == "ios_to_mac",
+                          !Self.isTerminalTransactionState(record.state) else { continue }
+                    guard let messageID = record.msgId else {
+                        throw SyncError.persistence("Pending action has no message identity.")
+                    }
+                    pending.append((messageID, record.action))
+                } catch { gaps.append("\(name): \(error.localizedDescription)") }
             }
+            if candidates.count > 64 { gaps.append("Launch recovery inspected 64 entries; additional receipts remain retained for response arrival or their original request's waiter.") }
+            return (pending, gaps)
+        } } catch {
+            syncError = "Pending action recovery could not read its transaction evidence: \(error.localizedDescription). Saved actions remain pending; repair iPhone transaction storage before retrying recovery."
+            return
         }
-        for (msgId, action) in pending {
+        var gaps = recovered.gaps
+        for (msgId, action) in recovered.pending {
             guard generation == lifecycleGeneration, !Task.isCancelled else { return }
-            _ = await pollResponse(msgId: msgId, expectedAction: action, settlesAnswersFromPreviousPairing: true)
+            if TaskWaitDeadline.expired {
+                gaps.append("Launch recovery reached its deadline; remaining responses are retained.")
+                break
+            }
+            do {
+                _ = try await pollResponse(msgId: msgId, expectedAction: action, settlesAnswersFromPreviousPairing: true)
+            } catch { gaps.append("\(msgId): \(error.localizedDescription)") }
         }
+        guard generation == lifecycleGeneration, !Task.isCancelled else { return }
+        if !gaps.isEmpty { syncError = "Action mailbox recovery is incomplete: " + gaps.joined(separator: ". ") }
     }
 
     /// Retain the exact signed envelope before submission. A retry of an
@@ -136,7 +184,7 @@ extension iCloudSyncEngine {
             var ambiguous = false
             for file in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
                 where file.pathExtension == "json" {
-                let data = try Data(contentsOf: file)
+                let data = try VolumeIO.contents(of: file)
                 let retained = try JSONDecoder().decode(InboxAction.self, from: data)
                 if retained.msgId == requested.msgId {
                     // An occupied identity must match every signed body field.
@@ -170,26 +218,28 @@ extension iCloudSyncEngine {
             let handle = try FileHandle(forWritingTo: file)
             defer { try? handle.close() }
             try handle.synchronize()
-            guard try Data(contentsOf: file) == data else {
+            guard try VolumeIO.contents(of: file) == data else {
                 throw SyncError.persistence("The pending action could not be verified after saving.")
             }
             return (requested, data, false)
         }
     }
 
-    func pendingCloudKitAction(msgId: String) async -> InboxAction? {
-        guard UUID(uuidString: msgId) != nil, let transactionDir else { return nil }
+    func pendingCloudKitAction(msgId: String) async throws -> InboxAction? {
+        guard UUID(uuidString: msgId) != nil else { throw SyncError.persistence("Invalid pending action identity.") }
+        guard let transactionDir else { throw SyncError.notSetup }
         let file = transactionDir.appendingPathComponent("pending-actions/\(msgId).json")
-        return await VolumeIO.run {
-            guard let data = try? Data(contentsOf: file) else { return nil }
-            return try? JSONDecoder().decode(InboxAction.self, from: data)
+        return try await VolumeIO.run {
+            guard let data = try Self.readActionMailboxFile(at: file) else { return nil }
+            let action = try JSONDecoder().decode(InboxAction.self, from: data)
+            guard action.msgId == msgId else { throw SyncError.persistence("Pending action filename and message identity disagree.") }
+            return action
         }
     }
 
     /// Previous-pairing answers settle as orphaned; files remain for ledger pruning.
-    func settleAnswerFromPreviousPairing(msgId: String, transactionId: String, action: String) async {
-        guard UUID(uuidString: msgId) != nil else { return }
-        try? await writeTransaction(
+    func settleAnswerFromPreviousPairing(msgId: String, transactionId: String, action: String) async throws {
+        try await writeTransaction(
             id: transactionId,
             action: action,
             state: "orphaned",
@@ -221,7 +271,9 @@ extension iCloudSyncEngine {
             throw SyncError.persistence("iCloud transaction ledger is not initialized.")
         }
         let capturedTransactionDir = transactionDir
-        let timeoutSeconds = max(0.05, transactionWriteTimeoutSeconds)
+        guard !TaskWaitDeadline.expired else { throw TaskWaitDeadline.cancellationError }
+        let timeoutSeconds = min(max(0.05, transactionWriteTimeoutSeconds),
+            TaskWaitDeadline.wallDate?.timeIntervalSinceNow ?? .infinity)
         let result: Result<Void, Error> = await withCheckedContinuation { continuation in
             let resumeBox = ContinuationOnce<Result<Void, Error>>()
             resumeBox.install(continuation)

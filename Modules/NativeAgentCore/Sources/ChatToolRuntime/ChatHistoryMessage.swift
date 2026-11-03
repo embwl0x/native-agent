@@ -17,7 +17,7 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
-// Blueprint: | `ChatHistoryMessage.swift` | Verbatim persisted messages, including boilerplate hidden by search, and bounded receipt pages |
+// Blueprint: | `ChatHistoryMessage.swift` | Verbatim persisted messages and bounded receipt pages; missing selected transcripts keep exact-message coverage incomplete |
 
 extension SwiftToolDispatcher {
     /// Characters per page. A page is a bounded read, not a whole transcript.
@@ -110,7 +110,7 @@ extension SwiftToolDispatcher {
             }
         }
         let complete = !listingFailed && unreadableSessionCount == 0
-            && malformedRowCount == 0 && invalidShapeRowCount == 0
+            && missingSessionCount == 0 && malformedRowCount == 0 && invalidShapeRowCount == 0
         let coverage: JSONValue = .object([
             "complete": .bool(complete),
             "scope": .string(requestedSession?.isEmpty == false ? "explicit_session" : "all_sessions"),
@@ -198,7 +198,7 @@ extension SwiftToolDispatcher {
                 + "Pass session_id to read a named copy."
             )
         }
-        if let title = readChatHistorySessionMetadata()[found.sessionId]?.title, !title.isEmpty {
+        if let title = try readChatHistorySessionMetadata()[found.sessionId]?.title, !title.isEmpty {
             response["session_title"] = .string(title)
         }
         return .object(response)

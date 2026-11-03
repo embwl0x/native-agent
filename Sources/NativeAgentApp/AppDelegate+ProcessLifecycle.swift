@@ -3,10 +3,9 @@ import NativeAgentShared
 import Foundation
 import AppKit
 import ServiceManagement
-import DeviceSync
 import PersistenceCore
 import os
-// Blueprint: | `AppDelegate+ProcessLifecycle.swift` | `AppDelegate`: `claimSingleAppInstance`, `presentSingleInstanceWedgedAlert`, `presentPublicReleaseDataRootError` |
+// Blueprint: | `AppDelegate+ProcessLifecycle.swift` | `AppDelegate`: checked single-instance activation with a bounded wait and process re-read; launch failure alerts and installed-app login registration |
 
 extension AppDelegate {
     @MainActor
@@ -20,32 +19,42 @@ extension AppDelegate {
         let semaphore = DispatchSemaphore(value: 0)
         let activationResult = OSAllocatedUnfairLock<Bool?>(initialState: nil)
         Task.detached(priority: .userInitiated) {
-            let activated = await withCKTimeout("singleInstanceActivate", seconds: 2) {
-                guard let target = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
-                    .first(where: { $0.processIdentifier == existingPID && !$0.isTerminated }) else {
-                    return false
-                }
-                return target.activate(options: [.activateAllWindows])
-            }
+            let target = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+                .first(where: { $0.processIdentifier == existingPID && !$0.isTerminated })
+            let activated = target?.activate(options: [.activateAllWindows])
             activationResult.withLock { $0 = activated }
             semaphore.signal()
         }
-        _ = semaphore.wait(timeout: .now() + 2.5)
-        guard activationResult.withLock({ $0 }) != nil else {
-            ModuleLog.app("[launch] existing pid wedged — cannot evict (kernel UE state); user must reboot")
-            Self.presentSingleInstanceWedgedAlert(pid: existingPID)
+        let wait = semaphore.wait(timeout: .now() + 2.5)
+        let activated = activationResult.withLock { $0 }
+        if activated == true {
+            ModuleLog.app("[launch] existing instance accepted activation (pid=\(existingPID)); exiting duplicate")
             return false
         }
-        ModuleLog.app("[launch] another NativeAgent instance is already running (pid=\(existing.processIdentifier)); activating it and exiting duplicate")
+        // A vanished process no longer owns the instance. Re-read the actual
+        // running apps, including a replacement that started during the wait.
+        let remaining = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+            .filter { $0.processIdentifier != currentPID && !$0.isTerminated }
+        guard !remaining.isEmpty else {
+            ModuleLog.app("[launch] previous instance exited before activation; continuing launch")
+            return true
+        }
+        let detail = wait == .timedOut
+            ? "Activation did not return within 2.5 seconds; its outcome is unknown."
+            : activated == false
+                ? "macOS returned false for the activation request."
+                : "The selected process exited before activation; another instance is still running."
+        ModuleLog.app("[launch] existing-instance activation unavailable: \(detail)")
+        Self.presentSingleInstanceActivationError(pids: remaining.map(\.processIdentifier), detail: detail)
         return false
     }
 
     @MainActor
-    static func presentSingleInstanceWedgedAlert(pid: pid_t) {
+    static func presentSingleInstanceActivationError(pids: [pid_t], detail: String) {
         NSApp.setActivationPolicy(.regular)
         let alert = NSAlert()
         alert.messageText = "NativeAgent cannot activate the existing app instance."
-        alert.informativeText = "The existing NativeAgent process (pid \(pid)) appears wedged in a system iCloud/CloudKit state. NativeAgent will exit this duplicate instance cleanly. Reboot the Mac to clear the stuck system process."
+        alert.informativeText = "\(detail) Running NativeAgent process IDs: \(pids.map { String($0) }.joined(separator: ", ")). This duplicate will exit. Open the existing NativeAgent window from the Dock or inspect those processes in Activity Monitor."
         alert.alertStyle = .critical
         alert.runModal()
     }
@@ -107,7 +116,6 @@ extension AppDelegate {
     /// sandboxable, replaces the old SMLoginItemSetEnabled API).
     @MainActor
     static func registerLoginItemIfNeeded() async {
-        guard #available(macOS 13.0, *) else { return }
         let bundlePath = Bundle.main.bundlePath
         guard InstallPaths.allowsLoginItem(bundlePath: bundlePath) else {
             print("[app] skipped login auto-start registration for non-installed bundle: \(bundlePath)")

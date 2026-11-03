@@ -7,24 +7,24 @@ import PersistenceCore
 import ProviderRouting
 import Cognition
 import DreamREMCycle
-// Blueprint: | `BackgroundWorkClients.swift` | `PersonaBackedBackgroundLLMClient` struct; `complete`, `streamMessages`; task-only context for `recall_judge`, `memory_interpret`, `memory_held`, and `kind_backfill`; other work honors caller-bound context assembly |
+// Blueprint: | `BackgroundWorkClients.swift` | `PersonaBackedBackgroundLLMClient`: `complete`, `streamMessages`, throwing `servingProviderID` and output-allowance forwarding; task-only context for `recall_judge`, `memory_interpret`, `memory_held`, and `kind_backfill`; other work honors caller-bound context assembly |
 
 // MARK: - Execution planner tool catalog injection
 //
 // Inject the dispatcher's tool catalog so Executions avoids a ChatTurnRuntime dependency cycle.
 public func makeWorkshopPlannerConnectorActionsProvider(
     dataRoot: URL = PersistenceCore.defaultDataRoot()
-) -> @Sendable () async -> [JSONValue] {
+) -> @Sendable () async throws -> [JSONValue] {
     // Reuse one dispatcher; schema reads recheck Full Mac flags and effects check authority.
     let holder = LazyDispatcherHolder(dataRoot: dataRoot)
     return {
         let dispatcher = await holder.dispatcher()
-        let schemas = (try? await dispatcher.listAvailableToolSchemas()) ?? []
-        return schemas.prefix(200).map { schema in
+        let schemas = try await dispatcher.listAvailableToolSchemas()
+        return try schemas.prefix(200).map { schema in
             JSONValue.object([
                 "id": .string(schema.name),
                 "description": .string(workshopPlannerToolDescription(schema)),
-                "parameters": (try? JSONValue.parse(schema.parametersJSON)) ?? .null,
+                "parameters": try schema.checkedParameters(),
             ])
         }
     }
@@ -88,8 +88,12 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
         }
     }
 
-    public func servingProviderID(model: String?, surface: String) async -> String? {
-        await inner.servingProviderID(model: model, surface: surface)
+    public func servingProviderID(model: String?, surface: String) async throws -> String {
+        try await inner.servingProviderID(model: model, surface: surface)
+    }
+
+    public func requestOutputTokens(model: String, surface: String) async throws -> Int {
+        try await inner.requestOutputTokens(model: model, surface: surface)
     }
 
     public func streamMessages(
@@ -131,8 +135,8 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
             == PersistenceCore.defaultDataRoot().standardizedFileURL
             ? SwiftNativePersonaEngine(dataRoot: dataRoot)
             : SwiftNativePersonaEngine.isolated(dataRoot: dataRoot)
-        let userMemoryCore = MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot)
-            ? await SwiftNativeMemoryV2.userCoreForBackground(dataRoot: dataRoot)
+        let userMemoryCore = try MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot)
+            ? try await SwiftNativeMemoryV2.userCoreForBackground(dataRoot: dataRoot)
             : []
         let packet = try await PersonaCompiler(engine: persona).compile(
             surface: surface, userMemoryCore: userMemoryCore

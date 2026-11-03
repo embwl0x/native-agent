@@ -245,7 +245,7 @@ public struct TurnContinuationRuntime: Sendable {
             })
     }
 
-    public func resumeTurn(_ checkpoint: TurnCheckpoint, progress: TurnEventSink? = nil) async throws {
+    public func resumeTurn(_ checkpoint: TurnCheckpoint) async throws {
         guard try DataRootLife.isCurrent(checkpoint.lifeID, in: dataRoot) else { throw CancellationError() }
         guard let surface = text(checkpoint.replyRoute, "surface") else { throw DeskContinuationError.unavailable }
         let route = AgentBridgeCompletionRoute(surface: surface, sessionId: checkpoint.sessionId,
@@ -253,15 +253,14 @@ public struct TurnContinuationRuntime: Sendable {
             sourceKey: text(checkpoint.replyRoute, "sourceKey"), replyTo: text(checkpoint.replyRoute, "replyTo"),
             correlationId: text(checkpoint.replyRoute, "correlationId"), requesterUserId: text(checkpoint.replyRoute, "requesterUserId"))
         let resume: @Sendable () async throws -> Void = {
-            try await resumeCheckpoint(checkpoint, route: route, progress: progress)
+            try await resumeCheckpoint(checkpoint, route: route)
         }
         if route.kind == .callerResult {
             try await engine.agents.tasks.resume(route, runID: checkpoint.runId, operation: resume)
         } else { try await resume() }
     }
 
-    private func resumeCheckpoint(_ checkpoint: TurnCheckpoint, route: AgentBridgeCompletionRoute,
-                                  progress: TurnEventSink?) async throws {
+    private func resumeCheckpoint(_ checkpoint: TurnCheckpoint, route: AgentBridgeCompletionRoute) async throws {
         guard let saved = TurnEnvelope.fromPersistedMetadata(.object(checkpoint.envelope)),
               let name = checkpoint.capabilityProfile,
               let profile = NativeAgentAppChatSurfaceProfile(rawValue: name),
@@ -294,7 +293,7 @@ public struct TurnContinuationRuntime: Sendable {
                         sessionId: checkpoint.sessionId, turnId: checkpoint.turnId), current.updatedAt == checkpoint.updatedAt else {
                         throw DeskContinuationError.conflict
                     }
-                    return try await client.resumeTurn(current, request: request, progress: progress)
+                    return try await client.resumeTurn(current, request: request)
                 }
             }
         }
@@ -450,13 +449,12 @@ public struct TurnContinuationRuntime: Sendable {
     }
 
     public func continueChatToolApproval(sessionID: String, envelope: TurnEnvelope, prompt: String,
-                                         fileAccess: String,
-                                         turnOptions: @escaping @Sendable () -> (persona: String?, serviceTier: String?)) async throws {
+                                         fileAccess: String) async throws {
         let steer = PeerDataTaint.current ?? PeerDataTaint()
         try await runApprovalAdmission(sessionID: sessionID, envelope: envelope, prompt: prompt) {
             try await PeerDataTaint.$current.withValue(steer) {
                 try await runApprovalFollowUp(sessionID: sessionID, envelope: envelope, prompt: prompt,
-                    fileAccess: fileAccess, turnOptions: turnOptions)
+                    fileAccess: fileAccess)
             }
         }
     }
@@ -464,17 +462,42 @@ public struct TurnContinuationRuntime: Sendable {
     /// Her normal tools on the card's own door: Trust, the peer
     /// floor and the steer bound around this turn judge every call in it.
     private func runApprovalFollowUp(sessionID: String, envelope: TurnEnvelope, prompt: String,
-                                     fileAccess: String,
-                                     turnOptions: @escaping @Sendable () -> (persona: String?, serviceTier: String?)) async throws {
+                                     fileAccess: String) async throws {
         let door = ConversationSurfaceProfile(envelope.surface)
-        let profile: NativeAgentAppChatSurfaceProfile = door.isAgentBridge
-            ? .bridge : door.isIOSRemote ? .ios : NativeAgentAppChatSurfaceProfile(rawValue: door.id) ?? .mac
-        let client = engine.chatClient(profile: profile,
-            approvalFiler: profile == .telegram ? telegramApprovalFiler() : nil)
-        let options = turnOptions()
-        let response = try await followUpRequest(message: prompt, sessionID: sessionID, fileAccess: fileAccess,
-            surface: envelope.surface, envelope: envelope, replyRoute: envelope.replyRoute,
-            persona: options.persona, serviceTier: .some(options.serviceTier)).chat(on: client)
+        let response: ChatResponse
+        if door.id == "bot" {
+            guard let bot = try BotDefinitionStore(dataRoot: dataRoot).definition(forSession: sessionID),
+                  bot.deleted != true else {
+                throw BotRunnerError.cannotRun("The approval's helper definition is unavailable. Repair its exact helper ownership before continuing.")
+            }
+            // Take the helper claim before turn admission, as scheduled/asked
+            // runs do. Its own session admits the turn; the approval wrapper
+            // must not hold turn admission while waiting for this claim.
+            let runner = BotRunner(dataRoot: dataRoot,
+                session: engine.standingBotSession(fileAccess: fileAccess))
+            let entry = try await followUpRequest(message: prompt, sessionID: sessionID, fileAccess: fileAccess,
+                surface: envelope.surface, envelope: envelope, replyRoute: envelope.replyRoute).bind {
+                    try await runner.ask(bot: bot.id, question: prompt)
+                }
+            response = StandingBotContinuity.response(BotTurnReply(reply: entry.actualReply,
+                artifacts: entry.artifacts ?? [], status: entry.runtimeStatus, detail: entry.statusDetail,
+                model: entry.model, approvalID: entry.approvalID), sessionID: sessionID, runID: entry.id.uuidString)
+        } else {
+            let profile: NativeAgentAppChatSurfaceProfile
+            if door.isAgentBridge { profile = .bridge }
+            else if door.isIOSRemote { profile = .ios }
+            else if door.id == "chat" { profile = .mac }
+            else if let supported = NativeAgentAppChatSurfaceProfile(rawValue: door.id) { profile = supported }
+            else {
+                throw NSError(domain: "ApprovalContinuation", code: 400, userInfo: [
+                    NSLocalizedDescriptionKey: "Unsupported approval continuation surface: \(door.id). Repair the card's origin before continuing."
+                ])
+            }
+            let client = engine.chatClient(profile: profile,
+                approvalFiler: profile == .telegram ? telegramApprovalFiler() : nil)
+            response = try await followUpRequest(message: prompt, sessionID: sessionID, fileAccess: fileAccess,
+                surface: envelope.surface, envelope: envelope, replyRoute: envelope.replyRoute).chat(on: client)
+        }
         // The approval claim covers both the turn and its one delivery attempt.
         // A failed or uncertain send must never cause another model turn.
         let saved = envelope.replyRoute
@@ -486,22 +509,25 @@ public struct TurnContinuationRuntime: Sendable {
     }
 
     private func followUpRequest(message: String, sessionID: String?, fileAccess: String, surface: String,
-        envelope: TurnEnvelope, replyRoute: ChatToolSessionContext.ReplyRoute, pinnedRunID: String?? = nil,
-        persona: String? = nil, serviceTier: String?? = nil) -> TurnRequest {
-        TurnRequest(message: message, sessionID: sessionID, fileAccess: fileAccess, persona: persona,
+        envelope: TurnEnvelope, replyRoute: ChatToolSessionContext.ReplyRoute, pinnedRunID: String?? = nil) -> TurnRequest {
+        TurnRequest(message: message, sessionID: sessionID, fileAccess: fileAccess,
             surface: surface, suppressUserAppend: true, envelope: envelope, verifiedSessionID: .some(sessionID),
             verifiedChatID: .some(envelope.verifiedChatId), verifiedUserID: .some(envelope.verifiedUserId),
-            replyRoute: replyRoute, pinnedRunID: pinnedRunID, serviceTier: serviceTier)
+            replyRoute: replyRoute, pinnedRunID: pinnedRunID)
     }
 
     /// `runID`: the resumed run, so a restart's restored backlog admits it in its place.
     private func runAdmittedContinuation<T: Sendable>(sessionID: String?, runID: String? = nil,
         operation: @escaping @Sendable () async throws -> T) async throws -> T {
-        try await TurnAdmission.shared.run(sessionID: sessionID, runID: runID, operation: operation)
+        try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionID, runID: runID, operation: operation)
     }
 
     private func runApprovalAdmission(sessionID: String, envelope: TurnEnvelope, prompt: String,
         operation: @escaping @Sendable () async throws -> Void) async throws {
+        if ConversationSurfaceProfile(envelope.surface).id == "bot" {
+            try await operation() // BotRunner -> helper session -> TurnAdmission.
+            return
+        }
         guard envelope.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "telegram" else {
             try await runAdmittedContinuation(sessionID: sessionID, operation: operation)
             return
@@ -574,7 +600,7 @@ public struct EngineAgentBridgeCompletionSender: AgentBridgeCompletionSending {
   private let engine: @Sendable () -> NativeAgentEngine
   private let router: @Sendable () -> AttentionRouter
   let dataRoot: URL
-  /// Telegram text lands without a sound or alert (context, not a ping).
+  /// Telegram replies, including images, land without a sound or alert.
   let silentTelegram: Bool
   let requestedResultDeliveryID: String?
 
@@ -602,7 +628,7 @@ public struct EngineAgentBridgeCompletionSender: AgentBridgeCompletionSending {
     try await AgentBridgeCompletionRouter.deliverReply(deliveryId: deliveryId, route: route,
       notifyRequestedResult: notifyRequestedResult, recoverTelegram: {
       guard let raw = route.destinationId, let chatID = Int(raw), response.sessionId != nil,
-            let config = TelegramConfig.loadFromDisk(dataRoot: dataRoot), config.enabled,
+            let config = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot), config.enabled,
             authorizeTelegramReply?(config, chatID) != false,
             route.threadId == nil || route.threadId.flatMap(Int.init) != nil,
             let loop = await BackgroundLoops.BackgroundLoopLifetimes.shared.loopRunner(loopId: "telegram_poll") as? TelegramPollLoop else {
@@ -615,7 +641,7 @@ public struct EngineAgentBridgeCompletionSender: AgentBridgeCompletionSending {
       guard let loop = await BackgroundLoops.BackgroundLoopLifetimes.shared.loopRunner(loopId: "slack_socket_mode") as? SlackSocketModeLoop else {
         throw DeliveryError.missingSlackDestination
       }
-      return try await loop.recoverReply(response, originRunId: response.runId, route: route, priorVerdict: priorVerdict)
+      return try await loop.recoverReply(response, originRunId: response.runId, route: route)
     }, recoverIOS: {
       guard let sync = engine().deviceSync else {
         throw PersistenceCoreError.ioFailure("The originating runtime has no phone delivery owner.")
@@ -637,7 +663,7 @@ public struct EngineAgentBridgeCompletionSender: AgentBridgeCompletionSending {
     }
     switch route.kind {
     case .telegram:
-      guard let config = TelegramConfig.loadFromDisk(dataRoot: dataRoot), config.enabled, !config.botToken.isEmpty,
+      guard let config = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot), config.enabled, !config.botToken.isEmpty,
             let raw = route.destinationId, let chatID = Int(raw), authorizeTelegramReply?(config, chatID) != false,
             route.threadId == nil || route.threadId.flatMap(Int.init) != nil else { throw DeliveryError.invalidTelegramDestination }
     case .slack: try SlackWebAPI.requireConfiguredToken(dataRoot: dataRoot)

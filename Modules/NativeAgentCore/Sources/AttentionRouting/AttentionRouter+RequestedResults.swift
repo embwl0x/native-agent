@@ -5,7 +5,7 @@ import PersistenceCore
 import Transcripts
 import DeviceSync
 import StandingBots
-// Blueprint: | `AttentionRouter+RequestedResults.swift` | `AttentionRouter`: `retryRequestedResults`, `deliverRequestedResult` |
+// Blueprint: | `AttentionRouter+RequestedResults.swift` | `AttentionRouter`: `retryRequestedResults`, `deliverRequestedResult`; unknown helper-condition verdicts notify couldn't tell through the same durable acceptance and exact shelf acknowledgement as matching results |
 
 extension AttentionRouter {
     /// Publication edges and the existing sync integrity pass retry only the
@@ -56,8 +56,8 @@ extension AttentionRouter {
             if !pending, let modified { retained[path] = modified }
         }
         settledResultFiles = retained
-        let confirmed = iCloudBridge.phoneConfirmedEventIDs(dataRoot: dataRoot)
-        Self.settleKnocks(confirmed: confirmed, dataRoot: dataRoot)
+        let confirmed = try iCloudBridge.phoneConfirmedEventIDs(dataRoot: dataRoot)
+        try await Self.settleKnocks(confirmed: confirmed, dataRoot: dataRoot)
         let total = deliveries.count + helpers.count
         guard total > 0 else {
             resultRetryOffset = 0
@@ -91,7 +91,9 @@ extension AttentionRouter {
                     let outcome = try await route(
                         eventId: eventID, importance: .requestedResult,
                         title: TurnSecretRedactor.redactDisplayText(String(title.prefix(160))),
-                        body: TurnSecretRedactor.redactDisplayText(String(entry.headline.prefix(500))),
+                        body: TurnSecretRedactor.redactDisplayText(String((entry.conditionMet == nil
+                            ? "Couldn't tell whether the condition was met. Open the saved run for its result and any failure."
+                            : entry.headline).prefix(500))),
                         userInfo: userInfo)
                     if Self.settled(outcome, confirmed: confirmed) {
                         try shelf.acknowledge(readerId: ShelfStore.conditionNotificationReaderID, entryIds: [entry.id])
@@ -147,6 +149,7 @@ extension AttentionRouter {
     /// owed; the router's ledger keeps a retry from sending it twice.
     private func deliverRequestedResult(row: JSONValue, intent: [String: JSONValue], opening: String? = nil,
                                         confirmed: Set<String>) async throws -> Bool {
+        try await Self.settleKnocks(confirmed: confirmed, dataRoot: dataRoot)
         guard case .string(let eventID)? = intent["eventId"],
               case .string(let sessionID)? = intent["sessionId"],
               case .string(let runID)? = intent["runId"],
@@ -175,7 +178,7 @@ extension AttentionRouter {
     private static func settled(_ outcome: AttentionOutcome, confirmed: Set<String>) -> Bool {
         switch outcome.deliveryProjection {
         case .accepted where outcome.delivery != .phone: return true
-        case .accepted, .queued, .previouslyHandled:
+        case .accepted, .queued:
             return outcome.knock.map(confirmed.contains) ?? false
         case .noChannel, .deferred, .failed: return false
         }

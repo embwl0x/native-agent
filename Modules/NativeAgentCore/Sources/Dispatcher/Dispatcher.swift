@@ -488,7 +488,9 @@ public actor SwiftNativeDispatcher {
 
 /// Compact JSON trace summary, capped by grapheme count before appending the truncation marker.
 private func truncateForTrace(_ value: JSONValue, maxChars: Int = 200) -> String {
-    let s = (try? value.serialize(pretty: false)) ?? "{}"
+    let s: String
+    do { s = try value.serialize(pretty: false) }
+    catch { return "[trace serialization unavailable: \(error.localizedDescription)]" }
     if s.count <= maxChars { return s }
     return String(s.prefix(maxChars)) + "...(truncated)"
 }

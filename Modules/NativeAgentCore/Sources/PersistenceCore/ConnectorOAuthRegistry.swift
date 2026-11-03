@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `ConnectorOAuthRegistry.swift` | Sole checked connector registry reader/schema and durable publication owner (`writeRegistry`), including bootstrap and Slack recovery; canonical IDs and `connectionDecision`. A connection decision is recorded only by the person's own connect or disconnect; seeds, first reads and migrations are undecided, and missing decision fields read as undecided without inferring from enabled/authState. `permitsCredentialMigration` reads only that decision: connected or undecided may migrate; a recorded person-disconnect never does. Malformed authority throws |
+// Blueprint: | `ConnectorOAuthRegistry.swift` | Sole checked connector-array reader/schema and durable publication owner (`writeRegistry`), including bootstrap; canonical IDs and `connectionDecision`. A connection decision is recorded only by the person's own connect or disconnect; seeds and retained pre-decision rows are undecided without inferring from enabled/authState. Malformed authority throws; dictionary-shape and credential-migration adapters are removed |
 
 /// Checked connector registry authority, shared by mutations and credential migration.
 public enum ConnectorOAuthRegistry {
@@ -11,32 +11,19 @@ public enum ConnectorOAuthRegistry {
     }
     public static let decisionField = "connectionDecision"
 
-    /// Only the recorded decision governs migration: connected or undecided may
-    /// migrate credentials; a recorded person-disconnect never may.
-    /// Caller holds the registry lock through any resulting import or retirement.
-    public static func permitsCredentialMigration(root: URL, provider: String) throws -> Bool {
-        let rows = try readRegistry(at: connectorRegistryPath(root: root))
-        guard let row = rows.first(where: { connectorRow($0, matches: normalizedConnectorID(provider)) }) else { return true }
-        return row[decisionField] != ConnectionDecision.disconnected.value
-    }
-
     /// Validate the entire authority before projecting or changing any row.
-    /// Missing legacy fields are supported; present fields must keep their type.
+    /// The current array shape is required. Retained pre-decision rows remain
+    /// undecided until their owner converts them; no health field infers consent.
     public static func checkedConnectorRows(from value: JSONValue) throws -> [[String: JSONValue]] {
-        let entries: [(String?, JSONValue)]
-        switch value {
-        case .array(let rows): entries = rows.map { (nil, $0) }
-        case .object(let rows): entries = rows.keys.sorted().map { ($0, rows[$0]!) }
-        default: throw PersistenceCoreError.ioFailure("Connector registry is not an array or object")
+        guard case .array(let entries) = value else {
+            throw PersistenceCoreError.ioFailure("Connector registry must be an array of current connector rows. Preserve and convert the file before continuing.")
         }
         var ids = Set<String>()
-        return try entries.map { key, value in
+        return try entries.map { value in
             guard case .object(var row) = value else {
                 throw PersistenceCoreError.ioFailure("Connector registry contains a non-object entry")
             }
-            if row["id"] == nil, let key { row["id"] = .string(normalizedConnectorID(key)) }
             guard let rawID = connectorString(row["id"]), !normalizedConnectorID(rawID).isEmpty,
-                  key == nil || normalizedConnectorID(key!) == normalizedConnectorID(rawID),
                   ids.insert(normalizedConnectorID(rawID)).inserted else {
                 throw PersistenceCoreError.ioFailure("Connector registry has a missing, conflicting or duplicate id")
             }
@@ -44,13 +31,13 @@ public enum ConnectorOAuthRegistry {
             guard let decision = connectorString(row[decisionField]), ConnectionDecision(rawValue: decision) != nil else {
                 throw PersistenceCoreError.ioFailure("Connector registry connectionDecision must be undecided, connected or disconnected")
             }
-            for field in ["enabled", "registered", "connected", "client_id_present", "clientIdPresent"] {
+            for field in ["enabled", "registered", "connected", "client_id_present"] {
                 if let value = row[field], case .bool = value {} else if row[field] != nil {
                     throw PersistenceCoreError.ioFailure("Connector registry field \(field) must be a boolean")
                 }
             }
             for field in ["name", "kind", "description", "authState", "healthStatus", "riskClass",
-                          "lastCheckedAt", "updatedAt", "registered_at", "registeredAt", "connected_at", "connectedAt",
+                          "lastCheckedAt", "updatedAt", "connectedAt",
                           "runtimeStatus", "runtimeDetail", "runtimeUpdatedAt"] {
                 guard let value = row[field] else { continue }
                 if case .string = value { continue }
@@ -73,7 +60,7 @@ public enum ConnectorOAuthRegistry {
             .appendingPathComponent("registry.json")
     }
 
-    /// Sole registry publication owner, including bootstrap and Slack recovery.
+    /// Sole registry publication owner, including bootstrap.
     /// Caller holds the registry lock across its read/edit/write transaction.
     public static func writeRegistry(_ value: JSONValue, at path: URL) throws {
         let rows = try checkedConnectorRows(from: value).map(JSONValue.object)

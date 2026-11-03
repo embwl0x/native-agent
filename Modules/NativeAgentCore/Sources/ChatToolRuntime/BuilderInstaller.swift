@@ -197,7 +197,7 @@ extension SwiftToolDispatcher {
         guard args.dropFirst().first == "--nativeagent-install-helper" else { return false }
         guard args.count == 7, let delay = Int(args[6]), (5...120).contains(delay),
               let bytes = try? Data(contentsOf: URL(fileURLWithPath: args[5])) else { return true }
-        let process = Process()
+        let process = ManagedProcess()
         let work = SubprocessWork(process)
         let startDelay = Task { try await Task.sleep(for: .seconds(delay)) }
         let signals = [SIGTERM, SIGINT, SIGHUP].map { number -> DispatchSourceSignal in
@@ -243,7 +243,7 @@ extension SwiftToolDispatcher {
             await work.run(reapDescendantsOnExit: false) { exit in
                 try? output.close()
                 finish(exit.stopped ? "stopped" : exit.code == 0 ? "completed" : "failed", code: exit.code,
-                    detail: exit.launchError ?? (exit.stopped
+                    detail: exit.terminationError ?? exit.launchError ?? (exit.stopped
                         ? "Installation stopped. Installer output is saved in log_path; any completed installation steps remain."
                         : "Installer exited; its output is saved in log_path."))
             }

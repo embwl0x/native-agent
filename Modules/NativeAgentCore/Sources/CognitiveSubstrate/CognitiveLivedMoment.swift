@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `CognitiveLivedMoment.swift` | `CognitiveLivedMoment`: a settled turn's journal record (identity, life, forgetting epochs, state owed → meant → lived or refused, fold seq, recorded input and caring request, meaning) and `LivedMomentDoor`, the interpretation owner's closures |
+// Blueprint: | `CognitiveLivedMoment.swift` | `CognitiveLivedMoment`: a settled turn's journal record (identity, life, forgetting epochs, state owed → meant → lived or refused, fold seq, recorded input with origin principal, carried queue steer and optional claimed wake cares, caring request, meaning) and `LivedMomentDoor`, the interpretation owner's closures |
 
 // HER LIFE HAS ONE DOOR (docs/SUBCONSCIOUS.md, "Lived moments").
 //
@@ -15,7 +15,7 @@ import PersistenceCore
 /// her knows the last moment it lived (its `lived` stamp; facts by operation
 /// identity), so the row needs no per-piece outcome: a meant row whose fold
 /// seq is set is a fold that began and did not finish, refolded at the
-/// opening. A row an older binary wrote as `folding` reads as meant.
+/// opening.
 public enum CognitiveMomentState: String, Codable, Sendable, Equatable {
     /// Recorded, not yet judged (or its judgment failed: judged again).
     case owed
@@ -25,6 +25,21 @@ public enum CognitiveMomentState: String, Codable, Sendable, Equatable {
     case lived
     /// Refused, with its reason (another life, her own work, nothing to live).
     case refused
+}
+
+/// A claimed care arrival, carried through the reply into its journal record.
+public struct CognitiveCareWake: Codable, Sendable, Equatable {
+    public var careID: UUID
+    public var watch: String
+    public var at: Date
+
+    public init(careID: UUID, watch: String, at: Date) {
+        self.careID = careID
+        self.watch = watch
+        self.at = at
+    }
+
+    var key: String { watch + "|" + careID.uuidString }
 }
 
 /// The exchange as it settled: everything the interpretation owner needs to
@@ -41,6 +56,8 @@ public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
     public var runId: String?
     public var messageId: String?
     public var occurredAt: Date?
+    /// Reply boundary captured before deferred memory work.
+    public var repliedAt: Date?
     public var took: String?
     public var standingAgentName: String?
     /// Provenance, kept exactly as the held queue keeps it: the turn's envelope,
@@ -48,12 +65,24 @@ public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
     public var envelope: JSONValue?
     public var sourceCheckpoint: [String]?
     public var elevatedSources: [String]?
+    /// The same principal and carried steer queue.add would record on this turn.
+    /// Optional only for journal inputs written before promises were inferred.
+    public var originPrincipal: String?
+    public var carriedSources: [String]?
+    /// Only care-bearing resident wakes enter the journal from her own work.
+    public var careWakes: [CognitiveCareWake]?
+
+    public var isCareWake: Bool {
+        sessionId == "resident-wake" && careWakes?.isEmpty == false
+            && !assistant.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     public init(sessionId: String, surface: String, user: String, asked: String, assistant: String,
                 turnId: String? = nil, runId: String? = nil, messageId: String? = nil,
-                occurredAt: Date? = nil, took: String? = nil, standingAgentName: String? = nil,
+                occurredAt: Date? = nil, repliedAt: Date? = nil, took: String? = nil, standingAgentName: String? = nil,
                 envelope: JSONValue? = nil, sourceCheckpoint: [String]? = nil,
-                elevatedSources: [String]? = nil) {
+                elevatedSources: [String]? = nil, originPrincipal: String? = nil,
+                carriedSources: [String]? = nil, careWakes: [CognitiveCareWake]? = nil) {
         self.sessionId = sessionId
         self.surface = surface
         self.user = user
@@ -63,11 +92,15 @@ public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
         self.runId = runId
         self.messageId = messageId
         self.occurredAt = occurredAt
+        self.repliedAt = repliedAt
         self.took = took
         self.standingAgentName = standingAgentName
         self.envelope = envelope
         self.sourceCheckpoint = sourceCheckpoint
         self.elevatedSources = elevatedSources
+        self.originPrincipal = originPrincipal
+        self.carriedSources = carriedSources
+        self.careWakes = careWakes
     }
 
     /// The origin the interpretation reads, rebuilt from the record.
@@ -76,6 +109,7 @@ public struct CognitiveMomentTurn: Codable, Sendable, Equatable {
         var origin = AfterTurnOrigin(sessionId: sessionId, runId: runId, messageId: messageId,
                                      occurredAt: occurredAt, userMessage: asked)
         origin.took = took
+        origin.careWakes = careWakes
         return origin
     }
 }
@@ -116,11 +150,11 @@ public struct CognitiveDeferredTurnRecord: Codable, Sendable, Equatable {
 public struct CognitiveMomentInput: Codable, Sendable, Equatable {
     public var turn: CognitiveMomentTurn?
     public var deferred: CognitiveDeferredTurnRecord?
-    /// A retired held-turn import or deliberately disabled cognition has no mind share.
+    /// Deliberately disabled cognition has no mind share.
     /// Missing ordinary context is unavailable evidence, never that permission.
     public var factsOnly: Bool?
     /// Set only after every mind/body save completes for this row's fold seq.
-    /// Absent on older inputs: replay their saved meaning before settlement.
+    /// Absent until every mind/body share has been durably folded.
     public var folded: UInt64?
 
     public init(turn: CognitiveMomentTurn? = nil, deferred: CognitiveDeferredTurnRecord? = nil,
@@ -137,7 +171,7 @@ public struct CognitiveLivedMoment: Codable, Sendable {
     public var id: String
     /// The `DataRootLife` it belongs to. A row from another life is refused.
     public var life: String
-    /// `turn`; old forgetting rows remain readable but no longer execute.
+    /// The current journal kind is `turn`.
     public var kind: String
     public var livedAt: Date
     public var acceptedAt: Date
@@ -199,7 +233,6 @@ public struct LivedMomentDoor: Sendable {
     /// nil means the journal is unavailable, never a proven empty queue.
     public var unlived: @Sendable () async -> [CognitiveLivedMoment]?
     /// Import held turns as owed moments in one transaction; true when they landed.
-    public var importHeld: @Sendable ([CognitiveMomentTurn]) async -> Bool
     /// One moment's row as it now stands (nil when absent or unreadable).
     public var moment: @Sendable (_ moment: String) async -> CognitiveLivedMoment?
 
@@ -211,7 +244,6 @@ public struct LivedMomentDoor: Sendable {
         lived: @escaping @Sendable (String) async -> Void,
         refuse: @escaping @Sendable (String, String) async -> Void,
         unlived: @escaping @Sendable () async -> [CognitiveLivedMoment]?,
-        importHeld: @escaping @Sendable ([CognitiveMomentTurn]) async -> Bool,
         moment: @escaping @Sendable (String) async -> CognitiveLivedMoment?
     ) {
         self.dataRoot = dataRoot
@@ -221,7 +253,6 @@ public struct LivedMomentDoor: Sendable {
         self.lived = lived
         self.refuse = refuse
         self.unlived = unlived
-        self.importHeld = importHeld
         self.moment = moment
     }
 }

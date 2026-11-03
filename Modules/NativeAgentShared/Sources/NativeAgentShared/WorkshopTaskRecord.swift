@@ -1,4 +1,4 @@
-// Blueprint: | `WorkshopTaskRecord.swift` | WorkshopTaskRecord: shared task wire row with compatible field decoding; the Mac supplies approval authority |
+// Blueprint: | `WorkshopTaskRecord.swift` | WorkshopTaskRecord: checked canonical task wire row; the Mac supplies approval authority |
 
 import Foundation
 
@@ -27,12 +27,6 @@ public struct WorkshopTaskRecord: Identifiable, Codable, Hashable, Sendable {
         case id, title, objective, status, phase, priority
         case autonomyLevel, permissionProfile, summary
         case createdAt, updatedAt, completedAt, receiptCount, currentStepId, requiresApproval
-    }
-
-    private enum HistoricalKeys: String, CodingKey {
-        case desk_handle, project_space_id, last_movement_at
-        case autonomy_level, permission_profile, receipt_count
-        case created_at, updated_at, completed_at, current_step_id
     }
 
     public init(
@@ -71,34 +65,4 @@ public struct WorkshopTaskRecord: Identifiable, Codable, Hashable, Sendable {
         self.lastMovementAt = lastMovementAt; self.requiresApproval = requiresApproval
     }
 
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        let historical = try decoder.container(keyedBy: HistoricalKeys.self)
-        id = try c.decode(String.self, forKey: .id)
-        deskHandle = try c.decodeIfPresent(String.self, forKey: .deskHandle) ?? historical.decodeIfPresent(String.self, forKey: .desk_handle)
-        projectSpaceId = try c.decodeIfPresent(String.self, forKey: .projectSpaceId) ?? historical.decodeIfPresent(String.self, forKey: .project_space_id)
-        lastMovementAt = try c.decodeIfPresent(String.self, forKey: .lastMovementAt) ?? historical.decodeIfPresent(String.self, forKey: .last_movement_at)
-        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
-        objective = try c.decodeIfPresent(String.self, forKey: .objective) ?? ""
-        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "queued"
-        phase = try c.decodeIfPresent(String.self, forKey: .phase) ?? status
-        priority = try c.decodeIfPresent(String.self, forKey: .priority)
-        autonomyLevel = try c.decodeIfPresent(String.self, forKey: .autonomyLevel)
-            ?? historical.decodeIfPresent(String.self, forKey: .autonomy_level)
-        permissionProfile = try c.decodeIfPresent(String.self, forKey: .permissionProfile)
-            ?? historical.decodeIfPresent(String.self, forKey: .permission_profile)
-        summary = try c.decodeIfPresent(String.self, forKey: .summary)
-        createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
-            ?? historical.decodeIfPresent(String.self, forKey: .created_at)
-            ?? ""
-        updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
-            ?? historical.decodeIfPresent(String.self, forKey: .updated_at)
-        completedAt = try c.decodeIfPresent(String.self, forKey: .completedAt)
-            ?? historical.decodeIfPresent(String.self, forKey: .completed_at)
-        receiptCount = try c.decodeIfPresent(Int.self, forKey: .receiptCount)
-            ?? historical.decodeIfPresent(Int.self, forKey: .receipt_count)
-        currentStepId = try c.decodeIfPresent(String.self, forKey: .currentStepId)
-            ?? historical.decodeIfPresent(String.self, forKey: .current_step_id)
-        requiresApproval = try c.decodeIfPresent(Bool.self, forKey: .requiresApproval)
-    }
 }

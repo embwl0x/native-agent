@@ -5,7 +5,7 @@ import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Studio
-// Blueprint: | `SwiftToolDispatcher+StudioTools.swift` | `SwiftToolDispatcher`: `impl_studio_shelf`, `studioImageInvitation`, `impl_studio_consult`; journal refresh holds the existing journal flock from read through graph commit and audit |
+// Blueprint: | `SwiftToolDispatcher+StudioTools.swift` | `SwiftToolDispatcher`: shelf, encounter, journal and recall paths; current journal refresh holds the existing flock through graph commit and audit, preserving append and graph success with separate derived failures; recall retains returned entries with counter-owner failure/remedy; completed backfill has no read-time trigger |
 
 // MARK: - Studio chat lane (studio_*)
 //
@@ -176,7 +176,6 @@ extension SwiftToolDispatcher {
     /// into the journal, does NOT retrieve journal entries, and does NOT carry
     /// or suggest a verdict: the judgment is hers, live, when she answers.
     func impl_studio_consult(input: [String: JSONValue]) async throws -> JSONValue {
-        await ensureStudioGraphIndexed()
         let refs = try studioStringArray(input, "artifact_refs", tool: "studio_consult")
         let question = optionalString(input, "question")?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -214,7 +213,6 @@ extension SwiftToolDispatcher {
     /// studio_consult_read — pull one consult envelope back, verbatim, so the
     /// full bundle is in front of her when she answers.
     func impl_studio_consult_read(input: [String: JSONValue]) async throws -> JSONValue {
-        await ensureStudioGraphIndexed()
         let id = try requireString(input, "consult_id")
         do {
             let consult = try await studioStore().readConsult(id: id)
@@ -241,7 +239,6 @@ extension SwiftToolDispatcher {
         // (explicitSessionId's key set). That is runtime plumbing, not caller
         // payload — strip it at the TOP level only, so a nested
         // `stance.session_id` is still refused like any other unknown field.
-        await ensureStudioGraphIndexed()
         var input = input
         for key in ["__session_id", "session_id", "sessionId"] {
             input.removeValue(forKey: key)
@@ -260,19 +257,32 @@ extension SwiftToolDispatcher {
         }
 
         // Normalize validated tool fields here; stored journal reads remain verbatim.
+        // A blank field is unstated (the writer never stores one), so it leaves the arguments here.
         func normalized(_ value: JSONValue) -> JSONValue {
             switch value {
             case .string(let text): return .string(text.trimmingCharacters(in: .whitespacesAndNewlines))
-            case .object(let object): return .object(object.mapValues(normalized))
+            case .object(let object): return .object(stated(object))
             case .array(let array): return .array(array.map(normalized))
             default: return value
             }
         }
-        let fields = input.mapValues(normalized)
+        func stated(_ object: [String: JSONValue]) -> [String: JSONValue] {
+            object.compactMapValues { value in
+                let next = normalized(value)
+                return next == .string("") ? nil : next
+            }
+        }
+        let fields = stated(input)
         guard let work = fields["work"].flatMap(StudioWork.fromJSON), !work.title.isEmpty else {
             return studioRefusal(.journalWorkTitleMissing)
         }
-        let reception = fields["reception"].map(StudioReception.fromJSON) ?? StudioReception()
+        let reception: StudioReception
+        if let value = fields["reception"] {
+            guard let decoded = StudioReception.fromJSON(value) else {
+                throw AutonomyGateError.toolDenied(reason: "studio_journal: reception must contain only valid supplied reception text.")
+            }
+            reception = decoded
+        } else { reception = StudioReception() }
 
         guard case .object(var originObject)? = fields["origin"],
               case .string(let originKindRaw)? = originObject["kind"], !originKindRaw.isEmpty else {
@@ -340,13 +350,16 @@ extension SwiftToolDispatcher {
             // The edges this entry's relations became, said out loud rather than
             // asserted. Each one names this entry as its provenance in the
             // graph, so the claim can be traced back to the judgment.
-            if case .object(var obj) = result, let graph, graph.graphAvailable {
-                obj["graph"] = .object([
-                    "works": .int(Int64(graph.worksIndexed)),
-                    "creators": .int(Int64(graph.creatorsIndexed)),
-                    "edges": .int(Int64(graph.edgesWritten)),
-                    "unresolved_relations": .int(Int64(graph.unresolvedRelations)),
-                ])
+            if case .object(var obj) = result {
+                obj["derived_failures"] = .array(graph.failures.map(JSONValue.string))
+                if let graph = graph.report, graph.graphAvailable {
+                    obj["graph"] = .object([
+                        "works": .int(Int64(graph.worksIndexed)),
+                        "creators": .int(Int64(graph.creatorsIndexed)),
+                        "edges": .int(Int64(graph.edgesWritten)),
+                        "unresolved_relations": .int(Int64(graph.unresolvedRelations)),
+                    ])
+                }
                 result = .object(obj)
             }
             return result
@@ -430,7 +443,7 @@ extension SwiftToolDispatcher {
     /// for the journal write to look like it failed. The entry is the canonical
     /// record; these are derived consumers waking up.
     @discardableResult
-    private func studioJournalDidAppend(_ entry: StudioJournalEntry) async -> StudioGraphIndexReport? {
+    private func studioJournalDidAppend(_ entry: StudioJournalEntry) async -> (report: StudioGraphIndexReport?, failures: [String]) {
         // 1. Wake the resident context index so the pointer for this entry is
         //    reachable on the NEXT turn instead of after the next launch.
         //    `StudioContext` consumes exactly this namespace and
@@ -445,10 +458,7 @@ extension SwiftToolDispatcher {
         ))
         // 2. Her relations become graph edges (desk 903 phase 3). The pass
         //    re-derives the WHOLE journal and is idempotent, so this single call
-        //    also completes any history that predates the graph — which is why
-        //    there is no separate backfill code path, only a first-run trigger
-        //    (`ensureStudioGraphIndexed`) for the case where she never files
-        //    again.
+        //    keeps all current history in the graph on each append.
         let report = await indexStudioJournalIntoGraph(reason: "entry_filed")
         // 3. The entry rides the cognitive bus (desk 903 phase 2). The delta
         //    comes from the ENTRY — sign and size from the judgment she wrote,
@@ -464,7 +474,7 @@ extension SwiftToolDispatcher {
     /// will not open is a quieter system, not a failed journal write. The entry
     /// is already durable when this runs.
     @discardableResult
-    private func indexStudioJournalIntoGraph(reason: String) async -> StudioGraphIndexReport? {
+    private func indexStudioJournalIntoGraph(reason: String) async -> (report: StudioGraphIndexReport?, failures: [String]) {
         do {
             // Keep the journal's existing flock through the graph commit. A
             // later refresh must read after this one writes, never replace
@@ -472,7 +482,7 @@ extension SwiftToolDispatcher {
             return try await SwiftNativePersistenceCore.withFileLock(studioStore().journalPath) {
                 // Index hot and archived entries so work and relation edges survive shelf trimming.
                 let entries = try await studioStore().journalEntriesIncludingArchive()
-                guard !entries.isEmpty else { return nil }
+                guard !entries.isEmpty else { return (nil, []) }
                 let indexer = try SwiftNativeKnowledgeGraphIndexer(
                     // The SAME store `KnowledgeGraphContext` reads,
                     // so a studio edge is selectable exactly like the other 94.
@@ -482,41 +492,26 @@ extension SwiftToolDispatcher {
                 )
                 let report = try await indexer.indexStudioJournal(entries)
                 // Keep relations provenance-only; report missing citing graph edges without repair or blocking recall.
-                await StudioCanonTending.recordAudit(
-                    (try? await indexer.auditStudioRelations(entries)) ?? .unavailable,
-                    dataRoot: dataRoot
-                )
-                return report
+                let audit: StudioRelationAuditReport
+                var failures: [String] = []
+                var auditFailure: String?
+                do {
+                    audit = try await indexer.auditStudioRelations(entries)
+                    if !audit.graphAvailable { auditFailure = "Studio relation audit unavailable: memory graph does not exist." }
+                } catch {
+                    audit = .unavailable
+                    auditFailure = "Studio relation audit read failed: \(error.localizedDescription)"
+                }
+                if let auditFailure { failures.append(auditFailure) }
+                do { try await StudioCanonTending.recordAudit(audit, failure: auditFailure, dataRoot: dataRoot) }
+                catch { failures.append("Studio relation audit persistence failed at \(StudioCanonTending.auditHealthPath(dataRoot: dataRoot).path): \(error.localizedDescription)") }
+                return (report, failures)
             }
         } catch {
             nativeLog("[studio] knowledge-graph index skipped (%@): %@",
                   reason, String(describing: error))
-            return nil
+            return (nil, ["Studio graph projection \(reason) failed: \(error.localizedDescription)"])
         }
-    }
-
-    /// ONE-SHOT BACKFILL. The journal predates the graph, so the entries already
-    /// on disk have to arrive once even if she never files another. Guarded by a
-    /// receipt beside the journal, so it runs once per install and not once per
-    /// call; a run that finds no graph writes NO receipt and is retried later.
-    /// JSON existence marker: off-disk backup only; no local backup/export/phone sync; PrivacyMap: studio.
-    func ensureStudioGraphIndexed() async {
-        let receipt = studioStore().studioRoot
-            .appendingPathComponent("journal", isDirectory: true)
-            .appendingPathComponent("kg_backfill_receipt.json")
-        guard !FileManager.default.fileExists(atPath: receipt.path) else { return }
-        guard let report = await indexStudioJournalIntoGraph(reason: "backfill"),
-              report.graphAvailable else { return }
-        try? await SwiftNativePersistenceCore.writeJSON(
-            .object([
-                "ran_at": .string(NativeTimestampFormat.sixDigitUTCOffset(Date())),
-                "works": .int(Int64(report.worksIndexed)),
-                "creators": .int(Int64(report.creatorsIndexed)),
-                "edges": .int(Int64(report.edgesWritten)),
-                "unresolved_relations": .int(Int64(report.unresolvedRelations)),
-            ]),
-            to: receipt
-        )
     }
 
     // MARK: - studio_recall
@@ -525,7 +520,6 @@ extension SwiftToolDispatcher {
     /// VERBATIM (the response text is the point), newest first, bounded, with an
     /// explicit has_more. No relevance score is computed or exposed.
     func impl_studio_recall(input: [String: JSONValue]) async throws -> JSONValue {
-        await ensureStudioGraphIndexed()
         var relationKind: StudioRelationKind?
         if let raw = optionalString(input, "relation_kind") {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -561,10 +555,11 @@ extension SwiftToolDispatcher {
         //      rule, so "pulled in production" means the same thing here as it
         //      does where the pointer gets selected.
         // Anything else reads the journal and records nothing.
+        var countingFailure: JSONValue?
         if !result.entries.isEmpty,
            case .success = StudioCanonSeatGate.liveTurnProvenance(),
            StudioCanonSeatGate.isProductionTasteJudgment() {
-            await studioStore().noteRecallPulls(
+            countingFailure = await studioStore().noteRecallPulls(
                 titles: result.entries.map { ($0.work.title, $0.work.creator) }
             )
         }
@@ -575,6 +570,7 @@ extension SwiftToolDispatcher {
             "matched": .int(Int64(result.matchedCount)),
             "has_more": .bool(result.hasMore),
         ]
+        if let countingFailure { payload["recall_counting"] = countingFailure }
         // Matches and counts cover only what was read: holes qualify them.
         if !result.historyUnreadable.isEmpty {
             payload["coverage"] = .string("partial")

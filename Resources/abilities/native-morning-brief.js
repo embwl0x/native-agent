@@ -27,16 +27,7 @@ function run(input) {
             return time >= current - 86400000 && time <= current;
         })) moved++;
     }
-    let unread = null;
-    if (inbox.state === "ready") {
-        const latest = new Map();
-        let valid = true;
-        for (const row of inbox.rows) {
-            if (!row || typeof row.id !== "string") { valid = false; break; }
-            latest.set(row.id, typeof row.status === "string" ? row.status.toLowerCase() : "unread");
-        }
-        if (valid) unread = Array.from(latest.values()).filter(s => s === "unread").length;
-    }
+    const unread = inbox.state === "ready" ? inbox.unread : null;
     let session = null, sessionAvailable = sessions.state === "ready";
     for (const row of sessions.rows || []) {
         if (!row || typeof row !== "object" || Array.isArray(row)) { sessionAvailable = false; continue; }
@@ -62,6 +53,7 @@ function run(input) {
     if (summaries.length) sections.push("## Since yesterday\n\n" + summaries.map(s => "- " + s).join("\n"));
     if (active || moved) sections.push("## Workshop\n\n- " + active + " active\n- " + moved + " moved in the last 24h");
     if (unread > 0) sections.push("## Inbox\n\n- " + unread + " unread " + plural(unread,"item","items"));
+    if (unread === null) sections.push("## Inbox\n\nUnavailable: " + inbox.error);
     if (session && session.title) {
         const delta = (current - session.at) / 1000, total = Math.floor(Math.max(0,delta));
         const days = Math.floor(total / 86400), hours = Math.floor(total % 86400 / 3600), minutes = Math.floor(total % 3600 / 60);

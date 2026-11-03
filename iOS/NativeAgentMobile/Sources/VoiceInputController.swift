@@ -1,6 +1,5 @@
 // VoiceInputController.swift — voice input for NativeAgent iOS
-// Uses SFSpeechRecognizer + AVAudioEngine, mirroring the Mac pattern but
-// touch-driven rather than hotkey-driven.
+// One capture owner for tap dictation and held voice notes.
 import Foundation
 import Observation
 import UIKit
@@ -8,6 +7,7 @@ import Speech
 import AVFoundation
 import os
 import NativeAgentShared
+// Blueprint: | `VoiceInputController.swift` | Session-bound microphone capture and bounded recognition finalization through the on-device SpeechAnalyzer; unsupported devices/locales report their blocker |
 
 enum VoiceInputAuthorizationPresentation {
     static func speechFailureMessage(
@@ -35,19 +35,26 @@ final class VoiceInputController {
     var isStarting = false
     var transcript = ""         // live partial transcript
     var lastFinalTranscript = "" // populated when user releases
-    var lastAttachment: MultimodalAttachment?
     var error: String?
     var statusText: String?
     var hasReceivedAudio = false
+    var isFinalizing: Bool { waitingForFinalAfterStop }
+    var isVoiceNote = false
+    var isLocked = false
+    var startedAt: Date?
+    /// Recent mic loudness, 0...1, oldest first; only the composer's waveform reads it.
+    var levels: [Float] = []
 
     @ObservationIgnored private var audioToken: UUID?
     @ObservationIgnored private var hasRecognitionTask = false
     @ObservationIgnored private var desiredListening = false
     @ObservationIgnored private var startGeneration = 0
-    @ObservationIgnored private var waitingForFinalAfterStop = false
+    private var waitingForFinalAfterStop = false
     @ObservationIgnored private var finalResultTimeout: Task<Void, Never>?
     @ObservationIgnored private var hasStartedAudioSession = false
     @ObservationIgnored private var utterance: SpeechUtterance?
+    @ObservationIgnored private var captureDeadline: Task<Void, Never>?
+    @ObservationIgnored private var startTask: Task<Void, Never>?
     @ObservationIgnored private let requestSpeechAuthorization: () async -> SFSpeechRecognizerAuthorizationStatus
     @ObservationIgnored private let requestMicrophoneAuthorization: () async -> Bool
 
@@ -57,23 +64,30 @@ final class VoiceInputController {
     ) {
         self.requestSpeechAuthorization = requestSpeechAuthorization
         self.requestMicrophoneAuthorization = requestMicrophoneAuthorization
+        Haptics.isRecording = { [weak self] in self?.isListening == true }
 
         // Stop cleanly when the app backgrounds (e.g. home-button press mid-hold)
         NotificationCenter.default.addObserver(
-            forName: UIApplication.willResignActiveNotification,
+            forName: UIApplication.didEnterBackgroundNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.stop()
+                self?.cancel()
             }
         }
     }
 
     // MARK: - Public API
 
-    func start() async {
-        guard !isStarting, !waitingForFinalAfterStop else { return }
+    func begin(voiceNote: Bool, names: [String]) {
+        startTask?.cancel()
+        startTask = Task { await start(voiceNote: voiceNote, names: names) }
+    }
+
+    func start(voiceNote: Bool = false, names: [String] = []) async {
+        guard !TalkModeController.shared.isPresented else { return }
+        guard !Task.isCancelled, !isStarting, !waitingForFinalAfterStop else { return }
         // If already listening, cancel the previous session first so we never
         // leak the audio engine across multiple rapid presses.
         finalResultTimeout?.cancel()
@@ -82,6 +96,10 @@ final class VoiceInputController {
         startGeneration += 1
         let generation = startGeneration
         isStarting = true
+        isVoiceNote = voiceNote
+        isLocked = false
+        startedAt = nil
+        levels = []
         desiredListening = true
         waitingForFinalAfterStop = false
         hasStartedAudioSession = false
@@ -89,9 +107,15 @@ final class VoiceInputController {
         statusText = "Requesting speech recognition permission..."
         transcript = ""
         lastFinalTranscript = ""
-        lastAttachment = nil
         utterance = nil
         hasReceivedAudio = false
+        captureDeadline?.cancel()
+        captureDeadline = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(45))
+            guard !Task.isCancelled, let self, self.startGeneration == generation, self.isStarting else { return }
+            self.cancel()
+            self.error = "Voice input did not become ready within 45 seconds. Try again after speech assets finish downloading."
+        }
         defer {
             if generation == startGeneration, !isListening {
                 isStarting = false
@@ -122,12 +146,17 @@ final class VoiceInputController {
         let token = UUID()
         audioToken = token
         do {
-            let preparationError = try await MobileDictation.shared.prepareInput(token: token, onAudio: { [weak self] in
+            let preparationError = try await MobileDictation.shared.prepareInput(token: token, names: names, onAudio: { [weak self] in
                 Task { @MainActor in
                     guard let self, self.startGeneration == generation
                         || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1) else { return }
                     self.hasReceivedAudio = true
                     if self.transcript.isEmpty { self.statusText = "Hearing you..." }
+                }
+            }, onLevel: { [weak self, generation] rms in
+                Task { @MainActor in
+                    guard let self, self.startGeneration == generation, self.isListening else { return }
+                    self.pushLevel(rms)
                 }
             }, onResult: { [weak self, generation] utterance in
                 Task { @MainActor in
@@ -143,11 +172,12 @@ final class VoiceInputController {
                         || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1) else { return }
                     if let detail { self.error = detail }
                     if self.waitingForFinalAfterStop { self.publishStoppedTranscript() }
-                    else if detail != nil { self.teardownAudio(cancelTask: true) }
+                    else if detail != nil { self.cancel() }
                 }
             })
             guard desiredListening, generation == startGeneration else {
-                teardownAudio(cancelTask: true); return
+                try? await MobileDictation.shared.stopInput(token: token, cancelTask: true)
+                return
             }
             if let preparationError {
                 desiredListening = false
@@ -157,6 +187,7 @@ final class VoiceInputController {
                 return
             }
         } catch {
+            guard desiredListening, generation == startGeneration else { return }
             teardownAudio(cancelTask: true)
             self.error = "Microphone could not start: \(error.localizedDescription)"
             statusText = nil
@@ -169,27 +200,45 @@ final class VoiceInputController {
             try await MobileDictation.shared.startInput(token: token)
             hasStartedAudioSession = true
         } catch {
+            guard desiredListening, generation == startGeneration else { return }
             teardownAudio(cancelTask: true)
             self.error = "Audio engine failed to start: \(error.localizedDescription)"
             statusText = nil
             return
         }
         guard desiredListening, generation == startGeneration else {
-            teardownAudio(cancelTask: true)
+            try? await MobileDictation.shared.stopInput(token: token, cancelTask: true)
             return
         }
 
         isListening = true
         isStarting = false
+        startedAt = Date()
+        if isVoiceNote { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+        captureDeadline?.cancel()
+        captureDeadline = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(180))
+            guard !Task.isCancelled, let self, self.startGeneration == generation else { return }
+            self.stop()
+        }
         error = nil
         statusText = hasReceivedAudio && transcript.isEmpty ? "Hearing you..." : "Listening..."
+    }
+
+    /// Speech sits roughly between -50 and -10 dBFS; map that span onto 0...1.
+    private func pushLevel(_ rms: Float) {
+        let decibels = 20 * log10(max(rms, 0.000_01))
+        levels.append(min(1, max(0, (decibels + 50) / 40)))
+        if levels.count > 96 { levels.removeFirst(levels.count - 96) }
     }
 
     /// End audio on touch-up, then allow recognition to finalize before publishing.
     func stop() {
         guard !waitingForFinalAfterStop else { return }
         let hadRecordingSession = isListening || hasStartedAudioSession
+        if !hadRecordingSession { startTask?.cancel() }
         desiredListening = false
+        captureDeadline?.cancel()
         startGeneration += 1
         waitingForFinalAfterStop = hadRecordingSession
         teardownAudio(cancelTask: !hadRecordingSession)
@@ -202,7 +251,7 @@ final class VoiceInputController {
         }
         let stopGeneration = startGeneration
         finalResultTimeout = Task { @MainActor [weak self] in
-            do { try await Task.sleep(nanoseconds: 900_000_000) }
+            do { try await Task.sleep(for: .seconds(3)) }
             catch { return }
             guard let self, self.startGeneration == stopGeneration,
                   self.waitingForFinalAfterStop else { return }
@@ -210,13 +259,29 @@ final class VoiceInputController {
         }
     }
 
+    func lock() {
+        guard isVoiceNote, isListening, !isLocked else { return }
+        isLocked = true
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    func cancel() {
+        desiredListening = false
+        startGeneration += 1
+        captureDeadline?.cancel(); finalResultTimeout?.cancel()
+        startTask?.cancel()
+        waitingForFinalAfterStop = false
+        isLocked = false
+        lastFinalTranscript = ""; transcript = ""
+        teardownAudio(cancelTask: true)
+    }
+
     private func publishStoppedTranscript() {
         guard waitingForFinalAfterStop else { return }
         finalResultTimeout?.cancel()
         finalResultTimeout = nil
         startGeneration += 1
-        let generation = startGeneration
-        guard let token = audioToken, let utterance, !utterance.text.isEmpty else {
+        guard let utterance, !utterance.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             waitingForFinalAfterStop = false
             if error == nil {
                 error = hasReceivedAudio
@@ -226,19 +291,10 @@ final class VoiceInputController {
             teardownAudio(cancelTask: true)
             return
         }
-        Task {
-            do {
-                let attachment = try await MobileDictation.shared.finishInput(token: token, utterance: utterance)
-                guard startGeneration == generation else { return }
-                lastAttachment = attachment
-                lastFinalTranscript = utterance.text
-            } catch {
-                guard startGeneration == generation else { return }
-                self.error = "Couldn't retain voice audio: \(error.localizedDescription)"
-            }
-            waitingForFinalAfterStop = false
-            teardownAudio(cancelTask: true)
-        }
+        // Only the words travel (User 10-31): no audio file to export or upload.
+        lastFinalTranscript = utterance.text
+        waitingForFinalAfterStop = false
+        teardownAudio(cancelTask: true)
     }
 
     // MARK: - Private
@@ -263,7 +319,9 @@ final class VoiceInputController {
         UIApplication.shared.open(url)
     }
 
-    nonisolated private static func requestSpeechAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
+    /// iOS answers on its own queue; a callback written inside main-actor code
+    /// would be checked onto the main actor and trap there (talk mode 10-31).
+    nonisolated static func requestSpeechAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
         await withCheckedContinuation { cont in
             SFSpeechRecognizer.requestAuthorization { status in
                 cont.resume(returning: status)
@@ -278,67 +336,68 @@ final class VoiceInputController {
 actor MobileDictation {
     static let shared = MobileDictation()
     private var engine: AVAudioEngine?
-    private var recognizer: SFSpeechRecognizer?
-    private var request: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionTask: SFSpeechRecognitionTask?
     private var inputToken: UUID?
     private var routeToken: UUID?
     private var tapInstalled = false
-    private var recording: SpeechUtterance.Recording?
+    private var modern: MobileSpeechAnalyzer?
 
-    func prepareInput(token: UUID, onAudio: @escaping @Sendable () -> Void,
+    /// Release the ordinary mic/read-aloud route before the call takes it.
+    /// Pending output cleanup then sees no matching token and cannot close
+    /// the call's audio session after its asynchronous preparation.
+    func prepareForTalk() async throws {
+        if let inputToken { try await stopInput(token: inputToken, cancelTask: true) }
+        if routeToken != nil {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            routeToken = nil
+        }
+    }
+
+    func prepareInput(token: UUID, names: [String], onAudio: @escaping @Sendable () -> Void,
+                      onLevel: @escaping @Sendable (Float) -> Void,
                       onResult: @escaping @Sendable (SpeechUtterance) -> Void,
-                      onError: @escaping @Sendable (String?) -> Void) throws -> String? {
-        if let inputToken { try stopInput(token: inputToken, cancelTask: true) }
-        let recognizer = SFSpeechRecognizer(locale: Locale.current)
-        guard let recognizer, recognizer.isAvailable else { return "Speech recognition unavailable on this device or locale." }
-        self.recognizer = recognizer
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = false
-        request.addsPunctuation = true
-        request.taskHint = .dictation
-        self.request = request
+                      onError: @escaping @Sendable (String?) -> Void) async throws -> String? {
+        if let inputToken { try await stopInput(token: inputToken, cancelTask: true) }
+        try Task.checkCancellation()
         inputToken = token
         routeToken = token
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playAndRecord, mode: .measurement,
             options: [.allowBluetoothHFP, .defaultToSpeaker, .duckOthers])
-        try? session.setPreferredSampleRate(16_000)
-        try? session.setPreferredIOBufferDuration(0.02)
+        try session.setAllowHapticsAndSystemSoundsDuringRecording(true)
         try session.setActive(true, options: .notifyOthersOnDeactivation)
         let engine = AVAudioEngine()
         self.engine = engine
         let input = engine.inputNode
         let format = input.inputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { return "No usable microphone input route was found." }
-        let recording = try SpeechUtterance.Recording(format: format)
-        self.recording = recording
+        let locale = await MobileSpeechAnalyzer.supportedLocale()
+        guard inputToken == token, !Task.isCancelled else { throw CancellationError() }
+        guard let locale else {
+            return "On-device speech recognition does not support this device or language. Choose a supported iPhone language in Settings before trying voice input again."
+        }
+        let modern = try await MobileSpeechAnalyzer(locale: locale, sourceFormat: format, names: names)
+        guard inputToken == token, !Task.isCancelled else { await modern.cancel(); throw CancellationError() }
+        self.modern = modern
+        modern.start(onResult: onResult, onError: onError)
         let hasReceivedAudio = OSAllocatedUnfairLock(initialState: false)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-            do { try recording.append(buffer) }
+            do { try modern.append(buffer) }
             catch { onError(error.localizedDescription); return }
-            request.append(buffer)
-            let firstAudibleBuffer = hasReceivedAudio.withLockUnchecked { received in
-                guard !received, let data = buffer.floatChannelData?.pointee, buffer.frameLength > 0 else { return false }
+            var rms: Float = 0
+            if let data = buffer.floatChannelData?.pointee, buffer.frameLength > 0 {
                 var sum: Float = 0
                 for index in 0..<Int(buffer.frameLength) { sum += data[index] * data[index] }
-                guard sqrt(sum / Float(buffer.frameLength)) > 0.002 else { return false }
+                rms = sqrt(sum / Float(buffer.frameLength))
+            }
+            onLevel(rms)
+            let firstAudibleBuffer = hasReceivedAudio.withLockUnchecked { received in
+                guard !received, rms > 0.002 else { return false }
                 received = true
                 return true
             }
             if firstAudibleBuffer { onAudio() }
         }
         tapInstalled = true
-        recognitionTask = recognizer.recognitionTask(with: request) { result, error in
-            if let result { onResult(SpeechUtterance(result)) }
-            if let error {
-                let failure = error as NSError
-                let suppressed = failure.domain == "kAFAssistantErrorDomain"
-                    && (failure.code == 216 || failure.code == 203 || failure.code == 1110)
-                onError(suppressed ? nil : error.localizedDescription)
-            }
-        }
         return nil
     }
 
@@ -348,27 +407,25 @@ actor MobileDictation {
         try engine.start()
     }
 
-    func stopInput(token: UUID, cancelTask: Bool) throws {
+    func stopInput(token: UUID, cancelTask: Bool) async throws {
         guard inputToken == token else { return }
-        request?.endAudio()
-        if cancelTask { recognitionTask?.cancel(); recognitionTask = nil; inputToken = nil; recognizer = nil }
-        else { recognitionTask?.finish() }
-        request = nil
+        if cancelTask { inputToken = nil }
         if tapInstalled { engine?.inputNode.removeTap(onBus: 0) }
         tapInstalled = false
         engine?.stop()
         engine = nil
-        if cancelTask { recording = nil }
-        guard routeToken == token else { return }
-        try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        routeToken = nil
+        var routeError: Error?
+        if routeToken == token {
+            do { try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
+            catch { routeError = error }
+            routeToken = nil
+        }
+        let analyzer = modern
+        if cancelTask { modern = nil; await analyzer?.cancel() }
+        else { try await analyzer?.finish() }
+        if let routeError { throw routeError }
     }
 
-    func finishInput(token: UUID, utterance: SpeechUtterance) throws -> MultimodalAttachment {
-        guard inputToken == token, let recording else { throw CancellationError() }
-        try stopInput(token: token, cancelTask: false)
-        return try recording.finish(utterance: utterance)
-    }
 
     func prepareOutput(token: UUID, configure: @Sendable () throws -> Void,
                        activate: @Sendable () throws -> Void) throws {

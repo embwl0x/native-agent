@@ -12,7 +12,7 @@ public actor BotRunnerScheduler {
         var next: Date
         var reason: String? = nil
         var failureID: UUID? = nil
-        var minimumInterval: TimeInterval? = BotRunLimits.minimumInterval
+        var minimumInterval: TimeInterval? = nil
         var scheduledFrom: Date? = nil
         var lastRunAt: Date? = nil
         /// The last occurrence this scheduler found already past its window.
@@ -95,9 +95,10 @@ public actor BotRunnerScheduler {
 
     /// How late an occurrence may be and still just run late. Being later than
     /// one whole cadence (never less than the floor) means the window passed.
-    private static func lateness(_ bot: BotDefinition) -> TimeInterval {
-        guard case .interval(let seconds) = bot.cadence else { return BotRunLimits.minimumInterval }
-        return max(seconds, BotRunLimits.minimumInterval)
+    private static func lateness(_ bot: BotDefinition) throws -> TimeInterval {
+        let minimum = try BotRunLimits.checkedMinimumInterval()
+        guard case .interval(let seconds) = bot.cadence else { return minimum }
+        return max(seconds, minimum)
     }
 
     private func next(_ bot: BotDefinition, after date: Date, lastRunAt: Date? = nil, beyond due: Date? = nil) throws -> Date {
@@ -119,7 +120,7 @@ public actor BotRunnerScheduler {
                 guard var job = jobs[id.uuidString] else { return }
                 job.missed = cleared
                 job.lastRunAt = date
-                if job.next < date.addingTimeInterval(BotRunLimits.minimumInterval) {
+                if job.next < date.addingTimeInterval(try BotRunLimits.checkedMinimumInterval()) {
                     job.plan(try next(bot, after: date, lastRunAt: date))
                     job.scheduledFrom = date
                 }
@@ -127,6 +128,7 @@ public actor BotRunnerScheduler {
                 return try disk.write(jobs, at: path)
             }
             jobs[id.uuidString] = Job(revision: bot.updatedAt, next: try next(bot, after: date, lastRunAt: date, beyond: due),
+                                      minimumInterval: try BotRunLimits.checkedMinimumInterval(),
                                       scheduledFrom: date, lastRunAt: date,
                                       missed: cleared)
             try disk.write(jobs, at: path)
@@ -134,12 +136,12 @@ public actor BotRunnerScheduler {
     }
 
     private func reconcile(_ bots: [BotDefinition], jobs: inout [String: Job]) throws {
+        let minimumInterval = try BotRunLimits.checkedMinimumInterval()
         let ids = Set(bots.map { $0.id.uuidString })
         jobs = jobs.filter { ids.contains($0.key) }
         for bot in bots where !bot.paused {
             let key = bot.id.uuidString
-            // Jobs saved before the preference existed already use the 15-minute floor.
-            var replan = jobs[key]?.revision != bot.updatedAt || (jobs[key]?.minimumInterval ?? 15 * 60) != BotRunLimits.minimumInterval
+            var replan = jobs[key]?.revision != bot.updatedAt || jobs[key]?.minimumInterval != minimumInterval
             // A zone move re-plans nothing: a cron's pending occurrence keeps
             // its wall clock in the Mac's new zone. The time-zone notification already
             // wakes this pass; a run in flight is placed on completion. A job saved
@@ -152,7 +154,7 @@ public actor BotRunnerScheduler {
                    let carried = SchedulerJobRuntime.wallClock(job.next, from: old, to: .autoupdatingCurrent),
                    SchedulerJobRuntime.wallClock(carried, from: .autoupdatingCurrent, to: old)
                        == SchedulerJobRuntime.wallClock(job.next, from: old, to: old),
-                   carried >= (job.lastRunAt ?? .distantPast).addingTimeInterval(BotRunLimits.minimumInterval) {
+                   carried >= (job.lastRunAt ?? .distantPast).addingTimeInterval(minimumInterval) {
                     job.plan(carried); jobs[key] = job
                 } else { replan = true }
             }
@@ -164,10 +166,11 @@ public actor BotRunnerScheduler {
                 let missed = jobs[key]?.missed
                 let lastRunAt = jobs[key]?.lastRunAt
                 do { jobs[key] = Job(revision: bot.updatedAt, next: try next(bot, after: anchor, lastRunAt: lastRunAt),
+                                     minimumInterval: minimumInterval,
                                      scheduledFrom: anchor, lastRunAt: lastRunAt,
                                      missed: missed) }
                 catch { jobs[key] = Job(revision: bot.updatedAt, next: .distantFuture,
-                                        reason: String(describing: error), failureID: UUID(), lastRunAt: lastRunAt, missed: missed) }
+                                        reason: String(describing: error), failureID: UUID(), minimumInterval: minimumInterval, lastRunAt: lastRunAt, missed: missed) }
             }
         }
         guard jobs.values.allSatisfy({ $0.next.timeIntervalSince1970.isFinite && $0.revision.timeIntervalSince1970.isFinite
@@ -221,8 +224,8 @@ public actor BotRunnerScheduler {
                 for bot in live {
                     let key = bot.id.uuidString
                     guard var job = jobs[key], job.reason == nil, job.next != .distantFuture,
-                          now.timeIntervalSince(job.next) > Self.lateness(bot) else { continue }
-                    job.missed = BotMissedRun(dueAt: job.next, reason: Self.reason(
+                          now.timeIntervalSince(job.next) > (try Self.lateness(bot)) else { continue }
+                    job.missed = BotMissedRun(dueAt: job.next, reason: try Self.reason(
                         bot, due: job.next, autonomyEnabled: autonomyEnabled,
                         startedAt: startedAt, lastTick: lastTick, now: now))
                     job.plan(try next(bot, after: now, lastRunAt: job.lastRunAt, beyond: job.next))
@@ -241,10 +244,10 @@ public actor BotRunnerScheduler {
     /// shows it never ran a pass across that window — a machine that stopped.
     /// Anything else is the honest blank.
     private static func reason(_ bot: BotDefinition, due: Date, autonomyEnabled: Bool,
-                               startedAt: Date, lastTick: Date?, now: Date) -> BotMissedRun.Reason {
+                               startedAt: Date, lastTick: Date?, now: Date) throws -> BotMissedRun.Reason {
         guard autonomyEnabled else { return .autonomyOff }
         if due < startedAt { return .appClosed }
-        guard let lastTick, lastTick < due, now.timeIntervalSince(lastTick) > lateness(bot) else { return .notRun }
+        guard let lastTick, lastTick < due, now.timeIntervalSince(lastTick) > (try lateness(bot)) else { return .notRun }
         return .asleep
     }
 
@@ -258,7 +261,7 @@ public actor BotRunnerScheduler {
     /// The unattended gates, re-read after an event-woken request has won its
     /// claim. `paused` is the definition the claim itself read, under the store
     /// lock. Returns true — having recorded the hold — when nothing may be spent.
-    private func holdUnattendedRun(bot id: UUID, paused: Bool) async -> Bool {
+    private func holdUnattendedRun(bot id: UUID, paused: Bool) async throws -> Bool {
         let enabled = await isAutonomyEnabled()
         let stopped = isShutDown || Task.isCancelled
         guard stopped || !enabled || paused else { return false }
@@ -266,7 +269,7 @@ public actor BotRunnerScheduler {
         // There is no `.paused` reason; `.notRun` plus the gate's own words is
         // the honest record for a bot paused under us.
         lastUnattendedHold[id] = enabled ? (.notRun, detail) : (.autonomyOff, nil)
-        try? events.hold(bot: id, detail: detail)
+        try events.hold(bot: id, detail: detail)
         return true
     }
 
@@ -317,12 +320,12 @@ public actor BotRunnerScheduler {
                 guard inFlight[id] == nil else { continue }
                 let requestID = request.runID
                 guard bots.contains(where: { $0.id == id }) else {
-                    try queue.rejectPending(bot: id, requestID: requestID)
+                    try queue.rejectPending(bot: id, requestID: requestID, detail: "This helper is deleted or unavailable in the checked definition list. No helper turn ran.")
                     continue
                 }
                 try Task.checkCancellation()
                 guard reconciledJobs[id.uuidString]?.reason == nil else {
-                    try queue.rejectPending(bot: id, requestID: requestID)
+                    try queue.rejectPending(bot: id, requestID: requestID, detail: "This helper's schedule is invalid: \(reconciledJobs[id.uuidString]?.reason ?? "schedule unavailable"). No helper turn ran.")
                     continue
                 }
                 // An event-woken request is unattended spend, and it can reach
@@ -332,10 +335,10 @@ public actor BotRunnerScheduler {
                 if request.isEvent {
                     let enabled = await isAutonomyEnabled()
                     guard !isShutDown, !Task.isCancelled else { return completed }
-                    let paused = (try? definitions.get(id))?.paused ?? false
+                    let paused = try definitions.get(id).paused
                     if !enabled || paused {
-                        try queue.rejectPending(bot: id, requestID: requestID)
-                        try? events.hold(bot: id, detail: enabled ? "the bot is paused" : "Autonomy is off")
+                        try queue.rejectPending(bot: id, requestID: requestID, detail: enabled ? "The bot is paused. No helper turn ran." : "Autonomy is off. No helper turn ran.")
+                        try events.hold(bot: id, detail: enabled ? "the bot is paused" : "Autonomy is off")
                         continue
                     }
                 }
@@ -346,9 +349,9 @@ public actor BotRunnerScheduler {
                 // during that wait and a queued request is exempt from the
                 // claim's own pause guard.
                 let isEvent = request.isEvent
-                let holdUnattended: @Sendable (BotDefinition) async -> Bool = { claimed in
+                let holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { claimed in
                     guard isEvent else { return false }
-                    return await self.holdUnattendedRun(bot: id, paused: claimed.paused)
+                    return try await self.holdUnattendedRun(bot: id, paused: claimed.paused)
                 }
                 try Task.checkCancellation()
                 inFlight[id] = Task {
@@ -390,6 +393,7 @@ public actor BotRunnerScheduler {
                     // Crash recovery skips this occurrence; never replays spend.
                     jobs[key] = Job(revision: fresh.updatedAt,
                                     next: try next(fresh, after: now.addingTimeInterval(BotRunLimits.maximumSeconds), lastRunAt: now, beyond: due),
+                                    minimumInterval: try BotRunLimits.checkedMinimumInterval(),
                                     scheduledFrom: now.addingTimeInterval(BotRunLimits.maximumSeconds),
                                     lastRunAt: jobs[key]?.lastRunAt,
                                     missed: jobs[key]?.missed)
@@ -409,8 +413,8 @@ public actor BotRunnerScheduler {
                         // unattended work was switched off.
                         let botID = bot.id
                         lastUnattendedHold.removeValue(forKey: botID)
-                        let holdUnattended: @Sendable (BotDefinition) async -> Bool = { claimed in
-                            await self.holdUnattendedRun(bot: botID, paused: claimed.paused)
+                        let holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { claimed in
+                            try await self.holdUnattendedRun(bot: botID, paused: claimed.paused)
                         }
                         if let entry = try await runner.run(bot: bot.id, holdUnattended: holdUnattended,
                                                           deadlineExceeded: { await self.reportDeadline(bot.id, detail: $0) }) {

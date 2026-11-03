@@ -11,11 +11,6 @@ public enum ProcedureCanonicalOracle: String, Codable, Sendable, Equatable {
     case workshopRecordAndTimeline = "workshop_record_and_timeline"
 }
 
-public enum ProcedureFallbackRoute: String, Codable, Sendable, Equatable {
-    case githubCanonicalReducer = "github_canonical_reducer"
-    case ordinaryWorkshopPlannerExecutor = "ordinary_workshop_planner_executor"
-}
-
 public enum ProcedureSafetyRecheckPoint: String, Codable, Sendable, Equatable {
     case beforeInvocation = "before_invocation"
     case beforeEveryAction = "before_every_action"
@@ -55,8 +50,7 @@ public struct ProcedureTransitionRule: Codable, Sendable, Equatable {
 }
 
 public struct DeclarativeProcedureArtifact: Codable, Sendable, Equatable, Identifiable {
-    public static let schema = "declarative-procedure-transition-table.v2"
-    static let legacySchema = "declarative-procedure-transition-table.v1"
+    public static let schema = "declarative-procedure-transition-table.v3"
 
     public private(set) var schema: String
     public private(set) var id: String
@@ -70,8 +64,6 @@ public struct DeclarativeProcedureArtifact: Codable, Sendable, Equatable, Identi
     public let transitionTable: [ProcedureTransitionRule]
     public let safety: ProcedureSafetyDeclaration
     public let deterministicAbandonConditions: [String]
-    public let deterministicFallback: ProcedureFallbackRoute
-    public let rollbackDeclaration: String
     public let reviewerDecision: ProcedureReviewerDecision
     public let manualInvocationEligible: Bool
     public let canaryEligible: Bool
@@ -95,37 +87,6 @@ public struct DeclarativeProcedureArtifact: Codable, Sendable, Equatable, Identi
         return artifact
     }
 
-    /// The v1 fingerprint omits semantic and approval fields; recognizing it never admits execution.
-    func legacyIdentity() -> String {
-        let fingerprint = [
-            procedureShapeIdentity,
-            domain,
-            inputContract.taskFamily,
-            inputContract.inputClass,
-            authorityClass,
-            inputContract.acceptedParameterSchemaIdentities.joined(separator: ","),
-            transitionTable.map {
-                "\($0.sequence)|\($0.beforeState ?? "nil")|\($0.onTransitionKind)|"
-                    + "\($0.actionKind ?? "nil")|\($0.requiredEvidenceKind ?? "nil")|"
-                    + "\($0.externalEffectClass)|\($0.afterState ?? "nil")|"
-                    + "\($0.terminalClass?.rawValue ?? "nil")"
-            }.joined(separator: ">"),
-            reviewerDecision.reviewerIdentity,
-            reviewerDecision.decidedAt,
-        ].joined(separator: "||")
-        return CausalTransitionEvidence.opaqueIdentity(fingerprint)
-    }
-
-    public var requiresLegacyRevalidation: Bool {
-        schema == Self.legacySchema && id != (try? canonicalIdentity())
-    }
-
-    func withLegacyIdentity() -> Self {
-        var artifact = self
-        artifact.schema = Self.legacySchema
-        artifact.id = artifact.legacyIdentity()
-        return artifact
-    }
 }
 
 public enum ProcedureCompilationError: Error, Equatable {
@@ -138,16 +99,15 @@ public enum ProcedureCompilationError: Error, Equatable {
 /// both read, so an artifact one boundary accepts the other accepts too.
 struct ProcedureDomainContract {
     let oracle: ProcedureCanonicalOracle
-    let fallback: ProcedureFallbackRoute
     let capability: String
 
     static func named(_ domain: String) -> ProcedureDomainContract? {
         switch domain {
         case "github_command":
-            ProcedureDomainContract(oracle: .githubCommandReducer, fallback: .githubCanonicalReducer,
+            ProcedureDomainContract(oracle: .githubCommandReducer,
                                     capability: "github_connector")
         case "workshop_execution":
-            ProcedureDomainContract(oracle: .workshopRecordAndTimeline, fallback: .ordinaryWorkshopPlannerExecutor,
+            ProcedureDomainContract(oracle: .workshopRecordAndTimeline,
                                     capability: "workshop_execution")
         default: nil
         }
@@ -216,8 +176,6 @@ public enum DeclarativeProcedureCompiler {
             transitionTable: table,
             safety: safety,
             deterministicAbandonConditions: candidate.deterministicAbandonConditions,
-            deterministicFallback: domain.fallback,
-            rollbackDeclaration: "delete_artifact_restore_fallback_no_data_migration",
             reviewerDecision: review,
             manualInvocationEligible: true,
             canaryEligible: candidate.canaryEligible,

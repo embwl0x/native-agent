@@ -9,8 +9,6 @@ import PersistenceCore
 /// Memory prose is never evidence that something is planned for a moment.
 public enum MemoryDueDateStamp {
     public static let dueAtKey = "due_at"
-    /// Write-time display retained for older readers; never current words or identity.
-    public static let dueLabelKey = "due_label"
     public static let dueSourceKey = "due_source"
 
     /// Derived from the resolved instant against the reader's clock, never prose.

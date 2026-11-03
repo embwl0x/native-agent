@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `CognitiveSubstrate+Capsule.swift` | `CognitiveSubstrate`: `compileFrozenCapsulePresentation` owns chat and inspect-only reflection assembly |
+// Blueprint: | `CognitiveSubstrate+Capsule.swift` | `CognitiveSubstrate`: frozen chat/inspect assembly; cached counterpart line and frozen shared person-presence evidence sit outside felt cue competition |
 
 extension CognitiveSubstrate {
     /// The care movement this turn's unbidden recall already resolved, if any.
@@ -82,7 +82,12 @@ extension CognitiveSubstrate {
             why: &cueWhy
         )
         // Receipts are not cues: they never compete for the one felt slot.
-        let dynamicLines = (request.surface == Self.cadenceExemptCapsuleSurface
+        let personLine: String? = request.mode == .inject && request.resolvedTurnKind == .live
+            ? request.speaker.flatMap {
+                read.personLines[CognitiveCareProvenance.personKey($0, aliases: read.carePersonAliases)]
+            }.map { "- With them: " + $0 } : nil
+        let presenceLine = read.personPresenceLine.map { "- Your person: " + $0 }
+        let dynamicLines = [personLine, presenceLine].compactMap { $0 } + (request.surface == Self.cadenceExemptCapsuleSurface
             ? candidateLines : Self.oneFeltCue(candidateLines))
             + Array(Set(unreadable)).sorted().map(Self.unreadableCueLine)
         let capsule = assembledCapsule(
@@ -101,6 +106,7 @@ extension CognitiveSubstrate {
                 expected: expectedPresentationState,
                 next: &nextPresentationState)
             commit = CognitiveCapsulePresentationCommit(
+                mindEpoch: read.mindEpoch,
                 fixedAt: read.fixedAt,
                 expected: expectedPresentationState,
                 next: nextPresentationState
@@ -242,7 +248,7 @@ extension CognitiveSubstrate {
         )
         // Felt mode selects an attested exemplar without adding prompt text.
         let mode = frozenRead.configuration.enabled
-            ? Self.feltMode(signals, intensityFloor: dyn.feltIntensityFloor)
+            ? signals.flatMap { Self.feltMode($0, intensityFloor: dyn.feltIntensityFloor) }
             : nil
         // Only the user's first turn after a qualifying gap may carry a cue of actual events.
         let gapOpened = request.fromUser
@@ -266,14 +272,14 @@ extension CognitiveSubstrate {
         let reflectionPreview = request.surface == Self.cadenceExemptCapsuleSurface
         let bodyLine = organismBodyLine(from: request.organismProjection)
         // The self-exemplar echo goes last so budget truncation cannot displace core cues.
-        let echo = soundEchoSelection(
+        let echo = signals.map { signals in soundEchoSelection(
             from: frozenRead,
             mode: mode,
             roomValence: signals.valence,
             currentSessionId: request.sessionId,
             surface: request.surface,
             emitReceipts: request.mode == .inject
-        )
+        ) } ?? .silent
         // ONE gate for the named rut line, whether or not the exemplar echo
         // speaks this turn.
         let rutSpeaks = soundRutAwarenessShouldSpeak(
@@ -289,7 +295,7 @@ extension CognitiveSubstrate {
         let fingerprint: FeltLineRender?
         if let felt {
             fingerprint = felt.fingerprint
-        } else {
+        } else if let signals {
             fingerprint = feltFingerprintLine(
                 signals: signals,
                 workspaceItems: workspaceItems,
@@ -298,7 +304,7 @@ extension CognitiveSubstrate {
                 dynamics: dyn,
                 affectEnabled: frozenRead.configuration.enabled
             )
-        }
+        } else { fingerprint = nil }
         if let fingerprint {
             // Delivery needs cadence approval and a first-run verdict; reflection omits only the first-run check.
             let verdict = fingerprintCadenceVerdict(
@@ -475,7 +481,8 @@ extension CognitiveSubstrate {
         let requestTurnKind = request.resolvedTurnKind
         guard requestTurnKind == .live || request.allowNonLiveProjection else { return nil }
         let read = await frozenRead(at: fixedAt)
-        let speaker = request.speaker.map(CognitiveCareProvenance.personKey)
+        let speaker = request.speaker.map { CognitiveCareProvenance.personKey($0, aliases: read.carePersonAliases) }
+            .flatMap { read.carePeopleAvailable || CognitiveCareProvenance.independentPersonKey($0) ? $0 : nil }
         let messageTerms = Self.associationTerms(in: request.userMessage)
         let reachableCares = read.cares.filter { care in
             care.fadedAt == nil && !read.associationSuppressions.contains {
@@ -490,8 +497,9 @@ extension CognitiveSubstrate {
         // moment while it did (`revalidatedRemindedOf`).
         async let recallRead = {
             var felt: (signals: FeltSignals, fingerprint: FeltLineRender?)?
-            let moment = await self.remindedOfMoment(for: request, from: read, among: reachableCares, felt: &felt)
-            return (moment, felt)
+            var unreadable: [String] = []
+            let moment = await self.remindedOfMoment(for: request, from: read, among: reachableCares, felt: &felt, unreadable: &unreadable)
+            return (moment, felt, unreadable)
         }()
         // Local continuity lookups keep their dream cooldown and first-turn gap gates.
         async let dreamRead = {
@@ -504,14 +512,18 @@ extension CognitiveSubstrate {
             let items = await self.sinceGapItems(for: request, from: read, unreadable: &unreadable)
             return (items, unreadable)
         }()
-        async let careRead = self.careCue(for: request, from: read, among: reachableCares)
+        async let careRead = {
+            var unreadable: [String] = []
+            let cue = await self.careCue(for: request, from: read, among: reachableCares, unreadable: &unreadable)
+            return (cue, unreadable)
+        }()
         let (recall, dream, gap, careCue) = await (recallRead, dreamRead, gapRead, careRead)
         guard !forgettingInFlight, mindEpoch == read.mindEpoch else { return nil }
         let remindedOf = recall.0.flatMap { revalidatedRemindedOf($0, against: read) }
         let prepared = compileFrozenCapsulePresentation(
             request, from: read, remindedOf: remindedOf,
-            dreamTheme: dream.0, gapItems: gap.0, careCue: careCue,
-            felt: recall.1, unreadable: dream.1 + gap.1)
+            dreamTheme: dream.0, gapItems: gap.0, careCue: careCue.0,
+            felt: recall.1, unreadable: dream.1 + gap.1 + recall.2 + careCue.1)
         // An empty capsule still returns, carrying its commit;
         // callers inject only `nonEmptyCapsule`.
         guard prepared.capsule.mode == .inject else { return nil }
@@ -525,6 +537,13 @@ extension CognitiveSubstrate {
     public func applyCapsulePresentationCommit(
         _ commit: CognitiveCapsulePresentationCommit
     ) -> Bool {
+        guard !forgettingInFlight, commit.mindEpoch == mindEpoch else {
+            TurnTraceBus.fireFromContext(kind: "cognition.capsule_commit_refused", payload: .object([
+                "preparedMindEpoch": .string(String(commit.mindEpoch)),
+                "currentMindEpoch": .string(String(mindEpoch)), "clearInFlight": .bool(forgettingInFlight),
+            ]))
+            return false
+        }
         // The rut turn counter free-runs on accepted turns, so an ingest
         // between prepare and commit legitimately moves it. Comparing it here
         // would reject the whole commit for a field the render only reads.
@@ -592,7 +611,10 @@ extension CognitiveSubstrate {
             object["careReleased"] = .object(capsulePresentationState.careReleased.mapValues { .double($0.timeIntervalSince1970) })
         }
         if !careWatchWoke.isEmpty {
-            object["careWatchWoke"] = .object(careWatchWoke.mapValues { .double($0.timeIntervalSince1970) })
+            object["careWatchWoke"] = .object(careWatchWoke.mapValues {
+                .object(["at": .double($0.at.timeIntervalSince1970), "streak": .int(Int64($0.streak)),
+                         "lived": .string(String($0.lived))])
+            })
         }
         if !capsulePresentationState.careLineRest.isEmpty {
             object["careLineRest"] = .object(capsulePresentationState.careLineRest.mapValues {
@@ -611,6 +633,13 @@ extension CognitiveSubstrate {
     /// Write the cadence ledger iff an accepted turn actually moved it.
     func flushCapsulePresentationIfNeeded(at now: Date) async {
         guard capsulePresentationDirty else { return }
+        do { try await persistCapsulePresentationChecked(at: now) }
+        catch { /* The checked owner records the stage and cause below. */ }
+    }
+
+    /// A journal fold awaits its own durable write even if another cadence
+    /// flush has already cleared the dirty flag while saving.
+    func persistCapsulePresentationChecked(at now: Date) async throws {
         // Clear before suspension so a concurrent update keeps its own dirty flag.
         capsulePresentationDirty = false
         do {
@@ -621,14 +650,16 @@ extension CognitiveSubstrate {
                 score: 0,
                 payload: capsulePresentationArtifactPayload(at: now)
             )
+            await notingPersistence("capsule_presentation") { }
         } catch {
             capsulePresentationDirty = true
+            await notingPersistence("capsule_presentation") { throw error }
+            throw error
         }
     }
 
-    /// Restore is DEFENSIVE: an unreadable or absent row leaves the live
-    /// (empty) cadence alone rather than throwing, because a lost cadence is a
-    /// nag, not a corruption.
+    /// Only a fully validated present payload reaches this projection.
+    /// An absent artifact leaves the empty cadence; damaged bytes fail restore.
     func restoreCapsulePresentation(from payloads: [JSONValue]) {
         guard case .object(let object)? = payloads.first else { return }
         // Only named "kind:phrase" rut signatures carry cadence.
@@ -674,12 +705,18 @@ extension CognitiveSubstrate {
             capsulePresentationState.careReleased = restored
         }
         if case .object(let woke)? = object["careWatchWoke"] {
-            var restored: [String: Date] = [:]
+            var restored: [String: CareWatchRest] = [:]
             for (key, value) in woke where key.utf8.count <= 512 && UUID(uuidString: String(key.suffix(36))) != nil {
-                if let at = value.numberValue(coercingStrings: false, finiteOnly: false) { restored[key] = Date(timeIntervalSince1970: at) }
+                if case .object(let row) = value,
+                   let at = row["at"]?.numberValue(coercingStrings: false, finiteOnly: true),
+                   let streak = row["streak"]?.numberValue(coercingStrings: false, finiteOnly: true),
+                   let count = Int(exactly: streak), count >= 0,
+                   let stamp = row["lived"]?.stringValue.flatMap({ UInt64($0) }) {
+                    restored[key] = CareWatchRest(at: Date(timeIntervalSince1970: at), streak: count, lived: stamp)
+                }
             }
-            Self.boundDateLedger(&restored)
             careWatchWoke = restored
+            boundCareWatchLedger()
         }
         if case .object(let rests)? = object["careLineRest"] {
             var restored: [String: CognitiveCapsulePresentationState.CareLineRest] = [:]

@@ -25,7 +25,7 @@ swift "$ROOT/script/generate_architecture_blueprint.swift" --check --repo "$ROOT
 echo "[smoke] production timer/deadline ownership"
 "$ROOT/script/check_timer_inventory.swift" --repo "$ROOT"
 
-echo "[smoke] persona hygiene"
+echo "[smoke] shipped persona guidance hygiene (no live state)"
 "$ROOT/script/check_persona_skill_hygiene.swift" --repo "$ROOT"
 
 if [[ "$LIVE" -eq 1 ]]; then

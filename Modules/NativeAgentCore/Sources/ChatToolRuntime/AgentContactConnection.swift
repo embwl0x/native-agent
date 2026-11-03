@@ -20,8 +20,43 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import TurnTrace
-// Blueprint: | `AgentContactConnection.swift` | Named contact connection and disconnection |
+// Blueprint: | `AgentContactConnection.swift` | Named contact connection and disconnection; one checked peer snapshot supplies current projections, with explicit unavailable readouts beside committed setup evidence |
 extension SwiftToolDispatcher {
+    /// A current contact and its peer set are one checked address-book read.
+    /// A failed read or a contact removed meanwhile cannot reuse an earlier binding.
+    static func checkedPeerSnapshot(_ id: String, store: AgentPeerStore) throws
+        -> (contact: AgentPeerContact, peers: [AgentPeerContact]) {
+        let peers = try store.list()
+        guard let contact = peers.first(where: { $0.id == id }) else {
+            throw ToolFailureError("The saved address book has no row for this contact ID. Read agent.contacts before continuing; nothing was resent.",
+                effects: .unknown, owner: store.fileURL.path,
+                nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]),
+                code: "agent_contact_not_saved", recovery: .inspect)
+        }
+        return (contact, peers)
+    }
+
+    /// Post-effect readers keep the effect receipt and label its projection
+    /// unavailable if the current address-book read failed.
+    static func checkedPeerReadout(_ id: String, store: AgentPeerStore) -> (contact: JSONValue, fields: [String: JSONValue]) {
+        do {
+            let snapshot = try checkedPeerSnapshot(id, store: store)
+            let state = try currentPeerState(snapshot.contact, peers: snapshot.peers)
+            let contact = peerProjection(snapshot.contact, peers: snapshot.peers)
+            let detail = state == .unavailable ? state.detail : AgentContactHealth.checkIn(snapshot.contact)?.detail ?? state.detail
+            return (contact, ["state": .string(state.rawValue), "state_detail": .string(detail), "contact": contact])
+        } catch {
+            let failure = ChatToolOutcome.failure(error: error)
+            let detail = "The saved contact state could not be read: \(error.localizedDescription). The operation's effect evidence is retained independently."
+            let contact: JSONValue = .object(["agent": .string("peer:" + id), "state": .string("unavailable"),
+                "state_detail": .string(detail), "state_failure": failure])
+            return (contact, ["state": .string("unavailable"), "state_detail": .string(detail), "state_failure": failure, "contact": contact])
+        }
+    }
+
+    static func checkedPeerProjection(_ id: String, store: AgentPeerStore) -> JSONValue {
+        checkedPeerReadout(id, store: store).contact
+    }
     static func peerFailure(_ failure: ProviderFailure.Report, into envelope: inout [String: JSONValue]) {
         AgentPeerPolicy.peerFailure(failure, into: &envelope)
     }
@@ -41,7 +76,7 @@ extension SwiftToolDispatcher {
                                 "detail": .string("Installation/bundle check failed: \(row.installationCheck)")])
             }
             let saved = try store.insertDiscovered(AgentPeerContact(name: row.displayName, endpoint: endpoint, transport: .desktopChat))
-            return .object(["status": .string("configured"), "contact": Self.peerProjection(saved, peers: (try? store.list()) ?? []),
+            return .object(["status": .string("configured"), "contact": Self.checkedPeerProjection(saved.id, store: store),
                 "changed": .bool(true), "completed": .bool(false),
                 "detail": .string("Saved. Your first message opens a chat of your own in \(row.displayName) and brings its answer back in the same call.")])
         }
@@ -83,7 +118,7 @@ extension SwiftToolDispatcher {
         if var existing = proposal.existing, proposal.row.acp == nil {
             if proposal.row.format == .shellEnvironment {
                 let result = try AgentHostConnection.ensureEnvironment(proposal: proposal, store: store)
-                return Self.environmentSetupResult(proposal: proposal, contact: result.contact, peers: try store.list(),
+                return Self.environmentSetupResult(proposal: proposal, contact: result.contact, store: store,
                     changed: result.repaired, repaired: result.repaired)
             }
             let setup = try AgentHostConnection.connect(proposal: proposal, store: store)
@@ -96,31 +131,34 @@ extension SwiftToolDispatcher {
             var programApproved = false
             if proposal.row.commandLine != nil,
                let path = proposal.executablePath, path == executablePath, existing.verifiedExecutablePath != path {
-                programApproved = (try? store.approveExecutable(peerID: existing.id, path: path)) == true
-                if programApproved, let saved = try? store.list().first(where: { $0.id == existing.id }) { existing = saved }
+                programApproved = try store.approveExecutable(peerID: existing.id, path: path)
+                guard programApproved else {
+                    throw ToolFailureError("The contact changed before its program could be approved. Read agent.contacts before continuing.",
+                        effects: .unknown, owner: store.fileURL.path,
+                        nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]), recovery: .inspect)
+                }
             }
-            var value: [String: JSONValue] = ["status": .string(repaired ? "configured" : "already_configured"), "contact": Self.peerProjection(existing, peers: (try? store.list()) ?? []),
+            var value: [String: JSONValue] = ["status": .string(repaired ? "configured" : "already_configured"), "contact": Self.checkedPeerProjection(existing.id, store: store),
                             "changed": .bool(repaired || permissionsChanged || programApproved),
                             "detail": .string(repaired
                                 ? "Repaired \(proposal.row.displayName)'s connector entry and key on the same contact. Restart: \(proposal.row.restartNote)"
                                 : programApproved
-                                ? "Approved the \(proposal.row.displayName) program at \(existing.approvedExecutablePath ?? ""); a Full Mac launch runs exactly this file. Nothing else was changed."
+                ? "Approved the \(proposal.row.displayName) program at \(executablePath ?? ""); a Full Mac launch runs exactly this file. Nothing else was changed."
                                 : "\(proposal.row.displayName) already has this app's entry and its own key. Nothing was changed.")]
             if existing.state != .connected, proposal.row.commandLine?.automaticMCPProbe == false {
                 value["detail"] = .string(Self.directCommandSetupDetail)
             }
-            if permissionsChanged { value["detail"] = .string("Enabled only this connection's two messaging tools in Antigravity. Send a message to verify the return path; existing Ask/Deny rules and all other permissions are unchanged.") }
+            if permissionsChanged { value["detail"] = .string("Enabled only this connection's two messaging tools in \(proposal.row.displayName). Send a message to verify the return path; existing Ask/Deny rules and all other permissions are unchanged. Restart: \(proposal.row.restartNote)") }
             if existing.state != .connected, proposal.row.commandLine?.automaticMCPProbe == true {
                 let probe = try await hostCommandRun(row: proposal.row, contact: existing,
                     message: AgentHostDirectory.probeText(appName: Self.appDisplayName),
                     session: nil, store: store, surface: surface, probe: true)
-                let settled = (try? store.list().first { $0.id == existing.id }) ?? existing
-                let peers = (try? store.list()) ?? []
-                let state = Self.currentPeerState(settled, peers: peers)
-                value["contact"] = Self.peerProjection(settled, peers: peers)
-                value["state"] = .string(state.rawValue)
-                value["status"] = .string(state == .connected ? "connected" : "configured")
-                value["detail"] = .string(state == .connected ? state.detail : Self.probeReason(probe, row: proposal.row))
+                let fields = Self.checkedPeerReadout(existing.id, store: store).fields
+                value.merge(fields) { _, current in current }
+                let connected = fields["state"] == .string(AgentPeerContactState.connected.rawValue)
+                value["status"] = .string(connected ? "connected" : "configured")
+                value["detail"] = connected ? fields["state_detail"] : .string(Self.probeReason(probe, row: proposal.row))
+                if fields["state_failure"] != nil { value["detail"] = fields["state_detail"] }
                 Self.includeConnectionProbe(probe, in: &value)
             }
             Self.sayReplaced(setup.outcome, in: &value)
@@ -147,10 +185,10 @@ extension SwiftToolDispatcher {
         let result = try AgentHostConnection.connect(proposal: proposal, store: store)
         let row = proposal.row
         if row.format == .shellEnvironment {
-            return Self.environmentSetupResult(proposal: proposal, contact: result.contact, peers: try store.list(), changed: true)
+            return Self.environmentSetupResult(proposal: proposal, contact: result.contact, store: store, changed: true)
         }
         if row.acp != nil {
-            return .object(["status": .string("configured"), "contact": Self.peerProjection(result.contact, peers: (try? store.list()) ?? []),
+            return .object(["status": .string("configured"), "contact": Self.checkedPeerProjection(result.contact.id, store: store),
                 "changed": .bool(true), "completed": .bool(false),
                 "detail": .string("Saved this connection with its own key. Its settings were not changed. Send a message to check that it can answer; setup alone does not prove that.")])
         }
@@ -166,15 +204,13 @@ extension SwiftToolDispatcher {
                 message: AgentHostDirectory.probeText(appName: Self.appDisplayName),
                 session: nil, store: store, surface: surface, probe: true)
         }
-        let settled = (try? store.list().first { $0.id == result.contact.id }) ?? result.contact
         // The probe's own reply is the CLI talking back on its command line.
         // Only an inbound request through the entry proves the entry works, so
         // the connect state is read back from the contact, never from the run.
-        let state = Self.currentPeerState(settled, peers: (try? store.list()) ?? [])
+        let fields = Self.checkedPeerReadout(result.contact.id, store: store).fields
+        let connected = fields["state"] == .string(AgentPeerContactState.connected.rawValue)
         var value: [String: JSONValue] = [
-            "status": .string(state == .connected ? "connected" : "configured"),
-            "contact": Self.peerProjection(settled, peers: (try? store.list()) ?? []),
-            "state": .string(state.rawValue), "state_detail": .string(state == .unavailable ? state.detail : AgentContactHealth.checkIn(settled)?.detail ?? state.detail),
+            "status": .string(connected ? "connected" : "configured"),
             "config_path": .string(result.outcome.path),
             "entry": .string(AgentHostDirectory.entryName),
             "restart_required": .bool(row.restartRequired),
@@ -184,34 +220,37 @@ extension SwiftToolDispatcher {
                 + (row.restartRequired
                    ? "\(row.displayName) may need a restart before it picks the entry up — restart it yourself; nothing of its window is opened or read. "
                    : "")
-                + (state == .connected
+                + (connected
                    ? "The executable answered a request; the contact carries the scope and time of that proof."
                    : row.commandLine != nil
                      ? "The probe did not come back through the entry, so this stays set up: an entry that exists proves only that it was written. " + Self.probeReason(probe, row: row)
                      : "No inbound message authenticated this contact's key yet. Check agents/recipes/\(row.id).json host.configPath=\(row.expandedConfigPath) with agent.verify. Restart: \(row.restartNote) Then send a message through that host's connector to prove it.")),
         ]
+        value.merge(fields) { _, current in current }
         if let probe { Self.includeConnectionProbe(probe, in: &value) }
-        if row.commandLine?.automaticMCPProbe == false, state != .connected {
+        if row.commandLine?.automaticMCPProbe == false, !connected {
             value["detail"] = .string(Self.directCommandSetupDetail)
         }
+        if fields["state_failure"] != nil { value["detail"] = fields["state_detail"] }
         if let backup = result.outcome.backupPath { value["backup_path"] = .string(backup) }
         Self.sayReplaced(result.outcome, in: &value)
         return .object(value)
     }
     private static let directCommandSetupDetail = "Contact saved with permission for its two MCP messaging tools only. agent.message returns the command's answer; conversation_id continues it. No callback was attempted. The separate MCP reply path stays unverified until an inbound message arrives."
     private static func environmentSetupResult(proposal: AgentHostConnection.Proposal, contact: AgentPeerContact,
-                                               peers: [AgentPeerContact], changed: Bool, repaired: Bool = false) -> JSONValue {
+                                               store: AgentPeerStore, changed: Bool, repaired: Bool = false) -> JSONValue {
         let prefix = "set -a && . " + AgentHostDirectory.shellQuoted(proposal.row.expandedConfigPath)
             + " && set +a && " + AgentHostDirectory.shellQuoted(proposal.command)
         let message = prefix + " message \"hello\""
         let reply = prefix + " reply --session '<session_id>' --request '<request_id>'"
-        let state = currentPeerState(contact, peers: peers)
-        return .object(["status": .string(repaired ? "repaired" : changed ? "configured" : "already_configured"),
-            "contact": peerProjection(contact, peers: peers), "changed": .bool(changed),
-            "state": .string(state.rawValue), "state_detail": .string(proposal.row.description),
+        let readout = checkedPeerReadout(contact.id, store: store)
+        var value: [String: JSONValue] = ["status": .string(repaired ? "repaired" : changed ? "configured" : "already_configured"),
+            "changed": .bool(changed),
             "env_file": .string(proposal.row.expandedConfigPath), "outbound_route": .string("chatgpt-dot-ipc"),
             "message_command": .string(message), "reply_command": .string(reply), "restart_required": .bool(false),
-            "detail": .string("\(repaired ? "Repaired" : changed ? "Created" : "Already configured") ChatGPT Dot with its own scoped key and private (0600) environment file. No ChatGPT settings were edited. NativeAgent can message Dot in-house after a read-only route check.\nGive Dot this exact command:\n\(message)\nIf the answer is enqueued, use the session_id and request_id returned by that command:\n\(reply)\nKeep the same --session to continue the conversation. Read enqueued answers with reply; do not resend the message.")])
+            "detail": .string("\(repaired ? "Repaired" : changed ? "Created" : "Already configured") ChatGPT Dot with its own scoped key and private (0600) environment file. No ChatGPT settings were edited. NativeAgent can message Dot in-house after a read-only route check.\nGive Dot this exact command:\n\(message)\nIf the answer is enqueued, use the session_id and request_id returned by that command:\n\(reply)\nKeep the same --session to continue the conversation. Read enqueued answers with reply; do not resend the message.")]
+        value.merge(readout.fields) { _, current in current }
+        return .object(value)
     }
     func hostDisconnect(name: String, store: AgentPeerStore) async throws -> JSONValue {
         guard usesCanonicalBody else {

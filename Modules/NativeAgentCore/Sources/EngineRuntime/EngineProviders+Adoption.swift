@@ -23,14 +23,14 @@ extension ProvidersFacade {
     ) async -> Bool {
         defer { Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() } }
         // Only an eligible account can become Chat's inherited route.
-        guard let providers = try? await list().providers,
-              providers.contains(where: { $0.provider_id == providerId && $0.auth_status.eligible }) else { return false }
         // Saved assignments (without sole-account resolution) are re-read
         // inside the picker's transaction. No stale per-surface clear follows.
         let routing = SwiftNativeProviderRouting(
             dataRoot: dataRoot
         )
         do {
+            let providers = try await list().providers
+            guard providers.contains(where: { $0.provider_id == providerId && $0.auth_status.eligible }) else { return false }
             let result = try await routing.adoptConnectedProvider(providerId)
             try publishCommittedRouting(result.snapshot)
             await refreshSessionsAfterRoutingWrite()

@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `ActivityRetention.swift` | `ActivityRetentionRunner`: durable last-run stamp, prune deadlines and policy-selected retention |
+// Blueprint: | `ActivityRetention.swift` | `ActivityRetentionRunner`: checked completed-run cadence before pruning; unreadable state preserves bytes and pauses retention; durable stamp follows successful pruning |
 
 /// W10 — retention enforcement.
 ///
@@ -16,25 +16,33 @@ public struct ActivityRetentionRunner: Sendable {
     public static let defaultInterval: TimeInterval = 6 * 3600
 
     public let stateURL: URL
+    private struct Cadence: Codable {
+        let last_run_at: Double
+    }
 
     public init(dataRoot: URL) {
         self.stateURL = ActivityWatchPaths.retentionStateURL(dataRoot: dataRoot)
     }
 
-    /// Throws when the state file exists but cannot be read; the caller records that and keeps its cadence.
+    /// Unavailable state throws: scheduling pauses until its exact file changes.
     public func nextRunDelay(now: Double = Date().timeIntervalSince1970) throws -> TimeInterval {
         guard let last = try lastRunAt(), last <= now,
-              last + Self.defaultInterval > now else { return Self.defaultInterval }
+              last + Self.defaultInterval > now else { return 0 }
         return last + Self.defaultInterval - now
     }
 
     /// nil: no state file yet (fresh). Throws: the file is there and unreadable or corrupt (a fault, not fresh).
     public func lastRunAt() throws -> Double? {
-        let data: Data
-        do { data = try Data(contentsOf: stateURL) }
-        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let stamp = object["last_run_at"] as? Double, stamp.isFinite else {
+        let attributes: [FileAttributeKey: Any]
+        do { attributes = try FileManager.default.attributesOfItem(atPath: stateURL.path) }
+        catch CocoaError.fileReadNoSuchFile { return nil }
+        catch CocoaError.fileNoSuchFile { return nil }
+        guard attributes[.type] as? FileAttributeType == .typeRegular else {
+            throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: stateURL.path])
+        }
+        let data = try Data(contentsOf: stateURL)
+        let stamp = try JSONDecoder().decode(Cadence.self, from: data).last_run_at
+        guard stamp.isFinite else {
             throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: stateURL.path])
         }
         return stamp
@@ -50,27 +58,23 @@ public struct ActivityRetentionRunner: Sendable {
     }
 
     /// Prune if due, then durably record the completed maintenance pass.
-    /// Returns the cadence fault when the last-run state could not be read: the
-    /// pass still runs (unknown cadence is due) and the caller records the fault.
+    /// A failed cadence read stops before pruning or writing the stamp. The
+    /// existing bytes remain available for repair; unknown cadence is not due.
     public func runIfDue(
         store: ActivitySpanStore,
         policy: ActivityPolicy,
         now: Double = Date().timeIntervalSince1970
-    ) async throws -> String? {
-        var fault: String?
-        let due: Bool
-        do { due = try isDue(now: now) } catch { due = true; fault = error.localizedDescription }
-        guard due else { return nil }
+    ) async throws {
+        guard try isDue(now: now) else { return }
         let retention = Double(max(1, policy.retentionDays)) * 86_400
         try await store.prune(olderThan: retention, now: now)
         try recordRun(at: now)
-        return fault
     }
 
     public func recordRun(at timestamp: Double) throws {
-        let data = try JSONSerialization.data(
-            withJSONObject: ["last_run_at": timestamp], options: [.sortedKeys]
-        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(Cadence(last_run_at: timestamp))
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: stateURL)
     }
 }

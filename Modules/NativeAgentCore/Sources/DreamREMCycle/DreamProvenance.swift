@@ -5,7 +5,15 @@ import Transcripts
 import CognitiveSubstrate
 import Studio
 
-// Blueprint: | `DreamProvenance.swift` | `DreamEntryProvenance` and `DreamSourceRef`: per-claim dream support, source resolution and section-aware peer provenance |
+// Blueprint: | `DreamProvenance.swift` | `DreamEntryProvenance`, `DreamClaimSection` and `DreamSourceRef`: checked section-scoped claim evidence, exact unavailable lines, source resolution and peer provenance; pending work stays out of model input |
+
+/// A malformed claim makes this section unavailable, without discarding siblings.
+public struct DreamClaimSection<Claim: Sendable>: Sendable {
+    public let content: String
+    public let line: Int
+    public let claims: [Claim]
+    public let unavailable: String?
+}
 
 /// An original row, its known exchange, or a consolidated stretch.
 public struct DreamSourceRef: Sendable, Equatable {
@@ -29,7 +37,7 @@ public struct DreamSourceRef: Sendable, Equatable {
 }
 
 /// Each claim keeps only the experiences the dream named for that claim.
-/// Old diary-wide provenance cannot establish a claim's support.
+/// The claim block is the source of support; other diary prose establishes no lineage.
 public struct DreamEntryProvenance: Sendable, Codable, Equatable {
     public var quote: String
     public var sourceRefs: [String]
@@ -136,9 +144,11 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
     /// The claims her prose backs, as lineage lines. A claim the prose or the dream's reading
     /// does not back is left without lineage and named in `dropped`; it never costs the night.
     static func renderBlock(_ claims: [DreamClaim], content: String, sources: [DreamSourceRef], dropped: inout [String]) throws -> String {
-        guard !content.contains("<!-- claim-sources"), !content.contains("<!-- dream-peers") else {
+        guard !content.contains("<!-- claim-sources"), !content.contains("<!-- dream-peers"),
+              !content.contains(DreamPendingWork.identityPrefix),
+              !content.components(separatedBy: "\n").dropFirst().contains(where: { $0.hasPrefix(DreamNight.againHeading) }) else {
             throw NSError(domain: "NativeAgent.DreamEntryProvenance", code: 1, userInfo: [NSLocalizedDescriptionKey:
-                "The dream's claim check refused the model's reply: its prose contains the reserved markers <!-- claim-sources or <!-- dream-peers. Nothing was written; the night stays owed and the next run retries it."])
+                "The dream's claim check refused the model's reply: its prose contains reserved dream metadata or a section heading. Nothing was written; the night stays owed and the next run retries it."])
         }
         // The model cites a source by its identity; the @date tail it may leave
         // off or misquote. What is kept is the dream's own reference and date.
@@ -164,27 +174,43 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         return result
     }
 
-    /// Decode only the trailing claim block of each dream section, in written order.
-    static func readClaims<Claim: Decodable>(in content: String, as: Claim.Type) -> [Claim] {
-        content.components(separatedBy: "\n## ").flatMap { section in
-            let lines = section.components(separatedBy: "\n").reversed().drop(while: {
-                $0.trimmingCharacters(in: .whitespaces).isEmpty
-                    || ($0.hasPrefix(DreamCycleRunner.consumedFooter) && $0.hasSuffix(" -->"))
-            }).prefix(while: { $0.hasPrefix(prefix) && $0.hasSuffix(" -->") })
-            return lines.reversed().compactMap { line in
-                try? JSONDecoder().decode(Claim.self, from: Data(line.dropFirst(prefix.count).dropLast(4).utf8))
+    /// Read the live writer's trailing block, checking every reserved claim line.
+    /// An absent block is unknown evidence; a present damaged block is a named gap.
+    static func readClaims<Claim: Decodable & Sendable>(in content: String, as: Claim.Type) -> [DreamClaimSection<Claim>] {
+        let lines = content.components(separatedBy: "\n")
+        let starts = [0] + lines.indices.filter { $0 > 0 && lines[$0].hasPrefix(DreamNight.againHeading) }
+        return starts.enumerated().map { sectionIndex, start in
+            let end = sectionIndex + 1 < starts.count ? starts[sectionIndex + 1] : lines.count
+            let body = lines[start..<end].filter { !$0.hasPrefix(DreamPendingWork.identityPrefix) }.joined(separator: "\n")
+            var claims: [Claim] = []
+            var unavailable: String?
+            var blockStarted = false
+            for index in start..<end {
+                let line = lines[index]
+                if line.hasPrefix("<!-- claim-sources") {
+                    blockStarted = true
+                    do {
+                        guard line.hasPrefix(prefix), line.hasSuffix(" -->") else {
+                            throw PersistenceCoreError.ioFailure("malformed claim-sources delimiter")
+                        }
+                        let data = Data(line.dropFirst(prefix.count).dropLast(4).utf8)
+                        // Validate the whole current claim, even when a caller needs only lineage.
+                        _ = try JSONDecoder().decode(DreamClaim.self, from: data)
+                        claims.append(try JSONDecoder().decode(Claim.self, from: data))
+                    } catch {
+                        unavailable = "section \(sectionIndex + 1) (starts at line \(start + 1)), claim line \(index + 1): \(error)"
+                        break
+                    }
+                } else if blockStarted, !line.trimmingCharacters(in: .whitespaces).isEmpty,
+                          !(line.hasPrefix(DreamCycleRunner.consumedFooter) && line.hasSuffix(" -->")),
+                          !(line.hasPrefix(DreamPendingWork.identityPrefix) && line.hasSuffix(" -->")) {
+                    unavailable = "section \(sectionIndex + 1) (starts at line \(start + 1)), line \(index + 1): claim block is not trailing"
+                    break
+                }
             }
+            return DreamClaimSection(content: body, line: start + 1,
+                claims: unavailable == nil ? claims : [], unavailable: unavailable)
         }
-    }
-
-    static func sources(in content: String) -> [String] {
-        var refs = Set(readClaims(in: content, as: Self.self).flatMap(\.sourceRefs))
-        // Historical diary-wide refs recover material, never support a quoted claim.
-        for line in content.components(separatedBy: "\n") where line.hasPrefix("_Sources: ") && line.hasSuffix("_") {
-            refs.formUnion(line.dropFirst(10).dropLast().components(separatedBy: " · ")
-                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
-        }
-        return refs.sorted()
     }
 
     public static func dateStem(for date: Date) -> String {

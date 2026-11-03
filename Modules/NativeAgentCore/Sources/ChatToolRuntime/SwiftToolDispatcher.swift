@@ -37,7 +37,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
 
     private struct BuiltInSchemaCacheKey: Hashable {
         let accessFlags: Int
-        let standingBotMinimumInterval: TimeInterval
+        let standingBotMinimumInterval: TimeInterval?
     }
 
     let dataRoot: URL
@@ -72,7 +72,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     let appTools: (any ToolExecutor)?
     private let executorDescriptors: [String: ToolDescriptor]
     let agentBridgeConfigRoot: URL?
-    let a2aPushConfiguration: (@Sendable (AgentPeerContact) async -> JSONValue?)?
+    let a2aPushConfiguration: (@Sendable (AgentPeerContact) async throws -> JSONValue)?
     /// Rebuildable temporal continuity for the agent-readable screen. This is
     /// dispatcher-local perception state, never memory, authority, or a second
     /// screen owner.
@@ -80,9 +80,8 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     private let builtInSchemaCacheLock = NSLock()
     private var builtInSchemaCache: [BuiltInSchemaCacheKey: [LLMToolSchema]] = [:]
 
-    /// Source-repository anchor for the legacy relative-path allowlist.
-    /// resolveTrustedFilePath also accepts workspace aliases, bundled docs,
-    /// workspace-relative paths and absolute paths under trusted roots.
+    /// Connector execution context; relative file reads resolve only in the
+    /// canonical workspace, with an explicit namespace for bundled docs.
     var rootForRead: URL { dataRoot.deletingLastPathComponent().standardizedFileURL }
 
     /// Her requests carry one tool, `app` (docs/TOOL_LOADING.md); every
@@ -99,7 +98,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         macIntegrationPermissionStore: MacIntegrationPermissionStore? = nil,
         appTools: (any ToolExecutor)? = nil,
         agentBridgeConfigRoot: URL? = nil,
-        a2aPushConfiguration: (@Sendable (AgentPeerContact) async -> JSONValue?)? = nil,
+        a2aPushConfiguration: (@Sendable (AgentPeerContact) async throws -> JSONValue)? = nil,
         standingBotRunEnqueue: (@Sendable (UUID, String?) throws -> BotRunReceipt)? = nil,
         standingBotSession: BotRunnerSession? = nil,
         swarmChatFactory: any SwarmChatClientFactory
@@ -120,7 +119,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         self.memoryV2 = memoryV2 ?? SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
         self.knowledgeGraphPath = knowledgeGraphPath ?? dataRoot
             .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("knowledge_graph.json")
+            .appendingPathComponent("memory.sqlite")
         self.allowsCanonicalBodyTools = allowProcessGlobalTools
         self.swarmChatFactory = swarmChatFactory
         self.providerLifecycleObserver = providerLifecycleObserver
@@ -193,16 +192,16 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         if names == ["app"] {
             return appTools == nil ? [] : executorDescriptors.values.filter { names.contains($0.name) }.map(\.schema)
         }
-        return await catalogSnapshot(includeSchemas: true, schemaNames: names).schemas
+        return try await catalogSnapshot(includeSchemas: true, schemaNames: names).schemas
     }
 
     public func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-        await catalogSnapshot(includeSchemas: true).schemas
+        try await catalogSnapshot(includeSchemas: true).schemas
     }
 
-    func catalogSnapshot(includeSchemas: Bool, schemaNames: Set<String>? = nil, surface: String = "chat") async -> (names: [String], schemas: [LLMToolSchema], access: FullMacToolAccess) {
-        let records = readRegistryRecords()
-        let access = await fullMacToolAccess(surface: surface)
+    func catalogSnapshot(includeSchemas: Bool, schemaNames: Set<String>? = nil, surface: String = "chat") async throws -> (names: [String], schemas: [LLMToolSchema], access: FullMacToolAccess) {
+        let records = try readRegistryRecords()
+        let access = try await fullMacToolAccess(surface: surface)
         let activity = await activityCaptureEnabled()
         let builtIn = cachedBuiltInToolSchemas(
             includeFullMacFileTools: access.fileOpsAllowed,
@@ -221,7 +220,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             .filter { seen.insert($0).inserted })
         var schemas: [LLMToolSchema] = []
         if includeSchemas {
-            let registry = Self.authoredTools(records: records, named: schemaNames).map(\.schema)
+            let registry = try Self.authoredTools(records: records, named: schemaNames).map(\.schema)
             let combined = builtIn.map { executorDescriptors[$0.name]?.schema ?? $0 } + registry
             schemas = withContributedSchemas(usesCanonicalBody
                 ? combined
@@ -250,7 +249,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     }
 
     public func listAvailableTools() async throws -> [String] {
-        await catalogSnapshot(includeSchemas: false).names
+        try await catalogSnapshot(includeSchemas: false).names
     }
 
     func registryToolRecord(_ tool: String) throws -> [String: JSONValue]? {
@@ -265,12 +264,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         return nil
     }
 
-    private func readRegistryRecords() -> [ToolRecord] { Self.readRegistryRecords(dataRoot: dataRoot) }
-
-    private static func readRegistryRecords(dataRoot: URL) -> [ToolRecord] {
-        guard case .success(let rows) = authoredRegistry(dataRoot: dataRoot) else { return [] }
-        return rows
-    }
+    private func readRegistryRecords() throws -> [ToolRecord] { try Self.authoredRegistry(dataRoot: dataRoot).get() }
 
     /// Her authored tool registry, or the fault that kept it from reading.
     /// A fault is never an empty registry: the catalog offers none of her
@@ -295,19 +289,10 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     private static let builtInsRegistered: Void = AppActionBinding.registerTools(Array(nativeToolDescriptors.values))
     package static let reservedBuiltInNames = nativeCanonicalToolNames.union(alwaysOnCoreNames)
 
-    /// Registry ownership must also reserve accepted alias spellings, but the
-    /// public built-in inventory remains canonical so catalogs and eval-ledger
-    /// enumeration do not advertise every compatibility spelling as a second
-    /// tool surface.
-    static let registryReservedNames: Set<String> = {
-        let dottedAliases = Set(nativeCanonicalToolNames
-            .filter { $0.contains("_") }
-            .map { $0.replacingOccurrences(of: "_", with: ".") })
-        return reservedBuiltInNames.union(dottedAliases)
-    }()
+    /// Built-in executor IDs and current door bindings own their names.
+    static let registryReservedNames: Set<String> = reservedBuiltInNames
 
-    /// A name a tool she writes may take: no built-in's (or its dotted
-    /// spelling), nothing an alias rewrites.
+    /// A name a tool she writes may take: no built-in executor or current door binding.
     public static func isAuthorableToolName(_ id: String) -> Bool {
         !registryReservedNames.contains(id) && !AppActionBinding.builtInToolName(id)
             && CanonicalToolNameDispatcher.canonical(id) == id
@@ -329,8 +314,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         checkedAuthoredCatalog(dataRoot: dataRoot).map(\.tools)
     }
 
-    /// One checked source snapshot supplies both callable contracts and the
-    /// id/name aliases their dependencies can name. No alias reads the store again.
+    /// One checked source snapshot supplies callable contracts and exact stable IDs.
     package struct AuthoredCatalog: Sendable {
         package let tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)]
         package let aliases: [String: String]
@@ -346,22 +330,21 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             }
             let key = (dataRoot.path, revision, AppActionBinding.registeredToolCount)
             if let memo = authoredToolsMemo, memo.key == key { return .success(memo.catalog) }
-            return authoredRegistry(dataRoot: dataRoot).map { records in
+            return authoredRegistry(dataRoot: dataRoot).flatMap { records in
+                Result {
                 var aliases: [String: String] = [:]
-                for record in records where aliases[record.name.lowercased()] == nil {
-                    aliases[record.name.lowercased()] = record.id
-                }
-                for record in records { aliases[record.id.lowercased()] = record.id }
-                let catalog = AuthoredCatalog(tools: authoredTools(records: records), aliases: aliases)
+                for record in records { aliases[record.id] = record.id }
+                let catalog = try AuthoredCatalog(tools: authoredTools(records: records), aliases: aliases)
                 authoredToolsMemo = (key, catalog)
                 return catalog
+                }
             }
         }
     }
     nonisolated(unsafe) private static var authoredToolsMemo: (key: (String, [String], Int),
         catalog: AuthoredCatalog)?
 
-    static func authoredTools(records: [ToolRecord], named names: Set<String>? = nil) -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {
+    static func authoredTools(records: [ToolRecord], named names: Set<String>? = nil) throws -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {
         let active = records
             .filter { $0.fields["status"] == .string("active") && $0.fields["disabledBy"] != .string("owner") }
         var tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] = []
@@ -371,13 +354,11 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             guard row.fields["language"] == .string("javascript") else { continue }
             guard let digest = row.codeFingerprint, !digest.isEmpty,
                   case .object(let admission)? = row.fields["admission"], admission["candidate"] == .string(digest) else { continue }
-            let schemaObject: [String: JSONValue] = if case .object(let schema)? = row.fields["inputSchema"] {
-                schema
-            } else { ["type": .string("object")] }
-            guard let schemaData = try? JSONSerialization.data(withJSONObject: JSONValue.object(schemaObject).foundationObject,
-                                                               options: [.sortedKeys]) else {
-                continue
+            guard case .object(let schemaObject)? = row.fields["inputSchema"], schemaObject["type"] == .string("object") else {
+                throw ToolFailureError("The admitted ability \(id) has no valid object inputSchema.", effects: .none,
+                    owner: "abilities/\(id).js", instruction: "Repair and validate this ability's parameter declaration before offering it as a tool.")
             }
+            let schemaData = try JSONValue.object(schemaObject).serializedData(pretty: false)
             let page: String? = if case .object(let face)? = row.fields["face"], case .string(let page)? = face["page"] { page } else { nil }
             let action: String? = if case .object(let face)? = row.fields["face"], case .string(let action)? = face["action"] { action } else { nil }
             let permissions = row.permissions ?? []

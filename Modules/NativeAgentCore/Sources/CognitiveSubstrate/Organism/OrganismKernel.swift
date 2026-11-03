@@ -95,6 +95,7 @@ public actor OrganismKernel {
     /// alone left them.
     public func ingest(_ signal: SomaticSignal, movesFeelings: Bool = true) async {
         guard configuration.enabled else { return }
+        if signal.kind == .dreamCompleted, body.dreamCompletions?.contains(signal.id) == true { return }
         let ingestedAt = dependencies.now()
         let bounded = SomaticSignal(
             id: signal.id,
@@ -107,7 +108,7 @@ public actor OrganismKernel {
             metadata: signal.metadata,
             bounds: configuration.metadataBounds
         )
-        // Horizon refresh updates horizons and earned chemistry release without recording traffic or consuming quiet time.
+        // Horizon refresh updates horizons without recording traffic or consuming quiet time.
         if bounded.kind == .horizonRefresh {
             let refreshed = OrganismPredictiveBody.applyingHorizonRefresh(
                 signal: bounded,
@@ -172,6 +173,10 @@ public actor OrganismKernel {
             // the total; this is what makes "how long have I been up" start
             // counting again from zero.
             wakefulnessFatigue = 0
+            if bounded.kind == .dreamCompleted {
+                if body.dreamCompletions == nil { body.dreamCompletions = [] }
+                body.dreamCompletions?.insert(bounded.id)
+            }
         }
         body.signalCount = min(body.signalCount, Int.max - 1) + 1
         // Quiet physiology follows when the signal reached this organism, not
@@ -326,16 +331,6 @@ public actor OrganismKernel {
         return body.predictionLedger.predictions[id]
     }
 
-    /// Pure cumulative capability read for body projections that must survive
-    /// a restart before their transient lifecycle sensor has been restored.
-    public func capabilityBelief(ofKind kind: OrganismPredictionKind) -> OrganismCapabilityBelief? {
-        guard configuration.enabled else { return nil }
-        return OrganismCapabilitySelfModel.beliefs(
-            ledger: body.predictionLedger,
-            at: dependencies.now()
-        ).first { $0.kind == kind }
-    }
-
     /// Pure deadline read for event-driven repair. No timer is owned by the
     /// kernel and no state is changed beyond ordinary analytic settlement.
     public func residualRepairOpportunity() async -> OrganismResidualRepairOpportunity {
@@ -349,11 +344,11 @@ public actor OrganismKernel {
     /// evidence decayed, a newer signal reset the quiet window, or no bounded
     /// field operation remained. It never recruits a model or dispatches work.
     @discardableResult
-    public func runResidualRepairIfDue() async -> Bool {
+    public func runResidualRepairIfDue(satisfyWait: Bool = false) async -> Bool {
         guard configuration.enabled else { return false }
         let now = dependencies.now()
         settleElapsedTime(at: now)
-        let opportunity = currentResidualRepairOpportunity(at: now)
+        let opportunity = currentResidualRepairOpportunity(at: now, satisfyWait: satisfyWait)
         guard opportunity.ready else { return false }
         let previous = body.dreamRepairState
         let repaired = OrganismDreamRepair.applyingResidualPressure(
@@ -455,6 +450,10 @@ public actor OrganismKernel {
     /// The epoch a moment must be stamped with for this body to live it.
     public func epoch() -> UInt64 { body.epoch }
 
+    public func hasCompletedDream(_ id: UUID) -> Bool {
+        body.dreamCompletions?.contains(id) == true
+    }
+
     /// The epoch with the kernel's mutation revision, read in one actor turn:
     /// the revision orders publications of the epoch (a reset rollback can
     /// lawfully return the old epoch at a newer revision).
@@ -478,10 +477,12 @@ public actor OrganismKernel {
         guard configuration.enabled else { return }
         let now = dependencies.now()
         settleElapsedTime(at: now)
-        var state = body
-        state.savedAt = now
         wakefulnessFatigue = OrganismChemistry.relaxedFatigue(wakefulnessFatigue, elapsed: 6 * 3_600)
-        body = state.decayed(at: now.addingTimeInterval(6 * 3_600))
+        // Relax the chemistry now. This is not six hours of observed body time:
+        // fields, pending predictions and the persisted clock keep their real age.
+        body.chemicalState = OrganismPersistentState.decayedChemistry(
+            body.chemicalState, hours: 6, tendernessHours: 6, fatigueElapsed: 6 * 3_600)
+        body.savedAt = now
         publishPredictedToolGroups()
     }
 
@@ -609,13 +610,14 @@ public actor OrganismKernel {
         )
     }
 
-    private func currentResidualRepairOpportunity(at now: Date) -> OrganismResidualRepairOpportunity {
+    private func currentResidualRepairOpportunity(at now: Date, satisfyWait: Bool = false) -> OrganismResidualRepairOpportunity {
         OrganismResidualRepair.opportunity(
             ledger: body.predictionLedger,
             field: body.field,
             repairState: body.dreamRepairState,
             lastSignalAt: body.lastSignalAt,
-            at: now
+            at: now,
+            satisfyWait: satisfyWait
         )
     }
 }

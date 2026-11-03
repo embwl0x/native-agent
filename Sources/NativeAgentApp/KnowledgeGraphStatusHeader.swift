@@ -11,21 +11,21 @@ import DeviceSync
 // truth once memory.sqlite is authoritative.
 struct KGNativeStackHeader: View {
     let memory: MemoryFacade
-    let totalEntities: Int
-    let totalEdges: Int
+    let totalEntities: Int?
+    let totalEdges: Int?
     var body: some View {
         // A row inside the alive group card: no material strip of its own,
         // and shell inks (the system tertiary fails on the haze).
         HStack(spacing: 12) {
-            Text("\(totalEntities) entities").font(.caption.weight(.semibold))
+            Text(totalEntities.map { "\($0) entities" } ?? "Entities unavailable").font(.caption.weight(.semibold))
             Text("·").foregroundStyle(NativeAgentShell.secondary)
-            Text("\(totalEdges) relationships").font(.caption.weight(.semibold))
+            Text(totalEdges.map { "\($0) relationships" } ?? "Relationships unavailable").font(.caption.weight(.semibold))
             Text("·").foregroundStyle(NativeAgentShell.secondary)
             Text("Last checked \(Self.relative(memory.diagnosticsCheckedAt))").font(.caption).foregroundStyle(NativeAgentShell.secondary)
             Spacer()
             Group {
-                Label("\(totalEntities) SQLite", systemImage: "cylinder.split.1x2")
-                Label("\(memory.diagnostics.runtimeEmbedderDimensions ?? 0)d vectors", systemImage: "cpu")
+                Label(totalEntities.map { "\($0) SQLite" } ?? "SQLite count unavailable", systemImage: "cylinder.split.1x2")
+                Label(memory.diagnostics.runtimeEmbedderDimensions.map { "\($0)d vectors" } ?? "Vector dimensions unavailable", systemImage: "cpu")
                 Label(memory.diagnostics.cloudKitAccountStatus, systemImage: "icloud")
             }
             .font(.caption2)

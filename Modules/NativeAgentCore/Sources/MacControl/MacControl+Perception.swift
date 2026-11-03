@@ -12,17 +12,10 @@ import CoreGraphics
 #endif
 #if canImport(ApplicationServices)
 import ApplicationServices
-// Blueprint: | `MacControl+Perception.swift` | `SwiftNativeMacControl`: `handleRead` reads live window text unless the caller names a file; semantic view masks pixels from the complete AX snapshot's secret frames before sharing |
+// Blueprint: | `MacControl+Perception.swift` | Shallow checked menu reading preserves availability and coverage for native page and windowless-app projections |
 #endif
 extension SwiftNativeMacControl {
-    /// The app's top-level menu titles, in order, from one bounded menu-bar
-    /// read; empty when the app's bar cannot be read.
-    func menuBarTitles(pid: Int32) -> [String] {
-        var titles: [String] = []
-        for item in MacMenuBar.read(source: accessibilitySource, pid: pid, depth: 1).items {
-            guard let top = item.titlePath.first, !top.isEmpty, !titles.contains(top) else { continue }
-            titles.append(top)
-        }
-        return titles
+    func menuBarReading(pid: Int32) -> MacMenuBar.Reading {
+        MacMenuBar.read(source: accessibilitySource, pid: pid, depth: 1)
     }
 }

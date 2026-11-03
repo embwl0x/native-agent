@@ -1,6 +1,6 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `BotRunner.swift` | `BotRunner` actor; `run`, `ask` |
+// Blueprint: | `BotRunner.swift` | `BotRunner` actor; `run`, `ask`; conditioned standing runs request a typed job result and retain unknown verdicts for requested notification |
 
 /// The app supplies the helper's own turn runner; StandingBots owns its
 /// scheduling, serialization, accounting and dated shelf projection.
@@ -16,10 +16,13 @@ public struct BotTurnReply: Sendable {
     /// Set when the turn stopped on an approval, so the shelf entry can be
     /// reconciled against that approval's own resolution later.
     public var approvalID: String?
+    /// The completed job's typed verdict; nil means it could not tell.
+    public var conditionMet: Bool?
     public init(reply: String, artifacts: [BotArtifact] = [], status: BotRunStatus = .completed,
-                detail: String? = nil, model: String? = nil, approvalID: String? = nil) {
+                detail: String? = nil, model: String? = nil, approvalID: String? = nil, conditionMet: Bool? = nil) {
         self.reply = reply; self.artifacts = artifacts; self.status = status; self.detail = detail
         self.model = model; self.approvalID = approvalID
+        self.conditionMet = conditionMet
     }
 }
 
@@ -105,46 +108,9 @@ public actor BotRunner {
         self.session = session
     }
 
-    /// The last line the helper is asked to end a conditioned run with.
-    static let conditionMarker = "TELL:"
-
-    /// The helper turn runner consumes the verdict before saving the reply.
-    @TaskLocal package static var conditionVerdict: ConditionVerdict?
-    package final class ConditionVerdict: @unchecked Sendable {
-        let sessionID: String
-        private let lock = NSLock()
-        private var verdict: Bool?
-        private var malformed: String?
-        init(sessionID: String) { self.sessionID = sessionID }
-        var met: Bool? { lock.lock(); defer { lock.unlock() }; return verdict }
-        var problem: String? { lock.lock(); defer { lock.unlock() }; return malformed }
-
-        func consume(_ reply: String) -> String {
-            var lines = reply.components(separatedBy: "\n")
-            while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty { lines.removeLast() }
-            let decoration = CharacterSet(charactersIn: " \t*_`")
-            let line = lines.last?.trimmingCharacters(in: decoration).uppercased() ?? ""
-            guard line.hasPrefix(BotRunner.conditionMarker) else { return reply }
-            let value = line.dropFirst(BotRunner.conditionMarker.count).trimmingCharacters(in: decoration)
-            lock.lock()
-            switch value {
-            case "YES": verdict = true; malformed = nil
-            case "NO": verdict = false; malformed = nil
-            default:
-                verdict = nil
-                malformed = "Tell me if: the run returned an invalid verdict (expected TELL: yes or TELL: no), so no notification was sent."
-            }
-            lock.unlock()
-            guard value == "YES" || value == "NO" else { return reply }
-            lines.removeLast()
-            return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-    }
-
-    package static func conditionReply(_ reply: String, sessionID: String) -> String {
-        guard let verdict = conditionVerdict, verdict.sessionID == sessionID else { return reply }
-        return verdict.consume(reply)
-    }
+    /// Only this standing run asks for a structured result, never an ordinary
+    /// message to the same helper or a nested turn in another conversation.
+    @TaskLocal package static var conditionSessionID: String?
 
     /// `holdUnattended` is the caller's unattended gate, re-read AFTER the claim
     /// is won. An event-woken request can sit in `claimWhenAvailable` for a whole
@@ -154,7 +120,7 @@ public actor BotRunner {
     /// proceed, having already recorded why — nothing is spent after it.
     @discardableResult
     public func run(bot id: UUID, requestID: UUID? = nil,
-                    holdUnattended: @Sendable (BotDefinition) async -> Bool = { _ in false },
+                    holdUnattended: @Sendable (BotDefinition) async throws -> Bool = { _ in false },
                     deadlineExceeded: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ShelfEntry? {
         let claimed: BotRunQueue.ClaimedRun
         do { claimed = try await queue.claimWhenAvailable(bot: id, requestID: requestID) }
@@ -162,18 +128,25 @@ public actor BotRunner {
         defer { queue.finish(bot: id) }
         let bot = claimed.bot
         // Before the gate, before the daily reservation, before any provider work.
-        if await holdUnattended(bot) { return nil }
-        if let problem = await BotRunGate.problem(for: bot, dataRoot: dataRoot) {
-            throw BotRunnerError.cannotRun(problem)
+        let held: Bool
+        do {
+            held = try await holdUnattended(bot)
+            if !held { try await prepare(bot, requestID: claimed.runID) }
+        } catch {
+            throw retireRefusal(claimed, cause: error)
+        }
+        if held {
+            try queue.retireUnstartedClaim(bot: id, requestID: claimed.runID, detail: "The unattended gate held this request before execution. No helper turn ran.")
+            return nil
         }
         // An event-woken run sees what woke it, from the request this run
         // claimed. Outside text: input for the brief, never an instruction.
         let woke = claimed.context.map { "\n\nWhat woke \(bot.name):\n" + $0 } ?? ""
         // "Tell me if": the helper that did the work judges its own result —
-        // no second model call — and the app reads one marked line back.
+        // no second model call — in its own typed final result.
         let condition = bot.notificationCondition?.trimmingCharacters(in: .whitespacesAndNewlines)
         let ask = condition.flatMap { $0.isEmpty ? nil : $0 }.map {
-            "\n\nTell me if: \($0)\nEnd your reply with one last line on its own: \(Self.conditionMarker) yes if this run's result meets that condition, otherwise \(Self.conditionMarker) no. The app reads that line to decide whether to notify the person, and removes it."
+            "\n\nTell me if: \($0)\nAfter finishing your work and tool calls, return only a JSON job result (no Markdown fence): {\"reply\":\"your complete result for the person\",\"condition_met\":true}. condition_met must be a JSON boolean: true if this run's result meets the condition, false if it does not. If you cannot determine it, use null. The app presents reply and uses this structured verdict for the requested notification."
         } ?? ""
         let message = "Execute your standing job now. Complete the work and return its result in this turn; do not invoke or wait on your own Run control." + woke + ask
         // This run is now on the task's stack: anything it reaches that asks
@@ -198,10 +171,8 @@ public actor BotRunner {
         let claimed = try await queue.claimWhenAvailable(bot: id, requestID: nil, manual: true)
         let bot = claimed.bot
         defer { queue.finish(bot: id) }
-        guard await BotRunGate.isReady() else { throw BotRunnerError.cannotRun("Provider check is not ready yet.") }
-        if let problem = await BotRunGate.problem(for: bot, dataRoot: dataRoot) {
-            throw BotRunnerError.cannotRun(problem)
-        }
+        do { try await prepare(bot, requestID: claimed.runID) }
+        catch { throw retireRefusal(claimed, cause: error) }
         return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([id])) {
             try await perform(bot, message: question, requestID: claimed.runID, asked: true)
         }
@@ -212,14 +183,37 @@ public actor BotRunner {
         let claimed = try await queue.claimWhenAvailable(bot: saved.id, requestID: nil)
         let bot = claimed.bot
         defer { queue.finish(bot: saved.id) }
-        guard bot == saved, !bot.paused, !(await holdUnattended(bot)) else { throw BotRunnerError.notPermitted }
+        do {
+            guard bot == saved, !bot.paused, !(await holdUnattended(bot)) else { throw BotRunnerError.notPermitted }
+            try await prepare(bot, requestID: claimed.runID)
+        } catch { throw retireRefusal(claimed, cause: error) }
+        return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([bot.id])) {
+            try await perform(bot, message: message, requestID: claimed.runID)
+        }
+    }
+
+    private func retireRefusal(_ claimed: BotRunQueue.ClaimedRun, cause: Error) -> Error {
+        do {
+            try queue.retireUnstartedClaim(bot: claimed.bot.id, requestID: claimed.runID, detail: String(describing: cause))
+            return cause
+        }
+        catch {
+            return BotRunnerError.cannotRun("Request \(claimed.runID) did not execute: \(cause). Its refused claim could not be retired: \(error). Repair that exact claim before requesting more work.")
+        }
+    }
+
+    /// All entry points pass the same provider and accounting admission before
+    /// execution. Refusals retire their exact claim while its lock is held.
+    private func prepare(_ bot: BotDefinition, requestID: UUID) async throws {
+        try Task.checkCancellation()
         guard await BotRunGate.isReady() else { throw BotRunnerError.cannotRun("Provider check is not ready yet.") }
         if let problem = await BotRunGate.problem(for: bot, dataRoot: dataRoot) {
             throw BotRunnerError.cannotRun(problem)
         }
-        return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([bot.id])) {
-            try await perform(bot, message: message, requestID: claimed.runID)
+        if let ceiling = bot.dailyTokenCeiling {
+            try queue.reserveDailySpend(tokens: bot.budget.tokens, bot: bot.id, ceiling: ceiling)
         }
+        try queue.admitExecution(bot: bot.id, requestID: requestID)
     }
 
     private func perform(_ bot: BotDefinition, message: String, requestID: UUID, asked: Bool = false,
@@ -227,14 +221,7 @@ public actor BotRunner {
                          deadlineExceeded: @escaping @Sendable (String) async -> Void = { _ in }) async throws -> ShelfEntry {
         let start = Date()
         let clock = ContinuousClock.now
-        // A refused daily reservation means the turn never started: it is a run
-        // that did not happen, not a failed run, so it throws instead of
-        // appending a shelf entry. The scheduler records the occurrence missed.
-        if let ceiling = bot.dailyTokenCeiling {
-            try queue.reserveDailySpend(tokens: bot.budget.tokens, bot: bot.id, ceiling: ceiling)
-        }
         var outcome: BotTurnReply
-        let verdict = judgesCondition ? ConditionVerdict(sessionID: bot.sessionID) : nil
         do {
             let session = self.session
             // The claim is released only after the session has settled.
@@ -248,7 +235,7 @@ public actor BotRunner {
                     await deadlineExceeded("\(bot.name) exceeded its run limit; its claim could not be updated: \(error)")
                 }
             }) {
-                try await Self.$conditionVerdict.withValue(verdict) {
+                try await Self.$conditionSessionID.withValue(judgesCondition ? bot.sessionID : nil) {
                     try await session(bot, message)
                 }
             }
@@ -256,9 +243,9 @@ public actor BotRunner {
             outcome = BotTurnReply(reply: "", status: error is CancellationError ? .stopped : error is BotRunnerError ? .interrupted : .failed,
                 detail: String(describing: error))
         }
-        let met = outcome.status == .completed && verdict?.met == true
-        if judgesCondition, outcome.status == .completed, verdict?.met == nil {
-            let problem = verdict?.problem ?? "Tell me if: the run did not say whether its condition was met, so no notification was sent."
+        if judgesCondition, outcome.status != .completed { outcome.conditionMet = nil }
+        if judgesCondition, outcome.conditionMet == nil {
+            let problem = "Couldn't tell whether the notification condition was met. The requested notification remains due with this uncertainty."
             outcome.detail = [outcome.detail, problem].compactMap { $0 }.joined(separator: "\n")
         }
         let elapsed = clock.duration(to: .now)
@@ -296,7 +283,7 @@ public actor BotRunner {
         entry.approvalID = outcome.approvalID
         if asked { entry.asked = true }
         if judgesCondition {
-            entry.conditionMet = verdict?.met == nil ? nil : met
+            entry.conditionMet = outcome.conditionMet
             entry.conditionNotificationTitle = "\(bot.name): \(bot.notificationCondition ?? "")"
         }
         try shelf.append(entry)

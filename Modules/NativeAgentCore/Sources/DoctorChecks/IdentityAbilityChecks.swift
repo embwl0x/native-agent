@@ -3,10 +3,10 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
-// Blueprint: | `IdentityAbilityChecks.swift` | PersonaEngineCheck compiles canonical identity documents and the saved onboarded profile without seeding identity; AbilityFilesCheck reports file and seed-install failures |
+// Blueprint: | `IdentityAbilityChecks.swift` | PersonaEngineCheck uses the canonical compiler, including its checked-missing genesis boundary, and reports named unreadable documents/profile failures; AbilityFilesCheck reports file and seed-install failures |
 
-/// Reads persona health through its canonical engine; Doctor never seeds identity.
-public struct PersonaEngineCheck: DoctorCheck {
+/// Persona health uses the same compile owner as turn and context preparation.
+public struct PersonaEngineCheck: RepairingDoctorCheck {
     public let id: String = "persona_engine"
     public let title: String = "Persona Engine 2.0"
     private let engineProvider: @Sendable () -> SwiftNativePersonaEngine
@@ -15,7 +15,7 @@ public struct PersonaEngineCheck: DoctorCheck {
         self.engineProvider = engineProvider ?? { root.map { SwiftNativePersonaEngine.isolated(dataRoot: $0) } ?? SwiftNativePersonaEngine() }
     }
 
-    public func run() async -> CheckResult {
+    public func run(repair: Bool) async -> CheckResult {
         let engine = engineProvider()
         let rootPath = await engine.personaRoot.path
         do {
@@ -35,9 +35,7 @@ public struct PersonaEngineCheck: DoctorCheck {
             }
             // After onboarding, require the saved profile to compile; Doctor never invents missing identity.
             let dataRoot = await engine.dataRootURL
-            if FileManager.default.fileExists(
-                atPath: dataRoot.appendingPathComponent(".onboarded").path
-            ) {
+            if NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot) {
                 let profileURL = dataRoot
                     .appendingPathComponent("memory", isDirectory: true)
                     .appendingPathComponent("profile.json")
@@ -62,8 +60,7 @@ public struct PersonaEngineCheck: DoctorCheck {
                 id: id,
                 title: title,
                 status: "ok",
-                detail: "Persona docs loaded (\(docs.count) entries) from \(rootPath).",
-                repair: nil
+                detail: "Persona docs loaded (\(docs.count) entries) from \(rootPath)."
             )
         } catch {
             return CheckResult(source: rootPath,
@@ -72,7 +69,8 @@ public struct PersonaEngineCheck: DoctorCheck {
                 status: "fail",
                 detail: "Persona compiler failed: \(error.localizedDescription)",
                 harm: "Her identity documents cannot be loaded.",
-                repair: nil
+                repair: nil,
+                human_action: "Preserve existing persona bytes and restore or repair the named unreadable document. Compilation creates checked-missing SOUL, VOICE, USER, GROWTH or AGENTS from their shared onboarding templates only after completed onboarding and a checked profile."
             )
         }
     }
@@ -83,17 +81,24 @@ public struct AbilityFilesCheck: DoctorCheck {
     public let id = "ability_files"
     public let title = "Ability Files"
     private let root: URL
-    nonisolated(unsafe) private static var seedFailures: [String: [String]] = [:]
+    private struct SeedInstallation: Sendable {
+        let failures: [String]
+        let current: Int
+        let prepared: Int
+    }
+    nonisolated(unsafe) private static var seedInstallations: [String: SeedInstallation] = [:]
 
-    package static func recordSeedFailures(_ failures: [String], root: URL) {
-        AbilityStore.withLock { seedFailures[root.standardizedFileURL.path] = failures }
+    package static func recordSeedInstallation(failures: [String], current: Int, prepared: Int, root: URL) {
+        AbilityStore.withLock {
+            seedInstallations[root.standardizedFileURL.path] = SeedInstallation(failures: failures, current: current, prepared: prepared)
+        }
     }
 
     public init(root: URL = defaultDataRoot()) { self.root = root }
 
     public func run() async -> CheckResult {
-        let failures = AbilityStore.withLock { Self.seedFailures[root.standardizedFileURL.path] ?? [] }
-        if !failures.isEmpty {
+        let installation = AbilityStore.withLock { Self.seedInstallations[root.standardizedFileURL.path] }
+        if let failures = installation?.failures, !failures.isEmpty {
             // Launch records "filename: error"; name each failed seed without turning an arbitrary error body into the check's
             // prose.
             let seeds = failures.compactMap { failure in
@@ -106,8 +111,20 @@ public struct AbilityFilesCheck: DoctorCheck {
                 human_action: "Tell the person: NativeAgent could not install the named bundled parts; preserve existing parts and the reported installation errors.", owner: .builder)
         }
         do {
-            let files = try AbilityStore(dataRoot: root).files()
-            return CheckResult(source: "abilities/", id: id, title: title, status: "ok", detail: "\(files.count) ability files read successfully.")
+            let inventory = try AbilityStore(dataRoot: root).inventory()
+            // Each damaged file is its own failure, named with its own lever; the rest still load.
+            if let first = inventory.damaged.first?.failure {
+                return CheckResult(source: first.owner, nextCall: first.nextCall, id: id, title: title, status: "fail",
+                    detail: inventory.damaged.map { $0.failure.localizedDescription }.joined(separator: " ")
+                        + " \(inventory.files.count) other ability files read successfully.",
+                    harm: "The named abilities cannot load; every other ability is unaffected.",
+                    human_action: first.tap ?? first.instruction, ask: first.personDecides ? .permission : nil)
+            }
+            let files = inventory.files
+            let seeds = installation.map {
+                " Bundled seeds this launch: \($0.current) current (admission skipped), \($0.prepared) admissions prepared."
+            } ?? " Bundled seed installation has not been observed this launch."
+            return CheckResult(source: "abilities/", id: id, title: title, status: "ok", detail: "\(files.count) ability files read successfully." + seeds)
         } catch {
             // AbilityStore's own no names its file and lever; an unattributed one is the store's.
             let failure = (error as? ToolFailureError).flatMap { $0.owner == nil ? nil : $0 }

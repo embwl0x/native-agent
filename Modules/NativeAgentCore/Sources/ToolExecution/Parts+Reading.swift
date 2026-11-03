@@ -9,19 +9,9 @@ import ToolRegistry
 import CryptoKit
 import TrustCenter
 import Privacy
-// Blueprint: | `Parts+Reading.swift` | Parts identity and row lookup, selected-version reads and bounded all-kind lists; built-in guidance and nearest-three unknown-id receipts |
+// Blueprint: | `Parts+Reading.swift` | Parts identity and row lookup, selected-version reads and bounded all-kind lists over the shared part read schema; built-in guidance with named body gaps and refused unavailable reads, and nearest-three unknown-id receipts |
 
 extension Parts {
-    /// Execution records by default; nil includes every stored kind for reads.
-    public func rows(kind: AbilityStore.Kind? = .part) throws -> [[String: JSONValue]] {
-        guard case .array(let rows) = try abilities.registry(kind: kind) else {
-            throw ToolFailureError("The ability registry did not return rows.", effects: .none, owner: abilities.root.path,
-                nextCall: ToolFailureError.call("app", ["action": .string("files.list"), "args": .object(["path": .string(abilities.root.path)])]),
-                code: "ability_registry_shape", instruction: "Inspect the ability sources and repair the reported malformed header from retained evidence; preserve versions and authority.", recovery: .inspect)
-        }
-        return rows.map(Self.fields)
-    }
-
     /// One reference spelling for every ability verb, including save's new id. Action names come from the registry; they name the same
     /// ability.
     public static func referenceID(_ given: String) -> String {
@@ -87,12 +77,18 @@ extension Parts {
                 return .object(try unknown(named, kind: nil, guidanceIDs: entries.map(\.id)).fields
                     .merging(["status": .string("not_found")]) { $1 })
             }
+            guard guidance.status == "active", let body = guidance.body else {
+                throw ToolFailureError(guidance.description, effects: .none, owner: "persona",
+                    code: "skill_body_unavailable", status: .refused,
+                    instruction: "Repair the named guidance file, then read it again.", recovery: .inspect)
+            }
             return .object(["status": .string("ok"), "id": .string(guidance.id), "built_in": .bool(true),
-                            "guidance": .string(guidance.body ?? ""),
+                            "guidance": .string(body),
                             "note": .string("Built-in guidance from the persona: read it; it is not an ability and does not run.")])
         }
-        var read = row.filter { ["id", "kind", "version", "name", "description", "status", "triggers", "origin", "overrides", "disabledBy", "disabledReason",
+        var read = row.filter { ["id", "kind", "version", "name", "description", "status", "unavailableReason", "triggers", "origin", "overrides", "disabledBy", "disabledReason",
                                  "validation_evidence", "candidate_validation_evidence", "learned"].contains($0.key) }
+        if row["status"] == .string("unavailable") { return .object(read) }
         read["status"] = .string("ok"); read["ability_status"] = row["status"] ?? .null
         var declares: [String: JSONValue] = [:]
         for (key, field) in [("params", "params"), ("input_schema", "inputSchema"), ("actions", "actions"), ("reach", "reach"),
@@ -111,8 +107,7 @@ extension Parts {
         read["versions"] = .object(versions)
         if Self.runs(row) { read["run"] = .object(["action": .string("authored." + id), "args": .object([:])]) }
         read["converted_versions"] = .array(try (row["kind"] == .string("ability") ? store.conversions(id: id) : []).map { candidate in
-            .object(["version": .string(candidate.digest), "converts": Self.fields(candidate.manifest)["converts"] ?? .array([]),
-                     "rollback_call": .object(["action": .string("ability.rollback"), "args": .object(["id": .string(id), "version": .string(candidate.digest)])])])
+            .object(["version": .string(candidate.digest), "converts": Self.fields(candidate.manifest)["converts"] ?? .array([])])
         })
         let latest = row["kind"] == .string("ability") ? try latest(row) : nil
         // Compiled from recorded practice: where its lifecycle stands. Standing is never granted here; its live runs (learned) earn it.
@@ -168,12 +163,16 @@ extension Parts {
     public func list(offset: Int = 0) throws -> JSONValue {
         let rows = try rows(kind: nil).sorted { (Self.string($0, "id") ?? "") < (Self.string($1, "id") ?? "") }
         let start = min(max(0, offset), rows.count)
-        let guidance = try InstalledSkillInventory.entries(dataRoot: root).map(\.id).sorted()
+        let guidanceEntries = try InstalledSkillInventory.entries(dataRoot: root)
+        let guidance = guidanceEntries.map(\.id).sorted()
+        let guidanceGaps = guidanceEntries.filter { $0.status == "unavailable" }.map { entry in
+            JSONValue.object(["id": .string(entry.id), "detail": .string(entry.description)])
+        }
         var parts: [JSONValue] = []
         var bytes = try JSONValue.array(guidance.map(JSONValue.string)).serializedData(pretty: false).count
         for row in rows.dropFirst(start).prefix(40) {
             let id = Self.string(row, "id") ?? ""
-            var item = row.filter { ["id", "kind", "version", "name", "description", "status"].contains($0.key) }
+            var item = row.filter { ["id", "kind", "version", "name", "description", "status", "unavailableReason"].contains($0.key) }
             item["runs"] = row["useCount"] ?? .int(0)
             let last = row["lastUsedAt"]
             if case .double(let stamp)? = last {
@@ -193,6 +192,7 @@ extension Parts {
         }
         let end = start + parts.count
         return .object(["status": .string("ok"), "abilities": .array(parts), "built_in_guidance": .array(guidance.map(JSONValue.string)),
+            "guidance_gaps": .array(guidanceGaps),
             "count": .int(Int64(parts.count)), "total": .int(Int64(rows.count)), "offset": .int(Int64(start)),
             "has_more": .bool(end < rows.count), "next_offset": end < rows.count ? .int(Int64(end)) : .null,
             "next_call": end < rows.count ? .object(["action": .string("ability.list"), "args": .object(["offset": .int(Int64(end))])]) : .null])

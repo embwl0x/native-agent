@@ -48,6 +48,8 @@ struct WorkActivityPushRegistration: Codable, Equatable, Sendable {
     }
     static func read(_ value: JSONValue?) throws -> Self? {
         guard let value else { return nil }
-        return try JSONDecoder().decode(Self.self, from: Data(value.serialize(pretty: false).utf8))
+        let registration = try JSONDecoder().decode(Self.self, from: Data(value.serialize(pretty: false).utf8))
+        _ = try SwiftNativeAPNSSender.Environment.checked(registration.environment)
+        return registration
     }
 }

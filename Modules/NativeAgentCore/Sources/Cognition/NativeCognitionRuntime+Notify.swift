@@ -1,4 +1,5 @@
 import Privacy
+import AgentWorkspace
 import ChatToolRuntime
 import CognitiveSubstrate
 import Foundation
@@ -8,7 +9,7 @@ import PersonaEngine
 import PersistenceCore
 import MemoryV2
 
-// Blueprint: | `NativeCognitionRuntime+Notify.swift` | `NativeCognitionRuntime.innerStateReading`: one reading across mind/body owners and pending stake-bearing expectations |
+// Blueprint: | `NativeCognitionRuntime+Notify.swift` | `NativeCognitionRuntime.innerStateReading`: one reading across mind/body owners, pending stake-bearing expectations and rhythm's standing claims with certainty in words |
 
 // The runtime reads substrate and organism together for one inner-state answer.
 
@@ -43,7 +44,12 @@ extension NativeCognitionRuntime: InnerStateProviding {
             // moment.
             diurnal: frozen.snapshot.enabled ? frozen.projection.diurnal : nil,
             toward: frozen.toward,
-            expectations: await pendingStakeBearingExpectations(at: at)
+            expectations: await pendingStakeBearingExpectations(at: at),
+            personDayTitle: HerScreen.names(dataRoot).person + "'s day, as I know it",
+            personDay: rhythm.value?.claims.map {
+                $0.words(person: HerScreen.names(dataRoot).person, day: at)
+                    + ($0.confidence >= 0.7 ? " Sure." : " Fairly sure.")
+            } ?? []
         )
         return await substrate.innerStateReading(
             windowHours: windowHours,

@@ -14,7 +14,7 @@ public enum PrivateWorkContextAssembly: Sendable {
 /// What woke the dream. `schedule` is the 03:30 daily job on the Mac's local clock.
 /// `manual` is a person asking for a pass now, from the Dreams tab or a tool. Receipts carry it so a dream's
 /// provenance is never guessed from its timestamp.
-public enum DreamTrigger: String, Sendable, Equatable, CaseIterable {
+public enum DreamTrigger: String, Sendable, Equatable, CaseIterable, Codable {
     case schedule
     case manual
 }
@@ -31,10 +31,12 @@ public struct DreamReport: Sendable, Equatable {
     /// `no_new_material` (nothing past the high-water mark; an existing entry
     /// for the day is never a reason) or `already_running`.
     public var skipReason: String?
-    /// The exact committed entry, delivered to reflection without a latest-item lookup.
-    public var reflectionMaterial: [String: CognitiveReflectionCause] = [:]
     /// Her cares as the committed dream was shown them, with its answer lines.
     public var careNight: CognitiveCareNight?
+    /// Generated and decoded through the real dream path; never committed.
+    public var preview: JSONValue?
+    /// Previously committed sections whose retained work finished on this pass.
+    public var effectsSettled: Int = 0
 
     public var committed: Bool { entriesWritten > 0 && !disabled && errors.isEmpty }
 
@@ -66,6 +68,10 @@ public struct DreamReport: Sendable, Equatable {
 /// by the `persona-feedback` tag.
 public typealias DreamMemoryDeltaProvider = @Sendable (_ since: Date) async throws -> [String]
 
+/// CPU reading of existing surprise records over the same high-water window
+/// as the dream. The runner adds the prompt-owned header and bounds the block.
+public typealias DreamSurpriseProvider = @Sendable (_ since: Date, _ through: Date) async throws -> String
+
 /// Provider for the "felt" tone of the dream prompt — ONE bounded, read-time
 /// summary of what the day FELT like, pulled from the cognitive substrate's
 /// felt layer (per-node emotional tags + derived mood). Returns nil when nothing
@@ -84,20 +90,48 @@ public typealias DreamFeltOriginProvider = @Sendable () async throws -> [Cogniti
 
 /// Her cares for the dream prompt: what moved her today and what is still open,
 /// with the keys the dream may answer by. nil when the inner life is off.
-public typealias DreamCareNightProvider = @Sendable () async -> CognitiveCareNight?
+public typealias DreamCareNightProvider = @Sendable () async throws -> CognitiveCareNight?
 
 /// Receipt channel for the dream lane. DreamREMCycle holds no substrate
 /// reference (and must not: cognition lives above it), so a receipt it owns is
 /// handed OUT to whoever holds the store — the same shape
-/// `CognitiveSubstrate.recordReceipt(kind:payload:)` already takes. Default is
-/// a no-op.
-public typealias DreamReceiptSink = @Sendable (_ kind: String, _ payload: JSONValue) async -> Void
+/// `CognitiveSubstrate.recordReceiptChecked(kind:payload:)` takes. Default is
+/// an explicit unavailable failure, never an acknowledgment.
+public typealias DreamReceiptSink = @Sendable (_ kind: String, _ payload: JSONValue) async throws -> Void
 
 /// Her explicit affect judgment, after the dream commits. The dated sink answers
-/// whether persistence landed, so a failed integration releases the existing claim.
+/// whether the effect persisted or its owner is explicitly switched off.
 public typealias DreamDatedMoodSink = @Sendable (
     _ affect: Double,
     _ dateKey: String
-) async -> Bool
+) async throws -> DreamEffectResult
+
+/// One owed step, carrying its retained input. Producing a reflection is distinct
+/// from integrating it: its judgment must be saved before it can change her.
+public enum DreamEffect: Sendable {
+    case reflectionJudgment([String: CognitiveReflectionCause])
+    case reflectionIntegration(CognitiveReflectionReceipt)
+    case reflectionAcknowledgment(UUID)
+    case care(CognitiveCareNight)
+    case completion(occurredAt: Date, feltSummary: String?)
+}
+
+public enum DreamEffectResult: Sendable {
+    case done
+    case skipped(String)
+    case reflection(CognitiveReflectionReceipt)
+}
+
+/// Delivery of the exact saved section, never a fresh lookup of the latest dream.
+public struct DreamDelivery: Sendable {
+    public let id: UUID
+    public let date: String
+    public let trigger: DreamTrigger
+    public let force: Bool
+    public let sessionsProcessed: Int
+    public let effect: DreamEffect
+}
+
+public typealias DreamEffectSink = @Sendable (DreamDelivery) async throws -> DreamEffectResult
 import CognitiveSubstrate
-// Blueprint: | `DreamCycleContracts.swift` | `DreamTrigger` enum |
+// Blueprint: | `DreamCycleContracts.swift` | Dream trigger, report, provider and saved-effect delivery contracts, including bounded CPU surprise material and the uncommitted decoded preview result |

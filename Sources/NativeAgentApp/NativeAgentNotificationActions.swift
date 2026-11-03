@@ -117,15 +117,12 @@ enum NativeAgentApprovalNotifications {
         let delivery = ApprovalNotificationDelivery(engine: engine)
         let approvalPath = await approvals.requestsPath()
         await EventDeadlinePhysiology.refreshOnChanges(paths: [approvalPath] + [
-            "config/apns.json", "notifications/push_tokens.json", "mobile_push/tokens.json", "user_prefs.json"
+            "config/apns.json", "notifications/push_tokens.json", "user_prefs.json"
         ].map { approvals.dataRoot.appendingPathComponent($0) },
             notifications: [NSApplication.didBecomeActiveNotification, .NSSystemClockDidChange, UserDefaults.didChangeNotification]) {
             await delivery.refresh(
                 router: .shared,
                 telegram: { ApprovalChatCards.runningTelegram },
-                post: { title, body, userInfo in
-                    await NativeAgentNotifications.postAndReport(title: title, body: body, userInfo: userInfo)
-                },
                 writeSnapshots: { Task { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() } }
             )
         }

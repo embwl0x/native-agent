@@ -110,7 +110,7 @@ extension TranscriptsFacade {
     }
     nonisolated internal func readTranscriptProjection(safeSessionId: String, cached: Bool) async throws -> TranscriptReadout {
         var projection = try await readTranscript(safeSessionId: safeSessionId, cached: cached)
-        let cards = await InlineCards.cardsByRow(
+        let cards = try await InlineCards.cardsByRow(
             projection.interactions, messages: projection.messages, sessionID: safeSessionId, dataRoot: dataRoot)
         for index in projection.messages.indices {
             projection.messages[index].inlineCards = cards.cardsByRow[projection.messages[index].id] ?? []
@@ -132,14 +132,14 @@ extension TranscriptsFacade {
             )
         }
         let rejectedRows = history.stats.malformedRowCount + history.stats.invalidShapeRowCount
-        guard !history.messages.isEmpty || rejectedRows == 0 else {
+        guard rejectedRows == 0 else {
             throw NSError(
                 domain: "NativeClient.ChatHistory", code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "The saved conversation has no readable messages (\(rejectedRows) damaged rows). Its data was left unchanged."]
+                userInfo: [NSLocalizedDescriptionKey: "The saved conversation is unavailable (\(rejectedRows) damaged rows). Its data was left unchanged; repair the rejected rows before displaying a complete history."]
             )
         }
-        // Missing/empty new sessions remain valid, and mixed transcripts keep
-        // their readable rows under the existing tolerant reader contract.
+        // Missing/empty new sessions remain valid. A surviving subset is not
+        // a complete transcript; the facade retains its previous publication.
         let coMessages = history.messages
         // Parse recollections from the same decoded rows as the displayed messages.
         let recollections = coMessages.compactMap { co -> ChatSessionRecollection? in
@@ -149,16 +149,13 @@ extension TranscriptsFacade {
                 sessionId: safeSessionId
             )
         }
-        let messages = coMessages.map { co -> ChatMessage in
+        let messages = try coMessages.map { co -> ChatMessage in
             guard case .object(let row)? = co.extras else {
-                return ChatMessage(
-                    sessionId: safeSessionId,
-                    role: co.role,
-                    content: co.content,
-                    createdAt: co.timestamp
-                )
+                throw NSError(domain: "NativeAgent.ChatHistory", code: 422, userInfo: [
+                    NSLocalizedDescriptionKey: "A saved message has no source row. Repair the transcript before displaying unverifiable history."
+                ])
             }
-            var message = ChatMessage(row: row)
+            var message = try ChatMessage(row: row)
             // A fork keeps its source rows byte-for-byte, including their
             // original session IDs. This UI projection belongs to the
             // requested transcript; actions on an inherited row must not

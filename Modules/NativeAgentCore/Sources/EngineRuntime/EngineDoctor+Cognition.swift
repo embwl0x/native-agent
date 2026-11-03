@@ -109,19 +109,12 @@ extension EngineDoctorRuntime {
         }
         let pushID = "live.phone_notifications"
         let pushTitle = "Phone notification transport"
-        guard FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent("config/apns.json").path) else {
-            return [pairing, CheckResult(source: "config/apns.json", id: pushID, title: pushTitle, status: "not needed",
-                detail: "Direct APNS is not configured for this installation.")]
-        }
         do {
-            let phone = try await SwiftNativeAPNSSender().notificationReadiness(dataRoot: dataRoot, strict: true)
-            if phone.status == "not_checked" {
-                return [pairing, CheckResult(source: "config/apns.json and mobile_push/apns_outcomes.jsonl", id: pushID, title: pushTitle, status: "unmeasured", detail: phone.detail)]
-            }
-            return [pairing, CheckResult(source: "config/apns.json and mobile_push/apns_outcomes.jsonl", id: pushID, title: pushTitle, status: phone.paired == 0 ? "not needed" : phone.supported ? "ok" : "warn",
+            let phone = try await SwiftNativeAPNSSender().notificationReadiness(dataRoot: dataRoot)
+            return [pairing, CheckResult(source: "paired_phones.json", id: pushID, title: pushTitle, status: phone.paired == 0 ? "not needed" : phone.supported ? "ok" : "warn",
                                detail: phone.detail)]
         } catch {
-            let source = (error as NSError).userInfo[NSFilePathErrorKey] as? String ?? "config/apns.json, notifications/push_tokens.json or mobile_push/apns_outcomes.jsonl"
+            let source = (error as NSError).userInfo[NSFilePathErrorKey] as? String ?? "paired_phones.json"
             return [pairing, CheckResult(source: source, id: pushID, title: pushTitle, status: "fail",
                                detail: "Phone notification transport could not be read: \(error.localizedDescription)")]
         }
@@ -140,8 +133,7 @@ extension EngineDoctorRuntime {
                            detail: "Pairing: " + connection.pairing.line.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))
                                + "; last exchange: " + connection.exchange.line.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) + ".",
                            harm: broken == nil ? nil : "The phone cannot exchange messages with her.",
-                           repair: recovery?.lever,
-                           human_action: personOwned ? recovery?.lever : nil,
+                           human_action: recovery?.lever,
                            ask: personOwned && recovery?.lever != nil ? .permission : nil,
                            owner: broken?.owner == .builder ? .builder : nil)
     }

@@ -2,11 +2,12 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
+import Synchronization
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
 
-// Blueprint: | `MacControlOperationStore.swift` | `MacControlOperationStore`: canonical payload-free operation lifecycle, request digests, cancellation settlement and motor projection |
+// Blueprint: | `MacControlOperationStore.swift` | `MacControlOperationStore`: canonical payload-free lifecycle, owner-scoped launch recovery admission, cancellation settlement and motor projection |
 
 /// Canonical, payload-free lifecycle state for one Mac Control operation.
 ///
@@ -42,7 +43,7 @@ public struct MacControlOperationRecord: Codable, Sendable, Equatable {
     /// SHA-256 over the canonical action + request body with operation identity
     /// removed. This binds an idempotency key to one exact intent without
     /// retaining shell text, file content, notification text, or other payload.
-    public let requestDigest: String?
+    public let requestDigest: String
     public var state: MacControlOperationState
     public let acceptedAt: Date
     public var startedAt: Date?
@@ -58,7 +59,7 @@ public struct MacControlOperationRecord: Codable, Sendable, Equatable {
     public init(
         operationId: String,
         action: String,
-        requestDigest: String? = nil,
+        requestDigest: String,
         state: MacControlOperationState,
         acceptedAt: Date,
         startedAt: Date? = nil,
@@ -96,6 +97,7 @@ public enum MacControlOperationStoreError: Error, Sendable, Equatable, Localized
     case operationNotFound
     case actionMismatch
     case requestMismatch
+    case recoveryUnavailable(String)
     case illegalTransition(from: MacControlOperationState, to: MacControlOperationState)
 
     public var errorDescription: String? {
@@ -105,6 +107,8 @@ public enum MacControlOperationStoreError: Error, Sendable, Equatable, Localized
         case .operationNotFound: return "mac_operation_not_found: No record exists for this operation_id. Check the identity from its original receipt; inspect the affected app with mac.look before creating new work."
         case .actionMismatch: return "operation_action_mismatch: This operation_id belongs to another action. Use the original receipt to reconcile that action before assigning a new operation_id to different work."
         case .requestMismatch: return "operation_request_mismatch: This operation_id belongs to another request. Reconcile the original receipt before assigning a new operation_id to changed args."
+        case .recoveryUnavailable(let cause):
+            return "mac_operation_recovery_unavailable: Mac actions are unavailable: \(cause). Preserve and repair mac_control/operations.json under the app data root, inspect affected apps with mac.look to reconcile unknown effects, then restart NativeAgent to recover. Looking and other surfaces remain available; do not repeat an uncertain action."
         case .illegalTransition(let from, let to):
             return "illegal_mac_operation_transition: \(from.rawValue) -> \(to.rawValue). Preserve the existing record in mac_control/operations.json and inspect the affected app with mac.look; do not replay the action to repair its lifecycle."
         }
@@ -116,6 +120,18 @@ public enum MacControlOperationStoreError: Error, Sendable, Equatable, Localized
 /// a second actor instance cannot race a duplicate side effect into existence.
 public actor MacControlOperationStore: MotorActionReadModelProviding {
     public static let maxRetainedOperations = 500
+    // Shared by every client of this canonical path, not by one actor instance.
+    // Absence means launch recovery has not completed, never permission to act.
+    private enum Recovery: Sendable { case ready, unavailable(String) }
+    private static let recovery = Mutex<[URL: Recovery]>([:])
+
+    public nonisolated var recoveryIssue: String? {
+        switch Self.recovery.withLock({ $0[path] }) {
+        case .ready: return nil
+        case .unavailable(let cause): return MacControlOperationStoreError.recoveryUnavailable(cause).localizedDescription
+        case nil: return MacControlOperationStoreError.recoveryUnavailable("Startup recovery has not completed").localizedDescription
+        }
+    }
 
     private struct Snapshot: Codable, Sendable {
         var schemaVersion: Int
@@ -123,13 +139,14 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
     }
 
     private let path: URL
+    nonisolated var registryIdentity: URL { path }
     private let now: @Sendable () -> Date
 
     public init(
         dataRoot: URL,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
-        self.path = dataRoot
+        self.path = dataRoot.standardizedFileURL
             .appendingPathComponent("mac_control", isDirectory: true)
             .appendingPathComponent("operations.json")
         self.now = now
@@ -163,8 +180,8 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
         #endif
     }
 
-    public nonisolated static func validRequestDigest(_ value: String?) -> Bool {
-        guard let value, value.utf8.count == 64 else { return false }
+    public nonisolated static func validRequestDigest(_ value: String) -> Bool {
+        guard value.utf8.count == 64 else { return false }
         return value.unicodeScalars.allSatisfy {
             CharacterSet(charactersIn: "0123456789abcdef").contains($0)
         }
@@ -174,13 +191,18 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
         operationId: String,
         action: String,
         requestDigest: String,
-        deadlineSeconds: Int? = nil
+        deadlineAt: Date? = nil
     ) async throws -> MacControlOperationBeginOutcome {
         guard Self.validOperationId(operationId) else {
             throw MacControlOperationStoreError.invalidOperationId
         }
         guard Self.validRequestDigest(requestDigest) else {
             throw MacControlOperationStoreError.requestMismatch
+        }
+        if let issue = recoveryIssue {
+            throw ToolFailureError(issue, effects: .none, owner: "mac_operation_recovery",
+                code: "mac_operation_recovery_unavailable", status: .refused,
+                instruction: "Preserve and repair mac_control/operations.json, inspect affected apps with mac.look to reconcile unknown effects, then restart NativeAgent.", recovery: .repair)
         }
         return try await mutate { snapshot in
             if let existing = snapshot.operations.first(where: { $0.operationId == operationId }) {
@@ -193,9 +215,6 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
                 return existing.state.isTerminal ? .replay(existing) : .duplicateActive(existing)
             }
             let acceptedAt = now()
-            let deadlineAt = deadlineSeconds.map {
-                acceptedAt.addingTimeInterval(TimeInterval(max(1, min($0, 120))))
-            }
             let record = MacControlOperationRecord(
                 operationId: operationId,
                 action: Self.clip(action, limit: 128),
@@ -219,7 +238,8 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
         verification: MotorVerificationState? = nil,
         expectedNextEvidence: String? = nil,
         outcomeCode: String? = nil,
-        acknowledgePreStartCancellation: Bool = false
+        acknowledgePreStartCancellation: Bool = false,
+        settlingActualExit: Bool = false
     ) async throws -> MacControlOperationRecord {
         try await mutate { snapshot in
             guard let index = snapshot.operations.firstIndex(where: { $0.operationId == operationId }) else {
@@ -231,10 +251,13 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
             let cancelledBeforeStart = acknowledgePreStartCancellation
                 && current.state == .cancelRequested && current.startedAt == nil
             let next = cancelledBeforeStart ? MacControlOperationState.cancelAcknowledged : next
-            if current.state == next {
-                return current
-            }
-            guard Self.legalTransitions[current.state, default: []].contains(next) else {
+            // Only the original body's actual-exit settlement can replace a
+            // reporting wait's unknown effect. Restart uncertainty stays final.
+            let settlesWait = settlingActualExit && current.state == .outcomeUnknown
+                && current.terminalAt == nil
+                && [.completed, .failed, .timedOut, .cancelAcknowledged, .outcomeUnknown].contains(next)
+            if current.state == next && !settlesWait { return current }
+            guard settlesWait || Self.legalTransitions[current.state, default: []].contains(next) else {
                 throw MacControlOperationStoreError.illegalTransition(from: current.state, to: next)
             }
             var updated = current
@@ -255,6 +278,22 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
             snapshot.operations[index] = updated
             Self.bound(&snapshot.operations)
             return updated
+        }
+    }
+
+    /// A reporting deadline never settles or retires the body's real result.
+    func responseUnavailable(operationId: String, timedOut: Bool) async throws -> MacControlOperationRecord {
+        try await mutate { snapshot in
+            guard let index = snapshot.operations.firstIndex(where: { $0.operationId == operationId }) else {
+                throw MacControlOperationStoreError.operationNotFound
+            }
+            if snapshot.operations[index].state.isTerminal { return snapshot.operations[index] }
+            snapshot.operations[index].state = .outcomeUnknown
+            snapshot.operations[index].verification = .unverified
+            snapshot.operations[index].expectedNextEvidence = "Original body exit and separate effect observation; do not replay"
+            snapshot.operations[index].outcomeCode = timedOut ? "deadline_effect_unknown" : "cancel_effect_unknown"
+            // No terminalAt: the body still owns exactly one terminal settlement.
+            return snapshot.operations[index]
         }
     }
 
@@ -293,33 +332,43 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
     /// Whole-store recovery is for app startup; a rebound bridge scopes its action.
     @discardableResult
     public func recoverInterruptedOperations(action: String? = nil) async throws -> Int {
-        try await mutate { snapshot in
-            var recovered = 0
-            let timestamp = now()
-            for index in snapshot.operations.indices where !snapshot.operations[index].state.isTerminal {
-                if let action, snapshot.operations[index].action != action { continue }
-                let priorState = snapshot.operations[index].state
-                // `accepted` is durably recorded before execution begins, so
-                // an interruption there proves no effect started. Once the
-                // operation reached `started` (or cancellation raced it), a
-                // restart cannot honestly infer whether the external effect
-                // happened. Preserve that ambiguity and forbid blind replay.
-                let effectMayHaveStarted = priorState == .started
-                    || priorState == .cancelRequested
-                snapshot.operations[index].state = effectMayHaveStarted
-                    ? .outcomeUnknown
-                    : .failed
-                snapshot.operations[index].terminalAt = timestamp
-                snapshot.operations[index].verification = effectMayHaveStarted
-                    ? .unknown
-                    : .failed
-                snapshot.operations[index].expectedNextEvidence = effectMayHaveStarted
-                    ? "Separate observation of intended effect; do not retry automatically"
-                    : nil
-                snapshot.operations[index].outcomeCode = "restart_interrupted"
-                recovered += 1
+        do {
+            let count = try await mutate { snapshot in
+                var recovered = 0
+                let timestamp = now()
+                for index in snapshot.operations.indices where !snapshot.operations[index].state.isTerminal || snapshot.operations[index].terminalAt == nil {
+                    if let action, snapshot.operations[index].action != action { continue }
+                    let priorState = snapshot.operations[index].state
+                    // `accepted` is durably recorded before execution begins, so
+                    // an interruption there proves no effect started. Once the
+                    // operation reached `started` (or cancellation raced it), a
+                    // restart cannot honestly infer whether the external effect
+                    // happened. Preserve that ambiguity and forbid blind replay.
+                    let effectMayHaveStarted = priorState == .started
+                        || priorState == .cancelRequested || priorState == .outcomeUnknown
+                    snapshot.operations[index].state = effectMayHaveStarted
+                        ? .outcomeUnknown
+                        : .failed
+                    snapshot.operations[index].terminalAt = timestamp
+                    snapshot.operations[index].verification = effectMayHaveStarted
+                        ? .unknown
+                        : .failed
+                    snapshot.operations[index].expectedNextEvidence = effectMayHaveStarted
+                        ? "Separate observation of intended effect; do not retry automatically"
+                        : nil
+                    snapshot.operations[index].outcomeCode = "restart_interrupted"
+                    recovered += 1
+                }
+                return recovered
             }
-            return recovered
+            // Only whole-owner launch recovery can open admission.
+            if action == nil {
+                Self.recovery.withLock { $0[path] = .ready }
+            }
+            return count
+        } catch {
+            Self.recovery.withLock { $0[path] = .unavailable(error.localizedDescription) }
+            throw error
         }
     }
 
@@ -353,7 +402,7 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
             guard snapshot.schemaVersion == 1,
                   snapshot.operations.allSatisfy({
                       Self.validOperationId($0.operationId)
-                          && ($0.requestDigest == nil || Self.validRequestDigest($0.requestDigest))
+                          && Self.validRequestDigest($0.requestDigest)
                   }) else {
                 throw MacControlOperationStoreError.corruptStore
             }
@@ -378,7 +427,7 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
     }
 
     private static let legalTransitions: [MacControlOperationState: Set<MacControlOperationState>] = [
-        .accepted: [.started, .blocked, .refused, .cancelRequested, .failed],
+        .accepted: [.started, .blocked, .refused, .cancelRequested, .cancelAcknowledged, .failed],
         .started: [.cancelRequested, .cancelAcknowledged, .timedOut, .outcomeUnknown, .completed, .failed],
         .cancelRequested: [.cancelAcknowledged, .timedOut, .outcomeUnknown, .completed, .failed],
         .cancelAcknowledged: [],
@@ -408,9 +457,9 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
         guard operations.count > maxRetainedOperations else { return }
         // Never evict an active operation. Keep newest terminal rows up to the
         // cap in addition to every active row.
-        let active = operations.filter { !$0.state.isTerminal }
+        let active = operations.filter { !$0.state.isTerminal || $0.terminalAt == nil }
         let terminalBudget = max(0, maxRetainedOperations - active.count)
-        operations = active + Array(operations.filter { $0.state.isTerminal }.prefix(terminalBudget))
+        operations = active + Array(operations.filter { $0.state.isTerminal && $0.terminalAt != nil }.prefix(terminalBudget))
     }
 
     private static func clip(_ value: String, limit: Int) -> String {

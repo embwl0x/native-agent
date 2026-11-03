@@ -4,7 +4,7 @@ import os
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `LLMClient+AnthropicOAuthDirectAdapter.swift` | `AnthropicOAuthTransport`: `requestMaxTokens`, `installedClaudeCodeVersion`; indexed content-block validation shared by OAuth text and Anthropic native-tool streams, keeping text/thinking/signature/tool deltas on their own blocks |
+// Blueprint: | `LLMClient+AnthropicOAuthDirectAdapter.swift` | `AnthropicOAuthTransport`: `requestOutputTokens`, explicit OAuth protocol client identity; indexed content-block validation shared by OAuth text and Anthropic native-tool streams, keeping text/thinking/signature/tool deltas on their own blocks |
 
 // MARK: - AnthropicOAuthTransport
 //
@@ -55,12 +55,12 @@ public final class AnthropicOAuthTransport: LLMTransport {
         self.telemetry = LLMCallTraceRecorder(dataRootOverride: telemetryDataRootOverride)
     }
 
-    func requestMaxTokens(model: String) -> Int {
+    public func requestOutputTokens(model: String) throws -> Int {
         if let limit = LLMCallContext.turnTokenBudget?.available { return limit }
-        return FirstPartyExecutionControls.anthropicMaxOutputTokens(
+        return try FirstPartyExecutionControls.anthropicMaxOutputTokens(
             model: model,
             requestedEffort: LLMCallContext.reasoningEffort,
-            explicitOverride: maxTokensOverride
+            explicitOverride: maxTokensOverride, providerID: providerId
         )
     }
 
@@ -72,22 +72,10 @@ public final class AnthropicOAuthTransport: LLMTransport {
         "oauth-2025-04-20",
         "fine-grained-tool-streaming-2025-05-14",
     ]
-    // The advertised client version is the newest installed CLI, desktop app or literal floor.
-    private static var claudeCLIVersion: String { installedClaudeCodeVersion(floor: "2.1.280") ?? "2.1.280" }
+    // Explicit protocol identity for this adapter; never inferred from another
+    // application's installed version or a directory read.
+    private static let claudeCLIVersion = "2.1.280"
 
-    static func installedClaudeCodeVersion(home: URL = FileManager.default.homeDirectoryForCurrentUser,
-                                           floor: String? = nil) -> String? {
-        let stores = [".local/share/claude/versions", "Library/Application Support/Claude/claude-code"]
-        let found = stores.flatMap { (try? FileManager.default.contentsOfDirectory(atPath: home.appendingPathComponent($0).path)) ?? [] }
-            + [floor].compactMap { $0 }
-        func parts(_ v: String) -> [Int]? {
-            let p = v.split(separator: ".").map { Int($0) }
-            let numbers = p.compactMap { $0 }
-            return p.count == 3 && numbers.count == 3 ? numbers : nil
-        }
-        return found.compactMap { v in parts(v).map { (v, $0) } }
-            .max { $0.1.lexicographicallyPrecedes($1.1) }?.0
-    }
     static func makeProductionSession(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> URLSession {
@@ -109,14 +97,6 @@ public final class AnthropicOAuthTransport: LLMTransport {
             "Accept":             "application/json",
             "Content-Type":       "application/json",
         ]
-    }
-
-    private static func validateCompletionResponse(status: Int, data: Data, response: URLResponse) throws {
-        try throwIfChatCompletionsError(
-            status: status,
-            data: data,
-            response: response
-        )
     }
 
     /// Every HTTP failure retains bounded body evidence before classification.
@@ -223,140 +203,14 @@ public final class AnthropicOAuthTransport: LLMTransport {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        try Self.refuseNativeTools(tools)
-        return try await completeBuffered(model: model, operation: "completeMessages") { coercedModel in
-            Self.makeMessagesRequestBody(
-                messages: messages,
-                system: system,
-                coercedModel: coercedModel,
-                maxTokens: requestMaxTokens(model: coercedModel),
-                stream: false
-            )
-        }
+        return try await LLMMessageStreamEvent.reply(collecting:
+            self.streamMessages(messages: messages, system: system, model: model, tools: tools), using: telemetry)
     }
 
     public func complete(
-        prompt: String,
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?
+        prompt: String, system: String?, model: String, tools: [LLMToolSchema]?
     ) async throws -> String {
-        try Self.refuseNativeTools(tools)
-        return try await completeBuffered(model: model, operation: "complete") { coercedModel in
-            let systemBlocks = Self.makeSystemBlocks(system)
-            var body: [String: Any] = [
-                "model": coercedModel,
-                "max_tokens": requestMaxTokens(model: coercedModel),
-                "messages": [["role": "user", "content": prompt]],
-                "system": systemBlocks,
-            ]
-            Self.applyTextLaneStops(to: &body, system: system)
-            FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: coercedModel)
-            return body
-        }
-    }
-
-    private func completeBuffered(
-        model: String,
-        operation: String,
-        requestBody: (String) -> [String: Any]
-    ) async throws -> String {
-        let coercedModel = try Self.coerceToClaudeModel(model)
-        let substitutedFrom = Self.substitutionTrace(requested: model, coerced: coercedModel)
-        // Forced refresh receives the sent token so concurrent rotations reuse the current credential.
-        let requestAccount = OAuthRequestAccount()
-        var lastSentAccessToken: String?
-        for attempt in 0...1 {
-            try Task.checkCancellation()
-            let accessToken: String
-            do {
-                accessToken = try await ensureFreshAccessToken(
-                    forceRefresh: attempt == 1, staleToken: lastSentAccessToken, requestAccount: requestAccount)
-                lastSentAccessToken = accessToken
-            } catch is CancellationError { throw CancellationError() }
-            catch let err as LLMError { throw err }
-            catch let err as any ProviderFailureWrapping { throw err }
-            catch {
-                throw ProviderFailure.Diagnostic(cause: .routingUnavailable,
-                    detail: "\(resolveAuthPath().path): \(ProviderFailure.diagnosticDescription(error))")
-            }
-
-            var req = URLRequest(url: endpoint)
-            req.httpMethod = "POST"
-            for (k, v) in Self.apiHeaders(
-                accessToken: accessToken
-            ) {
-                req.setValue(v, forHTTPHeaderField: k)
-            }
-
-            let body = requestBody(coercedModel)
-            do {
-                req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-            } catch {
-                throw LLMError.underlying(message: "encode body: \(error)")
-            }
-            Self.dumpBodyIfEnabled(body, call: operation)
-
-            try Task.checkCancellation()
-            let requestStartNs = DispatchTime.now().uptimeNanoseconds
-            let data: Data
-            let response: URLResponse
-            do {
-                if ProviderStreamContext.stallOnly { req.timeoutInterval = .infinity }
-                (data, response) = try await session.data(for: req)
-            } catch {
-                throw mapTransportError(error, fallback: transientNetworkError(error, endpoint: endpoint, operation: operation))
-            }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if status == 401, attempt == 0 { continue }
-            try Self.validateCompletionResponse(status: status, data: data, response: response)
-            let (obj, pieces) = try completionPieces(data: data, status: status)
-            let reachedLengthLimit = obj["stop_reason"] as? String == "max_tokens"
-            // Record usage only after validating response content.
-            let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-            await telemetry.record(
-                requestBody: req.httpBody,
-                provider: providerId,
-                model: coercedModel,
-                streaming: false,
-                usage: LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]),
-                ttftMs: nil,
-                durationMs: durationMs,
-                status: reachedLengthLimit ? "incomplete" : "ok",
-                substitutedFrom: substitutedFrom,
-                cacheMarkers: Self.cacheMarkers(in: body),
-                stopReason: reachedLengthLimit ? "max_tokens" : nil
-            )
-            if reachedLengthLimit {
-                throw LLMError.outputLengthLimit(partial: pieces.joined(separator: "\n"))
-            }
-            return pieces.joined(separator: "\n")
-        }
-        throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
-    }
-
-    /// Preserve response text order before recording successful usage.
-    private func completionPieces(data: Data, status: Int) throws -> ([String: Any], [String]) {
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = obj["content"] as? [[String: Any]] else {
-            throw LLMError.invalidResponse(status: status)
-        }
-        // Text blocks only: tool calls arrive as markers inside the text
-        // (text tool lane), never as native tool_use blocks.
-        var pieces: [String] = []
-        for block in content {
-            if block["type"] as? String == "text", let t = block["text"] as? String {
-                pieces.append(t)
-            }
-        }
-        if pieces.isEmpty && obj["stop_reason"] as? String != "max_tokens" {
-            throw FirstPartyExecutionControls.anthropicEmptyStreamError(
-                providerID: providerId,
-                stopReason: obj["stop_reason"] as? String,
-                expectedOutput: "answer text or tool call"
-            )
-        }
-        return (obj, pieces)
+        try await completeMessages(messages: [.user(prompt)], system: system, model: model, tools: tools)
     }
 
     /// Streams the messages-shaped text-tool body; native schemas are refused.
@@ -390,6 +244,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
                     continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "streamMessages: \(error)")))
                 }
             }
+            ProviderReplyWork.current?.own(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }
@@ -419,11 +274,11 @@ public final class AnthropicOAuthTransport: LLMTransport {
             }
             req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
-            let body = Self.makeMessagesRequestBody(
+            let body = try Self.makeMessagesRequestBody(
                 messages: messages,
                 system: system,
                 coercedModel: model,
-                maxTokens: requestMaxTokens(model: model),
+                maxTokens: try requestOutputTokens(model: model),
                 stream: true
             )
             req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
@@ -448,7 +303,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
             var yieldedSemanticOutput = false
             var lastStopReason: String?
             var contentBlocks: [Int: String] = [:]
-            var runaway = RunawayOutputDetector(endsAtToolBoundary: body["stop_sequences"] != nil)
+            var runaway = RunawayOutputDetector(endsAtToolBoundary: body["stop_sequences"] != nil, diagnosticDataRoot: telemetry.diagnosticDataRoot)
             // Connect and mid-stream transport errors share a mapping; parser errors and cancellation pass through.
             do {
                 // SSEEventStream owns framing; protocol semantics stay here.
@@ -495,11 +350,10 @@ public final class AnthropicOAuthTransport: LLMTransport {
         staleToken: String? = nil,
         requestAccount: OAuthRequestAccount = OAuthRequestAccount()
     ) async throws -> String {
+        try OAuthProductionSession.validate(session)
         let path = resolveAuthPath()
         let data = try Data(contentsOf: path)
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
-        }
+        let object = try ProviderStateValidation.credential(data: data)
         try requestAccount.check(object, provider: "anthropic_oauth_direct", rejectedToken: staleToken)
         // Fast path — no refresh needed.
         if !forceRefresh, let (token, exp) = Self.accessTokenAndExpiry(in: object) {
@@ -509,9 +363,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
                 }
                 // Else fall through to refresh.
             } else {
-                // No expires_at on disk: long-lived setup_token shape.
-                // Don't speculatively refresh — return as-is. The 401 retry
-                // path handles a stale token.
+                // No stated expiry: use this access token until rejected.
                 return token
             }
         }
@@ -519,9 +371,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
         let actor = Self.sharedRefreshActor(for: path)
         return try await actor.run { [self] in
             let data = try Data(contentsOf: path)
-            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
-            }
+            let object = try ProviderStateValidation.credential(data: data)
             try requestAccount.check(object, provider: "anthropic_oauth_direct")
             // A forced refresh reuses the on-disk token when another waiter has already rotated it.
             if forceRefresh, let staleToken, !staleToken.isEmpty,
@@ -544,7 +394,6 @@ public final class AnthropicOAuthTransport: LLMTransport {
         let access = tokens["access_token"] as? String
         guard let token = access, !token.isEmpty else { return nil }
         let expRaw: Any? = obj["expires_at"]
-            ?? (obj["tokens"] as? [String: Any]).flatMap { $0["expires_at"] }
         let exp = expRaw.flatMap(parseExpiresAt)
         return (token, exp)
     }
@@ -622,23 +471,13 @@ public final class AnthropicOAuthTransport: LLMTransport {
             throw LLMError.authRejected(
                 provider: "anthropic_oauth_direct", detail: providerErrorDetail(rdata))
         }
-        guard let payload = try? JSONSerialization.jsonObject(with: rdata) as? [String: Any] else {
-            throw LLMError.underlying(message: "anthropic refresh: unparseable response")
-        }
+        let answer = try OAuthGrantOperations.validateTokenResponse(rdata, requiringRefreshToken: false)
+        let payload = answer.fields
         try OAuthRefreshBinding.requireSameAccount(payload, original: obj, provider: "anthropic_oauth_direct")
 
         // Merge: keep client_id / scope / token_type / user_info; replace
-        // access_token, refresh_token (if rotated), recompute expires_at.
-        let rotatedAccess = (payload["access_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        let rotatedRefresh = (payload["refresh_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        // expires_in is seconds-from-now. Compute an absolute timestamp.
-        let expiresIn: Int = {
-            if let i = payload["expires_in"] as? Int { return i }
-            if let d = payload["expires_in"] as? Double { return Int(exactly: d.rounded(.towardZero)) ?? 3600 }
-            return 3600
-        }()
-        let exp = Date().addingTimeInterval(TimeInterval(expiresIn))
-        let rotatedExpiresAt = NativeTimestampFormat.basicZulu(exp)
+        // access_token, a supplied refresh_token, and the new token's expiry.
+        let rotatedExpiresAt = answer.expiresIn.map { NativeTimestampFormat.basicZulu(Date().addingTimeInterval($0)) }
 
         // Under the shared path lock, compare token-key generations and merge onto current settings.
         // Superseded refreshes skip the write and return a current credential only for the same account.
@@ -647,19 +486,14 @@ public final class AnthropicOAuthTransport: LLMTransport {
         let outcome: RefreshWrite
         do {
             outcome = try CredentialFileLock.withLock(path) { () -> RefreshWrite in
-                guard let current = try? Data(contentsOf: path) else { return .supersededAndGone }
+                guard let current = try ProviderStateValidation.dataIfPresent(at: path) else { return .supersededAndGone }
                 guard CredentialFileLock.credentialGeneration(ofFileContents: current) == generation else {
                     return .superseded(current)
                 }
-                guard var blob = try JSONSerialization.jsonObject(with: current) as? [String: Any] else {
-                    throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
-                }
-                if blob["access_token"] == nil && blob["refresh_token"] == nil {
-                    for (key, value) in tokenSet { blob[key] = value }
-                    blob.removeValue(forKey: "tokens")
-                }
-                if let rotatedAccess { blob["access_token"] = rotatedAccess }
-                if let rotatedRefresh { blob["refresh_token"] = rotatedRefresh }
+                var blob = try ProviderStateValidation.credential(data: current)
+                blob["access_token"] = answer.accessToken
+                if let refresh = answer.refreshToken { blob["refresh_token"] = refresh }
+                blob.removeValue(forKey: "expires_in")
                 blob["expires_at"] = rotatedExpiresAt
                 try saveAuthBlob(blob, to: path)
                 return .wrote
@@ -676,9 +510,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
 
         switch outcome {
         case .superseded(let current):
-            guard let object = try JSONSerialization.jsonObject(with: current) as? [String: Any] else {
-                throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
-            }
+            let object = try ProviderStateValidation.credential(data: current)
             try requestAccount.check(object, provider: "anthropic_oauth_direct")
             guard let access = OAuthRefreshBinding.string(OAuthRefreshBinding.tokenSet(object, provider: "anthropic_oauth_direct")["access_token"]) else {
                 throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
@@ -690,11 +522,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
             break
         }
 
-        guard let newAccess = rotatedAccess ?? (obj["access_token"] as? String),
-              !newAccess.isEmpty else {
-            throw LLMError.notConfigured(provider: "anthropic_oauth_direct")
-        }
-        return newAccess
+        return answer.accessToken
     }
 
     /// Private durable commit; the caller retains its credential lock.
@@ -707,7 +535,7 @@ public final class AnthropicOAuthTransport: LLMTransport {
             withJSONObject: blob,
             options: [.prettyPrinted, .sortedKeys]
         )
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path.resolvingSymlinksInPath())
     }
 }
 

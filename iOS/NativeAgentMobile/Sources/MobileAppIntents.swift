@@ -1,6 +1,6 @@
 import AppIntents
 import Foundation
-// Blueprint: | `MobileAppIntents.swift` | `MobileAskIntent`: `perform` |
+// Blueprint: | `MobileAppIntents.swift` | Named-agent Siri/Shortcuts actions, including authenticated foreground talk entry and ordinary Ask replies |
 
 struct MobileAgentEntity: AppEntity {
     static let typeDisplayRepresentation: TypeDisplayRepresentation = "Agent"
@@ -148,6 +148,22 @@ struct MobileStatusIntent: AppIntent {
     }
 }
 
+struct MobileTalkIntent: AppIntent {
+    static let title: LocalizedStringResource = "Talk to Your Agent"
+    static let description = IntentDescription("Open a hands-free conversation with your paired agent in the current chat.")
+    static let openAppWhenRun = true
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
+    @Parameter(title: "Agent") var agent: MobileAgentEntity
+    static var parameterSummary: some ParameterSummary { Summary("Talk to \(\.$agent)") }
+    @available(iOS 27, *)
+    static var allowedExecutionTargets: IntentExecutionTargets { .main }
+    @MainActor func perform() async throws -> some IntentResult {
+        try await MobileIntentRuntime.validate(agent)
+        try MobileTalkRoute.request()
+        return .result()
+    }
+}
+
 struct NativeAgentMobileShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(intent: MobileAskIntent(), phrases: ["Ask \(\.$agent) in \(.applicationName)", "Ask my agent in \(.applicationName)"], shortTitle: "Ask Your Agent", systemImageName: "person.bubble")
@@ -155,5 +171,6 @@ struct NativeAgentMobileShortcuts: AppShortcutsProvider {
         AppShortcut(intent: MobileApproveIntent(), phrases: ["Approve a request for \(\.$agent) in \(.applicationName)", "Approve in \(.applicationName)"], shortTitle: "Approve", systemImageName: "checkmark.shield")
         AppShortcut(intent: MobileStatusIntent(), phrases: ["Check on \(\.$agent) in \(.applicationName)", "Status in \(.applicationName)"], shortTitle: "Status", systemImageName: "waveform.path.ecg")
         AppShortcut(intent: MobileQuickAskIntent(), phrases: ["Quick Ask in \(.applicationName)"], shortTitle: "Quick Ask", systemImageName: "bubble.left")
+        AppShortcut(intent: MobileTalkIntent(), phrases: ["Talk to \(\.$agent) in \(.applicationName)", "Talk to my agent in \(.applicationName)"], shortTitle: "Talk", systemImageName: "phone.fill")
     }
 }

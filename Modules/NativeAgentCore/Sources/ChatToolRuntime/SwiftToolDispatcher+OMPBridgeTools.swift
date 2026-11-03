@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SwiftToolDispatcher+OMPBridgeTools.swift` | `SwiftToolDispatcher`: `runOMPMessage`, `ompSessionSaved` |
+// Blueprint: | `SwiftToolDispatcher+OMPBridgeTools.swift` | OMP message admission; answered/never-answered topic identities are checked at their current owners, only confirmed pointer absence admits unanswered state, and failed delivery logs never infer a session |
 
 extension SwiftToolDispatcher {
     // MARK: - OMP asynchronous bridge
@@ -85,11 +85,11 @@ extension SwiftToolDispatcher {
         let topic = conversation.topic
         // Refuse a continuation with no saved session before admitting its message.
         if Self.builderConversationReferenceSupplied(in: input),
-           !Self.ompSessionSaved(topic: topic, directory: directory) {
+           try !Self.ompSessionSaved(topic: topic, directory: directory) {
             return .object([
                 "status": .string("unavailable"), "sent": .bool(false), "reason": .string("continuation_unavailable"),
                 "conversationId": conversation.conversationId.map(JSONValue.string) ?? .null,
-                "detail": .string("That OMP conversation's session no longer exists, so nothing was sent and no work started. Start a new conversation to ask again."),
+                "detail": .string("No saved session identity is available for that OMP conversation. Nothing was sent and no work started. Reconcile its retained OMP state before choosing whether to start a new conversation."),
             ])
         }
         let worktreeResult = try await BuilderWorktreeAllocator.shared.resolve(
@@ -122,14 +122,14 @@ extension SwiftToolDispatcher {
         if requireExistingConversation { row["requireExistingConversation"] = .bool(true) }
         let inboxEntry = row
 
-        let quarantineNote = Self.BuilderInboxQuarantineNote()
+        let admissionNote = Self.BuilderInboxAdmissionNote()
         let appendResult: (status: String, retryWake: Bool, queuedAt: String)
         do {
             appendResult = try await Self.appendBuilderInboxMessage(
                 messageId, entry: inboxEntry, to: inboxURL, queuedAt: queuedAt,
                 comparePairReviewer: false, maxLines: JSONLLineCaps.ompBridgeInbox,
                 logLabel: "SwiftToolDispatcher.ompMessage",
-                quarantine: quarantineNote
+                admissionNote: admissionNote
             )
         } catch {
             var fields = Self.builderFailureFields(error,
@@ -137,7 +137,7 @@ extension SwiftToolDispatcher {
                 owner: inboxURL.path,
                 instruction: "Repair the reported inbox storage error from retained rows and message identities. Reconcile this message_id before another send; this wake did not launch.")
             fields["messageId"] = .string(messageId)
-            Self.stampBuilderInboxQuarantine(quarantineNote, on: &fields)
+            Self.stampBuilderInboxUncertainty(admissionNote, on: &fields)
             return .object(fields)
         }
         guard appendResult.status != "conflict" else {
@@ -155,7 +155,6 @@ extension SwiftToolDispatcher {
             replyWith: "omp_message")
         response["timeoutSeconds"] = .int(Int64(timeoutSeconds))
         response["note"] = .string("OMP's final reply returns as a separate bridge event. For a contextual follow-up, call omp_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id.")
-        Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
         if let topic { response["topic"] = .string(topic) }
         // Keep the ignored directory notice independent of the Desk-binding note.
         if let ignoredRequestedDirectory {
@@ -180,24 +179,37 @@ extension SwiftToolDispatcher {
         return .object(response)
     }
 
-    /// The selected canonical topic names a saved session pointer with an id
-    /// under wake-sessions/<slug>.json or, with no pointer file,
-    /// a retained wake-unanswered/<slug>.json identity naming the session OMP
-    /// kept, with failed deliveries as a legacy fallback.
-    static func ompSessionSaved(topic: String?, directory: URL) -> Bool {
+    /// Answered sessions and never-answered sessions are the wake owner's two
+    /// current states. Only confirmed pointer absence admits the latter read;
+    /// failed or malformed evidence stops admission with its exact file cause.
+    static func ompSessionSaved(topic: String?, directory: URL) throws -> Bool {
         let slug = topic ?? "general"
-        func session(_ row: Any?) -> Bool {
-            ((row as? [String: Any])?["sessionId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        func session(_ file: URL) throws -> String? {
+            let data: Data
+            do { data = try Data(contentsOf: file) }
+            catch CocoaError.fileReadNoSuchFile { return nil }
+            catch {
+                throw ToolFailureError("OMP's saved session identity could not be read: \(error.localizedDescription). Nothing was sent.",
+                    effects: .none, owner: file.path, code: "omp_session_unavailable",
+                    instruction: ToolFailureError.fileRepairInstruction(file, shape: "Preserve the exact OMP sessionId for this topic and repair the reported storage error."), recovery: .repair)
+            }
+            do {
+                guard let row = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let id = row["sessionId"] as? String,
+                      !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw ToolFailureError("OMP's saved session identity requires a nonempty sessionId.", effects: .none)
+                }
+                return id
+            } catch {
+                throw ToolFailureError("OMP's saved session identity is invalid: \(error.localizedDescription). Nothing was sent.",
+                    effects: .none, owner: file.path, code: "omp_session_invalid",
+                    instruction: ToolFailureError.fileRepairInstruction(file, shape: "A JSON object with this topic's exact nonempty string sessionId; recover it from OMP's retained session evidence, never guess another identity."), recovery: .repair)
+            }
         }
         let file = directory.appendingPathComponent("wake-sessions").appendingPathComponent(slug + ".json")
-        if let data = try? Data(contentsOf: file) { return session(try? JSONSerialization.jsonObject(with: data)) }
+        if try session(file) != nil { return true }
         let unanswered = directory.appendingPathComponent("wake-unanswered").appendingPathComponent(slug + ".json")
-        if let data = try? Data(contentsOf: unanswered) { return session(try? JSONSerialization.jsonObject(with: data)) }
-        guard let deliveries = try? String(contentsOf: directory.appendingPathComponent("wake-deliveries.jsonl"), encoding: .utf8) else { return false }
-        return deliveries.split(separator: "\n").contains { line in
-            guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return false }
-            return row["topicSlug"] as? String == slug && row["status"] as? String == "failed" && session(row)
-        }
+        return try session(unanswered) != nil
     }
 
 }

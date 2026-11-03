@@ -40,8 +40,8 @@ import ScreenCaptureKit
 ///     button that reads "Medium" then "Large" must keep one handle.
 ///
 /// A retitle (Calculator's C → AC) DOES mint a new handle, and that is correct
-/// — the app renamed the control, which is a real change. The `path` travels
-/// with every affordance as the resolve fallback for exactly that case.
+/// — the app renamed the control, which is a real change. Paths record observed
+/// topology; an unknown or drifted handle requires a fresh observation.
 ///
 /// Repeated tokens carry an ordinal in document order: `h7k2q1`, `h7k2q1.2`.
 /// Grouping the ordinal by rendered TOKEN rather than by fingerprint also makes
@@ -113,9 +113,8 @@ public enum MacLookHandle {
         }
     }
 }
-/// One interactive thing she can act on. `path` rides along on every row: it
-/// is the resolve fallback when a handle's fingerprint changed, and it is what
-/// keeps `stare` / `mac_ax_act` / `mac_click` compatible.
+/// One interactive thing she can act on. `path` records observed topology for
+/// live resolution; identity drift refuses the act and requires a fresh look.
 public struct MacLookAffordance: Sendable, Equatable {
     public let handle: String
     public let role: String
@@ -128,7 +127,7 @@ public struct MacLookAffordance: Sendable, Equatable {
     public let labelSource: String
     public let value: String?
     public let secret: Bool
-    public let enabled: Bool
+    public let enabled: Bool?
     public let selected: Bool?
     public let state: String?
     public let frame: MacAXFrame?
@@ -156,7 +155,7 @@ public struct MacLookAffordance: Sendable, Equatable {
         labelSource: String,
         value: String? = nil,
         secret: Bool = false,
-        enabled: Bool = true,
+        enabled: Bool? = nil,
         selected: Bool? = nil,
         frame: MacAXFrame? = nil,
         path: [Int],
@@ -201,7 +200,7 @@ public struct MacLookAffordance: Sendable, Equatable {
             "label": labelJSON
                 ?? MacScreenViewTextRedaction.redactedLegendString(label, valueChars: valueChars),
             "label_source": .string(labelSource),
-            "enabled": .bool(enabled),
+            "enabled": enabled.map(JSONValue.bool) ?? .null,
             "path": .array(path.map { .int(Int64($0)) }),
         ]
         if let subrole { object["subrole"] = .string(subrole) }
@@ -209,8 +208,8 @@ public struct MacLookAffordance: Sendable, Equatable {
             object["placeholder"] = placeholderJSON
                 ?? MacScreenViewTextRedaction.redactedLegendString(placeholder, valueChars: valueChars)
         }
-        // Coordinates remain implementation evidence for the four-verb fusion;
-        // the legacy look tool is no longer model-visible. Keeping the frame on
+        // Coordinates remain implementation evidence for the four-verb fusion.
+        // Keeping the frame on
         // the percept means an AX-named link/row cannot lose its physical point
         // merely because the separately captured view omitted or capped it.
         if let frame { object["frame"] = frame.toJSON() }
@@ -236,7 +235,7 @@ public struct MacLookAffordance: Sendable, Equatable {
 /// A read-only screen value with the shared node handle, path and compile-time redaction.
 public struct MacLookReadout: Sendable, Equatable {
     /// nil only when the node was outside the handle pass (never in practice —
-    /// handles are minted for EVERY node); the `path` is always the fallback.
+    /// handles are minted for EVERY node); `path` records the observed topology.
     public let handle: String?
     public let role: String
     public let text: String
@@ -305,6 +304,7 @@ public struct MacLookLandmark: Sendable, Equatable {
     public let depth: Int
     public let path: [Int]
     public let frame: MacAXFrame?
+    public let enabled: Bool?
     /// Compiler-redacted label (full node context); nil ⇒ legend fallback.
     public let labelJSON: JSONValue?
     public init(
@@ -314,7 +314,8 @@ public struct MacLookLandmark: Sendable, Equatable {
         depth: Int,
         path: [Int],
         frame: MacAXFrame? = nil,
-        labelJSON: JSONValue? = nil
+        labelJSON: JSONValue? = nil,
+        enabled: Bool? = nil
     ) {
         self.kind = kind
         self.role = role
@@ -323,6 +324,7 @@ public struct MacLookLandmark: Sendable, Equatable {
         self.path = path
         self.frame = frame
         self.labelJSON = labelJSON
+        self.enabled = enabled
     }
     public func toJSON(valueChars: Int = MacPerceptionCompiler.affordanceValueChars) -> JSONValue {
         var object: [String: JSONValue] = [
@@ -374,13 +376,15 @@ public struct MacLookFocus: Sendable, Equatable {
     public let path: [Int]
     public let labelJSON: JSONValue?
     public let selectionRange: NSRange?
-    public init(role: String, label: String?, handle: String?, path: [Int], labelJSON: JSONValue? = nil, selectionRange: NSRange? = nil) {
+    public let enabled: Bool?
+    public init(role: String, label: String?, handle: String?, path: [Int], labelJSON: JSONValue? = nil, selectionRange: NSRange? = nil, enabled: Bool? = nil) {
         self.role = role
         self.label = label
         self.handle = handle
         self.path = path
         self.labelJSON = labelJSON
         self.selectionRange = selectionRange
+        self.enabled = enabled
     }
     public var displayLabel: String? { MacPerceptionCompiler.displayText(label, json: labelJSON) }
     public func toJSON(valueChars: Int = MacPerceptionCompiler.affordanceValueChars) -> JSONValue {
@@ -412,7 +416,7 @@ public struct MacLookPercept: Sendable, Equatable {
     public let landmarks: [MacLookLandmark]
     public let affordances: [MacLookAffordance]
     /// Interactive elements with NO label, by role. The affordance rows retain
-    /// them; this is the matching census for compact/legacy consumers.
+    /// them; this is the matching census for compact projections.
     public let unlabeledByRole: [String: Int]
     /// Interactive+labeled elements dropped by the affordance cap (before the
     /// byte budget, which is applied at serialization time).
@@ -425,6 +429,7 @@ public struct MacLookPercept: Sendable, Equatable {
     public let truncated: Bool
     public let truncationReasons: [String]
     public let skippedAtLeast: Int
+    public let readFailures: [String]
     /// Compiler-redacted window title (full node context); nil ⇒ legend fallback.
     public let windowTitleJSON: JSONValue?
     /// The read-only values on the screen, ranked and capped.
@@ -449,6 +454,7 @@ public struct MacLookPercept: Sendable, Equatable {
         truncated: Bool,
         truncationReasons: [String],
         skippedAtLeast: Int,
+        readFailures: [String] = [],
         windowTitleJSON: JSONValue? = nil,
         readouts: [MacLookReadout] = [],
         readoutsOmitted: Int = 0,
@@ -467,6 +473,7 @@ public struct MacLookPercept: Sendable, Equatable {
         self.affordancesOmitted = affordancesOmitted
         self.interactiveCount = interactiveCount
         self.labeledCount = labeledCount
+        self.readFailures = readFailures
         self.truncated = truncated
         self.truncationReasons = truncationReasons
         self.skippedAtLeast = skippedAtLeast
@@ -515,7 +522,7 @@ public struct MacLookPercept: Sendable, Equatable {
         byteBudget: Int = MacPerceptionCompiler.lookByteBudget,
         valueChars: Int = MacPerceptionCompiler.affordanceValueChars,
         envelope: ([String: JSONValue]) -> [String: JSONValue]
-    ) -> JSONValue {
+    ) throws -> JSONValue {
         var rows = affordances.map { $0.toJSON(valueChars: valueChars) }
         var readoutRows = readouts.map { $0.toJSON(valueChars: valueChars) }
         var droppedForBytes = 0
@@ -526,7 +533,7 @@ public struct MacLookPercept: Sendable, Equatable {
             truncatedForBytes: Bool,
             dropped: Int,
             readoutsDropped: Int
-        ) -> JSONValue {
+        ) throws -> JSONValue {
             var object: [String: JSONValue] = [
                 "grade": .string("look"),
                 "app": app?.toJSON() ?? .null,
@@ -547,6 +554,7 @@ public struct MacLookPercept: Sendable, Equatable {
                 "labeled_count": .int(Int64(labeledCount)),
                 "truncated": .bool(truncated),
                 "truncation_reasons": .array(truncationReasons.map { .string($0) }),
+                "read_failures": .array(readFailures.map(JSONValue.string)),
                 "skipped_at_least": .int(Int64(skippedAtLeast)),
                 // Read-only values report the same omission accounting as controls.
                 "readouts": .array(readoutRows),
@@ -565,12 +573,12 @@ public struct MacLookPercept: Sendable, Equatable {
                     + "before acting on one."
                 )
             }
-            let perceptBytes = size(.object(object))
+            let perceptBytes = try size(.object(object))
             object = envelope(object)
             object["percept_bytes"] = .int(Int64(perceptBytes))
             object["bytes"] = .int(0)
             while true {
-                let bytes = size(.object(object))
+                let bytes = try size(.object(object))
                 if bytes > MacPerceptionCompiler.lookByteBudget, object["byte_budget_exceeded"] != .bool(true) {
                     object["byte_budget_exceeded"] = .bool(true)
                     object["byte_budget"] = .int(Int64(MacPerceptionCompiler.lookByteBudget))
@@ -581,14 +589,14 @@ public struct MacLookPercept: Sendable, Equatable {
             }
             return .object(object)
         }
-        func size(_ value: JSONValue) -> Int {
-            (try? value.serializedData(pretty: false).count) ?? 0
+        func size(_ value: JSONValue) throws -> Int {
+            try value.serializedData(pretty: false).count
         }
-        var json = render(
+        var json = try render(
             rows, readoutRows, truncatedForBytes: false, dropped: 0, readoutsDropped: 0
         )
         // Drop from the longer list's tail; ties give way to affordances.
-        while size(json) > byteBudget, !(rows.isEmpty && readoutRows.isEmpty) {
+        while try size(json) > byteBudget, !(rows.isEmpty && readoutRows.isEmpty) {
             if readoutRows.count > rows.count {
                 readoutRows.removeLast()
                 readoutsDropped += 1
@@ -599,7 +607,7 @@ public struct MacLookPercept: Sendable, Equatable {
                 readoutRows.removeLast()
                 readoutsDropped += 1
             }
-            json = render(
+            json = try render(
                 rows,
                 readoutRows,
                 truncatedForBytes: droppedForBytes > 0,

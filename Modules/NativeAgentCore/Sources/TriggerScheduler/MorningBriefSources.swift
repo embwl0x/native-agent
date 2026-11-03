@@ -5,6 +5,7 @@ import PersistenceCore
 import Privacy
 import Desk
 import WorkshopExecution
+import NotificationInbox
 // Blueprint: | `MorningBriefSources.swift` | Frozen checked Desk, Workshop, inbox, session and bounded parsed/redacted worklog observations; only consumed fields enter the part, with native row validity and unavailable/empty distinctions; native local-day and date-label facts |
 
 /// The scheduler supplies checked observations, never a brief or model prompt.
@@ -34,7 +35,7 @@ public struct MorningBriefSources: Sendable {
             "now": .string(NativeTimestampFormat.fractionalUTCOffset(now)),
             "yesterday": .string(NativeTimestampFormat.fractionalUTCOffset(yesterday)),
             "desk": await desk(), "worklog": worklog(), "workshop": await workshop(),
-            "inbox": jsonLines(root.appendingPathComponent("notifications/inbox.jsonl")),
+            "inbox": await inbox(),
             "sessions": jsonArray(root.appendingPathComponent("chat/sessions.json")),
         ])
     }
@@ -72,14 +73,12 @@ public struct MorningBriefSources: Sendable {
         } catch { return unavailable(error) }
     }
 
-    private func jsonLines(_ path: URL) -> JSONValue {
+    private func inbox() async -> JSONValue {
         do {
-            let text = try String(contentsOf: path, encoding: .utf8)
-            let rows = try text.split(separator: "\n").map { try JSONValue.parse(Data($0.utf8)) }
-            return checked(rows, fields: ["id", "status"]) { row in
-                if case .string? = row["id"] { return true }
-                return false
-            }
+            let rows = try await LiveNotificationInbox.live(dataRoot: root).rows()
+            let items = try InboxItemRecord.latest(in: rows)
+            return .object(["state": .string("ready"),
+                "unread": .int(Int64(items.filter { $0.status == "unread" }.count))])
         } catch { return unavailable(error) }
     }
 

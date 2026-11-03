@@ -12,27 +12,32 @@ import CoreGraphics
 #if canImport(UserNotifications)
 import UserNotifications
 #endif
-// Blueprint: | `MacSavePanelPlacement.swift` | Save-panel placement through the existing act verification loop |
+// Blueprint: | `MacSavePanelPlacement.swift` | Save-panel placement through the existing act verification loop; native full-directory URL and exact name readback own verification, never a folder basename |
 extension SwiftNativeMacControl {
     /// Go-to-folder selects the directory; AXValue sets the basename; the common act loop verifies both.
     func placeInSavePanel(_ placement: MacSavePanelPlacement, target: MacAXActTarget, window: MacAXWindowRef, pid: Int32,
                                  handle: String, frontBefore: MacAXAppInfo?) async -> MacActPerformed {
-        func wherePopup() -> MacAXActTarget? {
-            ["Where", "Where:"].lazy.compactMap {
-                self.accessibilityActSource.uniqueTarget(role: "AXPopUpButton", label: $0, labelSource: "title", inWindow: window)
-            }.first
+        func wherePopup() throws -> MacAXActTarget? {
+            for label in ["Where", "Where:"] {
+                if let target = try accessibilityActSource.uniqueTarget(
+                    role: "AXPopUpButton", label: label, labelSource: "title", inWindow: window
+                ) { return target }
+            }
+            return nil
         }
-        let before = wherePopup()?.value
         let inputStart = MacDriverContext.binding?.inputCount ?? 0
         var extra: [String: JSONValue] = ["directory": .string(placement.directory), "name": .string(placement.name),
-            "where_before": before.map(JSONValue.string) ?? .null]
+            "where_before": .null]
         func result(_ error: String? = nil, guidance: String? = nil) -> MacActPerformed {
             extra["posted_events"] = .int(Int64((MacDriverContext.binding?.inputCount ?? inputStart) - inputStart))
             if let guidance { extra["guidance"] = .string(guidance) }
-            return MacActPerformed(ok: error == nil, method: "save_panel_placement", requestedAction: "type", fallbackReason: nil,
-                error: error, target: target, postState: accessibilityActSource.reread(target), actedHandle: handle,
+            return MacActPerformed(ok: error == nil, method: "save_panel_placement", requestedAction: "type", error: error, target: target, postState: accessibilityActSource.reread(target), actedHandle: handle,
                 extra: extra, expectedText: placement.name)
         }
+        let before: String?
+        do { before = try wherePopup()?.value }
+        catch { return result("ax_evidence_unavailable", guidance: error.localizedDescription) }
+        extra["where_before"] = before.map(JSONValue.string) ?? .null
         guard frontBefore?.processIdentifier == pid else {
             return result("needs_front", guidance: "\(placement.directory) is a place, and a save panel takes a place only through its "
                     + "Go-to-folder sheet, which needs the keyboard, so the app must be in front: go name front:true when the "
@@ -52,23 +57,33 @@ extension SwiftNativeMacControl {
         let confirmed = await handleKeystroke(["keys": .string("return")])
         guard confirmed.ok else { return result(confirmed.error ?? "save_panel_placement_unverified") }
         var whereNow: String?
+        var directoryNow: URL?
+        let wantedDirectory = URL(fileURLWithPath: placement.directory, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
         for _ in 0..<12 {
             try? await Task.sleep(nanoseconds: 250_000_000)
-            whereNow = wherePopup()?.value
-            if whereNow == placement.directoryName { break }
+            if Task.isCancelled { return result("save_panel_placement_unverified", guidance: "Placement was stopped; inspect the panel before saving.") }
+            do {
+                let popup = try wherePopup()
+                whereNow = popup?.value
+                directoryNow = try popup.flatMap { try accessibilityActSource.url(of: $0) }
+            } catch { return result("ax_evidence_unavailable", guidance: error.localizedDescription) }
+            if directoryNow?.standardizedFileURL.resolvingSymlinksInPath() == wantedDirectory { break }
         }
-        let placed = whereNow == placement.directoryName
-        let named = accessibilityActSource.setValue(target, value: placement.name) == .performed
+        let placed = directoryNow?.standardizedFileURL.resolvingSymlinksInPath() == wantedDirectory
+        let nameOutcome = accessibilityActSource.setValue(target, value: placement.name)
+        extra.merge(nameOutcome.receipt) { _, new in new }
+        let named = nameOutcome == .performed
         let nameNow = accessibilityActSource.reread(target)?.value
         let ok = placed && named
         let text = ok
             ? "Pointed the save panel at \(placement.directory) (Where: \(whereNow ?? "")) and named the file \(placement.name); its Save button saves it there."
-            : "The save panel " + (placed ? "points at \(placement.directory)" : "shows Where: \(whereNow ?? "unknown"), not \(placement.directoryName), after the Go-to-folder sheet")
+            : "The save panel " + (placed ? "points at \(placement.directory)" : "has no verified full directory URL for \(placement.directory) after the Go-to-folder sheet (Where: \(whereNow ?? "unknown"))")
                 + (named ? "; the name \(placement.name) is set" : "; the name field did not take \(placement.name)") + ". Read the panel before pressing Save."
         extra["where_after"] = whereNow.map(JSONValue.string) ?? .null
+        extra["directory_url_after"] = directoryNow.map { .string($0.absoluteString) } ?? .null
         extra["name_after"] = nameNow.map(JSONValue.string) ?? .null
         extra["text"] = .string(text)
-        return result(named ? nil : "save_panel_placement_unverified")
+        return result(ok ? nil : "save_panel_placement_unverified")
     }
 }
 
@@ -77,7 +92,6 @@ extension SwiftNativeMacControl {
 public struct MacSavePanelPlacement: Sendable, Equatable {
     public let directory: String
     public let name: String
-    public var directoryName: String { (directory as NSString).lastPathComponent }
 
     /// The fields a save panel names its file by, as the screen labels them.
     static let nameFieldLabels: Set<String> = ["save as", "export as", "file name", "name"]

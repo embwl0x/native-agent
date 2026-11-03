@@ -23,15 +23,16 @@ extension NativeCognitionRuntime {
             replayRetryTask = nil
         case .skipped(let detail, _), .failed(error: let detail):
             replayReconciliationPending = true
+            let shouldRetry = allowRetry && !isFlushedForTermination
             await substrate.recordReceipt(
                 kind: "replay.reconciliation_pending",
                 payload: .object([
                     "reason": .string(reason),
                     "outcome": .string(String(detail.prefix(300))),
-                    "retryScheduled": .bool(allowRetry),
+                    "retryScheduled": .bool(shouldRetry),
                 ])
             )
-            guard allowRetry, replayRetryTask == nil else { return }
+            guard shouldRetry, replayRetryTask == nil else { return }
             replayRetryTask = Task { [weak self] in
                 let nanos = UInt64(Self.replayFailureRetryDelay * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: nanos)
@@ -52,21 +53,54 @@ extension NativeCognitionRuntime {
             return
         }
         let reason = "replay_event_retry"
-        let outcome = await runEventDrivenReplayWithDeadline(reason: reason)
-        await handleEventDrivenReplayOutcome(outcome, reason: reason, allowRetry: false)
+        _ = await runEventDrivenReplayWithDeadline(reason: reason, material: nil, allowRetry: false)
         replayRetryTask = nil
     }
 
-    /// The unstructured deadline returns without joining cancellation-insensitive replay.
-    /// Reconciliation remains durable and gets one bounded retry.
+    /// The deadline bounds the wait on a retained flight, never its commit.
+    /// Only that flight's terminal result settles reconciliation and reflection.
     func runEventDrivenReplayWithDeadline(
-        reason: String
+        reason: String,
+        material: [String: CognitiveReflectionCause]? = [:],
+        allowRetry: Bool = true
     ) async -> LoopTickOutcome {
-        let outcome = await raceAgainstTimeout(seconds: Self.eventDrivenReplayDeadlineSeconds) { [weak self] in
-            guard let self else {
-                return LoopTickOutcome.failed(error: "cognitive runtime released before event-driven replay")
+        replayReconciliationPending = true
+        if let material {
+            var pending = replayReflectionMaterial ?? [:]
+            pending.merge(material) { _, new in new }
+            replayReflectionMaterial = pending
+        }
+        if eventReplayTask != nil { eventReplayAgain = true }
+        if eventReplayTask == nil {
+            guard !isFlushedForTermination else { return .skipped(reason: "runtime stopping") }
+            eventReplayTask = Task {
+                var result: LoopTickOutcome
+                repeat {
+                    self.eventReplayAgain = false
+                    result = await self.runReplay(reason: reason, requiringFreshInput: true)
+                    if !self.eventReplayAgain {
+                        await self.handleEventDrivenReplayOutcome(result, reason: reason, allowRetry: allowRetry)
+                    }
+                    await self.reportLoopOutcome(loopId: "cognition_replay", outcome: result)
+                    let complete: Bool = switch result {
+                    case .completed: true
+                    case .skipped(let detail, _): detail == "no new replay evidence"
+                    case .failed: false
+                    }
+                    // A later commit may have arrived after this pass captured
+                    // its inputs. Integrate it before reflecting its material.
+                    if complete && !self.eventReplayAgain, let material = self.replayReflectionMaterial {
+                        self.replayReflectionMaterial = nil
+                        await self.scheduleEventDrivenReflection(reason: "reflection_" + reason, material: material)
+                    }
+                } while self.eventReplayAgain && !self.isFlushedForTermination
+                self.eventReplayTask = nil
+                return result
             }
-            return await self.runReplay(reason: reason)
+        }
+        guard let flight = eventReplayTask else { return .failed(error: "replay flight not retained") }
+        let outcome = await raceAgainstTimeout(seconds: Self.eventDrivenReplayDeadlineSeconds) {
+            await flight.value
         }
         switch outcome {
         case .value(let result):
@@ -75,9 +109,9 @@ extension NativeCognitionRuntime {
             return .failed(error: "event-driven replay race failed: \(detail)")
         case .timedOut:
             let detail = "event-driven replay '\(reason)' exceeded "
-                + "\(Self.eventDrivenReplayDeadlineSeconds)s deadline; task cancelled and reconciliation retained"
+                + "\(Self.eventDrivenReplayDeadlineSeconds)s wait deadline; retained integration is pending"
             deadlineLogger("TIMEOUT: \(detail)")
-            return .failed(error: detail)
+            return .skipped(reason: detail)
         case .cancelled:
             let detail = "event-driven replay '\(reason)' cancelled; reconciliation retained"
             deadlineLogger("CANCELLED: \(detail)")
@@ -86,22 +120,45 @@ extension NativeCognitionRuntime {
     }
 
     @discardableResult
-    public func runReplay(reason: String) async -> LoopTickOutcome {
+    public func runReplay(reason: String, requiringFreshInput: Bool = false) async -> LoopTickOutcome {
         await bootstrap()
         if let bootstrapFailure { return .failed(error: bootstrapFailure) }
+        if let replayTask {
+            let result = await replayTask.value
+            guard requiringFreshInput else { return result }
+            // That flight may have frozen its inputs before this event's commit.
+            // Its owner clears the slot before returning; a new pass reads after it.
+            return await runReplay(reason: reason)
+        }
+        guard !isFlushedForTermination else { return .skipped(reason: "runtime stopping") }
+        let flight = Task {
+            let result = await self.performReplay(reason: reason)
+            self.replayTask = nil
+            return result
+        }
+        replayTask = flight
+        return await flight.value
+    }
+
+    private func performReplay(reason: String) async -> LoopTickOutcome {
         let configuration = await substrate.configurationSnapshot()
         guard configuration.enabled else {
             return .skipped(reason: LoopTickOutcome.offPrefix + "cognitive replay disabled")
         }
         do {
             let persistenceEnabled = configuration.persistenceEnabled
-            let result = try await substrate.integrateReplayChecked(
-                await makeReplayIntegrationInput(reason: reason)
-            )
+            let input = await makeReplayIntegrationInput(reason: reason)
+            let result = try await substrate.integrateReplayChecked(input)
+            if !result.episodeIds.isEmpty || !result.schemaProposalIds.isEmpty || !result.timelineEventIds.isEmpty {
+                scheduleDirtyMicrocycle(reason: "replay_integration")
+                publishRuntimeChange(reason: "replay:committed")
+            }
+            guard input.unavailableEvidence.isEmpty else {
+                return .failed(error: "replay input incomplete; independently committed artifacts kept: " + input.unavailableEvidence.joined(separator: "; "))
+            }
             guard !result.episodeIds.isEmpty || !result.schemaProposalIds.isEmpty || !result.timelineEventIds.isEmpty else {
                 return .skipped(reason: "no new replay evidence")
             }
-            scheduleDirtyMicrocycle(reason: "replay_integration")
             publishRuntimeChange(reason: "replay:completed")
             return .completed(result: persistenceEnabled
                 ? "replay artifacts and lineage committed atomically"
@@ -126,8 +183,7 @@ extension NativeCognitionRuntime {
                     id: entry.filename ?? entry.date,
                     date: entry.date,
                     filename: entry.filename,
-                    content: content,
-                    modifiedAt: entry.modifiedAt
+                    content: content
                 )
             }
 

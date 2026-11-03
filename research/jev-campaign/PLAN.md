@@ -3,6 +3,16 @@
 This is a historical research record. The standalone Python harness has been retired;
 recorded results remain available, and original source is preserved in Git history.
 
+> **Provenance erratum — 2026-10-31:** The Corpus A availability and verbatim
+> claims below are the frozen plan's account, superseded by the
+> [corpus manifest erratum](corpus/MANIFEST.md#provenance-erratum--2026-10-31).
+> All seven saved X HTML files retain post bodies, including fuller cost text
+> and J02's `https://github.com/thruwire/foreman` link. Truncated syndication
+> extracts do not establish that the fetched continuations were unavailable;
+> J10 is a different search candidate. J10/J11 inputs are summaries, not
+> verbatim excerpts. Raw bytes, hashes and model inputs stay frozen; this
+> corrects provenance, not the held-out scores. Corpus A stays development-only.
+
 Research only. Nothing here is product code. The agent owns synthesis, experiment design
 and acceptance; this worktree owns the harness and the executed comparison.
 

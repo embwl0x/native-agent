@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import MemoryV2
-// Blueprint: | `MemoryModelChecks.swift` | MemoryStoreCheck inspects canonical memory and graph counts; CoreMLEmbedderCheck measures installed assets and model loading, repairing only the compile cache |
+// Blueprint: | `MemoryModelChecks.swift` | MemoryStoreCheck inspects canonical memory and graph counts; CoreMLEmbedderCheck reads the activation owner's refusal and measures installed assets and prediction; compile-cache repair reconverges a refused epoch through the canonical runtime |
 
 /// Prepare the memory directory, then inspect SQLite kg_entities/kg_relationships through the runtime reader; offer no
 /// automatic data repair.
@@ -52,7 +52,7 @@ public struct MemoryStoreCheck: DoctorCheck {
         var kgSummary: String?
         if warnings.isEmpty {
             let reader = makeKnowledgeGraphReader(
-                graphPath: memoryDir.appendingPathComponent("knowledge_graph.json")
+                graphPath: memoryDir.appendingPathComponent("memory.sqlite")
             )
             do {
                 let envelope = try await reader.allEntitiesChecked(page: 0)
@@ -94,7 +94,8 @@ public struct MemoryStoreCheck: DoctorCheck {
     }
 }
 
-/// Load the runtime's embedding model and vocabulary through its compile cache; repair clears that cache and probes again.
+/// Judge the activation owner's outcome as well as prediction; repair clears
+/// the compile cache and asks the canonical runtime to reconverge a refused epoch.
 public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
     public let id: String = "coreml_embedder"
 
@@ -159,13 +160,20 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
         }
         if repair {
             #if canImport(CoreML) && !os(Linux)
-            CoreMLEmbeddingProvider.wipeCompileCache(packageURL: installed.modelURL)
+            do { try CoreMLEmbeddingProvider.wipeCompileCache(packageURL: installed.modelURL) }
+            catch {
+                return CheckResult(source: installed.modelURL.path,
+                    id: id, title: title, status: "fail",
+                    detail: "Memory model cache could not be cleared: \(error.localizedDescription). Repair the cache directory access before loading the model again.",
+                    harm: "She cannot repair her memory search model's compiled cache.",
+                    repairApplied: false, repair_available: true)
+            }
             #endif
-            let after = await probe(installed: installed)
+            let after = await probe(installed: installed, reconcileRefusal: true)
             return CheckResult(source: after.source, nextCall: after.nextCall,
                 id: id, title: title, status: after.status, detail: after.detail,
                 harm: after.harm,
-                repair: "Wiped the CoreML compile cache and re-probed the model load.",
+                repair: "Removed this model artifact's compiled cache for the current OS and rechecked memory search health, resubmitting a matching activation refusal to the canonical memory owner. \(after.repair ?? "")",
                 repairApplied: true,
                 repair_available: true
             )
@@ -173,21 +181,48 @@ public struct CoreMLEmbedderCheck: RepairingDoctorCheck {
         return await probe(installed: installed)
     }
 
-    private func probe(installed: CoreMLEmbeddingProvider.InstalledExtrasModel) async -> CheckResult {
+    private func probe(installed: CoreMLEmbeddingProvider.InstalledExtrasModel, reconcileRefusal: Bool = false) async -> CheckResult {
         do {
+            let epoch = try CoreMLEmbeddingProvider.bundledEmbeddingEpoch(extrasRoot: root)
+            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: root)
+            var state = try await storage.embeddingEpochState()
+            if reconcileRefusal, state.activationFailure?.epoch == epoch.rawValue {
+                let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
+                _ = await memory.releaseEmbeddingMemory(reason: "Doctor repaired the refused model's compile cache")
+                _ = await memory.reconcileEmbeddingEpochAtLaunch()
+                state = try await storage.embeddingEpochState()
+            }
+            if let failure = state.activationFailure, failure.epoch == epoch.rawValue {
+                return CheckResult(source: "memory/memory.sqlite",
+                    id: id, title: title, status: "fail",
+                    detail: "Memory search activation refused at \(failure.recordedAt) for \(failure.epoch): \(failure.reason)",
+                    harm: "She cannot search her saved memories with the installed model.",
+                    repair: "Press Repair in Diagnostics → Health checks to clear the Core ML compile cache and rebuild through the memory owner. If activation is still refused, preserve the installed model and report the named model defect to the builder. A passing probe cannot clear this refusal; successful canonical activation is required.",
+                    repair_available: true)
+            }
             let provider = try CoreMLEmbeddingProvider(
                 modelURL: installed.modelURL, vocabURL: installed.vocabURL,
                 dimensions: installed.dimensions, modelId: installed.modelID)
+            let batch = try await provider.embedWithEpoch([MemoryEmbeddingEpoch.activationProbeText])
+            guard batch.vectors.count == 1 else {
+                throw DoctorChecksError.underlying("The model returned no activation probe vector.")
+            }
+            try VectorMath.requireUsable(batch.vectors[0], dimensions: installed.dimensions)
+            guard state.activeEpoch == provider.embeddingEpoch.rawValue, state.dimensions == provider.dimensions else {
+                return CheckResult(source: "memory/memory.sqlite",
+                    id: id, title: title, status: "warn",
+                    detail: "The model's activation probe produces a usable vector, but memory search has not activated this model and dimension. Canonical activation is still unmeasured; inspect convergence before judging memory search healthy.")
+            }
             return CheckResult(source: installed.modelURL.path,
                 id: id, title: title, status: "ok",
-                detail: "\(provider.modelId), \(provider.dimensions)-d, loads: model compiles/loads from cache and the WordPiece vocab parses."
+                detail: "\(provider.modelId), \(provider.dimensions)-d: memory search has activated this epoch, model loads, WordPiece vocab parses and the activation probe produces a usable vector."
             )
         } catch {
             return CheckResult(source: "Core ML model \(CoreMLEmbeddingProvider.bundledModelID) and its compiled cache",
                 id: id, title: title, status: "fail",
-                detail: "\(CoreMLEmbeddingProvider.bundledModelID) failed to load (\(String(describing: error))); semantic recall is unavailable.",
+                detail: "\(CoreMLEmbeddingProvider.bundledModelID) memory search health could not be established (\(String(describing: error))); model prediction and canonical activation must both be readable and usable.",
                 harm: "She cannot reliably search her memories by meaning.",
-                repair: "Press Repair in Diagnostics → Health checks to clear the Core ML compile cache and retry loading the model.",
+                repair: "Press Repair in Diagnostics → Health checks to clear the Core ML compile cache and retry the prediction. If it still fails, preserve the installed model and report the named model defect to the builder; do not activate an empty index.",
                 repair_available: true
             )
         }

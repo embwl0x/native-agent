@@ -8,7 +8,7 @@ const { isDeepStrictEqual } = require("util");
 // Own the inbox JSONL schema, admission, history and delivery updates under one lock.
 // Private protocol files: no app backup/export/phone file sync; contact status is
 // projected separately. PrivacyMap resolves primary and relocated bridge directories.
-function createCodexWakeInboxProjection({ BRIDGE_DIR, inboxLockDir, withDirLock, nowISO, writeJSONAtomic, writeTextAtomic }) {
+function createCodexWakeInboxProjection({ BRIDGE_DIR, inboxLockDir, withWakeLock, nowISO, writeJSONAtomic, writeTextAtomic }) {
 function historyPath(inboxPath, messageId) {
   const key = crypto.createHash("sha256").update(messageId).digest("hex");
   return path.join(path.dirname(inboxPath), "codex-inbox-history", `${key}.json`);
@@ -61,14 +61,14 @@ function rowMessageIds(row) {
 }
 
 async function appendInbox({ inboxPath, entry }) {
-  return await withDirLock(inboxLockDir(), async () => {
+  return await withWakeLock(inboxLockDir(), async () => {
     fs.mkdirSync(path.dirname(inboxPath), { recursive: true, mode: 0o700 });
     let raw;
     try { raw = fs.readFileSync(inboxPath).toString("latin1"); }
     catch (error) { if (error.code !== "ENOENT") throw error; raw = ""; }
     const rows = [];
     const valid = [];
-    let malformed = 0, parsed = 0, trailingPartial = false, nonObject = false;
+    let malformed = 0, trailingPartial = false, nonObject = false;
     const physical = raw.split("\n");
     if (physical[physical.length - 1] === "") physical.pop();
     for (const [index, bytes] of physical.entries()) {
@@ -81,25 +81,18 @@ async function appendInbox({ inboxPath, entry }) {
         else malformed++;
         continue;
       }
-      parsed++;
       if (!row || typeof row !== "object" || Array.isArray(row)) { nonObject = true; continue; }
       rows.push(row);
       valid.push(line);
     }
     let lines = valid;
-    let quarantinedPath;
     if (malformed || trailingPartial || nonObject) {
-      const base = `${inboxPath}.quarantined-${Math.floor(Date.now() / 1000)}`;
-      quarantinedPath = base;
-      for (let collision = 1; fs.existsSync(quarantinedPath); collision++) quarantinedPath = `${base}-${collision}`;
-      fs.copyFileSync(inboxPath, quarantinedPath, fs.constants.COPYFILE_EXCL);
-      writeTextAtomic(inboxPath, valid.length ? valid.join("\n") + "\n" : "");
-      try { fs.appendFileSync(path.join(path.dirname(inboxPath), "bridge-inbox-quarantine.jsonl"), JSON.stringify({
-        event: "builder_inbox_quarantined", quarantinedAt: nowISO(), inboxPath, quarantinedPath,
-        reason: "builder inbox is malformed; original bytes preserved",
-        malformedLineCount: malformed, trailingPartialLine: trailingPartial,
-        physicalLineCount: physical.length, parsedRowCount: parsed,
-      }) + "\n"); } catch { /* Original bytes are already preserved, as in the other bridge inboxes. */ }
+      // Do not rewrite even the valid rows: an earlier admission may be
+      // hidden in these damaged bytes. This reply never proceeds to a wake.
+      return { status: "uncertain", outcome: "unsettled", effects: "unknown",
+        reason: "prior_admission_uncertain", messageId: messageIdForPayload(entry),
+        inboxUnavailable: { preservedPath: inboxPath,
+          note: "Original inbox bytes remain untouched. A prior admission may be hidden in damaged rows. No new message was admitted and no wake started; reconcile this feed before another send." } };
     }
     const id = messageIdForPayload(entry);
     const matching = rows.filter((row) => rowMessageIds(row).includes(id));
@@ -130,7 +123,7 @@ async function appendInbox({ inboxPath, entry }) {
     }
     writeTextAtomic(inboxPath, lines.filter((line) => line.trim()).join("\n") + "\n");
     return { status, retryWake, queuedAt, quarantinedPath };
-  }, { waitMs: 30000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+  }, { waitMs: 30000 });
 }
 
 async function rewriteInboxEntries(entries, rewriteRow, successStatus) {
@@ -152,7 +145,7 @@ async function rewriteInboxEntries(entries, rewriteRow, successStatus) {
   const errors = [];
   for (const [inboxPath, targets] of targetsByPath.entries()) {
     try {
-      const result = await withDirLock(inboxLockDir(), async () => {
+      const result = await withWakeLock(inboxLockDir(), async () => {
         let raw;
         try {
           raw = fs.readFileSync(inboxPath, "utf8");
@@ -201,7 +194,7 @@ async function rewriteInboxEntries(entries, rewriteRow, successStatus) {
           marked: [...seen],
           missing: [...targets.keys()].filter((id) => !seen.has(id)),
         };
-      }, { waitMs: 5000, staleMs: 10 * 60 * 1000, preserveLiveOwner: true });
+      }, { waitMs: 5000 });
       if (result.status === "ok") {
         changed.push(...result.marked.map((messageId) => ({ inboxPath, messageId })));
         missing.push(...result.missing.map((messageId) => ({ inboxPath, messageId })));

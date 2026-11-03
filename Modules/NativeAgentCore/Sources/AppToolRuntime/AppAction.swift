@@ -53,8 +53,11 @@ public struct AppAction: Sendable {
     let part: String?
     /// This row declares a direct call to its tool, including fixed input.
     public let folded: Bool
-    /// `name`, `a|b` for either, `?` optional, `:type` when not a string; `:secret` is a key or token, which receipts and logs redact.
+    /// `name`, `a|b` for either, `?` optional, `:type` when not a string; `:object*` explicitly accepts arbitrary fields.
+    /// `:object` needs declared fields or a typed map in its owner schema; `:secret` is redacted in receipts and logs.
     public let args: [String]
+    /// The args naming what it acts on (`AppActionBinding.subject`).
+    public let subject: [String]
     public let owner: Owner
     public let lifecycle: CapabilityLifecycle.Action?
     /// Cannot be taken back once done, even when it is hers.
@@ -84,7 +87,7 @@ public struct AppAction: Sendable {
     public let capabilities: Set<String>
     public let resultSchema: JSONValue
 
-    init(_ id: String, _ page: String, _ label: String, _ args: [String] = [], owner: Owner = .hers,
+    init(_ id: String, _ page: String, _ label: String, _ args: [String] = [], subject: [String] = [], owner: Owner = .hers,
          irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .hers, capabilities: Set<String>? = nil,
          screen: Bool = false, warn: String = "", tool: String = "",
          input: [String: JSONValue] = [:], rename: [String: String] = [:], read: Bool = false,
@@ -94,7 +97,7 @@ public struct AppAction: Sendable {
          part: String? = nil, folded: Bool = false) {
         // A door action is a read when it says read:, else a write; it writes the app's own data unless it says otherwise.
         let toolClass = toolClass ?? (read ? .read : .write)
-        self.id = id; self.page = AppDoorNames.resolve(page); self.label = label; self.args = args; self.owner = owner
+        self.id = id; self.page = AppDoorNames.resolve(page); self.label = label; self.args = args; self.subject = subject; self.owner = owner
         self.irreversible = irreversible; self.toolClass = toolClass; self.screen = screen; self.warn = warn; self.tool = tool
         self.input = input; self.rename = rename; self.read = read
         self.versionExempt = versionExempt
@@ -119,7 +122,7 @@ public struct AppAction: Sendable {
                      irreversible: Bool = false, toolClass: ToolClass? = nil, reach: ToolReach = .hers, capabilities: Set<String> = ["safe_read", "tool_call"], screen: Bool = false,
                      warn: String = "", schema: LLMToolSchema? = nil, versionExempt: Bool = false,
                      readWhen: [String: JSONValue] = [:], advisory: Bool = false,
-                     resultSchema: JSONValue = AppActions.resultEnvelope, lifecycle: CapabilityLifecycle.Action? = nil) -> AppAction {
+                     resultSchema: JSONValue = AppActions.resultEnvelope, lifecycle: CapabilityLifecycle.Action? = nil) throws -> AppAction {
         // A fold is a read when it says read:, else a write; it carries the door's own capabilities unless it says otherwise.
         let toolClass = toolClass ?? (read ? .read : .write)
         let schema = schema ?? AppActions.foldSchemas[tool]
@@ -129,12 +132,10 @@ public struct AppAction: Sendable {
             let end = arg.firstIndex { $0 == "?" || $0 == ":" } ?? arg.endIndex
             return (names[String(arg[..<end])] ?? String(arg[..<end])) + arg[end...]
         }
-        let declaredArgs = (args ?? schema.map { ToolSignature.doorArgs($0.parametersJSON) } ?? []).map(door)
-        let senseArgs = ["screen", "read", "read_file", "read_page", "browser.read_text", "browser.read_links", "browser.chrome_snapshot"].contains(tool)
-            ? ["raw?:bool", "wrong?:bool", "why?"].filter { !declaredArgs.contains($0) } : []
+        let declaredArgs = try (args ?? schema.map { try ToolSignature.doorArgs($0.parametersJSON) } ?? []).map(door)
         return AppAction(id ?? ToolNameAliases.appAction(tool) ?? tool, page,
                          label ?? schema.map { AppActions.firstSentence(ToolNameAliases.foldedProse($0.description)) } ?? tool,
-                         declaredArgs + senseArgs,
+                         declaredArgs,
                          irreversible: irreversible, toolClass: toolClass, reach: reach, capabilities: capabilities,
                          screen: screen, warn: warn, tool: tool, input: input,
                          rename: Dictionary(uniqueKeysWithValues: names.map { ($0.value, $0.key) }),
@@ -161,7 +162,7 @@ public struct AppAction: Sendable {
 
     public var binding: AppActionBinding {
         AppActionBinding(isHis: isHis, irreversible: irreversible, read: read, secretArgs: secretArgs,
-                         readWhen: readWhen, lifecycle: lifecycle,
+                         readWhen: readWhen, lifecycle: lifecycle, subject: subject,
                          tool: tool, fixedInput: input, rename: rename, folded: isFold,
                          descriptor: schema.map { ToolDescriptor(schema: $0, bucket:
                              SwiftToolDispatcher.catalogBucket(forRegisteredToolNamed: tool) ?? AppToolExecutor.buckets[tool] ?? .unclassified) },

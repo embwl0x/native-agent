@@ -114,6 +114,7 @@ extension TurnTraceReplayReader {
             matchedRows += 1
             handle(event)
         }
-        return (read.truncated, read.report.malformedLineCount, matchedRows)
+        // A cut head loses nothing when the retained tail already starts before the floor.
+        return (read.truncated && read.events.first.map { $0.ts >= floor } ?? true, read.report.malformedLineCount, matchedRows)
     }
 }

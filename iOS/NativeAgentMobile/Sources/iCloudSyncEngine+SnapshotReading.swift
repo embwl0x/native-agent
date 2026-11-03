@@ -5,13 +5,12 @@ import CryptoKit
 import AppIntents
 import SwiftUI
 import Observation
-// Blueprint: | `iCloudSyncEngine+SnapshotReading.swift` | Snapshot replica freshness, bounded coordinated byte reads, tolerant decoding and read-health reporting on iCloudSyncEngine |
+// Blueprint: | `iCloudSyncEngine+SnapshotReading.swift` | Snapshot replica freshness, bounded checked acquisition, whole-document decoding and read-health reporting on iCloudSyncEngine |
 
 /// Health belongs to the read that produced it.
 enum SnapshotReadHealth: Equatable, Sendable {
     case fine
     case unreadable
-    case partial(dropped: Int)
     case readFailed(reason: String)
 
     var failed: Bool {
@@ -38,7 +37,7 @@ extension Dictionary where Key == String, Value == SnapshotReadHealth {
             ? names[0]
             : names.dropLast().joined(separator: ", ") + " and " + names[names.count - 1]
         return "\(list) couldn't be read - that copy arrived damaged, not late. "
-            + "The Mac's own data is untouched; Refresh asks it for a fresh copy of \(names.count == 1 ? "that view" : "those views")."
+            + "Refresh rereads the received copy. On the Mac, ask your agent to run doctor.repair for icloud_bridge_state to rebuild and publish phone views."
     }
 }
 
@@ -53,56 +52,60 @@ extension iCloudSyncEngine {
     }
 
     nonisolated static func loadSnapshotArrayOnly<T: Decodable & Sendable>(named filename: String, in dir: URL) async -> SnapshotReading<[T]> {
-        guard await awaitCurrentVersion(of: dir.appendingPathComponent(filename)), !Task.isCancelled else { return (nil, nil) }
-        let result: SnapshotReading<[T]> = await VolumeIO.run {
-            let read = loadSnapshotData(named: filename, in: dir)
-            guard let data = read.value else { return (nil, read.health) }
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            if let rows = try? decoder.decode([T].self, from: data) { return (rows, .fine) }
-            // Decode valid entries independently; dropped records make the snapshot explicitly partial.
-            guard let raw = try? JSONSerialization.jsonObject(with: data) as? [Any] else { return (nil, .unreadable) }
-            let rows = raw.compactMap { item -> T? in
-                guard JSONSerialization.isValidJSONObject(item),
-                      let bytes = try? JSONSerialization.data(withJSONObject: item) else { return nil }
-                return try? decoder.decode(T.self, from: bytes)
+        do { guard try await awaitCurrentVersion(of: dir.appendingPathComponent(filename)), !Task.isCancelled else { return (nil, nil) } }
+        catch { return (nil, .readFailed(reason: error.localizedDescription)) }
+        do {
+            let result: SnapshotReading<[T]> = try await VolumeIO.run {
+                let read = loadSnapshotData(named: filename, in: dir)
+                guard let data = read.value else { return (nil, read.health) }
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                do { return (try decoder.decode([T].self, from: data), .fine) }
+                catch { return (nil, .readFailed(reason: "The published snapshot is invalid: \(error.localizedDescription). Refresh rereads the received copy; ask your agent on the Mac to run doctor.repair for icloud_bridge_state.")) }
             }
-            guard !rows.isEmpty else { return (nil, .unreadable) }
-            return (rows, rows.count == raw.count ? .fine : .partial(dropped: raw.count - rows.count))
-        }
-        return Task.isCancelled ? (nil, nil) : result
+            return Task.isCancelled ? (nil, nil) : result
+        } catch is CancellationError { return (nil, nil) }
+        catch { return (nil, .readFailed(reason: error.localizedDescription)) }
     }
 
     nonisolated static func loadSnapshotObjectOnly<T: Decodable & Sendable>(named filename: String, in dir: URL) async -> SnapshotReading<T> {
-        guard await awaitCurrentVersion(of: dir.appendingPathComponent(filename)), !Task.isCancelled else { return (nil, nil) }
-        let result: SnapshotReading<T> = await VolumeIO.run {
-            let read = loadSnapshotData(named: filename, in: dir)
-            guard let data = read.value else { return (nil, read.health) }
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            guard let value = try? decoder.decode(T.self, from: data) else { return (nil, .unreadable) }
-            return (value, .fine)
-        }
-        return Task.isCancelled ? (nil, nil) : result
+        do { guard try await awaitCurrentVersion(of: dir.appendingPathComponent(filename)), !Task.isCancelled else { return (nil, nil) } }
+        catch { return (nil, .readFailed(reason: error.localizedDescription)) }
+        do {
+            let result: SnapshotReading<T> = try await VolumeIO.run {
+                let read = loadSnapshotData(named: filename, in: dir)
+                guard let data = read.value else { return (nil, read.health) }
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                guard let value = try? decoder.decode(T.self, from: data) else { return (nil, .unreadable) }
+                return (value, .fine)
+            }
+            return Task.isCancelled ? (nil, nil) : result
+        } catch is CancellationError { return (nil, nil) }
+        catch { return (nil, .readFailed(reason: error.localizedDescription)) }
     }
 
     private nonisolated static func loadSnapshotData(named filename: String, in dir: URL) -> SnapshotReading<Data> {
         let url = dir.appendingPathComponent(filename)
         let maxBytes = snapshotReadLimitBytes(named: filename)
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-           let fileSize = attrs[.size] as? NSNumber,
-           fileSize.uint64Value > UInt64(maxBytes) {
-            NSLog("[iCloudSync] skipping oversized snapshot %@ bytes=%llu limit=%d", filename, fileSize.uint64Value, maxBytes)
-            return (nil, nil)
+        do {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            if let fileSize = attrs[.size] as? NSNumber, fileSize.uint64Value > UInt64(maxBytes) {
+                return (nil, .readFailed(reason: "The snapshot exceeds its \(maxBytes)-byte read limit. Ask your agent on the Mac to run doctor.repair for icloud_bridge_state; Refresh only rereads the received copy."))
+            }
+        } catch {
+            let failure = error as NSError
+            if failure.domain == NSCocoaErrorDomain && (failure.code == NSFileNoSuchFileError || failure.code == NSFileReadNoSuchFileError) { return (nil, nil) }
+            return (nil, .readFailed(reason: error.localizedDescription))
         }
         let data: Data
         do { data = try coordinatedRead(url) }
         catch {
-            return (nil, FileManager.default.fileExists(atPath: url.path) ? .readFailed(reason: error.localizedDescription) : .fine)
+            return (nil, .readFailed(reason: error.localizedDescription))
         }
         if data.count > maxBytes {
             NSLog("[iCloudSync] skipping oversized snapshot %@ bytes=%d limit=%d", filename, data.count, maxBytes)
-            return (nil, nil)
+            return (nil, .readFailed(reason: "The snapshot exceeds its \(maxBytes)-byte read limit. Ask your agent on the Mac to run doctor.repair for icloud_bridge_state; Refresh only rereads the received copy."))
         }
         return (data, .fine)
     }
@@ -111,18 +114,21 @@ extension iCloudSyncEngine {
     nonisolated static func awaitCurrentVersion(
         of url: URL,
         timeout: TimeInterval = 2.5
-    ) async -> Bool {
+    ) async throws -> Bool {
         guard !Task.isCancelled else { return false }
         let fm = FileManager.default
         let isUbiquitous = fm.isUbiquitousItem(at: url)
         guard isUbiquitous else { return true }
-        try? fm.startDownloadingUbiquitousItem(at: url)
+        try fm.startDownloadingUbiquitousItem(at: url)
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             guard !Task.isCancelled else { return false }
-            guard let values = try? url.resourceValues(
+            let values = try url.resourceValues(
                 forKeys: [.ubiquitousItemDownloadingStatusKey]
-            ), let status = values.ubiquitousItemDownloadingStatus else { return false }
+            )
+            guard let status = values.ubiquitousItemDownloadingStatus else {
+                throw SyncError.persistence("iCloud did not provide the snapshot download status. Refresh after checking iCloud connectivity.")
+            }
             if acceptsSnapshotReplica(
                 isUbiquitous: isUbiquitous,
                 hasCurrentVersion: status == .current
@@ -146,12 +152,13 @@ extension iCloudSyncEngine {
 
     /// Coordinated reads avoid torn bytes; failure preserves publication and reports its cause.
     nonisolated static func coordinatedRead(_ url: URL, options: NSFileCoordinator.ReadingOptions = []) throws -> Data {
+        try VolumeIO.requireReadyForReading(url)
         var coordError: NSError?
         var result: Result<Data, Error>?
         NSFileCoordinator(filePresenter: nil).coordinate(
             readingItemAt: url, options: options, error: &coordError
         ) { readURL in
-            result = Result { try Data(contentsOf: readURL) }
+            result = Result { try VolumeIO.contents(of: readURL) }
         }
         if let coordError { throw coordError }
         guard let result else { throw SyncError.persistence("File coordination returned no read result.") }

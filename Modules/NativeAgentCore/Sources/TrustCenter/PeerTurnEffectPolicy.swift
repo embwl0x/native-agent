@@ -12,9 +12,9 @@ public enum PeerTurnEffectPolicy {
     public static func requiresPeerApproval(
         _ tool: String,
         input: [String: JSONValue] = [:]
-    ) -> Bool {
+    ) throws -> Bool {
         // A folded door action is a read here: it re-enters under its own tool and is judged there.
-        PermissionLaw.toolClass(tool, input: input) != .read
+        try PermissionLaw.toolClass(tool, input: input) != .read
     }
 
     public static func normalized(_ tool: String) -> String {
@@ -86,14 +86,14 @@ public enum PeerTurnEffectPolicy {
 
     /// The floor's card names the peer, quotes its request and states the call's declared class.
     public static func floorReason(tool: String, input: [String: JSONValue] = [:],
-                                   requester: String, quote: String) -> String {
+                                   requester: String, quote: String) throws -> String {
         let who = requester.trimmingCharacters(in: .whitespacesAndNewlines)
         let said = quote.isEmpty ? "" : " It said: \"\(quote)\"."
         // Name the act itself: through the app door that is the action, not "app".
         var shown = tool
         if tool == "app", case .string(let action)? = input["action"] { shown = action }
         let ran = ToolNameAliases.ranCall(tool, input: input)
-        let kind = switch PermissionLaw.toolClass(ran.tool, input: ran.input) {
+        let kind = switch try PermissionLaw.toolClass(ran.tool, input: ran.input) {
         case .send: "a send"
         case .destructive: "a delete or something that can't be undone"
         case .read, .write: "a change"

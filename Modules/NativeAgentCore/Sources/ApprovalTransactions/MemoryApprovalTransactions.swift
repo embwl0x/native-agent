@@ -16,10 +16,9 @@ public enum MemoryApprovalTransactions {
     /// content-hash stale guard inside MemoryKindBackfill.apply skips any
     /// row whose content drifted since staging. Denied → store untouched
     /// and the staging stamp stays (a refused backfill is never
-    /// re-proposed). Canceled / apply-failure / malformed payload → stamp
-    /// cleared so the next launch re-detects and re-stages. Every branch
-    /// annotates the approval record; an approved record must never read
-    /// as silently applied.
+    /// re-proposed). Cancellation clears the stamp. Application/read failures
+    /// preserve the same decision for repair; the shared approval owner keeps
+    /// the returned outcome through its execution-receipt write.
     public static func applyResolvedKindBackfill(
         from rec: ApprovalRecord,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -27,61 +26,37 @@ public enum MemoryApprovalTransactions {
         guard rec.action == MemoryKindBackfill.action,
               rec.status == "resolved",
               let decision = rec.decision else { return }
-        switch decision {
-        case "approved":
-            do {
+        await ApprovalExecutionOwners.perform(rec, dataRoot: dataRoot) {
+            switch decision {
+            case "approved":
                 let rows = MemoryKindBackfill.rowProposals(fromPayload: rec.payload)
                 guard !rows.isEmpty else {
-                    // Clear the malformed card's stamp before annotating failure so future staging remains possible.
-                    MemoryKindBackfill.clearStamp(dataRoot: dataRoot)
-                    try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                        rec.id,
-                        executedAction: .object(["error": .string("payload carries no row proposals")]),
-                        detail: "kind backfill FAILED: payload carries no row proposals — "
-                            + "stamp cleared; next launch re-stages whatever is still classifiable")
-                    return
+                    throw ApprovalInboxError.malformedResponse("kind-backfill payload carries no row proposals")
                 }
                 let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
                 let outcome = try await MemoryKindBackfill.apply(rows, storage: storage)
-                try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                    rec.id,
-                    executedAction: .object([
-                        "op": .string("memory_kind_backfill"),
-                        "applied": .array(outcome.applied.map { .string($0) }),
-                        "skippedStale": .array(outcome.skippedStale.map { .string($0) }),
-                        "failed": .object(outcome.failed.mapValues { .string($0) }),
-                    ]),
-                    detail: "kind backfill applied: \(outcome.applied.count) rows stamped"
-                        + (outcome.skippedStale.isEmpty ? "" : ", \(outcome.skippedStale.count) stale-skipped")
-                        + (outcome.failed.isEmpty ? "" : ", \(outcome.failed.count) FAILED"))
-            } catch {
-                nativeLog("[kindBackfill] apply failed: \(String(describing: error))")
+                return .init(action: .object([
+                    "op": .string("memory_kind_backfill"),
+                    "applied": .array(outcome.applied.map { .string($0) }),
+                    "skippedStale": .array(outcome.skippedStale.map { .string($0) }),
+                    "failed": .object(outcome.failed.mapValues { .string($0) }),
+                ]), detail: "kind backfill applied: \(outcome.applied.count) rows stamped, \(outcome.skippedStale.count) stale-skipped, \(outcome.failed.count) failed")
+            case "denied":
+                return .init(action: .object(["op": .string("memory_kind_backfill_deny")]),
+                    detail: "kind backfill denied — rows untouched")
+            case "canceled":
                 MemoryKindBackfill.clearStamp(dataRoot: dataRoot)
-                try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                    rec.id,
-                    executedAction: .object(["error": .string("\(error)")]),
-                    detail: "kind backfill FAILED: \(error.localizedDescription) — stamp cleared; "
-                        + "next launch re-stages whatever is still classifiable")
+                return .init(action: .object(["op": .string("memory_kind_backfill_cancel")]),
+                    detail: "kind backfill canceled — next launch may stage a fresh card")
+            default: throw ApprovalInboxError.malformedResponse("invalid kind-backfill decision: \(decision)")
             }
-        case "denied":
-            try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                rec.id,
-                executedAction: .object(["op": .string("memory_kind_backfill_deny")]),
-                detail: "kind backfill denied — rows untouched; will not be re-proposed")
-        default: // canceled
-            MemoryKindBackfill.clearStamp(dataRoot: dataRoot)
-            try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                rec.id,
-                executedAction: .object(["op": .string("memory_kind_backfill_cancel")]),
-                detail: "kind backfill canceled — stamp cleared; next launch re-stages it")
         }
     }
 
     /// Stages the kind-backfill approval card if the legacy kind-less rows
     /// still exist and no card was staged before (U3 wave-2 item 5).
-    /// MemoryV2 never imports ApprovalInbox (module-boundary rule), so the
-    /// approval-record create + pending-scan are backed here with
-    /// SwiftNativeApprovalInbox closures.
+    /// Canonical approval creation, Full Mac admission and the pending-card
+    /// check use this root's inbox, including automatic applications.
     public static func stageKindBackfillIfNeeded(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         makeLLMClient: @Sendable () -> any LLMClient
@@ -137,36 +112,16 @@ public enum MemoryApprovalTransactions {
                         ])
                     }
                     if yolo.admitted {
-                        guard case .object(let object) = body,
-                              let payload = object["payload"] else {
-                            throw NSError(domain: "MemoryKindBackfill", code: 422, userInfo: [
-                                NSLocalizedDescriptionKey: "kind-backfill staging body carries no payload"
-                            ])
-                        }
-                        let timestamp = ISO8601DateFormatter().string(from: Date())
-                        let id = "full-mac-yolo-\(UUID().uuidString.lowercased())"
-                        let admitted = ApprovalRecord(
-                            id: id,
-                            title: "Full Mac admitted memory kind backfill",
-                            action: MemoryKindBackfill.action,
-                            risk: "medium",
-                            reason: "Admitted by active Full Mac authority",
-                            status: "resolved",
-                            payload: payload,
-                            payloadPreview: "",
-                            createdAt: timestamp,
-                            resolvedAt: timestamp,
-                            decision: "approved",
-                            decidedBy: "full_mac_yolo",
-                            remoteResolvable: false,
-                            localOnly: true
-                        )
+                        let staged = try await inbox.create(body)
+                        let admitted = try await inbox.resolve(staged.id, decision: .approved,
+                            provenance: .local(decidedBy: "full_mac_yolo"))
                         await applyResolvedKindBackfill(from: admitted, dataRoot: dataRoot)
-                        return id
+                        return admitted.id
                     }
                     return try await inbox.create(body).id
                 }
             },
+            approvalIsPending: { id in try await inbox.get(id).status == "pending" },
             listPendingBackfills: {
                 let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
                     .fullMacYoloAuthority(origin: SecurityOriginContext(

@@ -47,21 +47,6 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
         self.retentionDays = retentionDays
     }
 
-    /// Decoding tolerates a policy file written by an older build: a missing key
-    /// falls back to the SAFE default, never to "on".
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        captureEnabled = try container.decodeIfPresent(Bool.self, forKey: .captureEnabled) ?? false
-        captureTitles = try container.decodeIfPresent(Bool.self, forKey: .captureTitles) ?? false
-        browserTitlesEnabled = try container.decodeIfPresent(Bool.self, forKey: .browserTitlesEnabled) ?? false
-        appNameOnlyMode = try container.decodeIfPresent(Bool.self, forKey: .appNameOnlyMode) ?? false
-        allowModelAccess = try container.decodeIfPresent(Bool.self, forKey: .allowModelAccess) ?? false
-        excludedBundleIDs = try container.decodeIfPresent(Set<String>.self, forKey: .excludedBundleIDs)
-            ?? ActivityPolicy.defaultExcludedBundleIDs
-        retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays)
-            ?? ActivityPolicy.defaultRetentionDays
-    }
-
     // MARK: - Constants
 
     public static let defaultRetentionDays = 30
@@ -194,18 +179,17 @@ public struct ActivityPolicyStore: Sendable {
     /// Missing is the documented safe bootstrap. An existing unreadable,
     /// non-regular, or malformed authority file is unavailable, not "missing".
     public func loadChecked() throws -> ActivityPolicy {
-        let manager = FileManager.default
-        if (try? manager.destinationOfSymbolicLink(atPath: fileURL.path)) != nil {
-            throw StoreError.unavailable("the path is a symbolic link")
-        }
-        guard manager.fileExists(atPath: fileURL.path) else { return ActivityPolicy() }
-        let values: URLResourceValues
+        let attributes: [FileAttributeKey: Any]
         do {
-            values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        } catch CocoaError.fileReadNoSuchFile {
+            return ActivityPolicy()
+        } catch CocoaError.fileNoSuchFile {
+            return ActivityPolicy()
         } catch {
             throw StoreError.unavailable(error.localizedDescription)
         }
-        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+        guard attributes[.type] as? FileAttributeType == .typeRegular else {
             throw StoreError.unavailable("the path is not a regular file")
         }
         let data: Data

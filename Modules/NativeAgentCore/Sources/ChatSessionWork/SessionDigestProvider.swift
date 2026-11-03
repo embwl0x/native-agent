@@ -268,8 +268,7 @@ public struct SessionDigestProvider: Sendable {
     ///
     /// BYTE-STABILITY: the first call for a (dataRoot, sessionId) pair builds
     /// ONCE (single-flighted across concurrent first turns), persists the
-    /// bytes, and caches them. The prose stays frozen; legacy retrieval pointers
-    /// render through the current app tool without rewriting the stored handoff.
+    /// bytes, and caches them. The prose and current retrieval pointer stay frozen.
     /// Extraction and persistence errors propagate; no title-only substitute.
     package func digest(forSessionId sessionId: String, prior: PriorChatSession.Resolved, model: String, surface: String, userMessage: String) async throws -> String? {
         let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -296,39 +295,41 @@ public struct SessionDigestProvider: Sendable {
 
     private func rendered(_ value: String, sessionId: String) throws -> (text: String, priorSessionId: String)? {
         guard let previous = try Self.priorSessionId(in: value, sessionId: sessionId, dataRoot: dataRoot) else { return nil }
-        var lines = value.components(separatedBy: "\n")
-        guard let index = lines.lastIndex(where: { !$0.isEmpty }) else { return nil }
-        lines[index] = Self.pointerSentence(sessionId: previous)
-        return (lines.joined(separator: "\n"), previous)
+        return (value, previous)
     }
 
     private static func priorSessionId(in value: String, sessionId: String, dataRoot: URL) throws -> String? {
+        if value.isEmpty { return nil }
         guard value.hasPrefix(headerLine + "\n"), value.count <= digestCharCap,
-              let pointer = value.split(separator: "\n").last.map(String.init) else { return nil }
-        let prefixes = ["app {action:\"chat.search\", args:{session_id:\"", "session_search(session_id: \""]
-        guard let prefix = prefixes.first(where: { pointer.hasPrefix($0) }),
-              let end = pointer.dropFirst(prefix.count).firstIndex(of: "\"") else { return nil }
+              let pointer = value.split(separator: "\n").last.map(String.init) else {
+            throw ChatSessionCompactionTranscriptError(errorDescription: "The saved conversation handoff is malformed. Repair its frozen bytes before borrowing continuity.")
+        }
+        let prefix = "app {action:\"chat.search\", args:{session_id:\""
+        guard pointer.hasPrefix(prefix),
+              let end = pointer.dropFirst(prefix.count).firstIndex(of: "\"") else {
+            throw ChatSessionCompactionTranscriptError(errorDescription: "The saved conversation handoff has an invalid retrieval pointer. Repair that pointer before borrowing continuity.")
+        }
         let previous = String(pointer[pointer.index(pointer.startIndex, offsetBy: prefix.count)..<end])
-        let legacy = "session_search(session_id: \"\(previous)\", mode: \"continuity\") pulls it back."
-        guard pointer == pointerSentence(sessionId: previous) || pointer == legacy else { return nil }
+        guard pointer == pointerSentence(sessionId: previous) else {
+            throw ChatSessionCompactionTranscriptError(errorDescription: "The saved conversation handoff has an invalid retrieval pointer. Repair that pointer before borrowing continuity.")
+        }
         guard try PriorChatSession.sameParticipant(
             sessionId: sessionId, otherSessionId: previous, dataRoot: dataRoot) else { return nil }
         return previous
     }
 
     /// Borrowed recollections share the handoff's admitted source and relevance
-    /// decision. An empty or legacy digest never admits an unrelated anchor.
-    package static func frozenPriorSessionId(sessionId: String, dataRoot: URL) -> String? {
-        guard let path = digestPath(sessionId: sessionId, dataRoot: dataRoot),
-              let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
-              let size = (attrs[.size] as? NSNumber)?.intValue, size <= digestCharCap * 4,
-              let text = try? String(contentsOf: path, encoding: .utf8) else { return nil }
+    /// decision. An empty digest never admits an unrelated anchor.
+    package static func frozenPriorSessionId(sessionId: String, dataRoot: URL) throws -> String? {
+        guard let path = digestPath(sessionId: sessionId, dataRoot: dataRoot) else { return nil }
         do {
+            let attrs = try FileManager.default.attributesOfItem(atPath: path.path)
+            guard let size = (attrs[.size] as? NSNumber)?.intValue, size <= digestCharCap * 4 else {
+                throw ChatSessionCompactionTranscriptError(errorDescription: "The saved conversation handoff has invalid size. Repair the handoff before borrowing its thread.")
+            }
+            let text = try String(contentsOf: path, encoding: .utf8)
             return try priorSessionId(in: text, sessionId: sessionId, dataRoot: dataRoot)
-        } catch {
-            nativeLog("Conversation handoff evidence unavailable: %@", error.localizedDescription)
-            return nil
-        }
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
     }
 
     // MARK: durable per-session bytes (disk layer)
@@ -341,7 +342,7 @@ public struct SessionDigestProvider: Sendable {
     /// and losers adopt them.
     func loadOrBuildAndPersist(prior: PriorChatSession.Resolved, sessionId: String, model: String, surface: String, userMessage: String) async throws -> String {
         if let persisted = try readPersistedDigest(sessionId: sessionId) {
-            return persisted.isEmpty || persisted.hasPrefix(Self.headerLine + "\n") ? persisted : ""
+            return persisted
         }
         let built = try await buildDigest(
             prior: prior, currentSessionId: sessionId, model: model, surface: surface, userMessage: userMessage) ?? ""
@@ -374,12 +375,14 @@ public struct SessionDigestProvider: Sendable {
     /// persisted value); nil only when absent. Unreadable bytes throw.
     private func readPersistedDigest(sessionId: String) throws -> String? {
         guard let path = persistedDigestPath(sessionId: sessionId) else { return nil }
-        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-        let attrs = try FileManager.default.attributesOfItem(atPath: path.path)
-        guard let size = (attrs[.size] as? NSNumber)?.intValue, size <= Self.digestCharCap * 4 else {
+        let data: Data
+        do { data = try Data(contentsOf: path) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
+        guard data.count <= Self.digestCharCap * 4 else {
             throw CocoaError(.fileReadTooLarge)
         }
-        return try String(contentsOf: path, encoding: .utf8)
+        guard let text = String(data: data, encoding: .utf8) else { throw CocoaError(.fileReadCorruptFile) }
+        return text
     }
 
     /// First-writer-wins publish: writes the bytes to a temp file (atomic —

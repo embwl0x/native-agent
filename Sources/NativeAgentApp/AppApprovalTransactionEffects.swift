@@ -13,7 +13,7 @@ import ChatTurnRuntime
 import ChatTurnContracts
 import TrustCenter
 import WorkshopExecution
-// Blueprint: | `AppApprovalTransactionEffects.swift` | `AppApprovalTransactionEffects` struct and `ApprovalExecution.app`: app-bound approval factory and live executor/platform bindings; `AppApprovalTransactionEffects` struct; `ApprovalExecution.app` |
+// Blueprint: | `AppApprovalTransactionEffects.swift` | App-bound approval factory and live executor/platform bindings; browser adapters return canonical outcomes for the approval owner's checked settlement |
 
 extension ApprovalExecution {
     /// The approval coordinator over the live app's effects.
@@ -65,10 +65,7 @@ struct AppApprovalTransactionEffects: ApprovalTransactionEffects {
 
     func continueChatToolApproval(dataRoot: URL, sessionID: String, envelope: TurnEnvelope, prompt: String, fileAccess: String) async throws {
         try await NativeAgentEngine.makeTurnContinuationRuntime(dataRoot: dataRoot)
-            .continueChatToolApproval(sessionID: sessionID, envelope: envelope, prompt: prompt, fileAccess: fileAccess) {
-                let options = NativeChatTurnOptions.current(surface: envelope.surface)
-                return (nil, options.serviceTier)
-            }
+            .continueChatToolApproval(sessionID: sessionID, envelope: envelope, prompt: prompt, fileAccess: fileAccess)
     }
 
     func chatTurnCompleted(sessionID: String?) async {
@@ -81,17 +78,22 @@ struct AppApprovalTransactionEffects: ApprovalTransactionEffects {
         await BrowserActionRoutes.app.observeBrowserMotorAction(runID: runID, dataRoot: dataRoot)
     }
 
-    func executeApprovedBrowserRun(from record: ApprovalRecord) async throws {
+    func executeApprovedBrowserRun(from record: ApprovalRecord) async throws -> JSONValue {
         try await BrowserActionRoutes.app.executeApprovedBrowserRun(from: record, dataRoot: dataRoot)
     }
 
-    func finishRejectedBrowserRun(from record: ApprovalRecord, status: String) async throws {
+    func finishRejectedBrowserRun(from record: ApprovalRecord, status: String) async throws -> JSONValue {
         try await BrowserActionRoutes.app.finishRejectedBrowserRun(from: record, status: status, dataRoot: dataRoot)
     }
 
-    /// Use the published live executor when it is available.
-    func workshopExecutor() -> WorkshopExecutorLoop {
-        return WorkshopExecutorRef.shared.current() ?? NativeAgentEngine.makeWorkshopExecutor()
+    /// Approval and the resident drain use the engine's retained executor.
+    func workshopExecutor() throws -> WorkshopExecutorLoop {
+        guard let executor = WorkshopExecutorRef.shared.current() else {
+            throw NSError(domain: "NativeAgentApprovals", code: 503, userInfo: [
+                NSLocalizedDescriptionKey: "The resident Desk executor is unavailable; the decided step remains owed until the executor is running."
+            ])
+        }
+        return executor
     }
 
     func workshopStepNotFound(_ description: String) -> any Error {

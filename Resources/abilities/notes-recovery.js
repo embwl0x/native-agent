@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id": "notes-recovery", "kind": "tool", "version": 1, "reach": {"capabilities": []}, "face": {"page": "notes"}, "record": {"description": "Recovery wording for structured notes failure reasons. No app access or effects.", "actions": [], "inputSchema": {"type": "object", "readOnly": true, "properties": {}, "additionalProperties": false}}}
+{"id": "notes-recovery", "kind": "ability", "version": 1, "reach": {"capabilities": []}, "face": {"page": "notes"}, "record": {"description": "Recovery wording for structured notes failure reasons. No app access or effects.", "actions": [], "inputSchema": {"type": "object", "readOnly": true, "properties": {}, "additionalProperties": false}}}
 */
 function run(input) {
     return {

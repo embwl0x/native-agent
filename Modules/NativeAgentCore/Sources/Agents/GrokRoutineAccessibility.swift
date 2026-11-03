@@ -20,11 +20,10 @@ import Senses
         case missingRoutine = "The NativeAgent reply routine is missing from Grok Bot's Routines panel. Check its creation request and approve it in Grok Bot if asked, then Connect again."
         case recipe = "Grok Bot's recipe has no routine navigation (host.grokRoutine). Read agents/recipes/grok-bot.json with agent.recipe and update it with agent.recipe_write, then Connect again."
         case frontmost = "Grok Bot is not the front app. Bring Grok Bot forward, then Connect again."
-        case person = "The Mac driver does not permit foreground input. Return control to NativeAgent, then Connect again; existing drafts and uncertain submissions are left in place."
         case focus = "Grok Bot's message box did not take focus. Open the intended chat with an empty composer, then Connect again."
         case paste = "The pasted request was not confirmed in Grok Bot's message box. Check the draft in Grok Bot before continuing; nothing will be resent automatically."
         case busy = "The desktop is handling another conversation. Connect again when that operation finishes; this request has not started."
-        case input = "NativeAgent could not create the mouse or keyboard input for Grok Bot. Return control to NativeAgent before continuing; no submission is confirmed."
+        case input = "NativeAgent could not create the mouse or keyboard input for Grok Bot; no submission is confirmed."
         case clipboard = "NativeAgent could not preserve or fill the clipboard for Grok Bot. Check the clipboard before continuing; no request was submitted."
         case geometry = "Grok Bot's control position could not be read through Accessibility. Open the intended chat in Grok Bot, then Connect again."
         case transcript = "Grok Bot's current conversation transcript could not be read to establish the outgoing-message boundary. Open the intended chat in Grok Bot, then Connect again; no request was submitted."
@@ -110,8 +109,9 @@ import Senses
         try Task.checkCancellation()
         guard SystemMacAXElementSource().isTrusted() else { throw Blocker.permission }
         try requireDriver()
-        guard let runningApp = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first,
-              try SystemMacAXActSource().enableManualAccessibility(pid: runningApp.processIdentifier).get() == .success else { throw Blocker.accessibility }
+        guard let runningApp = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first else { throw Blocker.accessibility }
+        // Settle a cold renderer here, before the synchronous main-lane reads.
+        try? await SystemMacAXElementSource.prepareRenderer(pid: runningApp.processIdentifier)
         try await bringForward(pid: runningApp.processIdentifier)
         try await waitUntil(accessibility: false, failure: Blocker.frontmost) {
             NSWorkspace.shared.frontmostApplication?.processIdentifier == runningApp.processIdentifier
@@ -129,7 +129,7 @@ import Senses
         let appName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "The requested app"
         let outcome = await source.activate(pid: pid)
         try Task.checkCancellation()
-        guard MacDriverContext.binding?.allowsEmission == true else { throw Blocker.person }
+        guard MacDriverContext.binding?.allowsEmission == true else { throw Failure(detail: MacAttentionSessionStore.sendRefusal) }
         guard outcome != .invalidTarget else {
             throw Failure(detail: "\(appName) is no longer running. Open it before continuing.")
         }
@@ -140,11 +140,11 @@ import Senses
     }
     static func requireDriver() throws {
         try Task.checkCancellation()
-        guard MacDriverContext.binding?.allowsEmission == true else { throw Blocker.person }
+        guard MacDriverContext.binding?.allowsEmission == true else { throw Failure(detail: MacAttentionSessionStore.sendRefusal) }
     }
     private static func withDriver<Value>(_ operation: () async throws -> Value) async throws -> Value {
         if MacDriverContext.binding != nil { return try await operation() }
-        let binding = await MacAttentionSessionStore.shared.bindDriver()
+        let binding = try await MacAttentionSessionStore.shared.bindDriver()
         return try await withTaskCancellationHandler {
             try await MacDriverContext.$binding.withValue(binding) { try await operation() }
         } onCancel: { binding.cancel() }
@@ -174,14 +174,19 @@ import Senses
         guard boxes.count == 1 else {
             throw Failure(detail: "Grok Bot exposes \(boxes.count) message boxes; setup needs exactly one empty composer. Open the intended chat with no draft, then Connect again.")
         }
-        guard let value = MacAXAttributeRead.copyRaw(boxes[0], kAXValueAttribute) as? String else {
-            throw Failure(detail: "Grok Bot's message box text could not be read through Accessibility. Check NativeAgent Accessibility access before continuing; no text was pasted.")
-        }
+        let value = try composerValue(boxes[0])
         guard isEmptyBox(value, conversation: bot) else {
             throw Failure(detail: "Grok Bot's message box already holds a draft, left untouched. Finish or clear that draft before continuing.")
         }
         return boxes[0]
     }
+    nonisolated static func composerValue(_ node: AXUIElement) throws -> String {
+        guard let value = MacAXAttributeRead.copyRaw(node, kAXValueAttribute) as? String else {
+            throw Failure(detail: "The exact message box text could not be read through Accessibility. Its draft was left untouched; nothing was typed.")
+        }
+        return value
+    }
+
     static func centre(_ node: AXUIElement) throws -> CGPoint {
         guard let frame = MacAXAttributeRead.frame(node) else { throw Blocker.geometry }
         return CGPoint(x: frame.midX, y: frame.midY)
@@ -341,8 +346,7 @@ import Senses
             try requireFrontmost()
             // The box reports the pasted text with its own trailing newline.
             let value = (MacAXAttributeRead.copyRaw(box, kAXValueAttribute) as? String) ?? ""
-            func flat(_ t: String) -> String { t.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
-            return !isEmptyBox(value, conversation: bot) && flat(value) == flat(text)
+            return !isEmptyBox(value, conversation: bot) && GrokDesktopReply.same(value, text)
         }
         try requireFrontmost()
         if watchReply, let layout = sentLayout {
@@ -567,10 +571,10 @@ import Senses
                     enabledItems = tree.filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXMenuItemRole
                         && (MacAXAttributeRead.copyRaw($0, kAXEnabledAttribute) as? Bool) == true }.map(MacAXAttributeRead.label)
                 }
-                exposedActions = Array(Set(tree.filter { matches($0, step.control) }.flatMap(MacAXAttributeRead.copyActions))).sorted()
+                exposedActions = Array(Set(try tree.filter { matches($0, step.control) }.flatMap(MacAXAttributeRead.copyActions))).sorted()
                 let controls = try tree.filter { node in
-                    guard matches(node, step.control), MacAXAttributeRead.copyActions(node).contains(step.action.rawValue),
-                          (MacAXAttributeRead.copyRaw(node, kAXEnabledAttribute) as? Bool) != false else { return false }
+                    guard matches(node, step.control), try MacAXAttributeRead.copyActions(node).contains(step.action.rawValue),
+                          try MacAXAttributeRead.checkedBool(node, kAXEnabledAttribute) == true else { return false }
                     if step.scope != .routineRow { return true }
                     return try MacAccessibilityReader.elements(in: node, searching: "the routine control").contains {
                         MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXStaticTextRole && MacAXAttributeRead.label($0) == routine

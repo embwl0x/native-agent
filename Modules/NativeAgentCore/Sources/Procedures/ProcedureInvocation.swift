@@ -126,8 +126,7 @@ extension ProcedureArtifactStore {
                 let existing = try await existingVerifiedReceipt(
                     invocationID: invocationID,
                     artifactID: artifact.id,
-                    inputReference: opaqueInputReference,
-                    expectedFallback: artifact.deterministicFallback
+                    inputReference: opaqueInputReference
                 )
                 if existing != nil {
                     try FileManager.default.removeItem(
@@ -186,7 +185,6 @@ extension ProcedureArtifactStore {
                 authorityRechecked: execution?.authorityRechecked ?? false,
                 canonicalEvidenceMatched: execution?.canonicalEvidenceMatched ?? false,
                 verified: accepted,
-                fallback: dry.fallback,
                 dispatched: dispatched,
                 payloadFree: true,
                 permissionAuthority: false,
@@ -225,8 +223,7 @@ extension ProcedureArtifactStore {
     private func existingVerifiedReceipt(
         invocationID: String,
         artifactID: String,
-        inputReference: String,
-        expectedFallback: ProcedureFallbackRoute
+        inputReference: String
     ) async throws -> ProcedureInvocationReceipt? {
         let receipts: [ProcedureInvocationReceipt]
         do { receipts = try await loadInvocationReceipts() }
@@ -238,8 +235,7 @@ extension ProcedureArtifactStore {
             // or a canonical approval becomes available.
             if receipt.invocationID == invocationID, receipt.dispatched {
                 guard receipt.artifactID == artifactID,
-                      receipt.opaqueInputReference == inputReference,
-                      receipt.fallback == expectedFallback else {
+                      receipt.opaqueInputReference == inputReference else {
                     throw ProcedureArtifactStoreError.corruptInvocationLedger
                 }
                 if existing == nil { existing = receipt }

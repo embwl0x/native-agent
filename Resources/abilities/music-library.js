@@ -1,81 +1,88 @@
 /* NativeAgent ability
-{"id": "music-library", "kind": "tool", "version": 1, "reach": {"capabilities": ["app_read:com.apple.Music"]}, "face": {"page": "music"}, "record": {"description": "Read Music playback state and observed timing; page typed playlists and sorted, filtered library/search results with totals, without opening Music.", "actions": [], "inputSchema": {"type": "object", "properties": {"operation": {"type": "string", "enum": ["search", "library", "playlists", "now_playing"]}, "input": {"type": "object"}}, "required": ["operation", "input"], "additionalProperties": false, "readOnly": true}}}
+{"id": "music-library", "kind": "ability", "version": 1, "reach": {"capabilities": ["app_read:com.apple.Music"]}, "face": {"page": "music"}, "record": {"description": "Read Music playback state and observed timing; page typed playlists and sorted, filtered library/search results with totals, without opening Music.", "actions": [], "inputSchema": {"type": "object", "properties": {"operation": {"type": "string", "enum": ["search", "library", "playlists", "now_playing"]}, "input": {"type": "object"}}, "required": ["operation", "input"], "additionalProperties": false, "readOnly": true}}}
 */
-const text = value => ["string", "number", "boolean"].includes(typeof value) ? String(value) : "";
-const escape = value => value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r\n/g, "\\n").replace(/\n/g, "\\n").replace(/\r/g, "\\r");
-const integer = (value, initial, minimum, maximum) => {
-    const raw = typeof value === "string" ? (/^[+-]?\d+$/.test(value.trim()) ? Number(value) : NaN)
-        : typeof value === "number" ? Math.trunc(value) : NaN;
-    return Math.max(minimum, Math.min(maximum, Number.isInteger(raw) && raw >= -9223372036854775808 && raw < 9223372036854775808 ? raw : initial));
-};
-const number = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+const escape = value => value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r");
 const failed = reason => ({status:"failed", integration:"music", reason, effects:"none"});
 
-function script(source, launch, readOnly = true) {
-    return host.apps.call({bundle_id:"com.apple.Music", script:source, launch, read_only:readOnly}).value;
+function script(source) {
+    return host.apps.call({bundle_id:"com.apple.Music", script:source, launch:false, read_only:true}).value;
 }
 
-function errorResult(error) {
-    // The native envelope retains effect evidence, consent cards and unknown outcomes.
-    if (error.name !== "AppError" || error.reason === "cancelled") throw error;
-    return error.receipt;
+function checked(condition, field) {
+    if (!condition) {
+        const error = new Error("Music returned an invalid " + field + ". Nothing changed; inspect Music's library before reading again.");
+        error.name = "MusicReadError";
+        throw error;
+    }
 }
+const tuple = (value, size, field) => checked(Array.isArray(value) && value.length === size, field);
+const count = (value, field) => checked(Number.isSafeInteger(value) && value >= 0, field);
+const string = (value, field) => checked(typeof value === "string", field);
+const id = (value, field) => checked(typeof value === "string" && /^[0-9A-Fa-f]{16}$/.test(value), field);
 
-function tracks(raw, paged, offset) {
-    return raw.trim().split("###").filter(e => e.trim()).map((entry, index) => {
-        const p = entry.trim().split("|||"), start = paged ? 1 : 0;
-        const row = {name:p[start] || "", artist:p[start + 1] || "", album:p[start + 2] || "", duration_seconds:number(p[start + 3])};
-        if (paged) Object.assign(row, {index:integer(p[0], offset + index + 1, 0, Number.MAX_SAFE_INTEGER), persistent_id:p[5] || ""});
-        return row;
-    });
+// Every track read has this one metadata record: [name, artist, album, duration].
+// Empty text is real metadata; missing values and failed reads are not text/zero.
+function track(raw, field) {
+    tuple(raw, 4, field);
+    ["name", "artist", "album"].forEach((key, i) => string(raw[i], field + "." + key));
+    checked(typeof raw[3] === "number" && Number.isFinite(raw[3]) && raw[3] >= 0, field + ".duration");
+    return {name:raw[0], artist:raw[1], album:raw[2], duration_seconds:raw[3]};
 }
 
 function page(raw, operation, offset, limit) {
-    const pieces = raw.split(":::PAGE:::"), total = integer(pieces.shift(), 0, 0, Number.MAX_SAFE_INTEGER);
-    const records = pieces.join(":::PAGE:::");
-    const rows = operation === "library" ? tracks(records, true, offset)
-        : records.trim().split("###").filter(e => e.trim()).map((entry, index) => {
-            const p = entry.trim().split("|||"), count = /^\d+$/.test(p[2] || "") ? Number(p[2]) : "unknown";
-            return {index:integer(p[0], offset + index + 1, 0, Number.MAX_SAFE_INTEGER), name:p[1] || "", track_count:count, persistent_id:p[3] || "", special_kind:p[4] || "", kind:p[5]};
-        });
-    return Object.assign({status:"completed", offset, limit, total, count:rows.length, has_more:offset + rows.length < total, hasMore:offset + rows.length < total}, {[operation === "library" ? "tracks" : "playlists"]:rows});
+    tuple(raw, 2, operation + " page");
+    const total = raw[0], records = raw[1];
+    count(total, operation + ".total");
+    checked(Array.isArray(records) && records.length === Math.min(limit, Math.max(0, total - offset)), operation + ".rows");
+    const rows = records.map((row, i) => {
+        const field = operation + ".row[" + (offset + i + 1) + "]";
+        if (operation !== "playlists") {
+            tuple(row, 2, field);
+            id(row[0], field + ".persistent_id");
+            const result = Object.assign(track(row[1], field), {persistent_id:row[0]});
+            if (operation === "library") result.index = offset + i + 1;
+            return result;
+        }
+        tuple(row, 5, field);
+        id(row[0], field + ".persistent_id");
+        string(row[1], field + ".name");
+        count(row[2], field + ".track_count");
+        string(row[3], field + ".special_kind");
+        checked(["owner", "smart", "library"].includes(row[4]), field + ".kind");
+        return {index:offset + i + 1, persistent_id:row[0], name:row[1], track_count:row[2], special_kind:row[3], kind:row[4]};
+    });
+    return Object.assign({status:"completed", offset, limit, total, count:rows.length, has_more:offset + rows.length < total},
+        {[operation === "search" ? "results" : operation === "library" ? "tracks" : "playlists"]:rows});
 }
 
 function playbackRead() {
     let raw;
-    try { raw = script(nowScript(), false); }
+    try { raw = script(nowScript()); }
     catch (error) {
+        // Process absence is observed by the native owner, not inferred from a failed property.
         if (error.reason === "not_running") return {status:"completed", isPlaying:false, playerState:"stopped", track:null, reason:"Music isn't open."};
-        const result = error.receipt && error.receipt.result;
-        if (result && result.code === -1751) return {status:"completed", isPlaying:false, playerState:"unknown", track:null, reason:"no_current_track"};
-        return errorResult(error);
+        throw error;
     }
-    if (!raw.trim()) return {status:"completed", isPlaying:false, playerState:"unknown", track:null, reason:"no_current_track"};
-    const p = raw.split("|||"), state = p[0].trim(), normalized = state.toLowerCase(), isPlaying = normalized === "playing";
-    const unparsed = "Music answered in a shape this read does not know, so the track is unknown. Nothing changed; read it again, and if it repeats, look at Music itself.";
-    if (!["playing", "paused", "stopped", "fast forwarding", "fast_forwarding", "rewinding", "unknown"].includes(normalized))
-        return {status:"failed", integration:"music", track:null, reason:"malformed_now_playing_response", detail:unparsed};
-    if (p.length === 2 && p[1] === "NO_TRACK") return {status:"completed", isPlaying:false, playerState:state, track:null, reason:"no_current_track"};
-    if (p.length >= 6) return {status:"completed", isPlaying, playerState:state,
-        track:{name:p[1], artist:p[2], album:p[3], duration_seconds:number(p[4]), position_seconds:number(p[5])}};
-    if (p.length === 2 && p[1].startsWith("ERR:")) {
-        const message = p[1].slice(4), lower = message.toLowerCase();
-        if (lower.includes("current track") || lower.includes("class ptrk") || lower.includes("track") && ["can't get", "can’t get", "can't make", "can’t make"].some(s => lower.includes(s)))
-            return {status:"completed", isPlaying, playerState:state, track:null, reason:"no_current_track"};
-        return {status:"failed", integration:"music", reason:"now_playing_applescript_error", detail:"Music could not read the current track: " + message + ". Nothing changed."};
+    tuple(raw, 3, "now_playing");
+    const state = raw[0];
+    checked(["playing", "paused", "stopped", "fast forwarding", "rewinding"].includes(state), "now_playing.playerState");
+    if (state === "stopped") {
+        tuple(raw[1], 0, "now_playing.stopped.track");
+        tuple(raw[2], 0, "now_playing.stopped.position");
+        return {status:"completed", isPlaying:false, playerState:state, track:null, reason:"no_current_track"};
     }
-    return {status:"failed", integration:"music", isPlaying, playerState:state, track:null, reason:"malformed_now_playing_response", detail:unparsed};
+    const current = track(raw[1], "now_playing.track");
+    checked(typeof raw[2] === "number" && Number.isFinite(raw[2]) && raw[2] >= 0, "now_playing.position");
+    current.position_seconds = raw[2];
+    return {status:"completed", isPlaying:state === "playing", playerState:state, track:current};
 }
 
 function nowPlaying() {
     const result = playbackRead(), observed_at = new Date().toISOString();
-    if (result.status !== "completed") return result;
-    const previous = host.state.get(), state = ["fast forwarding", "fast_forwarding", "rewinding"].includes(result.playerState) ? "playing" : result.playerState;
-    if (!["playing", "paused", "stopped"].includes(state)) return Object.assign(failed("playback_state_unavailable"), {track:null, observed_at});
-    const track_key = result.track ? [result.track.name, result.track.artist, result.track.album].join("\n") : null;
+    const previous = host.state.get(), state = ["fast forwarding", "rewinding"].includes(result.playerState) ? "playing" : result.playerState;
+    const track_key = result.track ? JSON.stringify([result.track.name, result.track.artist, result.track.album]) : null;
     const observed_since = previous && previous.state === state && previous.track_key === track_key ? previous.observed_since : observed_at;
-    // Music supplies no state-transition date. Do not turn a remembered read
-    // into a claim that playback continued unseen between observations.
+    // A remembered read is not evidence of playback continuing between reads.
     host.state.set({state, track_key, observed_since});
     return Object.assign({state, since:observed_since, since_basis:"first observed; Music supplies no transition time and continuity between reads is unknown", observed_since, observed_at}, result);
 }
@@ -88,77 +95,85 @@ function library(input, offset, limit) {
         return Object.assign(failed("invalid_filter"), {message:"filter takes artist, album and/or genre text; matching ignores case and contains all supplied values."});
     const terms = Object.keys(filter).map(k => k + ' contains "' + escape(filter[k]) + '"');
     const selection = "(every track of library playlist 1" + (terms.length ? " whose " + terms.join(" and ") : "") + ")";
-    const raw = script(libraryKeysScript(selection, sort), false);
-    if (!Array.isArray(raw) || raw.length !== 2 || !raw.every(Array.isArray) || raw[0].length !== raw[1].length)
-        return failed("malformed_library_sort_keys");
-    const ordered = raw[0].map((id, index) => ({id, key:raw[1][index], index}));
-    ordered.sort((a,b) => (sort === "added" ? Number(b.key) - Number(a.key) : String(a.key).localeCompare(String(b.key), undefined, {sensitivity:"base"})) || a.index - b.index);
+    const raw = script(libraryKeysScript(selection, sort));
+    tuple(raw, 2, "library sort keys");
+    checked(raw.every(Array.isArray) && raw[0].length === raw[1].length, "library sort keys");
+    const ordered = raw[0].map((value, index) => {
+        id(value, "library.sort.persistent_id[" + index + "]");
+        const key = raw[1][index];
+        if (sort === "added") count(key, "library.sort.added[" + index + "]");
+        else string(key, "library.sort." + sort + "[" + index + "]");
+        return {id:value, key, index};
+    });
+    ordered.sort((a,b) => (sort === "added" ? b.key - a.key : a.key.localeCompare(b.key, undefined, {sensitivity:"base"})) || a.index - b.index);
     const ids = ordered.slice(offset, offset + limit).map(row => row.id);
-    const rows = ids.length ? tracks(script(libraryScript(ids, offset), false), true, offset) : [];
-    const total = ordered.length, has_more = offset + rows.length < total;
-    return {status:"completed", sort, filter, offset, limit, count:rows.length, total, has_more, hasMore:has_more, tracks:rows};
+    const records = ids.length ? script(libraryScript(ids)) : [];
+    checked(Array.isArray(records) && records.length === ids.length && records.every((row, i) => Array.isArray(row) && row[0] === ids[i]), "library selected identities");
+    return Object.assign(page([ordered.length, records], "library", offset, limit), {sort, filter});
 }
 
 function run(request) {
     const input = request.input, operation = request.operation;
     try {
         if (operation === "now_playing") return nowPlaying();
+        const offset = input.offset === undefined ? 0 : input.offset, limit = input.limit === undefined ? (operation === "search" ? 20 : 50) : input.limit;
+        if (!Number.isInteger(offset) || offset < 0 || offset > 1000000 || !Number.isInteger(limit) || limit < 1 || limit > 100) return failed("invalid_pagination");
         if (operation === "search") {
-            const query = text(input.query), kind = ["string", "number", "boolean"].includes(typeof input.kind) ? text(input.kind).toLowerCase() : "track";
-            if (!query) return Object.assign(failed("missing_query"), {message:"Nothing to search for: give a word or phrase in query."});
-            if (!["track", "artist", "album"].includes(kind)) return failed("unknown_kind:" + kind);
+            const query = input.query, kind = input.kind === undefined ? "track" : input.kind;
+            if (typeof query !== "string" || !query) return failed("missing_query");
+            if (!["track", "artist", "album"].includes(kind)) return failed("unknown_kind");
             const predicate = kind === "artist" ? "artist contains q" : kind === "album" ? "album contains q" : "name contains q or artist contains q or album contains q";
-            const offset = integer(input.offset, 0, 0, 1000000), limit = integer(input.limit, 20, 1, 100);
-            const raw = script(searchScript(query, predicate, offset, limit), false), pieces = raw.split(":::PAGE:::");
-            const total = integer(pieces.shift(), 0, 0, Number.MAX_SAFE_INTEGER), results = tracks(pieces.join(":::PAGE:::"), false, offset);
-            const has_more = offset + results.length < total;
-            return {status:"completed", offset, limit, count:results.length, total, has_more, hasMore:has_more, results};
+            return page(script(searchScript(query, predicate, offset, limit)), operation, offset, limit);
         }
-        const offset = integer(input.offset, 0, 0, 1000000), limit = integer(input.limit, 50, 1, 100);
         if (operation === "library") return library(input, offset, limit);
         if (operation !== "playlists") return failed("unknown_operation");
-        return page(script(playlistsScript(offset, limit), false), operation, offset, limit);
+        return page(script(playlistsScript(offset, limit)), operation, offset, limit);
     } catch (error) {
-        if (error.reason === "not_running") return {status:"unavailable", count:0, total:null, has_more:null, reason:"Music isn't open; music.control play opens it."};
-        return errorResult(error);
+        if (error.name === "MusicReadError") return Object.assign(failed("malformed_music_response"), {detail:error.message});
+        if (error.name !== "AppError" || error.reason === "cancelled") throw error;
+        if (error.reason === "not_running") return {status:"unavailable", reason:"Music isn't open; music.control play opens it.", effects:"none"};
+        return error.receipt;
     }
 }
 
+// A failed property retains its AppleScript error code and names its row/property.
+function property(variable, expression, label) { return `
+    try
+        set ${variable} to ${expression}
+    on error errMsg number errNum
+        error ("Music " & ${label} & ": " & errMsg) number errNum
+    end try
+`; }
+function metadata(item, label) { return `
+    ${property("trackName", "name of " + item, label + ' & ".name"')}
+    ${property("trackArtist", "artist of " + item, label + ' & ".artist"')}
+    ${property("trackAlbum", "album of " + item, label + ' & ".album"')}
+    ${property("trackDuration", "duration of " + item, label + ' & ".duration"')}
+`; }
+function trackRow(item, label) { return `
+    ${property("trackID", "persistent ID of " + item, label + ' & ".persistent_id"')}
+    ${metadata(item, label)}
+    set end of rows to {trackID, {trackName, trackArtist, trackAlbum, trackDuration}}
+`; }
+
 function searchScript(query, predicate, offset, limit) { return `
 with timeout of 10 seconds
-        set searchOutputString to ""
-        set q to "${escape(query)}"
-        set searchHitsList to (every track of library playlist 1 whose ${predicate})
-        set totalHits to count of searchHitsList
-        set searchCountedNum to 0
-        repeat with hitIndex from ${offset + 1} to totalHits
-            if searchCountedNum ≥ ${limit} then exit repeat
-            set trackItem to item hitIndex of searchHitsList
-            set trackNameString to ""
-            set trackArtistString to ""
-            set trackAlbumString to ""
-            set trackDurationString to ""
-            try
-                set trackNameString to (name of trackItem) as string
-            end try
-            try
-                set trackArtistString to (artist of trackItem) as string
-            end try
-            try
-                set trackAlbumString to (album of trackItem) as string
-            end try
-            try
-                set trackDurationString to ((duration of trackItem) as string)
-            end try
-            set searchOutputString to searchOutputString & trackNameString & "|||" & trackArtistString & "|||" & trackAlbumString & "|||" & trackDurationString & "###"
-            set searchCountedNum to searchCountedNum + 1
-        end repeat
-        return (totalHits as string) & ":::PAGE:::" & searchOutputString
+    set q to "${escape(query)}"
+    set hits to (every track of library playlist 1 whose ${predicate})
+    set totalHits to count of hits
+    set rows to {}
+    repeat with rowIndex from ${offset + 1} to (totalHits)
+        if (count of rows) ≥ ${limit} then exit repeat
+        set trackItem to item rowIndex of hits
+        ${trackRow("trackItem", '"search row " & rowIndex')}
+    end repeat
+    return {totalHits, rows}
 end timeout
 `; }
 
 function libraryKeysScript(selection, sort) { return `
 with timeout of 15 seconds
+    -- Read plural properties from the query, not from a materialized list.
     set libraryIDs to persistent ID of ${selection}
     ${sort === "added" ? `set addedDates to date added of ${selection}
     set sortKeys to {}
@@ -169,124 +184,50 @@ with timeout of 15 seconds
 end timeout
 `; }
 
-function libraryScript(ids, offset) { return `
+function libraryScript(ids) { return `
 with timeout of 15 seconds
-        set libraryOutputString to ""
-        set selectedIDs to {${ids.map(id => '"' + escape(id) + '"').join(", ")}}
-            repeat with selectedIndex from 1 to (count of selectedIDs)
-                set selectedID to item selectedIndex of selectedIDs
-                set trackIndexNum to ${offset} + selectedIndex
-                set trackItem to first track of library playlist 1 whose persistent ID is selectedID
-                set trackNameString to ""
-                set trackArtistString to ""
-                set trackAlbumString to ""
-                set trackDurationString to ""
-                set trackPersistentIDString to ""
-                try
-                    set trackNameString to (name of trackItem) as string
-                end try
-                try
-                    set trackArtistString to (artist of trackItem) as string
-                end try
-                try
-                    set trackAlbumString to (album of trackItem) as string
-                end try
-                try
-                    set trackDurationString to ((duration of trackItem) as string)
-                end try
-                try
-                    set trackPersistentIDString to (persistent ID of trackItem) as string
-                end try
-                set libraryOutputString to libraryOutputString & trackIndexNum & "|||" & trackNameString & "|||" & trackArtistString & "|||" & trackAlbumString & "|||" & trackDurationString & "|||" & trackPersistentIDString & "###"
-            end repeat
-        return libraryOutputString
+    set rows to {}
+    set selectedIDs to {${ids.map(value => '"' + escape(value) + '"').join(", ")}}
+    repeat with selectedID in selectedIDs
+        set trackItem to first track of library playlist 1 whose persistent ID is selectedID
+        ${trackRow("trackItem", '"library track " & selectedID')}
+    end repeat
+    return rows
 end timeout
 `; }
 
 function playlistsScript(offset, limit) { return `
 with timeout of 15 seconds
-        set totalPlaylistCountString to "0"
-        set playlistOutputString to ""
-        set totalPlaylistCountNum to count of playlists
-        set totalPlaylistCountString to totalPlaylistCountNum as string
-        set startIndexNum to ${offset + 1}
-        set requestedEndIndexNum to ${offset + limit}
-        if startIndexNum is less than or equal to totalPlaylistCountNum then
-            set endIndexNum to requestedEndIndexNum
-            if endIndexNum is greater than totalPlaylistCountNum then set endIndexNum to totalPlaylistCountNum
-            repeat with playlistIndexNum from startIndexNum to endIndexNum
-                set playlistItem to playlist playlistIndexNum
-                set playlistNameString to ""
-                set playlistTrackCountString to "unknown"
-                set playlistPersistentIDString to ""
-                set playlistSpecialKindString to ""
-                set playlistKindString to "library"
-                if class of playlistItem is user playlist then
-                    if smart of playlistItem then
-                        set playlistKindString to "smart"
-                    else
-                        set playlistKindString to "owner"
-                    end if
-                end if
-                try
-                    set playlistNameString to (name of playlistItem) as string
-                end try
-                try
-                    set playlistTrackCountString to ((count of tracks of playlistItem) as string)
-                end try
-                try
-                    set playlistPersistentIDString to (persistent ID of playlistItem) as string
-                end try
-                try
-                    set playlistSpecialKindString to (special kind of playlistItem) as string
-                end try
-                set playlistOutputString to playlistOutputString & playlistIndexNum & "|||" & playlistNameString & "|||" & playlistTrackCountString & "|||" & playlistPersistentIDString & "|||" & playlistSpecialKindString & "|||" & playlistKindString & "###"
-            end repeat
+    set totalPlaylists to count of playlists
+    set rows to {}
+    repeat with rowIndex from ${offset + 1} to totalPlaylists
+        if (count of rows) ≥ ${limit} then exit repeat
+        set playlistItem to playlist rowIndex
+        set playlistKind to "library"
+        if class of playlistItem is user playlist then
+            if smart of playlistItem then
+                set playlistKind to "smart"
+            else
+                set playlistKind to "owner"
+            end if
         end if
-        return totalPlaylistCountString & ":::PAGE:::" & playlistOutputString
+        ${property("playlistID", "persistent ID of playlistItem", '"playlist row " & rowIndex & ".persistent_id"')}
+        ${property("playlistName", "name of playlistItem", '"playlist row " & rowIndex & ".name"')}
+        ${property("trackCount", "count of tracks of playlistItem", '"playlist row " & rowIndex & ".track_count"')}
+        ${property("specialKind", "(special kind of playlistItem) as text", '"playlist row " & rowIndex & ".special_kind"')}
+        set end of rows to {playlistID, playlistName, trackCount, specialKind, playlistKind}
+    end repeat
+    return {totalPlaylists, rows}
 end timeout
 `; }
 
 function nowScript() { return `
 with timeout of 5 seconds
-        set stateLabel to "unknown"
-        try
-            set stateLabel to (player state as text)
-        end try
-        if stateLabel is "stopped" then
-            return stateLabel & "|||NO_TRACK"
-        end if
-
-        try
-            set currentTrackRef to current track
-            set trackNameString to ""
-            set trackArtistString to ""
-            set trackAlbumString to ""
-            set trackDurationString to "0"
-            set playerPositionString to "0"
-
-            try
-                set trackNameString to (name of currentTrackRef) as text
-            end try
-            try
-                set trackArtistString to (artist of currentTrackRef) as text
-            end try
-            try
-                set trackAlbumString to (album of currentTrackRef) as text
-            end try
-            try
-                set trackDurationString to ((duration of currentTrackRef) as text)
-            end try
-            try
-                set playerPositionString to ((player position) as text)
-            end try
-
-            if trackNameString is "" and trackArtistString is "" and trackAlbumString is "" then
-                return stateLabel & "|||NO_TRACK"
-            end if
-            return stateLabel & "|||" & trackNameString & "|||" & trackArtistString & "|||" & trackAlbumString & "|||" & trackDurationString & "|||" & playerPositionString
-        on error errMsg number errNum
-            return stateLabel & "|||ERR:" & errNum & ":" & errMsg
-        end try
+    set stateLabel to player state as text
+    if stateLabel is "stopped" then return {stateLabel, {}, {}}
+    set trackItem to current track
+    ${metadata("trackItem", '"current track"')}
+    ${property("trackPosition", "player position", '"current track.position"')}
+    return {stateLabel, {trackName, trackArtist, trackAlbum, trackDuration}, trackPosition}
 end timeout
 `; }

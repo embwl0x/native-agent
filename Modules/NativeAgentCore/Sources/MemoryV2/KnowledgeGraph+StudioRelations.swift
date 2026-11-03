@@ -431,7 +431,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                   !reservedDerivedIDs.contains(id) else { return nil }
             return id
         }()
-        let metadata = studioMetadataJSON([
+        let metadata = try studioMetadataJSON([
             "indexer": .string(studioIndexVersion),
             createdByKey: .string(studioIndexVersion),
             "studio_node_key": .string(key),
@@ -478,7 +478,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         entryIDs: [String],
         now: String
     ) throws {
-        let metadata = studioMetadataJSON([
+        let metadata = try studioMetadataJSON([
             "indexer": .string(studioIndexVersion),
             "studio_entry_ids": .array(entryIDs.map { .string($0) }),
             "last_seen": .string(now),
@@ -500,7 +500,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             ])
     }
 
-    private static func studioMetadataJSON(_ object: [String: JSONValue]) -> String {
-        (try? JSONValue.object(object).serialize(pretty: false)) ?? "{}"
+    private static func studioMetadataJSON(_ object: [String: JSONValue]) throws -> String {
+        try JSONValue.object(object).serialize(pretty: false)
     }
 }

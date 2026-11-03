@@ -50,7 +50,7 @@ extension SwiftToolDispatcher {
             return $0.handle < $1.handle
         }
         let shown = Array(sorted.dropFirst(rowOffset).prefix(pageSize))
-        var base: [String: JSONValue] = ["structured": .bool(true)]
+        var base: [String: JSONValue] = [:]
         base["limit"] = .int(Int64(pageSize))
         base["sort"] = input["sort"]
         base["updated_on"] = input["updated_on"]

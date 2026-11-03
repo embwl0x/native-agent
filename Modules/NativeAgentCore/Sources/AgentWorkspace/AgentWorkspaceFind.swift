@@ -11,10 +11,10 @@ import ChatToolParsing
 /// provider reasoning, background work, or inferred action routing lives here.
 enum AgentWorkspaceFind {
     static func project(query: String, dataRoot: URL, perform: AgentWorkspace.Perform) async throws -> WorkspacePage {
-        if let exact = try await exact(query: query, dataRoot: dataRoot, perform: perform) { return exact }
         var items: [AgentWorkspaceItem] = []
         var sources: [JSONValue] = []
-        var partial = false
+        if let exact = try await exact(query: query, dataRoot: dataRoot, perform: perform, sources: &sources) { return exact }
+        var partial = !sources.isEmpty
         let lanes: [(String, String, [String: JSONValue], AgentWorkspaceLocation)] = [
             ("Work and conversations", "work_context", ["query": .string(query), "limit": .int(3)], .work(query)),
             ("Files", "artifact_find", ["query": .string(query), "limit": .int(3)], .documents(query)),
@@ -73,46 +73,74 @@ enum AgentWorkspaceFind {
         ])
     }
 
-    private static func exact(query: String, dataRoot: URL, perform: AgentWorkspace.Perform) async throws -> WorkspacePage? {
+    private static func exact(query: String, dataRoot: URL, perform: AgentWorkspace.Perform,
+                              sources: inout [JSONValue]) async throws -> WorkspacePage? {
         guard !query.contains(where: \.isWhitespace) else { return nil }
         func read(_ tool: String, _ input: [String: JSONValue], _ title: String) async throws -> WorkspacePage {
             let value = try await perform(tool, input)
             let location = AgentWorkspaceLocation.record(tool: tool, input: input, title: title)
             return await WorkspacePage.project(location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument.evidence(location: location, value: value))
         }
-        if let peer = try AgentWorkspacePorts.current.conversations.peers(dataRoot: dataRoot).first(where: { query == $0.id || query == "peer:" + $0.id }) {
-            return try await read("agent_contacts", ["discover": .string("peer:" + peer.id)], peer.name)
+        if query.hasPrefix("peer:") || query.hasPrefix("bot:") {
+            return try await read("agent_contacts", ["discover": .string(query)], "Contact")
         }
-        if let bot = try BotDefinitionStore(dataRoot: dataRoot).list().first(where: { query == $0.id.uuidString.lowercased() || query == "bot:" + $0.id.uuidString.lowercased() }) {
-            return try await read("agent_contacts", ["discover": .string("bot:" + bot.id.uuidString.lowercased())], bot.name)
+        if query.hasPrefix("desk_") {
+            return try await read("desk_read", ["handle": .string(query)], "Desk item")
         }
-        if query.hasPrefix("desk_"), let item = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items.first(where: { $0.handle == query }) {
-            return try await read("desk_read", ["handle": .string(item.handle)], item.title)
+        if query.hasPrefix("msg_") || query.hasPrefix("agent-conversation:") {
+            return try await read("read_chat_message", ["message_id": .string(query)], "Message")
         }
-        if let session = try ChatSessionIndexFile.loadObjectRowsForMutation(at: dataRoot.appendingPathComponent("chat/sessions.json"))
-            .first(where: { $0["id"] == .string(query) }) {
-            return try await read("chat_conversations", ["conversation_session_id": .string(query)], session["title"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "Conversation")
+        // UUIDs are shared by several owners. Each probe carries its own
+        // availability; an unrelated store failure never prevents topic reads.
+        guard let uuid = UUID(uuidString: query) else { return nil }
+        func unavailable(_ name: String, _ error: any Error) -> JSONValue {
+            .object(["name": .string(name), "status": .string("unavailable"),
+                "detail": .string(error.localizedDescription)])
         }
-        if UUID(uuidString: query) != nil {
+        do {
+            if let peer = try AgentWorkspacePorts.current.conversations.peers(dataRoot: dataRoot).first(where: { $0.id == query }) {
+                return try await read("agent_contacts", ["discover": .string("peer:" + peer.id)], peer.name)
+            }
+        } catch is CancellationError { throw CancellationError() }
+        catch { sources.append(unavailable("Exact peer identity", error)) }
+        do {
+            if let bot = try BotDefinitionStore(dataRoot: dataRoot).list().first(where: { $0.id == uuid }) {
+                return try await read("agent_contacts", ["discover": .string("bot:" + bot.id.uuidString.lowercased())], bot.name)
+            }
+        } catch is CancellationError { throw CancellationError() }
+        catch { sources.append(unavailable("Exact helper identity", error)) }
+        do {
+            if let session = try ChatSessionIndexFile.loadObjectRowsForMutation(at: dataRoot.appendingPathComponent("chat/sessions.json"))
+                .first(where: { $0["id"] == .string(query) }) {
+                return try await read("chat_conversations", ["conversation_session_id": .string(query)], session["title"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "Conversation")
+            }
+        } catch is CancellationError { throw CancellationError() }
+        catch { sources.append(unavailable("Exact conversation identity", error)) }
+        do {
             if let approval = try SwiftNativeApprovalInbox(root: dataRoot).recordsUnlocked()
                 .first(where: { $0.id == query }), case .object(let row) = approval.toJSON() {
                 return .init(title: "Approval", content: .object(row.filter { ["id", "title", "status", "createdAt", "resolvedAt", "decision"].contains($0.key) }), items: [],
                     actions: [.init(label: "Open Inbox", action: .open(.area("inbox")))])
             }
+        } catch is CancellationError { throw CancellationError() }
+        catch { sources.append(unavailable("Exact approval identity", error)) }
+        do {
             if let record = try AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true).first(where: {
                 $0.id == query || $0.operationID == query || $0.readInput?["message_id"] == .string(query)
             }) {
                 let input: [String: JSONValue] = ["agent": .string(record.agent), "conversation": .string(record.id)]
                 return try await read("agent_read", input, record.name + " — " + record.label)
             }
-        }
-        if UUID(uuidString: query) != nil || query.hasPrefix("msg_") || query.hasPrefix("agent-conversation:") {
+        } catch is CancellationError { throw CancellationError() }
+        catch { sources.append(unavailable("Exact contact message identity", error)) }
+        do {
             let value = try await perform("read_chat_message", ["message_id": .string(query)])
             if case .object(let row) = value, row["status"] != .string("not_found") {
                 let location = AgentWorkspaceLocation.record(tool: "read_chat_message", input: ["message_id": .string(query)], title: "Message")
                 return await WorkspacePage.project(location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument.evidence(location: location, value: value))
             }
-        }
+        } catch is CancellationError { throw CancellationError() }
+        catch { sources.append(unavailable("Exact transcript message identity", error)) }
         return nil
     }
 

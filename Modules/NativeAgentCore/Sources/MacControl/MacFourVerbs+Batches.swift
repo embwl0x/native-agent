@@ -3,7 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import Experiences
 import CryptoKit
-// Blueprint: | `MacFourVerbs+Batches.swift` | `MacFourVerbs`: `actSteps`, `SightCarry`, `ActFlow` and step digests; cancellation and confirmed effect mismatches stop further steps while preserving landed or uncertain receipts for resume |
+// Blueprint: | `MacFourVerbs+Batches.swift` | `MacFourVerbs`: ordered steps, recorded handle selections re-resolved live through the shared action owner, canonical complete-step digests for flow receipts and stop-at-failure settlement |
 
 extension MacFourVerbs {
     // MARK: batched steps
@@ -54,7 +54,8 @@ extension MacFourVerbs {
             // skipped, not failed, when nothing answers to it.
             let optional = asked.target.hasSuffix("?") && asked.target.count > 1
             let step = optional ? MacActStep(verb: asked.verb, target: String(asked.target.dropLast()), text: asked.text,
-                                             mode: asked.mode, to: asked.to, place: asked.place) : asked
+                                             mode: asked.mode, to: asked.to, place: asked.place,
+                                             holding: asked.holding, button: asked.button) : asked
             // After step 1 the app's own sheet or dialog (a save sheet) may be
             // what's in front: the same process is still required, not the
             // same window rect.
@@ -64,39 +65,24 @@ extension MacFourVerbs {
             let previousTyped = index == 0 ? Self.typedJustBefore
                 : Self.parseVerb(steps[index - 1].verb).0 == "type" ? steps[index - 1].text : nil
             let typedBefore = ["key", "press"].contains(Self.parseVerb(step.verb).0) ? previousTyped : nil
-            var reply = await Self.$typedJustBefore.withValue(typedBefore) {
+            let reply = await Self.$typedJustBefore.withValue(typedBefore) {
                 guard !Task.isCancelled else {
                     return MacFourVerbsReply(ok: false, text: "The action was cancelled; no further steps ran.", detail: ["error": .string("cancelled")])
                 }
+                if let handle = step.handle, let frameID = step.frameID {
+                    carry.last = nil
+                    if let expect, let frame = await MacLookFrameStore.shared.frame(frameId: frameID), frame.pid != expect.pid {
+                        return MacFourVerbsReply(ok: false, text: "That handle belongs to another app; no input was sent.",
+                            detail: ["error": .string("selection_app_mismatch")])
+                    }
+                    return await actSelection(verb: step.verb, handle: handle, frameID: frameID,
+                        text: step.text, mode: step.mode, app: app)
+                }
                 return await actOnce(
                     verb: step.verb, target: step.target, text: step.text, mode: step.mode, to: step.to, toApp: nil,
-                    seconds: nil, holding: nil, button: nil, scrollAmount: nil, attention: nil,
+                    seconds: nil, holding: step.holding, button: step.button, scrollAmount: nil, attention: nil,
                     app: app, expect: stepExpect, carry: carry, commitFollows: commitFollows, menus: !optional, place: step.place
                 )
-            }
-            // Allow bounded fresh reads for a settling surface and one re-resolution after pre-act drift.
-            var looks = 0
-            var reResolved = false
-            // Cancellation closes step/retry admission; the returned receipt
-            // still owns whether this step landed or may have acted.
-            while !Task.isCancelled {
-                let error = Self.string(reply.detail["error"])
-                if index > 0, looks < 3, error == "no_match" {
-                    looks += 1
-                } else if !reResolved, ["handle_drifted", "window_drifted", "frame_window_gone", "stale_frame"].contains(error) {
-                    reResolved = true
-                } else {
-                    break
-                }
-                await clock.sleep(seconds: 0.4)
-                if Task.isCancelled { break }
-                reply = await Self.$typedJustBefore.withValue(typedBefore) {
-                    await actOnce(
-                        verb: step.verb, target: step.target, text: step.text, mode: step.mode, to: step.to, toApp: nil,
-                        seconds: nil, holding: nil, button: nil, scrollAmount: nil, attention: nil,
-                        app: app, expect: stepExpect, carry: carry, commitFollows: commitFollows, menus: !optional, place: step.place
-                    )
-                }
             }
             if optional, Self.string(reply.detail["error"]) == "no_match" {
                 lines.append("\(index + 1) \(step.target) — not there, skipped (optional)")
@@ -180,15 +166,29 @@ extension MacFourVerbs {
     }
 
     /// The app is part of each step: the same steps in another app never landed there.
-    static func actStepDigests(_ steps: [MacActStep], app: String?) -> [String] {
-        steps.map { step in
+    static func actStepDigests(_ steps: [MacActStep], app: String?) throws -> [String] {
+        try steps.map { step in
             func point(_ point: MacPointerPosition?) -> JSONValue {
-                point.map { .array([.double($0.x), .double($0.y)]) } ?? .null
+                point.map { .object(["x": .double($0.x), "y": .double($0.y)]) } ?? .null
             }
-            let value = JSONValue.array([.string(app ?? ""), .string(step.verb), .string(step.target), step.text.map(JSONValue.string) ?? .null,
-                .string(step.mode.rawValue), step.to.map(JSONValue.string) ?? .null,
-                step.place.map { .array([$0.image.map(JSONValue.string) ?? .null, point($0.at), point($0.to)]) } ?? .null])
-            return SHA256.hash(data: (try? value.serializedData(pretty: false)) ?? Data()).map { String(format: "%02x", $0) }.joined()
+            let value = JSONValue.object([
+                "app": app.map(JSONValue.string) ?? .null,
+                "verb": .string(step.verb),
+                "target": .string(step.target),
+                "text": step.text.map(JSONValue.string) ?? .null,
+                "mode": .string(step.mode.rawValue),
+                "to": step.to.map(JSONValue.string) ?? .null,
+                "place": step.place.map { .object([
+                    "image": $0.image.map(JSONValue.string) ?? .null,
+                    "at": point($0.at),
+                    "to": point($0.to),
+                ]) } ?? .null,
+                "holding": step.holding.map(JSONValue.string) ?? .null,
+                "button": step.button.map(JSONValue.string) ?? .null,
+                "handle": step.handle.map(JSONValue.string) ?? .null,
+                "frame_id": step.frameID.map(JSONValue.string) ?? .null,
+            ])
+            return try SHA256.hash(data: value.serializedData(pretty: false)).map { String(format: "%02x", $0) }.joined()
         }
     }
 }

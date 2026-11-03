@@ -31,6 +31,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "trust_policy.json",
                 "mac_integration_permissions.json",
                 "personality.json",
+                "voice_preference.json",
                 "health.json",
                 "organism_living_status.json",
                 "sessions.json",
@@ -84,20 +85,6 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "runs.json",
                 "helpers_agents.json",
             ]
-        }
-    }
-
-    /// Files a group can publish WITHOUT, in the order they may be shed, when
-    /// the whole group does not fit one status envelope. Only reading
-    /// conveniences belong here: shedding one must never change what the phone
-    /// believes about the state itself, and the authoritative rows of the group
-    /// must always be among the files that stay.
-    ///
-    /// Desk reading copies may be shed so the compact board still fits its status envelope.
-    public var trimmableFilenames: [String] {
-        switch self {
-        case .desk: ["desk_details.json"]
-        case .core, .catalog, .chat, .scheduler, .activity, .advanced, .work: []
         }
     }
 
@@ -227,13 +214,10 @@ public enum NAMobileSnapshotStatusCodec {
         let decoded = try JSONDecoder().decode(NAMobileSnapshotPayload.self, from: payload)
         let allowed = Set(expectedGroup.filenames)
         guard !decoded.files.isEmpty,
-              decoded.files.keys.allSatisfy({ URL(fileURLWithPath: $0).lastPathComponent == $0 }) else {
+              decoded.files.keys.allSatisfy({ allowed.contains($0) && URL(fileURLWithPath: $0).lastPathComponent == $0 }) else {
             throw DeviceSyncError.underlying(message: "mobile snapshot contained an unsupported filename")
         }
-        // Only the signed group's own files are taken. A file this build does
-        // not know, or one another build carried in a different group (an
-        // older Mac's overview in Activity), is ignored, never written.
-        return decoded.files.filter { allowed.contains($0.key) }
+        return decoded.files
     }
 
     private static func sha256(_ data: Data) -> String {

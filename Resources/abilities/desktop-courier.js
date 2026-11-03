@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id":"desktop-courier","kind":"tool","version":1,
+{"id":"desktop-courier","kind":"ability","version":1,
  "reach":{"capabilities":[]},"face":{"page":"agents"},
  "record":{"description":"Prepare the desktop courier's reply address and constrained tool-turn procedure. Exact recipient/message binding, send evidence and uncertain outcomes remain native; no message content, credentials or Mac effects enter this preparation.","actions":[],"inputSchema":{"type":"object","required":["agentName"]}}}
 */

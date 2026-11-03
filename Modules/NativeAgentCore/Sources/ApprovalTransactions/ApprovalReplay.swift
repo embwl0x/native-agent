@@ -40,51 +40,18 @@ extension ApprovalExecution {
         let replyRoute: ChatToolSessionContext.ReplyRoute?
         let envelope: TurnEnvelope
     }
-    static func chatToolApprovalReplay(from rec: ApprovalRecord, reportingOnly: Bool = false) -> ChatToolApprovalReplay? {
-        guard case .object(let payload) = rec.payload else { return nil }
-        let kind: String = {
-            if case .string(let value)? = payload["kind"] { return value }
-            return ""
-        }()
-        let telegram: [String: JSONValue] = {
-            var fields: [String: JSONValue] = [:]
-            if reportingOnly, case .object(let state)? = rec.chatContinuation,
-               case .object(let queued)? = state["delivery"] { fields = queued }
-            if case .object(let obj)? = payload["telegram"] { fields.merge(obj) { _, value in value } }
-            return fields
-        }()
-        let origin: [String: JSONValue] = if case .object(let obj)? = payload["origin"] { obj } else { [:] }
-        let generic = kind == "chat_tool_approval" || kind == "telegram_tool_approval"
-        let toolName: String
-        let surface: String
-        let input: [String: JSONValue]
-        if generic {
-            guard let name = Self.nonEmptyPayloadString(payload["toolName"]),
-                  let door = Self.nonEmptyPayloadString(payload["surface"]),
-                  case .object(let arguments)? = payload["input"] else { return nil }
-            toolName = name; surface = door; input = arguments
-        } else {
-            // Legacy Telegram payloads supply reporting identity only. They
-            // never enter generic tool execution or rewrite the stored payload.
-            guard reportingOnly, Self.nonEmptyPayloadString(telegram["chatId"]) != nil,
-                  (Self.nonEmptyPayloadString(origin["sessionId"]) ?? Self.nonEmptyPayloadString(telegram["sessionId"])) != nil,
-                  !rec.isAgentsOwnDecision else { return nil }
-            if case .malformed = TelegramApprovalFiler.recordedTopic(rec.payload) { return nil }
-            toolName = rec.action; surface = "telegram"; input = [:]
-        }
+    static func chatToolApprovalReplay(from rec: ApprovalRecord) -> ChatToolApprovalReplay? {
+        guard case .object(let payload) = rec.payload,
+              payload["kind"] == .string("chat_tool_approval"),
+              case .object(let origin)? = payload["origin"],
+              let toolName = Self.nonEmptyPayloadString(payload["toolName"]),
+              let surface = Self.nonEmptyPayloadString(payload["surface"]),
+              case .object(let input)? = payload["input"] else { return nil }
         let sessionId = Self.nonEmptyPayloadString(origin["sessionId"])
-            ?? Self.nonEmptyPayloadString(telegram["sessionId"])
         let chatId = Self.nonEmptyPayloadString(origin["chatId"])
-            ?? Self.nonEmptyPayloadString(telegram["chatId"])
-        let decidingUser: String? = if !generic, case .telegram(let decidedChat, let user)? = rec.resolutionProvenance,
-            decidedChat == chatId { user } else { nil }
         let verifiedUserId = Self.nonEmptyPayloadString(origin["userId"])
-            ?? Self.nonEmptyPayloadString(telegram["fromUserId"])
-            ?? decidingUser
         let destinationId = Self.nonEmptyPayloadString(origin["destinationId"])
-            ?? (surface == "telegram" ? chatId : nil)
         let threadId = Self.nonEmptyPayloadString(origin["threadId"])
-            ?? Self.nonEmptyPayloadString(telegram["threadId"])
         let sourceKey = Self.nonEmptyPayloadString(origin["sourceKey"])
         let replyTo = Self.nonEmptyPayloadString(origin["replyTo"])
         let correlationId = Self.nonEmptyPayloadString(origin["correlationId"])
@@ -127,15 +94,9 @@ extension ApprovalExecution {
         )
     }
     private static func nonEmptyPayloadString(_ value: JSONValue?) -> String? {
-        let raw: String?
-        switch value {
-        case .string(let s)?: raw = s
-        case .int(let i)?: raw = String(i)
-        case .double(let d)?: raw = Int(exactly: d.rounded(.towardZero)).map { String($0) }
-        default: raw = nil
-        }
-        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty else { return nil }
+        guard case .string(let raw)? = value else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
         return trimmed
     }
     @discardableResult
@@ -149,7 +110,7 @@ extension ApprovalExecution {
         }
         var failures: Set<String> = []
         var executed = 0
-        for rec in records where Self.chatToolApprovalReplay(from: rec, reportingOnly: true) != nil {
+        for rec in records where Self.chatToolApprovalReplay(from: rec) != nil {
             if Self.chatToolApprovalReplay(from: rec) != nil, rec.executedAction == nil {
                 nativeLog("[approvalReconcile] reconciling eligible resolved chat tool approval "
                     + "\(rec.id) action=\(rec.action) decision=\(rec.decision ?? "?")")

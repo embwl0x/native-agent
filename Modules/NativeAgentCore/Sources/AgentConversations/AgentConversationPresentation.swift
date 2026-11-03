@@ -23,7 +23,7 @@ extension AgentConversationSession {
         // Merge contact history with handed-over turns from the chats that asked.
         // Identical reply text within ten minutes is shown once.
         let said = try ContactThread.mergedLines(dataRoot: dataRoot, owner: agent.hasPrefix("peer:") ? String(agent.dropFirst(5)) : agent, identity: AgentContactIdentity(dataRoot: dataRoot))
-        let turns = await HerScreen.routineReplies(dataRoot: dataRoot).filter { turn in
+        let turns = try await HerScreen.routineReplies(dataRoot: dataRoot).filter { turn in
             !said.contains { !$0.mine && $0.text == turn.text && abs($0.at.timeIntervalSince(turn.date ?? $0.at)) < 600 }
         }
         let talk = ContactThread.project((said + turns).sorted { $0.at < $1.at }.suffix(8), names: [agent: name], unattested: name,
@@ -102,7 +102,8 @@ extension AgentConversationSession {
             $0.automaticRead = $0.phase == "waiting" && $0.readInput != nil
                 && (peer?.transport == .a2a || peer?.transport == .nativeAgent)
             $0.nextReadAt = $0.automaticRead ? Date() : nil
-            if !isRefusal(receipt) { $0.selected = true }
+            let macHeld = $0.sendEvidence["reason"] == .string("mac_busy") && $0.sendStatus == "held"
+            if !isRefusal(receipt) || macHeld { $0.selected = true }
             if let firstActivity, let index = $0.exchanges?.lastIndex(where: { $0.id == row.operationID }) {
                 $0.exchanges?[index].firstActivityAt = firstActivity
             }
@@ -110,13 +111,13 @@ extension AgentConversationSession {
             // Publish settlement and delivery together, before a queued sender
             // can observe the finished exchange and advance this conversation.
             if background, $0.personInitiated != true, $0.phase != "waiting", !heldReplyPending($0), !$0.automaticRead,
-               !stoppedOrReleased($0), !AgentConversationRunning.shared.watched($0.id) {
+               !macHeld, !stoppedOrReleased($0), !AgentConversationRunning.shared.watched($0.id) {
                 $0.deliveryState = "delivering"; $0.automaticRead = true; $0.nextReadAt = Date()
             }
             // A queued follow-up went while nobody was waiting on this call: a
             // contact's answer (or its refusal) then comes to her as a turn, as a
             // delayed reply does. A send-only route has nothing to hand over.
-            if queued, $0.personInitiated != true, peer != nil, !$0.automaticRead, $0.phase != "waiting",
+            if queued, !macHeld, $0.personInitiated != true, peer != nil, !$0.automaticRead, $0.phase != "waiting",
                case .object(let fields)? = $0.receipt, AgentConversationView.reply(fields) != nil || fields["sent"] == .bool(false) {
                 $0.deliveryState = "delivering"; $0.automaticRead = true; $0.nextReadAt = Date()
             }
@@ -195,7 +196,7 @@ extension AgentConversationSession {
                   case .object(let action) = locator, case .object(var read)? = action["input"] {
             read["details"] = .bool(true); row.readInput = read
         }
-        let state = GrokBotRoute.normalizedStatus(row.sendStatus)
+        let state = row.sendStatus
         // A contact that pulls (an MCP host with no command line) took nothing
         // yet: the message is held and the thread is free (`takeHeld` drains it).
         if state == "held" {

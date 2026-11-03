@@ -4,7 +4,7 @@ import AgentWorkspace
 import BackgroundLoops
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `DelegationOutcome.swift` | Store-read availability and delegated outcome/liveness interpretation; terminal outcomes remain distinct from stalls |
+// Blueprint: | `DelegationOutcome.swift` | Store-read availability and delegated outcome/liveness interpretation; owner-proven terminal records need no execution timestamp and remain distinct from stalls |
 // Terminal outcomes remain distinct from the projector's stall classification.
 // A durable cursor advances only after the corresponding card is written.
 
@@ -17,10 +17,12 @@ public struct DelegationJobsRead: Sendable, Equatable {
     /// or parsed. An ABSENT store is readable — a bridge that is not configured
     /// on this machine is not a failed read.
     public var allStoresReadable: Bool
+    public var availabilityError: String?
 
-    public init(jobs: [DelegationReadout], allStoresReadable: Bool) {
+    public init(jobs: [DelegationReadout], allStoresReadable: Bool, availabilityError: String? = nil) {
         self.jobs = jobs
         self.allStoresReadable = allStoresReadable
+        self.availabilityError = availabilityError
     }
 }
 extension DelegationReadout {
@@ -57,12 +59,15 @@ extension DelegationReadout {
         return state?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             == "delivering"
     }
-    /// True when this record proves the run ENDED with an outcome.
+    /// True when runner or delivery-owner evidence proves a terminal record;
+    /// delivery settlement need not carry an execution completion timestamp.
     public var isTerminal: Bool {
+        if statusWord == "observation_unavailable" { return false }
         if completedAt != nil { return true }
         // Delivery evidence — the settlement written AFTER the POST — is what
         // makes a finished run terminal.
         if isDelivering { return false }
+        if stallBasis == .terminal { return true }
         if let statusWord, Self.terminalStatusWords.contains(statusWord) { return true }
         return false
     }
@@ -99,7 +104,11 @@ extension DelegationReadout {
         let phase: MotorActionPhase
         let verification: MotorVerificationState
         let next: String?
-        if isTerminal && deliveryOutcome == "blocked" && deliveryLost != true {
+        if statusWord == "observation_unavailable" {
+            phase = .unknown
+            verification = .unknown
+            next = "Completion observation is unavailable. Repair the named evidence source and inspect the existing turn; do not interrupt or replay it from silence."
+        } else if isTerminal && deliveryOutcome == "blocked" && deliveryLost != true {
             phase = .blocked
             verification = .unknown
             next = "Inspect the retained result and resolve the original completion route before explicitly delivering it. Do not rerun the worker."

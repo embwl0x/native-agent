@@ -11,7 +11,7 @@ import PersistenceCore
 import Desk
 import ProviderRouting
 
-// Blueprint: | `NativeCognitionRuntime+Reflection.swift` | `NativeCognitionRuntime` reflection: dream/REM-triggered single-flight reflection, budget admission, result settlement and pursuit proposals |
+// Blueprint: | `NativeCognitionRuntime+Reflection.swift` | `NativeCognitionRuntime` reflection: dream-journal checked completion, REM-triggered single-flight reflection, budget admission, durable result settlement and pursuit proposals |
 
 private enum CognitiveReflectionPersonaError: Error, Sendable, CustomStringConvertible {
     case compileFailed(String)
@@ -28,6 +28,69 @@ private enum CognitiveReflectionPersonaError: Error, Sendable, CustomStringConve
 }
 
 extension NativeCognitionRuntime {
+    /// Produce once, integrate later. The provider receipt is durable before
+    /// returning to the dream journal; recovery finds it by this exact reason.
+    public func produceDreamReflection(id: UUID, material: [String: CognitiveReflectionCause]) async throws -> CognitiveReflectionReceipt? {
+        await bootstrap()
+        guard usesLiveAppBody, !isFlushedForTermination, !Task.isCancelled else {
+            throw PersistenceCoreError.ioFailure("dream reflection awaits the running mind")
+        }
+        if let bootstrapFailure { throw PersistenceCoreError.ioFailure(bootstrapFailure) }
+        let reason = "dream:\(id.uuidString)"
+        if let receipt = await substrate.reflectionReceiptSnapshot().first(where: {
+            $0.request.reason == reason && !$0.cancelled && $0.judgment != nil
+        }) {
+            try await substrate.checkpointReflectionResultChecked(receipt)
+            return receipt
+        }
+        let configuration = await substrate.configurationSnapshot()
+        guard configuration.enabled, configuration.reflectiveCallsEnabled else { return nil }
+        guard configuration.persistenceEnabled else {
+            throw PersistenceCoreError.ioFailure("dream reflection requires durable inner life")
+        }
+        let replay = await runEventDrivenReplayWithDeadline(reason: reason, material: nil)
+        switch replay {
+        case .completed: break
+        case .skipped(let detail, _) where detail == "no new replay evidence": break
+        case .skipped(let detail, _), .failed(let detail):
+            throw PersistenceCoreError.ioFailure("dream reflection awaits replay: \(detail)")
+        }
+        let outcome = await runReflectionIfDue(
+            llm: host.backgroundLLMClient(dataRoot: dataRoot, cognition: self),
+            reason: reason, material: material, demand: .spontaneous, retainForDream: true)
+        await reportLoopOutcome(loopId: "cognition_reflection", outcome: outcome)
+        // Even a persistence failure retains the produced receipt in the owner.
+        // Never filter it out because its care or mood steps remain owed.
+        if let receipt = await substrate.reflectionReceiptSnapshot().first(where: {
+            $0.request.reason == reason && !$0.cancelled && $0.judgment != nil
+        }) {
+            try await substrate.checkpointReflectionResultChecked(receipt)
+            return receipt
+        }
+        switch outcome {
+        case .failed(let error): throw PersistenceCoreError.ioFailure("dream reflection failed: \(error)")
+        case .skipped(let reason, _): throw PersistenceCoreError.ioFailure("dream reflection remains owed: \(reason)")
+        case .completed: throw PersistenceCoreError.ioFailure("dream reflection returned no judgment receipt")
+        }
+    }
+
+    public func integrateDreamReflection(_ receipt: CognitiveReflectionReceipt) async throws -> String? {
+        await bootstrap()
+        if let bootstrapFailure { throw PersistenceCoreError.ioFailure(bootstrapFailure) }
+        guard !isFlushedForTermination, await substrate.configurationSnapshot().persistenceEnabled else {
+            throw PersistenceCoreError.ioFailure("dream reflection integration awaits saved inner life")
+        }
+        let result: Result<Void, Error> = await settle { [self] in
+            do { try await substrate.persistReflectionResultChecked(receipt); return .success(()) }
+            catch { return .failure(error) }
+        }
+        try result.get()
+        if !Task.isCancelled, !isFlushedForTermination {
+            await proposePursuitFromReflectionIfEligible(reason: receipt.request.reason)
+        }
+        return await substrate.reflectionReceiptSnapshot().first { $0.id == receipt.id }?.integrationSkipped
+    }
+
     /// Reflection follows the committed dream/REM replay. Each caller retains its
     /// committed material while awaiting the existing single-flight owner.
     /// Budget/enabled/reservation gating stays inside `runReflectionIfDue`;
@@ -66,7 +129,8 @@ extension NativeCognitionRuntime {
         reason: String,
         material: [String: CognitiveReflectionCause]? = nil,
         demand: CognitiveReflectionDemand = .requested,
-        sameSourceCooldown: TimeInterval? = nil
+        sameSourceCooldown: TimeInterval? = nil,
+        retainForDream: Bool = false
     ) async -> LoopTickOutcome {
         await bootstrap()
         if let bootstrapFailure { return .failed(error: bootstrapFailure) }
@@ -94,14 +158,14 @@ extension NativeCognitionRuntime {
             return .skipped(reason: admission.reason == CognitiveSubstrate.reflectionRefusalDisabled
                 ? LoopTickOutcome.offPrefix + "reflection disabled" : admission.detail)
         }
-        let reflectionOutcome = await executeReflection(request: request, llm: llm)
+        let reflectionOutcome = await executeReflection(request: request, llm: llm, retainForDream: retainForDream)
         if case .skipped(let why, _) = reflectionOutcome, why != "reflection cancelled" {
             // Routing refused before any provider work; return the unused slot.
             // A cancellation came after the provider call began: the slot is spent.
             _ = await lease.releaseUnused(holder: "reflection", window: window)
         }
         publishRuntimeChange(reason: "reflection:finished")
-        if case .completed = reflectionOutcome, !Task.isCancelled, !isFlushedForTermination {
+        if case .completed = reflectionOutcome, !retainForDream, !Task.isCancelled, !isFlushedForTermination {
             await proposePursuitFromReflectionIfEligible(reason: reason)
         }
         return reflectionOutcome
@@ -117,17 +181,10 @@ extension NativeCognitionRuntime {
         let citations = state.items.filter { $0.isPursuit && $0.origin == .agent }.flatMap {
             $0.pursuit?.evidence.citations ?? []
         }
-        var cited = Set(citations.compactMap { citation -> String? in
+        let cited = Set(citations.compactMap { citation -> String? in
             if case .care(let id) = citation { return id }
             return nil
         })
-        let carried = Set(citations.compactMap { citation -> String? in
-            if case .standingView(let id) = citation { return id }
-            return nil
-        })
-        for care in cares {
-            if case .migrated(let id) = care.origin, carried.contains(id) { cited.insert(care.id.uuidString) }
-        }
         guard let proposal = AutonomousPursuitProposer.propose(
             cares: cares, openAgentPursuitCount: open.count, citedCareIds: cited) else { return }
         do {
@@ -197,7 +254,8 @@ extension NativeCognitionRuntime {
         }
         let outcome = await executeReflection(
             request: request,
-            llm: host.backgroundLLMClient(dataRoot: dataRoot, cognition: self)
+            llm: host.backgroundLLMClient(dataRoot: dataRoot, cognition: self),
+            retainForDream: false
         )
         publishRuntimeChange(reason: "reflection:manual_finished")
         return outcome
@@ -206,7 +264,8 @@ extension NativeCognitionRuntime {
     @discardableResult
     private func executeReflection(
         request: CognitiveReflectionRequest,
-        llm: any LLMClient
+        llm: any LLMClient,
+        retainForDream: Bool
     ) async -> LoopTickOutcome {
         let result: CognitiveReflectionJudgment
         // Bind one checked route for execution and receipt attribution.
@@ -253,7 +312,7 @@ extension NativeCognitionRuntime {
                 }
             }
             result = try JSONDecoder().decode(CognitiveReflectionJudgment.self, from: Data(raw.utf8))
-            try result.validate(material: request.material)
+            try result.validate(material: request.material, cares: request.cares)
         } catch let error as CognitiveReflectionPersonaError {
             await substrate.recordReceipt(
                 kind: "reflection.persona_load_failed",
@@ -292,8 +351,9 @@ extension NativeCognitionRuntime {
             request: request,
             resultSummary: result.reflection,
             judgment: result,
+            retainForDream: retainForDream,
             rejection: "reflection result was not accepted by the substrate",
-            persistenceFailure: "reflection integrated but receipt persistence failed"
+            persistenceFailure: "reflection judgment or effect settlement remains owed"
         ) { return failure }
         let persistenceEnabled = await substrate.configurationSnapshot().persistenceEnabled
         return .completed(result: persistenceEnabled
@@ -306,18 +366,20 @@ extension NativeCognitionRuntime {
         resultSummary: String,
         judgment: CognitiveReflectionJudgment? = nil,
         cancelled: Bool = false,
+        retainForDream: Bool = false,
         rejection: String,
         persistenceFailure: String
     ) async -> LoopTickOutcome? {
         await settle { [self] in
             await self.persistReflectionSettlement(request: request, resultSummary: resultSummary,
-                judgment: judgment, cancelled: cancelled, rejection: rejection, persistenceFailure: persistenceFailure)
+                judgment: judgment, cancelled: cancelled, retainForDream: retainForDream,
+                rejection: rejection, persistenceFailure: persistenceFailure)
         }
     }
 
     private func persistReflectionSettlement(
         request: CognitiveReflectionRequest, resultSummary: String,
-        judgment: CognitiveReflectionJudgment?, cancelled: Bool,
+        judgment: CognitiveReflectionJudgment?, cancelled: Bool, retainForDream: Bool,
         rejection: String, persistenceFailure: String
     ) async -> LoopTickOutcome? {
         // Internal reflection mutations use the same coalesced settlement as sensory input.
@@ -327,12 +389,14 @@ extension NativeCognitionRuntime {
             resultSummary: resultSummary,
             provider: request.provider,
             cancelled: cancelled,
-            judgment: judgment
+            judgment: judgment,
+            journalPending: retainForDream
         ) else { return .failed(error: rejection) }
         do {
-            try await substrate.persistReflectionResultChecked(receipt)
+            try await substrate.checkpointReflectionResultChecked(receipt)
+            if !retainForDream { try await substrate.persistReflectionResultChecked(receipt) }
         } catch {
-            // A persistence failure never integrates the result a second time.
+            // The retained judgment and each pending effect survive failure.
             return .failed(error: "\(persistenceFailure): \(error.localizedDescription)")
         }
         return nil
@@ -342,8 +406,8 @@ extension NativeCognitionRuntime {
         let persona = cognitionPersonaEngine()
         let packet: PersonalityPacket
         do {
-            let userMemoryCore = MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot)
-                ? await SwiftNativeMemoryV2.userCoreForBackground(dataRoot: dataRoot)
+            let userMemoryCore = try MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot)
+                ? try await SwiftNativeMemoryV2.userCoreForBackground(dataRoot: dataRoot)
                 : []
             packet = try await PersonaCompiler(engine: persona).compile(
                 surface: surface, userMemoryCore: userMemoryCore

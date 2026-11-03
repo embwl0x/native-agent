@@ -3,9 +3,8 @@ import MacControl
 import ChatTurnRuntime
 import ChatTurnContracts
 import PersistenceCore
-import PersonaEngine
 
-// Blueprint: | `SlackTurnIngress.swift` | `SlackSocketModeLoop.ifConfigured`: configured Slack ingress, engine-profiled chat and settled-turn signal wiring without forged signature authority |
+// Blueprint: | `SlackTurnIngress.swift` | Configured Slack ingress uses shared installation persona selection, engine-profiled chat, settled-turn signals and Slack allowlist authority |
 
 extension SlackSocketModeLoop {
     /// Why `ifConfigured` built nothing, said as the lane's Off reason: Socket
@@ -29,7 +28,7 @@ extension SlackSocketModeLoop {
             return nil
         }
         let client = makeChatClient()
-        let handler: SlackProgressChat = { inbound, sessionId, progress in
+        let handler: SlackProgressChat = { inbound, sessionId in
             let takeover = await MacWorkContinuation.admit(inbound.text)
             let prompt = """
             [from: slack, user: \(inbound.userId), channel: \(inbound.channelId)]
@@ -48,7 +47,6 @@ extension SlackSocketModeLoop {
                 // The chat facade admits the complete checked tuple once;
                 // surface shells provide no stale partial pick.
                 attachments: inbound.attachments,
-                persona: PersonaCompiler.agentDisplayName(dataRoot: dataRoot),
                 surface: "slack",
                 verifiedChatID: inbound.channelId,
                 verifiedUserID: inbound.userId,
@@ -58,14 +56,10 @@ extension SlackSocketModeLoop {
             let response: ChatResponse
             do {
                 defer { turnCompleted(sessionId) }
-                // Forward only notices, one line per kind, to keep tool events out of the channel.
+                // The surface owns delivery of prose and notices; tool events stay local.
                 response = try await MacWorkContinuation.$current.withValue(takeover) {
-                try await TurnAdmission.shared.run(sessionID: sessionId) {
-                    try await request.chat(on: client, progress: { event in
-                        if case .notice(let kind, let text) = event {
-                            await progress(kind, text)
-                        }
-                    })
+                try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionId) {
+                    try await request.chat(on: client)
                 }
                 }
             }

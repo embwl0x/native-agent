@@ -2,7 +2,7 @@ import Foundation
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TrustCenter+PolicyLoading.swift` | Canonical checked policy bytes, decode/shape validation and normalization, also used by SavedTrustPolicyAuthority's exact-byte validation cache; absent files and validated empty objects receive fresh-install additions |
+// Blueprint: | `TrustCenter+PolicyLoading.swift` | Canonical checked policy bytes, authority types and closed posture validation before normalization; shared with SavedTrustPolicyAuthority's exact-byte validation cache; absent files and validated empty objects alone receive fresh-install additions |
 
 /// One checked authority generation for a SecurityCenter decision, read from
 /// one set of saved bytes so an effect-time gate cannot splice concurrent
@@ -78,8 +78,7 @@ extension SwiftNativeTrustCenter {
     }
 
     /// Canonical defaults define known field types. Optional authority booleans
-    /// and both Workshop spellings share this schema; validate both spellings
-    /// before folding so a shadowed malformed block cannot disappear.
+    /// share the current policy schema.
     /// Unknown metadata is retained without acquiring authority.
     public nonisolated static func validateKnownAuthorityPolicyTypes(
         _ policy: [String: JSONValue],
@@ -88,7 +87,10 @@ extension SwiftNativeTrustCenter {
         var schema = defaults
         schema["developerMode"] = .bool(false)
         schema["enableAutonomy"] = .bool(false)
-        schema[WorkshopPolicyBlockVocabulary.futureKey] = defaults[WorkshopPolicyBlockVocabulary.wireKey]
+        var security = defaults["securityPolicy"]?.objectValue ?? [:]
+        security["trustedRemoteHighRiskAllowed"] = .bool(true)
+        security["shellSandboxEnabled"] = .bool(true)
+        schema["securityPolicy"] = .object(security)
         for (key, value) in policy {
             guard let expected = schema[key] else { continue }
             try validateKnownAuthorityPolicyValue(
@@ -96,6 +98,15 @@ extension SwiftNativeTrustCenter {
                 against: expected,
                 path: key
             )
+        }
+        for (path, value, accepted) in [
+            ("permissionLevel", policy["permissionLevel"], ["strict", "balanced", "full_mac_os"]),
+            ("autonomyDefault", policy["autonomyDefault"], ["supervised", "app_data_autonomous", "workspace_autonomous"]),
+            ("filePolicy.outsideWorkspaceDefault", policy["filePolicy"]?.objectValue?["outsideWorkspaceDefault"], ["deny", "ask", "allow"]),
+        ] {
+            if let value, !accepted.contains(value.stringValue ?? "") {
+                throw Self.policyReadFailure("trust_policy_invalid_field", "Saved Trust policy field \(path) must be one of: \(accepted.joined(separator: ", ")).")
+            }
         }
     }
 
@@ -145,26 +156,12 @@ extension SwiftNativeTrustCenter {
     public func loadAuthorizationSnapshotChecked() async throws -> TrustPolicyAuthorizationSnapshot {
         let sourcePresent = FileManager.default.fileExists(atPath: trustPolicyURL.path)
         let defaults = defaultTrustPolicy()
-        let saved = WorkshopPolicyBlockVocabulary.foldToWireKey(
-            try Self.loadRawPolicyChecked(at: trustPolicyURL, defaults: defaults))
+        let saved = try Self.loadRawPolicyChecked(at: trustPolicyURL, defaults: defaults)
         return TrustPolicyAuthorizationSnapshot(
             // An empty policy file (setup writes `{}` before the person has
             // chosen anything) is a fresh install too.
             policy: normalizedTrustPolicy(saved: saved, defaults: defaults, freshInstall: !sourcePresent || saved.isEmpty)
         )
-    }
-
-    /// Nonthrowing projection uses the fail-closed policy when checked authority is invalid.
-    public func loadAuthorizationSnapshot() async -> TrustPolicyAuthorizationSnapshot {
-        do {
-            return try await loadAuthorizationSnapshotChecked()
-        } catch {
-            return TrustPolicyAuthorizationSnapshot(policy: failClosedTrustPolicy())
-        }
-    }
-
-    public func loadTrustPolicy() async -> [String: JSONValue] {
-        await loadAuthorizationSnapshot().policy
     }
 
     private var trustPolicyURL: URL {
@@ -187,8 +184,6 @@ extension SwiftNativeTrustCenter {
         freshInstall: Bool = false
     ) -> [String: JSONValue] {
         var merged = defaults
-        // Both workshop policy spellings normalize to the persisted missionPolicy key before merging.
-        let savedDict = WorkshopPolicyBlockVocabulary.foldToWireKey(savedDict)
         for (k, v) in savedDict {
             if case .object(let savedNested) = v,
                case .object(let defNested)? = merged[k] {
@@ -211,87 +206,18 @@ extension SwiftNativeTrustCenter {
         return Self.normalizeTrustPolicy(merged)
     }
 
-    private func failClosedTrustPolicy() -> [String: JSONValue] {
-        var policy = normalizedTrustPolicy(saved: [:], defaults: defaultTrustPolicy())
-        policy["developerMode"] = .bool(false)
-        policy["permissionLevel"] = .string("balanced")
-        policy["autonomyDefault"] = .string("supervised")
-        policy["enableAutonomy"] = .bool(false)
-        policy[WorkshopPolicyBlockVocabulary.wireKey] = .object([
-            "enabled": .bool(false),
-        ])
-        policy["trainingPolicy"] = .object([
-            "dream_scheduler": .bool(false),
-        ])
-        policy["memoryPolicy"] = .object([
-            "cross_session_recall": .bool(false),
-            "knowledge_graph_enabled": .bool(false),
-            "adaptive_promotion": .bool(false),
-            "vault_enabled": .bool(false),
-            "vault_require_encryption": .bool(true),
-        ])
-        policy["multimodalPolicy"] = .object([
-            "screen_capture": .bool(false),
-            "vision_api_calls": .bool(false),
-            "file_ingestion_pdf": .bool(false),
-            "file_ingestion_docx": .bool(false),
-            "image_generation_openai": .bool(false),
-            "tts_openai": .bool(false),
-        ])
-        policy["inboxPolicy"] = .object(["enabled": .bool(false)])
-        policy["swarmPolicy"] = .object([
-            "enabled": .bool(false),
-            "maxAgents": .int(0),
-            "maxParallel": .int(0),
-            "storeReceipts": .bool(true),
-        ])
-        policy["macControlPolicy"] = .object([
-            "enabled": .bool(false),
-            "applescript_allowed": .bool(false),
-            "jxa_allowed": .bool(false),
-            "shortcuts_allowed": .bool(false),
-            "accessibility_allowed": .bool(false),
-            "system_control_allowed": .bool(false),
-            "file_ops_allowed": .bool(false),
-            "shell_allowed": .bool(false),
-            "notifications_allowed": .bool(false),
-            "spotlight_allowed": .bool(false),
-            "remote_from_ios_allowed": .bool(false),
-        ])
-        policy["securityPolicy"] = .object([
-            "signedRemoteCommandsRequired": .bool(true),
-            "auditReceiptsEnabled": .bool(true),
-            "allowAppNotifications": .bool(false),
-            "killSwitchEnabled": .bool(true),
-        ])
-        return policy
-    }
-
     /// Normalize saved trust policy into the shape expected by Swift gates.
     ///
     /// Live authority normalization:
-    ///   1. `autonomyDefault` ∈ {supervised, app_data_autonomous,
-    ///      workspace_autonomous}; else → "supervised".
-    ///   2. `filePolicy.outsideWorkspaceDefault` backfilled to "deny".
-    ///   3. Shell and system control are disabled outside `developerMode`.
+    ///   1. `filePolicy.outsideWorkspaceDefault` backfilled to "deny".
+    ///   2. Shell and system control are disabled outside `developerMode`.
+    /// Closed posture values are validated before normalization, never replaced.
     nonisolated static func normalizeTrustPolicy(
         _ policy: [String: JSONValue]
     ) -> [String: JSONValue] {
         var out = policy
 
-        // 1. autonomyDefault validity.
-        let validAutonomy: Set<String> = [
-            "supervised", "app_data_autonomous", "workspace_autonomous",
-        ]
-        let currentAutonomy: String = {
-            if case .string(let s)? = out["autonomyDefault"] { return s }
-            return ""
-        }()
-        if !validAutonomy.contains(currentAutonomy) {
-            out["autonomyDefault"] = .string("supervised")
-        }
-
-        // 2. filePolicy.outsideWorkspaceDefault backfill.
+        // Absent selection uses the shipped outside-workspace default.
         var filePolicy: [String: JSONValue] = [:]
         if case .object(let fp)? = out["filePolicy"] { filePolicy = fp }
         if filePolicy["outsideWorkspaceDefault"] == nil {

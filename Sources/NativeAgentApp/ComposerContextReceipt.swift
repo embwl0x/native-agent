@@ -1,9 +1,10 @@
 import SwiftUI
 import ChatTurnRuntime
+import ChatSessionWork
 import EngineRuntime
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `ComposerContextReceipt.swift` | `ComposerContextReceiptBody`, `ComposerContextReceiptCard` views; `LatestRead` on the shell (or standalone card) orders receipt publication |
+// Blueprint: | `ComposerContextReceipt.swift` | Composer receipt views; shell LatestRead orders receipts; fed-text LatestRead binds loading/missing/loaded/unavailable publication to root, session and refresh |
 
 // MARK: - The receipt body, shared by the composer card and the classic panel
 
@@ -148,8 +149,9 @@ struct ComposerContextReceiptCard: View {
     @Environment(AppModel.self) private var appModel
     private var windowModel: String { model ?? appModel.chatModel }
     // Settings › Context window: a change re-sizes the window at once.
-    @AppStorage("nativeagent.contextWindowMode") private var windowMode = ""
-    @AppStorage("nativeagent.compactionThresholdTokens") private var windowSize = 0
+    @AppStorage(ChatSessionAutocompactionConfig.contextWindowModeKey) private var windowMode = "model"
+    @AppStorage(ChatSessionAutocompactionConfig.defaultsKey) private var windowSize = 200_000
+    @AppStorage(ChatSessionAutocompactionConfig.compactionPercentKey) private var compactionPercent = ChatSessionAutocompactionConfig.defaultCompactionPercent
     /// A completed turn refreshes the receipt already open in the shell.
     @State private var refreshToken = 0
 
@@ -161,7 +163,7 @@ struct ComposerContextReceiptCard: View {
             }
         }
             // Quiet reads await publication; model and window changes refresh the receipt.
-            .quietReadTask(id: "\(sessionId):\(refreshToken):\(windowModel):\(windowMode):\(windowSize)") {
+            .quietReadTask(id: "\(sessionId):\(refreshToken):\(windowModel):\(windowMode):\(windowSize):\(compactionPercent)") {
                 // Clear the previous receipt before reading this conversation.
                 shell.contextReceipt = .loading
                 _ = await shell.contextReceiptRead.read({ await ContextReceipts.read(
@@ -192,7 +194,11 @@ struct ComposerContextFedText: View {
     /// A completed turn reloads an open view.
     let refresh: Int
     @State private var open = false
-    @State private var text: String?
+    @State private var text = "Reading…"
+    @State private var latest = LatestRead()
+
+    private var readIdentity: String { dataRoot.standardizedFileURL.path + "\u{1F}" + sessionId + ":\(refresh)" }
+    @State private var loadedIdentity: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -208,7 +214,7 @@ struct ComposerContextFedText: View {
             .accessibilityIdentifier("chat.composer.context.fed.toggle")
             if open {
                 ScrollView {
-                    Text(text ?? "Reading…")
+                    Text(loadedIdentity == readIdentity ? text : "Reading…")
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(NativeAgentShell.text)
                         .textSelection(.enabled)
@@ -217,19 +223,28 @@ struct ComposerContextFedText: View {
                 // A fixed height: inside a popover a scroll view with only a
                 // maximum measures to zero and opens empty.
                 .frame(height: 300)
-                .task(id: "\(sessionId):\(refresh)") { await load() }
+                .task(id: readIdentity) { await load() }
             }
         }
     }
 
     private func load() async {
-        let sessionId = sessionId, dataRoot = dataRoot
-        let record = await Task.detached { ContextFedRecord.load(sessionId: sessionId, dataRoot: dataRoot) }.value
-        guard let record else {
-            text = "Nothing saved yet for this conversation. It is kept from the next turn on."
-            return
+        guard !Task.isCancelled else { return }
+        let sessionId = sessionId, dataRoot = dataRoot, identity = readIdentity
+        latest.write { text = "Reading…"; loadedIdentity = identity }
+        _ = await latest.read {
+            await Task.detached { ContextFedRecord.load(sessionId: sessionId, dataRoot: dataRoot) }.value
+        } publish: { result in
+            loadedIdentity = identity
+            switch result {
+            case .missing:
+                text = "No saved context record exists for this conversation."
+            case .unavailable(let reason):
+                text = "Saved context could not be read: " + reason
+            case .loaded(let record):
+                let brief = record.brief.isEmpty ? "" : "\n\n— Turn brief —\n" + record.brief
+                text = record.fed + brief
+            }
         }
-        let brief = record.brief.isEmpty ? "" : "\n\n— Turn brief —\n" + record.brief
-        text = record.fed + brief
     }
 }

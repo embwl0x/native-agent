@@ -87,12 +87,12 @@ private struct BubbleAction: View {
 
 /// Encode the canonical message for debug inspection, preserving wire shape and recorded origin.
 enum ChatMessageDebugJSON {
-    static func text(for message: ChatMessage) -> String {
+    static func text(for message: ChatMessage) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(message),
-              let string = String(data: data, encoding: .utf8) else {
-            return "{}"
+        let data = try encoder.encode(message)
+        guard let string = String(data: data, encoding: .utf8) else {
+            throw CocoaError(.fileReadInapplicableStringEncoding)
         }
         return string
     }
@@ -103,6 +103,7 @@ struct MessageJSONSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var jsonText = ""
+    @State private var encodingError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -115,7 +116,7 @@ struct MessageJSONSheet: View {
                     .controlSize(.small)
             }
             ScrollView {
-                Text(jsonText)
+                Text(encodingError.map { "Message data unavailable: \($0). Resolve the encoding problem before inspecting this message again." } ?? jsonText)
                     .font(NativeAgentFont.mono)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -126,10 +127,14 @@ struct MessageJSONSheet: View {
         .frame(width: 540, height: 420)
         .houseSheet()
         .task(id: message) {
-            let text = await Task.detached(priority: .userInitiated) { [message] in
-                ChatMessageDebugJSON.text(for: message)
+            let result = await Task.detached(priority: .userInitiated) { [message] in
+                Result { try ChatMessageDebugJSON.text(for: message) }
             }.value
-            if !Task.isCancelled { jsonText = text }
+            guard !Task.isCancelled else { return }
+            switch result {
+            case .success(let text): jsonText = text; encodingError = nil
+            case .failure(let error): jsonText = ""; encodingError = error.localizedDescription
+            }
         }
     }
 }

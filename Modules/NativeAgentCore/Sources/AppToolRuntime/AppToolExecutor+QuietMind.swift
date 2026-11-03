@@ -10,7 +10,7 @@ import PersonaEngine
 import PersistenceCore
 import Studio
 import TrustCenter
-// Blueprint: | `AppToolExecutor+QuietMind.swift` | quiet mind commands and decision receipts |
+// Blueprint: | `AppToolExecutor+QuietMind.swift` | Quiet mind commands; explicit dream and clock previews route before bootstrap and real effect callbacks, returning owner decisions or specific refusals |
 
 public typealias QuietMindOutcome = (ok: Bool, detail: String, fields: [String: JSONValue])
 
@@ -44,15 +44,28 @@ extension AppToolExecutor {
     public static func runQuietMind(
         verb: String, input: [String: JSONValue], runtime: NativeCognitionRuntime,
         dataRoot: URL, remPolicy: TrustPolicy?,
-        dreamEnabled: () async -> Bool,
+        dreamEnabled: () async throws -> Bool,
         runDream: () async -> (succeeded: Bool, status: String, error: String?),
+        previewDream: () async -> QuietMindOutcome,
         runREM: () async -> (succeeded: Bool, message: String),
         runGrowth: () async -> (succeeded: Bool, note: String)
     ) async -> QuietMindOutcome {
+        if input["preview"] == .bool(true) {
+            if verb == "dream" { return await previewDream() }
+            if let clock = MindClockVerb(rawValue: verb) {
+                let result = await runtime.runClockNow(verb: clock, input: input)
+                return (result.ok, result.why, result.json)
+            }
+        }
         switch verb {
         case "dream":
-            guard await dreamEnabled() else {
-                return (false, "Your dream cycle is off. setting.set with setting personality.dreams, value true turns it on; then run again.", [:])
+            do {
+                guard try await dreamEnabled() else {
+                    return (false, "Your dream cycle is off. setting.set with setting personality.dreams, value true turns it on; then run again.", [:])
+                }
+            } catch {
+                return (false, error.localizedDescription,
+                    ["status": .string("unavailable"), "error": .string("trust_policy_unavailable")])
             }
             let run = await runDream()
             guard run.succeeded else {
@@ -79,6 +92,10 @@ extension AppToolExecutor {
         default: break
         }
         await runtime.bootstrap()
+        if let clock = MindClockVerb(rawValue: verb) {
+            let result = await runtime.runClockNow(verb: clock, input: input)
+            return (result.ok, result.why, result.json)
+        }
         let config = await runtime.substrate.configurationSnapshot()
         guard config.enabled else {
             return (false, "Your inner life is off. setting.set with setting settings.inner_life, value true turns it on.", [:])

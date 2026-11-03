@@ -5,7 +5,7 @@ import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SensesContract.swift` | Shared sense records, wire validators, notebook bounds, native catalog, memory provenance and crossing contracts; built-in origins retain legacy spelling and provenance age formatting rejects invalid times |
+// Blueprint: | `SensesContract.swift` | Shared sense records, current JavaScript/native languages and canonical origin vocabulary, wire validators, notebook bounds, native catalog, memory provenance and crossing contracts; provenance age formatting rejects invalid times |
 
 // Shared sense contract: pages, named things, addresses and change news; behavior owners are in docs/SENSES.md.
 
@@ -167,8 +167,7 @@ public enum SenseStatus: String, Codable, Sendable { case draft, on, off, unavai
 
 /// The language a sense is written in. `native` = a built-in Swift sense
 /// (our existing corners, wrapped unchanged on day one).
-// swift is retained only to decode historical authored records.
-public enum SenseLanguage: String, Codable, Sendable { case javascript, swift, native }
+public enum SenseLanguage: String, Codable, Sendable { case javascript, native }
 
 /// On call: runs when she reads or acts, then stops. Live: keeps running to
 /// follow or maintain its corner, supervised and restarted from its state.
@@ -179,7 +178,6 @@ public enum SenseOrigin: String, Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let value = try decoder.singleValueContainer().decode(String.self)
-        if value == "built_in" { self = .builtIn; return }
         guard let origin = Self(rawValue: value) else {
             throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unknown sense origin: \(value)"))
         }
@@ -217,7 +215,7 @@ public struct SenseRecord: Codable, Sendable, Hashable {
     public var reach: SenseReach
     /// Source entry name, retained for bundled modules and portable exports (nil for `native`).
     public var entry: String?
-    /// Validated program identity; absent for bundled and migrated source-only abilities.
+    /// Validated program identity; absent for bundled JavaScript and native senses.
     public var candidateDigest: String?
     public var disabledBy: String?
     /// The verbs it offers on its things, for door discovery.
@@ -272,8 +270,6 @@ public struct SenseRecord: Codable, Sendable, Hashable {
         let created = try fields.decodeIfPresent(Date.self, forKey: .createdAt)
         createdAt = origin == .builtIn ? nil : created
         enabledAt = try fields.decodeIfPresent(Date.self, forKey: .enabledAt)
-        // Older bundles used Unix zero as both dates. It was never an event.
-        if origin == .builtIn, enabledAt == Date(timeIntervalSince1970: 0) { enabledAt = nil }
         lastUsedAt = try fields.decodeIfPresent(Date.self, forKey: .lastUsedAt)
         uses = try fields.decode(Int.self, forKey: .uses)
         corrections = try fields.decode(Int.self, forKey: .corrections)
@@ -297,9 +293,7 @@ public struct SenseRecord: Codable, Sendable, Hashable {
         try fields.encodeIfPresent(disabledBy, forKey: .disabledBy)
         try fields.encode(verbs, forKey: .verbs)
         if origin != .builtIn { try fields.encodeIfPresent(createdAt, forKey: .createdAt) }
-        if origin != .builtIn || enabledAt != Date(timeIntervalSince1970: 0) {
-            try fields.encodeIfPresent(enabledAt, forKey: .enabledAt)
-        }
+        try fields.encodeIfPresent(enabledAt, forKey: .enabledAt)
         try fields.encodeIfPresent(lastUsedAt, forKey: .lastUsedAt)
         try fields.encode(uses, forKey: .uses)
         try fields.encode(corrections, forKey: .corrections)
@@ -315,8 +309,7 @@ public struct SenseProvenance: Codable, Sendable, Hashable {
     public var grownAt: Date?
     public var uses: Int
     public var corrections: Int
-    /// Optional for previously persisted provenance; current reads always stamp it.
-    public var origin: SenseOrigin?
+    public var origin: SenseOrigin
 
     public init(record: SenseRecord) {
         senseID = record.id; version = record.version; grownAt = record.createdAt
@@ -339,7 +332,7 @@ public struct SenseProvenance: Codable, Sendable, Hashable {
             ? ago.map { "grown \($0) ago" } ?? "creation time unavailable" : "invalid creation time"
         let line = "via sense \(senseID) v\(version) · \(source) · used \(uses)× · corrected \(corrections)×"
         OwnedProgramRunner.ReadContent.current?.record(.string(line),
-            content: .string("via sense \(senseID) v\(version) · \(origin?.rawValue ?? "")"))
+            content: .string("via sense \(senseID) v\(version) · \(origin.rawValue)"))
         return line
     }
 }
@@ -388,7 +381,7 @@ public struct SenseFailure: Codable, Sendable, Hashable, Error {
             if provenance.origin != .builtIn, let grownAt = provenance.grownAt {
                 value["grownAt"] = .double(grownAt.timeIntervalSinceReferenceDate)
             }
-            if let origin = provenance.origin { value["origin"] = .string(origin.rawValue) }
+            value["origin"] = .string(provenance.origin.rawValue)
             fields["provenance"] = .object(value)
         }
         return fields
@@ -451,7 +444,17 @@ public protocol SenseFileReadReporting: SenseSourceProvider {
 /// Optional event-backed observation. Every delivered material passes the
 /// current raw-read gates. Unsupported corners fail rather than fake a watch.
 public protocol SenseSourceWatchingProvider: SenseSourceProvider {
-    func changes(for corner: SenseCorner, address: String?) async throws -> AsyncStream<SenseMaterial>
+    func changes(for corner: SenseCorner, address: String?) async throws -> AsyncStream<SenseSourceChange>
+}
+
+/// A source failure is a reading, never an empty snapshot. A file source owns
+/// both admitted material and its checked membership identity in one reading.
+public enum SenseSourceChange: Sendable {
+    case changed(SenseMaterial, files: [String: [Int64]]? = nil)
+    /// The gated file reader proved the watched root absent (ENOENT).
+    /// This is an empty membership identity, never a material/read failure.
+    case absent
+    case unavailable(SenseFailure)
 }
 
 /// Entry-local progress admission shared by the app supervisor and JS watchdog.
@@ -523,11 +526,8 @@ enum SenseRetainedText {
         switch source {
         case .array(let values): return .array(values.map(value))
         case .object(let fields):
-            var result = fields.filter { $0.key != "window_picture" && $0.key != "image" && $0.key != "png" }
+            let result = fields.filter { $0.key != "window_picture" && $0.key != "image" && $0.key != "png" }
                 .mapValues(value)
-            if fields["window_picture"] != nil {
-                result["window_text_unavailable_reason"] = .string("This retained app read predates text-only retention; read the app and reject that view again.")
-            }
             return .object(result)
         default: return source
         }

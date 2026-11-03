@@ -19,14 +19,12 @@ extension ChatGPTTransport {
         networkError: (Error) -> LLMError,
         continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation
     ) async throws {
-        var emittedProviderOutput = false
         struct PendingCall {
             var callId: String
             var name: String
             var args: String
         }
         var pendingByItemId: [String: PendingCall] = [:]
-        var pendingOrder: [String] = []
         var replyTextSettled = false
         var sawFunctionCall = false
         var yieldedToolCall = false
@@ -42,40 +40,38 @@ extension ChatGPTTransport {
         // response.incomplete supplies the terminal incomplete reason.
         var incompleteReason: String?
         var refusalTextByPart: [String: String] = [:]
-        var runaway = RunawayOutputDetector()
+        var runaway = RunawayOutputDetector(diagnosticDataRoot: telemetry.diagnosticDataRoot)
 
         func stampTTFT() {
-            emittedProviderOutput = true
             if ttftMs == nil {
                 ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
             }
         }
 
         func yieldToolCall(id: String, name: String, args: String) throws {
-            if transport == .publicAPI, name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                throw LLMError.providerError(message: "streamed tool batch contains an empty tool name")
+            guard !id.isEmpty, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  (try? JSONSerialization.jsonObject(with: Data(args.utf8))) is [String: Any] else {
+                throw LLMError.providerError(message: "\(providerLabel): incomplete function call; a call ID, name and object arguments are required. Repair the provider stream.")
             }
             sawFunctionCall = true
             yieldedToolCall = true
             resumeReply()
-            let body = args.isEmpty ? "{}" : args
             stampTTFT()
             continuation.yield(.toolCall(LLMStreamToolCall(
                 id: id,
                 name: name,
-                inputJSON: Data(body.utf8)
+                inputJSON: Data(args.utf8)
             )))
         }
 
         var lastRawDelta: ContinuousClock.Instant?
         func processPayload(_ payloadStr: String) throws -> Bool {
+            if payloadStr.isEmpty { return false }
             if payloadStr == "[DONE]" { return true }
             guard let pdata = payloadStr.data(using: .utf8),
                   let event = try? JSONSerialization.jsonObject(with: pdata) as? [String: Any] else {
-                // An unreadable frame after output starts is a retryable stream failure.
-                guard emittedProviderOutput else { return false }
-                throw LLMError.transient(
-                    message: "\(providerLabel): malformed stream frame after content")
+                throw ProviderFailure.Diagnostic(cause: .malformedResponse,
+                    detail: "\(providerLabel): malformed Responses stream frame")
             }
             let etype = event["type"] as? String ?? ""
             var textDelta: String?
@@ -108,19 +104,23 @@ extension ChatGPTTransport {
                 }
             } else if etype == "response.output_item.added" {
                 if let item = event["item"] as? [String: Any],
-                   (item["type"] as? String) == "function_call",
-                   let id = item["id"] as? String {
+                   (item["type"] as? String) == "function_call" {
+                    guard let id = item["id"] as? String, !id.isEmpty else {
+                        throw LLMError.providerError(message: "\(providerLabel): function-call item has no item ID")
+                    }
                     sawFunctionCall = true
                     resumeReply()
                     // First model-output frame for a
                     // tool-call-first response — stamp TTFT
                     // here, not at output_item.done.
                     stampTTFT()
-                    let callId = (item["call_id"] as? String) ?? id
-                    let name = (item["name"] as? String) ?? ""
+                    guard let callId = item["call_id"] as? String, !callId.isEmpty,
+                          let name = item["name"] as? String, !name.isEmpty,
+                          pendingByItemId[id] == nil else {
+                        throw LLMError.providerError(message: "\(providerLabel): invalid or duplicate function-call identity in output_item.added")
+                    }
                     let args = (item["arguments"] as? String) ?? ""
                     pendingByItemId[id] = PendingCall(callId: callId, name: name, args: args)
-                    pendingOrder.append(id)
                 }
             } else if etype == "response.function_call_arguments.delta" {
                 sawFunctionCall = true
@@ -132,7 +132,12 @@ extension ChatGPTTransport {
                     // recognized `added` frame — stamp
                     // unconditionally.
                     stampTTFT()
+                    guard pendingByItemId[id] != nil else {
+                        throw LLMError.providerError(message: "\(providerLabel): function-call arguments arrived before their item identity")
+                    }
                     pendingByItemId[id]?.args.append(delta)
+                } else {
+                    throw LLMError.providerError(message: "\(providerLabel): function-call delta has no item ID or arguments")
                 }
                 // Tool-argument deltas emit keepAlive because accumulated output still proves liveness.
                 continuation.yield(.keepAlive)
@@ -144,13 +149,18 @@ extension ChatGPTTransport {
                     continuation.yield(.replyTextSettled(true))
                 }
                 if let item = event["item"] as? [String: Any],
-                   (item["type"] as? String) == "function_call",
-                   let id = item["id"] as? String {
-                    var pending = pendingByItemId[id] ?? PendingCall(callId: id, name: "", args: "")
-                    if let callId = item["call_id"] as? String { pending.callId = callId }
-                    if pending.name.isEmpty, let name = item["name"] as? String { pending.name = name }
-                    if pending.args.isEmpty, let args = item["arguments"] as? String { pending.args = args }
-                    try yieldToolCall(id: pending.callId, name: pending.name, args: pending.args)
+                   (item["type"] as? String) == "function_call" {
+                    guard let id = item["id"] as? String, !id.isEmpty else {
+                        throw LLMError.providerError(message: "\(providerLabel): function-call item has no item ID")
+                    }
+                    guard let pending = pendingByItemId[id],
+                          let callID = item["call_id"] as? String, callID == pending.callId,
+                          let name = item["name"] as? String, name == pending.name,
+                          let arguments = item["arguments"] as? String,
+                          pending.args.isEmpty || pending.args == arguments else {
+                        throw LLMError.providerError(message: "\(providerLabel): function-call completion lacks or contradicts its registered identity/arguments")
+                    }
+                    try yieldToolCall(id: callID, name: name, args: arguments)
                     pendingByItemId.removeValue(forKey: id)
                 }
             } else if etype == "response.completed" || etype == "response.done" {
@@ -256,20 +266,14 @@ extension ChatGPTTransport {
                 stopReason: reason
             )
             if reason == "max_output_tokens" || reason == "max_tokens" {
-                RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
+                RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit", dataRoot: telemetry.diagnosticDataRoot)
                 continuation.yield(.toolBoundary(.outputLimit))
                 return
             }
             throw LLMError.providerError(message: Self.incompleteNote(reason))
         }
-        for id in pendingOrder {
-            if let pending = pendingByItemId[id] {
-                try yieldToolCall(
-                    id: pending.callId.isEmpty ? id : pending.callId,
-                    name: pending.name,
-                    args: pending.args
-                )
-            }
+        if !pendingByItemId.isEmpty {
+            throw LLMError.providerError(message: "\(providerLabel): response ended before function-call completion; no unfinished call was emitted")
         }
         if lastRawDelta == nil, !yieldedToolCall {
             throw LLMError.streamTruncated(

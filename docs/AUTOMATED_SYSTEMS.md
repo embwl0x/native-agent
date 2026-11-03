@@ -81,15 +81,15 @@ enabled state and next deadline matter more than a blanket freshness threshold.
 Every row below is retained pass evidence. Reading `live.pulses` inspects these
 records without running the writer or probing its dependency. `launch.*` rows
 are launch passes, not registered loop IDs; event-only pulses have no cadence.
+After approval reconciliation, `EngineLaunch.swift`'s independent memory branch
+archives repair inventory, migrates legacy correction scope and stages kind
+backfill; it emits no separate memory-repair or kind-backfill pulse.
 
 | Pulse | Source writer | What its pass records |
 |---|---|---|
 | `launch.chat_index` | `EngineRuntime/EngineLaunch.swift` | Recovered sessions, repaired index rows and corrupt transcripts found. |
-| `launch.memory_repairs` | `EngineRuntime/EngineLaunch.swift` | Approved memory-repair executions reconciled at launch. |
-| `launch.kind_backfills` | `EngineRuntime/EngineLaunch.swift` | Approved memory-kind backfills reconciled at launch. |
-| `launch.browser_stranded` | `EngineRuntime/EngineLaunch.swift` | Stranded browser operations closed as outcome unknown in pre-ingress state preparation; recovery failure stops launch through the existing interrupted-Mac-action error presentation. |
-| `launch.approval_executions` | `EngineRuntime/EngineLaunch.swift` | Unapplied approval executions settle before independent retained memory, procedure and REM catch-up branches; procedure revalidation precedes activation. |
-| `launch.procedure_revalidation` | `EngineRuntime/EngineLaunch.swift` | Legacy procedures kept off after evidence revalidation. |
+| `launch.browser_stranded` | `EngineRuntime/EngineLaunch.swift` | Successful recovery's stranded browser operations closed as outcome unknown before ingress under the [browser ownership contract](INTERNAL_WORKINGS.md#built-in-browser-operation-ownership). Failed recovery leaves browser starts unavailable while the app starts; it emits no success count. Doctor reads the retained cause. |
+| `launch.approval_executions` | `EngineRuntime/EngineLaunch.swift` | Unapplied approval executions settle before independent retained memory, procedure and REM catch-up branches; current-schema procedure activation is checked at its owner. |
 | `launch.procedure_activation` | `EngineRuntime/EngineLaunch.swift` | Qualified local-file-copy activation reviews staged. |
 | `launch.rem_staging` | `EngineRuntime/EngineDreams.swift` | Previously unstaged REM proposals staged. |
 | `abandoned_turns` | `TurnTrace/AbandonedTurnReconciliationHook.swift` | Checkpoints offered for resume, legacy recovery obligations and recovery failures. |
@@ -132,6 +132,11 @@ receipts by census ID in a bounded measurement window, excluded from heartbeat
 sweeps.
 Prompt-prefix token aggregation uses checked sums; an unrepresentable total is
 unmeasured with a failed row naming the provider, turn, session and timestamp.
+Prefix health, subconscious vitals and model compensations measure only a valid
+stamp from this process launch and build. Missing or invalid launch evidence is
+unmeasured; it never selects an older 24-hour window. A damaged Doctor snapshot
+or iPhone snapshot-skip ledger is a named storage failure. Fresh readings retain
+any failed snapshot publication alongside their measurement.
 Absent Auto Doctor settings use fresh-install defaults. An existing unreadable
 or invalid configuration disables automatic/startup execution and makes its
 registered tick fail with the file path and cause; the bytes remain untouched.
@@ -141,6 +146,13 @@ cannot claim disk clean or retire an existing finding.
 Weekly analysis distinguishes absent transcripts, error feeds and Doctor reports
 from unreadable or malformed evidence. Unavailable sources fail before synthesis
 and release the weekly reservation instead of supplying measured zeros.
+Heartbeat also keeps source availability: a missing checklist is off, while an
+unreadable checklist fails its tick; execution, task and error-log read failures
+produce an unavailable assessment. Incomplete durable-residue categories are
+named as unavailable and cannot clear their review card. Failed child-watch
+registration records its path, cause and rearming remedy while retaining the
+parent watch. Watchdog snapshots encode the live runtime lifecycle and running
+execution counts; retired daemon and LaunchAgent fields are absent.
 The weekly response requires a nonempty summary, complete typed findings and
 standing rows, including valid runtime operations. Invalid responses stage
 nothing, retain their returned bytes in the failed digest and release the week.
@@ -154,11 +166,20 @@ instead of reusing historical successful traffic. An unhealthy provider path rep
 registry verdict and otherwise reports `unmeasured`; a readable compensation
 scan without a v2 turn is also `unmeasured`. `off` and `not needed` remain
 distinct non-fault states, not evidence of healthy work.
+Doctor and Support rollups retain `unknown` for empty inventories or unclear
+statuses and `unmeasured` for readings without a verdict, after preserving any
+failure or warning. A healthy sibling cannot turn an incomplete check healthy.
+The autonomy row describes policy only; running improvement counts belong to
+the background-loop watchdog. Session and transcript integrity checks use
+`ChatSession.init(row:)` on the checked index and `SessionHistoryReader`'s full
+checked history, including message identity and provenance damage. Doctor has
+no separate, looser message schema.
 
 `detail` stays evidence prose; remedies and executable calls have their own
-fields. Instructions for the Repair button say “Press Repair in Diagnostics →
-Health checks to …”; the shared recognizer also accepts legacy cached
-“Run Repair Safe Issues” instructions.
+fields. `repair_available` records handler availability; `repair` describes
+that executable repair and never becomes a human step by its wording.
+A check declares its human recovery step in `human_action`. Older cached rows with only
+`repair` prose need a fresh reading to establish their current human remedy.
 
 `app {"page":"diagnostics","item":"doctor"}` reads the saved report
 (`Sources/NativeAgentApp/AppToolPlatform.swift`) and names the run it shows;
@@ -187,12 +208,31 @@ registration alone does not.
 
 The runtime page envelope adds `report_completed_at` and, while a run is active,
 `run_in_progress` to identify the report shown and the newer run still in flight.
+`report_availability` and `report_issue` retain the latest full run's availability;
+running or failed runs leave older checks inspectable under `report_status`,
+but `status` and `active_path_status` remain unavailable. The health pill and
+Doctor headline also keep that unavailable state, even after live rows refresh.
+Shortcuts admits and settles its run through the same live Doctor facade as
+the UI and automatic runs. The Diagnostics header reads that latest-run
+availability before retained checks and says every check passed only when all
+rows were measured and passed; empty, unmeasured or unclear checks stay incomplete.
+Only a completed full run clears a failed-run issue. Current route details come
+from one checked provider snapshot at the Doctor facade's own root. A failed
+read is a structured `current_route_issue` and makes the envelope unavailable;
+an absent provider is not a route-read failure.
 Health-cache reuse requires the current `launchID` and a `runAt` age from zero
 to less than 60 seconds; a fresh core reading never merges rows from an earlier
 launch.
 
 An empty set is not persisted as a clean bill of health. Some behavioral
 checks memoize, so publication time alone does not establish freshness.
+
+`script/organism_doctor.sh` reads phone evidence only from
+`<dataRoot>/mobile_snapshot_cache/snapshots/organism_living_status.json`, where
+`NATIVE_AGENT_DATA_ROOT` selects the root (default: this checkout's `data`).
+Missing evidence stays unavailable; there is no machine-wide snapshot search.
+`NATIVE_AGENT_ORGANISM_IOS_SNAPSHOT` explicitly selects a diagnostic file and
+is labeled as such rather than establishing the active phone's health.
 
 ### Live and status reading index
 
@@ -206,9 +246,11 @@ Local file and snapshot reads still can fail. Repair remains a separate action.
 | `live.providers` | `EngineRuntime/EngineDoctorMeasurements.swift`; `EngineRuntime/DoctorProviderPathReading.swift` | Saved authentication, active route and native connection-test reading. | No new connection test; reads the provider status feed. Explicit connection tests probe the saved credential. |
 | `live.memory` | `EngineRuntime/EngineDoctorMeasurements.swift` | Mounted canonical store attachment, query response, graph reconciliation failure and SQLite integrity. | Yes: queries the running store each time; `quick_check` is cached between integrity readings. |
 | `live.bridges` | `EngineRuntime/EngineDoctorMeasurements.swift` | Expected local listeners, bound ports and startup failures. | No; reads listener snapshots. |
-| `live.agent_connections` | `EngineRuntime/EngineDoctorMeasurements.swift`; `AgentConversations/AgentContactHealth.swift` | Contact readiness, saved reply-path evidence and open connection repairs. | Refreshes readiness; may schedule bounded connection verification for a failed path, without resending its message. |
+| `live.mac_operation_recovery` | `EngineRuntime/EngineDoctorRuntime.swift`; `MacControl/MacControlOperationStore.swift` | Mac owner's launch-recovery admission state, original failure and repair; unavailable refuses Mac effects while looking and other surfaces remain available. | No; reads owner state, never runs recovery. |
+| `live.browser_operation_recovery` | `EngineRuntime/EngineDoctorRuntime.swift`; `Browser/Browser+OperationStore.swift` | Browser owner's launch-recovery state and individual damaged run causes. Uncertain damaged runs refuse new effects; valid sibling rows remain readable and damaged row bytes stay intact. | No; reads owner state and canonical runs, never runs recovery. |
+| `live.agent_connections` | `EngineRuntime/EngineDoctorMeasurements.swift`; `AgentConversations/AgentContactHealth.swift` | Contact readiness, saved reply-path evidence and open connection repairs. | Refreshes readiness; definite unsent failures remain `not_reached` with current readable prerequisites, without reply-path repair. May schedule bounded connection verification for a possibly delivered failed path, without resending its message. |
 | `live.telegram` | `EngineRuntime/EngineDoctorMeasurements.swift` | Configuration, credential availability, poller state and fresh successful-poll evidence. | No new Telegram request; reads the transport's evidence, separately from loop registration. |
-| `live.search` | `EngineRuntime/EngineDoctorMeasurements.swift` | Configured SearXNG URL and bounded search response. | Doctor runs probe; ordinary live refresh reads the retained result, valid for that URL for less than ten minutes. |
+| `live.search` | `EngineRuntime/EngineDoctorMeasurements.swift` | Configured SearXNG URL and bounded checked search response, retaining probe failures separately from refused listeners. | Doctor runs probe; ordinary live refresh reads the retained result, valid for that URL for less than ten minutes. Repair checks/starts only that configured server; explicit setup owns discovery and endpoint selection. Only the Repair button may open Docker Desktop; background repair reports unavailable inventory when its daemon is down. |
 | `live.tools` | `EngineRuntime/EngineDoctorMeasurements.swift` | Authored tool registry readability and saved admission states. | No tool invoked; execution remains unmeasured. |
 | `live.autonomy` | `EngineRuntime/EngineDoctorMeasurements.swift` | Saved enable posture and reported autonomy runtime state. | No unattended work started. |
 | `install.data_root` | `EngineRuntime/EngineDoctorMeasurements.swift` | Installation move marker and any recorded backup location. | No; reads local installation evidence. |
@@ -226,7 +268,7 @@ Local file and snapshot reads still can fail. Repair remains a separate action.
 | `live.cognition.associations` | `EngineRuntime/EngineDoctor+Cognition.swift` | Whether displayed association endpoints resolve in the current node snapshot. | No graph repair; compares snapshot identifiers. |
 | `live.cognition.context_flow` | `EngineRuntime/EngineDoctor+Cognition.swift` | Context Flow registration, source errors and arena pressure. | No reconciliation; reads the owner's health state. |
 | `live.cognition.phone_pairing` | `EngineRuntime/EngineDoctor+Cognition.swift` | Checked pairing authority and the bridge's pairing/last-exchange assessment. | No phone message sent. |
-| `live.phone_notifications` | `EngineRuntime/EngineDoctor+Cognition.swift` | Optional APNS configuration, current tokens and matching saved push outcomes. | No push sent; pairing is measured independently. |
+| `live.phone_notifications` | `EngineRuntime/EngineDoctor+Cognition.swift` | Checked paired-phone authority; optional APNS credentials and wake outcomes do not gate ordinary notifications. | No push sent; unreadable authority reports unavailable. |
 | `status.desk_attention` | `EngineRuntime/EngineDoctor+StatusChecks.swift` | Canonical Desk/approval state, waiting work and parent/descendant contradictions. | Reads stores and calls the diagnostic narration part; parent reconciliation runs only on the repair path. |
 | `status.activity` | `EngineRuntime/EngineDoctor+StatusChecks.swift` | Activity readability, malformed rows, recent failures and unresolved effects. | Reads retained activity and calls the diagnostic narration part; no effect replay. |
 
@@ -246,6 +288,14 @@ lanes and their production defaults as of this writing; the installed set is
 row, with individual readings at `live.background_loop.<loopId>`. Enabled state,
 event deadlines, backoff and saved configuration determine actual work.
 
+Senses registration never gates this manifest or its resident observations.
+Loops start together, including Telegram/Slack ingress, reply reconciliation
+and Desk notifications. A loop's work that actually selects a sense waits at
+the shared read door; sense wakes and file subscriptions wait at their own
+owners. Doctor retains registration failures and their repair instructions.
+An explicit run of a stopped loop follows the same per-read rule. See
+[sense readiness and repair](SENSES.md) for bounds and subscription recovery.
+
 | loopId | Default wake or backstop | Work |
 |---|---|---|
 | `doctor_auto_run` | Launch, ok→adverse health reading, weekly; configured intervals at least 1h | Repair, publish Doctor snapshot, file one sign-in/permission ask. |
@@ -263,13 +313,29 @@ event deadlines, backoff and saved configuration determine actual work.
 | `desk_notify` | Events/deadlines; daily repair | Notify about eligible tracked Desk changes. |
 | `delegation_outcome` | Events/deadlines; 6h repair | Reconcile terminal delegation jobs and their notifications. |
 | `telegram_poll` | Long-poll transport | Admit configured Telegram messages. |
-| `slack_socket_mode` | Socket transport | Admit configured Slack messages. |
+| `slack_socket_mode` | Socket transport | Admit configured Slack messages; socket failure is reported and reconnects that same transport, with no Web API ingress/history polling. |
 
 Telegram and Slack remain registered as disabled when unconfigured and perform
 no remote work. Saved-configuration or credential read failures register as
 unreadable, so unavailable credentials do not appear disconnected. Launch and
 restart use the same registration factory. Registration alone is not proof
 that a connector is configured.
+
+The Mac's mobile receiver uses push, launch, network/KVS wakes and explicit
+refresh. A failed push registration reports its cause without a timed drain.
+Snapshot integrity uses exact file/store invalidations and launch reconciliation;
+there is no periodic missed-event pass. Unreadable held-notification or proactive
+scan inputs fail at their owner and retain owed work rather than count as empty.
+Proactive scans use the checked scheduler, approval, inbox and Desk projections.
+Their creation, update and execution share `ProactiveScanArguments`: `reason`,
+`limit` (1–50), `surfaceLimit` (0–12) and `staleDays` (positive integer).
+Missing optional arguments use their declared defaults; malformed or unknown
+arguments are refused. The retired numeric coercions, `surface_limit`,
+`stale_days` and unused `sources` input are removed.
+Notification release reads the immutable delivery ledger described in
+[Internal Workings](INTERNAL_WORKINGS.md). It does not rewrite its watched
+inbox. Channel suppression settles once; only destination acceptance is
+delivery, and unknown sends await evidence.
 
 Healthy periodic ticks persist their admitted start for cadence across relaunch;
 successful work keeps its separate completion timestamp. A long-running tick
@@ -283,6 +349,12 @@ Receipt-only delegation outcomes complete the same idempotent downstream
 settlement before their cursor advances; they still suppress redundant cards.
 Delegation snapshots carry the contact's declared name into cards and resident
 notices; without one they preserve the original identifier and spelling.
+
+The existing delegation scheduler combines contact-continuation deadlines with
+`ResidentWakeRuntime`'s arrival/spacing deadline. Each owns its due-work pass;
+a resident wake no longer preempts contact reply reads, and one owner's failed
+pass is reported after its sibling runs. Their ledgers and the scheduler remain
+unchanged; the continuation no longer implements resident wake work.
 
 Heartbeat findings and age deadlines share each source's admission scan,
 including bridge delivery and acknowledgment exclusions; deadline reads do not
@@ -309,6 +381,44 @@ claim stays held until the session settles. The person's Stop ends work early.
 Helper arguments use their declared closed schema after reference and null
 normalization; route admission and `BotDefinitionStore.check` retain semantic
 validation. A seconds budget is a positive finite number, including fractions.
+Helper definitions accept typed cadence, event and budget values; each Mac or
+phone form parses its own controls before calling the definition owner. A
+failed fresh definition read does not imply an unpaused helper. Event hold
+receipt failures report their storage cause through scheduler availability.
+Before execution, provider, unattended and daily-ceiling refusals settle the
+exact queue request as refused and retire its claim. Admission commits the
+exact claim or refusal before removing the queued request. A failed claim
+write retains the queue entry; a later interruption retains the claim and
+requires its exact settlement evidence before reconciliation can proceed.
+Only an execution that lost settlement is reconciled as interrupted. Daily
+reservations read and write only that helper's own `bots/<id>/daily-spend.json`;
+no fleet-wide allowance is
+charged against a new helper.
+
+### Intentions and body rhythms
+
+What they means to do later is a MY QUEUE intention, filed through
+`queue.add {text, when, until?, say?}`. `schedule.create` and `schedule.update`
+advertise only body rhythms. Unsupported kinds, including `notify`, `turn`
+and `workshop`, refuse before payload or schedule normalization and point to
+`queue.add {text, when, until?, say?}`. Updates use the merged saved/requested
+kind; connector creation and resume reach the same normalizer.
+
+Creatable body rhythms are `dream`, `rem`, `part`, `connector_action`,
+`harness_benchmark` and `proactive_scan`. A part rhythm posts its `schedule:`
+signal; its execution remains the part's. Legacy intention runner cases are
+removed. The launch migration backs up jobs byte for byte, moves enabled
+intention work into MY QUEUE with its first
+unconsumed clock occurrence, including calendar seconds. Disabled legacy
+definitions retain words, timing and pause with a first-migration disposition
+and are not pruned. The durable completion receipt ends migration permanently;
+imported work waits for it. Later restored intention jobs stay stopped and
+surface once as a keyed Desk notice inviting `queue.add`; they never reimport
+or enter scheduler selection. Uncertain prior effects stay stopped
+for reconciliation. Body-owned jobs remain scheduler rhythms. Today's Ahead
+reads the next five queue clock moments within seven days,
+alongside its dream and horizon rows. See [Intentions](INTENTIONS.md) for the
+migration contract and remaining design.
 
 `schedule.cancel` and `schedule.delete` share `scheduler_cancel_job`; saved
 `scheduler_delete_job` calls resolve as its alias. Both retain resumable history,
@@ -322,15 +432,42 @@ its unknown-outcome notice is durable before the claim is released.
 The calendar jobs `nativeagent-nightly-dream` and
 `nativeagent-weekly-rem` run through `SchedulerDueJobRunner`; there are no
 separate periodic Dream or REM wrappers in the loop manifest.
-Recognized legacy jobs retain their existing IDs; creation receipts read back
-the job resolved by bootstrap rather than assuming the default ID.
+Bootstrap matches these jobs only by their canonical IDs. Retired job-name
+aliases and connector-reader watch rewrites are removed.
 Phone and agent creation share recurring-dream admission: a repeating reflection
 uses that one nightly job, preserving pauses and reactivating cancellations.
+Diary discovery and inbox deduplication must succeed before catch-up or backfill
+can claim absence. A completed dream keeps its result if diary presentation
+fails and reports that separate failure. If recurrence cannot advance, the
+completed cycle stays completed and its future schedule is disabled with the
+cause and repair instruction; its retained timing is not runnable while disabled.
+Receipt backfill names the existing diary files it observed (at most five),
+without claiming a new pass, sessions processed, or total entries written. It
+does not update the job's execution history or consume its next occurrence.
+Scheduled REM consumes the REM owner's typed outcome: reservation skips retain
+their reason and settle as `skipped`; only a completed pass is `completed`,
+including a completed pass with zero proposals.
 
 `DreamREMCycle/DreamREMCycle.swift` owns the default schedule: Dream at
 03:30 daily and REM at 04:30 Sunday, in the Mac's current time zone.
 Read the persisted jobs and their enabled state to establish what will run
 on an installation.
+
+The same `mind_run` action family supports immediate owner passes:
+`app {action:"mind.dream"}`, `mind.rem`, `mind.self_improvement`,
+`mind.think_now` and `mind.reflect` retain their existing manual gates.
+Scheduled jobs have no run-now verb: running one early would consume its real
+occurrence (the nightly dream's 3:30 run). `mind.dream` runs a real dream and
+changes their; `app {action:"mind.dream", preview:true}` instead generates and
+decodes on current lived material, reporting care judgments through the same
+apply checks on a copy. It spends provider usage but writes no diary, cutoff,
+care, lesson, mood, Experience or wake, and leaves the schedule intact. Preview
+does not drain owed moments. The other nine clock verbs refuse preview with a
+specific explanation before entering their effectful owners. Preview receipts
+remain only redacted `mind.run_now` traces with `preview:true`; dispatch, provider
+health/usage and repair evidence cannot turn an inspection into lived learning.
+Other cognition clocks and the real care crossing have matching immediate
+verbs; [Subconscious](SUBCONSCIOUS.md#run-a-clock-owner-now) owns their contract.
 
 The nightly diary entry uses the previous local calendar day's key. Inspect
 the job outcome and file modification time; absence of a file named for today
@@ -339,8 +476,25 @@ path rather than directly treating a dream as permission to rewrite persona.
 Turn preparation reads the REM pin index through a checked cache: only a
 missing index is empty; unreadable or invalid bytes fail the turn with the
 owning path, without serving stale pins or rewriting the file.
-Each saved dream section carries its claim-source block followed by its
-consumed-message cutoff; REM reads the claims before that native footer.
+Each saved dream section carries its claim-source block, immutable `dream-id`
+and consumed-message cutoff. Before publication or effects, one durable
+`dream_diary/work/<section UUID>.json` record lists the exact write, care/self input,
+reflection judgment and integration, mood, completion signal, lessons and citations.
+The [dream settlement law](COGNITION_WIRING.md#the-subconscious-loops--schedule-artifacts-re-entry) owns their ordering:
+readable care evidence precedes the cutoff, the produced reflection receipt precedes
+care/mood effects, and each effect records done or explicitly skipped. Failure notes
+never gate retry. Every admitted real pass retries still-owed work across active and
+archived nights, including when no new material exists. Completion is delivered from
+that record after Stop or recovered publication; body-off completion is skipped.
+Settled journals remain complete and permit force replacement; checkpoints leave
+diary bytes stable. Dated mood and body completion claims persist with their effects.
+REM checks complete claim blocks section by section, names damaged sections and
+processes readable siblings. Damaged entries remain active past archival age,
+and the next REM reads all active dates so late repairs are not lost.
+REM excludes identity metadata from its model input. A failed evidence reading
+releases the weekly claim if no proposals were saved; durable proposals keep
+their IDs for staging. Archival shares the dream reservation so it cannot move
+a file during publication.
 Under the run reservation, the next pass reconciles `.dream_state.json` from the diary,
 including archived entries, before gathering new material. A crash between
 saving a section and advancing the mark therefore does not dream it again.
@@ -352,19 +506,11 @@ PersistenceCore's once-per-period reservation durably writes both the admitted
 stamp and any restored prior bytes. Restoring confirmed absence removes the
 stamp and syncs its parent directory under the same reservation lock.
 
-Each committed dream (scheduled or manual) then raises the night's practice
-(`EngineRuntime/EnginePractice.swift`, [as built](AGENT_IS_THE_APP.md#practice-compiles-the-night-as-built-10-27)):
-one pass at a time, off the dream's path, only while Autonomy allows unattended
-work, read again before each keep turn, replay and keep; quitting stops it and
-waits for its ledger to settle. Each keep turn is bounded at one unattended
-run's ceiling (`BotRunLimits`, through `TurnTokenBudget` and `TurnDeadline`). It reads the retained turn traces, nominates each agent's recurring
-sequences, offers at most three a night to that agent's own keep moment, and
-verifies and keeps what it saved through the gated app door. It has no
-separate offer counter: each offer time is saved in that agent's practice
-ledger before its keep turn starts, and every pass counts the same local
-noon-to-noon night (including failed or stopped offers and app relaunches).
-Ledgers predating time recording have no recorded offers to charge. It has no
-schedule of its own; its `practice.night` trace row is the record.
+The separate nightly practice compiler and its post-dream wake are removed
+([Habits H4](HABITS.md#h4--one-crystallizer)). Dreams no longer start candidate
+nomination, tape recording, keep turns, replay or admission. Repeated hand
+work reaches the turn's private keep on its second meeting; no
+`practice.night` rows or candidate ledger/tape writes remain.
 
 ### Scheduled reads are watches
 
@@ -488,12 +634,44 @@ Start with the smallest evidence relevant to the reported problem:
    failure receipts with its configuration and deadline.
 4. For a scheduled job, inspect enabled state and last outcome, and use
    `SchedulerJobRuntime.scheduledEpoch`: unclaimed wall-clock work follows its
-   civil occurrence in the current zone; claims and retry floors keep their instant.
+   retained civil occurrence in the current zone; active claims keep their instant.
    Single-file job mutations share `updateJobRows`' locked, checked transaction;
    unchanged rows are not rewritten. Retirement also records its separate ledger.
+   The canonical reader and writer validate required string identities, Boolean
+   enabled/oneShot, agreement between oneShot and schedule type, structured
+   schedules, supported payloads and current occurrence evidence. Damage is
+   unavailable authority, never scalar coercion or a guessed hourly schedule.
+   Current input units (`schedule`, `in_minutes`, `interval_seconds`) normalize
+   once; saved jobs require `schedule.type`. Numeric duration strings remain
+   supported documented units; booleans and fractional integers are refused.
+   No-schedule execution, retry markers and civil-key reconstruction are removed.
+   `nextRunAt` is the formatted list timestamp; the redundant `nextRunAtISO`
+   projection and writes are removed. List projection omits even a retained
+   `nextRunAtISO` key, so it cannot expose a stale timestamp. Reads leave saved
+   bytes untouched.
    Inbox triggers accept their card once under the inbox owner's lock before
    settling the occurrence. Delivery snapshots accepted cards before any knock,
    including cards with notification disabled; duplicate acceptance never knocks.
+   Trigger claim admission locks configuration then state, re-reading the current
+   enabled definition before the durable claim. Repair requires an exact retained
+   unfinished occurrence and explicit current-life identity under the state lock;
+   a sole retained occurrence may be selected when the optional occurrence is
+   omitted. Missing, corrupt, stopped or ambiguous evidence produces no effect.
+   The same admission transaction checks current configuration, inbox consent,
+   cancellation and retained claim evidence before preparation runs any model or
+   tool. Disabled retained occurrences settle as `disabled` without preparation;
+   they are removed from unfinished claims and their repair obligation settles,
+   without claiming a fire. Missing authority never seeds a repair definition.
+   Publication rechecks the enabled definition and notification consent under the
+   same config → state lock order after preparation. Repair never becomes manual
+   fire. Unsupported trigger rows are reported rather than hidden; neither inbox
+   nor Workshop deadline discovery suppresses configuration failures, and each
+   files its own repair obligation with the original cause. A failed discovery
+   contributes no deadline until a source/repair event or the integrity sweep.
+   `notified` means the notification router projected checked destination
+   acceptance. `queued` is an unknown phone outcome awaiting its signed receipt;
+   it cannot claim delivery. `accepted`, `queued`, `deferred`, `failed` and
+   `no_channel` stay distinct in delivery evidence.
 5. For a turn, inspect its terminal trace; for a mobile command or approval,
    inspect that transaction's outcome.
 
@@ -521,13 +699,14 @@ their launch and termination lifetimes.
 | Transcript aging | `ChatSessionWork/ChatSessionAgingConsolidation.swift` | A transcript append crossing the aging boundary schedules a retained body and cancellation deadline. | A history read does not start aging; the append path does. [Compaction law](TURN_RESILIENCE.md#8-context-compaction), [settlement](STOP.md). |
 | Part signals | `EngineRuntime/EnginePartWake.swift` | Source-owned signals and persisted turn terminals reach the wake index. | A part runs on its declared wake, not on a status read. [Wake contract](skill_manifest_spec.md#wake-signals). |
 | Part file wakes | `EngineRuntime/EnginePartWake.swift` | Declared file watches deliver changes and suppress self-write echoes. | Reading status does not emit a file-change wake. [Wake contract](skill_manifest_spec.md#wake-signals), [watcher settlement](STOP.md). |
-| Part presence wakes | `EngineRuntime/EnginePartWake.swift`; `MacControl/MacPersonInput.swift` (`MacPersonInput`) | `person.away` / `person.here` follow the person-input owner's presence transitions. | No presence probe from a status read. [Wake contract](skill_manifest_spec.md#wake-signals). |
+| Part presence wakes | `EngineRuntime/EnginePartWake.swift`; `MacControl/PersonPresence.swift`, `MacPersonInput.swift`; `PersistenceCore/PhoneSenseHistory.swift` | Mac-input transitions and durable phone-motion observations reach the same person presence owner; fresh walking/driving can signal away, later physical Mac input signals here. | No presence probe from a status read; silence/unknown is no phone verdict. [Wake contract](skill_manifest_spec.md#wake-signals), [phone evidence](mobile_companion.md#where-the-person-is). |
+| Network sense and wakes | `NativeAgentCore/NetworkSense.swift`; `EngineRuntime/EnginePartWake.swift`; `BackgroundWork/DelegationBackgroundWork.swift` | One process-wide path monitor serves provider waits, iCloud drain-on-return and Dot link recovery. `network.down` / `network.up` reach parts and intentions after five seconds of stable path state. Immediate offline state holds resident arrivals without claiming them; return re-ticks delegation. Its tick budget is the configured provider stream wall plus 60 seconds. | Reads use the owner's Bool; they do not create monitors or provider calls. [Wake contract](skill_manifest_spec.md#wake-signals), [provider deadlines](TURN_RESILIENCE.md#4-provider-timeouts). |
 | Part resume wakes | `EngineRuntime/EnginePartWake.swift` | Launch delivers `resumed` after registering source observers. | Reading status does not resume a part. [Wake contract](skill_manifest_spec.md#wake-signals). |
 | First-terminal Doctor refresh | `EngineRuntime/EngineDoctor+FirstTurnRefresh.swift` | Once per launch, the first persisted terminal triggers a fresh Doctor pass under its configured gate. | The terminal event measures afresh; reading the saved report does not. See [Doctor](#3-doctor--the-health-authority). |
 | Approval / Desk waits | `ApprovalTransactions/ApprovalReconciliation.swift` (`settleDeskWaitsOnEveryResolve`) | Manager-owned observation subscribes before launch reconciliation, then settles Desk waits on approval resolution. | Observation performs reconciliation; reading a card grants nothing. [Approval law](approval-schema.md#resolution-and-execution). |
 | Grant observation | `ApprovalTransactions/InlineInteractionResolver+ChatLifecycle.swift` (`GrantWatch`) | Manager-owned permission-change observation and card taps coalesce grant rechecks. | Its observation reads grants; a saved health read does not request one. [Authority](TOOL_LOADING.md#authority-and-receipts). |
 | Interaction delivery | `ApprovalTransactions/InlineInteractionDelivery.swift` | Manager-owned launch recovery restores card delivery pointers, then exact session changes refresh delivery. | The observer performs delivery work; reading saved status does not. [Delivery obligations](EXPERIENCE.md). |
-| Procedure-artifact retention | `Procedures/ProcedureRetention.swift` | Engine opens retention at launch; installation requests a coalesced sweep; termination closes admission and joins its flight. | `statusSnapshot` only reads; an over-cap `loadInstalledArtifacts` read requests retention and fails admission. [Lifecycle settlement](STOP.md); this retained artifact owner is distinct from authored-part lifecycle. |
+| Procedure-artifact retention | `Procedures/ProcedureRetention.swift` | Engine opens retention at launch; installation requests a coalesced sweep; termination closes admission and joins its flight. | Installation enforces the [shared discovery capacity](canonical_data_paths.md#procedure-artifacts) before writing. `statusSnapshot` only reads; an over-cap discovery read requests retention and refuses capacity. Protected references can prevent a sweep from freeing room. [Lifecycle settlement](STOP.md); this retained artifact owner is distinct from authored-part lifecycle. |
 
 The manager retains approval, grant and interaction observation together through
 its `residentObservation` lifecycle. Their ownership is in

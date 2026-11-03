@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ToolRegistry.swift` | `ToolRecord` and AbilityStore's checked part-record projection: missing required fields are omitted; invalid authored fields fail listing and dispatch discovery; `keepReview` and `reviewedKeepDigest` bind waiting or selected code to the review captured under the ability-store lock |
+// Blueprint: | `ToolRegistry.swift` | `ToolRecord` and AbilityStore's checked part-record projection through Parts' shared name schema: name damage is row-local; other missing required fields are omitted and invalid authored fields fail listing and dispatch discovery; `keepReview` and `reviewedKeepDigest` bind waiting or selected code to the review captured under the ability-store lock |
 
 // MARK: - Errors
 
@@ -33,10 +33,8 @@ public struct ToolRecord: Sendable, Equatable, Identifiable {
     public var updatedAt: String? { fields["updatedAt"]?.stringValue }
     public var phase: String? { fields["phase"]?.stringValue }
     public var lastUsedAt: String? { fields["lastUsedAt"]?.stringValue }
-    public var manifestSignature: String? { fields["manifestSignature"]?.stringValue }
     /// Selected candidate seal, including manifest/fixtures/dependencies/prior; not source SHA-256.
     public var codeFingerprint: String? { fields["codeFingerprint"]?.stringValue }
-    public var signedAt: String? { fields["signedAt"]?.stringValue }
     public var activePath: String? { fields["activePath"]?.stringValue }
     public var proposalPath: String? { fields["proposalPath"]?.stringValue }
     public var validationStatus: String? { fields["validationStatus"]?.stringValue }
@@ -44,17 +42,16 @@ public struct ToolRecord: Sendable, Equatable, Identifiable {
     public init?(json: JSONValue) {
         guard case .object(var fields) = json else { return nil }
         for key in ["id", "name", "status", "createdAt"] {
-            guard case .string(let value)? = fields[key], !value.isEmpty else { return nil }
+            guard case .string(let value)? = fields[key], key == "name" || !value.isEmpty else { return nil }
         }
         // Malformed optional strings are absent; explicit nulls remain null.
-        for key in ["updatedAt", "phase", "lastUsedAt", "manifestSignature", "codeFingerprint",
-                    "signedAt", "activePath", "proposalPath", "validationStatus"] {
+        for key in ["updatedAt", "phase", "lastUsedAt", "codeFingerprint",
+                    "activePath", "proposalPath", "validationStatus"] {
             switch fields[key] {
             case .string?, .null?, nil: break
             default: fields.removeValue(forKey: key)
             }
         }
-        fields.removeValue(forKey: "__presentNullKeys")
         self.fields = fields
     }
 
@@ -67,7 +64,6 @@ public struct ToolRecord: Sendable, Equatable, Identifiable {
     public var actions: [String]? { fields["actions"]?.arrayValue?.compactMap(\.stringValue) }
     public var validationErrors: [String]? { fields["validationErrors"]?.arrayValue?.compactMap(\.stringValue) }
     public var autoCreated: Bool? { fields["autoCreated"]?.boolValue }
-    public var autoRun: Bool? { fields["autoRun"]?.boolValue }
 
     public var language: String? { fields["language"]?.stringValue }
     public var candidateDigest: String? { fields["candidateDigest"]?.stringValue }
@@ -106,7 +102,7 @@ public struct ToolRecord: Sendable, Equatable, Identifiable {
         let optional: [(String, (JSONValue) -> Bool)] = [
             ("triggers", isStrings),
             ("language", isString), ("entrypoint", isString), ("permissions", isStrings), ("actions", isStrings),
-            ("autoCreated", isBool), ("autoPromote", isBool), ("autoRun", isBool), ("autoPromotable", isBool),
+            ("autoCreated", isBool), ("autoPromote", isBool), ("autoPromotable", isBool),
             ("validationErrors", isStrings), ("disabledReason", isString),
             ("sourceRunId", isString), ("useCount", { $0.exactIntegerValue != nil }),
         ]
@@ -159,18 +155,17 @@ public actor SwiftNativeToolRegistry {
 }
 
 /// The checked part-record projection shared by listing and dispatch discovery.
-/// Missing required fields are omitted; invalid authored fields fail the read.
+/// Parts owns display names and row-local name damage. Other missing required
+/// fields are omitted; invalid authored fields fail the read.
 extension AbilityStore {
     public func checkedToolRecords() throws -> [ToolRecord] {
-        guard case .array(let items) = try registry(kind: .part) else {
-            throw ToolRegistryError.registryUnreadable(reason: "abilities must contain ability records")
-        }
-        // One malformed part never locks the registry: it is named and left out,
-        // and every other part stays usable.
+        let items = try Parts(root: dataRoot).rows(kind: .part)
+        // Parts retains name damage as unavailable rows. The remaining checks
+        // below still require a complete execution record.
         return try items.enumerated().compactMap { index, item -> ToolRecord? in
-            guard let record = ToolRecord(json: item) else {
+            guard let record = ToolRecord(json: .object(item)) else {
                 var id = ""
-                if case .object(let fields) = item, case .string(let name)? = fields["id"] { id = " (" + name + ")" }
+                if case .string(let name)? = item["id"] { id = " (" + name + ")" }
                 nativeLog("ToolRegistry: row %ld%@ has missing or invalid required fields; left out", index + 1, id)
                 return nil
             }

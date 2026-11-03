@@ -13,7 +13,7 @@ import TurnTrace
 import CryptoKit
 import AgentLinkTransport
 import os
-// Blueprint: | `AgentDiscoverySession.swift` | `AgentDiscoveryCandidate` presents observed routes; `AgentDiscoverySession` owns discovery lifetime and offers. Launch connects settings hosts from recipes without awaiting Spotlight; index arrivals wait for any in-flight scan, recipe-location watches reconcile after arming. Saved declines/disconnects win; running hosts get one restart note. Candidate/wake setup failures name files, fields and remedies, keep dismissible offers and clear on recovery. `app.installed` signals whole bundles at new id/version pairs after a silent installed-apps.json baseline. |
+// Blueprint: | `AgentDiscoverySession.swift` | `AgentDiscoveryCandidate` presents observed routes; `AgentDiscoverySession` owns discovery lifetime and offers. Launch connects settings hosts from recipes without awaiting Spotlight; index arrivals wait for any in-flight scan, recipe-location watches reconcile after arming. Saved declines/disconnects win; running hosts get one restart note. Candidate/wake setup failures name files, fields and remedies, keep dismissible offers and clear on recovery. `app.installed` signals whole bundles from MacAppIndex's checked installed-Mac projection at new id/version pairs after a silent installed-apps.json baseline. |
 
 /// Session-only observations. These never write contacts, settings or credentials.
 public struct AgentDiscoveryCandidate: Sendable, Equatable, Identifiable {
@@ -187,7 +187,7 @@ public actor AgentDiscoverySession {
                 if pendingID == id { pending = nil; pendingID = nil; pendingGeneration = nil }
             }
             nativeLog("AgentDiscoverySession: discovery scan started")
-            async let probing = probe ? AgentPeerDiscovery.probe(bundles, launch: launch) : nil
+            async let probing = probe ? AgentPeerDiscovery.probe(bundles, launch: launch, dataRoot: dataRoot) : nil
             let recipes = await AgentPeerDiscovery.scanLocal()
             let found = await probing
             guard self.generation == generation, !Task.isCancelled else { return cached ?? [] }
@@ -223,7 +223,7 @@ public actor AgentDiscoverySession {
             return nativeLog("AgentDiscoverySession: %@ does not read; no app arrivals until it is fixed or removed", url.path)
         }
         let before = seen
-        for app in bundles {
+        for app in MacAppIndex.installed(bundles) {
             guard let id = app.bundleID, let info = app.info else { continue }
             if let sdef = info["OSAScriptingDefinition"] as? String,
                !FileManager.default.fileExists(atPath: app.url.appendingPathComponent("Contents/Resources/" + sdef).path) { continue }

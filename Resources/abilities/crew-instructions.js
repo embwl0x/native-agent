@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id":"crew-instructions","kind":"tool","version":1,
+{"id":"crew-instructions","kind":"ability","version":1,
  "reach":{"capabilities":[]},"face":{"page":"agents"},
  "record":{"description":"Prepare crew briefs, synthesis messages and digest bounds from native admitted worker facts. No provider or tool execution; worker routes, access, receipts and partial-output settlement remain native.","actions":[],"inputSchema":{"type":"object","required":["operation","objective"]}}}
 */

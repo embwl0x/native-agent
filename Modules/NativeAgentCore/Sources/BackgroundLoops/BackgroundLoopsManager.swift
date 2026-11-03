@@ -10,7 +10,6 @@ public actor BackgroundLoopLifetimes {
     public static let systemBackgroundActivities: [(loopId: String, interval: TimeInterval)] = [
         ("self_improvement_sweep", 7 * 24 * 60 * 60),
     ]
-    public static let retiredSystemBackgroundActivities = ["dream_cycle", "rem_cycle"]
 
     public static let shared = BackgroundLoopLifetimes(
         scheduler: SwiftNativeLoopScheduler(
@@ -130,6 +129,8 @@ public actor BackgroundLoopLifetimes {
         for loop in loops where registrations[loop.loopId] == nil {
             await register(loop)
         }
+        let early = earlyRestarts; earlyRestarts = [:]
+        for (id, newLoop) in early { await replaceLoop(id: id, newLoop: await newLoop(), lifecycle: generation) }
         guard starting, !stopped, lifecycleGeneration == generation else { return false }
 
         for registration in Array(registrations.values) {
@@ -426,7 +427,9 @@ public actor BackgroundLoopLifetimes {
     /// its replacement when its turn comes: an older restart resuming from the
     /// drain can never replace a newer one, and the last installs what is saved now.
     public func restartLoop(id: String, newLoop: @escaping @Sendable () async -> LoopRegistration?) async {
-        guard !stopped, started || starting else { return }
+        guard !stopped else { return }
+        // Before start, the last one asked for is built with the manifest.
+        guard started || starting else { earlyRestarts[id] = newLoop; return }
         let lifecycle = lifecycleGeneration
         let prior = restartTails[id]?.task
         let token = UUID()
@@ -445,6 +448,7 @@ public actor BackgroundLoopLifetimes {
     }
 
     private var restartTails: [String: (token: UUID, task: Task<Void, Never>)] = [:]
+    private var earlyRestarts: [String: @Sendable () async -> LoopRegistration?] = [:]
     private var replacingLoopIds: Set<String> = []
 
     private func replacementIsCurrent(_ lifecycle: UInt64) -> Bool {

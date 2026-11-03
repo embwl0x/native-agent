@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TurnTraceRecentReader.swift` | Checked recent/day-file reads, historical receipt reconciliation and usage queries; preserves unmatched history, outcomes and read coverage |
+// Blueprint: | `TurnTraceRecentReader.swift` | Checked recent/day-file reads and usage queries; projects canonical daily evidence alongside standalone receipts without merging fields or inferring duplicate identities; preserves outcomes and read coverage |
 
 /// Reads the writer's day files using its calendar and root overrides.
 public struct TurnTraceRecentReader: Sendable {
@@ -112,14 +112,14 @@ public struct TurnTraceRecentReader: Sendable {
         return Snapshot(sourceURL: sourceURL, events: events, sourceURLs: sources, truncated: truncated, oldestRetainedDay: oldestRetainedDay, malformedRows: malformedRows, trailingPartialLine: trailingPartialLine)
     }
 
-    /// Turn evidence has one durable owner. Historical ledger rows are removed
-    /// only when matched to a retained event, preserving any older outcome.
+    /// Turn evidence has one durable owner. Daily events and standalone receipts
+    /// are read as recorded, without inferred identities or merged measurements.
     public func traceEvidence(
         now: Date = Date(), since: Date? = nil,
         maximumReadBytes: Int = TurnTraceRecentReader.maxBytes
     ) async throws -> (rows: [JSONValue], report: JSONLReadReport, turns: Snapshot, sourceAbsent: Bool) {
         let turns = try await read(now: now, history: true, since: since,
-                                   holding: since == nil ? [] : ["llm.call", "provider.noReply", "tool.dispatch", "memory.commit", "context.compact", "turn.plan", "turn.terminal", "work.identified"],
+                                   holding: since == nil ? [] : ["llm.call", "provider.noReply", "tool.dispatch", "memory.commit", "context.compact", "turn.terminal", "work.identified"],
                                    maximumReadBytes: maximumReadBytes)
         let path = lane.resolvedDataRoot().appendingPathComponent("traces/events.jsonl")
         let ledger: (rows: [JSONValue], report: JSONLReadReport)
@@ -129,54 +129,14 @@ public struct TurnTraceRecentReader: Sendable {
             let tail = try await SwiftNativePersistenceCore.tailJSONLReadReceipt(path, limit: rowLimit, maxBytes: maximumReadBytes)
             ledger = (tail.rows, JSONLReadReport(malformedLineCount: tail.malformedJSONRowCount))
         }
-        func matchKey(kind: String, payload: [String: JSONValue], date: Date) throws -> Data? {
-            let identity: [JSONValue]
-            switch kind {
-            case "tool.dispatch":
-                guard case .object(let receipt)? = payload["receipt"],
-                      case .string(let id)? = receipt["id"] else { return nil }
-                identity = [.string(id)]
-            case "turn.plan":
-                guard case .string(let id)? = payload["runId"] else { return nil }
-                identity = [.string(id)]
-            case "llm.call", "provider.noReply":
-                guard case .string(let turn)? = payload["turnId"], !turn.isEmpty, turn != "unknown" else { return nil }
-                // Historical calls have no shared id; match their recorded second
-                // and measurements, consuming each ledger row at most once.
-                let fields = kind == "llm.call"
-                    ? ["provider", "model", "surface", "purpose", "streaming", "durationMs", "ttftMs", "inputTokens", "outputTokens"]
-                    : ["provider", "surface", "seconds", "events"]
-                identity = [.string(turn), .int(Int64(date.timeIntervalSince1970.rounded(.down)))]
-                    + fields.map { payload[$0] ?? .null }
-            default: return nil
-            }
-            return try JSONValue.array([.string(kind)] + identity).serializedData(pretty: false)
-        }
-        var matches: [Data: [Int]] = [:]
-        for (index, row) in ledger.rows.enumerated().reversed() {
-            guard case .object(let object) = row, case .string(let kind)? = object["kind"],
-                  case .object(let payload)? = object["payload"],
-                  case .string(let raw)? = object["createdAt"], let date = TurnTraceEvent.parseISO8601(raw),
-                  let key = try matchKey(kind: kind, payload: payload, date: date) else { continue }
-            matches[key, default: []].append(index)
-        }
-        var matched: Set<Int> = []
         var rows: [JSONValue] = []
         for event in turns.events {
-            guard !event.diagnostic.isEmpty || ["llm.call", "provider.noReply", "tool.dispatch", "turn.plan"].contains(event.kind),
+            guard !event.diagnostic.isEmpty || ["llm.call", "provider.noReply", "tool.dispatch"].contains(event.kind),
                   case .object(var payload) = event.payload else { continue }
             if event.kind == "tool.dispatch", payload["phase"] != .string("end"), event.diagnostic.isEmpty { continue }
             payload["turnId"] = .string(event.turnId)
-            if let key = try matchKey(kind: event.kind, payload: payload, date: event.ts),
-               let index = matches[key]?.popLast(), case .object(let legacy) = ledger.rows[index] {
-                matched.insert(index)
-                if case .object(let older)? = legacy["payload"] { payload = older.merging(payload) { _, current in current } }
-                if payload["status"] == nil { payload["status"] = legacy["status"] }
-            }
             let title: String
             if let value = event.diagnostic["title"]?.stringValue { title = value }
-            else if event.kind == "turn.plan", case .string(let goal)? = payload["goalType"],
-               case .string(let mode)? = payload["contextMode"] { title = "\(goal) -> \(mode)" }
             else if case .string(let value)? = payload[event.kind == "tool.dispatch" ? "name" : event.kind == "llm.call" ? "model" : "provider"] { title = value }
             else { title = event.kind }
             let id: String
@@ -194,7 +154,7 @@ public struct TurnTraceRecentReader: Sendable {
                 "payload": .object(payload),
             ]))
         }
-        rows += ledger.rows.enumerated().compactMap { matched.contains($0.offset) ? nil : $0.element }
+        rows += ledger.rows
         var report = ledger.report
         report.malformedLineCount += turns.malformedRows
         report.trailingPartialLine = report.trailingPartialLine || turns.trailingPartialLine
@@ -312,14 +272,15 @@ public struct TurnTraceRecentReader: Sendable {
     /// An app call as heaviest_asks names it: its action, or what it read.
     static func callLabel(_ payload: [String: JSONValue]) -> String {
         if case .object(let receipt)? = payload["receipt"], case .string(let action)? = receipt["action"], action != "app" { return action }
-        let args: [String: JSONValue] = if case .string(let raw)? = payload["args"],
-            case .object(let args)? = try? JSONValue.parse(Data(raw.utf8)) { args } else { [:] }
+        let decoded: [String: JSONValue]? = if case .string(let raw)? = payload["args"],
+            case .object(let args)? = try? JSONValue.parse(Data(raw.utf8)) { args } else { nil }
+        let args = decoded ?? [:]
         // A long script's args are clipped past parsing; its key names still say what it was.
         let keys: [JSONValue] = if case .array(let names)? = payload["argKeys"] { names } else { args.keys.map(JSONValue.string) }
         let blank: [JSONValue] = [.null, .string(""), .array([])]
         guard let key = ["actions", "script", "find", "page", "item"].first(where: {
             keys.contains(.string($0)) && !blank.contains(args[$0] ?? .bool(true))
-        }) else { return "home" }
+        }) else { return decoded?.isEmpty == true ? "home" : "unknown (arguments unavailable)" }
         switch args[key] {
         case .array(let list)?: return "\(key)[\(list.count)]"
         case .string(let text)? where ["page", "item"].contains(key): return key + " " + text
@@ -384,7 +345,7 @@ public struct TurnTraceRecentReader: Sendable {
             "malformed_rows": .int(Int64(evidence.report.malformedLineCount)),
             "trailing_partial_line": .bool(evidence.report.trailingPartialLine),
             "turn_traces_incomplete": .bool(snapshot.truncated),
-            "measurement": .string("Exact checked sums of reconciled llm.call values from daily turn traces and standalone traces/events.jsonl, without double-counting matched historical copies. missing_fields counts absent or null measurements; invalid domains or overflowing totals fail explicitly. Input and cached input are separate counters. Retention and read damage limit coverage."),
+            "measurement": .string("Exact checked sums of recorded llm.call values from canonical daily turn traces and standalone traces/events.jsonl. No inferred duplicate identities or cross-feed field merging. missing_fields counts absent or null measurements; invalid domains or overflowing totals fail explicitly. Input and cached input are separate counters. Retention and read damage limit coverage."),
             "totals": .object(counts(totals, missing: totalMissing)),
             "groups": .array(groups.sorted { $0.key < $1.key }.map { key, values in
                 var row = counts(values, missing: missing[key] ?? [:])

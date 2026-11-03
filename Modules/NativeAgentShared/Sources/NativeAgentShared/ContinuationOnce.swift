@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `ContinuationOnce.swift` | `ContinuationOnce`: one retained first outcome for single-consumer waits; winning resolution runs cancellation before any continuation resumes; CloudKit races preserve typed failures and caller-owned task policies |
+// Blueprint: | `ContinuationOnce.swift` | `ContinuationOnce`: one retained first outcome for single-consumer waits; winning resolution runs cancellation before any continuation resumes; typed cancellation waits honour Stop and the inherited tool-call deadline; CloudKit races preserve typed failures and caller-owned task policies; a write's deadline can end the wait without cancelling the write |
 
 /// First outcome wins, including resolution before continuation installation.
 public final class ContinuationOnce<T: Sendable>: @unchecked Sendable {
@@ -57,6 +57,20 @@ public final class ContinuationOnce<T: Sendable>: @unchecked Sendable {
     public func wait() async -> T {
         await withCheckedContinuation { _ = install($0) }
     }
+
+    /// A generic result has no invented cancellation value. The owner supplies
+    /// its existing typed cancellation path; both Stop and expiry use it.
+    public func wait(
+        cancellingWith value: @autoclosure @escaping @Sendable () -> T,
+        onCancel: @escaping @Sendable () -> Void = {}
+    ) async -> T {
+        let cancel: @Sendable () -> Void = { self.resume(value(), beforeResume: onCancel) }
+        let deadline = TaskWaitDeadline.arm(cancel)
+        defer { deadline?.cancel() }
+        return await withTaskCancellationHandler {
+            await wait()
+        } onCancel: { cancel() }
+    }
 }
 
 enum CloudKitTimeoutOutcome<T: Sendable>: Sendable {
@@ -71,7 +85,8 @@ extension ContinuationOnce {
     func cloudKitRace<Value: Sendable>(
         workTask: Task<Void, Never>,
         timeoutNanoseconds: UInt64,
-        timeoutOnCancellation: Bool = false
+        timeoutOnCancellation: Bool = false,
+        cancelWorkOnTimeout: Bool = true
     ) async -> CloudKitTimeoutOutcome<Value> where T == Result<Value, Error>? {
         await withTaskGroup(of: CloudKitTimeoutOutcome<Value>.self) { group in
             group.addTask {
@@ -89,7 +104,9 @@ extension ContinuationOnce {
             }
             let first = await group.next()
             group.cancelAll()
-            workTask.cancel()
+            // A deadline ends the wait. For a write it must not end the write:
+            // a cancelled upload is a message that never arrives (10-31).
+            if case .timedOut? = first, !cancelWorkOnTimeout {} else { workTask.cancel() }
             self.resume(nil)
             return first ?? .cancelled
         }

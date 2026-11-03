@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 // MARK: - REMReport
 
@@ -11,29 +12,34 @@ public struct REMReport: Sendable, Codable, Equatable {
     public var growthMDEvicted: Int
     public var archivedEntries: Int
     /// Proposals the store REFUSED, keyed by persona doc ("SOUL.md": 2).
-    /// nil (and omitted on the wire) when nothing was dropped — and optional
-    /// so run reports written before this field decode unchanged. The fence
-    /// itself is unchanged; this is the fence saying what it stopped.
+    /// nil (and omitted on the wire) when nothing was dropped.
     public var personaTargetDrops: [String: Int]?
     /// Proposals the store REFUSED for breaking the GROWTH.md passage bound,
-    /// keyed by reason ("over 240 characters": 1). nil when none, and optional
-    /// so older run reports decode unchanged.
+    /// keyed by reason ("over 240 characters": 1). nil when none.
     public var passageBoundDrops: [String: Int]?
-    /// Distinguishes skipped work from a completed quiet week; nil is omitted so older reports decode unchanged.
+    /// Distinguishes skipped work from a completed quiet week; nil when not skipped.
     public var skipReason: String?
+
+    /// The same terminal classification used by the REM owner and its callers.
+    public var outcome: REMRunReportPayload.Outcome {
+        if skipReason != nil { return .skipped }
+        if let unavailableDreamSections, !unavailableDreamSections.isEmpty { return .failed }
+        return .completed
+    }
     /// Of the survivors, how many are one lived occasion dreamt about more than
-    /// once — kept and labelled `dwelt_on`, never counted as a pattern. nil
-    /// when none, and optional so older run reports decode unchanged.
+    /// once — kept and labelled `dwelt_on`, never counted as a pattern. nil when none.
     public var dweltOnKept: Int?
     /// Of the survivors, how many rest on entries with no provenance at all, so
     /// whether they recurred is not knowable. Said, not assumed.
     public var provenanceUnavailableKept: Int?
+    /// Exact diary sections that remain unreadable and unconsumed; readable siblings proceed.
+    public var unavailableDreamSections: [String]?
     /// Transient delivery of committed causes, excluded from the counter-only run ledger.
     public var reflectionMaterial: [String: CognitiveReflectionCause] = [:]
 
     private enum CodingKeys: String, CodingKey {
         case proposalsGenerated, evidenceDatesMin, tombstoneSkips, growthMDEvicted, archivedEntries
-        case personaTargetDrops, passageBoundDrops, skipReason, dweltOnKept, provenanceUnavailableKept
+        case personaTargetDrops, passageBoundDrops, skipReason, dweltOnKept, provenanceUnavailableKept, unavailableDreamSections
     }
 
     public init(
@@ -127,31 +133,14 @@ extension REMRunReportPayload {
     }
 
     private static func bool(_ value: Any?) -> Bool? {
-        if let value = value as? Bool { return value }
-        if let value = value as? String {
-            switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "true", "1": return true
-            case "false", "0": return false
-            default: return nil
-            }
-        }
-        return nil
+        guard isBoolean(value), let number = value as? NSNumber else { return nil }
+        return number.boolValue
     }
 
     private static func nonnegativeInt(_ rawValue: Any?) -> Int? {
         // Reject genuine booleans by CF type, preserving numeric counts of 0 and 1 despite Bool bridging.
         if isBoolean(rawValue) { return nil }
-        let value: Int?
-        if let integer = rawValue as? Int {
-            value = integer
-        } else if let number = rawValue as? NSNumber {
-            value = number.intValue
-        } else if let text = rawValue as? String {
-            value = Int(text.trimmingCharacters(in: .whitespacesAndNewlines))
-        } else {
-            value = nil
-        }
-        guard let value, value >= 0 else { return nil }
+        guard let value = rawValue as? Int, value >= 0 else { return nil }
         return value
     }
 
@@ -163,4 +152,4 @@ extension REMRunReportPayload {
     }
 }
 import CognitiveSubstrate
-// Blueprint: | `REMReport.swift` | `REMReport`, `REMRunReportPayload`; manual completion validates counters and refuses skipped passes as completion |
+// Blueprint: | `REMReport.swift` | `REMReport` owns the typed completed/skipped/failed projection used by its ledger and scheduled caller; `REMRunReportPayload` manual completion validates counters and refuses skipped passes as completion |

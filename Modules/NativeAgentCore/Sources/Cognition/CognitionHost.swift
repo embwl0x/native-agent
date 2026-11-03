@@ -6,7 +6,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Desk
-// Blueprint: | `CognitionHost.swift` | Native cognition reach, including the sender-owned phone notification target count and root-bound pure readout-face invocation; domain facts and canonical commits remain outside editable code |
+// Blueprint: | `CognitionHost.swift` | Native cognition reach: engine-owned day perception, phone notification target count, pure readout faces and carried habit calls through the part-wake self door; domain facts and canonical commits remain outside editable code |
 
 /// Concrete tool and chat clients composed by the app for a Studio hour.
 public protocol StudioWanderClientPort: Sendable {
@@ -26,6 +26,11 @@ public protocol BackgroundWorkLeasing: Sendable {
 /// background LLM client and trust gate, the dream action, the scheduler's
 /// jobs file, morning briefs and her Studio hour.
 public protocol CognitionHost: Sendable {
+    /// Canonical Telegram identity, without coupling cognition/history to the transport module.
+    func telegramOwnerUserId(dataRoot: URL) throws -> Int64?
+    /// The clock changed (also once at launch); the engine brings today's
+    /// date and already-permitted calendar titles through the same crossing.
+    func perceiveDay(dataRoot: URL) async
     func phoneNotificationTargetCount(dataRoot: URL) async throws -> Int
     func readoutFace(id: String, input: JSONValue, version: String, dataRoot: URL) async -> PartCallResult<PartFace>
     /// The user's declared quiet hours, as the attention router reads them.
@@ -52,4 +57,6 @@ public protocol CognitionHost: Sendable {
     func studioWanderClient(dataRoot: URL, usesLiveAppBody: Bool) -> any StudioWanderClientPort
     /// Native source selection enters the engine's ordinary originating door.
     func callReadPart(id: String, input: JSONValue, actions: Set<String>, dataRoot: URL, origin: String) async throws -> JSONValue
+    /// A carried habit uses the same originating, gated door as a part wake.
+    func runCarriedAction(_ step: DeskStep, handle: String, dataRoot: URL) async -> JSONValue
 }

@@ -7,7 +7,7 @@ import ChatTurnContracts
 /// Shared session input handling; explicit caller fields confer no verified identity.
 package enum ChatToolSessionInjection {
     package static func explicitSessionId(in input: [String: JSONValue]) -> String {
-        for key in ["__session_id", "session_id", "sessionId"] {
+        for key in ["__session_id", "session_id"] {
             if case .string(let raw)? = input[key] {
                 let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty { return trimmed }
@@ -43,15 +43,13 @@ package enum ChatToolSessionInjection {
         out["__session_id"] = .string(sessionId)
         if toolName == "scratchpad_read" {
             out["session_id"] = .string(sessionId)
-            out["sessionId"] = .string(sessionId)
         }
         if toolName == "recent_trace_summary",
            out["view"] != .string("receipts"), out["effects_only"] != .bool(true),
-           out["session_id"] == nil,
-           out["sessionId"] == nil {
+           out["session_id"] == nil {
             out["session_id"] = .string(sessionId)
         }
-        if toolName == "search_chat_history" || toolName == "session_search" {
+        if toolName == "search_chat_history" {
             out["current_session_id"] = .string(sessionId)
         }
         if toolName == "tool_result_page" {

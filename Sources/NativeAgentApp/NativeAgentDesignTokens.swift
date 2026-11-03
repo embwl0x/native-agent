@@ -40,7 +40,4 @@ enum NativeAgentBrand {
     static let accent       = Color(hex: 0x06B6D4)
     /// Deep cyan-700 — gradient end for filled surfaces; keeps white text readable.
     static let accentDeep   = Color(hex: 0x0E7490)
-    /// Sky-400 — cool blue counter-tone for multi-stop gradients + glows.
-    static let accentCool    = Color(hex: 0x38BDF8)
-
 }

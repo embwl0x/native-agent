@@ -4,7 +4,7 @@ import PersistenceCore
 import CognitiveSubstrate
 import NativeAgentShared
 
-// Blueprint: | `AfterTurnSurpriseLedger.swift` | `AfterTurnSurpriseLedger`: the agent's own labelled record of complete-channel interpretation outcomes (append-only, keyed by agent, memory model and detector version): frozen precedent predictions, deferred turns labelled when their batch judges them, measured provider and delay costs, and the Wilson-bound cost law that grants deferral |
+// Blueprint: | `AfterTurnSurpriseLedger.swift` | `AfterTurnSurpriseLedger`: the agent's own labelled record of complete-channel interpretation outcomes (append-only, keyed by agent, memory model and detector version): stable precedent claims, deferred turns labelled when their batch judges them, measured provider and delay costs under shared `Expectation` standing, and a bounded dream reading of contradicted no-op predictions |
 
 public struct AfterTurnSurpriseObservation: Sendable, Equatable {
     public let check: AfterTurnMemorySurprise
@@ -19,36 +19,54 @@ public struct AfterTurnSurpriseAgreement: Sendable, Equatable {
     /// Turns predicted a complete no-op.
     public let wouldDefer: Int
     /// Of those, turns whose interpretation changed ANY channel (memories,
-    /// affect, caring, cares): a wrong prediction.
+    /// affect, caring, cares, promises): a wrong prediction.
     public let changedOnPrediction: Int
     /// Of those, turns not yet labelled by a complete judgment.
     public let incompletePredictions: Int
     public let ledgerReadable: Bool
 }
 
-/// What one complete judgment said about each channel.
+/// What one judgment measured in each channel; retained judgments may be incomplete.
 public struct AfterTurnChannelOutcome: Codable, Sendable, Equatable {
     public let facts: Bool
     public let affect: Bool
     public let caring: Bool
     public let cares: Bool
-    /// The judgment covered every channel it labels (its facts were asked and readable).
+    /// Nil when a retained judgment never measured promises.
+    public let promises: Bool?
+    /// All five channels were measured, with facts asked and readable.
     public let complete: Bool
-    public var nothingNew: Bool { complete && !facts && !affect && !caring && !cares }
+    public var nothingNew: Bool { complete && !facts && !affect && !caring && !cares && promises == false }
 
     /// The label a judgment gives: did it keep or change a memory, move affect
-    /// beyond noise, judge a caring moment, or move a care?
+    /// beyond noise, judge a caring moment, move a care, or make a promise?
     public init(interpretation: AfterTurnInterpretation, factsAsked: Bool) {
         facts = interpretation.memories.contains { $0.action != .skip }
         affect = !interpretation.affect.isNoOp
         caring = interpretation.caring.kind != nil
         cares = !interpretation.cares.isEmpty
+        promises = !interpretation.promises.isEmpty
         complete = factsAsked
+    }
+
+    private enum CodingKeys: String, CodingKey { case facts, affect, caring, cares, promises, complete }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        facts = try values.decode(Bool.self, forKey: .facts)
+        affect = try values.decode(Bool.self, forKey: .affect)
+        caring = try values.decode(Bool.self, forKey: .caring)
+        cares = try values.decode(Bool.self, forKey: .cares)
+        let measuredPromises = try values.decodeIfPresent(Bool.self, forKey: .promises)
+        promises = measuredPromises
+        complete = try values.decode(Bool.self, forKey: .complete) && measuredPromises != nil
     }
 }
 
 actor AfterTurnSurpriseLedger {
     static let shared = AfterTurnSurpriseLedger()
+    // Retained rows that never measured promises remain incomplete evidence.
+    // The reader preserves their unknown channel without rewriting the ledger.
     static let version = 3
     struct Row: Codable, Sendable {
         let version: Int
@@ -169,17 +187,29 @@ actor AfterTurnSurpriseLedger {
             ledgerReadable: book.readable)
     }
 
-    /// The Wilson score lower bound of a hit rate (z for a 95% two-sided
-    /// interval). 0 with no trials.
-    static func wilsonLower(hits: Int, of trials: Int, z: Double = 1.959964) -> Double {
-        guard trials > 0 else { return 0 }
-        let n = Double(trials)
-        let p = Double(min(max(0, hits), trials)) / n
-        let z2 = z * z
-        let centre = p + z2 / (2 * n)
-        let margin = z * ((p * (1 - p) + z2 / (4 * n)) / n).squareRoot()
-        return max(0, (centre - margin) / (1 + z2 / n))
+    func dreamMisses(dataRoot: URL, since: Date, through: Date) throws -> [String] {
+        let book = book(dataRoot)
+        guard book.readable else { throw MemoryV2Error.underlying("After-turn surprise ledger is unreadable.") }
+        let missed = book.rows.values.filter {
+            $0.at > since && $0.at <= through && $0.check.verdict == .nothingNew
+                && $0.channels?.complete == true && $0.channels?.nothingNew == false
+        }.sorted { $0.at == $1.at ? $0.id < $1.id : $0.at > $1.at }
+        guard !missed.isEmpty else { return [] }
+        return ["After-turn predictions: \(missed.count) expected nothing new, but changed."]
+            + missed.prefix(3).map { row in
+                let channels = row.channels!
+                let changed = [("memory", channels.facts), ("affect", channels.affect),
+                               ("caring", channels.caring), ("cares", channels.cares),
+                               ("promises", channels.promises == true)].filter { $0.1 }.map { $0.0 }
+                return "turn \(row.turn): expected nothing new; changed \(changed.joined(separator: ", "))."
+            }
     }
+
+    /// 65,536 chunk pairs admits all 256 newest examples at 16 chunks per
+    /// side. The 10-30 retained ledger's median is 4 chunks, p90 is 9 (max 30);
+    /// the former 4,096 bound admitted only 4 per side at that population.
+    /// This bounds comparison work only, never the nomination or cost bars.
+    private static let comparisonCap = 65_536
 
     func predict(dataRoot: URL, scope: AfterTurnMemorySurprise.Scope, epoch: String,
                  vectors: [[Float]], excluding turn: String) -> AfterTurnMemorySurprise {
@@ -190,7 +220,7 @@ actor AfterTurnSurpriseLedger {
             && $0.check.epoch == epoch && $0.check.vectors?.first?.count == vectors.first?.count }
             .sorted { $0.at > $1.at }.prefix(256)
         let comparisons = examples.reduce(0) { $0 &+ ($1.check.vectors?.count ?? 0) }
-        guard comparisons <= 4_096 / max(1, vectors.count) else { return .unsure("precedent_comparison_bound") }
+        guard comparisons <= Self.comparisonCap / max(1, vectors.count) else { return .unsure("precedent_comparison_bound") }
         // Every chunk on BOTH sides needs a counterpart. Similarity nominates;
         // only the model's settled judgment labels the complete interpretation.
         let ranked = examples.compactMap { row -> (Row, Double)? in
@@ -199,17 +229,15 @@ actor AfterTurnSurpriseLedger {
             let reverse = old.map { q in vectors.map { VectorMath.cosine(q, $0) }.max() ?? -1 }.min() ?? -1
             return (row, min(forward, reverse))
         }.sorted { $0.1 == $1.1 ? $0.0.id < $1.0.id : $0.1 > $1.1 }
-        // The applicability of a claim includes its contrast population:
-        // adding, changing or evicting a precedent is a new claim, never old
-        // standing applied to a changed boundary.
-        let applicability = AfterTurnMemorySurprise.fingerprint(examples.map(\.id).sorted())
         var verdict = AfterTurnMemorySurprise.Verdict.unsure
         var rule: String?
         if let best = ranked.first,
            let standout = VectorMath.standout(ranked.map(\.1))[0],
            standout >= VectorMath.chanceBar(.action, among: ranked.count) {
             verdict = best.0.channels?.nothingNew == true ? .nothingNew : .somethingNew
-            rule = AfterTurnMemorySurprise.fingerprint([best.0.id, applicability])
+            // The labelled precedent is the claim. Its contrast population
+            // still decides nomination, but cannot reset this claim's trials.
+            rule = AfterTurnMemorySurprise.fingerprint([best.0.id])
         }
         // THE COST LAW, from this scope's own record. A trial is a turn this
         // claim predicted a no-op and a complete judgment later labelled.
@@ -233,18 +261,19 @@ actor AfterTurnSurpriseLedger {
             return max(0, row.at.timeIntervalSince(start))
         }
         let missCost = delays.max() ?? 0
-        let bar = hitCost > 0 && missCost > 0 ? missCost / (missCost + hitCost) : 1
         // Defer only while the Wilson 95% lower bound of the claim's hit rate
         // beats c_miss / (c_miss + c_hit). Assumptions, stated: future turns'
         // outcomes are independent and resemble this scope's labelled past;
         // future provider service and delay resemble the measured ones; the
-        // bound is per frozen claim and per look (repeated looks are not
+        // bound is per precedent claim and per look (repeated looks are not
         // corrected for; every deferred turn is still judged in its batch and
         // labels the claim). It is a cost estimate, never a guarantee.
-        let lower = Self.wilsonLower(hits: hits, of: n)
+        let standing = Expectation.stands(hits: hits, tries: n,
+            cHit: hitCost > 0 ? hitCost : nil, cMiss: missCost > 0 ? missCost : nil)
         return .init(verdict: verdict, reason: rule == nil ? "no_standing_precedent" : "labelled_precedent",
             epoch: epoch, scope: scope, rule: rule, at: Date(), vectors: vectors,
-            standing: verdict == .nothingNew && lower > bar, lowerBound: lower, costBar: bar, tries: n, hits: hits)
+            standing: verdict == .nothingNew && standing.stands,
+            lowerBound: standing.lower, costBar: standing.bar ?? 1, tries: n, hits: hits)
     }
 
     func record(dataRoot: URL, session: String, turn: String, surface: String,
@@ -294,5 +323,13 @@ actor AfterTurnSurpriseLedger {
     func deferredTurns(dataRoot: URL, among turns: [(session: String, turn: String)]) -> Set<String> {
         let book = self.book(dataRoot)
         return Set(turns.map { $0.session + "\u{0}" + $0.turn }.filter { book.rows[$0]?.deferred == true })
+    }
+}
+
+extension SwiftNativeMemoryV2 {
+    /// Read the ledger's final labels, retaining the original prediction and
+    /// counting a deferred turn once when its batch has actually judged it.
+    public static func afterTurnMissesForDream(dataRoot: URL, since: Date, through: Date) async throws -> [String] {
+        try await AfterTurnSurpriseLedger.shared.dreamMisses(dataRoot: dataRoot, since: since, through: through)
     }
 }

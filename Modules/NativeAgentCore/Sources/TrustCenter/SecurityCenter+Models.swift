@@ -71,7 +71,7 @@ public enum SecurityToolDecision: String, Codable, Sendable, Equatable {
 public enum FullMacYoloAuthorityState: String, Codable, Sendable, Equatable {
     case admitted
     case inactive
-    /// Older audit receipts carry it; no saved per-tool entry decides now.
+    /// The current Full Mac kill switch explicitly blocks the action.
     case explicitlyBlocked = "explicitly_blocked"
     case untrustedOrigin = "untrusted_origin"
     case unavailable
@@ -163,37 +163,8 @@ public struct SecurityReason: Codable, Sendable, Equatable {
         let parts = persistedValue.split(separator: ":", maxSplits: 1).map(String.init)
         if parts.count == 2, let kind = Kind(rawValue: parts[0]) {
             self.init(kind, parts[1].trimmingCharacters(in: .whitespaces))
-        } else if parts.count == 2, ["security ask", "security block"].contains(parts[0]) {
-            self.init(.cause, parts[1].trimmingCharacters(in: .whitespaces))
         } else {
             self.init(.cause, persistedValue)
-        }
-        if parts.count == 2, Kind(rawValue: parts[0]) != nil,
-           sentence != "tool signature not in registry (yolo: not blocking)" { return }
-        switch sentence {
-        case "tool signature not in registry (yolo: not blocking)":
-            self = Self(.note, "This tool’s signature is unknown; it can still run.")
-        case "rollback receipt required for write/delete class":
-            self = Self(.note, "A restore point is required before changing or deleting files.")
-        case "prompt-injection markers noted (yolo: not gating)":
-            self = Self(.note, "Possible hidden instructions were noted; Full Mac allows this action.")
-        case "admitted Full Mac YOLO suppresses per-call approval":
-            self = Self(.note, "Full Mac allows this action without asking again.")
-        case "trusted local agent bridge allows task handoff text", "app notification tool is allowed by security policy":
-            kind = .note
-        default:
-            break
-        }
-        for (legacy, plain) in [
-            ("prompt-injection markers in ", "Possible hidden instructions were found in "),
-            ("secret-shaped input redacted in ", "Possible passwords or keys were hidden in ")
-        ] {
-            let translated = sentence.replacingOccurrences(of: legacy, with: plain, options: .anchored)
-            if translated != sentence { self = Self(.note, translated) }
-        }
-        if sentence.contains("allowlist") || sentence.contains("turn arrived with no verified")
-            || ["remote origin has no trust root", "iOS remote control not trusted for high-risk actions"].contains(sentence) {
-            kind = .origin
         }
     }
 

@@ -39,10 +39,10 @@ public struct ContextPacketItem: Codable, Equatable, Sendable {
     public let summary: String?
     /// When the memory this atom carries was recorded, so the renderer can lead
     /// with its age instead of handing every memory over as equally present.
-    /// Memory atoms only; nil everywhere else and on legacy packets.
+    /// Memory atoms only; nil where the source has no recorded timestamp.
     public let recordedAt: Date?
     /// How the memory came to be known (`verified` / `told by X` / `inferred`),
-    /// when the record says. nil on rows written before provenance existed.
+    /// when the source record says; nil when that evidence is unavailable.
     public let provenance: ContextMemoryProvenance?
     /// Untrusted sources of the selected text, retained from its exact atom.
     public let untrustedSources: [String]?
@@ -154,7 +154,6 @@ public struct ContextPacket: Codable, Equatable, Sendable {
     public let sourceFingerprint: String
     public let selectedItems: [ContextPacketItem]
     public let expandablePointers: [ContextAtomPointer]
-    public let conflictSets: [ContextConflictSet]
     public let degradedSources: [ContextDegradedSourceNotice]
     /// Selection-time accounting, retained when verification excludes items.
     public let budget: ContextBudgetUsage

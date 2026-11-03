@@ -42,7 +42,7 @@ public enum ConnectorRegistryActions {
         root: URL,
         projection: ConnectorRegistryProjectionPort
     ) async throws -> JSONValue {
-        // registry.json uses an array of rows; flock-protected updates also support object-shaped files.
+        // ConnectorOAuthRegistry owns the checked array and locked publication.
         let normalizedID = ConnectorOAuthRegistry.normalizedConnectorID(id)
         guard let currentEntry = try await ConnectorOAuthRegistry.readConnectorRegistryEntry(
             root: root,

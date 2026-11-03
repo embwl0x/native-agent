@@ -188,6 +188,8 @@ extension AppModel {
         }
         let normalizedEffort = ProvidersFacade.normalizedReasoningEffort(
             from: engine.providers.catalog,
+            providers: engine.providers.connections,
+            providerID: engine.providers.selection(for: "telegram").provider,
             model: telegramModel,
             selected: telegramReasoningEffort
         )
@@ -234,22 +236,12 @@ extension AppModel {
         isSavingTelegram = true
         statusText = "Clearing Telegram bot token..."
         defer { isSavingTelegram = false }
-        let restart: (@Sendable () async -> Void)? = restartPollLoop
-            ? { @Sendable [backgroundLoopsManager] in _ = await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll", manager: backgroundLoopsManager) }
+        let restart: (@Sendable () async -> Bool)? = restartPollLoop
+            ? { @Sendable [backgroundLoopsManager] in await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll", manager: backgroundLoopsManager).didRestart }
             : nil
         let submittedToken = telegramToken
         do {
-            try await engine.telegram.configureTelegram(
-                token: "",
-                allowedChatIds: splitIDs(telegramAllowedChats),
-                allowedUserIds: splitIDs(telegramAllowedUsers),
-                requireMention: telegramRequireMention,
-                model: telegramModel,
-                reasoningEffort: telegramReasoningEffort,
-                enabled: false,
-                clearToken: true,
-                restartPollLoop: restart
-            )
+            try await engine.telegram.disconnectTelegram(restartPollLoop: restart)
             if telegramToken == submittedToken { telegramToken = "" }
             await refreshAll()
             statusText = "Telegram bot token cleared"
@@ -265,32 +257,22 @@ extension AppModel {
     func refreshTelegram() async -> Bool {
         telegramStatusRefreshError = nil
         var published = false
-        await refreshTelegramSettingsDraft({ () async -> Result<(TelegramPresentationSnapshot, Bool), Error> in
+        await refreshTelegramSettingsDraft({ () async -> Result<TelegramPresentationSnapshot, Error> in
         do {
-            let status: TelegramPresentationSnapshot
-            var credentialUnavailable = false
-            do {
-                status = try await engine.telegram.refresh(manager: backgroundLoopsManager)
-            } catch is DeviceSecretKeychain.Failure {
-                // Keep validated authority fields editable for explicit grant
-                // replacement or disconnect; this is not transport readiness.
-                status = try await engine.telegram.refresh(manager: backgroundLoopsManager, credentialUnavailable: true)
-                credentialUnavailable = true
-            }
-            return .success((status, credentialUnavailable))
+            return .success(try await engine.telegram.refresh(manager: backgroundLoopsManager))
         } catch { return .failure(error) }
         }, snapshot: { result in
-            guard case .success(let (status, _)) = result else { return nil }
+            guard case .success(let status) = result else { return nil }
             return TelegramSettingsDraftSnapshot(
                 enabled: status.enabled, chats: status.allowedChatIds.joined(separator: ","),
                 users: status.allowedUserIds.joined(separator: ","), requireMention: status.requireMention
             )
         }, publish: { result in
         switch result {
-        case .success(let (_, credentialUnavailable)):
-            if credentialUnavailable { telegramStatusRefreshError = UserFacingError.advice(for: DeviceSecretKeychain.Failure.unavailable) }
+        case .success(let status):
+            telegramStatusRefreshError = status.credentialIssue ?? status.routingIssue
             statusText = telegramStatusRefreshError ?? "Telegram status refreshed"
-            published = true
+            published = telegramStatusRefreshError == nil
         case .failure(let error):
             setFailureStatus(error, action: "refresh Telegram")
             telegramStatusRefreshError = UserFacingError.advice(for: error)
@@ -372,7 +354,7 @@ extension AppModel {
             }
             return .completed(status: report.status, failingChecks: failing)
         } catch {
-            doctor.finishRun(nil)
+            doctor.finishRun(nil, failure: UserFacingError.message(error, action: "run the health checks"))
             setFailureStatus(error, action: "run the health checks")
             return .unavailable(statusText)
         }
@@ -388,9 +370,7 @@ extension AppModel {
         let liveChecks = await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
             .runtime.liveDoctorCoverageChecks()
         let statusChecks = await DoctorFacade.statusChecks(dataRoot: engine.dataRoot, approvals: engine.approvals, repairDesk: false, stuckReason: DeskPageContent.stuckReason, safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail).checks
-        let withoutRetiredProbe = DoctorReport(status: current.status, repaired: current.repaired,
-                                               checks: current.checks.filter { $0.id != "status.app_health" && $0.id != "status.living_sources" })
-        var refreshed = EngineDoctorRuntime<AppDoctorPort>.mergeReport(withoutRetiredProbe, liveChecks: liveChecks + statusChecks)
+        var refreshed = EngineDoctorRuntime<AppDoctorPort>.mergeReport(current, liveChecks: liveChecks + statusChecks)
         refreshed.checks = await DoctorReadout.repairProjection(refreshed.checks, dataRoot: engine.dataRoot)
         refreshed.status = DoctorReadout.doctorRollup(refreshed.checks.map(\.status))
         return refreshed

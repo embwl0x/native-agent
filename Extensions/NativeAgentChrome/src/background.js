@@ -10,6 +10,7 @@ import {
   successResponse,
   tabStripLockError,
   validateRequest,
+  trustedKeyEvents,
 } from "./protocol.js";
 
 let nativePort = null;
@@ -75,7 +76,11 @@ const PAGE_LOAD_DEADLINE_MS = 25_000;
 const PAGE_CHANGE_STORAGE_KEY = "nativeAgentPageChangeGenerationsV1";
 const PAGE_VIEW_STORAGE_KEY = "nativeAgentPageSnapshotViewsV1";
 const snapshotRoutes = new Map();
+const trustedInputs = new Map();
 const activeSnapshotReads = new Map();
+// One document generation for the aggregate page: any frame commit advances it.
+// Tokens are worker-local; no in-flight capture survives a worker restart.
+const pageDocumentGenerations = new Map();
 const activeNavigations = new Map();
 const activePageActions = new Map();
 const cancelledRequests = new Set();
@@ -176,7 +181,7 @@ chrome.webNavigation.onCommitted.addListener(({ tabId, frameId, url, transitionQ
     // A new document: waits on the old document's frames no longer apply.
     const stream = pageChangeStreams.get(tabId);
     if (stream) stream.waitingFrameId = undefined;
-    invalidateTabSnapshots(tabId);
+    invalidateTabSnapshots(tabId, true);
   } else {
     // An ad or tracker iframe loading replaces only that frame's rows.
     readyPageFrames.get(tabId)?.delete(frameId);
@@ -349,7 +354,7 @@ async function handleNativeMessage(rawRequest, port) {
     const result = await dispatch(request);
     const response = successResponse(request, result);
     if (result?.format === "jpeg" && utf8Encoder.encode(JSON.stringify(response)).byteLength > MAX_NATIVE_MESSAGE_BYTES) {
-      throw new ProtocolError("picture_too_large", "Chrome's encoded picture and response metadata exceed the relay's 1 MiB frame limit; the picture was not delivered.");
+      throw retainCleanup(new ProtocolError("picture_too_large", "Chrome's encoded picture and response metadata exceed the relay's 1 MiB frame limit; the picture was not delivered."), result.cleanupError);
     }
     if (postNativeMessage(port, response)) {
       if (request.action === "attach") {
@@ -446,8 +451,7 @@ async function dispatch(request) {
 async function navigateOwnedTab(payload, actionId) {
   let ownedTab;
   if (payload.tabId !== undefined) {
-    try { ownedTab = await workspace.requireForPageAction(payload); }
-    catch (error) { if (error.code !== "tab_not_owned") throw error; }
+    ownedTab = await workspace.requireForPageAction(payload);
   }
   if (!ownedTab) {
     if (payload.url === "back" || payload.url === "forward") {
@@ -456,7 +460,7 @@ async function navigateOwnedTab(payload, actionId) {
     ownedTab = await workspace.createTab(() => requireActiveRequest(actionId));
     payload = { ...payload, tabId: ownedTab.tabId, expectedUserSequence: ownedTab.userSequence };
   }
-  invalidateTabSnapshots(ownedTab.tabId);
+  invalidateTabSnapshots(ownedTab.tabId, true);
   activePageActions.set(actionId, ownedTab.tabId);
   cancelTabWaits(ownedTab.tabId, new ProtocolError("navigation_superseded", "A newer navigation superseded the pending observation."));
   const navigation = {};
@@ -464,6 +468,7 @@ async function navigateOwnedTab(payload, actionId) {
   const startedAt = new Date().toISOString();
   let topDocument;
   let navigationDispatched = false;
+  let cleanupError;
   async function requireCurrentNavigation() {
     await workspace.requireForPageAction(payload);
     requireActiveRequest(actionId);
@@ -475,18 +480,22 @@ async function navigateOwnedTab(payload, actionId) {
     // Chrome owns tab history, including documents such as PDFs that cannot
     // host a page agent. Step to the exact neighbouring entry through the
     // debugger: tabs.goBack skips entries added without user activation (her
-    // link clicks), so it would land one page too far. Only when the debugger
-    // cannot attach (DevTools already on the tab) does Chrome's own Back run.
+    // link clicks), so it would land one page too far. Attach failure refuses
+    // the exact operation; no different history implementation runs.
     const history = payload.url === "back" || payload.url === "forward"
-      ? (id) => stepTabHistory(id, payload.url) : null;
+      ? (id) => stepTabHistory(id, payload.url, requireCurrentNavigation, () => { navigationDispatched = true; }) : null;
     await requireCurrentNavigation();
     // Watch before dispatch, so a fast commit is not missed.
     topDocument = watchTopDocument(ownedTab.tabId);
-    navigationDispatched = true;
-    const updated = history
-      ? await history(ownedTab.tabId)
-        .then(() => chrome.tabs.get(ownedTab.tabId))
-      : await chrome.tabs.update(ownedTab.tabId, { url: payload.url });
+    let updated;
+    if (history) {
+      const settlement = await history(ownedTab.tabId);
+      cleanupError = settlement.cleanupError;
+      updated = await chrome.tabs.get(ownedTab.tabId);
+    } else {
+      navigationDispatched = true;
+      updated = await chrome.tabs.update(ownedTab.tabId, { url: payload.url });
+    }
     await requireCurrentNavigation();
     if (updated?.active === true) {
       await workspace.yieldForTab(ownedTab.tabId, "tab_activated_during_navigation");
@@ -518,6 +527,7 @@ async function navigateOwnedTab(payload, actionId) {
       outcome: "succeeded", verification: loaded ? "verified" : "not_verified",
       detail: {
         tabId: ownedTab.tabId, requestedUrl: payload.url,
+        ...(cleanupError ? { cleanupError } : {}),
         url: tab.url, title: tab.title ?? "", status: tab.status, verified: loaded,
         ...(loaded ? {} : { loading: "Chrome had not finished loading this page when the deadline passed." }),
       },
@@ -535,6 +545,7 @@ async function navigateOwnedTab(payload, actionId) {
         tabId: ownedTab.tabId, requestedUrl: payload.url,
         status: navigationDispatched ? "outcome_unknown" : "not_performed", verified: false,
         error: { code: error.code ?? "navigation_reply_lost", message: error.message ?? "Chrome navigation could not be confirmed." },
+        ...((cleanupError ?? error.details?.cleanupError) ? { cleanupError: cleanupError ?? error.details.cleanupError } : {}),
       },
     });
   } finally {
@@ -558,21 +569,40 @@ async function readStructuredSnapshot(payload, actionId) {
   if (!/^https?:/.test(ownedTab.url ?? "")) {
     return lookAtTab(payload, actionId, { pictureReason: "This Chrome page has no DOM reader; reading the picture Chrome renders." });
   }
-  let snapshot;
-  try { snapshot = await readDOMSnapshot(payload, actionId); }
-  catch (error) {
-    if (!["page_agent_loading", "page_agent_unavailable"].includes(error.code)) throw error;
-    // Chrome's PDF viewer can retain an HTTP URL but cannot host our reader.
-    // Prove its MIME type in Chrome before choosing pixels. An ordinary web
-    // page's missing reader remains its own failure, never a disguised image.
-    return lookAtTab(payload, actionId, { domUnavailableError: error,
-      pictureReason: "Chrome's PDF viewer has no accessible DOM reader; reading its displayed picture." });
+  const frame = await chrome.webNavigation.getFrame({ tabId: ownedTab.tabId, frameId: 0 });
+  if (!frame?.documentId) throw new ProtocolError("page_agent_loading", "Chrome has not identified the current document yet.");
+  const ready = readyPageFrames.get(ownedTab.tabId)?.get(0);
+  let kind;
+  if (ready?.documentId === frame.documentId) {
+    const document = await sendPageMessage(ownedTab.tabId,
+      { type: "nativeagent.page.document", actionId }, { documentId: frame.documentId });
+    kind = document.kind;
+  } else {
+    // Chromium's webNavigation filters chrome-extension:// viewer URLs
+    // (FrameNavigationState::IsValidUrl). Read the exact top document's
+    // contentType instead: Blink's Document::contentType reads its loader MIME
+    // even when MimeHandlerView renders a PDF inside an HTML wrapper.
+    const evidence = await chrome.scripting.executeScript({
+      target: { tabId: ownedTab.tabId, documentIds: [frame.documentId] },
+      injectImmediately: true,
+      func: () => document.contentType,
+    });
+    const document = evidence.find(result => result.frameId === 0 && result.documentId === frame.documentId);
+    if (typeof document?.result !== "string" || !document.result) {
+      throw new ProtocolError("page_document_unavailable", "Chrome did not return the admitted top document's content type; no reader was selected.");
+    }
+    if (document.result === "application/pdf") kind = "pdf";
+    else if (document.result.startsWith("image/")) kind = "image";
+    else throw new ProtocolError("page_agent_loading", "The current document has no ready DOM reader and is not a PDF or image. No reader was retried and no debugger was attached.");
   }
-  if (snapshot.document?.kind === "pdf") {
-    return lookAtTab(payload, actionId, { documentKind: "pdf",
-      pictureReason: "Reading Chrome's displayed PDF as a picture; no DOM text is available." });
-  }
-  return snapshot;
+  await workspace.requireForPageAction(payload);
+  requireActiveRequest(actionId);
+  const current = await chrome.webNavigation.getFrame({ tabId: ownedTab.tabId, frameId: 0 });
+  if (current?.documentId !== frame.documentId) throw new ProtocolError("page_changed", "The document changed before its reader was selected.");
+  if (kind === "pdf" || kind === "image") return lookAtTab(payload, actionId, {
+    documentKind: kind, expectedDocumentId: frame.documentId,
+    pictureReason: "Reading Chrome's displayed " + kind + " document as a picture." });
+  return readDOMSnapshot(payload, actionId);
 }
 
 async function readDOMSnapshot(payload, actionId) {
@@ -588,14 +618,14 @@ async function readDOMSnapshot(payload, actionId) {
   await workspace.requireForPageAction(payload);
   const loaded = tab.status === "complete" && !tab.pendingUrl;
   payload = { ...pageSnapshotViews.get(ownedTab.tabId), ...payload };
-  invalidateTabSnapshots(ownedTab.tabId);
+  invalidateTabSnapshots(ownedTab.tabId, false);
   requireActiveRequest(actionId);
-  const capture = { actionId, localSnapshotKeys: new Set(), invalidatedSnapshotKeys: new Set(), invalidationOverflow: false };
-  activeSnapshotReads.set(ownedTab.tabId, capture);
+  const capture = beginSnapshotCapture(ownedTab.tabId, { actionId });
   try {
     const snapshot = await readStructuredSnapshotForCapture(payload, ownedTab, capture);
+    await requireCurrentSnapshotCapture(ownedTab, capture);
     const cursor = payload.readCursor;
-    pageSnapshotViews.set(ownedTab.tabId, {
+    publishCurrentSnapshotCapture(ownedTab, capture, () => pageSnapshotViews.set(ownedTab.tabId, {
       maxNodes: payload.maxNodes ?? 120, maxTextChars: payload.maxTextChars ?? 12_000,
       scope: payload.scope ?? "page",
       // Keep the scroller, never the point reached by a one-off read-more.
@@ -603,13 +633,15 @@ async function readDOMSnapshot(payload, actionId) {
         url: cursor.url, frameURL: cursor.frameURL, frameId: cursor.frameId,
         viewportObservationId: cursor.viewportObservationId,
       } } : {}),
-    });
+    }));
     // Retain the successful reader's exact view durably before its reply,
     // without another page read. Writes serialize across tabs.
     await persistPageViews(ownedTab);
     await requireCurrentSnapshotCapture(ownedTab, capture);
-    snapshot.reading.pageMoved ||= snapshotCaptureMoved(capture);
-    return { ...snapshot, rendering: { ...snapshot.rendering, loaded } };
+    return publishCurrentSnapshotCapture(ownedTab, capture, () => {
+      snapshot.reading.pageMoved ||= snapshotCaptureMoved(capture);
+      return { ...snapshot, rendering: { ...snapshot.rendering, loaded } };
+    });
   } finally {
     if (activeSnapshotReads.get(ownedTab.tabId) === capture) activeSnapshotReads.delete(ownedTab.tabId);
     void drainSiteChanges(ownedTab.tabId);
@@ -628,12 +660,28 @@ function persistPageViews(ownedTab) {
   return viewWrites;
 }
 
+function beginSnapshotCapture(tabId, properties) {
+  if (!pageDocumentGenerations.has(tabId)) pageDocumentGenerations.set(tabId, Symbol());
+  const capture = { ...properties, documentGeneration: pageDocumentGenerations.get(tabId),
+    localSnapshotKeys: new Set(), invalidatedSnapshotKeys: new Set(), invalidationOverflow: false };
+  activeSnapshotReads.set(tabId, capture);
+  return capture;
+}
+
+// The check and publication share one continuation: no commit can run between
+// them. Every caller finishes its asynchronous ownership check before entering.
+function publishCurrentSnapshotCapture(ownedTab, capture, publish) {
+  requireActiveRequest(capture.actionId);
+  if (activeSnapshotReads.get(ownedTab.tabId) !== capture
+    || pageDocumentGenerations.get(ownedTab.tabId) !== capture.documentGeneration) {
+    throw new ProtocolError("snapshot_superseded", "A newer read or document change superseded this snapshot capture.");
+  }
+  return publish();
+}
+
 async function requireCurrentSnapshotCapture(ownedTab, capture) {
   await workspace.requireForPageAction({ tabId: ownedTab.tabId, expectedUserSequence: ownedTab.userSequence });
-  requireActiveRequest(capture.actionId);
-  if (activeSnapshotReads.get(ownedTab.tabId) !== capture) {
-    throw new ProtocolError("snapshot_superseded", "A newer read or navigation superseded this snapshot capture.");
-  }
+  publishCurrentSnapshotCapture(ownedTab, capture, () => {});
 }
 
 function snapshotCaptureMoved(capture) {
@@ -765,9 +813,6 @@ async function readStructuredSnapshotForCapture(payload, ownedTab, capture) {
   }
 
   if (!topSnapshot) {
-    if (frames.some((frame) => frame.frameId === 0 && frame.error?.code === "snapshot_scope_unsupported")) {
-      throw new ProtocolError("snapshot_scope_unsupported", "This page has an older reader. Reload the page before requesting semantic main content.");
-    }
     throw new ProtocolError("top_frame_unavailable", "The structured page agent is unavailable in the top frame.");
   }
   const snapshotId = crypto.randomUUID();
@@ -782,6 +827,7 @@ async function readStructuredSnapshotForCapture(payload, ownedTab, capture) {
       localToGlobal.set(localNode.nodeId, globalNodeId);
       routes.set(globalNodeId, {
         frameId: frame.frameId,
+        documentId: frame.documentId,
         localSnapshotId: local.snapshotId,
         localNodeId: localNode.nodeId,
       });
@@ -843,21 +889,23 @@ async function readStructuredSnapshotForCapture(payload, ownedTab, capture) {
     },
   }, routes, MAX_SNAPSHOT_RESULT_BYTES);
   await requireCurrentSnapshotCapture(ownedTab, capture);
-  result.reading.pageMoved ||= snapshotCaptureMoved(capture);
-  // A moved page is readable evidence, but an invalidated node is still no
-  // authority to act. Mutation notices before route publication count too.
-  for (const [id, route] of routes) {
-    const key = JSON.stringify([route.frameId, route.localSnapshotId]);
-    if (capture.invalidationOverflow || (capture.invalidatedSnapshotKeys.has(key)
-      && !capture.retainedNavigationNodes?.get(key)?.includes(route.localNodeId))) routes.delete(id);
-  }
-  snapshotRoutes.set(snapshotId, {
-    tabId: ownedTab.tabId,
-    userSequence: ownedTab.userSequence,
-    passive: capture.passive === true,
-    routes,
+  return publishCurrentSnapshotCapture(ownedTab, capture, () => {
+    result.reading.pageMoved ||= snapshotCaptureMoved(capture);
+    // A moved page is readable evidence, but an invalidated node is still no
+    // authority to act. Mutation notices before route publication count too.
+    for (const [id, route] of routes) {
+      const key = JSON.stringify([route.frameId, route.localSnapshotId]);
+      if (capture.invalidationOverflow || (capture.invalidatedSnapshotKeys.has(key)
+        && !capture.retainedNavigationNodes?.get(key)?.includes(route.localNodeId))) routes.delete(id);
+    }
+    snapshotRoutes.set(snapshotId, {
+      tabId: ownedTab.tabId,
+      userSequence: ownedTab.userSequence,
+      passive: capture.passive === true,
+      routes,
+    });
+    return result;
   });
-  return result;
 }
 
 
@@ -869,11 +917,11 @@ async function clickSnapshotNode(payload, actionId) {
 }
 
 async function fillSnapshotNode(payload, actionId) {
-  return mutateRoutedNode(payload, actionId, "fill", "nativeagent.page.fill", { value: payload.value });
+  return trustedInput(payload, actionId, "fill");
 }
 
 async function typeIntoSnapshotNode(payload, actionId) {
-  return mutateRoutedNode(payload, actionId, "type", "nativeagent.page.type", { text: payload.text, delayMs: payload.delayMs ?? 0 });
+  return trustedInput(payload, actionId, "type");
 }
 
 async function selectSnapshotNode(payload, actionId) {
@@ -881,7 +929,148 @@ async function selectSnapshotNode(payload, actionId) {
 }
 
 async function keypressSnapshotNode(payload, actionId) {
-  return mutateRoutedNode(payload, actionId, "keypress", "nativeagent.page.keypress", { key: payload.key });
+  return trustedInput(payload, actionId, "keypress");
+}
+
+async function trustedInput(payload, actionId, action) {
+  const ownedTab = await workspace.requireForPageAction(payload);
+  const route = requireSnapshotRoute(ownedTab, payload);
+  if (!route.documentId) throw new ProtocolError("snapshot_stale", "Read the exact document before sending input.");
+  if (trustedInputs.has(ownedTab.tabId)) throw new ProtocolError("input_busy", "Another input action is still settling on this tab.");
+  trustedInputs.set(ownedTab.tabId, actionId);
+  activePageActions.set(actionId, ownedTab.tabId);
+  const startedAt = new Date().toISOString(), deadline = Date.now() + 20_000;
+  const requested = action === "fill" ? payload.value : action === "type" ? payload.text : "";
+  let sentText = "", inputMode = "chrome_trusted", effectDispatched = false, inputInFlight = false, prepared = false, detail = {}, failure, cleanupError, keyReleaseError;
+  const page = async (operation, extra = {}) => {
+    const response = await chrome.tabs.sendMessage(ownedTab.tabId, {
+      type: "nativeagent.page.input." + operation, actionId, action,
+      tabId: ownedTab.tabId, userSequence: ownedTab.userSequence,
+      snapshotId: route.localSnapshotId, nodeId: route.localNodeId, ...extra,
+    }, { documentId: route.documentId });
+    if (!response?.ok) throw new ProtocolError(response?.error?.code ?? "input_reply_lost",
+      response?.error?.message ?? "The exact input document did not acknowledge the operation.");
+    return response.result;
+  };
+  const admit = async (settling = false, dispatch = () => {}) => {
+    await workspace.requireForPageAction(payload);
+    // Finish custody/attach/focus waits before the final identity read. An
+    // input dispatch runs in this continuation: no await may follow this read.
+    const frame = await chrome.webNavigation.getFrame({ tabId: ownedTab.tabId, frameId: route.frameId });
+    // Revocation events can run during getFrame; read the workspace owner's
+    // current sequence synchronously rather than starting another custody wait.
+    if (workspace.tabForId(ownedTab.tabId)?.userSequence !== ownedTab.userSequence) {
+      throw new ProtocolError("tab_not_owned", "The tab's custody ended during input admission; no further input was sent.");
+    }
+    if (!settling) requireActiveRequest(actionId);
+    if (frame?.documentId !== route.documentId) throw new ProtocolError("page_changed", "The admitted input document changed; no further input was sent.");
+    if (!settling && Date.now() >= deadline) throw new ProtocolError("execution_deadline", "The input deadline ended; inspect the retained text before continuing.");
+    return dispatch();
+  };
+  try {
+    await admit();
+    prepared = true;
+    const target = await page("prepare", { value: payload.value });
+    if (target.mode === "atomic") {
+      inputMode = "native_value";
+      await admit();
+      effectDispatched = true;
+      detail = await page("atomic", { value: payload.value });
+      sentText = requested;
+    }
+    else {
+      const settlement = await withDebuggerSession(ownedTab.tabId, admit, async debuggerTarget => {
+        // Every Input.* command, including key-up settlement, goes through this
+        // owner. Nothing suspends between final admission and dispatch.
+        const sendInput = (method, event, { settling = false, onDispatch = () => {} } = {}) => admit(settling, () => {
+          effectDispatched = true;
+          onDispatch();
+          return chrome.debugger.sendCommand(debuggerTarget, method, event);
+        });
+        await admit();
+        const focused = await page("focus");
+        const press = async key => {
+          const spec = trustedKeyEvents(key);
+          let downDispatched = false, pressFailure;
+          try {
+            await page("check", { expectedKeydown: spec.expectedKeydown });
+            await sendInput("Input.dispatchKeyEvent", spec.events[0], { onDispatch: () => { downDispatched = true; } });
+          } catch (error) { pressFailure = error; }
+          finally {
+            // Stop ends text/default work, never the release of a key already
+            // sent. Release only in the same document under current custody.
+            if (downDispatched) try {
+              await page("keyup");
+              await sendInput("Input.dispatchKeyEvent", spec.events.at(-1), { settling: true });
+            } catch (error) {
+              keyReleaseError = { code: error.code ?? "key_release_failed", message: String(error.message ?? error) };
+              if (!pressFailure) pressFailure = error;
+            }
+          }
+          if (pressFailure) throw pressFailure;
+        };
+        if (action === "keypress") await press(payload.key);
+        else {
+          if (focused.selection === "native_selection") await press(action === "fill" ? "Meta+A" : "Meta+ArrowRight");
+          if (action === "fill" && requested === "") await press("Backspace");
+          else {
+            const chunks = action === "type" && payload.delayMs > 0 ? Array.from(requested) : [requested];
+            for (let index = 0; index < chunks.length; index++) {
+              if (!chunks[index]) continue;
+              await page("check");
+              await sendInput("Input.insertText", { text: chunks[index] }, { onDispatch: () => { inputInFlight = true; } });
+              sentText += chunks[index];
+              inputInFlight = false;
+              if (index + 1 < chunks.length && payload.delayMs > 0) await waitInputDelay(payload.delayMs, actionId);
+            }
+          }
+        }
+      }, { focus: true });
+      cleanupError = settlement.cleanupError;
+    }
+  } catch (error) {
+    failure = { code: error.code ?? "trusted_input_failed", message: String(error.message ?? error) };
+    cleanupError = error.details?.cleanupError;
+  } finally {
+    // Read and release the retained target even after Stop. No new effect or
+    // substitute node is used for settlement.
+    if (prepared && detail.mode !== "atomic") {
+      try { detail = await page("readback", { sentText: inputMode === "native_value" ? requested : sentText }); }
+      catch (error) { detail = { outcome: "outcome_unknown", verification: "outcome_unknown",
+        readbackError: { code: error.code ?? "input_readback_unavailable", message: String(error.message ?? error) } }; }
+    }
+    if (prepared) {
+      try { await page("release"); }
+      catch (error) { detail.targetReleaseError = { code: "input_target_release_failed", message: String(error.message ?? error) }; }
+    }
+    trustedInputs.delete(ownedTab.tabId);
+  }
+  const completed = !failure && detail.outcome === "succeeded"
+    && (action === "keypress" || detail.mode === "atomic" || sentText === requested);
+  const partial = failure && action === "type" && !inputInFlight && sentText.length > 0 && sentText !== requested && detail.landed === "landed";
+  const outcome = partial ? "partially_completed" : failure ? (effectDispatched ? "outcome_unknown" : "refused") : detail.outcome;
+  return pageActionResult({ actionId, action, ownedTab, payload, startedAt,
+    outcome, verification: partial ? "page_acknowledged" : failure ? (effectDispatched ? "outcome_unknown" : "not_verified") : detail.verification,
+    detail: { ...detail, snapshotId: payload.snapshotId, nodeId: payload.nodeId, frameId: route.frameId,
+      input: inputMode, completed, dispatched: effectDispatched,
+      ...(action === "keypress" ? { key: payload.key } : { characterCount: Array.from(sentText).length,
+        requestedCharacterCount: Array.from(requested).length, nextUTF16Offset: sentText.length,
+        characterUnit: "unicode_code_point" }),
+      ...(failure ? { error: failure } : {}), ...(keyReleaseError ? { keyReleaseError } : {}),
+      ...(cleanupError ? { cleanupError } : {}) } });
+}
+
+function waitInputDelay(milliseconds, actionId) {
+  return new Promise((resolve, reject) => {
+    const finish = error => {
+      clearTimeout(timer);
+      activeRequestWaits.delete(actionId);
+      if (error) reject(error); else resolve();
+    };
+    const timer = setTimeout(() => finish(), milliseconds);
+    activeRequestWaits.set(actionId, finish);
+    try { requireActiveRequest(actionId); } catch (error) { finish(error); }
+  });
 }
 
 async function setCheckedSnapshotNode(payload, actionId) {
@@ -1049,88 +1238,114 @@ async function performSnapshotMutation({ ownedTab, route, payload, actionId, act
   });
 }
 
+function cleanupFailure(error) {
+  return { code: "debugger_release_failed", message: String(error.message ?? error) };
+}
+
+function retainCleanup(error, cleanupError) {
+  if (!cleanupError) return error;
+  const failure = error instanceof ProtocolError ? error
+    : new ProtocolError("debugger_operation_failed", String(error.message ?? error));
+  failure.details = { ...failure.details, cleanupError };
+  failure.message += " Debugger release also failed: " + cleanupError.message;
+  return failure;
+}
+
+// One debugger lease per operation. Settlement never replaces the effect.
+async function withDebuggerSession(tabId, admit, body, { focus = false } = {}) {
+  await admit();
+  const target = { tabId };
+  await chrome.debugger.attach(target, "1.3");
+  let value, error, cleanupError;
+  try {
+    await admit();
+    if (focus) await renderWhileHidden(target, admit);
+    value = await body(target);
+  } catch (failure) { error = failure; }
+  finally {
+    try { await chrome.debugger.detach(target); }
+    catch (failure) { cleanupError = cleanupFailure(failure); }
+  }
+  if (error) {
+    throw retainCleanup(error, cleanupError);
+  }
+  return { value, cleanupError };
+}
+
 // The entry beside the current one in this tab's own history, by id, so a
 // page reached by a scripted click is not skipped (Chrome's history
 // manipulation intervention marks such entries skippable for tabs.goBack).
-async function stepTabHistory(tabId, direction) {
-  const target = { tabId };
-  try {
-    await chrome.debugger.attach(target, "1.3");
-  } catch (error) {
-    return direction === "back" ? chrome.tabs.goBack(tabId) : chrome.tabs.goForward(tabId);
-  }
-  try {
+async function stepTabHistory(tabId, direction, admit, dispatched) {
+  return withDebuggerSession(tabId, admit, async target => {
+    await admit();
     const { currentIndex, entries } = await chrome.debugger.sendCommand(target, "Page.getNavigationHistory");
     const entry = entries?.[currentIndex + (direction === "back" ? -1 : 1)];
-    if (!entry) {
-      throw new ProtocolError("history_unavailable", `This tab has no ${direction} entry to go to.`);
-    }
+    if (!entry) throw new ProtocolError("history_unavailable", "This tab has no " + direction + " entry to go to.");
+    await admit();
+    dispatched();
     await chrome.debugger.sendCommand(target, "Page.navigateToHistoryEntry", { entryId: entry.id });
-  } finally {
-    await chrome.debugger.detach(target).catch(() => {});
-  }
+  });
 }
 
-async function lookAtTab(payload, actionId, { domUnavailableError, pictureReason, documentKind } = {}) {
+async function lookAtTab(payload, actionId, { pictureReason, documentKind, expectedDocumentId } = {}) {
   const ownedTab = await workspace.requireForPageAction(payload);
   requireActiveRequest(actionId);
   const internal = internalPageRead(ownedTab);
   if (internal) return internal;
-  const target = { tabId: ownedTab.tabId };
-  // Capture the existing surface only. Unlike hidden scrolling, looking
-  // needs neither focus emulation nor the person to be away.
-  requireActiveRequest(actionId);
-  await chrome.debugger.attach(target, "1.3");
-  let capture;
-  try {
-    if (domUnavailableError) {
-      requireActiveRequest(actionId);
-      const { frameTree } = await chrome.debugger.sendCommand(target, "Page.getFrameTree");
-      if (frameTree?.frame?.mimeType !== "application/pdf") throw domUnavailableError;
-      documentKind = "pdf";
-    }
+  const frame = await chrome.webNavigation.getFrame({ tabId: ownedTab.tabId, frameId: 0 });
+  const documentId = expectedDocumentId ?? frame?.documentId;
+  const admit = async () => {
+    await workspace.requireForPageAction(payload);
+    const current = await chrome.webNavigation.getFrame({ tabId: ownedTab.tabId, frameId: 0 });
+    requireActiveRequest(actionId);
+    if (!documentId || current?.documentId !== documentId) throw new ProtocolError("page_changed", "The exact picture document changed.");
+  };
+  const settlement = await withDebuggerSession(ownedTab.tabId, admit, async target => {
+    let capture;
     try {
       // The picture is bounded where it is taken: the visible viewport, scaled so
       // its long side is at most LOOK_MAX_PIXELS device pixels (what the image
       // slot shows anyway), so a Retina tab is not refused for its size.
-      requireActiveRequest(actionId);
+      await admit();
       const { cssVisualViewport: viewport } = await chrome.debugger.sendCommand(target, "Page.getLayoutMetrics");
-      requireActiveRequest(actionId);
+      await admit();
       const { result: ratio } = await chrome.debugger.sendCommand(target, "Runtime.evaluate",
         { expression: "window.devicePixelRatio", returnByValue: true });
       const dpr = Number(ratio?.value) > 0 ? Number(ratio.value) : 1;
       const width = Math.max(1, Math.round(viewport?.clientWidth ?? 0));
       const height = Math.max(1, Math.round(viewport?.clientHeight ?? 0));
       const scale = Math.min(1, LOOK_MAX_PIXELS / (Math.max(width, height) * dpr));
-      requireActiveRequest(actionId);
+      await admit();
       capture = await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {
         format: "jpeg", quality: 85, fromSurface: true,
         clip: { x: viewport?.pageX ?? 0, y: viewport?.pageY ?? 0, width, height, scale },
       });
       if (typeof capture?.data !== "string" || !capture.data.length) throw new Error("No picture data.");
     } catch (error) {
-      if (error.code === "action_cancelled") throw error;
+      if (error instanceof ProtocolError) throw error;
       throw new ProtocolError("tab_not_painted", "Chrome did not render this hidden tab for a picture. Nothing was changed; the tab was not activated.");
     }
-  } finally {
-    // No decoding or ownership work keeps the debugger infobar on screen. A tab
-    // gone mid-capture has nothing to detach; the capture's own error stands.
-    await chrome.debugger.detach(target).catch(() => {});
-  }
-  if (capture.data.length * 3 / 4 > LOOK_MAX_JPEG_BYTES) {
-    throw new ProtocolError("picture_too_large", "Chrome's picture exceeds the image slot's 8 MiB; it was not delivered. Nothing was changed; the tab was not activated.");
-  }
-  const bitmap = await createImageBitmap(new Blob([
-    Uint8Array.from(atob(capture.data), character => character.charCodeAt(0)),
-  ], { type: "image/jpeg" }));
-  const { width, height } = bitmap;
-  bitmap.close();
-  // A picture captured while the person took this tab is never delivered.
-  const tab = await workspace.requireForPageAction(payload);
-  return { tabId: tab.tabId, url: tab.url, title: tab.title,
-    userSequence: tab.userSequence, width, height, format: "jpeg", data: capture.data,
-    ...(documentKind ? { document: { kind: documentKind, status: "unread" } } : {}),
-    ...(pictureReason ? { reading: { mode: "picture", reason: pictureReason, domAccessible: false } } : {}) };
+    return capture;
+  });
+  const { value: capture, cleanupError } = settlement;
+  try {
+    if (capture.data.length * 3 / 4 > LOOK_MAX_JPEG_BYTES) {
+      throw new ProtocolError("picture_too_large", "Chrome's picture exceeds the image slot's 8 MiB; it was not delivered. Nothing was changed; the tab was not activated.");
+    }
+    const bitmap = await createImageBitmap(new Blob([
+      Uint8Array.from(atob(capture.data), character => character.charCodeAt(0)),
+    ], { type: "image/jpeg" }));
+    const { width, height } = bitmap;
+    bitmap.close();
+    // A picture captured while the person took this tab is never delivered.
+    await admit();
+    const tab = await workspace.requireForPageAction(payload);
+    return { tabId: tab.tabId, url: tab.url, title: tab.title,
+      userSequence: tab.userSequence, width, height, format: "jpeg", data: capture.data,
+      ...(cleanupError ? { cleanupError } : {}),
+      ...(documentKind ? { document: { kind: documentKind, status: "unread" } } : {}),
+      ...(pictureReason ? { reading: { mode: "picture", reason: pictureReason, domAccessible: false } } : {}) };
+  } catch (error) { throw retainCleanup(error, cleanupError); }
 }
 
 async function scrollPage(payload, actionId) {
@@ -1142,8 +1357,7 @@ async function scrollPage(payload, actionId) {
   // Only when the host says the person is away (idle or locked): the
   // debugging bar must never appear while they are using the Mac.
   requireActiveRequest(actionId);
-  const stopRendering = payload.renderHidden === true ? await renderWhileHidden(ownedTab.tabId, payload, actionId) : async () => {};
-  try {
+  const perform = async () => {
     const result = await performSnapshotMutation({
       ownedTab, route, payload, actionId, action: "scroll",
       pageMessage: {
@@ -1162,35 +1376,18 @@ async function scrollPage(payload, actionId) {
         frameURL: result.readCursor.url, frameId: route.frameId };
     }
     return result;
-  } finally {
-    await stopRendering();
-  }
+  };
+  if (payload.renderHidden !== true) return perform();
+  const admit = async () => { await workspace.requireForPageAction(payload); requireActiveRequest(actionId); };
+  const { value, cleanupError } = await withDebuggerSession(ownedTab.tabId, admit, perform, { focus: true });
+  return { ...value, ...(cleanupError ? { cleanupError } : {}) };
 }
 
-// Hidden scrolling temporarily owns debugger focus emulation so background tabs render.
-// Cleanup detaches the debugger; admission failures reach the caller.
-async function renderWhileHidden(tabId, payload, actionId) {
-  const none = async () => {};
-  const tab = await chrome.tabs.get(tabId);
-  await workspace.requireForPageAction(payload);
-  if (tab.active) {
-    const window = await chrome.windows.get(tab.windowId);
-    await workspace.requireForPageAction(payload);
-    if (window.state !== "minimized") return none;
-  }
-  const target = { tabId };
-  requireActiveRequest(actionId);
-  await chrome.debugger.attach(target, "1.3");
-  try {
-    await workspace.requireForPageAction(payload);
-    requireActiveRequest(actionId);
-    await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true });
-    await workspace.requireForPageAction(payload);
-  } catch (error) {
-    await chrome.debugger.detach(target).catch(() => {});
-    throw error;
-  }
-  return async () => { await chrome.debugger.detach(target).catch(() => {}); };
+// Trusted input and hidden scrolling share Chrome's focus-emulation owner.
+async function renderWhileHidden(target, admit) {
+  await admit();
+  await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true });
+  await admit();
 }
 
 async function sendPageMessage(tabId, message, options = undefined) {
@@ -1231,7 +1428,17 @@ function requireSnapshotRoute(ownedTab, payload) {
   return route;
 }
 
-function invalidateTabSnapshots(tabId) {
+function invalidatePageBaseline(tabId) {
+  // Advancing an existing generation also fences a frame whose reply has not
+  // arrived yet (and therefore has no local snapshot key to invalidate).
+  if (pageDocumentGenerations.has(tabId)) pageDocumentGenerations.set(tabId, Symbol());
+  sendEvent("page.invalidated", { tabId });
+}
+
+function invalidateTabSnapshots(tabId, invalidateBaseline) {
+  // The app owns subscription baselines too, including same-URL reloads.
+  // An explicit read replaces routes but publishes its own fresh baseline.
+  if (invalidateBaseline) invalidatePageBaseline(tabId);
   activeSnapshotReads.delete(tabId);
   for (const [snapshotId, snapshot] of snapshotRoutes) {
     if (snapshot.tabId === tabId) snapshotRoutes.delete(snapshotId);
@@ -1239,11 +1446,7 @@ function invalidateTabSnapshots(tabId) {
 }
 
 function invalidateSubframeSnapshots(tabId, frameId) {
-  // A read in flight that already captured this frame read its old document.
-  const capture = activeSnapshotReads.get(tabId);
-  for (const key of capture?.localSnapshotKeys ?? []) {
-    if (JSON.parse(key)[0] === frameId) capture.invalidatedSnapshotKeys.add(key);
-  }
+  invalidatePageBaseline(tabId);
   for (const snapshot of snapshotRoutes.values()) {
     if (snapshot.tabId !== tabId) continue;
     for (const [nodeId, route] of snapshot.routes) {
@@ -1376,17 +1579,17 @@ async function installPageReaders() {
   }
 }
 
-async function observeOwnedPage(ownedTab, frameId, { documentId, propagateFailure = false } = {}) {
+async function observeOwnedPage(ownedTab, frameId, { documentId } = {}) {
   try {
     await workspace.requireForPageAction({ tabId: ownedTab.tabId, expectedUserSequence: ownedTab.userSequence });
     if (frameId === undefined) {
       const frames = await chrome.webNavigation.getAllFrames({ tabId: ownedTab.tabId });
       for (const frame of frames ?? []) {
-        await observeOwnedPage(ownedTab, frame.frameId, { documentId: frame.documentId, propagateFailure });
+        await observeOwnedPage(ownedTab, frame.frameId, { documentId: frame.documentId });
       }
       return;
     }
-    if (!propagateFailure && !readyPageFrames.get(ownedTab.tabId)?.has(frameId ?? 0)) {
+    if (!readyPageFrames.get(ownedTab.tabId)?.has(frameId ?? 0)) {
       // Registration-race read for an already completed tab (including a
       // worker restart). A loading tab waits for ready/onCompleted.
       const tab = await chrome.tabs.get(ownedTab.tabId);
@@ -1394,7 +1597,6 @@ async function observeOwnedPage(ownedTab, frameId, { documentId, propagateFailur
     }
     const frame = await chrome.webNavigation.getFrame({ tabId: ownedTab.tabId, frameId: frameId ?? 0 });
     if (!frame || (documentId && frame.documentId !== documentId)) {
-      if (propagateFailure) throw new ProtocolError("page_changed", "The Chrome document changed before its reader was confirmed.");
       return;
     }
     documentId = frame.documentId;
@@ -1407,7 +1609,6 @@ async function observeOwnedPage(ownedTab, frameId, { documentId, propagateFailur
       throw new ProtocolError("page_observer_unavailable", "The Chrome page reader did not confirm live observation of this tab.");
     }
     if (result.ready === false) {
-      if (propagateFailure) throw new ProtocolError("page_agent_loading", "The HTTP(S) page agent is still loading or injecting. A read will work once the page is ready.");
       return;
     }
     if (await acceptPageReady(ownedTab.tabId, frameId ?? 0, documentId, frame.url)) {
@@ -1419,7 +1620,6 @@ async function observeOwnedPage(ownedTab, frameId, { documentId, propagateFailur
   } catch (error) {
     // Restricted/new documents have no content agent. Its page.ready message
     // arms observation when available; no tab is opened or navigated here.
-    if (propagateFailure) throw error;
     sendEvent("page.change_unavailable", {
       tabId: ownedTab.tabId, userSequence: ownedTab.userSequence,
       error: error.code === "unknown_page_action" ? {
@@ -1486,13 +1686,12 @@ async function drainSiteChanges(tabId) {
       try { ownedTab = await workspace.requireTab(stream.tabId); } catch { break; }
       const view = pageSnapshotViews.get(ownedTab.tabId) ?? { maxNodes: 120, maxTextChars: 12_000, scope: "page" };
       const payload = { tabId: ownedTab.tabId, expectedUserSequence: ownedTab.userSequence, ...view };
-      const capture = { passive: true, localSnapshotKeys: new Set(), invalidatedSnapshotKeys: new Set(), invalidationOverflow: false };
+      const capture = beginSnapshotCapture(tabId, { passive: true });
       // Replace only prior news routes. A page event must preserve the explicit
       // reader's still-valid navigation proofs and never changes ownership.
       for (const [id, route] of snapshotRoutes) {
         if (route.tabId === tabId && route.passive === true) snapshotRoutes.delete(id);
       }
-      activeSnapshotReads.set(tabId, capture);
       try {
         const snapshot = await readStructuredSnapshotForCapture(payload, ownedTab, capture);
         await requireCurrentSnapshotCapture(ownedTab, capture);
@@ -1504,14 +1703,16 @@ async function drainSiteChanges(tabId) {
         }));
         await generationWrites;
         await requireCurrentSnapshotCapture(ownedTab, capture);
-        snapshot.reading.pageMoved ||= snapshotCaptureMoved(capture);
-        sendEvent("page.changed", {
-          tabId, userSequence: ownedTab.userSequence,
-          changeGeneration, changedFrameId: stream.frameId, snapshot,
+        publishCurrentSnapshotCapture(ownedTab, capture, () => {
+          snapshot.reading.pageMoved ||= snapshotCaptureMoved(capture);
+          sendEvent("page.changed", {
+            tabId, userSequence: ownedTab.userSequence,
+            changeGeneration, changedFrameId: stream.frameId, snapshot,
+          });
         });
       } catch (error) {
-        // A newer explicit read owns publication. Mutations are returned as
-        // moved-page evidence, with no retry of the read.
+        // A newer read or document generation owns publication. A pending
+        // document edge waits for readiness; mutations remain moved-page evidence.
         if (error.code === "snapshot_superseded") stream.pending = true;
         else if (error.code !== "tab_not_owned") {
           if (error.code === "page_agent_unavailable" || error.code === "page_agent_loading") {
@@ -1541,7 +1742,8 @@ function tabOwnershipEnded(tab, reason) {
   pageChangeStreams.delete(tab.tabId);
   pageChangeGenerations.delete(tab.tabId);
   pageSnapshotViews.delete(tab.tabId);
-  invalidateTabSnapshots(tab.tabId);
+  invalidateTabSnapshots(tab.tabId, true);
+  pageDocumentGenerations.delete(tab.tabId);
   activeNavigations.delete(tab.tabId);
   cancelTabWaits(tab.tabId, tabNotOwnedError(tab.tabId, reason));
   void chrome.tabs.sendMessage(tab.tabId, { type: "nativeagent.page.tab.invalidated", tabId: tab.tabId }).catch(() => {});

@@ -6,7 +6,7 @@ import MemoryV2
 import TrustCenter
 import NativeAgentShared
 import DeviceSync
-// Blueprint: | `EngineMemory.swift` | Memory v2 status and read availability publish through `refreshStatuses`; pending proposals publish checked rows and failure together through `proposals(status:)`, retaining checked rows on failure and leaving decision animation to the Mac; canonical recall keeps request identity separate from retained rows' successful query and never substitutes inventory matches; memory reads/writes and durable review-reminder crossing; one checked `graphSnapshot` shared by Knowledge Graph and Capabilities; `ProposalRecord` evidence; LatestRead orders pending proposals and memory status; committed proposal decisions use write() with the Mac's existing animation transaction. |
+// Blueprint: | `EngineMemory.swift` | Memory v2 status and read availability publish through `refreshStatuses`; pending proposals publish checked rows and failure together through `proposals(status:)`, retaining checked rows on failure and leaving decision animation to the Mac; canonical recall keeps request identity separate from retained rows' successful query and never substitutes inventory matches; memory reads/writes; native notifications own review-reminder acceptance; one checked `graphSnapshot` shared by Knowledge Graph and Capabilities; `ProposalRecord` evidence; LatestRead orders pending proposals and memory status; committed proposal decisions use write() with the Mac's existing animation transaction. |
 
 /// `NativeAgentEngine.memory`: MemoryV2 and the
 /// Knowledge Graph for one data root, in
@@ -56,16 +56,28 @@ public final class MemoryFacade {
 
     public private(set) var status: MemoryV2Status?
     public private(set) var statusRefresh: PanelRefreshStatus?
+    public private(set) var statusReadError: String?
     @ObservationIgnored private let statusesRead = LatestRead()
     @ObservationIgnored private let proposalsRead = LatestRead()
 
     /// The newest 200 active memories, written by the app's refresh paths.
     public var memories: [MemoryV2.MemoryRecord] = []
+    public private(set) var memoriesReadError: String?
+    public private(set) var hasLoadedMemories = false
     @ObservationIgnored private let memoriesRead = LatestRead()
 
     @discardableResult
     public func refreshMemories() async throws -> [MemoryV2.MemoryRecord] {
-        try await memoriesRead.read({ try await activeMemories() }, publish: { memories = $0 })
+        let result: Result<[MemoryV2.MemoryRecord], Error> = await memoriesRead.read({
+            do { return .success(try await activeMemories()) }
+            catch { return .failure(error) }
+        }, publish: { result in
+            switch result {
+            case .success(let rows): memories = rows; hasLoadedMemories = true; memoriesReadError = nil
+            case .failure(let error): memoriesReadError = error.localizedDescription
+            }
+        })
+        return try result.get()
     }
     public var totalCount: Int? { status?.counts?.active }
     public private(set) var diagnostics: MemoryV2NativeStackSnapshot = .empty
@@ -76,7 +88,9 @@ public final class MemoryFacade {
     }
     @ObservationIgnored public var proposalsDidChange: (@MainActor () -> Void)?
 
-    public private(set) var proposalsReadFailed = false
+    public var proposalsReadFailed: Bool { proposalsReadError != nil }
+    public private(set) var proposalsReadError: String?
+    public private(set) var hasLoadedProposals = false
     public private(set) var rejectedProposals: [ProposalRecord] = []
     public private(set) var rejectedHistoryError: String?
     @ObservationIgnored private lazy var rejectedHistoryRead = LatestRead()
@@ -175,9 +189,11 @@ public final class MemoryFacade {
         }, publish: { result in
             switch result {
             case .success(let records):
-                proposalsReadFailed = false
+                proposalsReadError = nil
+                hasLoadedProposals = true
                 if proposals != records { publish { proposals = records } }
-            case .failure: proposalsReadFailed = true
+                else { proposalsDidChange?() }
+            case .failure(let error): proposalsReadError = error.localizedDescription
             }
         })
         return try result.get()
@@ -194,11 +210,18 @@ public final class MemoryFacade {
         let read = await statusesRead.read({
             var memory: MemoryV2Status?
             var failures: [(endpoint: String, label: String, error: Error)] = []
-            do { memory = try await MemoryRecoveryReadout.getMemoryV2Status(dataRoot: dataRoot) }
+            do {
+                let status = try await MemoryRecoveryReadout.getMemoryV2Status(dataRoot: dataRoot)
+                memory = status
+                if let failure = status.storageFailure {
+                    failures.append(("memory v2 status", "getMemoryV2Status", MemoryV2Error.underlying(failure)))
+                }
+            }
             catch { failures.append(("memory v2 status", "getMemoryV2Status", error)) }
             return (memory, failures)
         }, publish: { read in
             if let value = read.0 { status = value }
+            statusReadError = read.1.first?.error.localizedDescription
             statusRefresh = PanelRefreshStatus(lastAttemptAt: Date(),
                 lastSuccessAt: read.1.isEmpty ? Date() : statusRefresh?.lastSuccessAt, failedEndpoints: read.1.map { $0.endpoint })
         })
@@ -330,7 +353,7 @@ public final class MemoryFacade {
     nonisolated private var graphPath: URL {
         dataRoot
             .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("knowledge_graph.json")
+            .appendingPathComponent("memory.sqlite")
     }
 
     public nonisolated func searchGraph(query: String) async throws -> GraphSearchResponse {
@@ -377,70 +400,5 @@ public final class MemoryFacade {
     /// Detail is derived from the exact whole-graph revision beside it.
     public func neighborhood(entityID: String) -> KnowledgeGraphNeighborhood? {
         graphSnapshot?.neighborhood(entityID: entityID)
-    }
-}
-
-extension ProposalRecord {
-    /// Supporting sessions and recurrence, from the extractor's metadata or,
-    /// for an adaptive-promoter row, its source session.
-    public var evidence: (sessionIDs: [String], recurrenceCount: Int) {
-        var sessionIDs: [String] = []
-        var recurrenceCount: Int?
-        if case .object(let object)? = metadata {
-            if case .array(let values)? = object["supporting_session_ids"] {
-                sessionIDs = values.compactMap { value in
-                    guard case .string(let raw) = value else { return nil }
-                    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                    return trimmed.isEmpty ? nil : trimmed
-                }
-            }
-            switch object["recurrence_count"] {
-            case .int(let value)?: recurrenceCount = Int(value)
-            case .double(let value)?: recurrenceCount = Int(exactly: value.rounded(.towardZero))
-            case .string(let value)?: recurrenceCount = Int(value)
-            default: break
-            }
-        }
-        if sessionIDs.isEmpty,
-           let source,
-           source.lowercased().hasPrefix("adaptive-promoter:") {
-            let sessionID = String(source.dropFirst("adaptive-promoter:".count))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !sessionID.isEmpty { sessionIDs = [sessionID] }
-        }
-        sessionIDs = Array(Set(sessionIDs)).sorted()
-        return (sessionIDs, max(1, recurrenceCount ?? 1))
-    }
-
-    public var evidenceSummary: String {
-        let (sessionIDs, recurrence) = evidence
-        let sessions = sessionIDs.count
-        if sessions == 0 {
-            return recurrence == 1
-                ? "Observed once; session evidence unavailable"
-                : "Observed \(recurrence)x; session evidence unavailable"
-        }
-        return "Observed \(recurrence)x in \(sessions) session\(sessions == 1 ? "" : "s")"
-    }
-}
-
-extension MemoryFacade {
-    private static let reviewReminderThreshold = 10
-    private static let reviewReminderArmedKey = "memoryReviewReminder.belowThreshold"
-
-    public func reviewReminder(pending: Int, agentName: String) -> (title: String, body: String)? {
-        let defaults = UserDefaults.standard
-        // Absent key reads as armed, so a first crossing on an existing pile fires.
-        let armed = defaults.object(forKey: Self.reviewReminderArmedKey) as? Bool ?? true
-        if pending < Self.reviewReminderThreshold {
-            if !armed { defaults.set(true, forKey: Self.reviewReminderArmedKey) }
-            return nil
-        }
-        guard armed else { return nil }
-        defaults.set(false, forKey: Self.reviewReminderArmedKey)
-        return (
-            title: "Memories to look over",
-            body: "\(DeskPageWords.spelled(pending)) things \(agentName) wants to keep are waiting for your yes or no on the Memories page."
-        )
     }
 }

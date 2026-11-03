@@ -5,7 +5,7 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
-// Blueprint: | `ResidentWake.swift` | `ResidentWake`; declares its own session builder before its next turn; arrival queue/claims stamp their beginning DataRootLife; pending work from another life (no stamp is the first life) reads stopped/restored and cannot wake, hand back or accept; retained original arrival content/evidence remains visible |
+// Blueprint: | `ResidentWake.swift` | `ResidentWake`; one retained identity ledger for waking and accepted non-waking arrivals; declares its own session builder; care-bearing arrivals retain an optional care id for their reply's deferred reading; arrivals/claims stamp DataRootLife, restored work cannot wake or accept; retained habit receipts render as already_looked and forming suggestions ride their arrival; the existing ledger retains the latest 256 attempted habit occurrences and atomic carried-delivery settlement debts for bookkeeping-only launch/carried recovery |
 
 /// Her one way to be woken between turns. Something
 /// resolves (a reply lands with no turn of hers carrying it, a wake to another
@@ -44,6 +44,8 @@ package final class ResidentWake: @unchecked Sendable {
         package var recoveredFrom: String?
         package var recovery: AgentLocalHealth?
         package var reason = ""
+        /// The care this arrival woke her about. Older arrivals carry none.
+        package var careID: UUID?
         /// A newer item on the same key replaces a pending one (one agent's health).
         package var key: String?
         /// Hop count: a wake carrying this thread is one hop.
@@ -64,6 +66,12 @@ package final class ResidentWake: @unchecked Sendable {
         package var acceptedAt: Date?
         /// The carried item's material state when offered; notes are not material.
         package var materialFingerprint: String?
+        /// A prompt intention (clock, person or news). The historical `clock`
+        /// storage key stays readable; all prompt moments skip free-time quiet.
+        package var clock: Bool?
+        /// A habit has already made this call; its wake starts from this receipt.
+        package var habitReceipt: JSONValue?
+        package var habitSuggestion: String?
 
         /// Something she might share with the person. It wakes
         /// her alone, never rides a live turn, and its reply is her message.
@@ -71,7 +79,9 @@ package final class ResidentWake: @unchecked Sendable {
 
         package var renderedLine: String {
             let status = state == "stopped" ? "stopped (restored): " : ""
-            guard let recoveredFrom, let recovery else { return status + line }
+            let looked = habitReceipt.flatMap { try? $0.serialize(pretty: false) }
+                .map { "\nalready_looked (your habit already ran; start from this receipt, do not blindly repeat the call): " + $0 } ?? ""
+            guard let recoveredFrom, let recovery else { return status + line + looked + (habitSuggestion.map { " " + $0 } ?? "") }
             return status + line + ": " + recoveredFrom.replacingOccurrences(of: "_", with: " ")
                 + " cleared at " + ISO8601DateFormatter().string(from: recovery.checkedAt) + "; " + recovery.detail
         }
@@ -79,12 +89,13 @@ package final class ResidentWake: @unchecked Sendable {
         package init(id: String, line: String, key: String? = nil, thread: String? = nil, agent: String? = nil,
                      home: Bool = false, hold: TimeInterval = 0, at: Date = Date(), session: String? = nil,
                      recoveredFrom: String? = nil, recovery: AgentLocalHealth? = nil,
-                     filedAt: String? = nil, materialFingerprint: String? = nil) {
+                     filedAt: String? = nil, materialFingerprint: String? = nil, careID: UUID? = nil) {
             self.id = id; self.line = line; self.key = key; self.thread = thread; self.agent = agent
             self.home = home; self.hold = hold; self.at = at; self.session = session
             self.recoveredFrom = recoveredFrom; self.recovery = recovery
             self.filedAt = filedAt
             self.materialFingerprint = materialFingerprint
+            self.careID = careID
         }
     }
 
@@ -92,12 +103,17 @@ package final class ResidentWake: @unchecked Sendable {
     struct Ledger: Codable, Equatable {
         var lifeID: String?
         var pending: [Item] = []
-        /// Woken or taken, retained until the owning work clears them: dedupe and home.
+        /// Woken, taken or accepted without waking: dedupe and home under the existing retention policy.
         var recent: [Item] = []
         var lastWake: Date?
         var hops: [String: Hop] = [:]
         var notBefore: Date?
         var waitingForTurn: Bool?
+        /// Latest attempted occurrence per step, retained before execution so an
+        /// interrupted effect is handed to her, never automatically repeated.
+        var carriedRuns: [Item]?
+        /// Delivered effects whose Desk notes/once-close still need keeping.
+        var carriedSettlements: [CarriedSettlement]?
     }
 
     private let lock = NSLock()
@@ -106,13 +122,7 @@ package final class ResidentWake: @unchecked Sendable {
 
     static func read(_ root: URL) -> Ledger? {
         do {
-            let ledger = try checkedRead(root)
-            // An older build's acceptance debt settles here too, should the
-            // process have ended between accepting and settling it.
-            for item in ledger.recent where item.acceptedAt != nil {
-                RepairOwed.settle(root, operation: "home.accept:" + item.id, evidence: .init(source: "agents/resident-wake.json", id: item.id))
-            }
-            return ledger
+            return try checkedRead(root)
         }
         catch { storageFailure(root, error); return nil }
     }
@@ -158,24 +168,31 @@ package final class ResidentWake: @unchecked Sendable {
         }
     }
 
-    /// Keep these arrivals; the wake follows on its own terms. False when
-    /// they could not be kept.
+    /// Keep these arrivals in the one identity ledger. A waking arrival goes
+    /// pending; one already accepted by its non-waking delivery owner goes
+    /// directly to recent, without adding a wake or another home line.
+    /// False when they could not be kept.
     @discardableResult
-    package func request(dataRoot: URL, reason: String, items: [Item]) -> Bool {
+    package func request(dataRoot: URL, reason: String, items: [Item], waking: Bool = true) -> Bool {
         let life: String
         do { life = try DataRootLife.current(in: dataRoot) }
         catch { Self.storageFailure(dataRoot, error); return false }
         return kept(dataRoot) { ledger in
             var known = Set((ledger.pending + ledger.recent).map(\.id))
             for var item in items where known.insert(item.id).inserted {
-                if ledger.pending.contains(where: { $0.key == item.key && $0.filedAt == item.filedAt && $0.routeWait != nil }) { continue }
                 item.reason = reason
                 item.lifeID = life
-                if let key = item.key {
-                    ledger.pending.removeAll { $0.key == key }
-                    if key.hasPrefix("carry.") { ledger.recent.removeAll { $0.key == key && $0.acceptedAt != nil } }
+                if waking {
+                    if ledger.pending.contains(where: { $0.key == item.key && $0.filedAt == item.filedAt && $0.routeWait != nil }) { continue }
+                    if let key = item.key {
+                        ledger.pending.removeAll { $0.key == key }
+                        if key.hasPrefix("carry.") { ledger.recent.removeAll { $0.key == key && $0.acceptedAt != nil } }
+                    }
+                    ledger.pending.append(item)
+                } else {
+                    item.acceptedAt = Date()
+                    ledger.recent.append(item)
                 }
-                ledger.pending.append(item)
             }
         }?.saved ?? false
     }
@@ -199,22 +216,21 @@ package final class ResidentWake: @unchecked Sendable {
     /// it said is no longer true, so its home line goes and a recurrence is a
     /// new arrival.
     package func clear(dataRoot: URL, key: String) {
-        // Its owner cleared it: a debt an older build filed for accepting those arrivals settles.
-        guard let cleared = kept(dataRoot, { ledger -> [String] in
-            let ids = (ledger.pending + ledger.recent).filter { $0.key == key }.map(\.id)
+        _ = kept(dataRoot, { ledger in
             ledger.pending.removeAll { $0.key == key }
             ledger.recent.removeAll { $0.key == key }
-            return ids
-        }), cleared.saved else { return }
-        for id in cleared.result {
-            RepairOwed.settle(dataRoot, operation: "home.accept:" + id, evidence: .init(source: "agents/resident-wake.json", id: key))
-        }
+        })
     }
 
     private static func due(_ ledger: Ledger) -> Date? {
-        guard ledger.waitingForTurn != true,
-              let first = ledger.pending.filter({ $0.state != "stopped" && $0.routeWait == nil }).map({ $0.at.addingTimeInterval(max(window, $0.hold)) }).min() else { return nil }
-        return max(first, ledger.lastWake?.addingTimeInterval(spacing) ?? .distantPast)
+        guard ledger.waitingForTurn != true else { return nil }
+        // A clock moment comes at its time; the spacing between wakes holds only
+        // the rest (10-31: three 9:00 moments queued, the check-in ran at 9:21).
+        let spaced = ledger.lastWake?.addingTimeInterval(spacing) ?? .distantPast
+        return ledger.pending.filter({ $0.state != "stopped" && $0.routeWait == nil }).map { item in
+            let ready = item.at.addingTimeInterval(max(window, item.hold))
+            return item.clock == true ? ready : max(ready, spaced)
+        }.min()
     }
 
     /// The loop's timer: arrivals and spacing, then the free law's last wait.
@@ -310,14 +326,12 @@ package final class ResidentWake: @unchecked Sendable {
     /// Called only by the conversation index event, plus its registration read.
     package func routesChanged(dataRoot: URL) async {
         guard let ledger = Self.read(dataRoot), ledger.pending.contains(where: { $0.routeWait != nil }) else { return }
-        let legacy = Set(((try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState())?.items ?? [])
-            .filter { $0.step != nil && $0.step?.replyRoute == nil }.map { "carry." + $0.handle })
         update(dataRoot) { ledger in
             let rows = try? HumanConversationIndex.rows(dataRoot: dataRoot)
             for index in ledger.pending.indices {
                 guard let waited = ledger.pending[index].routeWait else { continue }
                 let revision = rows.map { Self.routeRevision(rows: $0, session: ledger.pending[index].session) }
-                guard ledger.pending[index].key.map(legacy.contains) == true || revision.map({ $0 != waited }) == true else { continue }
+                guard revision.map({ $0 != waited }) == true else { continue }
                 ledger.pending[index].routeWait = nil
             }
         }
@@ -359,11 +373,6 @@ package final class ResidentWake: @unchecked Sendable {
                 ledger.recent[index].acceptedAt = Date()
             }
         })?.saved == true else { return false }
-        // A pending acceptance is not a fault: nothing owes repair for it now.
-        // A debt filed for it by an older build settles here, once.
-        for item in items {
-            RepairOwed.settle(dataRoot, operation: "home.accept:" + item.id, evidence: .init(source: "agents/resident-wake.json", id: item.id))
-        }
         return true
     }
 

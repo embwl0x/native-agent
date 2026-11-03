@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id":"maintenance-assistance","kind":"tool","version":1,"reach":{"capabilities":[]},"face":{"page":"diagnostics"},"record":{"description":"Group and explain checked Doctor asks, saved storage plans and Speech Recognition permission facts. Content only; native owners publish the cards.","actions":[],"inputSchema":{"type":"object","readOnly":true,"properties":{},"additionalProperties":true}}}
+{"id":"maintenance-assistance","kind":"ability","version":1,"reach":{"capabilities":[]},"face":{"page":"diagnostics"},"record":{"description":"Group and explain checked Doctor asks, saved storage plans and Speech Recognition permission facts. Content only; native owners publish the cards.","actions":[],"inputSchema":{"type":"object","readOnly":true,"properties":{},"additionalProperties":true}}}
 */
 function run(input) {
     if (input.kind === "doctor") {

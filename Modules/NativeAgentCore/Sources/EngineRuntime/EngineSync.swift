@@ -5,7 +5,8 @@ import DeviceSync
 import NativeAgentShared
 import TrustCenter
 import NativeAgentCore
-// Blueprint: | `EngineSync.swift` | `SyncFacade` class; `observeStatus`, `setStatus`; pairing-key snapshot reads publish through `LatestRead`, and rotation advances the same boundary |
+import PersistenceCore
+// Blueprint: | `EngineSync.swift` | `SyncFacade` class; shared pairing assessment and delivery repair; pairing availability reads publish through `LatestRead`; rotation retains accepted-write verification and publication obligations |
 
 /// Settings' observable projection of the engine's canonical device-sync owner.
 /// Combine subscriptions bridge the core's published values without wire models.
@@ -20,8 +21,8 @@ public final class SyncFacade {
     public private(set) var phonePairedElsewhere = false
     /// The one assessment of the phone's connection, as the bridge holds it.
     public private(set) var connection: NAPhoneConnection?
-    public var secretBase64 = ""
     public var pairingError: String?
+    public private(set) var isCheckingPairing = false
     @ObservationIgnored private var subscriptions: Set<AnyCancellable> = []
     @ObservationIgnored private var isRotatingSecret = false
     @ObservationIgnored private let secretRead = LatestRead()
@@ -58,28 +59,35 @@ public final class SyncFacade {
         _ = await owner?.pairedPhones.setStatus(status, id: id)
     }
 
+    /// Ask the existing delivery owner to reconcile the current key and claim.
+    /// Checking never deliberately replaces another Mac's pairing.
+    public func checkPairingDelivery() async {
+        guard let owner, !isCheckingPairing, !isRotatingSecret else { return }
+        isCheckingPairing = true
+        defer { isCheckingPairing = false }
+        await owner.bridge.claimPhonePairing()
+        await loadSecret(quiet: true)
+    }
+
     public func loadSecret(quiet: Bool) async {
         guard !Task.isCancelled, !isRotatingSecret else { return }
-        guard owner != nil else {
-            secretRead.write { secretBase64 = ""; pairingError = "Pairing is unavailable." }
+        guard let owner else {
+            secretRead.write { pairingError = "Pairing is unavailable." }
             return
         }
+        let publicationOwed = owner.bridge.pairingPublicationOwed
         _ = await secretRead.read({
-        let result = await Task.detached(priority: .utility) { () -> (String?, String?) in
+        let result = await Task.detached(priority: .utility) { () -> String? in
             do {
-                if quiet { return (try PairingSecret.existingSecretBase64() ?? "", nil) }
-                return (try PairingSecret.currentSecretBase64(), nil)
-            } catch { return (nil, error.localizedDescription) }
+                if quiet { _ = try PairingSecret.existingSecretBase64() }
+                else if publicationOwed { _ = try PairingSecret.requireExistingSecret() }
+                else { _ = try PairingSecret.loadOrGenerateSecret() }
+                return nil
+            } catch { return error.localizedDescription }
         }.value
         return result
         }, publish: { result in
-        if let secret = result.0 {
-            pairingError = nil
-            secretBase64 = secret
-        } else {
-            pairingError = "Pairing is unavailable. \(result.1 ?? "The Mac pairing key could not be loaded.")"
-            secretBase64 = ""
-        }
+        pairingError = result.map { "Pairing is unavailable. \($0)" }
         })
     }
 
@@ -90,17 +98,32 @@ public final class SyncFacade {
         defer { isRotatingSecret = false }
         // Close admission before changing durable signing bytes, and reopen
         // with exactly the read-back key before either publication awaits.
+        let publicationWasOwed = owner.bridge.pairingPublicationOwed
         owner.bridge.owePairingPublication(true)
         owner.engine.beginPairingSecretRotation()
-        let result = await Task.detached(priority: .utility) { () -> (Data?, String?) in
-            do { return (try PairingSecret.rotateSecret(), nil) }
-            catch { return (nil, error.localizedDescription) }
-        }.value
-        guard let persistedSecret = result.0 else {
-            owner.bridge.owePairingPublication(false)
-            await owner.engine.finishPairingSecretRotation(with: nil)
-            let detail = result.1 ?? "The existing key was preserved."
-            pairingError = "Pairing key regeneration failed. \(detail)"
+        let persistedSecret: Data
+        do {
+            persistedSecret = try await Task.detached(priority: .utility) {
+                try PairingSecret.rotateSecret()
+            }.value
+        } catch {
+            let accepted: Bool
+            if let failure = error as? DeviceSecretKeychain.Failure,
+               case .acceptedButUnverified = failure { accepted = true }
+            else { accepted = false }
+            secretRead.write {
+                pairingError = "Pairing key regeneration failed. \(error.localizedDescription)"
+            }
+            if accepted || publicationWasOwed {
+                // Acceptance cannot be undone by a failed read. The normal
+                // claim path reconciles this exact item now or at the next sync.
+                owner.engine.awaitPairingSecretVerification()
+                nativeLog("[PairingBootstrap] Rotation requires exact-item reconciliation; pairing publication remains owed: \(error.localizedDescription)")
+                await owner.bridge.claimPhonePairing()
+            } else {
+                owner.bridge.owePairingPublication(false)
+                await owner.engine.finishPairingSecretRotation(with: nil)
+            }
             return
         }
         await owner.engine.finishPairingSecretRotation(with: persistedSecret)
@@ -111,7 +134,6 @@ public final class SyncFacade {
         _ = await (kvsPublished, cloudKitPublished)
         secretRead.write {
             pairingError = nil
-            secretBase64 = persistedSecret.base64EncodedString()
         }
     }
 }

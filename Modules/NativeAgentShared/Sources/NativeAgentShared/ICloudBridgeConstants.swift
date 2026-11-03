@@ -4,62 +4,63 @@
 // shared module prevents one side from silently drifting from the other.
 import Foundation
 
-// Blueprint: | `ICloudBridgeConstants.swift` | `NativeAgentICloudBridgeConstants`: shared KVS/Drive wire namespace, mobile source keys and configured background task identifiers |
+// Blueprint: | `ICloudBridgeConstants.swift` | Checked bundle-owned iCloud identity, mobile source and background task identifiers; shared retained Drive and current KVS namespaces |
 
 public enum NativeAgentICloudBridgeConstants {
-    public static let defaultContainerID = "iCloud.io.github.embwl0x.nativeagent"
-    public static let defaultMobileSourceKey = "mobile_app"
-    public static let defaultBackgroundTaskIDPrefix = "io.github.embwl0x.nativeagent"
-
     public static var containerID: String {
-        configuredValue(
-            infoKey: "NativeAgentICloudContainerID",
-            envKey: "NATIVEAGENT_ICLOUD_CONTAINER_ID",
-            defaultValue: defaultContainerID
-        )
+        get throws {
+            let value = try configuredValue(infoKey: "NativeAgentICloudContainerID")
+            guard value.hasPrefix("iCloud."), validDottedIdentifier(value), value.split(separator: ".").count >= 3 else {
+                throw ConfigurationFailure(infoKey: "NativeAgentICloudContainerID")
+            }
+            return value
+        }
     }
 
     public static var mobileSourceKey: String {
-        configuredValue(
-            infoKey: "NativeAgentMobileSourceKey",
-            envKey: "NATIVEAGENT_MOBILE_SOURCE_KEY",
-            defaultValue: defaultMobileSourceKey
-        )
+        get throws { try configuredValue(infoKey: "NativeAgentMobileSourceKey") }
     }
 
     public static var backgroundTaskIDPrefix: String {
-        configuredValue(
-            infoKey: "NativeAgentBackgroundTaskIDPrefix",
-            envKey: "NATIVEAGENT_BACKGROUND_TASK_PREFIX",
-            defaultValue: defaultBackgroundTaskIDPrefix
-        )
-    }
-
-    public static func isMobileSourceKey(_ sourceKey: String?) -> Bool {
-        guard let raw = sourceKey?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty else {
-            return false
-        }
-        return raw == mobileSourceKey
-    }
-
-    public static func backgroundTaskIdentifier(_ suffix: String) -> String {
-        "\(backgroundTaskIDPrefix).\(suffix)"
-    }
-
-    private static func configuredValue(infoKey: String, envKey: String, defaultValue: String) -> String {
-        if let value = ProcessInfo.processInfo.environment[envKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !value.isEmpty,
-           !value.contains("$(") {
+        get throws {
+            let value = try configuredValue(infoKey: "NativeAgentBackgroundTaskIDPrefix")
+            guard validDottedIdentifier(value), value.contains(".") else {
+                throw ConfigurationFailure(infoKey: "NativeAgentBackgroundTaskIDPrefix")
+            }
             return value
         }
-        if let value = Bundle.main.object(forInfoDictionaryKey: infoKey) as? String {
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty, !trimmed.contains("$(") {
-                return trimmed
+    }
+
+    public static func backgroundTaskIdentifier(_ suffix: String) throws -> String {
+        "\(try backgroundTaskIDPrefix).\(suffix)"
+    }
+
+    public struct ConfigurationFailure: LocalizedError, Sendable {
+        public let infoKey: String
+        public var errorDescription: String? {
+            "NativeAgent build configuration '\(infoKey)' is missing or invalid. Install a build with resolved iCloud identifiers."
+        }
+    }
+
+    /// The signed bundle is the one runtime configuration. Source-build defaults
+    /// belong in xcconfig, never in an environment override or a failed read.
+    private static func configuredValue(infoKey: String) throws -> String {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: infoKey) as? String,
+              !value.isEmpty,
+              value.utf8.allSatisfy({ byte in
+                  (65...90).contains(byte) || (97...122).contains(byte)
+                      || (48...57).contains(byte) || byte == 45 || byte == 46 || byte == 95
+              }) else { throw ConfigurationFailure(infoKey: infoKey) }
+        return value
+    }
+
+    private static func validDottedIdentifier(_ value: String) -> Bool {
+        value.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { part in
+            !part.isEmpty && part.utf8.allSatisfy { byte in
+                (65...90).contains(byte) || (97...122).contains(byte)
+                    || (48...57).contains(byte) || byte == 45
             }
         }
-        return defaultValue
     }
 
     public enum KVSKey {

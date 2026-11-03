@@ -34,7 +34,7 @@ extension HerScreen {
         let shown = tools.prefix(8)
         var rows: [String] = [], verbs: [(String, String)] = []
         for schema in shown {
-            let args = ToolSignature.argumentNames(schema.parametersJSON)
+            let args = try ToolSignature.argumentNames(schema.parametersJSON)
             rows.append(clip(sentence(schema.description), 90))
             let needs = args.required.isEmpty ? "needs nothing" : "needs " + args.required.joined(separator: ", ")
             let also = args.optional.isEmpty ? "" : " · also " + args.optional.prefix(4).joined(separator: ", ")

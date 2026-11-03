@@ -6,7 +6,7 @@ import PersistenceCore
 extension SwiftNativeKnowledgeGraphIndexer {
     /// Rebuild every MemoryV2-owned KG row from the canonical `memories` table
     /// in one database write transaction. It removes additive claims from changed
-    /// facts, preserves legacy/manual entities without the indexer provenance
+    /// facts, preserves independently owned entities without the indexer provenance
     /// stamp, and snapshots canonical rows under the same SQLite write lock so
     /// a concurrent memory mutation lands either before the rebuild snapshot or
     /// afterward through its ordinary indexing hook — never in a lost window.
@@ -16,8 +16,14 @@ extension SwiftNativeKnowledgeGraphIndexer {
     public func rebuildMemoryDerivedGraphFromCanonicalStore(
         producing: Bool = true
     ) async throws -> KnowledgeGraphMemoryRebuildReport {
+        try await rebuildMemoryDerivedGraphFromCanonicalStore(
+            producing: producing, identity: resolvedExtractionIdentity())
+    }
+
+    func rebuildMemoryDerivedGraphFromCanonicalStore(
+        producing: Bool, identity: ExtractionIdentity
+    ) async throws -> KnowledgeGraphMemoryRebuildReport {
         let dbPool = try await pool()
-        let primaryUserName = resolvedPrimaryUserName()
         return try await dbPool.write { db in
             // A cold write awaiting admission (MemoryV2's `admission_pending`)
             // is not a fact until its vector lands; its landing re-indexes it.
@@ -74,7 +80,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     """,
                 arguments: StatementArguments(Self.ownedIndexerVersions)
             )
-            var ownedEntitiesRemoved = db.changesCount
+            let ownedEntitiesRemoved = db.changesCount
             try db.execute(sql: "DELETE FROM kg_memory_index")
             let indexRowsRemoved = db.changesCount
 
@@ -84,41 +90,16 @@ extension SwiftNativeKnowledgeGraphIndexer {
             } else {
                 try Self.consolidatePrimaryUserEntities(
                     db,
-                    primaryUserName: primaryUserName
+                    primaryUserName: identity.primaryUserName
                 )
             }
-            var legacyRelationshipsRemoved = 0
-            // After primary-user consolidation, purge unowned nodes and edges while retaining the hub and known foreign writers.
-            let foreignPlaceholders = Self.foreignWriterProvenances
-                .map { _ in "?" }
-                .joined(separator: ", ")
-            try db.execute(
-                sql: """
-                    DELETE FROM kg_relationships
-                    WHERE (provenance IS NULL
-                           OR provenance NOT IN (\(foreignPlaceholders)))
-                      AND json_extract(metadata_json, '$.indexer') IS NULL
-                    """,
-                arguments: StatementArguments(Self.foreignWriterProvenances)
-            )
-            legacyRelationshipsRemoved += db.changesCount
-            try db.execute(
-                sql: """
-                    DELETE FROM kg_entities
-                    WHERE (provenance IS NULL
-                           OR provenance NOT IN (\(foreignPlaceholders)))
-                      AND json_extract(metadata_json, '$.\(Self.createdByKey)') IS NULL
-                      AND COALESCE(json_extract(metadata_json, '$.role'), '') <> 'primary_user'
-                    """,
-                arguments: StatementArguments(Self.foreignWriterProvenances)
-            )
-            ownedEntitiesRemoved += db.changesCount
+            var danglingRelationshipsRemoved = 0
             try db.execute(sql: """
                 DELETE FROM kg_relationships
                 WHERE from_id NOT IN (SELECT id FROM kg_entities)
                    OR to_id NOT IN (SELECT id FROM kg_entities)
                 """)
-            legacyRelationshipsRemoved += db.changesCount
+            danglingRelationshipsRemoved += db.changesCount
             // Reset the surviving primary-user hub's count before deriving it from current facts.
             try db.execute(sql: """
                 UPDATE kg_entities SET mention_count = 0
@@ -127,7 +108,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             for fact in facts {
                 let memoryID = fact.id.trimmingCharacters(in: .whitespacesAndNewlines)
                 let content = fact.content.trimmingCharacters(in: .whitespacesAndNewlines)
-                let contentHash = Self.factFingerprint(fact, content: content)
+                let contentHash = Self.factFingerprint(fact, content: content, identity: identity)
                 try Self.indexActiveFact(
                     db,
                     fact: fact,
@@ -135,14 +116,14 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     content: content,
                     contentHash: contentHash,
                     now: now,
-                    extracted: Self.extractEntities(from: content, knownPeople: knownPeople),
-                    primaryUserName: primaryUserName
+                    extracted: Self.extractEntities(from: content, knownPeople: identity.knownPeople),
+                    primaryUserName: identity.primaryUserName
                 )
             }
             return KnowledgeGraphMemoryRebuildReport(
                 factsIndexed: facts.count,
                 entitiesRemoved: ownedEntitiesRemoved + consolidation.entitiesRemoved,
-                relationshipsRemoved: ownedRelationshipsRemoved + legacyRelationshipsRemoved + consolidation.relationshipsRemoved,
+                relationshipsRemoved: ownedRelationshipsRemoved + danglingRelationshipsRemoved + consolidation.relationshipsRemoved,
                 indexRowsRemoved: indexRowsRemoved
             )
         }
@@ -153,6 +134,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
     /// are removed as well as missing ones restored.
     @discardableResult
     public func reconcileMemoryIndexFingerprints() async throws -> Int {
+        let identity = try resolvedExtractionIdentity()
         let dbPool = try await pool()
         let drift = try await dbPool.read { db in
             let rows = try Row.fetchAll(db, sql: """
@@ -174,32 +156,15 @@ extension SwiftNativeKnowledgeGraphIndexer {
             if indexCount != facts.count { return true }
             return facts.contains { fact, hash in
                 hash != Self.factFingerprint(
-                    fact, content: fact.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    fact, content: fact.content.trimmingCharacters(in: .whitespacesAndNewlines), identity: identity
                 )
             }
         }
         guard drift else { return 0 }
-        return try await rebuildMemoryDerivedGraphFromCanonicalStore().factsIndexed
+        return try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: true, identity: identity).factsIndexed
     }
 
     /// Projection stamps identify the rows rebuilt from MemoryV2.
-    private static let ownedIndexerVersions = [
-        "swift-memory-kg-v1",
-        "swift-memory-kg-v2",
-        "swift-memory-kg-v3",
-        // Keep v4 ownership so canonical rebuilds can remove its derived rows.
-        "swift-memory-kg-v4",
-        indexVersion,
-    ]
-
-    /// The one-time JSON importer stamps every row so canonical rebuilds preserve it.
-    static let legacyImportProvenance = "legacy-import"
-
-    /// Preserve foreign writers' rows: studio journal, growth distillation and one-time JSON imports.
-    private static let foreignWriterProvenances = [
-        studioProvenance,
-        "rem-growth-eviction",
-        legacyImportProvenance,
-    ]
+    private static let ownedIndexerVersions = [indexVersion]
 
 }

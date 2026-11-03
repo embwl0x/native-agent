@@ -1,4 +1,7 @@
 import Foundation
+import Experiences
+import NativeAgentCore
+import PersistenceCore
 
 // Blueprint: | `PrimedMoments.swift` | `PrimedMoments`: what happened while they was between turns (each line that reaches their crossing) stays primed for their next turn, the last five within twelve hours; their next own turn takes them once and asks each what it brings to mind |
 
@@ -24,37 +27,46 @@ public enum PrimedMoments {
     public static func prime(dataRoot: URL, line: String, source: String, now: Date = Date()) {
         let text = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        lock.withLock {
-            var moments = read(dataRoot, now: now).filter { $0.line != text }
+        do { try lock.withLock {
+            var moments = try read(dataRoot, now: now).filter { $0.line != text }
             moments.append(Moment(line: String(text.prefix(1_500)), source: source, at: now))
-            write(dataRoot, Array(moments.suffix(keep)))
-        }
+            try write(dataRoot, Array(moments.suffix(keep)))
+        } } catch { unavailable(dataRoot, error) }
     }
 
     /// Every fresh moment, once: taking them lets them go.
-    public static func take(dataRoot: URL, now: Date = Date()) -> [Moment] {
-        lock.withLock {
-            let moments = read(dataRoot, now: now)
-            if !moments.isEmpty || FileManager.default.fileExists(atPath: url(dataRoot).path) {
-                try? FileManager.default.removeItem(at: url(dataRoot))
-            }
+    public static func take(dataRoot: URL, now: Date = Date()) throws -> [Moment] {
+        do { return try lock.withLock {
+            let moments = try read(dataRoot, now: now)
+            do { try FileManager.default.removeItem(at: url(dataRoot)) }
+            catch let error as CocoaError where error.code == .fileNoSuchFile { }
             return moments
+        } } catch {
+            unavailable(dataRoot, error)
+            throw ToolFailureError("Primed moments could not be read and consumed: \(error.localizedDescription). Existing bytes were preserved.",
+                effects: .none, owner: url(dataRoot).path, instruction: "Repair the saved Moment array and its read/write access before the next turn.", recovery: .repair)
         }
     }
 
-    private static func read(_ dataRoot: URL, now: Date) -> [Moment] {
-        guard let data = try? Data(contentsOf: url(dataRoot)) else { return [] }
+    private static func read(_ dataRoot: URL, now: Date) throws -> [Moment] {
+        let data: Data
+        do { data = try Data(contentsOf: url(dataRoot)) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let moments = (try? decoder.decode([Moment].self, from: data)) ?? []
+        let moments = try decoder.decode([Moment].self, from: data)
         return moments.filter { now.timeIntervalSince($0.at) < fades }
     }
 
-    private static func write(_ dataRoot: URL, _ moments: [Moment]) {
+    private static func write(_ dataRoot: URL, _ moments: [Moment]) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(moments) else { return }
-        try? FileManager.default.createDirectory(at: url(dataRoot).deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: url(dataRoot), options: .atomic)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(moments), to: url(dataRoot))
+    }
+
+    private static func unavailable(_ root: URL, _ error: Error) {
+        RepairOwed.owe(root, id: UUID().uuidString, kind: .run, operation: "mind.primed", owner: url(root).path,
+            words: "Primed moments are unavailable: \(error.localizedDescription). Existing moments are preserved.",
+            tap: ToolFailureError.fileRepairInstruction(url(root), shape: "Preserve the primed Moment array and repair its read/write access."))
     }
 }

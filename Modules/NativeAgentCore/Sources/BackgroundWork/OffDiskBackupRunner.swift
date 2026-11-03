@@ -54,9 +54,16 @@ private struct OffDiskBackupRunner: EventDeadlineLoopRunner {
             return EventDeadlinePhysiology.storeAndFileEvents(paths: [])
         }
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
-        let identityFiles = ((try? FileManager.default.contentsOfDirectory(
-            at: personaRoot, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? [])
-            .filter { !$0.lastPathComponent.hasSuffix(".lock") }
+        let identityFiles: [URL]
+        do {
+            identityFiles = try FileManager.default.contentsOfDirectory(
+                at: personaRoot, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+                .filter { !$0.lastPathComponent.hasSuffix(".lock") }
+        } catch {
+            let cause = "Off-disk backup source watches are incompletely armed at \(personaRoot.path): \(error.localizedDescription). Repair persona directory access and reopen NativeAgent to rearm its child watches; the parent watch remains active."
+            Task { await BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: loopId, outcome: .failed(error: cause)) }
+            identityFiles = []
+        }
         return EventDeadlinePhysiology.storeAndFileEvents(
             paths: [personaRoot, dataRoot.appendingPathComponent("memory/profile.json")] + identityFiles,
             loopId: loopId

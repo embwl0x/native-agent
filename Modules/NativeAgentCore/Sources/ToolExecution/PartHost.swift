@@ -17,7 +17,7 @@ extension Parts {
         }
         try checkDependencies(candidate)
         let key = try await SwiftNativeManifestSigner(dataRoot: root).loadOrCreateSigningKey()
-        let broker = ToolPrimitiveBroker(permissions: Set(candidate.program.permissions), abilityID: candidate.id)
+        let broker = ToolPrimitiveBroker(permissions: Set(candidate.program.permissions), abilityID: candidate.id, dataRoot: root)
         let host = ToolHost(base: base, candidate: candidate, broker: broker, dataRoot: root, admission: {})
         do {
             let proof = try await store.validate(candidate, key: key, capture: capture, input: input, runner: OwnedProgramRunner(dataRoot: root).rehearsal(), host: { host }) {
@@ -54,31 +54,32 @@ struct ToolHost: OwnedProgramHostProfile {
         return targets
     }
     var actionIDs: [String] { candidate.program.dependencies }
-    private func declaredDependency(_ id: String) -> String? {
-        let resolved = base.canonicalAction(id)
-        return candidate.program.dependencies.first { base.canonicalAction($0) == resolved }
-    }
-    private func dependencyMatches(_ id: String) -> Bool {
-        guard let declared = declaredDependency(id) else { return action(id) != nil }
-        return base.dependencyMatches(id, Parts.fields(candidate.dependencyShapes)[declared])
+    private func declaredDependency(_ id: String) throws -> String? {
+        let resolved = try base.canonicalAction(id)
+        return try candidate.program.dependencies.first { try base.canonicalAction($0) == resolved }
     }
     var floorReasons: Set<String> { base.floorReasons.union(["undeclared_dependency", "state_changed"]) }
     var scriptKey: String { base.scriptKey }
-    func action(_ id: String) -> OwnedProgramAction? {
+    func action(_ id: String) throws -> OwnedProgramAction? {
         if projection { return nil }
-        guard let action = base.action(id) else { return nil }
+        guard let action = try base.action(id) else { return nil }
         let permissions = candidate.program.permissions
-        return declaredDependency(id) != nil || AbilityStore.reachActions(permissions).contains(base.canonicalAction(id)) ? action : nil
+        return try declaredDependency(id) != nil || AbilityStore.reachActions(permissions).contains(base.canonicalAction(id)) ? action : nil
     }
-    func canonicalAction(_ id: String) -> String { base.canonicalAction(id) }
+    func canonicalAction(_ id: String) throws -> String { try base.canonicalAction(id) }
     func doorInput(id: String, given: [JSONValue]) -> Result<[String: JSONValue], OwnedProgramRunner.ScriptError> {
-        guard action(id) != nil else {
+        do {
+        guard try action(id) != nil else {
+            if try declaredDependency(id) != nil, try base.action(id) == nil {
+                return .failure(.init(reason: "dependency_unavailable", detail: "\(id) is declared by ability \(candidate.id), but is unavailable in this app door. Use app find to inspect it; an authored dependency may need to be kept or enabled. It was not called."))
+            }
             let declared = Parts.fields(candidate.manifest)["declaredActions"].map { Parts.strings($0) } ?? candidate.program.dependencies
             let actions = Set(declared + [id]).sorted().map { "\"" + $0 + "\"" }.joined(separator: ", ")
             return .failure(.init(reason: "undeclared_dependency", detail: "\(id) is not among the actions ability \(candidate.id) declares, so it was not called. "
                 + "An action named at run time isn't read off the code: declare it with ability.save {id:\"\(candidate.id)\", actions:[\(actions)]}."))
         }
         return base.doorInput(id: id, given: given)
+        } catch { return .failure(.init(reason: "action_catalog_unavailable", detail: "The ability's action catalog is unavailable: \(error.localizedDescription). Repair its owner before running this call.")) }
     }
     func opensHomeItem(_ input: [String: JSONValue]) -> Bool { base.opensHomeItem(input) }
     func secretLine(_ text: String) -> Bool { base.secretLine(text) }
@@ -92,10 +93,20 @@ struct ToolHost: OwnedProgramHostProfile {
     }
     func validationPerform(_ call: [String: JSONValue], fixture: OwnedProgramFixtures) async -> JSONValue {
         if reads(call) { return await fixture.reply(call) }
-        guard case .string(let id)? = call["action"], action(id) != nil,
-              dependencyMatches(id) else {
-            let id = Parts.string(call, "action") ?? "(missing action)"
-            return Self.failure(Parts.revisionFailure("stale_dependency", "Ability \(candidate.id) version \(candidate.digest) declares unavailable or changed action \(id).", id: candidate.id, version: candidate.digest), effects: "none", execution: "not_run")
+        guard case .string(let id)? = call["action"] else {
+            return Self.failure("invalid_args", "A rehearsal call needs an action id.", effects: "none", execution: "not_run")
+        }
+        if case .failure(let error) = doorInput(id: id, given: [call["args"] ?? .object([:])]) {
+            return Self.failure(error.reason, error.detail, effects: "none", execution: "not_run")
+        }
+        // Interception must not turn a malformed dynamic call into a successful
+        // rehearsal. Live execution reaches this same schema at the app door.
+        do {
+            if let problem = try base.callProblem(id, given: [.object((call["args"]?.objectValue ?? [:]).mapValues(OwnedProgram.Calls.Argument.value))]) {
+                return Self.failure("invalid_args", "\(id) \(problem).", effects: "none", execution: "not_run")
+            }
+        } catch {
+            return Self.failure(error, effects: "none", execution: "not_run")
         }
         return await fixture.reply(call)
     }
@@ -119,7 +130,8 @@ struct ToolHost: OwnedProgramHostProfile {
         // call, through its declaration like any other, and only when the
         // registry classifies it as a read: a read never becomes a write, live
         // or in a preview.
-        if reads(call), let page = Parts.string(call, "page"), page.contains("."), let named = base.action(page) {
+        do {
+        if reads(call), let page = Parts.string(call, "page"), page.contains("."), let named = try base.action(page) {
             guard named.read else {
                 return Self.failure("not_a_read", "app.read(\"\(page)\") names an action that changes something; a read never runs it. "
                     + "Call it as its own action, declared, if the ability means to.", effects: "none")
@@ -127,10 +139,9 @@ struct ToolHost: OwnedProgramHostProfile {
             call = call.filter { $0.key.hasPrefix("__") }.merging(["action": .string(page), "args": .object([:])]) { $1 }
         }
         // A read goes through the same selection check and gates as any call.
-        guard reads(call) || Parts.string(call, "action").map({ action($0) != nil }) == true else {
+        guard try reads(call) || Parts.string(call, "action").map({ try action($0) != nil }) == true else {
             return Self.failure("undeclared_dependency", "An ability calls only its declared app actions.", effects: "none")
         }
-        do {
             try Task.checkCancellation()
             try await admission()
             try Task.checkCancellation()
@@ -169,6 +180,7 @@ struct ToolHost: OwnedProgramHostProfile {
                     throw SenseFailure(code: "read_only", message: "A read-declared app refuses modifying or unclassified events.")
                 }
                 try AppleScriptExecution.checkAppScript(args)
+                if !AuthoredToolEffects.appReadOnly(args), let refusal = MacAppActGate.refusal(bundleID: bundleID, throughAppleEvents: true, dataRoot: dataRoot) { throw refusal }
             } else { try await broker.check(operation, arguments: arguments) }
             return nil
         } catch {
@@ -184,7 +196,7 @@ struct ToolHost: OwnedProgramHostProfile {
               try input.serializedData(pretty: false).count <= 4 * 1024 * 1024 else {
             throw SenseFailure(code: "bad_input", message: "part.call takes an exact id and a JSON object input of at most 4 MiB.")
         }
-        guard declaredDependency("authored." + id) != nil else {
+        guard try declaredDependency("authored." + id) != nil else {
             throw SenseFailure(code: "undeclared_dependency", message: "Declare authored.\(id) in actions before calling that part.")
         }
         return (id, input)
@@ -253,10 +265,13 @@ struct ToolHost: OwnedProgramHostProfile {
             guard await !broker.closed else { throw CancellationError() }
             dispatched = true
             let result = if operation == "apps.call" {
-                try await AppleScriptExecution().callApp(arguments, targets: appTargets)
+                try await MacAppActGate.$dataRoot.withValue(dataRoot) {
+                    try await AppleScriptExecution().callApp(arguments, targets: appTargets)
+                }
             } else { try await broker.perform(operation, arguments: arguments, host: base, profile: self) }
             // The thought's envelope already carries its nested tool effects.
             if operation == "model.call" { return result }
+            if operation == "apps.call", result.objectValue?["status"] == .string("denied") { return result }
             let read = ToolPrimitiveBroker.readOnly(operation, arguments)
             // An app call's effects are what its events did, as its adapter observed them.
             let observed = if operation == "apps.call", case .object(let fields) = result, case .string(let effects)? = fields["effects"] { effects } else { nil as String? }
@@ -264,15 +279,7 @@ struct ToolHost: OwnedProgramHostProfile {
                 var refusal: [String: JSONValue] = ["status": .string("refused"), "reason": .string(state),
                     "detail": fields["detail"] ?? .string(state), "result": result,
                     "effects": .string(observed ?? (read || ["needs_consent", "denied", "unavailable"].contains(state) ? "none" : "unknown"))]
-                if state == "needs_consent", case .string(let bundleID)? = fields["bundle_id"] {
-                    refusal["detail"] = .string("macOS Automation consent has not been asked for \(bundleID). Request the owner's permission card to ask macOS.")
-                    refusal["next_call"] = .object(["tool": .string("app"), "input": .object([
-                        "action": .string("card.request"), "args": .object([
-                            "kind": .string("permission"), "target": .string("applescript:\(bundleID)"),
-                            "mode": .string(read ? "read" : "write"),
-                            "why": .string("This app call needs macOS Automation consent for \(bundleID)."),
-                            "decline_consequence": .string("I won't run this app call without your Automation consent.")])])])
-                }
+                refusal["remedy"] = fields["remedy"]
                 return .object(refusal)
             }
             return Self.receipt(result, effects: observed ?? (read ? "none" : "occurred"))
@@ -291,6 +298,9 @@ struct ToolHost: OwnedProgramHostProfile {
         .object(["status": .string("ok"), "effects": .string(effects), "result": result])
     }
     static func failure(_ error: Error, effects: String, execution: String) -> JSONValue {
+        if let refusal = error as? MacAppActRefusal { return .object(refusal.fields.merging([
+            "effects": .string(effects), "execution": .string(execution)
+        ]) { said, _ in said }) }
         let owned = error as? ToolFailureError
         let sense = error as? SenseFailure
         let reason = owned?.failureCode ?? sense?.code ?? (error is CancellationError ? "cancelled" : "world_error")

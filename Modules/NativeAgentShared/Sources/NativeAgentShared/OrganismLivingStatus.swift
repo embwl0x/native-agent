@@ -9,7 +9,6 @@ public enum OrganismLivingStatusAvailability: String, Codable, Hashable, Sendabl
     case disabled
     case unavailable
 }
-
 /// Rebuildable, read-only organism projection shared by the Mac snapshot
 /// writer and the iOS display client. Cognition remains Mac-owned; this DTO is
 /// transport tissue only and deliberately carries no behavior.
@@ -25,30 +24,19 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
     public var lastSignalAt: Date?
     public var body: OrganismLivingBodyFile
     public var counters: OrganismLivingCountersFile
-    public var standingViewProposals: [OrganismLivingStandingViewProposalFile]?
-    /// Optional for wire compatibility with snapshots written before explicit
-    /// availability reporting. New writers always set it.
-    public var availability: OrganismLivingStatusAvailability?
+    public var availability: OrganismLivingStatusAvailability
     /// A bounded machine-readable reason for `.unavailable`; never carries a
     /// raw filesystem or desk error into the mobile snapshot.
     public var unavailableReason: String?
 
     public var availabilityState: OrganismLivingStatusAvailability {
-        availability ?? (enabled ? .live : .disabled)
+        availability
     }
 
     private enum CodingKeys: String, CodingKey {
         case generatedAt, enabled, posture, bodyLine, behaviorLine, needsUser, needsAttention
-        case signalCount, lastSignalAt, body, counters, standingViewProposals
+        case signalCount, lastSignalAt, body, counters
         case availability, unavailableReason
-    }
-
-    private struct OwnerFlagKey: CodingKey {
-        let stringValue: String
-        var intValue: Int? { nil }
-
-        init(stringValue: String) { self.stringValue = stringValue }
-        init?(intValue: Int) { return nil }
     }
 
     public init(from decoder: Decoder) throws {
@@ -58,19 +46,13 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
         posture = try c.decode(String.self, forKey: .posture)
         bodyLine = try c.decodeIfPresent(String.self, forKey: .bodyLine)
         behaviorLine = try c.decode(String.self, forKey: .behaviorLine)
-        // Dynamic keys tolerate public-export identity rewrites without duplicate enum cases.
-        let flags = try decoder.container(keyedBy: OwnerFlagKey.self)
-        let ownerKey = ["needsOwner", "needsUser", "needsUser"]
-            .map { OwnerFlagKey(stringValue: $0) }
-            .first { flags.contains($0) }
-        needsUser = try ownerKey.map { try flags.decode(Bool.self, forKey: $0) } ?? false
+        needsUser = try c.decode(Bool.self, forKey: .needsUser)
         needsAttention = try c.decodeIfPresent(Bool.self, forKey: .needsAttention)
         signalCount = try c.decode(Int.self, forKey: .signalCount)
         lastSignalAt = try c.decodeIfPresent(Date.self, forKey: .lastSignalAt)
         body = try c.decode(OrganismLivingBodyFile.self, forKey: .body)
         counters = try c.decode(OrganismLivingCountersFile.self, forKey: .counters)
-        standingViewProposals = try c.decodeIfPresent([OrganismLivingStandingViewProposalFile].self, forKey: .standingViewProposals)
-        availability = try c.decodeIfPresent(OrganismLivingStatusAvailability.self, forKey: .availability)
+        availability = try c.decode(OrganismLivingStatusAvailability.self, forKey: .availability)
         unavailableReason = try c.decodeIfPresent(String.self, forKey: .unavailableReason)
     }
 
@@ -86,8 +68,7 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
         lastSignalAt: Date?,
         body: OrganismLivingBodyFile,
         counters: OrganismLivingCountersFile,
-        standingViewProposals: [OrganismLivingStandingViewProposalFile]?,
-        availability: OrganismLivingStatusAvailability? = nil,
+        availability: OrganismLivingStatusAvailability,
         unavailableReason: String? = nil
     ) {
         self.generatedAt = generatedAt
@@ -101,7 +82,6 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
         self.lastSignalAt = lastSignalAt
         self.body = body
         self.counters = counters
-        self.standingViewProposals = standingViewProposals
         self.availability = availability
         self.unavailableReason = unavailableReason
     }
@@ -120,7 +100,7 @@ public struct OrganismLivingBodyFile: Codable, Hashable, Sendable {
     public var dreamHealthy: Bool
     public var toolHandsAvailable: Bool
     public var approvalChannelsOpen: Bool
-    public var notificationPathHealthy: Bool
+    public var notificationPathHealthy: Bool?
     public var resourcePressure: String
 
     public init(
@@ -131,7 +111,7 @@ public struct OrganismLivingBodyFile: Codable, Hashable, Sendable {
         dreamHealthy: Bool,
         toolHandsAvailable: Bool,
         approvalChannelsOpen: Bool,
-        notificationPathHealthy: Bool,
+        notificationPathHealthy: Bool?,
         resourcePressure: String
     ) {
         self.macAwake = macAwake
@@ -150,48 +130,14 @@ public struct OrganismLivingCountersFile: Codable, Hashable, Sendable {
     public var fieldNodes: Int
     public var pendingPredictions: Int
     public var dreamRepairs: Int
-    public var reflexCandidates: Int
-    public var reflexesNeedReview: Int
-    public var approvedReflexBiases: Int?
-    public var standingViewProposals: Int?
 
     public init(
         fieldNodes: Int,
         pendingPredictions: Int,
-        dreamRepairs: Int,
-        reflexCandidates: Int,
-        reflexesNeedReview: Int,
-        approvedReflexBiases: Int?,
-        standingViewProposals: Int?
+        dreamRepairs: Int
     ) {
         self.fieldNodes = fieldNodes
         self.pendingPredictions = pendingPredictions
         self.dreamRepairs = dreamRepairs
-        self.reflexCandidates = reflexCandidates
-        self.reflexesNeedReview = reflexesNeedReview
-        self.approvedReflexBiases = approvedReflexBiases
-        self.standingViewProposals = standingViewProposals
-    }
-}
-
-public struct OrganismLivingStandingViewProposalFile: Codable, Hashable, Sendable, Identifiable {
-    public var id: String
-    public var title: String
-    public var rationale: String
-    public var evidenceIDs: [String]
-    public var reviewRequired: Bool
-
-    public init(
-        id: String,
-        title: String,
-        rationale: String,
-        evidenceIDs: [String],
-        reviewRequired: Bool
-    ) {
-        self.id = id
-        self.title = title
-        self.rationale = rationale
-        self.evidenceIDs = evidenceIDs
-        self.reviewRequired = reviewRequired
     }
 }

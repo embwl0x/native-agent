@@ -9,9 +9,9 @@ import TrustCenter
 import MacControl
 import NativeAgentCore
 import Privacy
-// Blueprint: | `EngineTrust.swift` | TrustFacade owns checked policy, effective feature verdicts and security status/invalidation; raw/typed policy and phone serialization publish through LatestRead, committed policy through write. Catalog/source/install/network publication, Privacy Map and inbox policy each share a LatestRead; catalog/inbox commits use write. Policy derives autonomy guardrails; connected-agent rows belong to engine.contacts. Rooted Mac audit decoding retains availability and canonical/legacy receipt fields. |
+// Blueprint: | `EngineTrust.swift` | TrustFacade owns checked policy, effective feature verdicts and security status/invalidation; raw/typed policy and phone serialization publish through LatestRead without policy effects, committed policy through write and the policy-change callback. Current capability/source/network publication, Privacy Map and inbox policy each share a LatestRead; source/inbox commits use write. Policy derives autonomy guardrails; connected-agent rows belong to engine.contacts. Rooted Mac audit decoding retains availability and requires canonical receipt identity, method and execution time. |
 
-/// Root-specific audit read availability and canonical/legacy receipt decoding.
+/// Root-specific audit read availability and canonical receipt decoding.
 public struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
     // Identifiable row id: stable per row but built from receiptID when
     // present so rows are deduped reliably in the List.
@@ -55,19 +55,14 @@ public struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
         case executedAt = "executed_at"
         case blocked
         case blockReason = "block_reason"
-        // Legacy fields some pre-cutover rows may still carry.
-        case ts
-        case action
-        case detail
-        case allowed
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
 
         // Canonical fields.
-        receiptID = try c.decodeIfPresent(String.self, forKey: .receiptID)
-        let decodedMethod = try c.decodeIfPresent(String.self, forKey: .method)
+        receiptID = try c.decode(String.self, forKey: .receiptID)
+        let decodedMethod = try c.decode(String.self, forKey: .method)
         category = try c.decodeIfPresent(String.self, forKey: .category)
         argsHash = try c.decodeIfPresent(String.self, forKey: .argsHash)
         trigger = try c.decodeIfPresent(String.self, forKey: .trigger)
@@ -78,23 +73,18 @@ public struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
         stdout = try c.decodeIfPresent(String.self, forKey: .stdout)
         stderr = try c.decodeIfPresent(String.self, forKey: .stderr)
         durationMs = try c.decodeIfPresent(Int.self, forKey: .durationMs)
-        executedAt = try c.decodeIfPresent(String.self, forKey: .executedAt)
+        let decodedExecutionTime = try c.decode(String.self, forKey: .executedAt)
+        executedAt = decodedExecutionTime
         blocked = try c.decodeIfPresent(Bool.self, forKey: .blocked)
         blockReason = try c.decodeIfPresent(String.self, forKey: .blockReason)
 
-        // UI summary fields, synthesized from canonical if missing.
-        ts = try c.decodeIfPresent(String.self, forKey: .ts)
-            ?? executedAt
-            ?? ""
-        let legacyAction = try c.decodeIfPresent(String.self, forKey: .action)
-        method = decodedMethod ?? legacyAction ?? ""
-        action = legacyAction ?? decodedMethod ?? "unknown"
+        // UI summary fields derive from required canonical evidence.
+        ts = decodedExecutionTime
+        method = decodedMethod
+        action = method
         // Empty canonical `block_reason` must not hide stderr when deriving historical receipt detail.
-        let decodedDetail = try c.decodeIfPresent(String.self, forKey: .detail)
-        detail = Self.firstNonEmpty(decodedDetail, blockReason, stderr)
-        if let explicit = try c.decodeIfPresent(Bool.self, forKey: .allowed) {
-            allowed = explicit
-        } else if let b = blocked {
+        detail = Self.firstNonEmpty(blockReason, stderr)
+        if let b = blocked {
             allowed = !b
         } else {
             allowed = nil
@@ -158,9 +148,8 @@ public final class TrustFacade {
     private nonisolated let connectorActionStatuses: (@Sendable () async throws -> [String: String])?
 
     /// The saved policy as of the last read or write.
-    public private(set) var policy: TrustPolicy? {
-        didSet { policyDidChange?() }
-    }
+    public private(set) var policy: TrustPolicy?
+    /// Effects follow committed policy changes, never a checked read.
     @ObservationIgnored public var policyDidChange: (@MainActor () -> Void)?
     /// Effective switches from the same checked policy the rest of Trust renders.
     /// Absence means unavailable, never a manufactured default permission.
@@ -194,6 +183,7 @@ public final class TrustFacade {
             policy = saved
             securityStatus = nil
         }
+        policyDidChange?()
     }
 
     private func readPolicy() async -> Result<[String: JSONValue], Error> {
@@ -254,9 +244,7 @@ public final class TrustFacade {
 
     /// Local backups, newest first, as of the last read.
     public var backups: [BackupRecord] = []
-    public private(set) var capabilityCatalog: [CapabilityCatalogItem] = []
     public private(set) var capabilityCatalogSources: [CapabilityCatalogSource] = []
-    public private(set) var capabilityPackInstalls: [CapabilityPackInstall] = []
     public private(set) var catalogRefresh: PanelRefreshStatus?
     public var autonomyKernel: AutonomyKernelSummary? { policy.map(Self.autonomyKernel(for:)) }
 
@@ -279,34 +267,26 @@ public final class TrustFacade {
     public func refreshCapabilityCatalog() async -> [(endpoint: String, label: String, error: Error)] {
         let read = await catalogRead.read({
             var summary: CapabilitySummaryResponse?
-            var items: [CapabilityCatalogItem]?
             var sources: [CapabilityCatalogSource]?
-            var installs: [CapabilityPackInstall]?
             var network: CapabilityTrustNetwork?
             var failures: [(endpoint: String, label: String, error: Error)] = []
             do { summary = try await loadCapabilities() }
             catch { failures.append(("capability summary", "getCapabilities", error)) }
-            do { items = try await catalog() }
-            catch { failures.append(("capability catalog", "getCapabilityCatalog", error)) }
             do { sources = try await catalogSources() }
             catch { failures.append(("catalog sources", "getCapabilityCatalogSources", error)) }
-            do { installs = try await packInstalls() }
-            catch { failures.append(("pack installs", "getCapabilityPackInstalls", error)) }
             do { network = try await loadCapabilityNetwork() }
             catch { failures.append(("capability trust", "getCapabilityTrust", error)) }
-            return (summary, items, sources, installs, network, failures)
+            return (summary, sources, network, failures)
         }, publish: { read in
             if let value = read.0 { capabilitySummary = value }
-            capabilitySummaryError = read.5.first { $0.endpoint == "capability summary" }?.error.localizedDescription
-            if let value = read.1 { capabilityCatalog = value }
-            if let value = read.2 { capabilityCatalogSources = value }
-            if let value = read.3 { capabilityPackInstalls = value }
-            if let value = read.4 { capabilityNetwork = value }
+            capabilitySummaryError = read.3.first { $0.endpoint == "capability summary" }?.error.localizedDescription
+            if let value = read.1 { capabilityCatalogSources = value }
+            if let value = read.2 { capabilityNetwork = value }
             catalogRefresh = PanelRefreshStatus(lastAttemptAt: Date(),
-                lastSuccessAt: read.5.isEmpty ? Date() : catalogRefresh?.lastSuccessAt,
-                failedEndpoints: read.5.map { $0.endpoint })
+                lastSuccessAt: read.3.isEmpty ? Date() : catalogRefresh?.lastSuccessAt,
+                failedEndpoints: read.3.map { $0.endpoint })
         })
-        return read.5
+        return read.3
     }
     public private(set) var inboxPolicyEnabled = false
     public private(set) var inboxPolicyError: Error?
@@ -361,16 +341,7 @@ public final class TrustFacade {
             dataRoot: root, nowISO: nowISO,
             connectorActionStatuses: connectorActionStatuses
         )
-        var records: [CapabilityRecord] = []
-        var firstError: Error?
-        for row in rows {
-            do { records.append(try CapabilityRecord(catalogRow: row)) }
-            catch {
-                if firstError == nil { firstError = error }
-                print("[NativeAgent] getCapabilities(swiftNative) dropped a malformed element: \(error)")
-            }
-        }
-        if records.isEmpty, let firstError { throw firstError }
+        let records = try rows.map { try CapabilityRecord(catalogRow: $0) }
         var byKind: [String: Int] = [:]
         var active = 0
         var review = 0
@@ -431,7 +402,7 @@ public final class TrustFacade {
         return try JSONValue.object(snapshot).serializedData(pretty: false)
     }
 
-    /// Read both `index.json` and historical `registry.json`, deduplicated by id, newest first.
+    /// Read the sole current `backups/index.json` array, newest first.
     public nonisolated func listBackups() async throws -> [BackupRecord] {
         try TrustBackupPersistence.readBackupRecords(root: dataRoot)
     }
@@ -471,12 +442,6 @@ extension TrustFacade {
         }
     }
 
-    /// The capability catalog: saved rows merged with the built-in defaults.
-    /// Read-only; the merge is never written back.
-    public nonisolated func catalog() async throws -> [CapabilityCatalogItem] {
-        try await listCapabilityCatalog(dataRoot: dataRoot).map { try CapabilityCatalogItem(row: .object($0)) }
-    }
-
     public func refreshCatalogSources() async throws {
         let result: Result<[CapabilityCatalogSource], Error> = await catalogRead.read({
             do { return .success(try await catalogSources()) }
@@ -494,24 +459,16 @@ extension TrustFacade {
         _ = try result.get()
     }
 
-    /// Catalog sources, defaults overlaid on the saved store. Missing state
-    /// reads as the defaults; a damaged store throws and is never rewritten.
+    /// Saved catalog sources only. Missing state has no saved records;
+    /// a damaged store throws and is never rewritten.
     public nonisolated func catalogSources() async throws -> [CapabilityCatalogSource] {
         try CapabilityCatalogStoreReader.catalogSources(dataRoot: dataRoot).map { try CapabilityCatalogSource(row: .object($0)) }
     }
 
-    /// Installed capability packs, newest first.
-    public nonisolated func packInstalls() async throws -> [CapabilityPackInstall] {
-        try await catalogWrites.listCapabilityPackInstalls().map { try CapabilityPackInstall(row: .object($0)) }
-    }
-
     /// Add or update one catalog source under the sources lock, with its trace.
     public func saveCatalogSource(name: String, url: String, kind: String) async throws -> CapabilityCatalogSource {
-        let saved = try CapabilityCatalogSource(row: .object(try await catalogWrites.upsertCatalogSource([
-            "name": .string(name),
-            "url": .string(url),
-            "kind": .string(kind),
-        ])))
+        let saved = try CapabilityCatalogSource(row: .object(try await catalogWrites.upsertCatalogSource(
+            name: name, url: url, kind: kind)))
         catalogRead.write {
             if let index = capabilityCatalogSources.firstIndex(where: { $0.id == saved.id }) {
                 capabilityCatalogSources[index] = saved

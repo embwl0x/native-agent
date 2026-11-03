@@ -1,22 +1,60 @@
 import Foundation
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `ProviderConnectionProbe.swift` | provider connection probes |
+// Blueprint: | `ProviderConnectionProbe.swift` | Native probe capabilities and request-bound OAuth credential evidence; API-key connection probes |
 
+/// One probe's last transport attempt, including a token renewed after 401.
+/// Only a fingerprint is retained; readiness never supplies request evidence.
+public final class OAuthProbeCredential: @unchecked Sendable {
+    @TaskLocal public static var current: OAuthProbeCredential?
+    private let lock = NSLock()
+    private var sent: String?
+
+    public init() {}
+
+    public var fingerprint: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return sent
+    }
+
+    static func sending(_ request: URLRequest) {
+        guard let current else { return }
+        guard let authorization = request.value(forHTTPHeaderField: "Authorization"),
+              authorization.hasPrefix("Bearer ") else { return }
+        current.lock.lock()
+        defer { current.lock.unlock() }
+        current.sent = LLMProviderStatusFeed.fingerprint(String(authorization.dropFirst("Bearer ".count)))
+    }
+}
 public extension SwiftNativeProviderRouting {
-    static func probeAPIProvider(_ id: String, dataRoot: URL, draftKey: String?) async throws -> NativeAgentShared.ProviderTestResult {
-        let configFile: String? = switch id {
-        case "openai", "anthropic", "moonshot", "kimi-code", "openrouter": "\(id).json"
-        default: nil
-        }
+    enum ConnectionProbe: Sendable {
+        case oauth, apiKey, unsupported
+    }
 
-        guard let configFile else {
-            return NativeAgentShared.ProviderTestResult(
-                provider_id: id, status: "unknown", tested: false,
-                response: nil, model_used: nil,
-                detail: "no native probe for \(id)", error: nil
-            )
+    static func connectionProbe(_ id: String, authMode: String?) -> ConnectionProbe {
+        switch (id, authMode) {
+        case ("openai_oauth_direct", nil), ("anthropic_oauth_direct", nil), ("xai_oauth_direct", nil),
+             ("openai_oauth_direct", "oauth"?), ("anthropic_oauth_direct", "oauth"?), ("xai_oauth_direct", "oauth"?):
+            return .oauth
+        case ("openai", nil), ("anthropic", nil), ("moonshot", nil), ("kimi-code", nil), ("openrouter", nil),
+             ("openai", "api_key"?), ("anthropic", "api_key"?), ("moonshot", "api_key"?), ("kimi-code", "api_key"?), ("openrouter", "api_key"?):
+            return .apiKey
+        default: return .unsupported
         }
+    }
+
+    static func unsupportedConnectionProbe(_ id: String) -> NativeAgentShared.ProviderTestResult {
+        .init(provider_id: id, status: "unknown", tested: false,
+              response: nil, model_used: nil,
+              detail: "No native connection test is available for this provider and sign-in method. It was not checked.", error: nil)
+    }
+
+    static func probeAPIProvider(_ id: String, dataRoot: URL, draftKey: String?) async throws -> NativeAgentShared.ProviderTestResult {
+        guard case .apiKey = connectionProbe(id, authMode: "api_key") else {
+            return unsupportedConnectionProbe(id)
+        }
+        let configFile = "\(id).json"
         guard let apiKey = try draftKey ?? LLMCredentialResolver.checkedAPIKey(
             providerConfigFile: configFile, dataRoot: dataRoot
         ), !apiKey.isEmpty else {
@@ -166,40 +204,4 @@ public extension ProviderCatalogSnapshot {
         return probeModel
     }
 
-}
-
-/// A local Claude CLI presence check is the only evidence this panel has for
-/// its persistent-MCP connection claim. Do not manufacture readiness from a
-/// provider-list payload that may have been collected before the CLI moved or
-/// was removed.
-public enum AnthropicMCPCLIProbe {
-    public enum Availability: Equatable, Sendable {
-        case checking
-        case available(path: String)
-        case unavailable(reason: String)
-    }
-
-    public static func probe(
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
-    ) -> Availability {
-        guard let path = environment["PATH"], !path.isEmpty else {
-            return .unavailable(reason: "Claude CLI could not be checked because PATH is unavailable.")
-        }
-        let directories = path.split(separator: ":", omittingEmptySubsequences: true)
-            .map(String.init)
-            .filter { $0.hasPrefix("/") }
-        guard !directories.isEmpty else {
-            return .unavailable(reason: "Claude CLI could not be checked because PATH has no absolute directories.")
-        }
-        for directory in directories {
-            let candidate = URL(fileURLWithPath: directory)
-                .appendingPathComponent("claude")
-                .path
-            if isExecutable(candidate) {
-                return .available(path: candidate)
-            }
-        }
-        return .unavailable(reason: "Claude CLI was not found on PATH. Install or restore Claude Code, then test again.")
-    }
 }

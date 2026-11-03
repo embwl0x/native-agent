@@ -66,9 +66,11 @@ actor TelegramTurnProgressCardDriver {
     private var terminalProjection: Task<String, Never>?
     /// Nil while terminal identity is unsettled; false records persistence failure.
     private var terminalIdentityPersisted: Bool?
-    private var terminalWaiters: [
-        UUID: CheckedContinuation<TelegramTurnPresentationPhase?, Never>
-    ] = [:]
+    private final class TerminalWait {
+        let done = ScopedWaiter()
+        var phase: TelegramTurnPresentationPhase?
+    }
+    private var terminalWaiters: [UUID: TerminalWait] = [:]
 
     init(
         token: String,
@@ -256,16 +258,11 @@ actor TelegramTurnProgressCardDriver {
     func waitForTerminal() async -> TelegramTurnPresentationPhase? {
         if let terminalIdentityPersisted { return terminalIdentityPersisted ? state.phase : nil }
         guard !closed, !Task.isCancelled else { return nil }
-        let waiterId = UUID()
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                terminalWaiters[waiterId] = continuation
-            }
-        } onCancel: {
-            Task { [weak self] in
-                await self?.cancelTerminalWaiter(waiterId)
-            }
-        }
+        let id = UUID(), response = TerminalWait()
+        terminalWaiters[id] = response
+        await response.done.park()
+        terminalWaiters.removeValue(forKey: id)
+        return response.phase
     }
 
     private func startHeartbeatIfNeeded() {
@@ -405,16 +402,12 @@ actor TelegramTurnProgressCardDriver {
 
     private func resolveTerminalWaiters(_ phase: TelegramTurnPresentationPhase?) {
         terminalIdentityPersisted = phase != nil
-        let waiters = Array(terminalWaiters.values)
+        let waiting = terminalWaiters.values
         terminalWaiters.removeAll()
-        for waiter in waiters { waiter.resume(returning: phase) }
-    }
-
-    private func cancelTerminalWaiter(_ waiterId: UUID) {
-        guard let waiter = terminalWaiters.removeValue(forKey: waiterId) else {
-            return
+        for response in waiting {
+            response.phase = phase
+            response.done.resume()
         }
-        waiter.resume(returning: nil)
     }
 
     private static func shouldRetryEdit(after error: Error) -> Bool {

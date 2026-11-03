@@ -2,7 +2,7 @@ import Foundation
 import MacControl
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SwiftToolDispatcher+RemoteNodes.swift` | `SwiftToolDispatcher`: remote node listing and execution; admission refusals stay distinct from cancellation and transport failures with unknown effects |
+// Blueprint: | `SwiftToolDispatcher+RemoteNodes.swift` | `SwiftToolDispatcher`: remote node listing and execution; stopped SSH receipts retain captured evidence with unknown remote effects; admission refusals stay distinct from transport failures |
 
 extension SwiftToolDispatcher {
     func impl_remote_node_list() async throws -> JSONValue {
@@ -52,8 +52,8 @@ extension SwiftToolDispatcher {
                 arguments: arguments,
                 timeoutSeconds: timeout
             )
-            return .object([
-                "status": .string(receipt.exitCode == 0 ? "completed" : "failed"),
+            var output: [String: JSONValue] = [
+                "status": .string(receipt.cancelled ? "cancelled" : receipt.exitCode == 0 ? "completed" : "failed"),
                 "receipt_id": .string(receipt.id),
                 "node_id": .string(receipt.nodeId),
                 "node_name": .string(receipt.nodeName),
@@ -62,10 +62,18 @@ extension SwiftToolDispatcher {
                 "exit_code": .int(Int64(receipt.exitCode)),
                 "stdout": .string(receipt.stdout),
                 "stderr": .string(receipt.stderr),
+                "stdout_truncated": .bool(receipt.stdoutTruncated),
+                "stderr_truncated": .bool(receipt.stderrTruncated),
+                "timed_out": .bool(receipt.timedOut),
                 "host_key_fingerprint": .string(receipt.hostKeyFingerprint),
                 "started_at": .string(receipt.startedAt),
                 "finished_at": .string(receipt.finishedAt),
-            ])
+            ]
+            if receipt.cancelled {
+                output["effects"] = .string("unknown")
+                output["detail"] = .string("Local SSH was stopped. The remote command may still have taken effect; inspect the retained output and remote state before another execution.")
+            }
+            return .object(output)
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as TrustedRemoteEffectError {

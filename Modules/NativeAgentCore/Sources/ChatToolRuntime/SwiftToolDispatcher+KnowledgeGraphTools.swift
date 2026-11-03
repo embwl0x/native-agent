@@ -49,21 +49,10 @@ extension SwiftToolDispatcher {
         if let failure = MemoryPolicyGate.knowledgeGraphFailure(dataRoot: dataRoot) {
             return ChatToolOutcome.failure(error: failure, tool: "search_kg")
         }
-        let disclosedIDs = Set(try await memoryV2.listMemory(kind: nil).filter {
-            MemoryRecordDisclosurePolicy.classify($0)?.permits(surface: surface, personaID: nil) == true
-        }.map(\.id))
-        let disclosedFactIDs = Set(disclosedIDs.map(SwiftNativeKnowledgeGraphIndexer.memoryFactEntityID))
+        let disclosure = KnowledgeGraphMemoryDisclosure(
+            records: try await memoryV2.listMemory(kind: nil), surface: surface)
         func permitsDisclosure(_ value: JSONValue) -> Bool {
-            guard case .object(let o) = value else { return false }
-            for key in ["memory_id", "last_memory_id"] {
-                if let source = o[key], source != .null {
-                    guard case .string(let id) = source, disclosedIDs.contains(id) else { return false }
-                }
-            }
-            if case .string(let id)? = o["id"], id.hasPrefix("memfact_") {
-                return disclosedFactIDs.contains(id)
-            }
-            return true
+            disclosure.permits(value)
         }
         func passesFilters(_ ent: JSONValue) -> Bool {
             guard permitsDisclosure(ent) else { return false }

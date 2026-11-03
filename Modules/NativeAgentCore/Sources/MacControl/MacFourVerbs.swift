@@ -9,10 +9,9 @@ import PersistenceCore
 // Screen text retains compiler redaction through `MacScreenRender` and `MacScreenText`.
 // Withheld labels cannot be named; resolution uses display text only, and typed text is never echoed.
 //
-// THE PHYSICAL TIER IS INTERNAL. `act` can move, hover, hold, drag, press keys,
-// and aim at regions discovered by the fused screen. Coordinates, view ids, and
-// mark ids remain private implementation details; uncertain vision rows stay
-// visible but are deliberately not promoted to actionable targets.
+// `act` accepts names and points on an image already delivered to the model.
+// The physical owner resolves captured-image geometry and retains per-event
+// driver, focus and attention admission; a point grants no authority.
 
 // MARK: - The four verbs
 

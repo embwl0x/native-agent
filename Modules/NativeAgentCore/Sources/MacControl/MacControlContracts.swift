@@ -177,6 +177,10 @@ public final class MacMotorCount: MacControlClient, @unchecked Sendable {
             let result = try await run()
             if result.operationState != .refused, result.operationState != .blocked { lock.withLock { count += 1 } }
             return result
+        } catch let error as ToolFailureError where error.effects == .none {
+            // The owner refused admission, including unavailable launch recovery.
+            // Preserve that evidence instead of counting an effect that never ran.
+            throw error
         } catch {
             lock.withLock { count += 1 }
             throw error
@@ -231,12 +235,13 @@ public let macControlUnsupportedActions: Set<String> = [
 
 /// Read-only accessibility perception actions.
 ///
-/// They are perception only: no CGEvent, no AXUIElementPerformAction, no
-/// attribute writes. Gate category is `accessibility` (same category as
+/// They emit no CGEvent or AXUIElementPerformAction. The live source may enable
+/// an advertised renderer mode before reading; passive reads never write it.
+/// Gate category is `accessibility` (same category as
 /// keystroke/click) but they are READ tier — no approval, mirroring how
 /// `spotlight` reads are gated but unapproved.
 /// The client may first clear a covering saver with the shared inert wake;
-/// the read handlers themselves still emit no input or app mutation.
+/// the read handlers themselves still emit no UI input.
 public let macControlAccessibilityReadActions: Set<String> = [
     "ax_status",
     "ax_tree",
@@ -358,10 +363,8 @@ public func macControlFilePolicyPathKeys(forAction action: String) -> [String] {
 
 /// Production dispatch reads TrustCenter policy before native execution; direct library callers may omit the provider.
 public protocol MacControlPolicyProvider: Sendable {
-    /// Return the current policy, or nil if it can't be resolved (in which
-    /// case production callers fail closed before any side effect. Tests can
-    /// omit the provider when they need to exercise a handler directly.
-    func currentPolicy() async -> MacControlPolicy?
+    /// Return checked current policy; preserve authority failures as errors.
+    func currentPolicy() async throws -> MacControlPolicy
     /// The one authorization decision for a raw dispatch of `tool` (the
     /// action): the level (`auto`, `confirm`, `blocked`), reason and lever.
     /// Nil: nothing more to decide, or the door that built this provider

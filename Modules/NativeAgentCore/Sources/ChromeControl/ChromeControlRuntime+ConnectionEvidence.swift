@@ -7,7 +7,7 @@ import NativeAgentCore
 import TrustCenter
 import MacControl
 import NativeAgentShared
-// Blueprint: | `ChromeControlRuntime+ConnectionEvidence.swift` | `ChromeControlRuntime` connection evidence: historical persisted facts, setup verification, connection diagnosis, capture/relay diagnostics, extension errors and observed browser signature preflight; observations never prove connection or permission |
+// Blueprint: | `ChromeControlRuntime+ConnectionEvidence.swift` | `ChromeControlRuntime` connection evidence: sole persisted historical facts, current-code setup verification and diagnostics, connection diagnosis, capture/relay errors and observed browser signature preflight; observations never prove connection or permission |
 
 /// Historical observations only. Never used as connection or permission proof.
 struct ChromeConnectionFacts: Codable {
@@ -52,10 +52,10 @@ final class ChromeBrowserLaunchObserver: @unchecked Sendable {
 }
 
 extension ChromeControlRuntime {
-    public func setupConnectionStatus() async -> (state: ChromeControlConnectionState, enabled: Bool, diagnostics: [String: JSONValue]) {
+    public func setupConnectionStatus(fresh: Bool = false) async -> (state: ChromeControlConnectionState, enabled: Bool, diagnostics: [String: JSONValue]) {
         let enabled = await transportAvailable()
         let browsers = await Self.runningChromeProcesses()
-        readExtensionFiles()
+        readExtensionFiles(fresh: fresh)
         reconcileReloadBrowser(browsers)
         var diagnostics = connectionDiagnostics(browsers: browsers)
         if let failure = transportAuthorityFailure {
@@ -87,7 +87,7 @@ extension ChromeControlRuntime {
             try Task.checkCancellation()
             if readyChannel != nil, let seen = facts.extensionSeenAt, seen >= selectedAt,
                let files = extensionFiles, files.path == ChromeExtensionFolder.visible.path,
-               files.diskVersion == files.shippedVersion, facts.extensionVersion == files.shippedVersion { return true }
+               acceptedExtensionMatchesFolder == true { return true }
             if let at = handshakeAt, at >= selectedAt, facts.handshakeResult == "rejected" { break }
             if await transportAvailable() == false { break }
         }
@@ -122,6 +122,7 @@ extension ChromeControlRuntime {
             "extension_files_version": extensionFiles.map { .string($0.diskVersion) } ?? .null,
             "extension_running_code": channel != nil ? facts.extensionCode.map(JSONValue.string) ?? .null : .null,
             "extension_files_code": extensionFiles?.code.map(JSONValue.string) ?? .null,
+            "extension_code_matches_folder": acceptedExtensionMatchesFolder.map(JSONValue.bool) ?? .null,
             "extension_path": extensionFiles.map { .string($0.path) } ?? .null,
             "extension_version_check_error": extensionFilesError.map(JSONValue.string) ?? .null,
             "extension_reload": reload,

@@ -41,23 +41,19 @@ struct SimpleContactThread: View {
         case .read?: "Read by \(contact.name)."
         case .failed?: "No reply came back from \(contact.name)."
         case .notDelivered?: "Didn't reach \(contact.name)."
+        case .unanswered?: "No reply from \(contact.name)."
         default: nil
         }
     }
 
     /// Chats this contact opened with the agent over the bridge. Peer-owned
-    /// session IDs survive retitling; legacy bridge chats carry their label.
+    /// session IDs survive retitling.
     /// The contact's own conversation is this thread, so it is not listed.
     private var openedChats: [ChatSession] {
         let owner = String(contact.id.dropFirst(5))
         return appModel.engine.transcripts.sessions.filter { session in
             if session.id == ContactThread.session(owner: owner) { return false }
-            if session.id.hasPrefix(ContactThread.prefix(owner: owner)) { return true }
-            guard session.title.hasPrefix("[from: "),
-                  let end = session.title.range(of: ", via bridge]") else { return false }
-            let label = session.title[session.title.index(session.title.startIndex, offsetBy: 7)..<end.lowerBound]
-                .lowercased()
-            return label == contact.name.lowercased()
+            return session.id.hasPrefix(ContactThread.prefix(owner: owner))
         }
     }
 
@@ -212,13 +208,13 @@ struct SimpleContactThread: View {
     /// happened is written on the thread and shows from there.
     private func stop() {
         guard !stopAsked, let flight = store.flight(for: contact.id) else { return }
-        let session = appModel.engine.transcripts.sessions.contains(where: { $0.id == flight.scope }) ? flight.scope : appModel.activeChatSessionId
+        let session = flight.scope
         guard !session.isEmpty else { return }
         let root = root
         stopAsked = true
         failure = nil
         Task { @MainActor in
-            if let why = await NativeAgentEngine.live.stopContactMessage(agent: flight.agent, conversation: flight.label,
+            if let why = await NativeAgentEngine.live.stopContactMessage(agent: flight.agent, record: flight.recordID,
                                                       session: session, root: root) {
                 failure = why
             }
@@ -244,7 +240,11 @@ struct SimpleContactThread: View {
                                                       conversation: flight.agent.hasPrefix("bot:") ? nil : flight.recordID) {
                 failure = why
             } else {
-                await NativeAgentEngine.live.withdrawContactMessage(item.id, record: flight.recordID, root: root)
+                do {
+                    try await NativeAgentEngine.live.withdrawContactMessage(item.id, record: flight.recordID, root: root)
+                } catch {
+                    failure = "The replacement was accepted, but the old held copy could not be withdrawn: \(error.localizedDescription) Do not send it again."
+                }
             }
             resending.remove(item.id)
         }

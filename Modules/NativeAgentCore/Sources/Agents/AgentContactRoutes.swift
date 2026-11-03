@@ -1,4 +1,5 @@
 import Foundation
+import Experiences
 import NativeAgentShared
 import CoreFoundation
 import Network
@@ -7,7 +8,8 @@ import AgentConversations
 import AgentLinkTransport
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentContactRoutes.swift` | Authenticated contact ingress, MCP/A2A requests, retained reply pagination (failed prose followed by its terminal cause), event waits and transport-confirmed fetch acknowledgements; A2A HTTP waits retain their worker and cancel on connection failure or stop, preserving the reply path on receive half-close without canceling the accepted canonical turn |
+import Privacy
+// Blueprint: | `AgentContactRoutes.swift` | Authenticated contact ingress, MCP/A2A requests, retained reply pagination (failed prose followed by its terminal cause), top-level builder attachments and canonical file bytes, event waits and transport-confirmed text/file fetch acknowledgements; A2A HTTP waits retain their worker and cancel on connection failure or stop, preserving the reply path on receive half-close without canceling the accepted canonical turn |
 
 private final class AgentContactHTTPWait: @unchecked Sendable {
     private let lock = NSLock()
@@ -154,7 +156,7 @@ public struct AgentContactRoutes: Sendable {
                 switch response {
                 case .json(let status, let value, let onSent):
                     Self.writeA2AJSON(conn, status: status, object: value, onSent: { Task { await onSent?() } })
-                case .stream(let events): AgentContactSSE.write(conn, id: "rest", events: events, version: "1.0", rest: true)
+                case .stream(let events, let onSent): AgentContactSSE.write(conn, id: "rest", events: events, version: "1.0", rest: true, onSent: onSent)
                 }
             }
             return
@@ -184,15 +186,31 @@ public struct AgentContactRoutes: Sendable {
             func wire(_ item: AgentConversationStore.Held) -> [String: String] {
                 ["at": NativeTimestampFormat.plainZulu(item.at), "text": item.text, "conversation_id": item.conversation ?? session]
             }
-            let held: (taken: [AgentConversationStore.Held], remaining: Int) = tool.flatMap { _ in principal.peerID.flatMap { peer in
-                try? conversations.takeHeld(agent: "peer:" + peer) { NativeAgentMCPWire.heldFits($0.map(wire)) }
-            } } ?? ([], 0)
+            let held: (taken: [AgentConversationStore.Held], remaining: Int)
+            do {
+                if tool != nil, let peer = principal.peerID {
+                    held = try conversations.takeHeld(agent: "peer:" + peer) { NativeAgentMCPWire.heldFits($0.map(wire)) }
+                } else { held = ([], 0) }
+            } catch {
+                BridgeCore.writeJSON(conn, status: 503, obj: ["error": "held_message_drain_failed",
+                    "source": conversations.fileURL.path,
+                    "detail": NativeAgentSecretRedactor.redactText(error.localizedDescription)])
+                return
+            }
             let taken = held.taken
             let settle: @Sendable (Bool) -> Void = { written in
-                guard !taken.isEmpty else { return }
-                let name = (try? AgentPeerStore(dataRoot: dataRoot).list())?.first { $0.id == principal.peerID }?.name ?? "the host"
-                do { try conversations.settleHeld(taken, written: written, to: name, via: tool ?? "MCP") }
-                catch { nativeLog("AgentContactRoutes: held messages were not settled (they stay delivering until the next launch): %@", error.localizedDescription) }
+                guard !taken.isEmpty, let tool else { return }
+                do { try conversations.settleHeld(taken, written: written, to: principal.displayName ?? principal.id, via: tool) }
+                catch {
+                    let words = "Held message settlement failed: " + error.localizedDescription
+                        + "; response written: \(written); exchanges: " + taken.map(\.exchange).joined(separator: ", ")
+                    RepairOwed.owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .message,
+                        operation: "agent.held.settle:" + principal.id, owner: conversations.fileURL.path,
+                        words: words, lever: "Repair the saved delivery transition against its original response outcome before any resend.",
+                        nextCall: ToolFailureError.call("app", ["action": .string("agent.read"), "args": .object([
+                            "agent": .string("peer:" + principal.id)])]))
+                    nativeLog("%@", words)
+                }
             }
             switch NativeAgentMCPWire.parse(request, byteCount: body.count, defaultSession: principal.conversationID(protocolName: "mcp"),
                                             held: (taken.map(wire), held.remaining)) {
@@ -209,10 +227,10 @@ public struct AgentContactRoutes: Sendable {
             case .reply(let request, let session, let offset, let waitSeconds, let project):
                 Task {
                     let tasks = self.tasks()
-                    let receipt = await peerReplyReceipt(requestID: request, sessionID: session,
+                    let reply = await peerReplyReceipt(requestID: request, sessionID: session,
                         offset: offset, waitSeconds: waitSeconds, principal: principal, tasks: tasks)
-                    let fetched = Self.fetched(receipt, principal: principal, tasks: tasks)
-                    BridgeCore.writeJSON(conn, status: 200, obj: project(receipt), onSent: { fetched?(); settle(true) },
+                    let fetched = Self.fetched(reply.receipt, task: reply.task, tasks: tasks)
+                    BridgeCore.writeJSON(conn, status: 200, obj: project(reply.receipt), onSent: { fetched?(); settle(true) },
                                          onFailed: { settle(false) })
                 }
             case .immediate(let status, let response):
@@ -244,7 +262,7 @@ public struct AgentContactRoutes: Sendable {
                 switch response {
                 case .json(let object, let onSent):
                     BridgeCore.writeJSON(conn, status: 200, obj: object, onSent: { Task { await onSent?() } })
-                case .stream(let id, let events, let version): AgentContactSSE.write(conn, id: id, events: events, version: version)
+                case .stream(let id, let events, let version, let onSent): AgentContactSSE.write(conn, id: id, events: events, version: version, onSent: onSent)
                 }
             }
         case "/agent/card":
@@ -274,8 +292,8 @@ public struct AgentContactRoutes: Sendable {
                 let result = await peerReplyReceipt(requestID: requestID, sessionID: sessionID,
                     offset: Self.peerInteger(json["offset"]) ?? 0, maxChars: Self.peerInteger(json["max_chars"]) ?? 8000,
                     principal: principal, tasks: tasks)
-                BridgeCore.writeJSON(conn, status: result["status"] as? String == "invalid_request" ? 400 : 200, obj: result,
-                          onSent: Self.fetched(result, principal: principal, tasks: tasks))
+                BridgeCore.writeJSON(conn, status: result.receipt["status"] as? String == "invalid_request" ? 400 : 200, obj: result.receipt,
+                          onSent: Self.fetched(result.receipt, task: result.task, tasks: tasks))
             }
         case "/agent/message":
             guard method == "POST" else {
@@ -338,33 +356,36 @@ public struct AgentContactRoutes: Sendable {
     }
 
     private func peerReplyReceipt(requestID: String, sessionID: String, offset: Int = 0, maxChars: Int = 8000,
-                                  waitSeconds: Int = 0, principal: AgentBridgePrincipal, tasks: AgentContactTasks) async -> [String: Any] {
+                                  waitSeconds: Int = 0, principal: AgentBridgePrincipal, tasks: AgentContactTasks) async -> (receipt: [String: Any], task: AgentContactTask?) {
         let protocolSession = NativeAgentMCPWire.validSession(sessionID) || NativeAgentA2AWire.validContext(sessionID)
         let storedSession = protocolSession ? principal.storedConversation(sessionID) : sessionID
-        guard storedSession.hasPrefix(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id)) else {
-            return ["status": "invalid_request", "retrieval_result_class": "failed"]
-        }
         // The task is filed under the transport's context; the session is the contact's one thread.
-        let context = protocolSession ? sessionID
-            : String(storedSession.dropFirst(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id).count))
-        let taskID = "na3.\(context).\(requestID)"
+        let taskID = Self.taskID(requestID: requestID, sessionID: sessionID, principal: principal)
         // agent_reply's wait: back the moment the reply settles (its stream
         // ends with it), or when the caller's bound passes, as agent_message waits.
         // A wait that cannot watch the reply says why, never a silent immediate read.
-        var waitIgnored: String?
         if waitSeconds > 0 {
             do {
                 let events = try await tasks.subscribe(taskID, owner: principal.id)
                 await Self.untilSettled(seconds: waitSeconds) {
                     for await event in events { if case .status(_, final: true) = event { return } }
                 }
-            } catch { waitIgnored = ((error as? AgentContactFailure)?.message ?? error.localizedDescription) + "; read as it is now." }
+            } catch {
+                return (["status": "unavailable", "retrieval_result_class": "failed", "evidence": "canonical_task_wait_unavailable",
+                    "request_id": requestID, "session_id": sessionID,
+                    "detail": "The retained task could not be watched: \(error.localizedDescription). Repair task observation; do not repeat the message."], nil)
+            }
         }
-        var receipt = await Self.retainedReply(requestID: requestID, sessionID: sessionID,
+        return await Self.retainedReply(requestID: requestID, sessionID: sessionID,
             taskID: taskID, receiptSessionID: storedSession, offset: offset, maxChars: maxChars,
-            principal: principal, tasks: tasks).receipt
-        if let waitIgnored { receipt["wait_ignored"] = waitIgnored }
-        return receipt
+            principal: principal, tasks: tasks)
+    }
+
+    static func taskID(requestID: String, sessionID: String, principal: AgentBridgePrincipal) -> String {
+        let protocolSession = NativeAgentMCPWire.validSession(sessionID) || NativeAgentA2AWire.validContext(sessionID)
+        let prefix = AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id)
+        let context = !protocolSession && sessionID.hasPrefix(prefix) ? String(sessionID.dropFirst(prefix.count)) : sessionID
+        return "na3.\(context).\(requestID)"
     }
 
     static func retainedReply(requestID: String, sessionID: String, taskID: String, receiptSessionID: String,
@@ -385,17 +406,18 @@ public struct AgentContactRoutes: Sendable {
         }
     }
 
-    private static func fetched(_ receipt: [String: Any], principal: AgentBridgePrincipal,
-                                tasks: AgentContactTasks) -> (@Sendable () -> Void)? {
-        guard receipt["status"] as? String == "ok", let reply = receipt["reply"] as? String, !reply.isEmpty,
-              let session = receipt["session_id"] as? String, let request = receipt["request_id"] as? String,
-              let run = receipt["run_id"] as? String, !run.isEmpty else { return nil }
-        let stored = NativeAgentMCPWire.validSession(session) || NativeAgentA2AWire.validContext(session)
-            ? principal.storedConversation(session) : session
-        return { Task { await tasks.recordReplyFetch(session: stored, request: request, run: run, owner: principal.id) } }
+    static func carriesReply(_ receipt: [String: Any]) -> Bool {
+        (receipt["reply"] as? String)?.isEmpty == false
+            || (receipt["attachments"] as? [[String: Any]])?.isEmpty == false
     }
 
-    /// The peer doors share A2A's retained execution; the legacy builder handler stays separate.
+    static func fetched(_ receipt: [String: Any], task: AgentContactTask?,
+                                tasks: AgentContactTasks) -> (@Sendable () -> Void)? {
+        guard let task, carriesReply(receipt) else { return nil }
+        return { Task { await tasks.recordReplyFetch(task) } }
+    }
+
+    /// Peer and builder doors share the retained task execution owner.
     private func handleContactMessage(conn: NWConnection, json: [String: Any]?,
                                       tasks: AgentContactTasks, peer: PeerTurnContext,
                                       responseProjection: (@Sendable (Int, [String: Any]) -> [String: Any])? = nil,
@@ -481,17 +503,20 @@ public struct AgentContactRoutes: Sendable {
             do { try await AgentContactSSE.send(data, on: conn); return true }
             catch { return false }
         }
-        @Sendable func frame(_ object: [String: Any]) -> Data {
+        @Sendable func frame(_ object: [String: Any]) throws -> Data {
             var data = Data("event: message\ndata: ".utf8)
-            data.append((try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8))
+            data.append(try JSONSerialization.data(withJSONObject: object))
             data.append(Data("\n\n".utf8))
             return data
         }
+        do {
         let token = wait.progressToken
         if token != nil, await !send(Data("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n".utf8)) {
             conn.cancel(); return
         }
-        if let events = try? await tasks.subscribe(taskID, owner: owner) {
+        var retrievalFailure: String?
+        do {
+            let events = try await tasks.subscribe(taskID, owner: owner)
             let agent = PeerFacingIdentity.agentName
             await untilSettled(seconds: wait.seconds) {
                 var step = 0, last = Date.distantPast
@@ -507,28 +532,40 @@ public struct AgentContactRoutes: Sendable {
                     let message = task.state == .inputRequired ? (task.detail ?? "Waiting for the person")
                         : task.text.isEmpty ? "\(agent) is working" : String(task.text.suffix(2000))
                     last = Date(); step += 1
-                    guard await send(frame(NativeAgentMCPWire.progress(token, step: step, message: message))) else { return }
+                    let progress: Data
+                    do { progress = try frame(NativeAgentMCPWire.progress(token, step: step, message: message)) }
+                    catch { nativeLog("Contact progress could not be encoded: %@", error.localizedDescription); conn.cancel(); return }
+                    guard await send(progress) else { return }
                 }
             }
-        }
+        } catch { retrievalFailure = "The retained task could not be watched: " + error.localizedDescription }
         var receipt = ack
         var fetchedTask: AgentContactTask?
-        if let task = try? await tasks.get(taskID, owner: owner) {
-            receipt.merge(contactReply(task, requestID: requestID, sessionID: sessionID, offset: 0, maxChars: 8000)) { ack, _ in ack }
-            if let reply = receipt["reply"] as? String, !reply.isEmpty { fetchedTask = task }
+        if retrievalFailure == nil {
+            do {
+                let task = try await tasks.get(taskID, owner: owner)
+                receipt.merge(contactReply(task, requestID: requestID, sessionID: sessionID, offset: 0, maxChars: 8000)) { ack, _ in ack }
+                if carriesReply(receipt) { fetchedTask = task }
+            } catch { retrievalFailure = "The retained task could not be read: " + error.localizedDescription }
+        }
+        if let retrievalFailure {
+            receipt["status"] = "unavailable"
+            receipt["retrieval_result_class"] = "failed"
+            receipt["detail"] = retrievalFailure + ". The message remains accepted; repair task observation and do not resend it."
         }
         let response = project(200, receipt)
         let sent: Bool
         if token != nil {
-            sent = await send(frame(response))
+            sent = await send(try frame(response))
         } else {
-            guard let body = try? JSONSerialization.data(withJSONObject: response) else { return }
+            let body = try JSONSerialization.data(withJSONObject: response)
             var data = Data("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
             data.append(body)
             sent = await send(data)
         }
         settle?(sent)
         if sent, let fetchedTask { await tasks.recordReplyFetch(fetchedTask) }
+        } catch { nativeLog("Contact result could not be encoded: %@", error.localizedDescription); conn.cancel() }
     }
 
     /// The caller's wait on a reply (agent_message's, agent_reply's): `watch`
@@ -550,14 +587,34 @@ public struct AgentContactRoutes: Sendable {
         guard offset >= 0, offset <= reply.count, (1...16000).contains(maxChars) else { return ["status": "invalid_request", "retrieval_result_class": "failed"] }
         let slice = String(reply.dropFirst(offset).prefix(maxChars))
         var receipt: [String: Any] = ["status": task.state.terminal ? "ok" : "pending",
-            "retrieval_result_class": task.state.terminal ? "succeeded" : "unknown",
+            "retrieval_result_class": task.replyRecovery != nil ? "failed" : task.state.terminal ? "succeeded" : "unknown",
             "execution_result_class": task.state == .completed ? "succeeded" : task.state == .failed ? "failed" : task.state.terminal ? "cancelled" : "unknown",
             "execution_terminal": task.state.terminal,
             "original_status": task.state.rawValue, "request_id": requestID, "session_id": sessionID,
             "run_id": task.canonicalRunID ?? "", "reply": slice, "offset": offset,
             "next_offset": offset + slice.count, "has_more": offset + slice.count < reply.count]
         if let detail = task.detail { receipt["detail"] = detail }
-        if let result = task.toolResult { receipt["result"] = result.foundationObject }
+        if let recovery = task.replyRecovery {
+            receipt["reply_recovery"] = ["source": recovery.source, "detail": recovery.detail]
+            receipt["detail"] = [task.detail, recovery.detail].compactMap { $0 }.joined(separator: "\n")
+        }
+        // Canonical file parts carry their bytes. Builder results additionally
+        // retain their door's attachment descriptors (including saved paths);
+        // return that live payload at the same top-level keys its readers use.
+        receipt["attachments"] = task.parts.enumerated().compactMap { index, part -> [String: Any]? in
+            guard case .file(let name, let mediaType, let bytes, _) = part else { return nil }
+            return ["id": "\(task.id):\(index)", "type": mediaType.hasPrefix("image/") ? "image" : "file",
+                "mime": mediaType, "name": name, "byteSize": bytes.count,
+                "base64": bytes.base64EncodedString(), "path": NSNull()]
+        }
+        if let result = task.toolResult {
+            receipt["result"] = result.foundationObject
+            if case .object(let fields) = result {
+                for key in ["attachments", "completionDelivery", "deliveryId"] {
+                    if let value = fields[key] { receipt[key] = value.foundationObject }
+                }
+            }
+        }
         if let completions = task.delegatedCompletions {
             receipt["delegated_completions"] = completions.sorted { $0.key < $1.key }.map {
                 var completion: [String: Any] = ["artifact_id": $0.key, "parts": [$0.value.wire03]]

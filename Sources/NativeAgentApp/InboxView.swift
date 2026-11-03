@@ -424,7 +424,7 @@ struct InboxListRow: View {
         actionError = nil
         Task { @MainActor in
             let outcome = await performAction(actionID)
-            if case .failed = outcome { actionError = InboxActionWords.failure(actionID) }
+            if case .failed(let detail) = outcome { actionError = detail }
         }
     }
 

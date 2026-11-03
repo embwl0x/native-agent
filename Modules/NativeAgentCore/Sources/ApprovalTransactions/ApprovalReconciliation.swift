@@ -80,20 +80,19 @@ extension ApprovalExecution {
     @discardableResult
     public func reconcileUnappliedApprovalExecutions(
         dataRoot: URL, records: [ApprovalRecord]
-    ) async -> Int {
+    ) async throws -> Int {
         let executed = await Self.reconcileUnappliedApprovalExecutions(
             kinds: approvalExecutors(), records: records)
         let chatTools = await reconcileUnappliedChatToolApprovalExecutions(dataRoot: dataRoot, records: records)
         let connectors = await reconcileUnappliedConnectorActionApprovals(dataRoot: dataRoot, records: records)
-        await checkpointApprovalReconciliation(dataRoot: dataRoot, records: records, retry: chatTools.failures)
+        try await checkpointApprovalReconciliation(dataRoot: dataRoot, records: records, retry: chatTools.failures)
         return executed + chatTools.executed + connectors
     }
     // Owns the Codable cursor object in workflows/approvals: local backup and
     // export include it, phone sync excludes it, PrivacyMap lists Approvals.
     struct ApprovalReconciliationCursor: Codable {
         var stamp = ""
-        // Optional so old (stamp, id) cursors safely revisit the boundary.
-        var boundaryIDs: Set<String>?
+        var boundaryIDs: Set<String> = []
         var retry: [String] = []
         static func path(_ root: URL) -> URL {
             root.appendingPathComponent("workflows/approvals/reconciliation-cursor.json")
@@ -107,7 +106,7 @@ extension ApprovalExecution {
     // Reconcile by resolution time, oldest first; failed effects/receipts keep explicit retries.
     public static func resolvedApprovalsForReconciliation(
         dataRoot: URL
-    ) async -> [ApprovalRecord] {
+    ) async throws -> [ApprovalRecord] {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         do {
             let cursor = try ApprovalReconciliationCursor.read(dataRoot)
@@ -116,7 +115,7 @@ extension ApprovalExecution {
             let page = rows.filter {
                 let stamp = $0.resolvedAt ?? $0.createdAt
                 return stamp > cursor.stamp || (stamp == cursor.stamp
-                    && !(cursor.boundaryIDs ?? []).contains($0.id))
+                    && !cursor.boundaryIDs.contains($0.id))
             }.sorted {
                 ($0.resolvedAt ?? $0.createdAt, $0.id) < ($1.resolvedAt ?? $1.createdAt, $1.id)
             }.prefix(SwiftNativeApprovalInbox.storedApprovalCap)
@@ -130,7 +129,7 @@ extension ApprovalExecution {
                 // Continuity is a separate commit from the replay cursor.
                 // Include owed turns and abandoned claims independently of age
                 // and the execution cursor. A started turn must be settled.
-                guard let replay = Self.chatToolApprovalReplay(from: record, reportingOnly: true),
+                guard let replay = Self.chatToolApprovalReplay(from: record),
                       let session = NativeAgentChatSessionID.normalizedPathComponent(replay.sessionId),
                       !(replay.surface == "connector_action" && session.hasPrefix("ephemeral:connector_action:")) else { return false }
                 if case .object(let state)? = record.chatContinuation,
@@ -139,20 +138,22 @@ extension ApprovalExecution {
             }
         } catch {
             nativeLog("[approvalReconcile] scan failed: \(String(describing: error))")
-            return []
+            throw error
         }
     }
     public func checkpointApprovalReconciliation(
         dataRoot: URL, records: [ApprovalRecord], retry: Set<String> = []
-    ) async {
+    ) async throws {
         guard !records.isEmpty else { return }
         do {
             var cursor = try ApprovalReconciliationCursor.read(dataRoot)
             let refreshed = try await SwiftNativeApprovalInbox(root: dataRoot).list(filter: .resolved)
             let selected = Set(records.map(\.id))
-            let unresolved = refreshed.filter {
-                selected.contains($0.id) && (($0.decision == "approved" && $0.executedAction == nil)
-                    || retry.contains($0.id))
+            let domains = approvalExecutors()
+            let unresolved = refreshed.filter { record in
+                selected.contains(record.id) && ((record.executedAction == nil && (record.decision == "approved"
+                    || domains.contains { executor in ExecutionEventVocabulary.matches(record.action, executor.action) && executor.shouldReconcile(record) }))
+                    || retry.contains(record.id))
             }.map(\.id)
             let retainedIDs = Set(refreshed.map(\.id))
             cursor.retry.removeAll { selected.contains($0) || !retainedIDs.contains($0) }
@@ -164,13 +165,14 @@ extension ApprovalExecution {
                     cursor.boundaryIDs = []
                 }
                 if stamp == cursor.stamp {
-                    cursor.boundaryIDs = (cursor.boundaryIDs ?? []).union([row.id])
+                    cursor.boundaryIDs.insert(row.id)
                 }
             }
-            cursor.boundaryIDs?.formIntersection(Set(refreshed.map(\.id)))
+            cursor.boundaryIDs.formIntersection(Set(refreshed.map(\.id)))
             try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(cursor), to: ApprovalReconciliationCursor.path(dataRoot))
         } catch {
             nativeLog("[approvalReconcile] checkpoint failed: \(error)")
+            throw error
         }
     }
     /// Execute the checked batch in executor order.
@@ -207,9 +209,6 @@ extension ApprovalExecution {
                 shouldReconcile: { $0.decision == "approved" },
                 execute: { await client.applyApprovedSelfImprovement(from: $0) }),
             ApprovalExecutor(
-                action: "self_evolution.apply",
-                execute: { await client.retireSelfEvolutionApproval(from: $0) }),
-            ApprovalExecutor(
                 action: "browser.open_url",
                 execute: { try await self.executeResolvedBrowserRun(from: $0) }),
             ApprovalExecutor(
@@ -223,8 +222,6 @@ extension ApprovalExecution {
                 execute: {
                     await Self.applyResolvedProcedureExactActivation(from: $0, dataRoot: self.dataRoot)
                 }),
-            ApprovalExecutor(action: MemoryRepairOneShot.action,
-                execute: { await MemoryRepairOneShot.applyResolvedMemoryRepair(from: $0, dataRoot: self.dataRoot) }),
             ApprovalExecutor(action: MemoryKindBackfill.action,
                 execute: { await MemoryApprovalTransactions.applyResolvedKindBackfill(from: $0, dataRoot: self.dataRoot) }),
         ]

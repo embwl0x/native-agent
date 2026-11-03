@@ -64,10 +64,11 @@ public enum InlineInteractionCompactionRetention {
               case .string(let name)? = state["name"],
               finishedStates.contains(name)
         else { return true }
-        guard case .object(let continuation)? = interaction["continuation"] else {
+        guard let value = interaction["continuation"], value != .null else {
             // Terminal, and there is no suspended request behind it.
             return false
         }
+        guard case .object(let continuation) = value else { return true }
         guard case .string(let resumeState)? = continuation["state"] else { return true }
         return !spentContinuationStates.contains(resumeState)
     }

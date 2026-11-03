@@ -22,7 +22,7 @@ extension NativeAgentEngine {
         // Capture where User was before entering the shared session queue.
         let takeover = await MacWorkContinuation.admit(message)
         let reply = try await MacWorkContinuation.$current.withValue(takeover) {
-            try await TurnAdmission.shared.run(sessionID: sessionID) {
+            try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionID) {
                 try await TurnRequest(
                     message: message,
                     sessionID: sessionID,

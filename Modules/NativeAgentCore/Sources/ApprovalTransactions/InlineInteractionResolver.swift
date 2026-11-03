@@ -1,6 +1,7 @@
 import AuthoredCapabilities
 import Experiences
 import Foundation
+import NotificationInbox
 import ChatTurnRuntime
 import ChatTurnContracts
 import ChatToolRuntime
@@ -14,7 +15,7 @@ import TrustCenter
 import ToolRegistry
 import MacControl
 import Transcripts
-// Blueprint: | `InlineInteractionResolver.swift` | Control/continuation resolution uses the chat owner's transcript CAS and stopped projection; same-life stranded claims alone may reclaim/replay. The person's Resume replaces stopped continuations with fresh work without captured blocked calls. Existing setup admission, Stop settlement and slot ownership remain canonical |
+// Blueprint: | `InlineInteractionResolver.swift` | Control/continuation resolution uses the chat owner's transcript CAS and stopped projection; all filing reuses an open ask under the transcript lock by conversation, tool and subject, preserving its continuation; same-life stranded claims alone may reclaim/replay. The person's Resume replaces stopped continuations with fresh work without captured blocked calls. Existing setup admission, Stop settlement and slot ownership remain canonical |
 /// The one place an inline card settles and the one place a suspended request
 /// resumes.
 ///
@@ -114,16 +115,6 @@ public enum InlineInteractionResolver {
         handBacks.removeValue(forKey: id)
     }
     public typealias ResolveError = SwiftNativeChatOrchestrationClient.InlineInteractionResolveError
-    /// Every interaction row in a session, newest last. Reads the transcript
-    /// and nothing else, so a relaunch rebuilds pending cards from disk.
-    public static func interactions(
-        sessionID: String,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async -> [InlineInteraction] {
-        (try? await checkedRows(sessionID, dataRoot)).map { read in
-            read.rows.compactMap { SwiftNativeChatOrchestrationClient.inlineInteraction(in: $0, lifeID: read.lifeID) }
-        } ?? []
-    }
     /// The transcript read, with its failure VISIBLE.
     ///
     /// A missing file is not a failure — it reads as no rows. A read that
@@ -149,13 +140,22 @@ public enum InlineInteractionResolver {
         id: String,
         sessionID: String,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async -> InlineInteraction? {
-        await interactions(sessionID: sessionID, dataRoot: dataRoot).first { $0.id == id }
+    ) async throws -> InlineInteraction? {
+        let read = try await checkedRows(sessionID, dataRoot)
+        for row in read.rows {
+            guard case .object(let object) = row,
+                  case .object(let metadata)? = object["metadata"],
+                  metadata["kind"] == .string(InlineInteractionWire.transcriptKind),
+                  case .object(let raw)? = metadata[InlineInteractionWire.metadataKey],
+                  raw["id"] == .string(id) else { continue }
+            return try SwiftNativeChatOrchestrationClient.checkedInlineInteraction(in: row, lifeID: read.lifeID)
+        }
+        return nil
     }
     /// Every interaction in a session PAIRED WITH THE TRANSCRIPT ROW it was
     /// raised on. The card belongs under that row and nowhere else, so the
     /// renderer needs the row identity the reader is scrolling past — not just
-    /// the interaction. Same single read as `interactions`.
+    /// the interaction. One checked transcript read supplies both.
     /// The checked form: a read failure is returned, not flattened to "no
     /// cards", so the renderer can keep the last good projection on screen.
     public static func checkedInteractionsByRow(
@@ -169,22 +169,30 @@ public enum InlineInteractionResolver {
             return .failure(error)
         }
     }
-    public static func interactionsByRow(
-        sessionID: String,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async -> [(rowID: String, interaction: InlineInteraction)] {
-        (try? await checkedRows(sessionID, dataRoot)).map { interactionsByRow(in: $0.rows, lifeID: $0.lifeID) } ?? []
-    }
     public nonisolated static func interactionsByRow(
         in rows: [JSONValue], lifeID: String? = nil
     ) -> [(rowID: String, interaction: InlineInteraction)] {
-        rows.compactMap { row in
+        return rows.compactMap { row in
             guard case .object(let object) = row,
-                  case .string(let rowID)? = object["id"],
-                  let interaction = SwiftNativeChatOrchestrationClient.inlineInteraction(in: row, lifeID: lifeID)
+                  case .string(let rowID)? = object["id"]
             else { return nil }
-            return (rowID, interaction)
+            do {
+                guard let interaction = try SwiftNativeChatOrchestrationClient.checkedInlineInteraction(in: row, lifeID: lifeID)
+                else { return nil }
+                return (rowID, interaction)
+            } catch {
+                // Display-only unavailable evidence, never an executable card
+                // or a replacement written over the damaged source.
+                return (rowID, unavailableInteraction(rowID: rowID, error: error))
+            }
         }
+    }
+    public nonisolated static func unavailableInteraction(rowID: String, error: any Error) -> InlineInteraction {
+        InlineInteraction(id: "unavailable:" + rowID,
+            kind: .unknown, target: "", title: "Saved request unavailable",
+            why: TurnSecretRedactor.redactText(error.localizedDescription),
+            primaryActionLabel: "", declineConsequence: "",
+            state: .unknown("unavailable"), createdAt: .distantPast)
     }
     /// The descriptor the card renders from: display name, which control
     /// opens, and whether it can be completed on this device at all.
@@ -204,20 +212,26 @@ public enum InlineInteractionResolver {
     public static func waitForAnswer(_ interaction: InlineInteraction, tool: String, input: [String: JSONValue],
                                      sessionID: String, dataRoot: URL) async -> JSONValue {
         waitingHosts.insert(interaction.id)
-        let result = await waitForAnswerBody(interaction, tool: tool, input: input,
-                                             sessionID: sessionID, dataRoot: dataRoot)
+        let result: JSONValue
+        do {
+            result = try await waitForAnswerBody(interaction, tool: tool, input: input,
+                                                sessionID: sessionID, dataRoot: dataRoot)
+        } catch {
+            result = .object(["status": .string("failed"), "reason": .string("card_unavailable"),
+                "detail": .string(TurnSecretRedactor.redactText(error.localizedDescription))])
+        }
         await settle { @MainActor in _ = waitingHosts.remove(interaction.id) }
         return result
     }
     private static func waitForAnswerBody(
         _ interaction: InlineInteraction, tool: String, input: [String: JSONValue], sessionID: String, dataRoot: URL
-    ) async -> JSONValue {
+    ) async throws -> JSONValue {
         let changes = NotificationCenter.default.notifications(named: InlineInteractionWire.changedNotification)
             .compactMap { $0.object as? String }
         var card = interaction
         // Titled once, when first raised: an outer layer seeing the same card keeps its title.
         if let requester = SkillRunContext.requester,
-           await Self.interaction(id: interaction.id, sessionID: sessionID, dataRoot: dataRoot) == nil {
+           try await Self.interaction(id: interaction.id, sessionID: sessionID, dataRoot: dataRoot) == nil {
             card.title = "\(requester) wants to ask: \(card.title)"
         }
         let blocked = InlineInteractionNeed.blocksTurn(interaction)
@@ -232,20 +246,25 @@ public enum InlineInteractionResolver {
         guard let raised = await raise(card, sessionID: sessionID, resumable: InlineInteractionNeed.blocksTurn(interaction),
             toolName: blocked ? tool : nil, toolArgumentsJSON: blocked ? arguments : nil,
             toolCallId: blocked ? UUID().uuidString : nil,
+            requestingTool: tool,
             origin: TurnEnvelope.current(surface: ChatToolSessionContext.envelope?.surface ?? "chat"), dataRoot: dataRoot) else {
             return .object(["status": .string("failed"), "reason": .string("card_unavailable"),
                 "detail": .string("The card could not be saved; nothing was answered.")])
         }
-        if !InlineInteractionNeed.blocksTurn(raised) { return InlineInteractionNeed.envelope(raised) }
-        func answer() async -> InlineInteraction? {
-            guard let current = await Self.interaction(id: raised.id, sessionID: sessionID, dataRoot: dataRoot),
+        // The existing ask retains its continuation. A re-ask returns its
+        // pointer instead of adding a second host waiting to replay work.
+        if raised.id != card.id || !InlineInteractionNeed.blocksTurn(raised) {
+            return InlineInteractionNeed.envelope(raised)
+        }
+        func answer() async throws -> InlineInteraction? {
+            guard let current = try await Self.interaction(id: raised.id, sessionID: sessionID, dataRoot: dataRoot),
                   current.state.isTerminal, current.state.failureReason == nil else { return nil }
             return current
         }
-        let current: InlineInteraction? = await TurnDeadline.withHumanWait {
-            if let result = await answer() { return result }
+        let current: InlineInteraction? = try await TurnDeadline.withHumanWait {
+            if let result = try await answer() { return result }
             for await changed in changes where changed == sessionID {
-                if let result = await answer() { return result }
+                if let result = try await answer() { return result }
             }
             return InlineInteraction?.none
         }
@@ -265,7 +284,22 @@ public enum InlineInteractionResolver {
         if let choice = current.state.outcome?.selection { receipt["answer"] = .string(choice) }
         return .object(receipt)
     }
+    /// Permission-remedy asks use the same locked transcript filing boundary.
+    /// A different conversation or access axis is a different ask.
+    public static func filePermissionRequest(_ need: InlineInteraction, sessionID: String,
+        origin: TurnEnvelope, dataRoot: URL) async throws -> (id: String, sessionID: String) {
+        // Continue after Allow without capturing the failed call, whose
+        // effects may already be unknown.
+        guard let raised = await raise(need, sessionID: sessionID, requestingTool: "permissions.request",
+                                      origin: origin, dataRoot: dataRoot) else {
+            throw NSError(domain: "PermissionCard", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The permission card could not be saved; no card is up."])
+        }
+        return (raised.id, sessionID)
+    }
+
     /// Persist a card outside a tool-receipt write, using `Continuation`'s input contract.
+    /// The producer supplies the origin stamped into both the continuation witness and row.
     /// Nonresumable inputs, including attachments whose bytes are not retained,
     /// are invalidated in the same atomic write.
     @discardableResult
@@ -277,49 +311,18 @@ public enum InlineInteractionResolver {
         toolName: String? = nil,
         toolArgumentsJSON: String? = nil,
         toolCallId: String? = nil,
-        origin: TurnEnvelope? = nil,
+        requestingTool: String? = nil,
+        origin: TurnEnvelope,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> InlineInteraction? {
-        var stamped = SwiftNativeChatOrchestrationClient.scrubbedCardDisplay(interaction)
+        let stamped: InlineInteraction
         do {
-            stamped.continuation = try InlineInteraction.Continuation.stamped(
-                for: stamped, sessionID: sessionID, toolCallId: toolCallId,
-                toolName: toolName, toolArgumentsJSON: toolArgumentsJSON,
-                mode: toolName == nil ? .continueTurn : .retryBlockedTool,
-                state: resumable ? .waiting : .invalidated, resumeText: resumeText,
-                peerSurface: ChatToolSessionContext.envelope?.surface ?? "chat",
-                originEnvelope: origin, dataRoot: dataRoot)
-        }
-        catch { nativeLog("[interaction] life identity is unavailable: \(error)"); return nil }
-        guard let encoded = InlineInteractionNeed.encode(stamped) else { return nil }
-        let envelope = receiptEnvelope(stamped)
-        var metadata: [String: JSONValue] = [
-            "kind": .string(InlineInteractionWire.transcriptKind),
-            "toolName": .string(InlineInteractionWire.toolName),
-            "inputJSON": .string("{}"),
-            "resultSummary": .string((try? envelope.serialize(pretty: false)) ?? ""),
-            "resultStatus": .string(InlineInteractionWire.waitingStatus),
-            "ok": .bool(false),
-            InlineInteractionWire.metadataKey: encoded,
-            "interactionId": .string(stamped.id),
-        ]
-        if let origin { metadata["envelope"] = origin.persistedMetadata() }
-        let row: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
-            "sessionId": .string(sessionID),
-            "role": .string("tool"),
-            "content": .string(""),
-            "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
-            "source": .string("chat"),
-            "runId": .string(stamped.continuation?.resumeRunId ?? stamped.id),
-            "metadata": .object(metadata),
-        ])
-        let file = path(sessionID, dataRoot)
-        do {
-            try await SwiftNativeChatOrchestrationClient.appendTranscriptRow(
-                row, to: file, interaction: stamped)
+            stamped = try await SwiftNativeChatOrchestrationClient.fileInlineInteraction(
+                interaction, sessionID: sessionID, resumeText: resumeText, resumable: resumable,
+                toolName: toolName, toolArgumentsJSON: toolArgumentsJSON, toolCallId: toolCallId,
+                requestingTool: requestingTool, origin: origin, dataRoot: dataRoot)
         } catch {
-            nativeLog("[interaction] raise failed for \(stamped.id): \(error)")
+            nativeLog("[interaction] raise failed for \(interaction.id): \(error)")
             return nil
         }
         await ApprovalChatCards.publishInteractionChange(id: stamped.id, sessionID: sessionID, dataRoot: dataRoot)
@@ -437,7 +440,7 @@ public enum InlineInteractionResolver {
         case .failure(let reason):
             // Not verified is NOT settled. The card keeps its control, the
             // person can try again, and nothing anywhere reads as connected.
-            let failed = current.failed(reason: reason)
+            let failed = current.failed(reason: String(TurnSecretRedactor.redactText(reason).prefix(1_000)))
             try await persist(
                 failed, sessionID: sessionID, ifRevision: current.revision, dataRoot: dataRoot
             )
@@ -461,8 +464,12 @@ public enum InlineInteractionResolver {
                 for target in settled.allTargets {
                     guard let capability = SystemPermissionPreflight.cardSettingsCapability(target) else { continue }
                     let id = AppleScriptExecution.automationTarget(target).map { "applescript:" + $0 } ?? capability.rawValue
-                    RepairOwed.settle(dataRoot, operation: "permissions.request:" + id + (capability == .calendars && settled.mode == .write ? ":write" : ""),
-                                     evidence: .init(source: "interaction", id: settled.id))
+                    // The grant settles the bare ask and the ask in the mode it granted.
+                    let asks: [[String: JSONValue]] = [["capability": .string(id)]] + (settled.mode.map { [["capability": .string(id), "mode": .string($0.rawValue)]] } ?? [])
+                    for args in asks {
+                        RepairOwed.settle(dataRoot, operation: AppActionBinding.repairOperation("permissions.request", args),
+                                         evidence: .init(source: "interaction", id: settled.id))
+                    }
                 }
             }
             await resumeOnce(settled, sessionID: sessionID, dataRoot: dataRoot)
@@ -503,7 +510,7 @@ public enum InlineInteractionResolver {
     /// phone, Telegram owner) are not the agent and pass. Not now is `decline`,
     /// which stays hers.
     private static func refuseAgentOnUsersCard(_ id: String, byAgent: Bool, dataRoot: URL) async throws {
-        guard byAgent, await ApprovalChatCards.isMirroredToUser(id, dataRoot: dataRoot) else { return }
+        guard byAgent, try await ApprovalChatCards.isMirroredToUser(id, dataRoot: dataRoot) else { return }
         throw ResolveError.usersCard
     }
     /// Undo a `begin` that must not carry through: the card goes back to
@@ -553,7 +560,14 @@ public enum InlineInteractionResolver {
         let owner = Task<JSONValue?, Never> {
             await settle { @MainActor in
                 defer { resumesInFlight[id] = nil }
-                guard var current = await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
+                let found: InlineInteraction?
+                do { found = try await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot) }
+                catch {
+                    RepairOwed.owe(dataRoot, id: "interaction-stop-\(id)", kind: .act,
+                        operation: "interaction.stop", owner: "transcript", words: error.localizedDescription)
+                    return nil
+                }
+                guard var current = found,
                       let state = current.continuation?.state,
                       state != .resumed, state != .invalidated else { return nil }
                 let revision = current.revision

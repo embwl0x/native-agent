@@ -78,7 +78,11 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         var seenTurns = Set<String>()
 
         let moment = Date()
-        let window = DoctorWindowFloor.resolve(root: root, now: moment)
+        guard let window = DoctorWindowFloor.resolve(root: root, now: moment) else {
+            return CheckResult(source: root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename).path,
+                id: id, title: title, status: "unmeasured",
+                detail: "This launch's build stamp is unavailable or invalid. Repair build_launch.json through the app launch owner before measuring this build.")
+        }
         let summary = await TurnTraceWindowReader.scan(
             root: root,
             now: moment,

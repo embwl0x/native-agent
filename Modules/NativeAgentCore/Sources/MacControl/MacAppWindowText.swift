@@ -12,7 +12,7 @@ import ApplicationServices
 /// own pixels. This never captures the desktop, launches or activates an app.
 public enum MacAppWindowText {
     public static func read(bundleID: String, window: JSONValue?) async throws -> (rows: JSONValue, text: String) {
-        if MacObservationMode.current == .passive, MacScreenLock.isCovered() {
+        if MacObservationMode.current == .passive, try MacScreenLock.isCovered() {
             throw SenseFailure(code: "source_unavailable", message: MacScreenLock.passiveReply)
         }
         #if canImport(Vision) && canImport(ApplicationServices) && os(macOS)

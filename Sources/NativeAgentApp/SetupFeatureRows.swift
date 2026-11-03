@@ -7,6 +7,7 @@ import MemoryV2
 // status and recovery); this card puts it first, over the lanes it owns.
 
 import Cognition
+import Foundation
 import SwiftUI
 import Context
 import TrustCenter
@@ -36,9 +37,16 @@ struct SetupFeatureRows<InnerLife: View>: View {
     @State private var savingEmbeddings = false
     @State private var pendingEmbeddings: Bool?
     @State private var savingContextFlow = false
+    @State private var trustLoadFailure: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
+            if appModel.engine.trust.policy == nil,
+               let failure = trustLoadFailure ?? appModel.engine.trust.securityRefreshError {
+                Text(failure + " Open Trust and repair its reported policy error.")
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .textSelection(.enabled)
+            }
             AdvancedSection(title: "Inner life") {
                 innerLife
                 reflectionRow
@@ -51,6 +59,7 @@ struct SetupFeatureRows<InnerLife: View>: View {
             AdvancedSection(title: "Memory") {
                 meaningMemoryRow
                 LivingMemoryPermissionsView()
+                    .disabled(appModel.engine.trust.policy == nil)
             }
         }
         .task { await load() }
@@ -100,19 +109,27 @@ struct SetupFeatureRows<InnerLife: View>: View {
 
     /// Context flow uses a menu so Off remains reversible.
     private var fluidContextRow: some View {
-        SetupRow(
+        // AppStorage supplies invalidation; read the stored type as well so a
+        // non-string preference cannot be displayed as its initial Active value.
+        let selection = UserDefaults.standard.object(forKey: "contextFlowMode").map { $0 as? String ?? "" }
+            ?? ContextFlowMode.active.rawValue
+        return SetupRow(
             title: "Memory in every reply",
             detail: "What I remember shapes each reply."
         ) {
             Picker("Memory in every reply", selection: Binding(
-                get: { ContextFlowMode(rawValue: contextFlowMode) ?? .active },
-                set: { mode in
-                    contextFlowMode = mode.rawValue
+                get: { selection },
+                set: { raw in
+                    guard let mode = ContextFlowMode(rawValue: raw) else { return }
+                    contextFlowMode = raw
                     Task { await setFluidContext(mode) }
                 }
             )) {
+                if ContextFlowMode(rawValue: selection) == nil {
+                    Text("Unavailable — choose Off or Active").tag(selection)
+                }
                 ForEach([ContextFlowMode.off, .active], id: \.rawValue) { mode in
-                    Text(OperationalSettingsControlPresentation.fluidContextLabel(mode)).tag(mode)
+                    Text(OperationalSettingsControlPresentation.fluidContextLabel(mode)).tag(mode.rawValue)
                 }
             }
             .pickerStyle(.menu)
@@ -128,9 +145,13 @@ struct SetupFeatureRows<InnerLife: View>: View {
         savingContextFlow = true
         defer { savingContextFlow = false }
         let status = await NativeAgentEngine.live.contextFlow.setMode(requested)
-        if status.effectiveMode != requested {
+        guard let effectiveMode = status.effectiveMode else {
+            appModel.systemToasts.push(warn: status.unavailableReason ?? "Fluid context is unavailable.")
+            return
+        }
+        if effectiveMode != requested {
             appModel.systemToasts.push(
-                warn: "Fluid context is effectively \(OperationalSettingsControlPresentation.fluidContextLabel(status.effectiveMode)) right now."
+                warn: "Fluid context is effectively \(OperationalSettingsControlPresentation.fluidContextLabel(effectiveMode)) right now."
             )
         }
     }
@@ -151,7 +172,7 @@ struct SetupFeatureRows<InnerLife: View>: View {
                     Task { await setDreams(value) }
                 }
             ),
-            disabled: savingDream || appModel.engine.cognitionView.diaryGate == nil
+            disabled: savingDream || appModel.engine.trust.policy == nil || appModel.engine.cognitionView.diaryGate == nil
         )
     }
 
@@ -193,7 +214,7 @@ struct SetupFeatureRows<InnerLife: View>: View {
                     }
                 }
             ),
-            disabled: pendingRem != nil
+            disabled: pendingRem != nil || appModel.engine.trust.policy == nil
         )
     }
 
@@ -262,10 +283,12 @@ struct SetupFeatureRows<InnerLife: View>: View {
         switch status.effectiveBackend {
         case ManagedEmbeddingProvider.coreMLBackend:
             return "On — I find memories by what they mean, not by the words in them."
-        case ManagedEmbeddingProvider.failClosedBackend where status.requestedBackend != ManagedEmbeddingProvider.mockBackend:
-            return "Asked for, but the on-device model could not be loaded; I match on words for now."
+        case ManagedEmbeddingProvider.failClosedBackend:
+            return "Semantic recall is unavailable. " + (status.lastLoadError ?? "Open Doctor for the model file and failure.")
+        case ManagedEmbeddingProvider.mockBackend:
+            return "Off — semantic embeddings are explicitly set to mock."
         default:
-            return "Off — I match memories on their words alone."
+            return "The semantic embedding backend is unavailable. Open Doctor to inspect the embedding runtime."
         }
     }
 
@@ -289,7 +312,18 @@ struct SetupFeatureRows<InnerLife: View>: View {
         // loads it too; this only fills the gap when these rows are mounted
         // before that read lands.
         if appModel.engine.trust.policy == nil {
-            _ = try? await appModel.engine.trust.load()
+            do {
+                _ = try await appModel.engine.trust.load()
+                trustLoadFailure = nil
+            }
+            catch {
+                let detail = UserFacingError.message(error, action: "read Trust settings")
+                trustLoadFailure = detail
+                appModel.systemToasts.push(error: detail
+                    + " Open Trust and repair its reported policy error; dependent controls remain unavailable.")
+            }
+        } else {
+            trustLoadFailure = nil
         }
         await appModel.engine.cognitionView.refreshDiary()
         await appModel.engine.memory.loadEmbeddings()

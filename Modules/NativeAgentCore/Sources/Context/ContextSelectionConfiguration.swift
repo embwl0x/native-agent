@@ -6,7 +6,6 @@ public enum ContextSelectionError: Error, Equatable, Sendable {
     case requestedGenerationMismatch(requested: Int64, actual: Int64)
     case snapshotGenerationMismatch(snapshot: Int64, generation: Int64)
     case snapshotFingerprintMismatch
-    case invalidConflictResolution(conflictID: String, atomID: ContextAtomID)
     case mandatoryUnavailable([ContextAtomID])
     case mandatoryBudgetExceeded(required: Int, limit: Int)
 }
@@ -28,8 +27,6 @@ public struct ContextScoreWeights: Equatable, Sendable {
     public let characterCostPenaltyCap: Double = 0.35
     /// Message-coverage weight; 0 disables its contribution while scores remain in receipts.
     public let messageCoverage: Double = 1.5
-    /// Rank penalty applied while an atom's conflict group is unresolved.
-    public let conflictPenalty: Double = 0.12
     /// Rerank bonus for the first atom from a not-yet-selected source.
     public let diversityNewSourceBonus: Double = 0.14
     /// Rerank bonus for the first atom of a not-yet-selected kind.
@@ -63,16 +60,15 @@ public struct ContextSelectionConfiguration: Equatable, Sendable {
     /// leave-one-out population (each memory's general pull removed) by two
     /// standard deviations: what the message brings to mind. Fewer than three
     /// comparable vectors use the model-scaled semantic contribution at
-    /// `minimumRelevance`. (10-29: a chance bar over memories × readings, about
-    /// four deviations at her store's size, let ~0.1 memories a turn through
-    /// from 10-27 on; two deviations gave most turns one or two.)
+    /// `minimumRelevance`. The deviation floor is fixed, independent of the
+    /// number of atoms and readings recorded in the receipt.
     public static let memoryStandoutDeviations: Double = 2.0
     /// An ambient moment's bar. With her ~70 memories, chance alone puts one or
     /// two past two deviations for any text, so a moment nobody addressed to
     /// her ("could not read: bad_input") surfaced noise (10-29); past three,
     /// chance passes about one memory in ten moments.
     public static let ambientStandoutDeviations: Double = 3.0
-    /// REST. A memory served on one of the last `memoryRestTurns` turns is
+    /// REST. A memory served on one of the last `memoryRestTurns` exchanges is
     /// already in the conversation; it comes again only when it stands out one
     /// deviation more than the bar (`ContextSelector.memoryStandout` + 1), so
     /// nothing rides every turn on a touch that barely clears.

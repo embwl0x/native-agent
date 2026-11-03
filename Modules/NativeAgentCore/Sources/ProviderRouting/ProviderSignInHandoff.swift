@@ -13,7 +13,7 @@ public final class ProviderSignInHandoff {
 
     public func start(
         _ id: String, requestID: String,
-        signIn: @escaping @MainActor () async -> Bool,
+        signIn: @escaping @MainActor () async throws -> Bool,
         publish: @escaping @MainActor () async -> Void
     ) -> [String: String] {
         if let running = states[id], running["state"] == "pending" {
@@ -26,8 +26,12 @@ public final class ProviderSignInHandoff {
         }
         states[id] = ["request_id": requestID, "state": "pending"]
         tasks[id] = Task {
-            let signedIn = await signIn()
-            states[id] = ["request_id": requestID, "state": signedIn ? "signed_in" : "failed"]
+            do {
+                let signedIn = try await signIn()
+                states[id] = ["request_id": requestID, "state": signedIn ? "signed_in" : "failed"]
+            } catch {
+                states[id] = ["request_id": requestID, "state": "failed", "message": error.localizedDescription]
+            }
             tasks[id] = nil
             await publish()
         }

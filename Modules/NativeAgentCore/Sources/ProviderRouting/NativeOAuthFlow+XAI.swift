@@ -20,10 +20,9 @@ extension NativeOAuthFlow {
         let server: NativeOAuthLoopbackCallbackServer
         do {
             server = try platform.makeLoopbackSession(
-                preferredPort: 56121,
+                preferredPort: 0,
                 path: "/callback",
-                displayName: "xAI",
-                allowsPortFallback: true
+                displayName: "xAI"
             )
         } catch {
             return OAuthFlowResult(ok: false,
@@ -186,42 +185,29 @@ extension NativeOAuthFlow {
         scope: String,
         dataRoot: URL
     ) throws {
-        guard let access = tokens["access_token"] as? String,
-              !access.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw NSError(domain: "NativeOAuthFlow.xAI", code: -4, userInfo: [
-                NSLocalizedDescriptionKey: "xAI token response did not include access_token.",
-            ])
-        }
+        let answer = try OAuthGrantOperations.validateTokenResponse(tokens, requiringRefreshToken: true)
         let path = XAIOAuthTransport.tokenPath(dataRoot: dataRoot)
-        try ProviderStateValidation.credential(tokens)
         try OAuthGrantOperations.updateProviderCredential(at: path, replacingXAIGrant: true) { existing in
-            // Optional identity, expiry and refresh fields belong only to this sign-in.
+            // Identity, expiry and refresh fields belong only to this sign-in.
             for key in ["tokens", "refresh_token", "id_token", "expires_in", "expires_at",
                         "oauth_account_identity", "refresh_token_account_identity"] {
                 existing.removeValue(forKey: key)
             }
             existing["provider_id"] = "xai_oauth_direct"
-            existing["auth_mode"] = "oauth_pkce"
+            existing["auth_mode"] = "oauth"
             existing["client_id"] = XAIOAuthTransport.clientID
             existing["scope"] = (tokens["scope"] as? String) ?? scope
             existing["base_url"] = "https://api.x.ai/v1"
             existing["redirect_uri"] = redirectURI
-            existing["access_token"] = access
-            if let refresh = tokens["refresh_token"] as? String, !refresh.isEmpty {
-                existing["refresh_token"] = refresh
-            }
+            existing["access_token"] = answer.accessToken
+            existing["refresh_token"] = answer.refreshToken
             if let idToken = tokens["id_token"] as? String, !idToken.isEmpty {
                 existing["id_token"] = idToken
             }
             existing["token_type"] = (tokens["token_type"] as? String) ?? "Bearer"
             existing["last_refresh"] = NativeTimestampFormat.plainZulu(Date())
-            if let expiresIn = tokens["expires_in"] as? Int {
-                existing["expires_in"] = expiresIn
-                existing["expires_at"] = NativeTimestampFormat.basicZulu(Date().addingTimeInterval(TimeInterval(expiresIn)))
-            } else if let expiresInDouble = tokens["expires_in"] as? Double {
-                existing["expires_in"] = expiresInDouble
-                existing["expires_at"] = NativeTimestampFormat.basicZulu(Date().addingTimeInterval(expiresInDouble))
-            }
+            existing["expires_in"] = answer.expiresIn
+            existing["expires_at"] = answer.expiresIn.map { NativeTimestampFormat.basicZulu(Date().addingTimeInterval($0)) }
             existing["discovery"] = [
                 "authorization_endpoint": discovery.authorizationEndpoint.absoluteString,
                 "token_endpoint": discovery.tokenEndpoint.absoluteString,

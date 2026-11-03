@@ -52,7 +52,7 @@ public final class NativeAgentEngine: Sendable {
             let cognition = NativeCognitionRuntime(dataRoot: dataRoot, host: ports.cognitionHost, contextFlow: contextFlow)
             self.contextFlow = contextFlow
             self.cognition = cognition
-            self.deviceSync = DeviceSync(dataRoot: dataRoot, host: ports.deviceSyncHost, cognition: cognition)
+            self.deviceSync = DeviceSync(host: ports.deviceSyncHost, cognition: cognition)
         }
     }
     public let dataRoot: URL
@@ -208,10 +208,11 @@ public final class NativeAgentEngine: Sendable {
         self.deviceSync = deviceSync
         self.sync = SyncFacade(owner: deviceSync)
         self.macIntegration = MacIntegrationFacade(dataRoot: dataRoot, deviceSync: deviceSync, platform: ports.connectorStatus)
-        AgentHostLaunches.install { AgentRecipeStore.launch($0) }
+        AgentHostLaunches.install { try AgentConversationRouting.messagesHostByCommand($0, dataRoot: $1) }
         self.agents = AgentContacts(dataRoot: dataRoot, clients: clients,
                                     completionSender: ports.completionSender(dataRoot))
         clients.attach(self.agents)
+        installSessionDelivery()
         Task { @MainActor [layout] in layout.start() }
     }
 

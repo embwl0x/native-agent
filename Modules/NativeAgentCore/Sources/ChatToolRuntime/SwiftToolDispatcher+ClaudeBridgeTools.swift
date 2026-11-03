@@ -23,7 +23,7 @@ extension SwiftToolDispatcher {
         configRootOverride: URL? = nil
     ) async throws -> JSONValue {
         let target = Self.stringField("agent", in: .object(input)) ?? "claude"
-        guard let door = AgentConversationDelivery.door(for: target, dataRoot: dataRoot, bridgeConfigRoot: configRootOverride), door.liveReader,
+        guard let door = try AgentConversationDelivery.door(for: target, dataRoot: dataRoot, bridgeConfigRoot: configRootOverride), door.liveReader,
               let who = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { ($0.handles ?? []).contains(door.handle) }) else {
             throw ToolFailureError("No contact carries this inbox door.", effects: .none, owner: "Saved agent contacts", nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]))
         }
@@ -89,21 +89,21 @@ extension SwiftToolDispatcher {
         if fyi { entry["expectsReply"] = .bool(false) }
         let inboxEntry = entry
 
-        let quarantineNote = Self.BuilderInboxQuarantineNote()
+        let admissionNote = Self.BuilderInboxAdmissionNote()
         let appendResult: (status: String, retryWake: Bool, queuedAt: String)
         do {
             appendResult = try await Self.appendBuilderInboxMessage(
                 messageId, entry: inboxEntry, to: inboxURL, queuedAt: timestamp,
                 comparePairReviewer: true, maxLines: JSONLLineCaps.claudeBridgeInbox,
                 logLabel: "SwiftToolDispatcher.claudeMessage",
-                quarantine: quarantineNote, durable: true
+                admissionNote: admissionNote
             )
         } catch {
             var failure = Self.builderFailureFields(error, tool: "claude_message",
                 reason: "inbox_write_failed", effects: .unknown, owner: inboxURL.path,
                 instruction: "Reconcile this message_id against the preserved inbox and execution evidence before another send; this wake did not launch.")
             failure["messageId"] = .string(messageId)
-            Self.stampBuilderInboxQuarantine(quarantineNote, on: &failure)
+            Self.stampBuilderInboxUncertainty(admissionNote, on: &failure)
             return .object(failure)
         }
         guard appendResult.status != "conflict" else {
@@ -126,7 +126,6 @@ extension SwiftToolDispatcher {
             "detail": .string("Queued for \(who.name); acceptance is owed until its live session reads this message. Open that session and read this exact message with agent.read; do not resend it."),
             "remedy": door.remedy(),
         ]) { _, new in new }
-        Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
         if let droppedDeskItem {
             response["deskItemIgnored"] = .string(droppedDeskItem)
             response["detail"] = .string((Self.stringField("detail", in: .object(response)) ?? "") + " desk_item '\(droppedDeskItem)' is not a live Desk item; the message was queued without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")

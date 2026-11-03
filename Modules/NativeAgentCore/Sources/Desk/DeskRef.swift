@@ -128,12 +128,11 @@ public struct DeskRef: Sendable, Equatable {
         return .object(obj)
     }
 
-    /// Tolerant decode. An unknown `kind` token → nil (skipped by the caller).
+    /// Decode the current writer's exact reference, preserving all fields.
     public static func fromJSON(_ value: JSONValue) -> DeskRef? {
         guard case .object(let obj) = value,
-              let token = obj["kind"]?.stringValue else { return nil }
-        // Deterministic fallback when `refId` is absent (legacy / hand-authored line): an empty id, NEVER a fresh random UUID — a random one would make each rebuild produce a different DeskState and drift state.json.
-        let refId = obj["refId"]?.stringValue ?? ""
+              let token = obj["kind"]?.stringValue,
+              let refId = obj["refId"]?.stringValue, !refId.isEmpty else { return nil }
         let kind: DeskRefKind
         switch token {
         case "file":
@@ -167,8 +166,10 @@ public struct DeskRef: Sendable, Equatable {
             guard let step = DeskStep(fields: obj) else { return nil }
             kind = .step(step)
         default:
-            return nil // tolerant: unknown ref kinds skipped
+            return nil
         }
-        return DeskRef(refId: refId, kind: kind)
+        let ref = DeskRef(refId: refId, kind: kind)
+        guard ref.toJSON() == value else { return nil }
+        return ref
     }
 }

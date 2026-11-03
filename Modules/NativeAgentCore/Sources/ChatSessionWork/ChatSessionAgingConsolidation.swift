@@ -3,10 +3,10 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import TurnTrace
-// Blueprint: | `ChatSessionAgingConsolidation.swift` | Append-triggered aging at 85% keeps ~55% raw history and distills proportional consecutive chunks concurrently before one ordered commit; coordinator retains bodies and 300-second cancellation deadlines, releases claims only at body exit, closes admission and joins admitted bodies and deadlines at engine termination |
+// Blueprint: | `ChatSessionAgingConsolidation.swift` | Append-triggered aging uses the same configured measured trigger and verified target as foreground compaction; concurrent distillation; coordinator retains bodies and 300-second cancellation deadlines until actual exit, joins both at engine termination |
 
-// Appends trigger background recollection at 85% of the threshold, keeping ~55%
-// raw history through proportional concurrent distillation and one ordered commit.
+// Appends trigger aging at the foreground threshold. Both configured input
+// thresholds leave room for the actual request adapter's output allowance.
 // Foreground compaction waits on its own recollection; stale aging prefixes cannot
 // replace it. Background failures are recorded without taking down a turn.
 
@@ -89,15 +89,15 @@ public struct ChatSessionAgingConsolidation: Sendable {
     static let agingPassDeadlineSeconds: Double = 300
 
     /// EVENT-DRIVEN entry: called on the turn's append, right after the
-    /// synchronous backstop. Cheap enough to sit on the critical path (one
-    /// stat(2) against the aging boundary) and returns immediately; the work
+    /// synchronous backstop. Returns immediately; measurement and work
     /// itself is a detached background task the turn never awaits and that can
     /// never fail the turn.
     public func scheduleTranscriptAgingIfNeeded(
         sessionId: String,
         model: String,
         surface: String,
-        runId: String?
+        runId: String?,
+        outputBudgetTokens: Int? = nil
     ) {
         let config = autocompactionConfig
         guard config.agingEnabled else { return }
@@ -105,26 +105,23 @@ public struct ChatSessionAgingConsolidation: Sendable {
             return
         }
         let providerID = LLMCallContext.providerId
-        let boundaryTokens = config.effectiveAgingThresholdTokens(
-            forModel: model,
-            providerID: providerID,
-            dataRoot: dataRoot
-        )
-        let messagesPath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(safeSessionId).jsonl")
-        // The crossing test — the same file-size prefilter the backstop uses,
-        // at the aging boundary. Below it, this append changed nothing that
-        // matters and the turn moves on without spawning anything.
-        guard Self.transcriptBytes(messagesPath)
-            >= Int64(Double(boundaryTokens) * ContextBudgetPolicy.transcriptCharactersPerToken)
-        else { return }
-
+        let effort = LLMCallContext.reasoningEffort
         let dataRoot = self.dataRoot
         let clock = self.clock
         let llm = self.llm
         Task.detached(priority: .background) {
+            await LLMCallContext.$client.withValue(llm) {
+            await LLMCallContext.$reasoningEffort.withValue(effort) {
+            // Helpers start each turn with their definition's own allowance;
+            // the completed turn's depleted remainder is not the next request.
+            await LLMCallContext.$turnTokenBudget.withValue(outputBudgetTokens.map { TurnTokenBudget(tokens: $0) }) {
+            let boundaryTokens: Int
+            do {
+                boundaryTokens = try await config.effectiveThresholdTokens(forModel: model, providerID: providerID, dataRoot: dataRoot)
+            } catch {
+                nativeLog("Transcript aging unavailable for %@: %@", safeSessionId, error.localizedDescription)
+                return
+            }
             await TranscriptConsolidationFlights.shared.start(safeSessionId) {
                 await Self.runTranscriptAging(
                     sessionId: safeSessionId,
@@ -138,6 +135,9 @@ public struct ChatSessionAgingConsolidation: Sendable {
                     llm: llm,
                     now: clock
                 )
+            }
+            }
+            }
             }
         }
     }
@@ -159,6 +159,9 @@ public struct ChatSessionAgingConsolidation: Sendable {
         guard !Task.isCancelled else { return }
 
         let compactor = ChatSessionAutocompactor(dataRoot: dataRoot, config: config, now: now)
+        var towardTarget = false
+        var previousTokens: Int?
+        while !Task.isCancelled {
         let start: ChatSessionAutocompactor.AgingStart
         do {
             start = try await compactor.startAging(
@@ -166,7 +169,8 @@ public struct ChatSessionAgingConsolidation: Sendable {
                 model: model,
                 providerID: providerID,
                 trigger: agingTrigger,
-                thresholdTokens: boundaryTokens
+                thresholdTokens: boundaryTokens,
+                towardTarget: towardTarget
             )
         } catch {
             // FAIL LOUD, off the critical path. The autocompactor refuses to
@@ -181,7 +185,13 @@ public struct ChatSessionAgingConsolidation: Sendable {
         let distiller = makeAgingDistiller(dataRoot: dataRoot, llm: llm, now: now)
         guard !Task.isCancelled else { return }
         switch start {
-        case .nothing:
+        case .nothing(let outcome):
+            if towardTarget {
+                await reportAgingError(ProviderRoutingError.configurationFailed(
+                    "Compaction cannot reach its configured target: \(outcome.reason). Protected turns/cards and the dream boundary remain intact."),
+                    sessionId: sessionId, surface: surface, model: model, runId: runId,
+                    boundaryTokens: boundaryTokens, dataRoot: dataRoot, now: now)
+            }
             return
         case .pending(let outcome):
             // A foreground compaction left this recollection owed; the turn
@@ -190,7 +200,7 @@ public struct ChatSessionAgingConsolidation: Sendable {
             guard let summaryRowId = outcome.summaryRowId,
                   let backupPath = outcome.backupPath
             else { return }
-            await distiller.distill(
+            guard await distiller.distill(
                 sessionId: sessionId,
                 summaryRowId: summaryRowId,
                 backupPath: backupPath,
@@ -198,14 +208,15 @@ public struct ChatSessionAgingConsolidation: Sendable {
                 turnModel: model,
                 surface: surface,
                 runId: runId
-            )
+            ) else { return }
+            previousTokens = nil
         case .fold(let fold):
             // Distill FIRST, from the prefix as read, with the transcript
             // unlocked and unchanged: a turn arriving meanwhile reads its
             // history as it is and waits on nothing. Only the finished
             // recollection takes the lock, for a replacement that first
             // checks the prefix is still exactly what was distilled.
-            _ = await distiller.distillAhead(
+            guard await distiller.distillAhead(
                 sessionId: sessionId,
                 rows: fold.source,
                 turnModel: model,
@@ -229,7 +240,18 @@ public struct ChatSessionAgingConsolidation: Sendable {
                     }
                     return committed
                 }
-            )
+            ) else { return }
+            previousTokens = fold.measuredTokensBefore
+        }
+        do {
+            if try await compactor.targetReached(sessionId: sessionId, model: model,
+                providerID: providerID, previousTokens: previousTokens) { return }
+        } catch {
+            await reportAgingError(error, sessionId: sessionId, surface: surface, model: model,
+                runId: runId, boundaryTokens: boundaryTokens, dataRoot: dataRoot, now: now)
+            return
+        }
+        towardTarget = true
         }
     }
 
@@ -280,12 +302,6 @@ public struct ChatSessionAgingConsolidation: Sendable {
             llm: llm,
             now: now
         )
-    }
-
-    private static func transcriptBytes(_ path: URL) -> Int64 {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
-              let size = attrs[.size] as? NSNumber else { return 0 }
-        return size.int64Value
     }
 
     /// Deferrals and failures of the background lane land on the SAME trace

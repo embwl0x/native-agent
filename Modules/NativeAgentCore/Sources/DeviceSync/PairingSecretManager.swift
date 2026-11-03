@@ -5,7 +5,7 @@ import Security
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `PairingSecretManager.swift` | `PairingSecret`: checked device-only HMAC secret ownership, explicit rotation and pairing material publication |
+// Blueprint: | `PairingSecretManager.swift` | `PairingSecret`: checked device-only HMAC secret ownership, explicit rotation, existing-item reconciliation without generation and pairing material publication |
 
 private enum PairingKVSPublishResult: Sendable {
     case skippedCurrent
@@ -40,8 +40,8 @@ public enum PairingSecret {
         }
     }
 
-    /// Explicit Keychain rotation with read-back verification and rollback
-    /// of the prior bytes if verification fails.
+    /// Explicit Keychain rotation with checked readback. An accepted but
+    /// unverified write stays in place and requires exact-item reconciliation.
     public static func rotateSecret() throws -> Data {
         try rotateSecret(at: secretURL)
     }
@@ -65,41 +65,25 @@ public enum PairingSecret {
         return Data(bytes)
     }
 
-    /// Base-64 string of the current secret (for display / manual entry on iOS).
-    public static func currentSecretBase64() throws -> String {
-        try loadOrGenerateSecret().base64EncodedString()
-    }
-
-    /// The existing secret, migrating legacy disk material without generating.
-    ///
-    /// A read must not make the thing it reads. `currentSecretBase64()` goes
-    /// through `loadOrGenerateSecret`, which CREATES the canonical pairing
-    /// secret when storage is missing — fine for the page a person opened,
-    /// wrong for a quiet offscreen read of Connectors, which would mint
-    /// pairing authority nobody asked for.
+    /// The existing Keychain secret, without generating authority.
+    /// Quiet page reads never mint pairing authority.
     public static func existingSecretBase64() throws -> String? {
         try existingSecret(at: secretURL)?.base64EncodedString()
+    }
+
+    /// Reconcile committed authority without creating a replacement if it is absent.
+    public static func requireExistingSecret() throws -> Data {
+        guard let secret = try existingSecret(at: secretURL) else {
+            throw DeviceSecretKeychain.Failure.unavailable
+        }
+        return secret
     }
 
     static func existingSecret(at url: URL) throws -> Data? {
         try CredentialFileLock.withLock(url) {
             let account = secretAccount(for: url)
-            let legacy = try CheckedFixedSizeSecretFile.peekExisting(at: url, byteCount: 32)
-            var current = try DeviceSecretKeychain.read(service: secretService, account: account)
+            let current = try DeviceSecretKeychain.read(service: secretService, account: account)
             if let current, current.count != 32 { throw DeviceSecretKeychain.Failure.unavailable }
-            if let legacy {
-                if let current {
-                    guard current == legacy else { throw DeviceSecretKeychain.Failure.unavailable }
-                } else {
-                    try DeviceSecretKeychain.insert(legacy, service: secretService, account: account)
-                    current = legacy
-                }
-                // Insert verifies the exact Keychain bytes before legacy removal.
-                guard try DeviceSecretKeychain.read(service: secretService, account: account) == legacy else {
-                    throw DeviceSecretKeychain.Failure.unavailable
-                }
-                try FileManager.default.removeItem(at: url)
-            }
             return current
         }
     }
@@ -156,7 +140,6 @@ public enum PairingSecret {
             guard !overflow else { return PairingKVSPublishResult.versionExhausted }
             defaults.removeObject(forKey: synchronizationCheckpointKey)
             kvs.set(secretB64, forKey: "NativeAgent.pairing.hmacSecret")
-            kvs.set(ISO8601DateFormatter().string(from: Date()), forKey: "NativeAgent.pairing.publishedAt")
             kvs.set(Int64(nextVersion), forKey: "NativeAgent.pairing.secretVersion")
             let synced = kvs.synchronize()
             if synced {

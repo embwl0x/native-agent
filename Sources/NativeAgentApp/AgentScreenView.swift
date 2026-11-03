@@ -13,11 +13,12 @@ struct AgentScreenView: View {
 
     var body: some View {
         let scope = appModel.activeChatSessionId
+        SurfaceLayoutContent(appModel.engine.layout.availability) { layout in
         ShellFrame {
             // Every room in the Mac's own sidebar list (User 09-27: all
             // controls native), so none hides past the window's edge the way
             // the old capsule strip let them.
-            List(HerScreenPreview.tabs(appModel.engine.layout.layout, profile: SimpleViewMode.agent), id: \.self,
+            List(HerScreenPreview.tabs(layout, profile: SimpleViewMode.agent), id: \.self,
                  selection: Binding<String?>(get: { room }, set: { if let next = $0 { room = next } })) { name in
                 Text(name).font(ShellType.label)
             }
@@ -49,6 +50,7 @@ struct AgentScreenView: View {
             await appModel.engine.turns.observeAgentScreen(room: room, scope: scope)
         }
         .onDisappear { room = "home" }
+        }
     }
 
 }

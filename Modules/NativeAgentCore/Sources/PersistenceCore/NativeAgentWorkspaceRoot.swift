@@ -86,19 +86,13 @@ public enum NativeAgentWorkspaceRoot {
     public static func fileCandidate(_ raw: String, relativeTo base: URL, workspaceRoot: URL? = nil) -> URL {
         var path = fileSpelling(raw)
         if let workspaceRoot { path = normalizeWorkspaceAlias(path, workspaceRoot: workspaceRoot) }
-        if path.lowercased() == "/documents" || path.lowercased().hasPrefix("/documents/") {
-            path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents")
-                .appendingPathComponent(String(path.dropFirst("/documents".count))).path
-        }
         return (path.hasPrefix("/") ? URL(fileURLWithPath: path) : base.appendingPathComponent(path)).standardizedFileURL
     }
 
     public static func fileSpelling(_ raw: String) -> String {
         let path: String
-        if let address = URL(string: raw), address.isFileURL {
+        if raw.lowercased().hasPrefix("file:"), let address = URL(string: raw), address.isFileURL {
             path = address.path
-        } else if !raw.hasPrefix("/"), let decoded = raw.removingPercentEncoding, decoded.hasPrefix("/") {
-            path = decoded
         } else {
             path = raw
         }

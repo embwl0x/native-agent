@@ -5,7 +5,7 @@ import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
 
-// Blueprint: | `NativeKnowledgeGraphContextProjection.swift` | `KnowledgeGraphContext`: rebuildable graph atoms, support and triggers with canonical-source verification |
+// Blueprint: | `NativeKnowledgeGraphContextProjection.swift` | `KnowledgeGraphContext`: rebuildable graph atoms, support and triggers with canonical-source verification; unreadable graph retains rebuild inputs with source-unavailable health, while selection/expansion reread graph hashes and withhold unverified relations |
 
 /// The knowledge graph, made REACHABLE instead of dark.
 ///
@@ -31,7 +31,8 @@ import NativeAgentShared
 ///
 /// ── FAILURE ──────────────────────────────────────────────────────────────────
 /// A missing graph is an empty graph. An unreadable one keeps the last good
-/// relations (no changes, no removals) and says so in the log — a garnish must
+/// relations as rebuild inputs, reports their source failure, and withholds
+/// unverified relations at selection/expansion — a garnish must
 /// never be able to fail the whole context generation that also carries
 /// persona, memory and resident work.
 struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
@@ -47,16 +48,23 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
     )
 
     var projectionIdentifier: String { Self.owner }
-    /// The graph lives inside memory.sqlite and is written on memory writes, so
-    /// it invalidates on exactly the signal the memory projection uses.
-    var invalidationNamespaces: Set<String> { ["memory-v2"] }
+    /// Facts and profile identity both determine the memory-derived graph.
+    var invalidationNamespaces: Set<String> { ["memory-v2", "persona"] }
     var invalidationSourceURL: URL? { sqlite }
     private let sqlite: URL
 
     private let dataRoot: URL
 
+    func isInvalidated(by change: DerivedSourceChange) -> Bool {
+        guard change.semantic, invalidationNamespaces.contains(change.namespace),
+              let locator = change.canonicalLocator else { return false }
+        let expected = change.namespace == "persona"
+            ? dataRoot.appendingPathComponent("memory/profile.json") : sqlite
+        return expected.standardizedFileURL == URL(fileURLWithPath: locator).standardizedFileURL
+    }
+
     var excludedSourceOwners: Set<String> {
-        MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) ? [] : [Self.owner]
+        MemoryPolicyGate.knowledgeGraphFailure(dataRoot: dataRoot) == nil ? [] : [Self.owner]
     }
 
     init(
@@ -73,17 +81,36 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
                 surface: ContextSurface) async -> ContextTurnExclusion {
         let owned = Set(generation.sources.lazy.filter { $0.descriptor.owner == Self.owner }.map(\.descriptor.id))
         let relations = chosen.filter { owned.contains($0.draft.sourceID) }
-        // Compiled before relations recorded their support: unknowable here,
-        // so they wait for the rebuild to republish them.
-        let legacy = relations.filter { atom in !atom.draft.entities.contains { $0.kind == Self.supportKind } }
-        var exclusion = ContextTurnExclusion(atomIDs: Set(legacy.map(\.draft.id)), unverified: legacy.isEmpty ? [] : [
-            ContextDegradedSourceNotice(sourceID: ContextStableID.source(owner: Self.owner, locator: "knowledge-graph"),
-                                        reason: "graph relations compiled by an earlier build wait for the graph rebuild")])
-        let supported = relations.compactMap { atom -> (ContextStoredAtom, String, Date)? in
+        guard !relations.isEmpty else { return ContextTurnExclusion() }
+        // Supporting memories alone cannot confirm that the graph read worked.
+        // Reread the canonical graph for both selection and later expansion.
+        let current: (sources: [ContextCompiledSource], failures: [ContextSourceID: String])
+        do { current = Self.prepare(try await readRelations()) }
+        catch {
+            return ContextTurnExclusion(atomIDs: Set(relations.map(\.draft.id)), unverified:
+                Set(relations.map(\.draft.sourceID)).sorted().map {
+                    ContextDegradedSourceNotice(sourceID: $0, reason: "Knowledge graph source unavailable: \(error.localizedDescription)")
+                })
+        }
+        let hashes = Dictionary(current.sources.map { ($0.descriptor.id, $0.sourceHash) }, uniquingKeysWith: { first, _ in first })
+        var exclusion = ContextTurnExclusion(atomIDs: Set(relations.filter {
+            hashes[$0.draft.sourceID] != $0.draft.sourceHash
+        }.map(\.draft.id)))
+        exclusion.unverified += current.failures.compactMap { id, reason in
+            relations.contains { $0.draft.sourceID == id } ? ContextDegradedSourceNotice(sourceID: id, reason: reason) : nil
+        }
+        var supported: [(ContextStoredAtom, String, Date)] = []
+        for atom in relations {
             guard let support = atom.draft.entities.first(where: { $0.kind == Self.supportKind }),
-                  support.id != "none", let at = support.id.lastIndex(of: "@") else { return nil }
-            return (atom, String(support.id[..<at]),
-                    MemoryContext.parseDate(String(support.id[support.id.index(after: at)...])) ?? .distantPast)
+                  support.id != "none" else { continue }
+            guard let at = support.id.lastIndex(of: "@"),
+                  let version = MemoryContext.parseDate(String(support.id[support.id.index(after: at)...])) else {
+                exclusion.atomIDs.insert(atom.draft.id)
+                exclusion.unverified.append(ContextDegradedSourceNotice(sourceID: atom.draft.sourceID,
+                    reason: "Graph supporting-memory version unavailable; repair its canonical source date."))
+                continue
+            }
+            supported.append((atom, String(support.id[..<at]), version))
         }
         guard !supported.isEmpty else { return exclusion }
         do {
@@ -108,29 +135,35 @@ struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
     func compiledProjection(
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult {
-        guard MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) else {
-            return ContextCompiledProjectionResult(
-                owner: Self.owner, currentSources: [], previousSources: previousSources
-            )
-        }
         let relations: [KnowledgeGraphContextRelation]
         do {
-            let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlite)
-            relations = try await indexer.contextRelations(
-                perSubjectLimit: Self.maximumRelationsPerEntity,
-                maximumRelations: Self.maximumRelations
-            )
+            guard try MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) else {
+                return ContextCompiledProjectionResult(
+                    owner: Self.owner, currentSources: [], previousSources: previousSources
+                )
+            }
+            relations = try await readRelations()
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            // Last known good: publish nothing, retire nothing.
+            // Last known good remains rebuild input, never a claim of freshness.
             nativeLog("%@", "[context-kg] relation read failed: \(String(describing: error))")
-            return ContextCompiledProjectionResult(changedSources: [], removedSourceIDs: [])
+            let ids = Set(previousSources.values.filter { $0.descriptor.owner == Self.owner }.map(\.descriptor.id))
+            let unavailable = ids.isEmpty ? [ContextStableID.source(owner: Self.owner, locator: "knowledge-graph")] : Array(ids)
+            return ContextCompiledProjectionResult(changedSources: [], removedSourceIDs: [], sourceFailures:
+                Dictionary(uniqueKeysWithValues: unavailable.map { ($0, "Knowledge graph source unavailable: \(error.localizedDescription)") }))
         }
 
+        let prepared = Self.prepare(relations)
         return ContextCompiledProjectionResult(
-            owner: Self.owner, currentSources: Self.prepare(relations), previousSources: previousSources
-        )
+            owner: Self.owner, currentSources: prepared.sources, previousSources: previousSources,
+            sourceFailures: prepared.failures, verifiedSources: prepared.sources)
+    }
+
+    private func readRelations() async throws -> [KnowledgeGraphContextRelation] {
+        let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlite)
+        return try await indexer.contextRelations(perSubjectLimit: Self.maximumRelationsPerEntity,
+                                                maximumRelations: Self.maximumRelations)
     }
 }
 
@@ -138,7 +171,7 @@ extension KnowledgeGraphContext {
     /// One source per subject entity, one atom per edge. Grouping this way lets
     /// the selector's existing `maximumAtomsPerSource` bound keep a single
     /// entity from owning the whole relationship budget of one packet.
-    static func prepare(_ relations: [KnowledgeGraphContextRelation]) -> [ContextCompiledSource] {
+    static func prepare(_ relations: [KnowledgeGraphContextRelation]) -> (sources: [ContextCompiledSource], failures: [ContextSourceID: String]) {
         let usable = relations.filter { relation in
             let body = self.body(relation)
             return !body.isEmpty
@@ -147,8 +180,10 @@ extension KnowledgeGraphContext {
                 && !ContextSecretContentPolicy.containsSecretLikeContent(body)
         }
         let grouped = Dictionary(grouping: usable, by: \.subjectID)
-        return grouped.keys.sorted().compactMap { subjectID -> ContextCompiledSource? in
-            guard let edges = grouped[subjectID], !edges.isEmpty else { return nil }
+        var sources: [ContextCompiledSource] = []
+        var failures: [ContextSourceID: String] = [:]
+        for subjectID in grouped.keys.sorted() {
+            guard let edges = grouped[subjectID], !edges.isEmpty else { continue }
             let locatorDigest = ContextStableID.digest(parts: [subjectID])
             let locator = "knowledge-graph/entities/\(locatorDigest)"
             let sourceID = ContextStableID.source(owner: owner, locator: locator)
@@ -171,15 +206,14 @@ extension KnowledgeGraphContext {
                 permittedSurfaces: surfaces,
                 injectionPolicy: .adaptive
             )
-            let atoms = ordered.map { relation in
-                atom(relation, sourceID: sourceID, sourceHash: sourceHash)
-            }
-            return ContextCompiledSource(
-                descriptor: descriptor,
-                sourceHash: sourceHash,
-                atoms: atoms
-            )
+            do {
+                let atoms = try ordered.map { relation in
+                    try atom(relation, sourceID: sourceID, sourceHash: sourceHash)
+                }
+                sources.append(ContextCompiledSource(descriptor: descriptor, sourceHash: sourceHash, atoms: atoms))
+            } catch { failures[sourceID] = "Knowledge graph dates unavailable: \(error.localizedDescription)" }
         }
+        return (sources, failures)
     }
 
     /// The whole atom body. A relation is a pointer to structure, not a
@@ -198,7 +232,8 @@ extension KnowledgeGraphContext {
         _ relation: KnowledgeGraphContextRelation,
         sourceID: ContextSourceID,
         sourceHash: String
-    ) -> ContextAtomDraft {
+    ) throws -> ContextAtomDraft {
+        if let failure = relation.sourceDateFailure { throw MemoryV2Error.underlying(failure) }
         let body = self.body(relation)
         let edgeDigest = ContextStableID.digest(parts: [relation.predicate, relation.objectID])
         let atomID = ContextStableID.atom(
@@ -236,7 +271,7 @@ extension KnowledgeGraphContext {
             body: body,
             authority: .inferred,
             confidence: min(1, max(0, relation.weight)),
-            freshness: ContextFreshness(updatedAt: MemoryContext.parseDate(relation.lastSeen) ?? .distantPast),
+            freshness: ContextFreshness(updatedAt: try NativeContextProjectionText.requiredDate(relation.lastSeen, owner: "graph \(relation.subjectID) lastSeen")),
             privacy: .localPrivate,
             permittedSurfaces: surfaces,
             injectionPolicy: .adaptive,

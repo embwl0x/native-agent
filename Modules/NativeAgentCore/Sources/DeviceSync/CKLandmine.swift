@@ -10,9 +10,6 @@ import Security
 // Blueprint: | `CKLandmine.swift` | CloudKit entitlement probes and guarded account-status projection |
 #endif
 
-// CloudKit database availability does not determine KVS or iCloud Drive availability.
-public let nativeAgentCloudKitDisabledStatus = "DB sync off (KVS sync active)"
-
 public func nativeAgentCloudKitAccountProbeEnabled(
     environment: [String: String] = ProcessInfo.processInfo.environment,
     hasCloudKitEntitlement: @Sendable () -> Bool = nativeAgentHasCloudKitServiceEntitlement
@@ -29,7 +26,7 @@ public func nativeAgentHasCloudKitServiceEntitlement() -> Bool {
 }
 
 public func nativeAgentCloudKitAccountStatus(label: String) async -> String {
-    guard nativeAgentCloudKitAccountProbeEnabled() else { return nativeAgentCloudKitDisabledStatus }
+    guard nativeAgentCloudKitAccountProbeEnabled() else { return "iCloud account not checked (diagnostic probe disabled)" }
     #if canImport(CloudKit)
     return await withCKTimeout(label) {
         nativeAgentCloudKitAccountWords(try await CKContainer.default().accountStatus())

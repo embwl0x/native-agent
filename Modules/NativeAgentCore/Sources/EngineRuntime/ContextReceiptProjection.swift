@@ -5,7 +5,7 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import ProviderRouting
-// Blueprint: | `ContextReceiptProjection.swift` | `ComposerContextReceiptRow`, `ComposerContextReceipt`, `ComposerContextReceiptState`, `ContextReceipts`; shared context trace/receipt facts and checked Composer receipt reader using the caller engine's root for trace and provider/window reads; sizes are nonnegative whole counts, checked totals and estimates stay unavailable when unrepresentable |
+// Blueprint: | `ContextReceiptProjection.swift` | `ComposerContextReceiptRow`, `ComposerContextReceipt`, `ComposerContextReceiptState`, `ContextReceipts`; checked context trace fields and named unavailable errors; complete measured sizes alone calibrate estimates, with unmeasured components/totals remaining unknown; caller engine owns trace and provider/window reads |
 
 /// The composer's receipt reads the session's last accepted `context.snapshot`.
 /// Rows use traced sizes and split the provider's first-request input tokens by byte share.
@@ -30,7 +30,8 @@ public struct ComposerContextReceipt: Equatable, Sendable {
     public let model: String?
     public let ranAt: Date
     public let rows: [ComposerContextReceiptRow]
-    /// The sum of the rows that HAVE a size; nil when that sum overflows.
+    /// The complete assembled size; nil when any component is unmeasured or
+    /// the sum overflows. A partial sum cannot calibrate token shares.
     public let assembledBytes: Int?
     /// The provider's input tokens for the turn's LAST request, from the same
     /// turn's `llm.call` rows — never from another turn's receipt file.
@@ -83,12 +84,14 @@ public enum ContextReceipts {
         } else { loaded = near }
         guard case .receipt(var receipt) = loaded else { return loaded }
         let selected = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        let windowModel = selected.isEmpty ? (receipt.model ?? "") : selected
+        guard let windowModel = selected.isEmpty ? receipt.model : selected else {
+            return .unavailable("context.snapshot has no valid model")
+        }
         // The selected model on the Chat route, as the ring reads it; a window
         // no catalog row states stays nil, and the card says so.
-        let route = await SwiftNativeProviderRouting(dataRoot: dataRoot).chatRouteProvider()
+        let route = try await SwiftNativeProviderRouting(dataRoot: dataRoot).chatRouteProvider()
         receipt.nativeWindowTokens = ProviderRouting.verifiedContextLength(forModel: windowModel, providerID: route, dataRoot: dataRoot)
-        receipt.windowTokens = ChatSessionAutocompactionConfig.productionDefault().effectiveWindowTokens(nativeWindowTokens: receipt.nativeWindowTokens)
+        receipt.windowTokens = try ChatSessionAutocompactionConfig.productionDefault().effectiveWindowTokens(nativeWindowTokens: receipt.nativeWindowTokens)
         receipt.windowModelName = windowModel.isEmpty
             ? nil
             : FirstPartyModelCatalog.descriptor(for: windowModel)?.name ?? windowModel
@@ -136,20 +139,27 @@ public enum ContextReceipts {
         // the tool rounds after it are counted from the provider's numbers.
         guard let first = events.firstIndex(where: {
             $0.kind == snapshotKind && $0.turnId == turnId
-        }), case .object(let payload) = events[first].payload else { return .noTurn }
+        }) else { return .noTurn }
+        guard case .object(let payload) = events[first].payload else {
+            return .unavailable("context.snapshot has no valid payload object")
+        }
         let snapshot = events[first]
 
         // Same turn AND surface, and only the turn's own loop: auxiliary lanes
         // (memory, moments) run under the parent turn id and are stamped
         // `requestShape: unmeasured` with no tool contract or prefix shape;
         // every main-loop request carries one of those two.
-        let calls: [[String: JSONValue]] = events[first...].compactMap {
-            guard $0.kind == callKind, $0.turnId == turnId, $0.surface == snapshot.surface,
-                  case .object(let call) = $0.payload,
-                  string(call, "requestShape") != "unmeasured",
-                  call["tools.wireSchemaBytes"] != nil || call["shapeVersion"] != nil
-            else { return nil }
-            return call
+        var calls: [[String: JSONValue]] = []
+        for event in events[first...] where event.kind == callKind && event.turnId == turnId && event.surface == snapshot.surface {
+            guard case .object(let call) = event.payload else {
+                return .unavailable("llm.call has no valid payload object")
+            }
+            if let shape = call["requestShape"], shape != .null {
+                guard case .string = shape else { return .unavailable("llm.call has no valid requestShape") }
+            }
+            guard string(call, "requestShape") != "unmeasured",
+                  call["tools.wireSchemaBytes"] != nil || call["shapeVersion"] != nil else { continue }
+            calls.append(call)
         }
         let previousHistoryBytes = events[..<first].last(where: {
             $0.kind == snapshotKind && $0.sessionId == sessionId && $0.turnId != turnId
@@ -161,13 +171,20 @@ public enum ContextReceipts {
             $0.kind == TurnLifecycleMilestone.contextIntraTurnCompaction.rawValue
                 && $0.turnId == turnId
         }
-        return .receipt(receipt(
-            payload: payload,
-            ranAt: snapshot.ts,
-            compactedMidTurn: compacted,
-            calls: calls,
-            previousHistoryBytes: previousHistoryBytes
-        ))
+        if let failure = string(payload, "toolCatalogMeasurementError") {
+            return .unavailable("Tool catalog measurement is unavailable: " + failure)
+        }
+        do {
+            return .receipt(try receipt(
+                payload: payload,
+                ranAt: snapshot.ts,
+                compactedMidTurn: compacted,
+                calls: calls,
+                previousHistoryBytes: previousHistoryBytes
+            ))
+        } catch {
+            return .unavailable(error.localizedDescription)
+        }
     }
 
     public static func receipt(
@@ -176,7 +193,36 @@ public enum ContextReceipts {
         compactedMidTurn: Bool,
         calls: [[String: JSONValue]] = [],
         previousHistoryBytes: Int? = nil
-    ) -> ComposerContextReceipt {
+    ) throws -> ComposerContextReceipt {
+        let source = try JSONRow(.object(payload))
+        for key in ["systemTotalBytes", "dynamicBytes", "userMessageBytes", "imagePayloadBytes",
+                    "toolSchemaMaterialBytes", "personaSourceBytes", "toolSchemaCount"] {
+            guard let count = try source.optionalInt(key), count >= 0 else {
+                throw JSONRow.Malformed.field(key)
+            }
+        }
+        for key in ["toolCatalogSystemBytes", "toolCatalogBriefBytes", "volatileBlockBytes",
+                    "historyMessageBytes", "historyMessageCount", "imageBlockCount"] {
+            if let count = try source.optionalInt(key), count < 0 { throw JSONRow.Malformed.field(key) }
+        }
+        let model = try source.string("model")
+        guard !model.isEmpty else { throw JSONRow.Malformed.field("model") }
+        _ = try source.optionalString("historyDelivery")
+        _ = try source.optionalString("toolCatalogMeasurementError")
+        guard let raw = source.optionalValue("memoryRecall") else { throw JSONRow.Malformed.field("memoryRecall") }
+        let recall = try JSONRow(raw)
+        _ = try recall.string("outcome")
+        guard let count = try recall.optionalInt("injectedHitCount"), count >= 0 else {
+            throw JSONRow.Malformed.field("memoryRecall.injectedHitCount")
+        }
+        for call in calls {
+            let row = try JSONRow(.object(call))
+            _ = try row.string("provider")
+            _ = try row.optionalBool("additiveInputCounters")
+            for key in ["inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens", "tools.wireSchemaBytes"] {
+                if let count = try row.optionalInt(key), count < 0 { throw JSONRow.Malformed.field(key) }
+            }
+        }
         // Text tool lane: no tools array goes to the provider (the call row
         // says `tools.wireSchemaBytes: 0`); each tool is one prose line inside
         // the system prompt or the turn brief. The schema JSON is never sent,
@@ -187,30 +233,40 @@ public enum ContextReceipts {
         let catalogInBrief = int(payload, "toolCatalogBriefBytes")
         let toolsAsText = catalogInSystem != nil
             || calls.first.flatMap { int($0, "tools.wireSchemaBytes") } == 0
+        if toolsAsText {
+            guard catalogInSystem != nil else { throw JSONRow.Malformed.field("toolCatalogSystemBytes") }
+            guard catalogInBrief != nil else { throw JSONRow.Malformed.field("toolCatalogBriefBytes") }
+        }
         let toolBytes = toolsAsText
-            ? catalogInSystem.flatMap { sum($0, catalogInBrief ?? 0) }
+            ? catalogInSystem.flatMap { system in catalogInBrief.flatMap { sum(system, $0) } }
             : int(payload, "toolSchemaMaterialBytes")
-        let systemBytes = int(payload, "systemTotalBytes").flatMap { difference($0, catalogInSystem ?? 0) }
-        let briefBytes = int(payload, "volatileBlockBytes").flatMap { difference($0, catalogInBrief ?? 0) }
+        let systemBytes = int(payload, "systemTotalBytes").flatMap { total in
+            toolsAsText ? catalogInSystem.flatMap { difference(total, $0) } : total
+        }
+        let briefBytes = int(payload, "volatileBlockBytes").flatMap { total in
+            toolsAsText ? catalogInBrief.flatMap { difference(total, $0) } : total
+        }
         // What this turn fed her rides in the system prompt's changing part
         // (pinned facts, recalled memories, inner state, clock), plus any brief.
         // When the per-turn part rides as the brief, the snapshot's dynamic IS
         // the brief and the system prompt holds none of it.
         let dynamicBytes = int(payload, "dynamicBytes")
-        let ridesBrief = (int(payload, "volatileBlockBytes") ?? 0) > 0 && int(payload, "volatileBlockBytes") == dynamicBytes
+        let ridesBrief = int(payload, "volatileBlockBytes").map { $0 > 0 && $0 == dynamicBytes } == true
         let personaBytes = ridesBrief ? systemBytes
-            : dynamicBytes.flatMap { dynamic in systemBytes.flatMap { difference($0, dynamic) } } ?? systemBytes
-        let fedBytes = ridesBrief ? briefBytes : dynamicBytes.map { $0 + max(briefBytes ?? 0, 0) } ?? briefBytes
+            : dynamicBytes.flatMap { dynamic in systemBytes.flatMap { difference($0, dynamic) } }
+        let fedBytes = ridesBrief ? briefBytes
+            : dynamicBytes.flatMap { dynamic in briefBytes.flatMap { sum(dynamic, $0) } }
         let historyBytes = int(payload, "historyMessageBytes")
         let userBytes = int(payload, "userMessageBytes")
-        let imageBytes = int(payload, "imagePayloadBytes").flatMap { $0 > 0 ? $0 : nil }
-        let assembled = [systemBytes, briefBytes, toolBytes, historyBytes, userBytes, imageBytes]
-            .reduce(Optional(0)) { total, bytes in total.flatMap { sum($0, bytes ?? 0) } }
+        let imagePayloadBytes = int(payload, "imagePayloadBytes")
+        let imageBytes = imagePayloadBytes.flatMap { $0 > 0 ? $0 : nil }
+        let assembled = [systemBytes, briefBytes, toolBytes, historyBytes, userBytes, imagePayloadBytes]
+            .reduce(Optional(0)) { total, bytes in total.flatMap { total in bytes.flatMap { sum(total, $0) } } }
 
         let firstTokens = calls.first.flatMap(inputTokens)
         let lastTokens = calls.last.flatMap(inputTokens)
         let tokensPerByte: Double? = {
-            guard let firstTokens, let assembled, assembled > 0, imageBytes == nil else { return nil }
+            guard let firstTokens, let assembled, assembled > 0, imagePayloadBytes == 0 else { return nil }
             return Double(firstTokens) / Double(assembled)
         }()
         func tokens(_ bytes: Int?) -> Int? {
@@ -234,7 +290,7 @@ public enum ContextReceipts {
             ),
             ComposerContextReceiptRow(
                 label: "Fed this turn",
-                detail: fedBytes == nil ? nil : "pinned facts, recalled memories, inner state and the clock",
+                detail: fedBytes == nil ? "volatileBlockBytes unavailable" : "pinned facts, recalled memories, inner state and the clock",
                 bytes: fedBytes,
                 tokens: tokens(fedBytes)
             ),
@@ -294,12 +350,13 @@ public enum ContextReceipts {
     /// The provider's logical input for one request — Anthropic's three
     /// disjoint counters summed, OpenAI's total as is (`LLMUsage` owns that).
     private static func inputTokens(_ call: [String: JSONValue]) -> Int? {
-        let provider = string(call, "provider") ?? ""
+        guard let provider = string(call, "provider"),
+              case .bool(let additive)? = call["additiveInputCounters"] else { return nil }
         return LLMUsage(
             inputTokens: int(call, "inputTokens"),
             cacheReadInputTokens: int(call, "cacheReadInputTokens"),
             cacheCreationInputTokens: int(call, "cacheCreationInputTokens"),
-            additiveInputCounters: LLMUsage.persistedAdditiveInputCounters(call["additiveInputCounters"], provider: provider)
+            additiveInputCounters: additive
         ).logicalInputTokens(provider: provider)
     }
 
@@ -319,8 +376,8 @@ public enum ContextReceipts {
         return "including \(size) of persona"
     }
 
-    /// The count is everything advertised this turn: the always-on core, the
-    /// session's loaded set (capped at 40).
+    /// The count is the tools actually advertised on this request; `app` is
+    /// the only always-on tool. Actions are discovered through its results.
     private static func toolDetail(
         _ payload: [String: JSONValue],
         asText: Bool,
@@ -336,13 +393,14 @@ public enum ContextReceipts {
     /// row says what was recalled and stays silent about how big it was.
     private static func recallDetail(_ payload: [String: JSONValue]) -> String? {
         guard case .object(let recall)? = payload["memoryRecall"] else { return nil }
-        let injected = int(recall, "injectedHitCount") ?? 0
+        let injected = int(recall, "injectedHitCount")
         switch string(recall, "outcome") {
         case "notConfigured": return "not configured"
         case "error": return "recall failed"
         case "unknown": return "not recorded"
         case "zeroHits": return "no hits"
         case "hits", "contextFlow":
+            guard let injected else { return "injectedHitCount unavailable" }
             return injected == 1 ? "1 memory injected" : "\(injected) memories injected"
         default: return nil
         }

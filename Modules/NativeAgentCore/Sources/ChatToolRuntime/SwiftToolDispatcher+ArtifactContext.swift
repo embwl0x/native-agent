@@ -231,16 +231,20 @@ enum ArtifactContext {
             if message.role == "tool" {
                 let row = object(message.extras)
                 // An app call of a folded action is redacted as the tool it ran.
-                let tool = ToolNameAliases.shown(string(meta["toolName"] ?? row["toolName"]) ?? "unknown",
-                                                 inputJSON: string(meta["inputJSON"] ?? row["inputJSON"])).name
-                let raw = string(meta["resultSummary"] ?? row["resultSummary"]) ?? message.content
+                let tool = ToolNameAliases.shown(string(meta["toolName"]) ?? "unknown",
+                                                 inputJSON: string(meta["inputJSON"])).name
+                let raw = string(meta["resultSummary"]) ?? message.content
                 if raw.utf8.count <= 128 * 1024 {
                     let safe = ChatToolJSONRedaction.redactedResultJSON(tool: tool, json: raw)
                     refs += receiptReferences(object(.string(ChatSecretRedactor.redactText(safe))))
                 }
             }
             guard !refs.isEmpty else { continue }
-            let messageKey = sessionID + ":" + message.historyIdentity()
+            guard let identity = message.historyIdentity() else {
+                nativeLog("Artifact evidence unavailable in session %@: saved message identity is missing", sessionID)
+                continue
+            }
+            let messageKey = sessionID + ":" + identity
             guard !seenMessages.contains(messageKey) else { continue }
             let before = candidates.count
             // Sampling destroys adjacency: only the exact source is then

@@ -19,8 +19,8 @@ settings:
   SWIFT_STRICT_CONCURRENCY: complete
   TARGETED_DEVICE_FAMILY: "1,2"  # iPhone + iPad
   SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
-  MARKETING_VERSION: "0.6.13"
-  CURRENT_PROJECT_VERSION: "26"
+  MARKETING_VERSION: "0.6.14"
+  CURRENT_PROJECT_VERSION: "44"
   # Set DEVELOPMENT_TEAM locally in Xcode or on the xcodebuild command line
   # for device builds. Do not commit a personal Apple Developer Team ID.
   CODE_SIGN_STYLE: "Automatic"
@@ -109,15 +109,19 @@ targets:
         # NativeAgent uses CryptoKit only for authentication/integrity and Apple
         # platform transport; it does not ship custom or non-exempt encryption.
         ITSAppUsesNonExemptEncryption: false
-        NSMicrophoneUsageDescription: "Listen to push-to-talk so you can dictate messages to your agent."
-        NSPhotoLibraryUsageDescription: "NativeAgentMobile lets you attach photos from your library so your agent can see them in chat."
-        NSLocationWhenInUseUsageDescription: "Share your current location with your agent when you accept a phone request."
+        NSMicrophoneUsageDescription: "Use the microphone for hands-free talk while a talk session is active, voice notes, and dictation to your agent."
+        NSPhotoLibraryUsageDescription: "Attach photos you choose to chat, or enable Photos today to share only a count of visible photos dated today with your paired Mac and its selected AI provider. Limited Access is enough for counting."
+        NSAppleMusicUsageDescription: "When you enable Apple Music, share the Music app's playback state and available song title and artist with your paired Mac and its selected AI provider. No audio is shared."
+        PHPhotoLibraryPreventAutomaticLimitedAccessAlert: true
+        NSLocationWhenInUseUsageDescription: "Save a place on this phone or share your current location when you accept a phone request."
         NSCameraUsageDescription: "Take a photo to share with your agent when you accept a camera request."
-        NSLocationAlwaysAndWhenInUseUsageDescription: "Let your agent know when you arrive at or leave places you enable, even while NativeAgent is closed."
+        NSLocationAlwaysAndWhenInUseUsageDescription: "Share enabled place transitions and wake brief phone-presence readings when you move, even while NativeAgent is closed. Coordinates for these senses stay on this phone."
+        NSMotionUsageDescription: "Share motion estimates (stationary, walking, running, cycling or driving) and confidence with your paired Mac and its selected AI provider when you enable Motion."
+        NSFocusStatusUsageDescription: "Share whether Focus is on with your paired Mac when you enable Focus."
         NSSupportsLiveActivities: true
         NSUserActivityTypes: [INSendMessageIntent]
         NativeAgentNotificationGroup: group.$(NATIVEAGENT_IOS_BUNDLE_ID).notifications
-        NSSpeechRecognitionUsageDescription: "Convert your voice to text so your agent can read what you said."
+        NSSpeechRecognitionUsageDescription: "Recognize your words on this device during hands-free talk. Also transcribe voice notes and dictation for your agent."
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         # Read by ICloudBridgeConstants + DoctorChecks — must live HERE, not
@@ -133,7 +137,7 @@ targets:
         NativeAgentDeviceSync: "cloudkit"
         NativeAgentAppGroupID: "$(NATIVEAGENT_IOS_APP_GROUP_ID)"
         UILaunchScreen: {}
-        UIBackgroundModes: [remote-notification]
+        UIBackgroundModes: [remote-notification, audio]
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         NSAppTransportSecurity:

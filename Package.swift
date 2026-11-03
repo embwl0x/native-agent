@@ -21,10 +21,9 @@ let package = Package(
         .package(url: "https://github.com/grpc/grpc-swift-protobuf.git", exact: "2.4.1"),
         .package(
             url: "https://github.com/sparkle-project/Sparkle.git",
-            // 2.9.2 is the security floor: it hardens delta-update symlink
-            // handling and validates the installer connection before data is
-            // accepted. Package.resolved pins the current 2.9.4 patch.
-            from: "2.9.2"
+            // 2.9.6 is the security floor: it fixes the installer path race
+            // in GHSA-3x7w-j75x-ppq5 (versions through 2.9.5 are affected).
+            from: "2.9.6"
         ),
         .package(path: "Modules/NativeAgentShared"),
         .package(path: "Modules/NativeAgentCore")

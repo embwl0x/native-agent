@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+SemanticAppraisal.swift` | `SemanticAppraisal`: meaning-weighted event appraisal against outcomes and embedding-touched cares |
+// Blueprint: | `CognitiveSubstrate+SemanticAppraisal.swift` | `SemanticAppraisal`: meaning-weighted event appraisal against outcomes and embedding-touched cares; belief reaction requires a semantic judgment with exact prior-statement and incoming evidence, never valence |
 
 /// The appraised MEANING of one event, all dims computable without suspension.
 struct SemanticAppraisal: Sendable, Equatable {
@@ -94,11 +94,7 @@ extension CognitiveSubstrate {
                 default: break
                 }
             }
-            // Historical nodes predate typed event metadata. Keep a bounded
-            // lexical fallback for replay compatibility only.
-            let t = node.summary.lowercased()
-            if containsAny(t, ["passed", "succeeded", "success", "complete", "fixed", "resolved", "shipped"]) { return 1 }
-            if containsAny(t, ["failed", "failure", "error", "timeout", "timed out", "crash", "rejected"]) { return -1 }
+            // A summary cannot attest an effect. Untyped evidence stays unknown.
             return 0
         }
         let lastNegativeAt = toolObs.last(where: { outcome($0) < 0 })?.lastActivatedAt
@@ -126,7 +122,6 @@ extension CognitiveSubstrate {
         switch event.kind {
         case .userCorrection, .toolFailed, .providerFailure: kindBase = 0.9
         case .providerVitalsShift: kindBase = 0.7
-        case .workshopExecutionCompleted: kindBase = 0.8
         case .userMessageReceived: kindBase = 0.7
         case .toolSucceeded, .toolStarted: kindBase = 0.6
         case .toolCancelled: kindBase = 0.2
@@ -159,7 +154,7 @@ extension CognitiveSubstrate {
         // -- selfAgency ---------------------------------------------------------
         switch event.kind {
         case .assistantTurnCompleted: a.selfAgency = 0.7
-        case .toolStarted, .toolSucceeded, .toolFailed, .workshopExecutionCompleted: a.selfAgency = 0.35
+        case .toolStarted, .toolSucceeded, .toolFailed: a.selfAgency = 0.35
         case .toolCancelled: a.selfAgency = 0
         case .userMessageReceived, .userCorrection: a.selfAgency = -0.3
         case .providerFailure, .providerVitalsShift: a.selfAgency = -0.1
@@ -238,9 +233,9 @@ extension CognitiveSubstrate {
     /// seed cares participate in the same match as every grown live care: the
     /// care cue's law (`caresStandingOut`), so a turn touches a care only when
     /// one stands out for its words.
-    func appraisalCares(in text: String) async -> [CognitiveCare] {
+    func appraisalCares(in text: String) async throws -> [CognitiveCare] {
         let live = cares.values.filter { $0.fadedAt == nil }
-        guard let cosines = await careCosines(to: text, among: live) else { return [] }
+        guard let cosines = try await careCosines(to: text, among: live) else { return [] }
         return Self.caresStandingOut(cosines, among: live).compactMap { touched -> (CognitiveCare, Double)? in
             guard let current = cares[touched.care.id], current.fadedAt == nil,
                   current.updatedAt == touched.care.updatedAt else { return nil }
@@ -254,12 +249,19 @@ extension CognitiveSubstrate {
 
 extension CognitiveSubstrate {
 
-    /// Valence sign → the organism's reaction vocabulary. Negative is the only
-    /// violating read; everything else is "he did not push back".
-    static func semanticReactionLabel(fromValence valence: Double) -> String {
-        if valence < 0 { return OrganismSemanticExpectation.pushbackReaction }
-        if valence > 0 { return OrganismSemanticExpectation.confirmedReaction }
-        return OrganismSemanticExpectation.neutralReaction
+    /// Only a grounded judgment about this completion is belief evidence.
+    /// Feeling, silence and a change of subject say nothing about its truth.
+    static func semanticReactionLabel(appraisal: AffectAppraisal, target: String?,
+                                      incoming: String) -> String? {
+        guard let reaction = appraisal.beliefReaction, let target else { return nil }
+        let statement = reaction.statement.trimmingCharacters(in: .whitespacesAndNewlines)
+        let evidence = reaction.evidence.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !statement.isEmpty, !evidence.isEmpty,
+              target.contains(statement), incoming.contains(evidence) else { return nil }
+        switch reaction.kind {
+        case .pushback: return OrganismSemanticExpectation.pushbackReaction
+        case .confirmed: return OrganismSemanticExpectation.confirmedReaction
+        }
     }
 }
 

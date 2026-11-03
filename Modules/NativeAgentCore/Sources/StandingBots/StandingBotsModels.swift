@@ -1,7 +1,9 @@
 import Foundation
-// Blueprint: | `StandingBotsModels.swift` | Helper definitions own name, optional personality, job, output and provider/budget settings; cadence, run and shelf values |
+import CoreFoundation
+// Blueprint: | `StandingBotsModels.swift` | Helper definitions own name, optional personality, unified job brief and provider/budget settings; cadence, run and shelf values |
 
-/// Historical source references fold into the live brief during decoding.
+/// Retained definition/audit documents still carry the sources key. Keep its
+/// one reader until that DATA-FIRST format is explicitly retired.
 private enum LegacyBotSource: Decodable {
     case http(String)
     case tool(String)
@@ -19,16 +21,20 @@ private enum LegacyBotSource: Decodable {
         default: throw StandingBotsError.invalidValue("sources accept http {url} or tool {name}")
         }
     }
-
 }
 
 public enum BotRunLimits {
     /// Person-owned app preference; no bot tool exposes a setter.
     public static let minimumIntervalMinutesKey = "standingBots.minimumIntervalMinutes"
-    public static var minimumInterval: TimeInterval { minimumInterval(in: .standard) }
-    public static func minimumInterval(in defaults: UserDefaults) -> TimeInterval {
-        guard let value = defaults.object(forKey: minimumIntervalMinutesKey) as? NSNumber,
-              value.doubleValue.isFinite, (1...15).contains(value.doubleValue) else { return 15 * 60 }
+    /// Display-only availability. Admission and scheduling use the checked read.
+    public static var minimumInterval: TimeInterval? { try? checkedMinimumInterval() }
+    public static func checkedMinimumInterval(in defaults: UserDefaults = .standard) throws -> TimeInterval {
+        guard let saved = defaults.object(forKey: minimumIntervalMinutesKey) else { return 15 * 60 }
+        guard let value = saved as? NSNumber,
+              CFGetTypeID(value) != CFBooleanGetTypeID(),
+              value.doubleValue.isFinite, (1...15).contains(value.doubleValue) else {
+            throw StandingBotsError.invalidValue("Closest a bot may run is unreadable. Set it to a number from 1 to 15 minutes in Helpers settings before scheduling or changing a cadence.")
+        }
         return value.doubleValue * 60
     }
     public static let maximumTokens = 32_000
@@ -81,25 +87,19 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
         guard let sessionID, sessionID.hasPrefix("bot-") else { return nil }
         return UUID(uuidString: String(sessionID.dropFirst(4)))
     }
-    public var outputFormat: String?
     public var budget: BotBudget
     public var paused: Bool
-    /// Why a bot is off when the person did not switch it off; kept until it
-    /// is resumed or its timing changes.
-    public var offReason: String? = nil
     public let createdAt: Date
     public internal(set) var updatedAt: Date
 
     public init(id: UUID = UUID(), name: String, brief: String, cadence: BotCadence,
                 budget: BotBudget, paused: Bool = false,
-                outputFormat: String? = nil,
                 createdAt: Date = Date()) {
         self.id = id
         self.name = name
         self.brief = brief
         self.briefVersion = 1
         self.cadence = cadence
-        self.outputFormat = outputFormat
         self.budget = budget
         self.paused = paused
         self.createdAt = createdAt
@@ -110,9 +110,9 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
 extension BotDefinition {
     private enum LegacyCodingKeys: String, CodingKey { case sources }
     private enum CodingKeys: String, CodingKey {
-        case id, name, personality, brief, briefVersion, cadence, outputFormat, budget, paused, createdAt, updatedAt
+        case id, name, personality, brief, briefVersion, cadence, budget, paused, createdAt, updatedAt
         case provider, model, modelPinned, reasoningEffort, fast, dailyTokenCeiling, notificationCondition, deleted
-        case eventTrigger, offReason
+        case eventTrigger
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -125,7 +125,6 @@ extension BotDefinition {
         let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
         let oldSources = try legacy.decodeIfPresent([LegacyBotSource].self, forKey: .sources) ?? []
         if !oldSources.isEmpty { brief += "\n\nSources: " + oldSources.map(\.reference).joined(separator: ", ") }
-        outputFormat = try c.decodeIfPresent(String.self, forKey: .outputFormat)
         budget = try c.decode(BotBudget.self, forKey: .budget)
         paused = try c.decode(Bool.self, forKey: .paused)
         createdAt = try c.decode(Date.self, forKey: .createdAt)
@@ -138,19 +137,9 @@ extension BotDefinition {
         dailyTokenCeiling = try c.decodeIfPresent(Int.self, forKey: .dailyTokenCeiling)
         notificationCondition = try c.decodeIfPresent(String.self, forKey: .notificationCondition)
         deleted = try c.decodeIfPresent(Bool.self, forKey: .deleted)
-        offReason = try c.decodeIfPresent(String.self, forKey: .offReason)
-        struct SavedSource: Decodable { let source: String }
-        if try c.decodeIfPresent(SavedSource.self, forKey: .eventTrigger)?.source == "github" {
-            paused = true
-            offReason = Self.githubTriggerOff
-        } else {
-            eventTrigger = try c.decodeIfPresent(BotEventTrigger.self, forKey: .eventTrigger)
-        }
+        eventTrigger = try c.decodeIfPresent(BotEventTrigger.self, forKey: .eventTrigger)
     }
 
-    /// A bot with a retired GitHub event trigger reads as switched off
-    /// with no trigger, and the next save keeps it so; resuming it leaves it manual.
-    public static let githubTriggerOff = "GitHub events are no longer built in; an ability of hers can signal this bot"
 }
 
 public enum BotRunStatus: String, Codable, Sendable {
@@ -214,7 +203,6 @@ public struct ShelfEntry: Codable, Equatable, Sendable, Identifiable {
     public let uncertainties: [String]
     public let runHealth: ShelfRunHealth
     public let spend: ShelfSpend
-    public let failureEvidenceID: UUID?
     public var reply: String? = nil
     public var artifacts: [BotArtifact]? = nil
     public var status: BotRunStatus? = nil
@@ -231,6 +219,8 @@ public struct ShelfEntry: Codable, Equatable, Sendable, Identifiable {
     public var approvalID: String? = nil
     /// True for a helper-message answer (bot_ask); nil means this field was not recorded.
     public var asked: Bool? = nil
+    /// A conditioned run has a notification title: true notifies its result,
+    /// false suppresses it, nil notifies that the job couldn't tell.
     public var conditionMet: Bool? = nil
     public var conditionNotificationTitle: String? = nil
     public var actualReply: String { reply ?? findings }
@@ -240,14 +230,12 @@ public struct ShelfEntry: Codable, Equatable, Sendable, Identifiable {
     public init(id: UUID = UUID(), botId: UUID, briefVersion: Int, runAt: Date,
                 coverageStart: Date, coverageEnd: Date, headline: String, findings: String,
                 changedSinceLastGood: String, sourceLinks: [ShelfSourceLink] = [],
-                uncertainties: [String] = [], runHealth: ShelfRunHealth, spend: ShelfSpend,
-                failureEvidenceID: UUID? = nil) {
+                uncertainties: [String] = [], runHealth: ShelfRunHealth, spend: ShelfSpend) {
         self.id = id; self.botId = botId; self.briefVersion = briefVersion
         self.runAt = runAt; self.coverageStart = coverageStart; self.coverageEnd = coverageEnd
         self.headline = headline; self.findings = findings
         self.changedSinceLastGood = changedSinceLastGood; self.sourceLinks = sourceLinks
         self.uncertainties = uncertainties; self.runHealth = runHealth; self.spend = spend
-        self.failureEvidenceID = failureEvidenceID
     }
 }
 

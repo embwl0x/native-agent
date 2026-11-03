@@ -11,7 +11,8 @@ extension ActivityWatcher {
     /// let the engine emit retro-close commands. UI callers never wait on AX.
     public func updatePolicy(_ policy: ActivityPolicy) {
         lock.lock()
-        let wasEnabled = _captureEnabled
+        let wasEnabled = _captureEnabled && _policyAvailable
+        _policyAvailable = true
         _captureEnabled = policy.captureEnabled
         _lastKnownPolicy = policy
         let installed = _installed
@@ -55,6 +56,14 @@ extension ActivityWatcher {
                 Task { [weak self] in _ = await self?.startBounded() }
             }
         }
+    }
+
+    /// Fence capture immediately without replacing the last checked consent.
+    /// Teardown uses the same lifecycle as a requested disable; a later checked
+    /// policy update may restart only after the old pump actually settles.
+    public func policyUnavailable() async {
+        withLock { _policyAvailable = false }
+        _ = await requestStop()
     }
 
     /// External file changes may only tighten the current capture policy.

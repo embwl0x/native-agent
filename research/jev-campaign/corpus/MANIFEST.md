@@ -4,6 +4,34 @@ Frozen 2026-09-17. SHA-256 over the exact bytes on disk.
 Nothing in `text` is paraphrased; planted control records are labelled as written by the
 experimenter and are not presented as fetched sources.
 
+## Provenance erratum — 2026-10-31
+
+The frozen recovery and verbatim claims below are retained as the original
+record, but are superseded by this erratum. Availability in the saved fetches
+was broader than the text extracted into the development corpus:
+
+- All seven saved `raw/x_*.html` files retain post bodies; they are not empty
+  JavaScript shells. The syndication extracts used in `jev-launch/sources.jsonl`
+  can be display-truncated even when the saved HTML contains more of the post.
+  An extract ending does not establish that its continuation was unavailable.
+- `raw/x_2100426999546184123.html` retains the summary cost ($3.99),
+  classification cost ($0.08) and combined cost (just over $4). The truncated
+  J04 input did not carry that full cost account.
+- `raw/x_2100573432089866717.html` retains a `thruwire/foreman` card and the
+  literal link `https://github.com/thruwire/foreman`. J02's repository URL was
+  therefore fetched, though not recovered into its corpus input. J10 remains
+  the separate search candidate, `vercel-labs/eve-software-factory-template`;
+  it is not the repository linked by the saved J02 post.
+- J10 and J11 `text` fields are summaries, not verbatim excerpts. Compare
+  `jev-launch/sources.jsonl` rows 10–11 with `raw/foreman_README.md` and
+  `raw/typesafe_guide.html`. The opening "Nothing … paraphrased" claim does
+  not hold for these records.
+
+Raw payloads, extracted inputs and their recorded hashes remain frozen. This
+corrects the account of what was fetched, extracted and summarized; it does
+not replace the inputs the arms saw, recover unretained media, rerun the
+experiment or change held-out scores. Corpus A remains development-only.
+
 ## Corpus A — jev-launch (DEVELOPMENT corpus, not scored for discovery)
 
 | id | kind | author | url | truncated |

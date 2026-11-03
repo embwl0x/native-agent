@@ -3,6 +3,7 @@ import AppIntents
 import CryptoKit
 import UserNotifications
 import UIKit
+import ActivityKit
 import NativeAgentShared
 #if canImport(CloudKit)
 import CloudKit
@@ -112,7 +113,7 @@ struct NativeAgentNotificationLaunchIntent: Codable, Identifiable, Hashable {
 
     static func stage(screen: String?, sessionID: String? = nil, taskID: String? = nil) {
         let raw = screen?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) ?? "activity"
-        let screen = raw == "missions" ? "workshop" : allowedScreens.contains(raw) ? raw : "activity"
+        let screen = allowedScreens.contains(raw) ? raw : "activity"
         let session = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
         let intent = Self(screen: screen, sessionID: screen == "chat" ? session.flatMap { $0.isEmpty ? nil : $0 } : nil,
                           taskID: ["desk", "workshop"].contains(screen) ? taskID.flatMap { $0.isEmpty ? nil : $0 } : nil)
@@ -144,21 +145,23 @@ struct ChatReplyNotificationKeys: Sendable {
 
 @MainActor
 enum ChatReplyNotificationPresentation {
-    static func isAlreadyDisplayed(userInfo: [AnyHashable: Any]) -> Bool {
-        isAlreadyDisplayed(keys: ChatReplyNotificationKeys(userInfo: userInfo))
+    static func ownsVisibleConversation(userInfo: [AnyHashable: Any]) -> Bool {
+        ownsVisibleConversation(keys: ChatReplyNotificationKeys(userInfo: userInfo))
     }
 
-    static func isAlreadyDisplayed(keys: ChatReplyNotificationKeys) -> Bool {
+    static func ownsVisibleConversation(keys: ChatReplyNotificationKeys) -> Bool {
         guard keys.source == "icloud_chat_reply",
-              let correlationID = keys.correlationID,
               let store = ChatStore.visibleStore
         else { return false }
-        let notifiedSessionID = ChatStore.cleanSessionID(keys.sessionID)
-        if let notifiedSessionID,
-           notifiedSessionID != ChatStore.cleanSessionID(store.selectedSessionID) {
-            return false
-        }
-        return store.resolvedICloudReplyIds.contains(correlationID)
+        guard let notifiedSessionID = ChatStore.cleanSessionID(keys.sessionID) else { return false }
+        if notifiedSessionID == ChatStore.cleanSessionID(store.selectedSessionID) { return true }
+        // The first reply names the session the Mac just created while the
+        // visible pending exchange still has no assigned session.
+        guard ChatStore.cleanSessionID(store.selectedSessionID) == nil else { return false }
+        guard let correlationID = keys.correlationID else { return false }
+        return store.pendingExchanges[correlationID].map {
+            $0.sessionID == ChatStore.cleanSessionID(store.selectedSessionID)
+        } ?? false
     }
 }
 
@@ -180,6 +183,18 @@ struct NativeAgentMobileApp: App {
     @AppStorage(NativeAgentAppearance.storageKey) private var appearanceRawValue = NativeAgentAppearance.system.rawValue
 
     init() {
+        PhoneTalkCommands.handle = { callID, command in
+            let talk = TalkModeController.shared
+            guard talk.acceptsCommand(callID: callID) else { return false }
+            switch command {
+            case .mute: talk.toggleMute()
+            case .end: talk.end()
+            }
+            return true
+        }
+        // A terminated process cannot own a call. Retire any old island on
+        // cold launch rather than pretending the microphone survived it.
+        Task { await TalkModeController.endTalkActivities(callID: nil) }
         ChatRuntimeControls.primeDeviceSourceKey()
         MobileNotificationRouting.register()
         UNUserNotificationCenter.current().delegate = notificationDelegate
@@ -271,6 +286,10 @@ struct NativeAgentMobileApp: App {
                             refreshOnForeground()
                         }
                         .onChange(of: scenePhase) { _, newPhase in
+                            if newPhase == .background {
+                                voiceOutput.stop()
+                                VoiceNoteBubble.stopPlayback()
+                            }
                             if newPhase != .active {
                                 Task {
                                     do { try await chatStore.storage.flush() }
@@ -318,7 +337,13 @@ struct NativeAgentMobileApp: App {
         iCloudSyncEngine.shared.pairingStore = pairingStore
         Task {
             guard !pairingStore.connectionRepairPending, !pairingStore.isRepairingConnection else { return }
-            _ = try? await iCloudSyncEngine.shared.sendAction(.make(action: "pairDevice", payload: [:]), intentionalNewRequest: true)
+            do {
+                _ = try await iCloudSyncEngine.shared.sendAction(.make(action: "pairDevice", payload: [:]), intentionalNewRequest: true)
+            } catch {
+                iCloudSyncEngine.shared.syncError = "Phone announcement: \(error.localizedDescription)"
+                iCloudBridge.shared.syncStatus = "Phone announcement: \(error.localizedDescription)"
+                NSLog("[NativeAgentMobile] Phone announcement failed: %@", error.localizedDescription)
+            }
         }
     }
 
@@ -396,8 +421,7 @@ struct NativeAgentMobileApp: App {
     /// Launch-args test hook for simulator pairing without iCloud sync.
     /// Pass `-pairingSecretBase64 <base64>` to xcrun simctl launch — sim
     /// can't sign into a real iCloud, so KVS auto-bootstrap never fires
-    /// there. This injects the secret directly into the PairingStore so
-    /// we can verify the post-pair UI in headless tests.
+    /// there. PairingStore still owns the Keychain commit and checked readback.
     private func checkLaunchArgsForPairingSecret() {
         #if DEBUG
         let args = ProcessInfo.processInfo.arguments
@@ -408,9 +432,9 @@ struct NativeAgentMobileApp: App {
             return
         }
         Task { @MainActor in
-            pairingStore.iCloudPairingSecret = data
-            pairingStore.isICloudPaired = true
-            NSLog("[NativeAgentMobile] -pairingSecretBase64: injected (\(data.count) bytes); isICloudPaired=true")
+            guard pairingStore.applyCloudKitPairingSecret(data) else { return }
+            pairingStore.applyICloudPairing()
+            NSLog("[NativeAgentMobile] -pairingSecretBase64: installed through PairingStore; isICloudPaired=true")
         }
         #endif
     }

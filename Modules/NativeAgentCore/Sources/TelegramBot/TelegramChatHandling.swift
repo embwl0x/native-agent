@@ -3,7 +3,7 @@ import PersistenceCore
 import ChatSessionWork
 import ChatTurnRuntime
 
-// Blueprint: | `TelegramChatHandling.swift` | Telegram chat contracts: progress/compaction sinks and attempt context carrying decoded sender identity separately from chat identity |
+// Blueprint: | `TelegramChatHandling.swift` | Telegram chat contracts: compaction, surface progress presentation and attempt context carrying decoded sender identity separately from chat identity; turn handlers carry no delivery sink |
 
 public typealias TelegramCompaction = @Sendable (_ sessionId: String) async throws -> ChatSessionCompactionOutcome
 
@@ -52,6 +52,5 @@ public typealias TelegramProgressChatHandlerWithAttachments = @Sendable (
     _ chatId: Int,
     _ text: String,
     _ attachments: [TelegramMediaAttachment],
-    _ progress: @escaping TelegramChatProgressSink,
     _ context: TelegramChatAttemptContext
 ) async throws -> (reply: String, imagePaths: [String])

@@ -2,7 +2,7 @@ import TrustCenter
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `DreamsView.swift` | `DreamsView`: shared diary reads, selection, dream/REM controls and unavailable/error presentation |
+// Blueprint: | `DreamsView.swift` | `DreamsView`: shared diary reads, exact palette date selection without substituting another entry, dream/REM controls and unavailable/error presentation |
 // Dream and REM switches belong to Settings → Inner life; this page reads them.
 import SwiftUI
 import DreamREMCycle
@@ -120,6 +120,7 @@ enum DreamEntryDetailPresentation: Equatable {
 
 struct DreamsView: View {
     @Environment(AppModel.self) private var appModel
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
 
     @State private var selectedDate: String?
     @State private var isRunningDream = false
@@ -178,10 +179,14 @@ struct DreamsView: View {
         .alivePageLine(headerLine, id: "dreams.line")
         .navigationTitle("Dreams")
         .task {
+            acceptPaletteDestination()
             await loadREMPolicy()
-            await loadDiary(selectLatest: true)
+            await loadDiary()
         }
-        .onChange(of: diaryOwner.diary) { _, _ in reconcileSelection(selectLatest: false) }
+        .onChange(of: appModel.pendingPaletteDestination, initial: true) { _, _ in
+            acceptPaletteDestination()
+        }
+        .onChange(of: diaryOwner.diary) { _, _ in reconcileSelection() }
         .onDisappear {
             refreshTask?.cancel()
             refreshTask = nil
@@ -303,7 +308,7 @@ struct DreamsView: View {
                         Button {
                             diaryLimit += Self.diaryPage
                             refreshTask?.cancel()
-                            refreshTask = Task { await loadDiary(selectLatest: false) }
+                            refreshTask = Task { await loadDiary() }
                         } label: {
                             Text(isLoadingDiary
                                  ? "Reading older dreams…"
@@ -345,6 +350,7 @@ struct DreamsView: View {
                         // morning), so the two are named apart.
                         let night = "Night of " + DreamReaderText.friendlyDate(entry.date)
                         Text(reading.title ?? night)
+                            .accessibilityIdentifier("dreams.selected-entry.\(entry.date)")
                             .font(ShellType.bodySemibold)
                             .foregroundStyle(NativeAgentShell.text)
                         let written = entry.modifiedAt.map { "written " + shortTimestamp($0) }
@@ -434,7 +440,7 @@ struct DreamsView: View {
         refreshTask?.cancel()
         refreshTask = Task {
             await loadREMPolicy()
-            await loadDiary(selectLatest: false)
+            await loadDiary()
         }
     }
 
@@ -458,23 +464,30 @@ struct DreamsView: View {
             let feedback = await appModel.runRemPass()
             isRunningRem = false
             remRunFeedback = feedback
-            if feedback.isSuccess { await loadDiary(selectLatest: false) }
+            if feedback.isSuccess { await loadDiary() }
         }
     }
 
     // ── Loaders ───────────────────────────────────────────────────────────────
     @MainActor
-    private func loadDiary(selectLatest: Bool) async {
+    private func loadDiary(selectLatest: Bool = false) async {
         appModel.dreamError = nil
         await diaryOwner.refreshDiary(limit: diaryLimit)
         guard !Task.isCancelled, !diaryLoadFailed else { return }
         reconcileSelection(selectLatest: selectLatest)
     }
 
-    private func reconcileSelection(selectLatest: Bool) {
-        if selectLatest || !entries.contains(where: { $0.date == selectedDate }) {
-            selectedDate = entries.first?.date
+    private func reconcileSelection(selectLatest: Bool = false) {
+        if let latest = entries.first, selectLatest || selectedDate == nil {
+            selectedDate = latest.date
         }
+    }
+
+    private func acceptPaletteDestination() {
+        guard !quietOffscreenRead,
+              case .dream(let date)? = appModel.pendingPaletteDestination else { return }
+        selectedDate = date
+        appModel.pendingPaletteDestination = nil
     }
 
     @MainActor

@@ -94,7 +94,14 @@ public final class ConnectorReadiness: Sendable {
         guard let id = connectorString(row["id"]).map(normalizedConnectorID), !id.isEmpty else {
             return row
         }
-        let proofs = proof ?? ConnectorProofLedger.latestByConnector(root: root)
+        let proofs: [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)]
+        do { proofs = try proof ?? ConnectorProofLedger.latestByConnector(root: root) }
+        catch {
+            var unavailable = row
+            unavailable["healthStatus"] = .string("unavailable")
+            unavailable["healthError"] = .string(error.localizedDescription)
+            return unavailable
+        }
         var out = row
         out["id"] = .string(id)
         // Health decay eligibility is DERIVED here, never carried in from the
@@ -279,10 +286,6 @@ public final class ConnectorReadiness: Sendable {
                     let detail = connectorString(row["runtimeDetail"]) ?? ""
                     row["runtimeDetail"] = .string("\(detail) \(recovery.pendingCount) accepted replies are pending delivery.")
                 }
-                if recovery.hasQuarantinedEvidence {
-                    let detail = connectorString(row["runtimeDetail"]) ?? ""
-                    row["runtimeDetail"] = .string("\(detail) A damaged Slack delivery journal was moved aside (.stale-<ts>). Accepted replies that were not delivered may only exist in that file; ask \(platform.agentSubject) to inspect it before any manual retry.")
-                }
             }
         } catch {
             row["runtimeStatus"] = .string("recovery_unavailable")
@@ -338,7 +341,7 @@ public final class ConnectorReadiness: Sendable {
     public static func checkedConnectorRecords(root: URL, platform: AppConnectorStatusPlatform) throws -> [ConnectorRecord] {
         let current = try ConnectorOAuthRegistry.readRegistry(at: connectorRegistryPath(root: root))
         // List and mutation projections use the same receipt-backed overlay.
-        let proof = ConnectorProofLedger.latestByConnector(root: root)
+        let proof = try ConnectorProofLedger.latestByConnector(root: root)
         let rows = current.map {
             connectorRowWithRuntimeOverlay($0, root: root, platform: platform, proof: proof)
         }

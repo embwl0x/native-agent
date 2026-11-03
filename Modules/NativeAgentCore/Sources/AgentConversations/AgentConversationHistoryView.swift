@@ -28,9 +28,16 @@ enum AgentConversationHistoryView {
             "order": .string("oldest_first"), "untrusted_remote_data": .bool(false)
         ]
         let owner = agent.hasPrefix("peer:") ? String(agent.dropFirst(5)) : agent
-        let peers = peers ?? (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
+        let contacts: [AgentPeerContact]
+        do { contacts = try peers ?? AgentPeerStore(dataRoot: dataRoot).list() }
+        catch {
+            metadata["status"] = .string("unavailable")
+            metadata["detail"] = .string("Contact identity could not be read: " + error.localizedDescription + ". Repair agents/peers.json; the conversation is preserved.")
+            result["session_history"] = .object(metadata); return .object(result)
+        }
+        let peers = contacts
         let lines: [ContactThread.Line]
-        do { lines = try snapshot?.get() ?? ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: AgentContactIdentity(dataRoot: dataRoot, peers: peers)) }
+        do { lines = try snapshot?.get() ?? ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: AgentContactIdentity(contacts: peers)) }
         catch {
             metadata["status"] = .string("unavailable")
             metadata["detail"] = .string("This conversation's session could not be read (\(error.localizedDescription)). The conversation is preserved; no message was repeated.")

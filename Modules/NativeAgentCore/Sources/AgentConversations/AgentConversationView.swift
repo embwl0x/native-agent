@@ -4,7 +4,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentConversationView.swift` | `AgentConversationView` owns receipt and named-conversation rendering: `read`, `view`, `conversationPresentation`, `compact`, `queueProjection`, `withQueue`, `withLive`, `codingReply`, `expiringReply`; history selection stays with the session caller; `dotReply` projects Dot's existing half-hour wait from its stored send time for UI and contact reads. `claudeWorklogTail` is the shared bounded continuity/worklog reader; `claudeWorklog` exposes recent recorded work for contact reads and the read-only app action. |
+// Blueprint: | `AgentConversationView.swift` | `AgentConversationView` owns receipt and named-conversation rendering: `read`, `view`, `conversationPresentation`, `compact`, `queueProjection`, `withQueue`, `withLive`, `codingReply`, `expiringReply`; history selection stays with the session caller; `dotReply` projects Dot's existing half-hour wait from its stored send time for UI and contact reads. `claudeWorklogTail` is the shared checked bounded continuity/worklog reader (a malformed row fails the feed with its source); `claudeWorklog` exposes recent recorded work for contact reads and the read-only app action. |
 
 /// Receipt and named-conversation presentation over already-authorized reads.
 /// The session owns dispatch, waits, queues and state transitions.
@@ -15,9 +15,25 @@ public enum AgentConversationView {
     public static func claudeWorklogTail(_ url: URL) throws -> [[String: Any]] {
         guard let read = try SwiftNativePersistenceCore.tailPhysicalLines(url, limit: .max, maxBytes: 65_536)
         else { throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: url.path]) }
-        return read.lines.dropFirst(read.leadingFragment ? 1 : 0).compactMap {
-            try? JSONSerialization.jsonObject(with: Data(String(decoding: $0, as: UTF8.self).utf8)) as? [String: Any]
+        var rows: [[String: Any]] = []
+        for (index, bytes) in read.lines.dropFirst(read.leadingFragment ? 1 : 0).enumerated() {
+            if bytes.allSatisfy({ $0 == 32 || $0 == 9 || $0 == 13 }) { continue }
+            do {
+                guard String(data: Data(bytes), encoding: .utf8) != nil,
+                      let row = try JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any],
+                      let ts = row["ts"] as? String, NativeTimestampFormat.parseISO8601FractionalFirst(ts) != nil,
+                      let kind = row["kind"] as? String, !kind.isEmpty, row["summary"] is String else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                rows.append(row)
+            } catch {
+                throw ToolFailureError("Worklog tail row \(index + 1) in \(url.path) is malformed: \(error.localizedDescription). This read is incomplete.",
+                    effects: .none, owner: url.path, code: "agent_worklog_incomplete",
+                    instruction: ToolFailureError.fileRepairInstruction(url,
+                        shape: "Each nonblank worklog row must be a UTF-8 JSON object with an ISO 8601 ts, nonempty kind and text summary. Preserve the malformed source while repairing it."))
+            }
         }
+        return rows
     }
 
     public static func claudeWorklog(input: [String: JSONValue] = [:]) -> JSONValue {
@@ -39,6 +55,11 @@ public enum AgentConversationView {
         do { rows = try claudeWorklogTail(claudeWorklogURL) }
         catch CocoaError.fileReadNoSuchFile {
             return .object(["status": .string("absent"), "detail": .string("Claude has no worklog.")])
+        } catch let failure as ToolFailureError {
+            var fields = failure.failureEvidence(defaultCode: "agent_worklog_incomplete")
+            fields["status"] = .string("unavailable")
+            fields["detail"] = .string(failure.message)
+            return .object(fields)
         } catch {
             let attributes = try? FileManager.default.attributesOfItem(atPath: claudeWorklogURL.path)
             let canRepairMode = (error as? CocoaError)?.code == .fileReadNoPermission
@@ -54,11 +75,11 @@ public enum AgentConversationView {
                     "next_call": .object(["tool": .string("app"),
                         "input": .object(["action": .string("files.info"), "args": .object(["path": .string(claudeWorklogURL.path)])])])])
             return .object(["status": .string("unavailable"), "effects": .string("none"),
-                "detail": .string("Worklog open/seek/read failed at \(claudeWorklogURL.path): \(error.localizedDescription)"),
+                "detail": .string("Worklog read failed at \(claudeWorklogURL.path): \(error.localizedDescription)"),
                 "remedy": remedy])
         }
         let entries = rows.compactMap { row -> (Date, JSONValue)? in
-            guard let ts = row["ts"] as? String, let at = NativeTimestampFormat.parseISO8601(ts),
+            guard let ts = row["ts"] as? String, let at = NativeTimestampFormat.parseISO8601FractionalFirst(ts),
                   since.map({ at >= $0 }) ?? true,
                   let summary = row["summary"] as? String, let kind = row["kind"] as? String else { return nil }
             return (at, .object([
@@ -92,7 +113,7 @@ public enum AgentConversationView {
               let deadline = ISO8601DateFormatter().date(from: stamp), deadline <= Date() else { return receipt }
         if fields["reply_observation"] == .string("running") {
             fields["status"] = .string("no_reply_expired"); fields["reply_state"] = .string("no_reply_expired")
-            fields["detail"] = .string("The reply is still being observed after its reporting deadline. No finished answer has been confirmed; nothing was resent.")
+            fields["detail"] = .string("The reply deadline has elapsed; local observation is settling. No finished answer has been confirmed; nothing was resent.")
             return .object(fields)
         }
         fields["status"] = .string("no_reply_expired")
@@ -144,10 +165,16 @@ public enum AgentConversationView {
                      historyBefore: String? = nil, historyExchange: String? = nil, includeHistory: Bool = true) -> JSONValue {
         let receipt = row.sendReceipt ?? .object(["status": .string("unknown")])
         guard case .object = receipt else { return receipt }
-        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
+        let peers: [AgentPeerContact]
+        do { peers = try AgentPeerStore(dataRoot: dataRoot).list() }
+        catch {
+            return .object(["status": .string("unavailable"), "detail": .string("Contact identity could not be read: " + error.localizedDescription),
+                "retained_send": receipt, "effects": .string("none"),
+                "remedy": Repair.remedy(owner: "agents/peers.json", nextCall: nil, tap: "Repair the contact address book before resolving this conversation.")])
+        }
         let peer = peers.first { "peer:" + $0.id == row.agent }
         let owner = row.agent.hasPrefix("peer:") ? String(row.agent.dropFirst(5)) : row.agent
-        let identity = AgentContactIdentity(dataRoot: dataRoot, peers: peers)
+        let identity = AgentContactIdentity(contacts: peers)
         let history = !details && includeHistory
         let lines: Result<[ContactThread.Line], Error>? = history ? Result { try ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: identity) } : nil
         var result = details ? receipt : conversationPresentation(row, transport: peer?.transport, prefix: read ? "last_send_" : "")
@@ -196,8 +223,17 @@ public enum AgentConversationView {
 
     /// What the agent is doing on the unsettled send, when it is still on it.
     static func withLive(_ result: JSONValue, row: AgentConversationRecord?, dataRoot: URL) -> JSONValue {
-        guard let row, case .object(var fields) = result,
-              let live = AgentConversationLiveStore(dataRoot: dataRoot).current(for: row),
+        guard let row, case .object(var fields) = result else { return result }
+        let current: AgentConversationLive?
+        do { current = try AgentConversationLiveStore(dataRoot: dataRoot).current(for: row) }
+        catch {
+            fields["live"] = .object(["state": .string("unavailable"),
+                "detail": .string("Live conversation evidence could not be read: " + error.localizedDescription),
+                "remedy": Repair.remedy(owner: "agents/conversation-live.json", nextCall: nil,
+                    tap: "Repair the live conversation file; preserve its existing bytes.")])
+            return .object(fields)
+        }
+        guard let live = current,
               case .object(var projection) = live.projection(name: row.name) else { return result }
         if row.agent.hasPrefix("peer:"), projection["partial_text"] != nil { projection["untrusted_remote_data"] = .bool(true) }
         fields["live"] = .object(projection)
@@ -210,13 +246,16 @@ public enum AgentConversationView {
         guard case .object(let root) = receipt else { return receipt }
         let value = row.sendEvidence
         let handOff = AgentConversationSession.liveHandOff(row), handOffSettled = handOff && AgentConversationSession.settled(row)
-        let status = GrokBotRoute.normalizedStatus(row.sendStatus)
+        let status = row.sendStatus
         // An unavailable continuation means the session behind this name is gone.
         let deadThread = (AgentConversationSession.string(value["reason"]) ?? AgentConversationSession.string(value["execution_error"])) == "continuation_unavailable"
         // can_reply means a new message goes now; otherwise say when. A new send supersedes terminal attention.
         var canReply = (!["sending", "waiting"].contains(row.phase) || (row.phase == "waiting" && handOffSettled))
         var replyDetail: String?
-        if ["sending", "waiting"].contains(row.phase), !canReply {
+        if row.queued?.contains(where: { $0.waitingForMac == true }) == true {
+            canReply = false
+            replyDetail = "Waiting for the Mac to be free; the held message will go then. A new message queues behind it."
+        } else if ["sending", "waiting"].contains(row.phase), !canReply {
             replyDetail = "After \(row.name) answers the message in progress; a message sent now waits in the queue and goes by itself then."
         } else if row.phase == "attention", deadThread {
             canReply = false

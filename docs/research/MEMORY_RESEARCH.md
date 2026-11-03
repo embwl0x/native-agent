@@ -1161,8 +1161,10 @@ what does not fit, on time and on change.
 
 **Lesson for an agent:** Every system above is a store with a retrieval
 policy. None has a self deciding what matters, so importance is a number
-fixed at writing; none keeps a record apart from its reconstructions, so
-updates delete and evolution overwrites. The benchmarks show the cost exactly
+fixed at writing. Where a system keeps only reconstructions, updates can
+delete and evolution can overwrite the record. Zep is an exception: it keeps
+raw episodes beside derived facts and closes old validity intervals rather
+than deleting those facts, as described above. The benchmarks show the cost exactly
 where the human science predicts it: change, time, source, and knowing what
 one does not know.
 

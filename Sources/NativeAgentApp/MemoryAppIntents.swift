@@ -34,10 +34,10 @@ struct QueryMemoryIntent: AppIntent {
         let reply: String
         if #available(macOS 27, *) {
             reply = try await performBackgroundTask {
-                try await NativeAgentChatIntent.reply(to: message)
+                try await AskResidentAgentIntent.reply(to: message)
             }
         } else {
-            reply = try await NativeAgentChatIntent.reply(to: message)
+            reply = try await AskResidentAgentIntent.reply(to: message)
         }
         return .result(value: reply, dialog: IntentDialog(stringLiteral: reply))
     }
@@ -67,10 +67,10 @@ struct StoreMemoryIntent: AppIntent {
         let reply: String
         if #available(macOS 27, *) {
             reply = try await performBackgroundTask {
-                try await NativeAgentChatIntent.reply(to: message)
+                try await AskResidentAgentIntent.reply(to: message)
             }
         } else {
-            reply = try await NativeAgentChatIntent.reply(to: message)
+            reply = try await AskResidentAgentIntent.reply(to: message)
         }
         return .result(value: reply, dialog: IntentDialog(stringLiteral: reply))
     }

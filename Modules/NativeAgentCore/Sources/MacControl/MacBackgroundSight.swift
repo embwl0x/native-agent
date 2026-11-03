@@ -1,10 +1,10 @@
 // Pure running-app name resolution without activation or a focus change.
-// Missing, ambiguous and self-process targets remain distinct refusals so the
-// caller can explain the next step without walking an unsafe or guessed tree.
+// Missing, ambiguous and self-process targets remain distinct so callers can
+// report an observation or refuse an act without walking an unsafe or guessed tree.
 
 import Foundation
 
-// Blueprint: | `MacBackgroundSight.swift` | `MacBackgroundSight.resolve`: exact running and installed identities precede partial running-app matches without activation; missing, ambiguous, unavailable and self targets remain distinct |
+// Blueprint: | `MacBackgroundSight.swift` | `MacBackgroundSight.resolve`: exact running and checked installed identities precede partial running-app matches without activation; a matching row with unavailable platform/install classification stops partial-name guessing; missing, ambiguous, unavailable and self targets remain distinct |
 
 public enum MacBackgroundSight {
     /// What naming an app resolved to. Every non-match is its own case because
@@ -73,6 +73,14 @@ public enum MacBackgroundSight {
         // The hot path never waits for Spotlight, and never guesses a partial
         // name before the installed identities are available.
         guard let indexed = MacAppIndex.shared.readyApps() else { return .indexUnavailable }
+        // Incomplete matching identity cannot authorize a partial-name guess
+        // at another running app. Exact running identities above need no census.
+        if indexed.contains(where: {
+            $0.installationUncertain && (
+                normalized($0.bundleID ?? "") == needle || normalized($0.name) == bare
+                || normalized($0.url.deletingPathExtension().lastPathComponent) == bare
+                || squashed($0.name) == flat || squashed($0.url.deletingPathExtension().lastPathComponent) == flat)
+        }) { return .indexUnavailable }
         let installed = MacAppIndex.installed(indexed)
         let exact = installed.filter {
             normalized($0.bundleID ?? "") == needle || normalized($0.name) == bare
@@ -107,14 +115,14 @@ public enum MacBackgroundSight {
         return Array(names.prefix(maxCandidates)) + ["and \(names.count - maxCandidates) more"]
     }
 
-    /// The refusal, in words. A model that gets "app_not_running" and nothing
-    /// else re-tries the same spelling forever.
+    /// The resolution, in words. A stopped app is an empty look observation;
+    /// a caller that needs a running app still treats it as a precondition failure.
     public static func words(for resolution: Resolution, requested name: String) -> String? {
         switch resolution {
         case .matched:
             return nil
         case .indexUnavailable:
-            return "The installed-app index is not ready, so I can't resolve \"\(name)\" without guessing. "
+            return "The installed-app index is not ready or the matching app's classification is unavailable, so I can't resolve \"\(name)\" without guessing. "
                 + "Use the running app's exact name or bundle identifier, or try again once Spotlight has gathered the apps."
         case .selfProcess:
             // Match the AX path's `selfInspectionNote` refusal and recovery direction.

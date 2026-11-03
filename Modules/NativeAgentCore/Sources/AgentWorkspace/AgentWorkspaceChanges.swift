@@ -100,7 +100,7 @@ enum AgentWorkspaceChanges {
     static func evaluateHumanListing(location: AgentWorkspaceLocation, row: [String: JSONValue], previous: Stamp?) -> Observation? {
         guard let source = source(location), source.tool == "chat_conversations", let identity = identity(location: location),
               row["conversation_session_id"] == source.input["conversation_session_id"] else { return nil }
-        guard successful(row), let revision = row["source_revision"], revision != .string("legacy"),
+        guard successful(row), let revision = row["source_revision"],
               revision != .null, let current = hash(revision) else {
             return .init(state: .unavailable, nextStamp: previous, detail: "The conversation index has no comparable current revision; open it to read current messages.")
         }

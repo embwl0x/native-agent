@@ -1,10 +1,53 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `JSONEntrySplice.swift` | Byte-preserving JSON/JSONC member splicing, validation and duplicate-key refusal over shared JSONByteScanner spans |
+// Blueprint: | `JSONEntrySplice.swift` | Byte-preserving JSON/JSONC server and nested permission member splicing, validation and duplicate-key refusal over shared JSONByteScanner spans |
 
 /// Splice one member without re-encoding the rest. Validate the complete object
 /// before shared lexical scanning; refuse unreadable or ambiguous settings.
 enum JSONEntrySplice {
+
+    /// Nested permission members use the same scanner and byte splice as server
+    /// entries. Existing ancestor objects and sibling bytes are never re-encoded.
+    static func member(_ data: Data, path: [String]) throws -> String? {
+        let bytes = try validatedBytes(data, comments: true, trailingCommas: true)
+        var open = try objectStart(bytes)
+        for (index, key) in path.enumerated() {
+            let scan = try JSONByteScanner.members(bytes, from: open)
+            guard let member = try unique(scan.members, named: key, called: "permission member") else { return nil }
+            if index == path.count - 1 { return String(decoding: Array(data)[member.valueStart..<member.end], as: UTF8.self) }
+            open = member.valueStart
+        }
+        return nil
+    }
+
+    static func setMember(_ data: Data, path: [String], value: String?) throws -> Data {
+        guard !path.isEmpty else { throw AgentHostConfigWriter.Failure.unparsable("empty permission path") }
+        let bytes = try validatedBytes(data, comments: true, trailingCommas: true)
+        let original = Array(data)
+        var open = try objectStart(bytes)
+        var output: Data?
+        for (index, key) in path.enumerated() {
+            let scan = try JSONByteScanner.members(bytes, from: open)
+            let member = try unique(scan.members, named: key, called: "permission member")
+            if index == path.count - 1, let member {
+                if let value { output = splice(original, range: member.valueStart..<member.end, with: value) }
+                else {
+                    let separators = try validatedBytes(data, comments: true, trailingCommas: true, preservingTrailingCommas: true)
+                    output = splice(original, range: deletionRange(separators, of: member, in: scan), with: "")
+                }
+                break
+            }
+            if let member { open = member.valueStart; continue }
+            guard var body = value else { return data }
+            for child in path.dropFirst(index + 1).reversed() { body = "{" + quoted(child) + ":" + body + "}" }
+            output = insertMember(original, into: scan, text: quoted(key) + ": " + body,
+                indent: indentation(bytes, memberStart: scan.members.first?.start))
+            break
+        }
+        guard let output else { return data }
+        _ = try validatedBytes(output, comments: true, trailingCommas: true)
+        return output
+    }
 
     /// THE ONE member of this name, or none. JSON permits duplicate keys and
     /// readers disagree about which of them wins, so a file carrying two is

@@ -3,7 +3,7 @@ import Cognition
 import SwiftUI
 import Observation
 import CognitiveSubstrate
-// Blueprint: | `CognitionProposalsView.swift` | `CognitionProposalsView`: read-only schema lineage from canonical Dream/REM approvals |
+// Blueprint: | `CognitionProposalsView.swift` | `CognitionProposalsView`: read-only schema lineage and proposal-owned displaced content from canonical Dream/REM approvals |
 
 struct CognitionProposalsView: View {
     @Environment(AppModel.self) private var appModel
@@ -46,6 +46,9 @@ struct CognitionProposalsView: View {
                             Text(proposal.title)
                                 .font(.caption.weight(.semibold))
                             Text(proposal.body)
+                                .font(.caption)
+                                .textSelection(.enabled)
+                            Text(proposal.replacementDescription)
                                 .font(.caption)
                                 .textSelection(.enabled)
                             Text("\(proposal.status.rawValue), \(proposal.target), confidence \(String(format: "%.2f", proposal.confidence))")

@@ -4,7 +4,7 @@ import NativeAgentShared
 import NativeAgentCore
 import MemoryV2
 import PersistenceCore
-// Blueprint: | `MacSyncEngine+Security.swift` | MacSyncEngine pairing rotation and signed responses; complete signed CloudKit action-record budgeting before terminal ledger settlement; oversized readbacks return an explicit processed-action error; BridgeMessage owns HMAC, constant-time comparison and inner-action verification; outer signatures remain case-sensitive |
+// Blueprint: | `MacSyncEngine+Security.swift` | MacSyncEngine pairing rotation holds signing through accepted-write verification; signed responses and complete signed CloudKit action-record budgeting before terminal ledger settlement; oversized readbacks return an explicit processed-action error; BridgeMessage owns HMAC, constant-time comparison and inner-action verification; outer signatures remain case-sensitive |
 
 extension MacSyncEngine {
     // The HMAC pairing secret is loaded lazily through PairingSecret.
@@ -17,22 +17,28 @@ extension MacSyncEngine {
             )
         }
         if let s = _pairingSecret { return s }
-        let s = try PairingSecret.loadOrGenerateSecret()
+        let s = try sync.bridge.pairingPublicationOwed
+            ? PairingSecret.requireExistingSecret() : PairingSecret.loadOrGenerateSecret()
         _pairingSecret = s
         return s
     }
 
     /// Close the HMAC boundary before canonical pairing bytes are replaced.
     /// Inbound validation/signing remains unavailable until `finish` installs
-    /// the exact bytes returned by durable rotation.
+    /// the exact bytes read back by rotation or existing-item reconciliation.
     public func beginPairingSecretRotation() {
-        pairingSecretRotationInProgress = true
+        pairingSecretRotation = .writing
         _pairingSecret = nil
+    }
+
+    /// The write has exited, but signing stays closed until its exact item is read.
+    public func awaitPairingSecretVerification() {
+        pairingSecretRotation = .awaitingVerification
     }
 
     public func finishPairingSecretRotation(with persistedSecret: Data?) async {
         _pairingSecret = persistedSecret
-        pairingSecretRotationInProgress = false
+        pairingSecretRotation = nil
         // Revoke the old Drive write generation and republish into this key's
         // directory. Late writes remain confined to their captured old URL.
         if inboxDir != nil, let docsURL = activeDocsURL {

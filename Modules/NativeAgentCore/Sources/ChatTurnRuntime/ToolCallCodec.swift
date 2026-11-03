@@ -12,13 +12,12 @@ import ProviderRouting
 /// dispatch, recovery); the codec owns the wire encoding of calls and results.
 enum ToolCallCodec: Sendable, Equatable {
     /// Provider-native tool calling: `tools[]` on the request, calls as
-    /// `.toolCall` stream events. XML/JSON markers in the text are still
-    /// held back from the surface and parsed when a round streamed no call.
+    /// `.toolCall` stream events. Text never supplies executable calls.
     case native
     /// A transport with no tool calling (Codex CLI). The
     /// offered array still reaches the client, whose capability admission
     /// records the text-only note, and the adapter never forwards it; the
-    /// incremental text is read exactly as `.native` reads text.
+    /// reply is prose only; neither text nor structured events execute tools.
     case none
     /// The text-compatibility marker protocol (`TextMarkerCodec`): no
     /// `tools[]`, the catalog as prose in the system prompt, calls as markers
@@ -27,11 +26,10 @@ enum ToolCallCodec: Sendable, Equatable {
     case textMarkers
 
     /// Chosen from the provider the client resolves for the turn's calls
-    /// (`LLMClient.servingProviderID`). Nil — a client that does not route,
-    /// or a call that fails before any adapter — keeps the native reading.
-    static func forProvider(_ providerID: String?) -> ToolCallCodec {
-        guard let providerID, !providerID.isEmpty else { return .native }
-        switch ProviderToolCapability.wire(providerID: providerID) {
+    /// (`LLMClient.servingProviderID`). Missing/unknown capability is an
+    /// admission error, never an inferred native-tool protocol.
+    static func forProvider(_ providerID: String) throws -> ToolCallCodec {
+        switch try ProviderToolCapability.checkedWire(providerID: providerID) {
         case .native: return .native
         case .textMarkers: return .textMarkers
         case .unsupported: return .none
@@ -144,7 +142,7 @@ enum ToolCallCodec: Sendable, Equatable {
     /// the loop ignores. Arguments that are not a JSON object fail the round.
     func decode(_ call: LLMStreamToolCall) throws -> ParsedToolCall? {
         // Nothing offered, so nothing streamed is a call.
-        if self == .textMarkers { return nil }
+        if self != .native { return nil }
         guard !ToolCallParser.isIgnorableToolName(call.name) else { return nil }
         guard let parsed = try? JSONValue.parse(call.inputJSON),
               case .object(let input) = parsed else {
@@ -153,17 +151,17 @@ enum ToolCallCodec: Sendable, Equatable {
         return ParsedToolCall(id: call.id, name: call.name, input: input)
     }
 
-    /// A finished round's executable calls: the streamed ones, else any
-    /// recovered from the round's text. `schemas` is the round's catalog,
-    /// which marker-argument repair reads.
+    /// A finished round's calls from exactly its offered transport grammar.
     func roundCalls(
         streamed: [ParsedToolCall], text: String, schemas: [LLMToolSchema], recordShims: Bool = true
-    ) -> [ParsedToolCall] {
+    ) throws -> [ParsedToolCall] {
         switch self {
-        case .native, .none:
-            ToolCallParser.executableCalls(streamed.isEmpty ? ToolCallParser.parse(text, recordShims: recordShims) : streamed)
+        case .native:
+            ToolCallParser.executableCalls(streamed)
+        case .none:
+            []
         case .textMarkers:
-            TextMarkerCodec(schemas: schemas, turnActiveTools: []).calls(in: text, recordShims: recordShims)
+            try TextMarkerCodec(schemas: schemas, turnActiveTools: []).calls(in: text, recordShims: recordShims)
         }
     }
 }

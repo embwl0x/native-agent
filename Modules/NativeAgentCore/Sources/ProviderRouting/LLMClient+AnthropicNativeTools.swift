@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 // Provider streams share PersistenceCore's SSE framing.
 import PersistenceCore
-// Blueprint: | `LLMClient+AnthropicNativeTools.swift` | `AnthropicTransport`: buffered JSON and SSE both open through `ProviderWire`; native-tool stream decoding commits explicit object input at content-block close; empty-input candidates and later blocks wait in wire order for the terminal verdict; interruptions discard unconfirmed empty candidates and release explicit calls, retaining thinking replay; shared Anthropic event type, wire errors, usage and stop-reason accumulation |
+// Blueprint: | `LLMClient+AnthropicNativeTools.swift` | `AnthropicTransport`: one SSE path through `ProviderWire`; native-tool stream decoding commits explicit object input at content-block close; empty-input candidates and later blocks wait in wire order for the terminal verdict; interruptions discard unconfirmed empty candidates and release explicit calls, retaining thinking replay; shared Anthropic event type, wire errors, usage and stop-reason accumulation |
 
 // API-key transports carry native tools; OAuth transports use text markers.
 // Omit tool_choice; strict tool definitions require first-party closed schemas.
@@ -82,20 +82,7 @@ actor ToolCallReplayLedger<Payload: Sendable> {
     }
 }
 
-public struct AnthropicNativeToolResult: Sendable, Equatable {
-    /// Joined text blocks. EMPTY is legal when `toolCalls` is non-empty.
-    public let text: String
-    /// Every `tool_use` block, in wire order (P0 shape C: all must dispatch).
-    public let toolCalls: [LLMStreamToolCall]
-    /// Raw provider `stop_reason` ("tool_use", "end_turn", "max_tokens", …).
-    public let stopReason: String?
 
-    public init(text: String, toolCalls: [LLMStreamToolCall], stopReason: String?) {
-        self.text = text
-        self.toolCalls = toolCalls
-        self.stopReason = stopReason
-    }
-}
 
 extension AnthropicTransport {
     /// A delta belongs to its indexed block, even when its own type claims otherwise.
@@ -142,8 +129,7 @@ extension AnthropicTransport {
         if sse.data.isEmpty || sse.data == "[DONE]" { return false }
         guard let data = sse.data.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            if semanticOutput { throw LLMError.streamTruncated(message: malformedFrame) }
-            return false
+            throw ProviderFailure.Diagnostic(cause: .malformedResponse, detail: malformedFrame)
         }
         let type = object["type"] as? String ?? ""
         let event = type.isEmpty ? (sse.event ?? "") : type
@@ -222,7 +208,7 @@ extension AnthropicTransport {
             _ = try await payload("client_tool_boundary", object, stopReason)
         } else if cutoff {
             if inspectThinking != nil { AnthropicOAuthTransport.logCutoffShape(runaway.text) }
-            RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
+            RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit", dataRoot: telemetry.diagnosticDataRoot)
         } else {
             if let emptyError { throw emptyError }
             if inspectThinking != nil { AnthropicOAuthTransport.logStopWithoutToolCall(stopReason, runaway.text) }
@@ -245,16 +231,14 @@ extension AnthropicTransport {
     // MARK: - Request encoding
 
     /// Anthropic `tools` array. `input_schema` is the tool's JSON-Schema object
-    /// decoded from its canonical bytes; a schema that won't decode falls back
-    /// to a permissive object rather than dropping the tool (a missing tool is
-    /// invisible to the model; a loose schema is merely lenient).
+    /// decoded from its canonical bytes. Invalid schemas fail the request at
+    /// checkedParameters/checkedProviderJSONObject before anything is sent.
     ///
     /// `strict` opts into PROVIDER-SIDE argument validation (Fable 5.1
     /// contract). It rides only where the tool's own schema already closed
     /// itself — at EVERY level (see `schemaIsRecursivelyClosed`). We
-    /// deliberately never manufacture that closure: several tools here — the
-    /// MCP schemaless passthrough shape above all — declare
-    /// `additionalProperties: true` and genuinely accept extra keys, and
+    /// deliberately never manufacture that closure: a schema can declare
+    /// `additionalProperties: true` and accept extra keys, and
     /// forcing them shut would make the provider reject arguments the tool
     /// would have honored. Strictness is a property the schema earns, not one
     /// this encoder asserts.
@@ -269,11 +253,10 @@ extension AnthropicTransport {
         _ tools: [LLMToolSchema],
         strict: Bool,
         cacheBreakpoint: Bool
-    ) -> [[String: Any]] {
-        var out: [[String: Any]] = tools.map { schema in
-            var inputSchema: [String: Any] = (try? JSONSerialization.jsonObject(
-                with: schema.parametersJSON
-            )) as? [String: Any] ?? ["type": "object", "properties": [String: Any]()]
+    ) throws -> [[String: Any]] {
+        var out: [[String: Any]] = try tools.map { schema in
+            _ = try schema.checkedParameters()
+            var inputSchema = try checkedProviderJSONObject(schema.parametersJSON, owner: "Tool schema \(schema.name)")
             var tool: [String: Any] = [
                 "name": schema.name,
                 "description": schema.description,
@@ -292,7 +275,7 @@ extension AnthropicTransport {
             return tool
         }
         if cacheBreakpoint, !out.isEmpty {
-            out[out.count - 1]["cache_control"] = ["type": "ephemeral"]
+            out[out.count - 1]["cache_control"] = AnthropicOAuthTransport.ephemeralCacheControl
         }
         return out
     }
@@ -338,13 +321,13 @@ extension AnthropicTransport {
     }
 
     /// Anthropic's native content-block wire fields; message policy stays with its builder.
-    static func anthropicBlock(_ block: LLMContentBlock) -> [String: Any] {
+    static func anthropicBlock(_ block: LLMContentBlock) throws -> [String: Any] {
         switch block {
         case .text(let text): return ["type": "text", "text": text]
         case .image(let mediaType, let base64, _, _):
             return ["type": "image", "source": ["type": "base64", "media_type": mediaType, "data": base64]]
         case .toolUse(let id, let name, let inputJSON):
-            let input: Any = (try? JSONSerialization.jsonObject(with: inputJSON)) ?? [String: Any]()
+            let input = try checkedProviderJSONObject(inputJSON, owner: "Recorded tool call \(name) (\(id))")
             return ["type": "tool_use", "id": id, "name": name, "input": input]
         case .toolResult(let id, let content, let isError):
             var result: [String: Any] = ["type": "tool_result", "tool_use_id": id, "content": content]
@@ -370,7 +353,7 @@ extension AnthropicTransport {
     static func nativeAnthropicMessages(
         _ messages: [LLMMessage],
         thinkingReplay: [String: [AnthropicThinkingBlock]] = [:]
-    ) -> [[String: Any]] {
+    ) throws -> [[String: Any]] {
         var out: [[String: Any]] = []
         for m in messages {
             var blocks: [[String: Any]] = []
@@ -388,7 +371,7 @@ extension AnthropicTransport {
             for block in m.content {
                 // Native messages omit empty text while retaining replay order.
                 if case .text(let text) = block, text.isEmpty { continue }
-                blocks.append(Self.anthropicBlock(block))
+                blocks.append(try Self.anthropicBlock(block))
             }
             guard !blocks.isEmpty else { continue }
             // Three-way role — see the api-key adapter's note. A `.system`
@@ -403,10 +386,7 @@ extension AnthropicTransport {
         return out
     }
 
-    /// ONE request body for both native-lane transports. The streaming and
-    /// non-streaming calls differ by exactly one key (`stream`), so they share
-    /// this builder: a tools-array or system-block difference between them
-    /// would be invisible in tests that only exercise one of the two.
+    /// One request body for native-tool and tool-free Messages streams.
     ///
     /// NO `tool_choice` KEY IS EVER SET HERE. Forced tool choice
     /// (`{"type":"any"}` / `{"type":"tool"}`) returns 400 on Fable 5.1, and
@@ -419,14 +399,14 @@ extension AnthropicTransport {
         model: String,
         tools: [LLMToolSchema],
         stream: Bool
-    ) async -> [String: Any] {
+    ) async throws -> [String: Any] {
         let replay = await thinkingReplayMap(for: messages)
-        let encoded = messages.enumerated().compactMap { index, message -> (Int, [String: Any])? in
-            Self.nativeAnthropicMessages([message], thinkingReplay: replay).first.map { (index, $0) }
+        let encoded = try messages.enumerated().compactMap { index, message -> (Int, [String: Any])? in
+            try Self.nativeAnthropicMessages([message], thinkingReplay: replay).first.map { (index, $0) }
         }
         var body: [String: Any] = [
             "model": model,
-            "max_tokens": requestMaxTokens(model: model),
+            "max_tokens": try requestOutputTokens(model: model),
             "messages": encoded.map { $0.1 },
         ]
         if stream { body["stream"] = true }
@@ -435,7 +415,7 @@ extension AnthropicTransport {
         // presence as "tool mode". The native BLOCK ENCODING still applies,
         // which is the part that must not regress (see usesNativeToolLane).
         if !tools.isEmpty {
-            body["tools"] = Self.nativeToolsArray(
+            body["tools"] = try Self.nativeToolsArray(
                 tools,
                 strict: firstPartyAnthropicToolContract,
                 cacheBreakpoint: firstPartyAnthropicToolContract
@@ -449,8 +429,8 @@ extension AnthropicTransport {
             AnthropicOAuthTransport.cacheConversationPrefix(&body, sourceMessages: messages,
                 wireSourceIndices: encoded.map { $0.0 }, usesPrefixShape: usesPrefix)
         }
-        FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model)
-        applyThinkingControls(to: &body)
+        if firstPartyAnthropicToolContract { try FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model) }
+        try applyThinkingControls(to: &body, model: model)
         return body
     }
 
@@ -480,8 +460,7 @@ extension AnthropicTransport {
     // MARK: - Response parsing
 
     /// Every `tool_use` block in wire order. `thinking` blocks are skipped here
-    /// exactly as `joinedTextBlocks` skips them — they are not tool calls and
-    /// never reply text. They are NOT discarded, though: `nativeThinkingBlocks`
+    /// they are not tool calls and never reply text. Signed thinking
     /// captures them for the replay the next round requires.
     static func nativeToolCalls(_ content: [[String: Any]]) throws -> [LLMStreamToolCall] {
         try content.filter { ($0["type"] as? String) == "tool_use" }.map { block in
@@ -495,31 +474,6 @@ extension AnthropicTransport {
             }
             return LLMStreamToolCall(id: id, name: name, inputJSON: data)
         }
-    }
-
-    /// Every `thinking` / `redacted_thinking` block in wire order — the exact
-    /// sequence the next round has to replay ahead of the tool_result turn.
-    static func nativeThinkingBlocks(_ content: [[String: Any]]) -> [AnthropicThinkingBlock] {
-        content.compactMap { AnthropicThinkingBlock(responseBlock: $0) }
-    }
-
-    // MARK: - The native call
-
-    /// Non-streaming native-tools request. Returns BOTH text and tool_use
-    /// blocks so the caller never has to re-parse prose to find a tool call.
-    ///
-    /// A native tool call can satisfy a response without text.
-    public func completeMessagesWithTools(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]
-    ) async throws -> AnthropicNativeToolResult {
-        let req = try request(body: await makeNativeToolsBody(
-            messages: messages, system: system, model: model, tools: tools, stream: false
-        ))
-
-        return try await performCompletion(request: req, model: model, nativeTools: true)
     }
 
     // MARK: - Streaming
@@ -539,13 +493,14 @@ extension AnthropicTransport {
                         fallback: .underlying(message: "streamMessages: \(error)")))
                 }
             }
+            ProviderReplyWork.current?.own(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }
 
     // MARK: - First-party SSE tool streaming (Fable 5.1 shape D)
 
-    /// Streams the SAME body `completeMessagesWithTools` posts (+ `stream`),
+    /// Streams the canonical Messages body through SSE,
     /// through the Anthropic SSE protocol, emitting:
     ///   * `.textDelta` per `text_delta` — live reply tokens;
     ///   * ONE `.toolCall` per completed `tool_use` block, its `input` assembled
@@ -585,7 +540,7 @@ extension AnthropicTransport {
         }
         defer { bytes.task.cancel() }
 
-        // Status ladder identical to completeMessagesWithTools, with the body
+        // HTTP failures retain their typed cause, with the body
         // drained (bounded) so a provider message survives into the error.
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if !(200..<300).contains(status) {
@@ -619,7 +574,7 @@ extension AnthropicTransport {
         var openThinkingSignature = ""
         var openThinkingData: String?
         var thinkingBlocks: [AnthropicThinkingBlock] = []
-        var runaway = RunawayOutputDetector()
+        var runaway = RunawayOutputDetector(diagnosticDataRoot: telemetry.diagnosticDataRoot)
 
         func commitToolCalls(terminal: Bool, stopReason: String?) async throws -> Bool {
             var committed = false

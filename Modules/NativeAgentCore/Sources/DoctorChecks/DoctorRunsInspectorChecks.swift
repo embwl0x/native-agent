@@ -6,7 +6,7 @@ import TurnTrace
 import SwarmRuns
 // Blueprint: | `DoctorRunsInspectorChecks.swift` | Inspector health verdict from the engine's persisted-trace observation state |
 
-/// Reads runs.json exactly as the Runs page does (bare array or {"runs": [...]}).
+/// Reads runs.json exactly as the Runs page does (a bare array).
 private enum DoctorRunLedgerRead {
     static func rowCount(root: URL) throws -> Int? {
         let path = root.appendingPathComponent("runs/runs.json")

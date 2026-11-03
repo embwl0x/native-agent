@@ -5,6 +5,7 @@ import Foundation
 public enum ChatSlashCommandRoute: String, Sendable, CaseIterable {
     case clear, compact, model, think, fast, persona, remember, note, scratch
     case help, tools, export, new
+    case settings, connect, helpers, agents, today, desk, memory, forget, voice, context
 }
 
 public struct ChatSlashCommandDescriptor: Identifiable, Equatable, Sendable {
@@ -33,6 +34,16 @@ public enum ChatSlashCommandRegistry {
         .init(route: .scratch, command: "scratch", description: "Write ephemeral session scratchpad", placeholder: "scratch <key> <value>"),
         .init(route: .tools, command: "tools", description: "Open the Tools catalog", placeholder: ""),
         .init(route: .export, command: "export", description: "Export chat as Markdown to Downloads", placeholder: ""),
+        .init(route: .settings, command: "settings", description: "Open Settings", placeholder: ""),
+        .init(route: .connect, command: "connect", description: "Open connections or a service's setup", placeholder: "connect [service]"),
+        .init(route: .helpers, command: "helpers", description: "Open Helpers", placeholder: ""),
+        .init(route: .agents, command: "agents", description: "Open agent connections and threads", placeholder: ""),
+        .init(route: .today, command: "today", description: "Open Today", placeholder: ""),
+        .init(route: .desk, command: "desk", description: "Open Desk", placeholder: ""),
+        .init(route: .memory, command: "memory", description: "Browse or search saved memories", placeholder: "memory [thing]"),
+        .init(route: .forget, command: "forget", description: "Choose a saved memory to forget, with confirmation", placeholder: ""),
+        .init(route: .voice, command: "voice", description: "Start or stop voice input", placeholder: ""),
+        .init(route: .context, command: "context", description: "Open the last turn's context receipt", placeholder: ""),
         .init(route: .help, command: "help", description: "Show all slash commands", placeholder: ""),
     ]
 
@@ -60,6 +71,8 @@ public enum ChatSlashCommandRouting {
         /// A recognized command on a surface that cannot run it. The payload
         /// is the bare command name, for the toast.
         case unsupportedHere(String)
+        /// A command-shaped word that is absent from the registry.
+        case unknownCommand(String)
     }
 
     /// `supportsDispatch` is the surface's answer to whether it can run commands.
@@ -73,7 +86,10 @@ public enum ChatSlashCommandRouting {
         let name = (body.components(separatedBy: .whitespacesAndNewlines).first ?? "")
             .lowercased()
         guard ChatSlashCommandRegistry.commandNames.contains(name) else {
-            return .sendAsMessage
+            // Paths (/tmp/file), URLs and other slash prose remain ordinary
+            // messages. A bare command word must never silently become a turn.
+            return name.range(of: "^[a-z][a-z0-9_-]*$", options: .regularExpression) != nil
+                ? .unknownCommand(name) : .sendAsMessage
         }
         return supportsDispatch ? .dispatch(body) : .unsupportedHere(name)
     }
@@ -82,6 +98,10 @@ public enum ChatSlashCommandRouting {
     /// just refusing.
     public static func unsupportedMessage(command: String) -> String {
         "/\(command) only works in the main chat window."
+    }
+
+    public static func unknownMessage(command: String) -> String {
+        "Unknown command /\(command). Type /help for the list."
     }
 }
 
@@ -103,7 +123,7 @@ public protocol ChatSlashCommandHost: AnyObject, Sendable {
 
 public extension ChatSlashCommandRouting {
     enum CommandDisposition {
-        case presentation(ChatSlashCommandRoute)
+        case presentation(ChatSlashCommandRoute, argument: String)
         case consumed
         case deferred
         case refused(String)
@@ -121,12 +141,20 @@ public extension ChatSlashCommandRouting {
             .components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
         let command = parts.first?.lowercased() ?? ""
         let argument = parts.dropFirst().joined(separator: " ")
-        switch ChatSlashCommandRegistry.descriptor(named: command)?.route {
-        case .new: return .presentation(.new)
-        case .clear: return .presentation(.clear)
-        case .help: return .presentation(.help)
-        case .tools: return .presentation(.tools)
-        case .export: return .presentation(.export)
+        guard let route = ChatSlashCommandRegistry.descriptor(named: command)?.route else {
+            return .refused(unknownMessage(command: command))
+        }
+        switch route {
+        case .new: return .presentation(.new, argument: argument)
+        case .clear: return .presentation(.clear, argument: argument)
+        case .help: return .presentation(.help, argument: argument)
+        case .tools: return .presentation(.tools, argument: argument)
+        case .export: return .presentation(.export, argument: argument)
+        case .settings, .connect, .helpers, .agents, .today, .desk, .memory, .forget, .voice, .context:
+            guard argument.isEmpty || route == .connect || route == .memory else {
+                return .refused("/\(command) takes no arguments")
+            }
+            return .presentation(route, argument: argument)
         case .compact:
             if host.activeChatSessionId.isEmpty {
                 toast("No active session to compact")
@@ -186,8 +214,6 @@ public extension ChatSlashCommandRouting {
                 mutationFinished(result.succeeded, result.message)
             }
             return .deferred
-        case nil:
-            return .refused("Unknown command /\(command). Type /help for the list.")
         }
         return .consumed
     }

@@ -105,7 +105,7 @@ extension CognitionObservatoryView {
                             Text("\(receipt.request.model) via \(receipt.provider)")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                            Text("estimated tokens \(tokens), estimated cost units \(String(format: "%.2f", receipt.estimatedCostUnits)), proposals \(receipt.proposalIds.count), yield \(String(format: "%.2f", receipt.proposalYieldScore))")
+                            Text("estimated tokens \(tokens), estimated cost units \(String(format: "%.2f", receipt.estimatedCostUnits)), cares affected \(receipt.affectedCareIDs.count)")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }

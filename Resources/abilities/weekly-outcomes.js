@@ -1,12 +1,12 @@
 /* NativeAgent ability
-{"id":"weekly-outcomes","kind":"tool","version":1,"reach":{"capabilities":[]},"face":{"page":"desk"},"record":{"description":"Compose the weekly Workshop outcome digest from complete native-normalized samples. CPU only; never schedules work or reads execution stores.","actions":[],"inputSchema":{"type":"object","required":["availability","samples"],"properties":{"availability":{"type":"string","enum":["available"]},"samples":{"type":"array"},"maxWeeks":{"type":"integer"},"onlyTriggerSource":{"type":["string","null"]}},"additionalProperties":false,"readOnly":true}}}
+{"id":"weekly-outcomes","kind":"ability","version":1,"reach":{"capabilities":[]},"face":{"page":"desk"},"record":{"description":"Compose the weekly Workshop outcome digest from complete native-normalized samples. CPU only; never schedules work or reads execution stores.","actions":[],"inputSchema":{"type":"object","required":["availability","samples"],"properties":{"availability":{"type":"string","enum":["available"]},"samples":{"type":"array"},"maxWeeks":{"type":"integer"},"onlyTriggerSource":{"type":["string","null"]}},"additionalProperties":false,"readOnly":true}}}
 */
 
 function run(input) {
     // Native source failures never arrive as an empty sample list. The native
     // owner fails the pass; L0 refuses oversized input without truncation.
     const median = values => {
-        if (!values.length) return 0;
+        if (!values.length) return null;
         const sorted = values.slice().sort((a, b) => a - b);
         const middle = Math.floor(sorted.length / 2);
         return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
@@ -32,7 +32,7 @@ function run(input) {
         return {
             weekStart: week, total: group.length, terminal: terminal.length, completed,
             unverified: group.filter(s => s.status === "unverified").length,
-            completionRate: terminal.length ? completed / terminal.length : 0,
+            completionRate: terminal.length ? completed / terminal.length : null,
             medianTotalSteps: median(group.map(s => s.totalSteps)),
             medianWallSeconds: median(terminal.map(s => s.wallSeconds)),
             medianRerunCount: median(group.map(s => s.rerunCount)),
@@ -43,18 +43,18 @@ function run(input) {
     if (!weeks.length || window === 0) return "";
     const recent = weeks.slice(-window);
     const lines = recent.map(w => {
-        const rate = Math.round(w.completionRate * 100);
-        const wall = w.medianWallSeconds >= 60
+        const rate = w.completionRate === null ? "unmeasured" : Math.round(w.completionRate * 100) + "%";
+        const wall = w.medianWallSeconds === null ? "unmeasured" : w.medianWallSeconds >= 60
             ? Math.round(w.medianWallSeconds / 60) + "m" : Math.round(w.medianWallSeconds) + "s";
         return "- week of " + w.weekStart + ": "
-            + w.total + " job(s), " + w.completed + "/" + w.terminal + " completed (" + rate + "%), "
+            + w.total + " job(s), " + w.completed + "/" + w.terminal + " completed (" + rate + "), "
             + w.unverified + " unverified, "
-            + "median " + Math.round(w.medianTotalSteps) + " steps, ~" + wall + " wall, "
+            + "median " + Math.round(w.medianTotalSteps) + " steps, " + (w.medianWallSeconds === null ? "" : "~") + wall + " wall, "
             + w.medianRerunCount.toFixed(1) + " reruns, "
             + Math.round(w.stubRate * 100) + "% planner-fallback";
     });
     let trend = "";
-    if (recent.length >= 2) {
+    if (recent.length >= 2 && recent[recent.length - 1].terminal > 0 && recent[recent.length - 2].terminal > 0) {
         const delta = (recent[recent.length - 1].completionRate - recent[recent.length - 2].completionRate) * 100;
         const direction = delta > 0.5 ? "UP" : delta < -0.5 ? "DOWN" : "flat";
         // String(format: "%+.0f") keeps a minus for negative values rounded to

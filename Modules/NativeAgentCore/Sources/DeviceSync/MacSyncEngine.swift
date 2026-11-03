@@ -10,7 +10,7 @@ import NativeAgentCore
 import MemoryV2
 import PersistenceCore
 
-// Blueprint: | `MacSyncEngine.swift` | Mac snapshot/inbox state, active chat tasks and stop bookkeeping; chat snapshots add read-only other-room exchanges beside canonical messages |
+// Blueprint: | `MacSyncEngine.swift` | Mac snapshot/inbox state, pairing write/verification phase and active chat tasks; scoped Stop is retained by the durable chat admission ledger; chat snapshots add read-only other-room exchanges beside canonical messages |
 
 // MARK: - MacSyncEngine
 
@@ -28,10 +28,7 @@ public final class MacSyncEngine: ObservableObject {
     var responsesDir: URL?
     var transactionDir: URL?
     var inboxQuery: NSMetadataQuery?
-    /// Slow missed-event integrity fallback. Normal snapshot writes are driven
-    /// by app/store mutation seams; unchanged passes write nothing and make no
-    /// provider calls.
-    var snapshotIntegrityTask: Task<Void, Never>?
+    /// Exact snapshot-file observation; app/store mutations own normal writes.
     var snapshotIntegrityWatcher: FileChangeWatcher?
     var snapshotIntegrityReconcileTask: Task<Void, Never>?
     var snapshotIntegrityReconcileQueued = false
@@ -44,8 +41,8 @@ public final class MacSyncEngine: ObservableObject {
     var presenceBeatDue: Date?
     var presenceBeatDelay = NAMacPresence.beat
     /// Payload-free resident-state subscription. This closes the normal
-    /// cognition/organism -> iOS snapshot path without shortening the slow
-    /// integrity fallback or adding a polling loop.
+    /// cognition/organism -> iOS snapshot path; exact file observations and
+    /// explicit launch/repair reconciliation cover integrity.
     var cognitionSnapshotObservationTask: Task<Void, Never>?
     var helpersSnapshotWatcher: FileChangeWatcher?
     var workActivityObservationTask: Task<Void, Never>?
@@ -91,10 +88,8 @@ public final class MacSyncEngine: ObservableObject {
     /// What a remote Stop actually did to the session's in-flight chat task.
     public enum MacSyncChatCancelOutcome: String, Equatable {
         case cancelled
-        /// Leave the current run and disk markers untouched; retain Stop for the named run's registration.
+        /// Leave the current run and disk markers untouched.
         case runMismatch
-        /// Hold an early scoped Stop until its run registers, without writing a session cancel marker.
-        case stopRecorded
         case noActiveTask
     }
 
@@ -109,46 +104,6 @@ public final class MacSyncEngine: ObservableObject {
     // registered until their forwarder settles and unregisters the exact task.
     // Remote Stop remains the separate explicit cancellation path.
 
-    /// Early Stops are keyed by session and run, consumed at registration, and bounded by TTL and cap.
-    var stopRequestedChatRuns: [String: Date] = [:]
-    static let stopRequestedRunTTL: TimeInterval = 300
-    static let stopRequestedRunCap = 64
-
-    private static func stopRequestKey(session: String, runID: String) -> String {
-        "\(session)\u{1}\(runID)"
-    }
-
-    private func pruneStopRequestedChatRuns(now: Date = Date()) {
-        stopRequestedChatRuns = stopRequestedChatRuns.filter { $0.value > now }
-        guard stopRequestedChatRuns.count > Self.stopRequestedRunCap else { return }
-        // Oldest deadline first; a run that never registers is the only way to
-        // get here and dropping the stalest one is the right eviction.
-        let doomed = stopRequestedChatRuns
-            .sorted { $0.value < $1.value }
-            .prefix(stopRequestedChatRuns.count - Self.stopRequestedRunCap)
-        for entry in doomed { stopRequestedChatRuns.removeValue(forKey: entry.key) }
-    }
-
-    func recordStopRequestedChatRuns(for sessionID: String, runIDs: [String]) {
-        let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !runIDs.isEmpty else { return }
-        let deadline = Date().addingTimeInterval(Self.stopRequestedRunTTL)
-        for runID in runIDs where !runID.isEmpty {
-            stopRequestedChatRuns[Self.stopRequestKey(session: trimmed, runID: runID)] = deadline
-        }
-        pruneStopRequestedChatRuns()
-    }
-
-    /// True exactly once per recorded (session, run): a Stop was already asked
-    /// for and this run is it.
-    func consumeStopRequestedChatRun(for sessionID: String, runID: String?) -> Bool {
-        let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let runID, !runID.isEmpty else { return false }
-        pruneStopRequestedChatRuns()
-        return stopRequestedChatRuns
-            .removeValue(forKey: Self.stopRequestKey(session: trimmed, runID: runID)) != nil
-    }
-
     public func registerActiveChatTask(
         _ task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int, attachments: [NativeAgentShared.MultimodalAttachment], cause: Error?), Never>,
         for sessionID: String,
@@ -160,10 +115,6 @@ public final class MacSyncEngine: ObservableObject {
             existing.task.cancel()
         }
         activeChatTasks[trimmed] = ActiveChatTask(task: task, runID: runID)
-        // Registration honors any Stop already recorded for this exact run.
-        if consumeStopRequestedChatRun(for: trimmed, runID: runID) {
-            task.cancel()
-        }
     }
 
     public func unregisterActiveChatTask(
@@ -189,14 +140,12 @@ public final class MacSyncEngine: ObservableObject {
         let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .noActiveTask }
         guard let entry = activeChatTasks[trimmed] else {
-            // Retain a named Stop until registration; turn acceptance clears unscoped disk markers.
+            // The action router durably retained this named Stop before task cancellation.
             guard !runIDs.isEmpty else { return .noActiveTask }
-            recordStopRequestedChatRuns(for: trimmed, runIDs: runIDs)
-            return .stopRecorded
+            return .noActiveTask
         }
         if !runIDs.isEmpty, let runID = entry.runID, !runIDs.contains(runID) {
-            // Hold Stop for the named run's registration while leaving the current run untouched.
-            recordStopRequestedChatRuns(for: trimmed, runIDs: runIDs)
+            // Leave the other run untouched; the router retained the named Stop.
             return .runMismatch
         }
         entry.task.cancel()
@@ -205,7 +154,9 @@ public final class MacSyncEngine: ObservableObject {
 
     let processedIdsCap = 5000
     var _pairingSecret: Data?
-    var pairingSecretRotationInProgress = false
+    enum PairingSecretRotation: Equatable { case writing, awaitingVerification }
+    var pairingSecretRotation: PairingSecretRotation?
+    var pairingSecretRotationInProgress: Bool { pairingSecretRotation != nil }
     enum KVSKey {
         static let snapshotUpdated = "snapshot_updated"
         static let inboxPending = "inbox_pending"

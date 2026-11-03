@@ -18,13 +18,12 @@ public enum CognitiveEventKind: String, Codable, Sendable, Equatable, CaseIterab
     /// Direction/band travel in metadata; the somatic adapter reads them to
     /// grade sluggishness vs relief.
     case providerVitalsShift
-    case workshopExecutionCompleted = "missionCompleted" // compatibility wire ID
     case appWake
     case appSleep
     /// Round 3 Wave A2 — a bodily resolution the organism felt strongly
     /// enough to remember: relief (braced expectation landed fine) or earned
-    /// disappointment (counted-on expectation fell through). Minted ONLY by
-    /// the runtime's kernel drain; carries feltValence/feltArousal metadata.
+    /// disappointment (counted-on expectation fell through), or a noticed break
+    /// in his day. Runtime-owned, care-gated; carries feltValence/feltArousal metadata.
     case organismResolutionFelt
 
     var nodeKind: CognitiveNodeKind {
@@ -37,8 +36,6 @@ public enum CognitiveEventKind: String, Codable, Sendable, Equatable, CaseIterab
             return .correction
         case .providerFailure, .providerVitalsShift:
             return .providerHealth
-        case .workshopExecutionCompleted:
-            return .workshopExecution
         case .appWake, .appSleep:
             return .appLifecycle
         case .organismResolutionFelt:
@@ -161,7 +158,7 @@ public struct CognitiveEvent: Codable, Sendable, Equatable {
         let safeID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         let defaultTurnKind: CognitiveTurnKind
         switch kind {
-        case .toolStarted, .toolSucceeded, .toolFailed, .toolCancelled, .providerFailure, .providerVitalsShift, .workshopExecutionCompleted, .appWake, .appSleep, .organismResolutionFelt:
+        case .toolStarted, .toolSucceeded, .toolFailed, .toolCancelled, .providerFailure, .providerVitalsShift, .appWake, .appSleep, .organismResolutionFelt:
             defaultTurnKind = .system
         case .userMessageReceived, .assistantTurnCompleted, .userCorrection:
             defaultTurnKind = .live
@@ -197,33 +194,13 @@ public struct CognitiveEvent: Codable, Sendable, Equatable {
         ].joined(separator: "|")
     }
 
-    /// Exact terminal direction when this event's closed kind/metadata can
-    /// establish one. `workshopExecutionCompleted` is a legacy wire name for
-    /// every Workshop terminal event, so its canonical `status` must decide
-    /// whether the outcome helped, hurt, or remains unknown. Treating the enum
-    /// case itself as success made failed/cancelled work reduce uncertainty in
-    /// the resident affect path while the organism signal path correctly
-    /// reported a block.
+    /// Exact terminal direction established by the event's current kind.
     var terminalOutcomePolarity: Int {
         switch kind {
         case .toolSucceeded:
             return 1
         case .toolFailed, .providerFailure, .userCorrection:
             return -1
-        case .workshopExecutionCompleted:
-            guard case .string(let rawStatus)? = metadata["status"] else {
-                // Backward compatibility for historical `missionCompleted`
-                // events written before canonical status metadata existed.
-                return 1
-            }
-            switch rawStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "completed", "done", "succeeded":
-                return 1
-            case "failed", "blocked", "cancelled", "canceled":
-                return -1
-            default:
-                return 0
-            }
         default:
             return 0
         }

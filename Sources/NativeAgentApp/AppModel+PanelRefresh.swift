@@ -20,7 +20,7 @@ import MultimodalTTS
 import SystemOps
 import TelegramBot
 import DeviceSync
-// Blueprint: | `AppModel+PanelRefresh.swift` | `AppModel`: per-panel `LatestRead` and freshness receipts; sidebar reads engine-owned sources without claiming unrelated refreshes |
+// Blueprint: | `AppModel+PanelRefresh.swift` | `AppModel`: per-panel `LatestRead` and freshness receipts; Activity and sidebar share one ordered badge read of engine-owned sources without claiming unrelated refreshes |
 
 @MainActor
 extension AppModel {
@@ -41,7 +41,6 @@ extension AppModel {
         let previousName = persona.profile?.name
         let memory = engine.memory
         let approvalStore = engine.approvals
-        let inbox = engine.inbox
         let toolStore = engine.tools
         var failedEndpoints: [String] = []
         // Branches that perform no read must not claim refreshed data.
@@ -59,21 +58,18 @@ extension AppModel {
             if engine.providers.settings?.catalogError != nil { failedEndpoints.append("model catalog") }
             await reloadChatState()
             if chatStateLoadFailed { failedEndpoints.append("chat messages") }
-            _ = fresh("personality", try? await persona.prepareDocuments())
+            _ = fresh("personality", try? await persona.loadDocuments())
             // Load the profile on Chat entry so every name comes from its owner.
             if persona.profile == nil {
                 _ = fresh("personality profile", try? await persona.loadProfile())
                 teachMemoryHygieneName(previousName: previousName)
             }
-        case .legacyWorkshop:
-            // Approvals refresh independently of execution runs.
-            _ = fresh("runs", try? await engine.runs.refresh(dataRoot: engine.dataRoot))
-        case .desk, .workshop, .work, .command, .bots:
+        case .desk, .bots:
             // Nothing is read here, so nothing is said about freshness below.
             performedRead = false
             // DeskPageView, SchedulerView and ResearchView own their bounded reads.
             break
-        case .memory, .memories, .knowledge:
+        case .memories, .knowledge:
             async let nextMemories = try? memory.refreshMemories()
             async let nextMemoryProposals = try? memory.proposals(status: "pending")
             async let nextMemoryStatus = memory.refreshStatuses()
@@ -102,7 +98,7 @@ extension AppModel {
         case .connectors:
             _ = fresh("connectors", try? await engine.connectors.refresh().get())
             _ = fresh("shared folders", try? await engine.connectors.refreshWorkspaces())
-        case .settingsHub, .settings, .providers, .telegram, .inboxPolicy, .macIntegration:
+        case .settings, .providers, .telegram, .inboxPolicy, .macIntegration:
             async let nextConfig: Void? = try? RuntimeReadouts.configuration(engine: engine)
             async let nextTelegramStatus = try? engine.telegram.refresh(manager: backgroundLoopsManager)
             async let nextConnectors = try? engine.connectors.refresh().get()
@@ -114,18 +110,9 @@ extension AppModel {
             _ = fresh("config", configRow)
             _ = fresh("telegram status", telegramRow)
             _ = fresh("connectors", connectorRows)
-        case .approvals, .activity:
-            async let nextApprovals = try? approvalStore.list()
-            async let nextInbox = try? inbox.list()
-            async let nextMemoryProposals = try? memory.proposals(status: "pending")
-            let (approvalRows, inboxRows, proposalRows) = await (
-                nextApprovals,
-                nextInbox,
-                nextMemoryProposals
-            )
-            _ = fresh("approvals", approvalRows)
-            _ = fresh("inbox", inboxRows)
-            _ = fresh("memory proposals", proposalRows)
+        case .activity:
+            let badgeReceipt = await refreshSidebarActivityBadge()
+            failedEndpoints += badgeReceipt.failedEndpoints
             // LatestRead is main-actor owned: read it here, not in an async let child task.
             let nextMisses = await missLessonsRead.read({ await MemoryRecoveryReadout.recentMisses(dataRoot: engine.dataRoot) }, publish: { rows in
                 if let rows { missLessons = rows }
@@ -167,9 +154,6 @@ extension AppModel {
             _ = fresh("tools", toolRows)
             _ = fresh("approvals", approvalRows)
             _ = fresh("connector actions", connectorActionRegistryRow)
-        case .autoImprovement:
-            // The weekly pass reads its digest directly.
-            _ = await refreshSchedulerJobs()
         case .dreams:
             // The Dreams tab fetches its diary itself; refresh the trust policy
             // here so the REM toggle (trainingPolicy.rem_cycle_enabled) reflects
@@ -177,7 +161,7 @@ extension AppModel {
             _ = fresh("trust policy", try? await engine.trust.load())
         case .cognition:
             performedRead = false
-        case .skills, .skillLifecycle:
+        case .skills:
             _ = fresh("skills", try? await toolStore.refreshSkills())
         case .diagnostics:
             // Diagnostics reads Doctor's activity projection and the run ledger.
@@ -214,12 +198,6 @@ extension AppModel {
             _ = fresh("connectors", connectorRows)
             _ = fresh("workspaces", workspaceRows)
             _ = fresh("backups", backupRows)
-        case .panels:
-            async let nextSkills = try? toolStore.refreshSkills()
-            async let nextTools = try? toolStore.listAuthored()
-            let (skillRows, toolRows) = await (nextSkills, nextTools)
-            _ = fresh("skills", skillRows)
-            _ = fresh("tools", toolRows)
         case .tools:
             async let nextTools = try? toolStore.listAuthored()
             async let nextConnectorActions = try? engine.connectors.refreshActions()
@@ -247,18 +225,6 @@ extension AppModel {
         }, publish: { result in
         let (receipt, performedRead) = result
         panelRefreshStatus[item] = receipt
-        if item.normalized == .activity {
-            // Reuse the Activity read for the badge’s three sources without another fetch.
-            let badgeEndpoints: Set<String> = ["approvals", "inbox", "memory proposals"]
-            let badgeFailures = receipt.failedEndpoints.filter { badgeEndpoints.contains($0) }
-            if let nextStatus = Self.staleFlagOnlyStatusToStore(
-                previous: sidebarActivityRefreshStatus,
-                failedEndpoints: badgeFailures,
-                at: receipt.lastAttemptAt
-            ) {
-                sidebarActivityRefreshStatus = nextStatus
-            }
-        }
         // Only Diagnostics reads runtime health; other pages report their own reads.
         if item.normalized == .diagnostics {
             statusText = engine.doctor.health?.ok == true ? "I'm online" : "I'm unavailable"
@@ -338,6 +304,8 @@ extension AppModel {
     @MainActor
     @discardableResult
     func refreshSidebarActivityBadge() async -> PanelRefreshStatus {
+        let attemptedAt = Date()
+        let receipt = await sidebarActivityRead.read({
         let approvalStore = engine.approvals
         let inbox = engine.inbox
         let memory = engine.memory
@@ -354,19 +322,22 @@ extension AppModel {
         if approvalRows == nil { failed.append("approvals") }
         if inboxRows == nil { failed.append("inbox") }
         if proposalRows == nil { failed.append("memory proposals") }
-        let attemptedAt = Date()
         let receipt = PanelRefreshStatus(
             lastAttemptAt: attemptedAt,
             lastSuccessAt: failed.isEmpty ? attemptedAt : sidebarActivityRefreshStatus?.lastSuccessAt,
             failedEndpoints: failed
         )
+        return receipt
+        }, publish: { receipt in
         if let nextStatus = Self.staleFlagOnlyStatusToStore(
             previous: sidebarActivityRefreshStatus,
-            failedEndpoints: failed,
-            at: attemptedAt
+            failedEndpoints: receipt.failedEndpoints,
+            at: receipt.lastAttemptAt
         ) {
             sidebarActivityRefreshStatus = nextStatus
+            ModuleLog.app("[sidebar-activity] published attempt=\(receipt.lastAttemptAt.timeIntervalSince1970) failed_endpoints=\(receipt.failedEndpoints.joined(separator: ","))")
         }
+        })
         await publishWorkStatus()
         return receipt
     }

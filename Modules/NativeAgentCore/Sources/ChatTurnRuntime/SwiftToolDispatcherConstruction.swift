@@ -30,7 +30,7 @@ extension SwiftToolDispatcher {
         macIntegrationPermissionStore: MacIntegrationPermissionStore? = nil,
         appTools: (any ToolExecutor)? = nil,
         agentBridgeConfigRoot: URL? = nil,
-        a2aPushConfiguration: (@Sendable (AgentPeerContact) async -> JSONValue?)? = nil,
+        a2aPushConfiguration: (@Sendable (AgentPeerContact) async throws -> JSONValue)? = nil,
         standingBotRunEnqueue: (@Sendable (UUID, String?) throws -> BotRunReceipt)? = nil,
         standingBotSession: BotRunnerSession? = nil
     ) {

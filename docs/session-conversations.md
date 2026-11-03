@@ -8,6 +8,13 @@ existing retention archive index; this adds no durable store. Single-ID reads
 reuse a process-lifetime cache of parsed indexes keyed by file path and stamp;
 a changed `SnapshotTailOpLog.FileStamp` causes the index to be read again.
 Failed inspection cannot authorize a cache hit; index reads retain their symlink behavior.
+Every new empty session records `transcriptGeneration: 0`; the canonical
+message transaction advances it on append or rewrite. Restoring a retained
+session keeps its existing generation rather than declaring it new.
+An archive row whose transcript path or bytes are unavailable refuses restoration;
+only a missing archive row permits creation of a new session. Clear changes the
+canonical `chat/messages/<id>.jsonl` only; compaction backups and archived originals
+remain retained evidence, never a second nested transcript cleared on its behalf.
 Peer provenance, dreams, cares, capsules and moment recall pass their owning
 app's data root into this read, including when another app data root is active.
 Dream gathering excludes own-work and helper-owned sessions, and reads the
@@ -33,9 +40,10 @@ without creator evidence, so such a row stays unclassified (`legacy`).
 unavailable index proves no kind.
 
 Helper-only policies need the helper owner as well as the common `agent`
-kind. A helper writes its exact `helperID` on its session; older rows' `bot`
-creation provenance identifies the same owner. `SessionConversation.isHelper`
-reads that row evidence, so peer turns retain the resident's glance and
+kind. A helper writes its exact `helperID` on its session. Admission calls
+`SessionConversation.checkedIsHelper`; unavailable index reads throw before
+choosing resident or helper behavior. A successfully read index with no owner
+is distinct from an unreadable index. The row evidence lets peer turns retain the resident's glance and
 context while helper loops remain independent. Routing a particular helper
 uses the helper owner's locator inverse, `BotDefinition.id(forSession:)`;
 this is identity resolution, not conversation classification.
@@ -46,14 +54,20 @@ Fast facts from the provider owner's checked session presentation. A recognized
 helper with an unavailable definition keeps its unavailable helper contract.
 Missing presentations disable model/effort controls; only a checked resident
 presentation admits pending picks and model, effort or Fast writes to Chat defaults.
+Phone ingress, steering, memory and caring policies, composer controls and
+the resident glance use that checked ownership boundary. Failed ownership
+inspection withholds the dependent work and reports the index's cause; it
+never becomes a resident conversation.
 
-Every transcript read shares the Mac slot's `LatestRead` row/card publication
-and its engine's turn owner, including phone and card refreshes. Unowned rows
-admit disk; populated live rows win, empty live slots may be seeded, and a turn
-that advances during a read wins over it. This owner restores optimistic row
-identities and retains synthetic failures for selection, reload and detached windows.
-It reconciles text, optimistic rows and fresh cards before one structural publication;
-cards can still advance when a changed turn prevents disk text replacement.
+A conversation on screen is the saved conversation with the live turn over it.
+`saved` is the last read of the store (rows with their cards); only a read writes
+it, and a mounted conversation reads when its file changes, whoever wrote it.
+`live` holds the rows the turn owns (the optimistic request, the streaming reply,
+an unsaved notice), each under the id the store will save it with. While its turn
+leads, a live row is drawn over its saved copy (a resumed reply over the partials
+it replaces); when the turn settles, the row leaves the moment the store holds it.
+A row the store never takes stays until a newer completed reply lands. No turn
+refreshes a view, so Stop or a cancelled task can never hide what was saved.
 
 Only the creator corrects a kind its older writer recorded incorrectly.
 For Telegram and Slack, `SessionConversation` reads historical hot and archived
@@ -92,10 +106,41 @@ chat acceptance. A publication write failure keeps its cause in a dismissible
 notice and warns that other surfaces may still open the preceding conversation;
 it does not reject the accepted message or erase the new session.
 
-Navigation projects the Mac pin preference `NativeAgent.pinnedChatSessionIds`
-and its retention mirror `chat/pinned_session_ids.json`, alongside the separate
-`chat/anchor_pin.json`. `ChatSessionNavigation` carries these resolved pin and
-anchor flags to the phone; it does not introduce another pin store.
+Navigation, retention and phone publication read one ordered durable pin list,
+`chat/pinned_session_ids.json`, alongside the separate `chat/anchor_pin.json`.
+There is no persisted defaults copy or union of pin authorities. An absent pin
+file is an empty list; an unreadable or malformed file preserves the current UI
+publication, reports its cause and halts retention. Navigation watches the pin
+file itself. `ChatSessionNavigation` carries the resolved pin and anchor flags
+to the phone; it does not introduce another pin store.
+
+History search accepts one explicit scope (`all_sessions`, `current_session`,
+`previous_session`) and sort (`relevance`, `oldest`, `newest`). It never widens a
+weak search into another scope. Unresolved current/previous scope returns
+`status: unavailable`, `coverage.scope_resolution_failed: true` and incomplete
+coverage. Exact-message reads include selected-but-missing transcripts in
+incomplete coverage; a missing result then proves no absence. Conversation
+projections expose unavailable source/revision as null, never a guessed app
+source or a synthetic historical revision. The human index accepts current
+declared sources (`app`, `ios`, `telegram`, `slack`).
+
+Contact reply projections quote only the matching canonical conversation line.
+A retained reply record with no matching line reports incomplete history; its
+cached answer cannot stand in as transcript speech. Run-origin indexes inspect
+the transcript's shared filesystem version before cache hits, extend only
+in-place appends, and rebuild after replacement or a same-size/shrinking rewrite.
+An in-place append during a read preserves the prefix bounded by the initial
+file stamp; only whole rows in that prefix enter the index, and later bytes
+are picked up on the next read. Replacement, shrink or a same-size rewrite
+during the read leaves provenance unavailable until a subsequent read.
+Delegation reads name each lifecycle decode or transcript-origin read gap in
+`source_availability.detail` and mark that source `partial`; readable sibling
+jobs still return. Exact-message and agent-filtered reads retain these gaps:
+an unknown principal cannot establish that the failed item belongs elsewhere.
+
+Destructive compaction keeps an inline card unless its interaction is terminal
+and its continuation is explicitly absent/null or spent (`resumed`, `invalidated`).
+A malformed continuation is unknown and the card stays verbatim.
 
 The old contact-ID regex and scattered bot/agent/wake prefix classifications
 are removed. Exact contact namespaces for finding that contact's history,

@@ -124,7 +124,7 @@ extension SwiftNativeChatOrchestrationClient {
             if let key = checkpoint.owedDelivery(status: "completed")?.key {
                 let settle: ExperienceStore.Change? = switch verdict {
                 case "completed": .obligation(key: key, phase: .accepted)
-                case "sent_unconfirmed": .letGo(key: key, reason: .abandoned)
+                case "sent_unconfirmed", "let_go": .letGo(key: key, reason: .abandoned)
                 default: nil
                 }
                 if let settle {

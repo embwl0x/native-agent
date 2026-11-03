@@ -2,7 +2,8 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `StudioCanon.swift` | Append-only membership, evidence-bound proposal references and unchanged native identity/fingerprints (fixed 90-day silence ledger units); editable `Resources/abilities/studio-canon.js` owns proposal selection/reasons and the next silence deadline; native counts/entry ids cannot be supplied by the part, native capacity and agent-only decision/append authority remain |
+import Experiences
+// Blueprint: | `StudioCanon.swift` | Strict current membership rows require explicit provenance/evidence; append-only membership and unchanged native fingerprints (fixed 90-day silence ledger units); editable `Resources/abilities/studio-canon.js` owns proposals and silence deadlines; production-pull failures retain successful recall and exact unconfirmed pulls through Experiences repair debt, which blocks canon count evidence until reconciled; native capacity and agent-only append authority remain |
 
 // Native storage owns canon identity, membership, evidence and the append-only decision ledger.
 // studio-canon.js owns proposal selection, reasons and silence deadlines; proposals never decide membership.
@@ -120,28 +121,23 @@ public struct StudioCanonRow: Sendable, Equatable {
               case .object(let work)? = obj["work"],
               case .string(let title)? = work["title"],
               case .string(let decidedAt)? = obj["decided_at"],
-              case .string(let decidedBy)? = obj["decided_by"] else { return nil }
-        var surface = ""
-        if case .string(let value)? = obj["decided_on_surface"] { surface = value }
-        var turn = ""
-        if case .string(let value)? = obj["decided_in_turn"] { turn = value }
-        var creator: String?
-        if case .string(let c)? = work["creator"], !c.isEmpty { creator = c }
-        var evidenceKind = StudioCanonEvidenceKind.recurrence
-        if case .string(let raw)? = obj["evidence_kind"],
-           let parsed = StudioCanonEvidenceKind(rawValue: raw) { evidenceKind = parsed }
-        var entryIDs: [String] = []
-        if case .array(let arr)? = obj["evidence_entry_ids"] {
-            entryIDs = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
-        }
-        var note: String?
-        if case .string(let n)? = obj["note"], !n.isEmpty { note = n }
-        return StudioCanonRow(
-            proposalID: proposalID, action: action, standing: standing,
-            workTitle: title, workCreator: creator, decidedAt: decidedAt,
-            decidedBy: decidedBy, decidedOnSurface: surface, decidedInTurn: turn,
-            evidenceKind: evidenceKind, evidenceEntryIDs: entryIDs, note: note
-        )
+              case .string(let decidedBy)? = obj["decided_by"],
+              case .string(let evidenceRaw)? = obj["evidence_kind"],
+              let evidenceKind = StudioCanonEvidenceKind(rawValue: evidenceRaw),
+              StudioCanonSeat.isAgent(decidedBy) else { return nil }
+        do {
+            let row = try StudioSavedRow(value)
+            _ = try row.string("proposal_id")
+            _ = try row.string("decided_at")
+            _ = try StudioSavedRow(.object(work)).string("title")
+            let entryIDs = try row.strings("evidence_entry_ids", required: true)
+            guard entryIDs.count <= maximumEvidenceEntryIDs else { return nil }
+            return try StudioCanonRow(
+                proposalID: proposalID, action: action, standing: standing,
+                workTitle: title, workCreator: StudioSavedRow(.object(work)).optionalString("creator"), decidedAt: decidedAt,
+                decidedBy: decidedBy, decidedOnSurface: row.string("decided_on_surface"), decidedInTurn: row.string("decided_in_turn"),
+                evidenceKind: evidenceKind, evidenceEntryIDs: entryIDs, note: row.optionalString("note"))
+        } catch { return nil }
     }
 }
 
@@ -481,6 +477,7 @@ public extension SwiftNativeStudioStore {
         guard !row.workTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw StudioCanonError.missingWorkTitle
         }
+        guard StudioCanonRow.fromJSON(row.toJSON()) != nil else { throw StudioCanonError.unreadableHistory }
         try FileManager.default.createDirectory(
             at: canonDirectory, withIntermediateDirectories: true
         )
@@ -523,30 +520,27 @@ public extension SwiftNativeStudioStore {
         titles: [(title: String, creator: String?)],
         now: Date = Date(),
         maximumTrackedWorks: Int = 256
-    ) async {
-        guard !titles.isEmpty, maximumTrackedWorks > 0 else { return }
+    ) async -> JSONValue? {
+        guard !titles.isEmpty else { return nil }
         let stamp = NativeTimestampFormat.sixDigitUTCOffset(now)
-        try? FileManager.default.createDirectory(
-            at: canonDirectory, withIntermediateDirectories: true
-        )
         let path = canonRecallHitsPath
-        do { try await SwiftNativePersistenceCore.withFileLock(path) {
-            let current = try await SwiftNativePersistenceCore.readJSON(path, ifMissing: .object([:]))
-            var table: [String: JSONValue] = [:]
-            if case .object(let obj) = current, case .object(let works)? = obj["works"] {
-                table = works
+        var committed = false
+        do {
+            guard maximumTrackedWorks > 0 else { throw StudioCanonError.unavailableRecallCounts }
+            try FileManager.default.createDirectory(at: canonDirectory, withIntermediateDirectories: true)
+            try await SwiftNativePersistenceCore.withFileLock(path) {
+            let current = try Self.readRecallCounter(at: path)
+            let counts = try Self.checkedRecallCounts(current)
+            guard case .object(let obj) = current, case .object(var table)? = obj["works"] else {
+                throw StudioCanonError.unavailableRecallCounts
             }
-            _ = try Self.checkedRecallCounts(current)
             var seen = Set<String>()
             for entry in titles {
                 let cleaned = entry.title.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !cleaned.isEmpty else { continue }
                 let key = StudioCanonLaw.workKey(title: cleaned, creator: entry.creator)
                 guard seen.insert(key).inserted else { continue }
-                var count: Int64 = 0
-                if case .object(let row)? = table[key], case .int(let existing)? = row["count"] {
-                    count = existing
-                }
+                let count = Int64(counts[key]?.count ?? 0) // This key has never been pulled when absent.
                 let (next, overflow) = count.addingReportingOverflow(1)
                 guard !overflow else { throw StudioCanonError.unavailableRecallCounts }
                 let row: [String: JSONValue] = [
@@ -558,44 +552,78 @@ public extension SwiftNativeStudioStore {
             if table.count > maximumTrackedWorks {
                 // Evict the least recently pulled. A counter that grows forever
                 // is telemetry; this one is evidence with a bound.
-                let ordered = table.sorted { lhs, rhs in
-                    func stamp(_ value: JSONValue) -> String {
-                        if case .object(let obj) = value, case .string(let s)? = obj["last_at"] {
-                            return s
-                        }
-                        return ""
-                    }
-                    return stamp(lhs.value) > stamp(rhs.value)
-                }
-                table = Dictionary(
-                    uniqueKeysWithValues: ordered.prefix(maximumTrackedWorks).map { ($0.key, $0.value) }
-                )
+                let updated = try Self.checkedRecallCounts(.object(["works": .object(table)]))
+                let keep = Set(updated.sorted { $0.value.lastAt > $1.value.lastAt }.prefix(maximumTrackedWorks).map(\.key))
+                table = table.filter { keep.contains($0.key) }
             }
             try await SwiftNativePersistenceCore.writeJSON(
                 .object(["works": .object(table)]),
                 to: path
             )
-        } } catch {
-            nativeLog("[StudioCanon] Recall counting unavailable: %@", error.localizedDescription)
+            }
+            committed = true
+            try await requireRecallCountingAvailable()
+            return nil
+        } catch {
+            let words = "Recall returned its entries, but production-pull counting at \(path.path) is unavailable: \(error.localizedDescription). "
+                + (committed ? "This pull was counted; earlier counting remains unreconciled. Pull at " : "Unconfirmed pull at ")
+                + "\(stamp) for work keys: "
+                + titles.map { StudioCanonLaw.workKey(title: $0.title, creator: $0.creator) }.joined(separator: ", ")
+            let instruction = ToolFailureError.fileRepairInstruction(path,
+                shape: "Reconcile the unconfirmed pull in this repair's evidence against the existing counter before restoring counting; a later successful pull cannot prove this one was counted. Do not repeat the completed recall.")
+            if !committed {
+                let operation = Self.recallCountingOperation
+                let debt = ExperienceStore.record(dataRoot, "repair:" + operation) { store in
+                    try await RepairOwed.owe(store, id: "studio-recall-count:" + UUID().uuidString,
+                        kind: .act, evidence: [.init(source: "studio/canon/recall_hits.json", id: stamp)],
+                        operation: operation, owner: path.path, words: words, tap: path.path)
+                    if let open = try await RepairOwed.openDebt(store, operation: operation, owner: path.path) {
+                        // Repeated failures share one debt, but every pull keeps
+                        // its exact timestamp, works and cause for reconciliation.
+                        try await store.append([.claim(.init(claim: words, evidence: []))], to: open.id)
+                    }
+                }
+                await settle { await debt.value }
+            }
+            return .object(["status": .string("unavailable"), "reason": .string(words),
+                "remedy": Repair.remedy(owner: path.path, nextCall: nil, tap: path.path, instruction: instruction)])
+        }
+    }
+
+    private static var recallCountingOperation: String { "studio.recall_counting" }
+
+    private func requireRecallCountingAvailable() async throws {
+        let experiences = try await ExperienceStore.at(dataRoot).projection()
+        if let owed = experiences.first(where: { RepairOwed.isOwed($0)
+            && RepairOwed.claim($0, "operation") == Self.recallCountingOperation
+            && RepairOwed.claim($0, "owner") == canonRecallHitsPath.path }) {
+            throw StudioCanonError.recallCountingRepairOwed(owed.id)
         }
     }
 
     /// The counter, read back as `workKey → (count, lastAt)`.
     func recallPullCounts() async throws -> [String: (count: Int, lastAt: String)] {
-        let value = try await SwiftNativePersistenceCore.readJSON(canonRecallHitsPath, ifMissing: .object([:]))
+        // An existing failed pull is evidence the counter is incomplete, even
+        // when its older bytes still decode. Never read that as zero/fewer pulls.
+        try await requireRecallCountingAvailable()
+        let value = try Self.readRecallCounter(at: canonRecallHitsPath)
         return try Self.checkedRecallCounts(value)
+    }
+
+    private static func readRecallCounter(at path: URL) throws -> JSONValue {
+        do { return try JSONValue.parse(Data(contentsOf: path)) }
+        catch CocoaError.fileReadNoSuchFile { return .object(["works": .object([:])]) }
     }
 
     private static func checkedRecallCounts(_ value: JSONValue) throws -> [String: (count: Int, lastAt: String)] {
         guard case .object(let obj) = value else { throw StudioCanonError.unavailableRecallCounts }
-        if obj.isEmpty { return [:] } // A missing counter has no pulls yet.
         guard case .object(let works)? = obj["works"] else { throw StudioCanonError.unavailableRecallCounts }
         var result: [String: (count: Int, lastAt: String)] = [:]
         for (key, row) in works {
             guard case .object(let fields) = row,
                   case .int(let value)? = fields["count"], value >= 0,
                   let count = Int(exactly: value),
-                  case .string(let lastAt)? = fields["last_at"] else {
+                  case .string(let lastAt)? = fields["last_at"], !lastAt.isEmpty else {
                 throw StudioCanonError.unavailableRecallCounts
             }
             result[key] = (count, lastAt)
@@ -614,9 +642,12 @@ public enum StudioCanonError: Error, LocalizedError, Sendable, Equatable {
     case unknownProposal(String)
     case unreadableHistory
     case unavailableRecallCounts
+    case recallCountingRepairOwed(String)
 
     public var errorDescription: String? {
         switch self {
+        case .recallCountingRepairOwed(let id):
+            return "studio canon: production-pull counting has unconfirmed evidence in Experience \(id); reconcile that repair before treating the stored counts as complete. A later successful pull cannot settle it."
         case .unavailableRecallCounts:
             return "studio canon: recall counts are invalid or exhausted; counting is unavailable and stored bytes were preserved."
         case .approvalNotFromAgentSeat(let seat):

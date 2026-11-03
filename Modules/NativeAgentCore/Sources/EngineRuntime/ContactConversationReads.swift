@@ -9,7 +9,7 @@ import StandingBots
 import Transcripts
 import Darwin
 import Experiences
-// Blueprint: | `ContactConversationReads.swift` | AgentContactThreads and shared contact values read canonical contact conversations, helper results and isolated live flights for desktop and phone |
+// Blueprint: | `ContactConversationReads.swift` | AgentContactThreads and shared contact values read canonical contact conversations, helper results and isolated live flights for desktop and phone; helper reply times come from recorded settlement, with missing times unavailable; live-only read failures propagate instead of requesting a second full read; mobile summaries project plain state and activity time from that evidence, retaining diagnostics in detail; waitingForMac projects the conversation queue's automatic hold as waiting for the Mac to be free |
 
 /// A saved contact, keyed `peer:<id>` like the agent's conversation records.
 public struct AgentContactPresentation: Identifiable, Equatable, Sendable {
@@ -36,6 +36,9 @@ public struct AgentContactPresentation: Identifiable, Equatable, Sendable {
 
     /// One precedence for every door; dates and clipping belong to the renderer.
     public func status(flight: AgentContactFlight?, waiting: Bool, delivery: AgentConversationDelivery?) -> String? {
+        if let flight, !flight.inFlight, flight.queued.contains(where: { $0.waitingForMac }) {
+            return "Waiting for the Mac to be free"
+        }
         if !owedExperiences.isEmpty { return "\(owedExperiences.count) \(owedExperiences.count == 1 ? "message" : "messages") still owed" }
         if let problem = health?.problem { return problem }
         if let flight {
@@ -57,6 +60,7 @@ public struct AgentContactPresentation: Identifiable, Equatable, Sendable {
         case .answered?: return "Replied"
         case .failed?: return "No reply"
         case .notDelivered?: return "Not delivered"
+        case .unanswered?: return "No reply"
         case nil: return health?.word
         }
     }
@@ -76,7 +80,8 @@ public struct AgentContactThreadLine: Identifiable, Equatable, Sendable {
     public let id: String
     public let fromAgent: Bool
     public let text: String
-    public let at: Date
+    /// Nil when this retained helper reply has no recorded completion time.
+    public let at: Date?
     /// Typed by the person in this thread rather than sent by the agent.
     public var byPerson = false
     public var door: String? = nil
@@ -105,12 +110,14 @@ public struct AgentContactFlight: Equatable, Sendable {
         public let at: Date
         public let byPerson: Bool
         public let state: State
+        public var waitingForMac = false
     }
 
     public init?(_ record: AgentConversationRecord, live: AgentConversationLive?) {
         let queued = (record.queued ?? []).map { item in
             Queued(id: item.id, text: item.text, at: item.queuedAt, byPerson: item.byPerson == true,
-                   state: item.held.map { .held($0) } ?? (item.id == record.queueReservation ? .sending : .queued))
+                   state: item.held.map { .held($0) } ?? (item.id == record.queueReservation ? .sending : .queued),
+                   waitingForMac: item.waitingForMac == true)
         }
         let stop = record.stop?.operationID == record.operationID ? record.stop : nil
         let inFlight = ["sending", "waiting"].contains(record.phase)
@@ -216,9 +223,13 @@ public enum AgentContactThreads {
     }
 
     /// A file's identity, size and times; status changes include mode changes.
-    private static func stamp(_ path: String) -> SnapshotTailOpLog.FileStamp? {
+    private static func stamp(_ path: String) throws -> SnapshotTailOpLog.FileStamp {
         var info = stat()
-        guard lstat(path, &info) == 0 else { return errno == ENOENT ? .absent : nil }
+        guard lstat(path, &info) == 0 else {
+            let code = errno
+            if code == ENOENT { return .absent }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(code), userInfo: [NSFilePathErrorKey: path])
+        }
         return SnapshotTailOpLog.FileStamp(info)
     }
 
@@ -253,7 +264,7 @@ public enum AgentContactThreads {
 
     public static func mobileThreads(root: URL, contacts: ContactListFacade) async throws -> [MobileAgentThread] {
         let snapshot = try await read(root: root, contacts: contacts, includeHelpers: false)
-        return snapshot.contacts.map { contact in
+        return try snapshot.contacts.map { contact in
             let lines = snapshot.lines[contact.id] ?? []
             let status = contact.status(flight: snapshot.flights[contact.id],
                 waiting: snapshot.waiting.contains(contact.id), delivery: snapshot.status[contact.id]) ?? ""
@@ -262,22 +273,48 @@ public enum AgentContactThreads {
                                      lastExchange: String((last?.text ?? "").prefix(240)), status: status,
                                      sendRestriction: contact.sendRestriction)
             row.experiences = contact.owedExperiences.map(\.mobile)
+            row.lastActivityAt = [contact.lastActivityAt, last?.at].compactMap { $0 }.max()?.timeIntervalSince1970
+            let flight = snapshot.flights[contact.id]
+            let delivery = snapshot.status[contact.id]
+            if flight?.inFlight == true || flight?.queued.isEmpty == false
+                || snapshot.waiting.contains(contact.id) || !contact.owedExperiences.isEmpty {
+                row.stateLine = "Waiting"
+            } else if contact.health?.problem != nil {
+                row.stateLine = "Connection needs attention"
+            } else {
+                switch delivery {
+                case .sending?, .waiting?: row.stateLine = "Waiting"
+                case .failed?, .notDelivered?: row.stateLine = "Couldn’t reach"
+                case .unanswered?: row.stateLine = "No reply yet"
+                case .answered?: row.stateLine = "Replied"
+                case .delivered?: row.stateLine = "Delivered"
+                case .read?: row.stateLine = "Read"
+                case nil:
+                    row.stateLine = last.map { $0.fromAgent ? "Last message sent" : "Replied" }
+                        ?? (contact.lastActivityAt == nil ? "No exchanges recorded" : "Last active")
+                }
+            }
             let tail = lines.suffix(32)
-            return MobileAgentThread(agent: row, lines: tail.map {
-                MobileAgentLine(id: $0.id, speaker: $0.byPerson ? "You" : $0.fromAgent ? "Agent" : contact.name,
-                                text: String($0.text.prefix(2_000)), at: $0.at.timeIntervalSince1970)
+            return MobileAgentThread(agent: row, lines: try tail.map {
+                // Only contacts are published here, using the transcript's
+                // existing time projection. Optional helper times never enter
+                // this contract. Never manufacture a date or drop a line here.
+                guard let at = $0.at else {
+                    throw ToolFailureError("This contact message has no recorded time; preserve and repair its transcript.", effects: .none)
+                }
+                return MobileAgentLine(id: $0.id, speaker: $0.byPerson ? "You" : $0.fromAgent ? "Agent" : contact.name,
+                                text: String($0.text.prefix(2_000)), at: at.timeIntervalSince1970)
             }, truncated: lines.count > tail.count || tail.contains { $0.text.count > 2_000 })
         }
     }
 
     public static func read(root: URL, contacts contactOwner: ContactListFacade, includeHelpers: Bool = true) async throws -> Snapshot {
-        let recordsStamp = threadStamp(root: root)
+        let recordsStamp = try threadStamp(root: root)
         let (doors, recordRead) = try await contactOwner.refreshDoors()
         let rows = doors.filter { $0.primary && $0.contact != nil }
-        let dates = ISO8601DateFormatter()
         // The contact owner has already selected canonical rows and checked credentials.
-        let restrictions = rows.map { row in
-            AgentConversationDelivery.lane(for: row.key, dataRoot: root) != nil ? nil : sendRestriction(row)
+        let restrictions = try rows.map { row in
+            try AgentConversationDelivery.lane(for: row.key, dataRoot: root) != nil ? nil : sendRestriction(row)
         }
         let grouped = rows.indices.sorted { a, b in
             return restrictions[a] == nil && restrictions[b] != nil
@@ -289,14 +326,14 @@ public enum AgentContactThreads {
                                  via: via(row),
                                  sendRestriction: restrictions[index],
                                  lastActivityAt: [row.contact?.provenInboundAt, row.contact?.provenOutboundAt]
-                                   .compactMap { $0.flatMap { dates.date(from: $0) } }.max(),
+                                   .compactMap { $0.flatMap(NativeTimestampFormat.parseISO8601) }.max(),
                                  appBundleID: appBundleID(row),
                                  link: link(row),
                                  clawd: isClaude(row),
                                  dot: row.contact.map(ChatGPTDotIPCTransport.owns) ?? false,
                                  health: row.health)
         }
-        let identity = AgentContactIdentity(dataRoot: root)
+        let identity = try AgentContactIdentity(dataRoot: root)
         let displayed = Dictionary(contacts.map { (identity.canonical($0.id), $0.id) }, uniquingKeysWith: { first, _ in first })
         let ids = Set(contacts.map(\.id))
         let dots = Set(contacts.filter(\.dot).map(\.id))
@@ -337,13 +374,14 @@ public enum AgentContactThreads {
                 }
                 if let reply, !reply.isEmpty {
                     replies[id, default: []].append(.init(id: exchange.id + ":reply", fromAgent: false,
-                        text: reply, at: exchange.sentAt.addingTimeInterval(0.001),
+                        text: reply, at: exchange.settledAt,
                         resultID: exchange.id == record.operationID ? receipt?.resultID : exchange.resultID))
                 }
             }
             if history.isEmpty, let receipt {
                 replies[id, default: []].append(.init(id: record.id + ":reply", fromAgent: false,
-                    text: receipt.text, at: record.updatedAt, resultID: receipt.resultID))
+                    text: receipt.text, at: record.sendEvidence["replied_at"]?.stringValue.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst),
+                    resultID: receipt.resultID))
             }
         }
         // Everything a contact and the agent said to each other, from its own session.
@@ -359,8 +397,17 @@ public enum AgentContactThreads {
         }
         for (id, said) in replies { lines[id, default: []] += said }
         for key in lines.keys {
-            lines[key]?.sort { $0.at < $1.at }
-            if let last = lines[key]?.last { lastActive[key] = max(lastActive[key] ?? .distantPast, last.at) }
+            // Dated messages are chronological. Unknown-time replies retain
+            // source order after them and are rendered as time unavailable.
+            lines[key] = lines[key]?.enumerated().sorted { lhs, rhs in
+                switch (lhs.element.at, rhs.element.at) {
+                case let (a?, b?): return a == b ? lhs.offset < rhs.offset : a < b
+                case (_?, nil): return true
+                case (nil, _?): return false
+                case (nil, nil): return lhs.offset < rhs.offset
+                }
+            }.map(\.element)
+            if let at = lines[key]?.compactMap(\.at).max() { lastActive[key] = max(lastActive[key] ?? .distantPast, at) }
         }
 
         var waiting: Set<String> = []
@@ -381,7 +428,7 @@ public enum AgentContactThreads {
                 continue
             }
             // A failed outbound attempt says nothing about a newer inbound turn's answer.
-            if let last = lines[id]?.last, last.at > record.updatedAt {
+            if let last = lines[id]?.last, let at = last.at, at > record.updatedAt {
                 if last.fromAgent, last.fetched { status[id] = .read }
                 continue
             }
@@ -399,13 +446,13 @@ public enum AgentContactThreads {
         // Dot's thread owns its wait; every view uses the same reply projection.
         // Inbound only, no reply is awaited: his thread carries his contact's state.
         for id in dots where ChatGPTDotIPCTransport.available {
-            guard let last = lines[id]?.last, last.fromAgent else { continue }
-            if case .object(let reply) = AgentConversationView.dotReply(.object([:]), sentAt: last.at), reply["terminal"] == .bool(true) {
+            guard let last = lines[id]?.last, last.fromAgent, let at = last.at else { continue }
+            if case .object(let reply) = AgentConversationView.dotReply(.object([:]), sentAt: at), reply["terminal"] == .bool(true) {
                 status[id] = .failed
             } else { waiting.insert(id) }
         }
         let live = latest.values.contains { ["sending", "waiting"].contains($0.phase) }
-            ? AgentConversationLiveStore(dataRoot: root).all() : [:]
+            ? try AgentConversationLiveStore(dataRoot: root).all() : [:]
         var flights: [String: AgentContactFlight] = [:]
         for (id, record) in latest { flights[id] = AgentContactFlight(record, live: AgentConversationLiveStore.current(for: record, in: live)) }
         let ordered = contacts.enumerated().sorted { a, b in
@@ -416,32 +463,32 @@ public enum AgentContactThreads {
             case (nil, nil): return a.offset < b.offset
             }
         }.map(\.element)
-        let helpers = includeHelpers ? (try? await NativeAgentEngine.forRoot(root).botsShelfRead()) ?? [] : []
+        let helpers = includeHelpers ? try await NativeAgentEngine.forRoot(root).botsShelfRead() : []
         // Queued, or claimed by a runner in this app: the shelf's own "Running".
-        let running = (try? BotRunQueue(dataRoot: root).activeOrQueuedIDs()) ?? []
+        let running = try BotRunQueue(dataRoot: root).activeOrQueuedIDs()
         return Snapshot(contacts: ordered, lines: lines, waiting: waiting, status: status, flights: flights,
                          helpers: helpers, running: running, flightRecords: latest.mapValues(\.id),
-                         recordsStamp: recordsStamp, otherRooms: HerScreen.otherRoomExchanges(dataRoot: root, identity: identity, since: .distantPast).map {
+                         recordsStamp: recordsStamp, otherRooms: try HerScreen.otherRoomExchanges(dataRoot: root, identity: identity, since: .distantPast).map {
                              var event = $0
                              event.contactID = owner(event.contactID) ?? event.contactID
                              return event
                          })
     }
 
-    private static func threadStamp(root: URL) -> [SnapshotTailOpLog.FileStamp?] {
-        [stamp(root.appendingPathComponent("agents/conversations.json").path),
-         stamp(root.appendingPathComponent("chat/sessions.json").path)]
+    private static func threadStamp(root: URL) throws -> [SnapshotTailOpLog.FileStamp?] {
+        [try stamp(root.appendingPathComponent("agents/conversations.json").path),
+         try stamp(root.appendingPathComponent("chat/sessions.json").path)]
     }
 
     /// Only the flights, for a tick of the live file alone. Nil when the
     /// records or chat index moved since the last full read.
-    public static func readFlights(root: URL, last: Snapshot) -> [String: AgentContactFlight]? {
-        let stamp = threadStamp(root: root)
-        guard !stamp.contains(nil), stamp == last.recordsStamp,
-              let records = try? AgentConversationStore(dataRoot: root).records() else { return nil }
+    public static func readFlights(root: URL, last: Snapshot) throws -> [String: AgentContactFlight]? {
+        let stamp = try threadStamp(root: root)
+        guard stamp == last.recordsStamp else { return nil }
+        let records = try AgentConversationStore(dataRoot: root).records()
         let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         let live = last.flightRecords.values.contains { byID[$0].map { ["sending", "waiting"].contains($0.phase) } == true }
-            ? AgentConversationLiveStore(dataRoot: root).all() : [:]
+            ? try AgentConversationLiveStore(dataRoot: root).all() : [:]
         var flights: [String: AgentContactFlight] = [:]
         for (contact, id) in last.flightRecords {
             if let record = byID[id] { flights[contact] = AgentContactFlight(record, live: AgentConversationLiveStore.current(for: record, in: live)) }

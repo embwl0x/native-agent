@@ -41,7 +41,12 @@ extension ApprovalChatCards {
         quiet: Bool = false
     ) async -> Outcome {
         guard card.state.isOpen, !Task.isCancelled else { return .skipped }
-        let savedNote = await mirrorNote(card.id, dataRoot: dataRoot)
+        let savedNote: [String: JSONValue]?
+        do { savedNote = try await mirrorNote(card.id, dataRoot: dataRoot) }
+        catch {
+            nativeLog("[approval-chat-card] mirror authority unavailable: %@", error.localizedDescription)
+            return .failed
+        }
         let savedAnchor: String? = if case .string(let value)? = savedNote?["chat_session_id"] { value } else { nil }
         guard let proposedAnchor = savedAnchor ?? usersConversation(unless: sessionID, dataRoot: dataRoot),
               NativeAgentChatSessionID.normalizedPathComponent(proposedAnchor) == proposedAnchor else { return .skipped }
@@ -59,7 +64,7 @@ extension ApprovalChatCards {
             do {
                 try await inbox.patch(id: noteID, unlessPresent: "chat_session_id",
                                       ["chat_session_id": .string(proposedAnchor)])
-                guard let note = await mirrorNote(card.id, dataRoot: dataRoot),
+                guard let note = try await mirrorNote(card.id, dataRoot: dataRoot),
                       case .string(let anchor)? = note["chat_session_id"],
                       NativeAgentChatSessionID.normalizedPathComponent(anchor) == anchor else {
                     return Result<String?, Error>.success(nil)
@@ -89,7 +94,12 @@ extension ApprovalChatCards {
             nativeLog("[approval-chat-card] mirror write failed: %@", error.localizedDescription)
             return .failed
         }
-        let ownerChat = telegram == nil || !reach.send ? nil : await ownerDM(boundTo: anchor, dataRoot: dataRoot)
+        let ownerChat: Int?
+        do { ownerChat = telegram == nil || !reach.send ? nil : try await ownerDM(boundTo: anchor, dataRoot: dataRoot) }
+        catch {
+            nativeLog("[approval-chat-card] Telegram owner unavailable: %@", error.localizedDescription)
+            return .failed
+        }
         if let telegram, let ownerChat, !quiet, !Task.isCancelled {
             var keyboard: [JSONValue] = []
             if buttons {
@@ -115,12 +125,20 @@ extension ApprovalChatCards {
 
     static func promptPendingInteractions(dataRoot: URL, telegram: TelegramApprovalFiler) async {
         let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
-        guard let notes = try? await inbox.rows() else { return }
-        for case .object(let note) in notes {
+        let notes: [JSONValue]
+        do { notes = try await inbox.rows() }
+        catch {
+            nativeLog("[approval-chat-card] pending mirrors unavailable: %@", error.localizedDescription)
+            return
+        }
+        for case .object(let savedNote) in notes {
             guard !Task.isCancelled else { return }
-            guard note["source"] == .string("interaction"),
-                  case .string(let id)? = note["interaction_id"],
-                  case .string(let session)? = note["interaction_session_id"] else { continue }
+            guard savedNote["source"] == .string("interaction"),
+                  case .string(let id)? = savedNote["interaction_id"],
+                  case .string(let session)? = savedNote["interaction_session_id"] else { continue }
+            do {
+            try await telegram.recoverInteractionReceipt(id: id, dataRoot: dataRoot)
+            guard let note = try await mirrorNote(id, dataRoot: dataRoot) else { continue }
             if note["telegram_message_id"] != nil {
                 // A card answered while Telegram was stopped still owes its
                 // delivered copy an edit, owned by the same settlement filer.
@@ -129,12 +147,13 @@ extension ApprovalChatCards {
                 }
                 continue
             }
-            guard let card = await InlineInteractionResolver.interaction(id: id, sessionID: session, dataRoot: dataRoot),
+            guard let card = try await InlineInteractionResolver.interaction(id: id, sessionID: session, dataRoot: dataRoot),
                   card.state.isOpen else { continue }
             let held = await MainActor.run {
                 InlineInteractionResolver.platform.residentWakeHeld(sessionID: session, dataRoot: dataRoot)
             }
             await postInteraction(card, sessionID: session, dataRoot: dataRoot, telegram: telegram, quiet: held)
+            } catch { nativeLog("[approval-chat-card] pending interaction unavailable: %@", error.localizedDescription) }
         }
     }
 
@@ -143,19 +162,14 @@ extension ApprovalChatCards {
     static func isControlOption(_ id: String) -> Bool { id.hasPrefix("__") }
 
     /// The card's inbox note says it was mirrored to User: his to answer.
-    static func isMirroredToUser(_ id: String, dataRoot: URL) async -> Bool {
-        guard let held = await mirrorNote(id, dataRoot: dataRoot)?["chat_session_id"] else { return false }
+    static func isMirroredToUser(_ id: String, dataRoot: URL) async throws -> Bool {
+        guard let held = try await mirrorNote(id, dataRoot: dataRoot)?["chat_session_id"] else { return false }
         return held != .null
     }
 
-    static func mirrorNote(_ id: String, dataRoot: URL) async -> [String: JSONValue]? {
+    static func mirrorNote(_ id: String, dataRoot: URL) async throws -> [String: JSONValue]? {
         let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
-        guard let rows = try? await inbox.rows(),
-              case .object(let note)? = rows.last(where: {
-                  guard case .object(let row) = $0 else { return false }
-                  return row["id"] == .string("interaction:\(id)")
-              }) else { return nil }
-        return note
+        return try await inbox.row(id: "interaction:\(id)")?.objectValue
     }
 
     /// One Telegram filer, registered at assembly and cleared only by its own stop.
@@ -171,11 +185,13 @@ extension ApprovalChatCards {
     /// Once a mirrored card is settled (answered on any surface, withdrawn or
     /// expired), its Telegram copy's buttons go away and it says how it ended.
     static func settleTelegramCopy(id: String, sessionID: String, dataRoot: URL, filer: TelegramApprovalFiler) async {
-        guard let note = await mirrorNote(id, dataRoot: dataRoot),
+        do {
+        try await filer.recoverInteractionReceipt(id: id, dataRoot: dataRoot)
+        guard let note = try await mirrorNote(id, dataRoot: dataRoot),
               note["telegram_card_settled"] != .bool(true),
               case .string(let chat)? = note["telegram_chat_id"], let chatId = Int(chat),
               case .string(let message)? = note["telegram_message_id"], let messageId = Int(message),
-              let card = await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
+              let card = try await InlineInteractionResolver.interaction(id: id, sessionID: sessionID, dataRoot: dataRoot),
               !card.state.isOpen else { return }
         let title: String = if case .string(let saved)? = note["telegram_card_title"] { saved } else { NativeAppSecretRedactor.redactText(card.title) }
         let summary = card.state.outcome?.summary.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -183,7 +199,6 @@ extension ApprovalChatCards {
         let text = String((title + "\n\n" + (summary.isEmpty ? "Closed." : "✓ " + NativeAppSecretRedactor.redactText(summary))).prefix(3500))
         // Settled on Telegram's receipt only: a failed edit stays outstanding,
         // and the card's next change tries it again.
-        do {
             try await filer.settleChatCard(chatId: chatId, messageId: messageId, text: text)
             let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
             _ = try await inbox.patch(id: "interaction:\(id)", unlessPresent: "telegram_card_settled", ["telegram_card_settled": .bool(true)])
@@ -198,10 +213,12 @@ extension ApprovalChatCards {
             _ = await filer.enqueueInteractionSettlement(id: id, sessionID: sessionID, dataRoot: dataRoot)
         }
         var sessions: Set<String> = [sessionID]
-        if case .string(let mirror)? = await mirrorNote(id, dataRoot: dataRoot)?["chat_session_id"],
+        do {
+        if case .string(let mirror)? = try await mirrorNote(id, dataRoot: dataRoot)?["chat_session_id"],
            NativeAgentChatSessionID.normalizedPathComponent(mirror) == mirror {
             sessions.insert(mirror)
         }
+        } catch { nativeLog("[approval-chat-card] mirror publication unavailable: %@", error.localizedDescription) }
         await publishTranscriptChanges(sessionIDs: sessions, dataRoot: dataRoot)
     }
 
@@ -211,13 +228,13 @@ extension ApprovalChatCards {
     static func answerInteractionFromTelegram(
         id: String, choice: Int?, decline: Bool, chatId: Int, fromUserId: Int?, dataRoot: URL
     ) async throws -> String? {
-        guard let note = await mirrorNote(id, dataRoot: dataRoot),
+        guard let note = try await mirrorNote(id, dataRoot: dataRoot),
               case .string(let session)? = note["interaction_session_id"] else { return nil }
         guard note["telegram_chat_id"] == .string(String(chatId)), fromUserId == chatId else {
             throw NSError(domain: "ApprovalChatCards", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "That card is answered by its owner in his own chat."])
         }
-        guard let card = await InlineInteractionResolver.interaction(id: id, sessionID: session, dataRoot: dataRoot),
+        guard let card = try await InlineInteractionResolver.interaction(id: id, sessionID: session, dataRoot: dataRoot),
               card.state.isOpen else { return "Already answered — nothing changed." }
         if decline {
             _ = try await InlineInteractionResolver.decline(id: id, sessionID: session,

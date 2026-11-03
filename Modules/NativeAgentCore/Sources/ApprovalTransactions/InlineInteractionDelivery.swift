@@ -27,7 +27,7 @@ public enum InlineInteractionDelivery {
               let id = payload["interactionID"], let revision = Int(payload["revision"] ?? ""),
               let action = payload["action"], ["primary", "decline", "verify"].contains(action),
               payload.count <= 12, payload.values.allSatisfy({ $0.utf8.count <= 16_384 }),
-              let card = await InlineInteractionResolver.interaction(id: id, sessionID: session, dataRoot: dataRoot),
+              let card = try await InlineInteractionResolver.interaction(id: id, sessionID: session, dataRoot: dataRoot),
               card.revision == revision else {
             throw NSError(domain: "InteractionCard", code: 4, userInfo: [NSLocalizedDescriptionKey: "This card changed. Refresh the conversation and try again."])
         }
@@ -113,7 +113,7 @@ public enum InlineInteractionDelivery {
 
     public static func pointer(id: String, dataRoot: URL) async throws -> Pointer {
         let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
-        guard let item = try await inbox.rows().compactMap(InboxItemRecord.init(row:)).first(where: { $0.id == id }) else {
+        guard let item = try await inbox.item(id: id) else {
             throw NSError(domain: "InteractionCard", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "This request is unavailable. Refresh Activity and try again."
             ])
@@ -295,7 +295,7 @@ public enum InlineInteractionDelivery {
         let pointer = try await pointer(id: id, dataRoot: dataRoot)
         if action.hasPrefix("interaction_choice_"),
            let index = Int(action.dropFirst("interaction_choice_".count)),
-           let card = await InlineInteractionResolver.interaction(id: pointer.interactionID,
+           let card = try await InlineInteractionResolver.interaction(id: pointer.interactionID,
                 sessionID: pointer.sessionID, dataRoot: dataRoot),
            card.kind == .choose, card.options.indices.contains(index) {
             // `quiet` is the agent's inbox.act; the phone's signed tap is User's.

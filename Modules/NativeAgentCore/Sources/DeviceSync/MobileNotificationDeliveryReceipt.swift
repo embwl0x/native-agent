@@ -4,85 +4,46 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `MobileNotificationDeliveryReceipt.swift` | Bridge/APNs notification receipts distinguish acceptance, display uncertainty and named errors |
+// Blueprint: | `MobileNotificationDeliveryReceipt.swift` | Keyless notification publication receipts name CloudKit ordinary alerts or signed-result readers, optional APNs wakes and unverified phone display |
 public struct MobileNotificationDeliveryReceipt: Sendable {
-    public let bridgeMessageID: String?
-    public let bridgeError: String?
+    public let bridgeMessageID: String
     public let apnsReceipts: [SwiftNativeAPNSReceipt]
     public let apnsErrors: [String]
-    public let eventID: String?
+    public let eventID: String
+    public let signedResult: Bool
 
-    public init(
-        bridgeMessageID: String?,
-        bridgeError: String?,
-        apnsReceipts: [SwiftNativeAPNSReceipt],
-        apnsErrors: [String],
-        eventID: String? = nil
-    ) {
+    public init(bridgeMessageID: String, apnsReceipts: [SwiftNativeAPNSReceipt],
+                apnsErrors: [String], eventID: String, signedResult: Bool) {
         self.bridgeMessageID = bridgeMessageID
-        self.bridgeError = bridgeError
         self.apnsReceipts = apnsReceipts
         self.apnsErrors = apnsErrors
         self.eventID = eventID
+        self.signedResult = signedResult
     }
-    public var apnsSent: Bool {
-        apnsReceipts.contains { $0.isSuccess }
+
+    /// Publication is proven; neither transport nor process receipt proves display.
+    public var status: String { "queued" }
+
+    public var notificationOutcome: NotificationDeliveryOutcome {
+        .unknown(sent: true, reason: "CloudKit publication accepted; signed phone receipt pending")
     }
-    public var apnsAccepted: Bool {
-        apnsSent
-    }
-    public var bridgeQueued: Bool {
-        bridgeMessageID != nil
-    }
-    public var status: String {
-        apnsAccepted ? "accepted" : (bridgeQueued ? "queued" : "failed")
-    }
-    public var route: String {
-        if apnsSent && bridgeQueued { return "apns_and_icloud_bridge" }
-        if apnsSent { return "apns" }
-        return "mac_icloud_bridge_notification"
-    }
-    public var delivery: String {
-        if apnsAccepted && bridgeQueued { return "accepted_by_apns_and_queued_to_icloud_bridge" }
-        if apnsAccepted { return "accepted_by_apns" }
-        return "queued_to_icloud_bridge"
-    }
+
     public func deliveryFields() -> [String: JSONValue] {
-        var obj: [String: JSONValue] = [
+        [
             "status": .string(status),
-            "delivery": .string(delivery),
-            "route": .string(route),
-            "bridgeQueued": .bool(bridgeQueued),
-            "apnsSent": .bool(apnsSent),
-            "apnsAccepted": .bool(apnsAccepted),
-            "apnsSemantics": .string("APNS 2xx means Apple accepted the request, not that the device displayed it."),
-            "providerAcceptanceOnly": .bool(apnsAccepted),
+            "delivery": .string("queued_to_icloud_bridge"),
+            "route": .string(signedResult ? "mac_icloud_bridge_notification" : "cloudkit_visible_notification"),
+            "bridgeQueued": .bool(true),
+            "bridgeMessageId": .string(bridgeMessageID),
+            "eventId": .string(eventID),
+            "apnsAccepted": .bool(apnsReceipts.contains { $0.isSuccess }),
+            "apnsPushType": .string("background"),
+            "apnsSemantics": .string("Optional APNS only wakes sync. No provider configuration is required; acceptance does not prove phone receipt or display."),
+            "apnsReceipts": .array(apnsReceipts.map { $0.toJSON() }),
+            "apnsErrors": .array(apnsErrors.map(JSONValue.string)),
             "lockScreenDisplayVerified": .bool(false),
-            "deliveryVerification": .string(
-                apnsAccepted
-                    ? "provider_accepted_device_display_unverified"
-                    : "device_display_unverified"
-            ),
-            "requiresIOSAppActiveForBridge": .bool(bridgeQueued),
-            "cloudKitVisualPushEligible": .bool(false),
+            "deliveryVerification": .string("device_display_unverified"),
         ]
-        if let bridgeMessageID {
-            obj["bridgeMessageId"] = .string(bridgeMessageID)
-        }
-        if let eventID {
-            obj["eventId"] = .string(eventID)
-        }
-        if let bridgeError {
-            obj["bridgeError"] = .string(bridgeError)
-        }
-        if !apnsReceipts.isEmpty {
-            obj["apnsReceipts"] = .array(apnsReceipts.map { $0.toJSON() })
-            obj["apnsReceiptCount"] = .int(Int64(apnsReceipts.count))
-        }
-        if !apnsErrors.isEmpty {
-            obj["apnsErrors"] = .array(apnsErrors.map { .string($0) })
-        }
-        return obj
     }
 }
 public struct SwiftNativeAPNSReceipt: Sendable {

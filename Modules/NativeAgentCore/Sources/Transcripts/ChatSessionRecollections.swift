@@ -32,9 +32,8 @@ public struct ChatSessionRecollection: Sendable, Equatable {
     /// own high-water mark against THIS, never against `createdAt`: a
     /// recollection written today can cover turns from last week, and a
     /// consumer that already read those turns raw must not read them again
-    /// through their recollection. Legacy rows (written before coverage was
-    /// recorded) fall back to the row's own timestamp.
-    public var consolidatedThrough: Date? { coversUntil ?? createdAt }
+    /// through their recollection. Missing coverage remains unknown.
+    public var consolidatedThrough: Date? { coversUntil }
 
     public init(
         sessionId: String,
@@ -243,15 +242,26 @@ public enum ChatSessionRecollections {
         var pending = Data()
         var recollections = previous
         var consumed = offset
-        func parse(_ bytes: Data) -> ChatSessionRecollection? {
-            guard let row = try? JSONValue.parse(bytes) else { return nil }
-            return recollection(fromTranscriptRow: row, sessionId: sessionId)
+        func parse(_ bytes: Data) throws -> ChatSessionRecollection? {
+            guard !bytes.allSatisfy({ $0 == 32 || $0 == 9 || $0 == 13 }) else { return nil }
+            guard String(data: bytes, encoding: .utf8) != nil else {
+                throw ChatSessionIndexFileError.malformed(path: path.path, reason: "Invalid UTF-8 at byte \(consumed)")
+            }
+            let fields: [String: JSONValue]
+            do { fields = try ContactThread.decodeRow(bytes) }
+            catch { throw ChatSessionIndexFileError.malformed(path: path.path, reason: "Transcript row at byte \(consumed): \(error.localizedDescription)") }
+            let row = JSONValue.object(fields)
+            let recollection = recollection(fromTranscriptRow: row, sessionId: sessionId)
+            if case .object(let metadata)? = fields["metadata"], metadata["kind"] == .string(rowKind), recollection == nil {
+                throw ChatSessionIndexFileError.malformed(path: path.path, reason: "Malformed recollection at byte \(consumed)")
+            }
+            return recollection
         }
         while let chunk = try file.read(upToCount: 64 * 1024), !chunk.isEmpty {
             pending.append(chunk)
             while let newline = pending.firstIndex(of: 10) {
                 let end = pending.index(after: newline)
-                if let value = parse(Data(pending[..<newline])) { recollections.append(value) }
+                if let value = try parse(Data(pending[..<newline])) { recollections.append(value) }
                 consumed += UInt64(pending.distance(from: pending.startIndex, to: end))
                 pending.removeSubrange(..<end)
             }
@@ -259,7 +269,7 @@ public enum ChatSessionRecollections {
         // Preserve the tolerant accessor's support for a valid final JSON row
         // without a newline. Re-read that line if another append completes it.
         return Scan(completeRecollections: recollections,
-                    trailingRecollection: pending.isEmpty ? nil : parse(pending), nextOffset: consumed)
+                    trailingRecollection: pending.isEmpty ? nil : try parse(pending), nextOffset: consumed)
     }
 
     /// `metadata.kind` marking a transcript row as a consolidated recollection.
@@ -427,28 +437,11 @@ public enum ChatSessionRecollections {
         return from <= mark && until > mark
     }
 
-    /// Live transcripts carry microsecond ISO8601 (`...T11:33:32.167835+00:00`)
-    /// while `ISO8601DateFormatter.withFractionalSeconds` accepts three digits.
-    /// Try fractional, then plain, then truncate to milliseconds.
+    /// Read current ISO8601 timestamps without changing the saved observation time.
     public static func parseTimestamp(_ value: JSONValue?) -> Date? {
         guard case .string(let raw)? = value else { return nil }
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
-        if let date = NativeTimestampFormat.parseISO8601FractionalFirst(text) { return date }
-        // Truncate an over-long fractional part to milliseconds and retry.
-        if let dot = text.firstIndex(of: ".") {
-            let afterDot = text.index(after: dot)
-            var digitsEnd = afterDot
-            while digitsEnd < text.endIndex, text[digitsEnd].isNumber {
-                digitsEnd = text.index(after: digitsEnd)
-            }
-            let digits = text[afterDot..<digitsEnd]
-            if digits.count > 3 {
-                let keep = text.index(afterDot, offsetBy: 3)
-                let rebuilt = String(text[text.startIndex..<keep]) + String(text[digitsEnd...])
-                if let date = NativeTimestampFormat.parseISO8601FractionalFirst(rebuilt) { return date }
-            }
-        }
-        return nil
+        return NativeTimestampFormat.parseISO8601FractionalFirst(text)
     }
 }

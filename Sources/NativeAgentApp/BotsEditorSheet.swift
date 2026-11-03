@@ -1,7 +1,7 @@
 import SwiftUI
 import StandingBots
 import ProviderRouting
-// Blueprint: | `BotsEditorSheet.swift` | facade provider accounts and checked settings, shelf next-run projection, engine-owned fresh definition merge |
+// Blueprint: | `BotsEditorSheet.swift` | Mac form parses timing, events and limits into domain values; facade provider accounts and checked settings, shelf next-run projection, engine-owned fresh definition merge; in-memory current-shape drafts |
 
 struct BotsEditorSheet: View {
     @Environment(AppModel.self) private var appModel
@@ -11,8 +11,7 @@ struct BotsEditorSheet: View {
     let save: (BotDefinition) async throws -> Void
     private struct Draft: Codable, Equatable {
         var name = ""
-        /// Optional so drafts saved before the field still decode.
-        var personality: String?
+        var personality = ""
         var brief = ""
         var provider = ""
         var model = ""
@@ -56,7 +55,7 @@ struct BotsEditorSheet: View {
             ProviderThenModelPicker.Provider(id: account.provider_id, name: account.provider_id == "codex" ? "OpenAI (subscription)" : account.display_name,
                 ready: account.auth_status.eligible, models: account.models.map {
                     ProviderThenModelPicker.Model(id: $0.id, name: $0.name,
-                        supportedEfforts: $0.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"], supportsFast: $0.supports_fast)
+                        supportedEfforts: $0.supported_reasoning_efforts, supportsFast: $0.supports_fast)
                 })
         }
     }
@@ -119,8 +118,7 @@ struct BotsEditorSheet: View {
     private var fields: some View {
                 VStack(alignment: .leading, spacing: 14) {
                     field("Name", text: draftBinding.name)
-                    editor("Personality", text: Binding(get: { draft.personality ?? "" },
-                                                        set: { draft.personality = $0.isEmpty ? nil : $0 }), height: 70)
+                    editor("Personality", text: draftBinding.personality, height: 70)
                     editor("What to do", text: draftBinding.brief, height: 110)
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Model").font(.subheadline)
@@ -231,14 +229,9 @@ struct BotsEditorSheet: View {
     private func initialDraft(_ definition: BotDefinition?, nextRun: Date?) -> Draft {
         var draft = Draft()
         guard let bot = definition else { return draft }
-        // One place describes the job. A definition written when "Desired
-        // output" was its own field still reads: its output instructions are
-        // shown after the brief and are stored back as one brief on save.
         draft.name = bot.name
-        draft.personality = bot.personality
-        draft.brief = [bot.brief, bot.outputFormat ?? ""]
-            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .joined(separator: "\n\n")
+        draft.personality = bot.personality ?? ""
+        draft.brief = bot.brief
         draft.provider = bot.provider ?? ""; draft.model = bot.model ?? ""; draft.think = bot.reasoningEffort ?? ""; draft.fast = bot.fast
         draft.modelPinned = bot.modelPinned ?? false
         draft.tokens = String(bot.budget.tokens); draft.seconds = String(bot.budget.seconds); draft.daily = bot.dailyTokenCeiling.map(String.init) ?? ""
@@ -275,13 +268,62 @@ struct BotsEditorSheet: View {
         try await appModel.engine.editBotDefinition(definition?.id) { current, nextRun in
             let draft = try appModel.mergingEditDraft(draftSubject, edited: submitted, into: initialDraft(current, nextRun: nextRun))
             let selectedModel = providers.first { $0.id == draft.provider }?.models.first { $0.id == draft.model }
-            return try BotDefinitionStore.editorDefinition(current, name: draft.name, personality: draft.personality ?? "", brief: draft.brief,
+            if draft.modelPinned {
+                guard providers.first(where: { $0.id == draft.provider })?.ready == true,
+                      selectedModel?.supportedEfforts?.contains(draft.think) == true else {
+                    throw StandingBotsError.invalidValue("Choose a connected account, a model it serves, and a supported Think level.")
+                }
+            }
+            let cadence = try parsedCadence(draft, current: current)
+            var trigger: BotEventTrigger?
+            if draft.when == "On an event" {
+                let target = draft.eventFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard BotEventTrigger.isChannelID(target) else {
+                    throw StandingBotsError.invalidValue("Enter the Slack channel ID, such as C0123ABCD.")
+                }
+                trigger = BotEventTrigger(source: draft.eventSource, filter: target.uppercased(), keyword: draft.eventKeyword)
+            }
+            let tokens: Int
+            if draft.tokens.isEmpty { tokens = BotRunLimits.maximumTokens }
+            else if let value = Int(draft.tokens), value > 0 { tokens = value }
+            else { throw StandingBotsError.invalidValue("Enter a positive token limit, or leave it blank.") }
+            let seconds: Double
+            if draft.seconds.isEmpty { seconds = BotRunLimits.maximumSeconds }
+            else if let value = Double(draft.seconds), value.isFinite, value > 0 { seconds = value }
+            else { throw StandingBotsError.invalidValue("Enter a positive time limit, or leave it blank.") }
+            let daily: Int?
+            if draft.daily.isEmpty { daily = nil }
+            else if let value = Int(draft.daily), value > 0 { daily = value }
+            else { throw StandingBotsError.invalidValue("Enter a positive daily ceiling, or leave it blank.") }
+            if draft.tell, draft.condition.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                throw StandingBotsError.invalidValue("Enter a condition or turn Tell me if off.")
+            }
+            let personality = draft.personality.trimmingCharacters(in: .whitespacesAndNewlines)
+            return BotDefinitionStore.editedDefinition(current, name: draft.name, personality: personality.isEmpty ? nil : personality, brief: draft.brief,
                 provider: draft.provider, model: draft.model, think: draft.think, modelPinned: draft.modelPinned,
-                providerReady: providers.first(where: { $0.id == draft.provider })?.ready == true,
-                supportedEfforts: selectedModel?.supportedEfforts, supportsFast: selectedModel?.supportsFast == true,
-                fast: draft.fast, tokens: draft.tokens, seconds: draft.seconds, daily: draft.daily, when: draft.when, hours: draft.hours,
-                cron: draft.cron, weekday: draft.weekday, clockText: draft.clockText, timingUnchanged: draft.timingKey == draft.loadedTiming,
-                eventSource: draft.eventSource, eventFilter: draft.eventFilter, eventKeyword: draft.eventKeyword, tell: draft.tell, condition: draft.condition)
+                fast: selectedModel?.supportsFast == true && draft.fast == true,
+                budget: BotBudget(tokens: tokens, seconds: seconds), dailyTokenCeiling: daily,
+                cadence: cadence, eventTrigger: trigger, notificationCondition: draft.tell ? draft.condition : nil)
+        }
+    }
+
+    private func parsedCadence(_ draft: Draft, current: BotDefinition?) throws -> BotCadence {
+        if let current, draft.timingKey == draft.loadedTiming { return current.cadence }
+        switch draft.when {
+        case "Manual only", "On an event": return .manual
+        case "Daily", "Weekdays": return try StandingBotSchedule.parse("\(draft.when) at \(draft.clockText)")
+        case "Weekly":
+            guard StandingBotSchedule.weekdays.indices.contains(draft.weekday) else {
+                throw StandingBotsError.invalidValue("Choose a valid weekday.")
+            }
+            return try StandingBotSchedule.parse("weekly on \(StandingBotSchedule.weekdays[draft.weekday]) at \(draft.clockText)")
+        case "Every N hours":
+            guard let hours = Double(draft.hours), hours.isFinite, hours > 0 else {
+                throw StandingBotsError.invalidValue("Enter the number of hours.")
+            }
+            return .interval(seconds: hours * 3600)
+        case "Custom": return .cron(expression: draft.cron)
+        default: throw StandingBotsError.invalidValue("Choose when this helper runs.")
         }
     }
 }

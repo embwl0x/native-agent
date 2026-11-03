@@ -8,13 +8,15 @@ public struct MemoryV2Status: Codable, Hashable {
     public var counts: MemoryV2Counts?
     public var afterTurn: AfterTurnMemoryRecoveryStatus?
     public var createdAt: String?
-    public init(status: String, version: String? = nil, embedding: MemoryV2Embedding? = nil, counts: MemoryV2Counts? = nil, afterTurn: AfterTurnMemoryRecoveryStatus? = nil, createdAt: String? = nil) {
+    public var storageFailure: String?
+    public init(status: String, version: String? = nil, embedding: MemoryV2Embedding? = nil, counts: MemoryV2Counts? = nil, afterTurn: AfterTurnMemoryRecoveryStatus? = nil, createdAt: String? = nil, storageFailure: String? = nil) {
         self.status = status
         self.version = version
         self.embedding = embedding
         self.counts = counts
         self.afterTurn = afterTurn
         self.createdAt = createdAt
+        self.storageFailure = storageFailure
     }
 }
 
@@ -58,6 +60,7 @@ public struct MemoryV2Counts: Codable, Hashable {
 /// One time she was given a correction, in the miss ledger
 /// (`MemoryRecoveryReadout.misses`).
 public struct MemoryMiss: Codable, Hashable, Sendable, Identifiable {
+    public var originId: String
     public var memoryId: String
     public var text: String
     /// When, and the ISO week that falls in ("2026-W41").
@@ -66,14 +69,15 @@ public struct MemoryMiss: Codable, Hashable, Sendable, Identifiable {
     public var sessionId: String?
     /// `history:<message id>` in that session; nil on rows kept before turns were stamped.
     public var history: String?
-    public var id: String { memoryId + "@" + at }
+    public var id: String { "\(memoryId.utf8.count):\(memoryId)" + originId }
 }
 
-/// The corrections that teach one lesson, newest first.
+/// Full-window counts and at most ten examples, newest first, for one lesson.
 public struct MemoryMissLesson: Codable, Hashable, Sendable, Identifiable {
     public var lesson: String
+    public var countsByWeek: [String: Int]
     public var misses: [MemoryMiss]
     public var id: String { lesson }
 
-    public func count(week: String) -> Int { misses.filter { $0.week == week }.count }
+    public func count(week: String) -> Int { countsByWeek[week, default: 0] }
 }

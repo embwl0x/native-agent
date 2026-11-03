@@ -5,7 +5,7 @@ import ToolRegistry
 import SwiftUI
 import TrustCenter
 import ApprovalInbox
-// Blueprint: | `CapabilitiesView+MacActions.swift` | `CapabilitiesView`: native Mac actions, checked availability and browser/improvement run receipts |
+// Blueprint: | `CapabilitiesView+MacActions.swift` | Native Mac actions and checked availability; browser preview is local view state, displayed separately from durable browser/improvement run receipts |
 
 enum NativeMacPowerPanelPresentation {
     struct Tile: Equatable {
@@ -131,7 +131,7 @@ extension CapabilitiesView {
                                 CapabilityDetailRow(
                                     title: action.name,
                                     detail: AdvancedStatusWords.label(action.kind ?? action.id),
-                                    status: action.risk ?? "ok"
+                                    status: action.risk ?? "unknown"
                                 )
                                 Spacer()
                                 Button("Dry run") {
@@ -190,7 +190,7 @@ extension CapabilitiesView {
                                 CapabilityDetailRow(
                                     title: action.name,
                                     detail: "\(AdvancedStatusWords.label(action.connectorId ?? "connector")) · \(AdvancedStatusWords.label(action.authState ?? "unknown"))",
-                                    status: action.connectorStatus ?? (action.enabled == true ? "ok" : "warn")
+                                    status: action.connectorStatus ?? "unknown"
                                 )
                                 Spacer()
                                 Button("Dry run") {
@@ -211,6 +211,7 @@ extension CapabilitiesView {
 struct CapabilitiesRunGauntletAndBrowserActions: View {
     @Environment(AppModel.self) private var appModel
     @State private var isRunningBrowserDryRun = false
+    @State private var browserPreview: BrowserRun?
     @State private var isRunningGauntlet = false
 
     var body: some View {
@@ -221,7 +222,7 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
                     Task {
                         isRunningBrowserDryRun = true
                         defer { isRunningBrowserDryRun = false }
-                        await appModel.runBrowserDryRun()
+                        browserPreview = await appModel.runBrowserDryRun()
                     }
                 }
                 .controlSize(.small)
@@ -251,6 +252,12 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
                 }
             }
 
+            if let preview = browserPreview {
+                CapabilityDetailRow(title: "Browser preview", detail: preview.url ?? "",
+                    status: preview.status)
+                    .accessibilityIdentifier("capabilities.browser-dry-run.outcome")
+            }
+
             if let run = appModel.engine.tools.browserStatus?.latestReceipt {
                 let presentation = CapabilitiesRunActionPresentation.browserOutcome(for: run)
                 CapabilityDetailRow(
@@ -258,7 +265,7 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
                     detail: presentation.detail,
                     status: presentation.status
                 )
-                .accessibilityIdentifier("capabilities.browser-dry-run.outcome")
+                .accessibilityIdentifier("capabilities.browser-latest-run.outcome")
             }
 
             if let gauntlet = latestGauntlet {
@@ -279,13 +286,10 @@ struct CapabilitiesRunGauntletAndBrowserActions: View {
                 }
             }
 
-            if appModel.statusText.hasPrefix("Browser dry run:")
-                || appModel.statusText.hasPrefix("Browser run failed:")
-                || appModel.statusText.hasPrefix("Gauntlet:")
-                || appModel.statusText.hasPrefix("Gauntlet failed:") {
+            if let status = appModel.capabilityRunStatus {
                 Text(appModel.statusText)
                     .font(ShellType.caption)
-                    .foregroundStyle(appModel.statusText.contains("failed:") ? NativeAgentShell.trouble : NativeAgentShell.secondary)
+                    .foregroundStyle(status == .failed ? NativeAgentShell.trouble : NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("capabilities.run-actions.status")
             }

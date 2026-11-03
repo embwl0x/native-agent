@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TelegramPollLoop+StateReceipts.swift` | `TelegramPollLoop`: sole checked state.json reader and mutation owner (`readState`, `mutateState`) for polling, migration and status consumers; only missing state is empty, and unreadable/non-object state fails with a dedicated telegram/state.json error and is never overwritten; migration locks only existing legacy storage; `inferDataRoot`, `writeStatePatch`, `botTokenFingerprint`, `discoverSenders`; bounded setup pages persist in the canonical inbox before the bot cursor advances |
+// Blueprint: | `TelegramPollLoop+StateReceipts.swift` | `TelegramPollLoop`: sole checked state.json reader and mutation owner (`readState`, `mutateState`) for polling and status consumers; only missing state is empty, and unreadable/non-object state fails with a dedicated telegram/state.json error and is never overwritten; bot ingress validates its current identity without global-storage migration; `inferDataRoot`, `writeStatePatch`, `botTokenFingerprint`, `discoverSenders`; bounded setup pages persist in the canonical inbox before the bot cursor advances |
 
 private struct TelegramStateReadError: LocalizedError, CustomStringConvertible {
     let description = "telegram_state_unavailable: telegram/state.json is unreadable or is not a JSON object. Its contents were preserved."
@@ -21,55 +21,6 @@ extension TelegramPollLoop {
     func prepareBotIngressStorage() async throws {
         guard let id = Int64(botIdentity), id > 0, token.contains(":") else {
             throw TelegramOffsetCursorError.malformed
-        }
-        let legacyInbox = TelegramUpdateInbox(offsetURL: legacyOffsetURL, dataRoot: dataRoot)
-        guard FileManager.default.fileExists(atPath: legacyOffsetURL.path)
-                || FileManager.default.fileExists(atPath: legacyInbox.directory.path) else { return }
-        // The saved bot ID survives token rotation and does not depend on a
-        // private chat ever needing the optional username cache.
-        try await SwiftNativePersistenceCore.withFileLock(legacyOffsetURL) {
-            guard !FileManager.default.fileExists(atPath: offsetURL.path) else { return }
-            let root = try await Self.readState(dataRoot: dataRoot)
-            let savedIdentity: String?
-            // Only the previous poller's state can attribute legacy work.
-            // Current credentials say nothing about who received that inbox.
-            if case .object(let menu)? = root["commandMenu"], let identity = menu["botIdentity"]?.stringValue {
-                savedIdentity = identity
-            } else {
-                savedIdentity = nil
-            }
-            // A matching old cache can still attribute storage for callers
-            // without saved configuration. Never bypass a conflicting saved ID.
-            let ownsLegacy = savedIdentity.map { $0 == String(id) }
-                ?? (root["botUsernameTokenFingerprint"]?.stringValue == Self.botTokenFingerprint(token))
-            guard ownsLegacy else {
-                throw TelegramBotError.underlying("Legacy Telegram inbox ownership unresolved for this bot; cursor and inbox preserved, polling paused. Restore historical bot identity evidence before retrying.")
-            }
-            let inbox = TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot)
-            if FileManager.default.fileExists(atPath: legacyInbox.directory.path) {
-                try await SwiftNativePersistenceCore.withFileLock(legacyInbox.directory.appendingPathComponent("claims_index.json")) {
-                    let manager = FileManager.default
-                    if manager.fileExists(atPath: inbox.directory.path) {
-                        guard manager.contentsEqual(atPath: legacyInbox.directory.path, andPath: inbox.directory.path) else {
-                            throw TelegramBotError.underlying("Legacy Telegram inbox migration is incomplete; cursor and both inboxes preserved, polling paused.")
-                        }
-                        _ = try await inbox.snapshots()
-                    } else {
-                        let staged = TelegramUpdateInbox(offsetURL: offsetURL.deletingLastPathComponent()
-                            .appendingPathComponent(".migration-\(UUID().uuidString)"), dataRoot: dataRoot)
-                        try manager.createDirectory(at: inbox.directory.deletingLastPathComponent(), withIntermediateDirectories: true)
-                        defer { try? manager.removeItem(at: staged.directory) }
-                        try manager.copyItem(at: legacyInbox.directory, to: staged.directory)
-                        _ = try await staged.snapshots()
-                        guard manager.contentsEqual(atPath: legacyInbox.directory.path, andPath: staged.directory.path) else {
-                            throw TelegramBotError.underlying("Legacy Telegram inbox copy could not be verified; polling paused.")
-                        }
-                        try manager.moveItem(at: staged.directory, to: inbox.directory)
-                    }
-                }
-            }
-            let offset = try TelegramOffsetCursor(fileURL: legacyOffsetURL).load()
-            _ = try await TelegramOffsetCursor(fileURL: offsetURL).advance(to: offset)
         }
     }
 
@@ -93,7 +44,7 @@ extension TelegramPollLoop {
         } catch {
             // Never write over a state file that did not read back. Logged
             // here, not through recordError, which writes state.json too.
-            await TelegramErrorLog.append(
+            await appendErrorLog(
                 .object([
                     "id": .string(UUID().uuidString),
                     "at": .string(_tgNowString()),
@@ -327,7 +278,7 @@ extension TelegramPollLoop {
             row["textPreview"] = .string(preview)
         }
         // Locked append with 5 MB rotation and one backup.
-        await TelegramErrorLog.append(
+        await appendErrorLog(
             .object(row),
             to: telegramDir.appendingPathComponent("errors.jsonl")
         )
@@ -336,7 +287,16 @@ extension TelegramPollLoop {
         ])
     }
 
-    /// Stop the ephemeral preview, then persist one system notice and receipt.
+    /// Polling reports log-storage failure without attempting another writer.
+    private func appendErrorLog(_ row: JSONValue, to path: URL) async {
+        do { try await TelegramErrorLog.append(row, to: path) }
+        catch {
+            // No second write mechanism: polling reports the storage cause here.
+            FileHandle.standardError.write(Data("Telegram error log unavailable at \(path.path): \(error.localizedDescription)\n".utf8))
+        }
+    }
+
+    /// The update's assistant-delivery journal owns its one failure notice.
     func deliverTurnNotice(
         _ notice: String,
         delivery: TelegramAssistantDeliveryDriver,
@@ -346,16 +306,21 @@ extension TelegramPollLoop {
         message: TelegramMessage,
         text: String
     ) async {
-        await delivery.stop()
         do {
-            try await Self.defaultSendMessage(token, message.destination, notice)
-            await recordReceipt(
-                kind: receiptKind,
-                update: update,
-                message: message,
-                text: text,
-                reply: notice
-            )
+            let inbox = TelegramUpdateInbox(offsetURL: offsetURL, dataRoot: dataRoot)
+            let claim = try inbox.claim(updateId: update.updateId)
+            _ = try await inbox.recordAssistantDelivery(updateId: update.updateId,
+                delivery: claim.assistantDelivery, failedBeforeAnswer: true)
+            switch await delivery.finalize(reply: notice) {
+            case .delivered:
+                if let session = claim.assistantSessionId, let run = claim.assistantRunId {
+                    try await settleReplyCheckpoint(sessionId: session, runId: run, verdict: "failed_before_answer")
+                }
+                await recordReceipt(kind: receiptKind, update: update, message: message, text: text, reply: notice)
+            case .failed(let reason), .outcomeUnknown(let reason):
+                await recordError(context: sendErrorContext, error: reason, update: update, message: message, text: text)
+            case .held: break
+            }
         } catch {
             await recordError(
                 context: sendErrorContext,

@@ -1,6 +1,8 @@
 import Foundation
 import PersistenceCore
 import NativeAgentShared
+import NativeAgentCore
+import Experiences
 // Blueprint: | `ChatUpdateNote.swift` | Version note selection and launch transaction with supplied bundle resource/version inputs |
 
 /// A bundle-version change writes one note, delivered once through the next turn's dynamic segment outside the cached prefix.
@@ -32,15 +34,23 @@ public enum ChatUpdateNote {
             .appendingPathComponent("update_note.json")
     }
 
-    public static func load(dataRoot: URL) -> ChatUpdateNoteRecord? {
-        guard let data = try? Data(contentsOf: recordURL(dataRoot: dataRoot)) else { return nil }
-        return try? JSONDecoder().decode(ChatUpdateNoteRecord.self, from: data)
+    public static func load(dataRoot: URL) throws -> ChatUpdateNoteRecord? {
+        let data: Data
+        do { data = try Data(contentsOf: recordURL(dataRoot: dataRoot)) }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
+        let record = try JSONDecoder().decode(ChatUpdateNoteRecord.self, from: data)
+        guard ISO8601DateFormatter().date(from: record.createdAt) != nil,
+              record.deliveredAt == nil || record.deliveredAt.flatMap({ ISO8601DateFormatter().date(from: $0) }) != nil,
+              !record.note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ToolFailureError("The saved update note has an invalid timestamp or empty text. Repair context/update_note.json; its bytes are preserved.", effects: .none, owner: "context/update_note.json", recovery: .repair)
+        }
+        return record
     }
 
     /// The note to put in this turn's context, or nil when there is nothing to
     /// say: no record, already delivered, empty, or past retention.
-    public static func pendingNote(dataRoot: URL, now: Date = Date()) -> String? {
-        guard let record = load(dataRoot: dataRoot) else { return nil }
+    public static func pendingNote(dataRoot: URL, now: Date = Date()) throws -> String? {
+        guard let record = try load(dataRoot: dataRoot) else { return nil }
         guard record.deliveredAt == nil else { return nil }
         let note = record.note.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !note.isEmpty else { return nil }
@@ -49,24 +59,26 @@ public enum ChatUpdateNote {
         return note
     }
 
-    /// Stamp the record delivered. Best-effort on purpose: failing to stamp must
-    /// not fail the turn, and the worst case is the note appearing once more.
-    public static func markDelivered(dataRoot: URL, now: Date = Date(), expectedNote: String? = nil) {
-        guard var record = load(dataRoot: dataRoot), record.deliveredAt == nil else { return }
+    /// Provider acceptance is recorded durably; a failed stamp remains repair owed.
+    public static func markDelivered(dataRoot: URL, now: Date = Date(), expectedNote: String? = nil) throws {
+        guard var record = try load(dataRoot: dataRoot), record.deliveredAt == nil else { return }
         if let expectedNote, record.note.trimmingCharacters(in: .whitespacesAndNewlines) != expectedNote { return }
         record.deliveredAt = ISO8601DateFormatter().string(from: now)
-        write(record, dataRoot: dataRoot)
+        do {
+            try write(record, dataRoot: dataRoot)
+            RepairOwed.settle(dataRoot, operation: "update_note.delivered", evidence: .init(source: "context/update_note.json", id: record.to))
+        } catch {
+            RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "update_note.delivered", owner: "context/update_note.json",
+                words: "The provider accepted the update note, but its delivery stamp could not be saved: \(error.localizedDescription). Repair the note store before consuming it again.")
+            throw error
+        }
     }
 
-    public static func write(_ record: ChatUpdateNoteRecord, dataRoot: URL) {
+    public static func write(_ record: ChatUpdateNoteRecord, dataRoot: URL) throws {
         let url = recordURL(dataRoot: dataRoot)
-        do {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(record), to: url)
-        } catch {
-            nativeLog("[update-note] could not write the update note: %@", error.localizedDescription)
-        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(record), to: url)
     }
 }
 
@@ -76,6 +88,7 @@ public enum ChatUpdateNoteDecision: Equatable, Sendable {
     case freshInstall(version: String)
     case unchanged(version: String)
     case updated(from: String, to: String)
+    case unavailable(reason: String)
 }
 
 extension ChatUpdateNote {
@@ -181,9 +194,9 @@ extension ChatUpdateNote {
         currentVersion: String,
         defaults: UserDefaults,
         now: Date = Date(),
-        availableVersions: () -> [String],
-        noteBody: (String) -> String?
-    ) -> ChatUpdateNoteDecision {
+        availableVersions: () throws -> [String],
+        noteBody: (String) throws -> String
+    ) throws -> ChatUpdateNoteDecision {
         guard !currentVersion.isEmpty else {
             // No version to compare: say nothing and store nothing rather than
             // inventing an update out of a blank string.
@@ -191,19 +204,19 @@ extension ChatUpdateNote {
         }
         let stored = defaults.string(forKey: ChatUpdateNote.lastLaunchedVersionDefaultsKey)
         let decision = ChatUpdateNote.decide(storedVersion: stored, currentVersion: currentVersion)
-        defaults.set(currentVersion, forKey: ChatUpdateNote.lastLaunchedVersionDefaultsKey)
-
-        guard case .updated(let from, let to) = decision else { return decision }
+        guard case .updated(let from, let to) = decision else {
+            defaults.set(currentVersion, forKey: ChatUpdateNote.lastLaunchedVersionDefaultsKey)
+            return decision
+        }
+        // Existing damaged records are preserved instead of replaced by a new note.
+        _ = try load(dataRoot: dataRoot)
 
         let versions = ChatUpdateNote.versionsToReport(
             from: from,
             to: to,
-            available: availableVersions()
+            available: try availableVersions()
         )
-        let notes: [(version: String, body: String)] = versions.compactMap { version in
-            guard let body = noteBody(version) else { return nil }
-            return (version: version, body: body)
-        }
+        let notes: [(version: String, body: String)] = try versions.map { (version: $0, body: try noteBody($0)) }
         let text = ChatUpdateNote.compose(from: from, to: to, notes: notes)
         let record = ChatUpdateNoteRecord(
             from: from,
@@ -211,45 +224,33 @@ extension ChatUpdateNote {
             createdAt: ISO8601DateFormatter().string(from: now),
             note: text
         )
-        ChatUpdateNote.write(record, dataRoot: dataRoot)
+        try ChatUpdateNote.write(record, dataRoot: dataRoot)
+        defaults.set(currentVersion, forKey: ChatUpdateNote.lastLaunchedVersionDefaultsKey)
         return decision
     }
 }
 
 extension ChatUpdateNote {
     /// Versions whose notes ship inside this bundle.
-    public static func bundledVersions(resources: URL?) -> [String] {
-        guard let dir = bundledNotesDirectory(resources: resources),
-              let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
-            return []
-        }
+    public static func bundledVersions(resources: URL?) throws -> [String] {
+        let dir = try bundledNotesDirectory(resources: resources)
+        let names = try FileManager.default.contentsOfDirectory(atPath: dir.path)
         return names
             .filter { $0.hasSuffix(".md") }
             .map { String($0.dropLast(3)) }
             .filter { !$0.isEmpty }
     }
 
-    public static func bundledNote(version: String, resources: URL?) -> String? {
-        guard !version.contains("/"), version != ".", version != ".." else { return nil }
-        guard let dir = bundledNotesDirectory(resources: resources) else { return nil }
+    public static func bundledNote(version: String, resources: URL?) throws -> String {
+        guard !version.contains("/"), version != ".", version != ".." else { throw CocoaError(.fileReadInvalidFileName) }
+        let dir = try bundledNotesDirectory(resources: resources)
         let url = dir.appendingPathComponent("\(version).md")
-        return try? String(contentsOf: url, encoding: .utf8)
+        return try String(contentsOf: url, encoding: .utf8)
     }
 
-    private static func bundledNotesDirectory(resources: URL?) -> URL? {
-        guard let resources else { return nil }
-        // The release layout is Resources/docs/release-notes/; the SwiftPM
-        // development layout puts copied resources at the resource root, so
-        // accept release-notes/ there too (same two-step as the data-limits doc).
-        for relative in ["docs/release-notes", "release-notes"] {
-            let candidate = resources.appendingPathComponent(relative, isDirectory: true)
-            var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDir),
-               isDir.boolValue {
-                return candidate
-            }
-        }
-        return nil
+    private static func bundledNotesDirectory(resources: URL?) throws -> URL {
+        guard let resources else { throw CocoaError(.fileReadNoSuchFile) }
+        return resources.appendingPathComponent(bundledNotesRelativeDirectory, isDirectory: true)
     }
 
     @discardableResult
@@ -260,13 +261,22 @@ extension ChatUpdateNote {
         defaults: UserDefaults = .standard,
         now: Date = Date()
     ) -> ChatUpdateNoteDecision {
-        recordLaunch(
+        do {
+        let decision = try recordLaunch(
             dataRoot: dataRoot,
             currentVersion: currentVersion.trimmingCharacters(in: .whitespacesAndNewlines),
             defaults: defaults,
             now: now,
-            availableVersions: { bundledVersions(resources: resources) },
-            noteBody: { bundledNote(version: $0, resources: resources) }
+            availableVersions: { try bundledVersions(resources: resources) },
+            noteBody: { try bundledNote(version: $0, resources: resources) }
         )
+        RepairOwed.settle(dataRoot, operation: "update_note.launch", evidence: .init(source: "context/update_note.json", id: currentVersion))
+        return decision
+        } catch {
+            let words = "The update note could not be prepared: \(error.localizedDescription). The launch version was not advanced; repair the bundled notes or note store and reopen the app."
+            RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "update_note.launch", owner: "context/update_note.json", words: words)
+            nativeLog("[update-note] \(words)")
+            return .unavailable(reason: words)
+        }
     }
 }

@@ -152,14 +152,14 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
     }
 
     /// Stream shapes, by protocol rather than by agent.
-    public enum Stream: String, Sendable, Equatable, Codable {
+    public enum Stream: String, Sendable, Equatable, Codable, CaseIterable {
         /// `agy --output-format stream-json`: step_update text_delta, then one result.
         case antigravity
         /// `codex exec --json`: whole items as they complete.
         case codex
     }
 
-    public enum PermissionFlags: String, Sendable, Equatable, Codable {
+    public enum PermissionFlags: String, Sendable, Equatable, Codable, CaseIterable {
         /// `codex -c sandbox_mode=… -c approval_policy=…`.
         case codex
         case claude
@@ -221,17 +221,22 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
     }
 }
 
-/// What a host's recipe launches now, read through `AgentRecipeStore.launch`.
-/// The Trust boundary prices a message by it but sits below the store's
-/// module, so the engine installs that reader here at assembly; until then
-/// no host launches anything, and the run itself is gated again at dispatch.
+/// The contact owner's checked message-effect projection. Trust sits below
+/// that owner, so assembly installs its reader; absence reports unavailable.
 public enum AgentHostLaunches {
     public typealias Launch = (acp: AgentHostACP?, commandLine: AgentHostCommandLine?)
-    private static let reader = OSAllocatedUnfairLock<(@Sendable (String) -> Launch)?>(initialState: nil)
+    private static let reader = OSAllocatedUnfairLock<(@Sendable (String, URL) throws -> Bool)?>(initialState: nil)
 
-    public static func install(_ read: @escaping @Sendable (String) -> Launch) { reader.withLock { $0 = read } }
+    public static func install(_ read: @escaping @Sendable (String, URL) throws -> Bool) { reader.withLock { $0 = read } }
 
-    public static func launch(host: String) -> Launch { reader.withLock { $0 }?(host) ?? (nil, nil) }
+    public static func messagesByCommand(agent: String, dataRoot: URL) throws -> Bool {
+        guard let read = reader.withLock({ $0 }) else {
+            throw ToolFailureError("Contact effect classification is not installed.", effects: .none,
+                owner: "Agent contacts", code: "agent_profile_unavailable",
+                instruction: "Repair runtime assembly before sending to another agent.")
+        }
+        return try read(agent, dataRoot)
+    }
 }
 
 /// Command-line executable resolution and the login environment used by host recipes.
@@ -246,7 +251,7 @@ public enum AgentHostCommandLines {
                 tap: "Repair \(files); the app reads PATH again at its next launch", personDecides: true))
         }
         guard shell.hasPrefix("/"), access(shell, X_OK) == 0 else { return refused("the account's shell is not executable") }
-        let process = Process(), output = Pipe(), exited = DispatchSemaphore(value: 0)
+        let process = ManagedProcess(), output = Pipe(), exited = DispatchSemaphore(value: 0)
         let bytes = OSAllocatedUnfairLock(initialState: Data())
         process.executableURL = URL(fileURLWithPath: shell)
         process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
@@ -264,10 +269,11 @@ public enum AgentHostCommandLines {
             try process.run()
             try? output.fileHandleForWriting.close()
             if exited.wait(timeout: .now() + 3) == .timedOut {
-                ProcessTreeReaper.quiesceAndKill(ProcessTreeReaper.snapshot(rootPID: process.processIdentifier))
-                return refused("PATH did not return within three seconds")
+                ProcessTreeReaper.quiesceAndKill(process.groupSnapshot)
+                return refused(process.terminationError ?? "PATH did not return within three seconds; process-group settlement remains in progress")
             }
             drain.stopAndWait()
+            if let failure = process.terminationError { return refused(failure) }
             let fields = bytes.withLock { $0.split(separator: 0, omittingEmptySubsequences: false) }
             guard process.terminationStatus == 0, fields.count >= 3,
                   let path = String(data: Data(fields[1]), encoding: .utf8), !path.isEmpty else { return refused("no readable PATH returned") }

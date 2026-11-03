@@ -4,9 +4,10 @@ import NativeAgentCore
 import PersistenceCore
 import ApprovalInbox
 import ChatTurnRuntime
+import Transcripts
 import NotificationInbox
 
-// Blueprint: | `InboxCardActions.swift` | `InboxCardActions`: engagement-before-effect ordering, primary action projection and spoken/draft delivery through one inbox claim |
+// Blueprint: | `InboxCardActions.swift` | `InboxCardActions`: primary action projection and spoken/draft delivery through one inbox claim; speech addresses the card's conversation or checked anchor and marks read only after acceptance |
 
 /// Assembly and presentation bindings; the transaction owns ordering and receipts.
 public protocol InboxCardActionEffects: Sendable {
@@ -47,6 +48,16 @@ public enum InboxCardActions {
         }
         let endpointAction = normalizedAction
 
+        if endpointAction == "archive" || endpointAction == "dismiss",
+           let row = try await LiveNotificationInbox(path: visibleInboxPath).rows().first(where: {
+               $0.objectValue?["id"]?.stringValue == id }),
+           case .object(let card) = row,
+           !(card["related_approval_id"]?.stringValue ?? "").isEmpty,
+           !(card["actions"]?.arrayValue ?? []).contains(where: { $0.objectValue?["id"]?.stringValue == endpointAction }) {
+            // The same rule every surface shows: an approval's card is settled by its approval.
+            throw NSError(domain: "NativeAgentSwiftOnly", code: -409, userInfo: [NSLocalizedDescriptionKey:
+                "This card belongs to a pending approval; approve or deny it (or open Approvals) instead of \(endpointAction == "archive" ? "archiving" : "dismissing") it."])
+        }
         if endpointAction == "read" || endpointAction == "archive" || endpointAction == "dismiss" {
             if await updateVisibleStatus(
                 id: id, action: endpointAction, inboxPath: visibleInboxPath, metadata: metadata) {
@@ -89,18 +100,6 @@ public enum InboxCardActions {
                 )
             }
             let resolution = resolvePrimaryAction(for: item)
-            // Persist engagement before its effect; disposal owns its own write.
-            if let statusAction = resolution.inboxStatusAction {
-                guard await updateVisibleStatus(
-                    id: id, action: statusAction, inboxPath: visibleInboxPath) else {
-                    throw NSError(
-                        domain: "NativeAgentSwiftOnly",
-                        code: -423,
-                        userInfo: [NSLocalizedDescriptionKey:
-                            "Inbox act for \(id) couldn't mark the item \(statusAction) (transient lock/IO failure or stale row) — retry."]
-                    )
-                }
-            }
             switch resolution {
             case .openApprovals:
                 if quiet {
@@ -115,22 +114,8 @@ public enum InboxCardActions {
                 if quiet { break }
                 await effects.openChatDraft(draft)
             case .chatSpoken(let message):
-                let spokenSession = try await postSpokenInboxMessage(message: message, itemId: id, dataRoot: root, effects: effects)
-                if quiet {
-                    guard spokenSession != nil else {
-                        throw NSError(domain: "NativeAgentSwiftOnly", code: -423, userInfo: [NSLocalizedDescriptionKey:
-                            "Inbox act for \(id): the chat message didn't post (rate limit or write failure) — retry later."])
-                    }
-                    break
-                }
-                if let spokenSession {
-                    await effects.openSpokenChat(spokenSession)
-                } else {
-                    await effects.openChatDraft(inboxChatDraftText(
-                        title: item.title.trimmingCharacters(in: .whitespacesAndNewlines),
-                        summary: item.summary.trimmingCharacters(in: .whitespacesAndNewlines)
-                    ))
-                }
+                let spokenSession = try await postSpokenInboxMessage(message: message, item: item, dataRoot: root, effects: effects)
+                if !quiet { await effects.openSpokenChat(spokenSession) }
             case .diskCleanup:
                 let message = try await effects.cleanUpDiskHygiene(dataRoot: root)
                 nativeLog("[inbox] inboxAction(act) disk_hygiene: \(message)")
@@ -143,6 +128,14 @@ public enum InboxCardActions {
                         + "Use the explicit archive/dismiss/approve/reject actions, "
                         + "or open the item for full context."]
                 )
+            }
+            // A refused effect leaves the card unread. A posted speech is
+            // idempotent, so a failed read-marker write can safely be retried.
+            if let statusAction = resolution.inboxStatusAction {
+                guard await updateVisibleStatus(id: id, action: statusAction, inboxPath: visibleInboxPath) else {
+                    throw NSError(domain: "NativeAgentSwiftOnly", code: -423, userInfo: [NSLocalizedDescriptionKey:
+                        "Inbox act for \(id) completed, but marking it \(statusAction) did not persist. Retry this same card."])
+                }
             }
             return
         }
@@ -223,14 +216,24 @@ public enum InboxCardActions {
         return draft + "\n\n"
     }
 
-    private static func postSpokenInboxMessage(message: String, itemId: String, dataRoot: URL, effects: any InboxCardActionEffects) async throws -> String? {
+    private static func postSpokenInboxMessage(message: String, item: InboxItemRecord, dataRoot: URL, effects: any InboxCardActionEffects) async throws -> String {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let sessionId = (UserDefaults.standard.string(forKey: "activeChatSessionId") ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !sessionId.isEmpty else {
-            nativeLog("[inbox] act chat_spoken: no active chat session — falling back to draft")
-            return nil
+        guard !trimmed.isEmpty else {
+            throw NSError(domain: "NativeAgentSwiftOnly", code: -423, userInfo: [NSLocalizedDescriptionKey: "This inbox message has no content to deliver."])
+        }
+        let sessionId: String
+        if let own = item.chat_session_id {
+            guard NativeAgentChatSessionID.normalizedPathComponent(own) == own else {
+                throw NSError(domain: "NativeAgentSwiftOnly", code: -423, userInfo: [NSLocalizedDescriptionKey:
+                    "This inbox card's conversation is invalid. Repair its conversation link before delivering it."])
+            }
+            sessionId = own
+        } else {
+            guard let anchor = try ConversationAnchor.checkedCurrent(dataRoot: dataRoot) else {
+                throw NSError(domain: "NativeAgentSwiftOnly", code: -423, userInfo: [NSLocalizedDescriptionKey:
+                    "This inbox card has no conversation and no current conversation is anchored. Open your conversation, then retry this card."])
+            }
+            sessionId = anchor.sessionId
         }
         let client = effects.chatClient(dataRoot: dataRoot)
         do {
@@ -239,7 +242,7 @@ public enum InboxCardActions {
                 content: trimmed,
                 caller: .morningBrief,
                 idempotencyKey: SwiftNativeChatOrchestrationClient.proactiveSpeechIdempotencyKey(
-                    scope: "inbox:\(itemId)",
+                    scope: "inbox:\(item.id)",
                     content: trimmed
                 ),
                 sessionId: sessionId,
@@ -251,14 +254,12 @@ public enum InboxCardActions {
             case .duplicate(let destination):
                 return destination
             case .rateLimited(let seconds):
-                nativeLog("[inbox] act chat_spoken: rate limited (%ds) — falling back to draft", seconds)
-                return nil
+                throw NSError(domain: "NativeAgentSwiftOnly", code: -423, userInfo: [NSLocalizedDescriptionKey: "Inbox delivery is rate limited for \(seconds) seconds. The same card and message remain available; retry later."])
             }
         } catch let error as ProactiveSpeechError {
             throw error
         } catch {
-            nativeLog("[inbox] act chat_spoken failed: \(error) — falling back to draft")
-            return nil
+            throw error
         }
     }
 

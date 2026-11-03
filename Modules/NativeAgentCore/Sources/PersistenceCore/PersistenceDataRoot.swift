@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 import NativeAgentCore
-// Blueprint: | `PersistenceDataRoot.swift` | Swift initializes the stable process data root once; explicit resolver arguments bypass it; literalFileURL preserves configuration path spelling; `DataRootLife.life(of:)` interprets JSON stamps, with a missing or non-string stamp naming the first life |
+// Blueprint: | `PersistenceDataRoot.swift` | Swift initializes the stable process data root once; explicit resolver arguments bypass it; public installs use Foundation's applicationSupportDirectory directly; literalFileURL preserves configuration path spelling; `DataRootLife.life(of:)` interprets JSON stamps, with a missing or non-string stamp naming the first life |
 
 // MARK: - Data root resolution
 
@@ -52,7 +52,7 @@ internal func resolveDefaultDataRoot(
 
     // 3. Everything else, the public release among them (bare — no /data
     //    suffix, no dir creation).
-    return libraryAppSupportFallback(fileManager: fileManager)
+    return applicationSupportDataRoot()
 }
 
 /// Configuration paths keep literal whitespace and `~`, without home expansion.
@@ -111,19 +111,11 @@ public func missingLaunchRoots(
 
 /// `~/Library/Application Support/NativeAgent` BARE — no `/data` suffix, no
 /// directory creation; shared by every subsystem.
-public func libraryAppSupportFallback(
-    fileManager: FileManager = .default,
+public func applicationSupportDataRoot(
     appBundleIdentifier: String? = currentAppBundleIdentifier()
 ) -> URL {
     let folder = appSupportFolderName(for: appBundleIdentifier)
-    if let appSupport = try? fileManager.url(
-        for: .applicationSupportDirectory, in: .userDomainMask,
-        appropriateFor: nil, create: false
-    ) {
-        return appSupport.appendingPathComponent(folder, isDirectory: true)
-    }
-    return URL(fileURLWithPath: NSHomeDirectory())
-        .appendingPathComponent("Library/Application Support/\(folder)")
+    return URL.applicationSupportDirectory.appendingPathComponent(folder, isDirectory: true)
 }
 
 /// The one public install whose data lives at the historic

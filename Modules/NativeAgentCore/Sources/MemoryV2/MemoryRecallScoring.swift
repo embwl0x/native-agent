@@ -79,17 +79,7 @@ public enum MemoryRecallScoring {
         if record.memoryKind?.lowercased() == "correction" || tags.contains("correction") { return true }
         let metadata: [String: JSONValue]
         if case .object(let object)? = record.extras { metadata = object } else { metadata = [:] }
-        guard let correction = record.correction ?? metadata["correction"] else { return false }
-        switch correction {
-        case .null, .bool(false): return false
-        case .object(let object):
-            if case .bool(let current)? = object["current"] { return current }
-            if case .bool(let active)? = object["active"] { return active }
-            return !object.isEmpty
-        case .array(let values): return !values.isEmpty
-        case .string(let value): return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        case .bool(true), .int, .double: return true
-        }
+        return metadata["correction"] == .bool(true)
     }
 
     public static func lexicalTokens(_ text: String) -> [String] {

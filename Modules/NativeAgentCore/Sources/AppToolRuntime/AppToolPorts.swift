@@ -85,7 +85,7 @@ public struct QuietComposerOutcome: Sendable {
 public typealias QuietToolPage = NativeAgentShared.QuietToolPage
 
 @MainActor public protocol QuietToolPresentationPort: Sendable {
-    var pages: [QuietToolPage] { get }
+    var pages: [QuietToolPage] { get throws }
     var currentPage: QuietToolPage? { get }
     var visiblePageInput: [String: JSONValue]? { get }
     func page(named: String) -> QuietToolPage?

@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `CognitiveSubstrate+Workspace.swift` | `CognitiveSubstrate`: `workspaceSnapshot`, `frozenRead` |
+import MacControl
+// Blueprint: | `CognitiveSubstrate+Workspace.swift` | `CognitiveSubstrate`: `workspaceSnapshot`, `frozenRead` captures nodes and associations from one copied field and the shared person-presence line at the frozen instant |
 
 extension CognitiveSubstrate {
     /// Build a workspace from the exact field settlement already owned by the
@@ -31,7 +32,7 @@ extension CognitiveSubstrate {
     /// Settle one copied continuity field at an explicit timestamp. The
     /// resulting snapshot/workspace may be rendered into a frozen provider
     /// packet without advancing the live field's decay anchors.
-    public func frozenRead(at fixedAt: Date) async -> CognitiveFrozenRead {
+    public func frozenRead(at fixedAt: Date) -> CognitiveFrozenRead {
         let frozenConfiguration = configuration
         let frozenDynamics = dynamics
         let fixedAffect = projectedAffect(at: fixedAt, dynamics: frozenDynamics)
@@ -44,13 +45,11 @@ extension CognitiveSubstrate {
         let frozenSuppressions = associationSuppressions
         let peerIds = Set(field.peekNodes().compactMap { Self.peerIdentity(metadata: $0.metadata, dataRoot: conversationDataRoot) })
         let frozenTrustedPeers = Set(peerIds.filter { dependencies.peerTrusted($0) })
-        // Curiosity is workspace-relative, so it is captured below where
-        // the frozen workspace is known; the other two are workspace-independent.
-        let frozenFatigue = substrateFatigueProxy(at: fixedAt)
-        let frozenClarity = substrateClarityProxy(affect: fixedAffect, at: fixedAt)
         var copiedField = field
         let settledNodes = frozenConfiguration.enabled
             ? copiedField.snapshot(at: fixedAt, configuration: frozenConfiguration) : []
+        let associations = frozenConfiguration.enabled
+            ? copiedField.associationEdges(at: fixedAt, configuration: frozenConfiguration) : []
         let snapshot = CognitiveSubstrateSnapshot(
             generatedAt: fixedAt,
             enabled: frozenConfiguration.enabled,
@@ -76,23 +75,23 @@ extension CognitiveSubstrate {
             personalityDynamics: frozenDynamics,
             snapshot: snapshot,
             workspace: workspace,
+            associations: associations,
             affect: fixedAffect,
             mood: fixedMood,
-            feltProxies: CognitiveFeltProxyReads(
-                fatigue: frozenFatigue,
-                // Curiosity is novelty of what she is HOLDING, so it is captured
-                // against the frozen workspace — the same items the capsule
-                // renders from.
-                curiosity: substrateCuriosityProxy(
-                    from: workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) },
-                    at: fixedAt),
-                clarity: frozenClarity),
             soundLandingScores: frozenSoundLandingScores,
             capsulePresentationState: frozenPresentationState,
             associationSuppressions: frozenSuppressions,
             trustedPeerIds: frozenTrustedPeers,
             mindEpoch: mindEpoch,
-            cares: Array(cares.values)
+            cares: Array(cares.values),
+            carePersonAliases: carePersonAliases,
+            carePeopleAvailable: carePeopleReadFailure == nil,
+            selfTraits: selfKnowledge?.traits ?? [],
+            personLines: selfPersonLines,
+            personPresenceLine: PersonPresence.read(dataRoot: conversationDataRoot, now: fixedAt).line,
+            episodeCount: episodes.count,
+            reflectionCount: reflectionReceipts.count,
+            ablations: ablations
         )
     }
 
@@ -208,7 +207,7 @@ extension CognitiveSubstrate {
         switch node.kind {
         case .conversationFocus, .correction:
             return !isCapsuleMetaOrOperationalTrace(node)
-        case .toolObservation, .providerHealth, .workshopExecution, .appLifecycle, .feltResolution:
+        case .toolObservation, .providerHealth, .appLifecycle, .feltResolution:
             return false
         }
     }
@@ -278,7 +277,6 @@ extension CognitiveSubstrate {
         let kindBoost: Double
         switch node.kind {
         case .correction: kindBoost = 0.15
-        case .workshopExecution: kindBoost = 0.12
         case .providerHealth, .toolObservation: kindBoost = 0.08
         case .conversationFocus: kindBoost = 0.05
         case .appLifecycle: kindBoost = 0

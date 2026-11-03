@@ -19,8 +19,8 @@ function step(state, event) {
       if (event.calls.length) return next({purpose: state.purpose, calls: event.calls.length, hand: state.hand},
         event.calls.map(function (call) { return {effect: "app", call: call}; }));
       if (state.purpose === "keep") return next(state, []);
-      // What she worked out by hand, she keeps: one more turn of thought after the reply.
-      // One call made 3 rounds in a row used her mind as a loop: the same moment opens for it.
+      // Hand work offers a private keep; the stem opens it on the practice's second meeting.
+      // One call made 3 rounds in a row used her mind as a loop: the same gate applies.
       var loop = event.repeated && event.repeated.count >= 3 ? looped(event.repeated) : "";
       if (state.hand || loop) return next({purpose: "keep", calls: 0}, [{effect: "reply.end"}, {effect: "after"},
         {effect: "model.call", purpose: "keep", note: state.hand ? KEEP + (loop ? " Also, " + loop : "") : "Your reply is delivered. Before you move on: " + loop}]);
@@ -52,7 +52,8 @@ var KEEP = "Your reply is delivered. Before you move on: you worked part of this
   "Keep the route that worked as one of your own abilities, so next time you run it instead of working it out again: " +
   "app ability.save {id, description, code, params}, whose run(input) makes the calls that worked, in order, " +
   "with this request's specifics as its inputs and the attempts that failed left out. If you worked around an ability of yours, " +
-  "save its fixed version under that ability's id instead. A single call you can simply make again needs no ability: then keep nothing.";
+  "save its fixed version under that ability's id instead. A single call you can simply make again needs no ability: then keep nothing. " +
+  "A habit that gathers and wants your judgment returns needs_me: \"<why>\"; otherwise it finishes the job itself.";
 
 function looped(repeated) {
   return "you made the same call " + repeated.count + " rounds in a row (" + repeated.call + "), each round only deciding to go again. " +

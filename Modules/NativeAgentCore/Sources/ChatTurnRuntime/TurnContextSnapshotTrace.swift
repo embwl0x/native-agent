@@ -4,7 +4,7 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 
-// Blueprint: | `TurnContextSnapshotTrace.swift` | `SwiftNativeTurnEngine.fireContextSnapshotEvent`: local bounded, redacted context snapshots and prompt/schema fingerprints tied to the current turn trace |
+// Blueprint: | `TurnContextSnapshotTrace.swift` | Final opening-request snapshots and wire fingerprints; root-bound, admission-ordered and joined fed-context writes with checked missing/loaded/unavailable reads; context.ready stays at assembly |
 // v2Prefix receipts (ConversationPrefixTelemetry).
 import ProviderRouting
 // ContextFlow packet provenance, for the memory-recall outcome on packet turns.
@@ -13,6 +13,14 @@ import Context
 // MARK: - Turn Inspector context snapshots
 
 extension SwiftNativeTurnEngine {
+    /// Cheap lifecycle boundary; snapshot redaction and local persistence may
+    /// run beside dispatch without moving the meaning of context.ready.
+    nonisolated static func fireContextReady(surface: String, context: TurnContext, sessionId: String?) {
+        TurnLifecycleTelemetry.emit(.contextReady, surface: surface, sessionId: sessionId,
+            observedBy: "context.snapshot.input", counts: [
+                "systemBytes": Int64((context.systemPrompt ?? context.systemSegments?.combined ?? "").utf8.count),
+                "toolSchemaParameterBytes": Int64(context.toolSchemas.reduce(0) { $0 + $1.parametersJSON.count })])
+    }
     private static let contextSnapshotChunkChars = 1_800
     private static let contextSnapshotStableLimit = 48_000
     private static let contextSnapshotDynamicLimit = 32_000
@@ -21,25 +29,30 @@ extension SwiftNativeTurnEngine {
     private static let contextSnapshotCognitiveLimit = 12_000
     private static let contextSnapshotToolLimit = 160
 
-    /// Emit the model-visible turn context for local inspection.
+    /// Inspect the final opening request, after seeding, codec layout and fit.
     ///
     /// This is intentionally separate from `assembly.stage`, which remains
     /// sizes-only. The snapshot event is still local, bounded, redacted, and
     /// tied to the current `TurnTraceContext.turnId`; if no turn is bound it is
     /// dropped by `TurnTraceBus.fireFromContext`. An empty recall with no
     /// explicit outcome stays `unknown`; this seam never guesses that a
-    /// swallowed recall failure was a legitimate zero-hit result. Returns the
+    /// failed recall was a legitimate zero-hit result. Returns the
     /// session id the snapshot was filed under, for the turn's later milestones.
     @discardableResult
     nonisolated static func fireContextSnapshotEvent(
         surface: String,
-        context: TurnContext,
+        request: ConversationPrefixSeeding.Request,
+        messages: [LLMMessage],
+        publication: ContextFedRecord.Publication?,
         sessionId: String? = nil,
-        runId: String? = nil
+        runId: String? = nil,
+        emitReady: Bool = true
     ) -> String? {
+        let context = request.seed.context
         let segments = context.systemSegments
-        let systemPrompt = context.systemPrompt ?? segments?.combined ?? ""
-        let stable = segments?.stable ?? ""
+        let systemPrompt = request.system ?? request.segments?.combined ?? ""
+        let stable = request.segments?.stable ?? ""
+        let wireSchemas = request.tools ?? []
         // Per-turn material may travel in the user block instead of system segments.
         let volatileBlock = context.turnVolatileBlock ?? ""
         let ridesVolatileBlock = !volatileBlock.isEmpty
@@ -55,7 +68,7 @@ extension SwiftNativeTurnEngine {
                 "bytes": .int(Int64(content.utf8.count)),
             ])
         }
-        let schemaSizes = context.toolSchemas.map { schema in
+        let schemaSizes = wireSchemas.map { schema in
             let nameBytes = schema.name.utf8.count
             let descriptionBytes = schema.description.utf8.count
             let parameterBytes = schema.parametersJSON.count
@@ -68,10 +81,10 @@ extension SwiftNativeTurnEngine {
             ])
         }
         let sourceBytes = context.personaDocs.values.reduce(0) { $0 + $1.utf8.count }
-        let toolSchemaParameterBytes = context.toolSchemas.reduce(0) {
+        let toolSchemaParameterBytes = wireSchemas.reduce(0) {
             $0 + $1.parametersJSON.count
         }
-        let toolSchemaMaterialBytes = context.toolSchemas.reduce(0) {
+        let toolSchemaMaterialBytes = wireSchemas.reduce(0) {
             $0 + $1.name.utf8.count + $1.description.utf8.count + $1.parametersJSON.count
         }
         let systemBytes = systemPrompt.utf8.count
@@ -83,7 +96,7 @@ extension SwiftNativeTurnEngine {
             guard case .image(_, _, _, let byteSize) = block else { return partial }
             return partial + max(0, byteSize)
         }
-        // On a ContextFlow-active turn the legacy `recalled` lane is empty BY
+        // On a ContextFlow-active turn the direct `recalled` lane is empty BY
         // DESIGN — memory arrives inside the packet — so falling straight to
         // `.unknown` reported "we have no idea" about a turn whose memory
         // provenance is fully known. Derive the same `.contextFlow` outcome
@@ -104,16 +117,7 @@ extension SwiftNativeTurnEngine {
             return .unknown
         }()
 
-        TurnLifecycleTelemetry.emit(
-            .contextReady,
-            surface: surface,
-            sessionId: sessionId,
-            observedBy: "context.snapshot.input",
-            counts: [
-                "systemBytes": Int64(systemBytes),
-                "toolSchemaParameterBytes": Int64(toolSchemaParameterBytes),
-            ]
-        )
+        if emitReady { fireContextReady(surface: surface, context: context, sessionId: sessionId) }
 
         var payload: [String: JSONValue] = [
             "schema": .string("context.snapshot.v1"),
@@ -123,11 +127,11 @@ extension SwiftNativeTurnEngine {
             "stableChars": .int(Int64(stable.count)),
             "dynamicChars": .int(Int64(dynamic.count)),
             "userMessageChars": .int(Int64(context.userMessage.count)),
-            "toolSchemaCount": .int(Int64(context.toolSchemas.count)),
+            "toolSchemaCount": .int(Int64(wireSchemas.count)),
             "toolsAvailableCount": .int(Int64(context.toolsAvailable.count)),
             "recalledCount": .int(Int64(context.recalled.count)),
             "imageBlockCount": .int(Int64(context.imageBlocks.count)),
-            "segmented": .bool(segments != nil),
+            "segmented": .bool(request.segments != nil),
             "containsCognitiveSubstrate": .bool(cognitive != nil),
             "personaSourceBytes": .int(Int64(sourceBytes)),
             "userBlockBytes": .int(Int64(context.personaDocs["USER"].map {
@@ -145,17 +149,16 @@ extension SwiftNativeTurnEngine {
             "toolSchemaParameterBytes": .int(Int64(toolSchemaParameterBytes)),
             "toolSchemaMaterialBytes": .int(Int64(toolSchemaMaterialBytes)),
             "toolSchemaBytes": .array(schemaSizes),
-            // Injected = legacy hits ∪ packet provenance (resolvedRecalledIds);
+            // Injected = direct hits ∪ packet provenance (resolvedRecalledIds);
             // `context.recalled` alone is empty on every `.active` turn.
             "memoryRecall": resolvedMemoryRecallOutcome.payload(
                 injectedHitCount: context.resolvedRecalledIds.count
             ),
             "promptFingerprintSHA256": .string(promptFingerprint(
                 systemPrompt: systemPrompt,
-                userMessage: context.userMessage,
-                imageBlocks: context.imageBlocks
+                messages: messages
             )),
-            "toolSchemaFingerprintSHA256": .string(toolSchemaFingerprint(context.toolSchemas)),
+            "toolSchemaFingerprintSHA256": .string(toolSchemaFingerprint(wireSchemas)),
             "limits": .object([
                 "chunkChars": .int(Int64(contextSnapshotChunkChars)),
                 "stableChars": .int(Int64(contextSnapshotStableLimit)),
@@ -169,6 +172,8 @@ extension SwiftNativeTurnEngine {
             payload["preparationMs"] = .int(preparationMs)
         }
         payload["shapeVersion"] = .string("v2Prefix")
+        payload["wireMessageCount"] = .int(Int64(messages.count))
+        payload["snapshotBoundary"] = .string("opening_request")
         // One user-leading delivery on every provider. An empty delta has
         // no new block to send; its unchanged paragraphs remain in history.
         payload["volatileDelivery"] = .string(
@@ -210,17 +215,21 @@ extension SwiftNativeTurnEngine {
         // brief. Measure those rows where they actually sit, so the receipt
         // can name the tool cost without counting JSON that never left.
         if systemPrompt.contains(AnthropicOAuthTransport.textToolProtocolHeader) {
-            let catalog = TextMarkerCodec.catalogSections(
-                schemas: context.toolSchemas,
-                names: context.toolsAvailable
-            )
-            func bytes(_ text: String, in host: String) -> Int {
-                !text.isEmpty && host.contains(text) ? text.utf8.count : 0
+            do {
+                let catalog = try TextMarkerCodec.catalogSections(
+                    schemas: context.toolSchemas,
+                    names: context.toolsAvailable
+                )
+                func bytes(_ text: String, in host: String) -> Int {
+                    !text.isEmpty && host.contains(text) ? text.utf8.count : 0
+                }
+                payload["toolCatalogSystemBytes"] = .int(Int64(
+                    bytes(catalog.floor, in: systemPrompt) + bytes(catalog.appended, in: systemPrompt)
+                ))
+                payload["toolCatalogBriefBytes"] = .int(Int64(bytes(catalog.appended, in: volatileBlock)))
+            } catch {
+                payload["toolCatalogMeasurementError"] = .string(String(error.localizedDescription.prefix(1000)))
             }
-            payload["toolCatalogSystemBytes"] = .int(Int64(
-                bytes(catalog.floor, in: systemPrompt) + bytes(catalog.appended, in: systemPrompt)
-            ))
-            payload["toolCatalogBriefBytes"] = .int(Int64(bytes(catalog.appended, in: volatileBlock)))
         }
         if let prefix = ConversationPrefixTelemetry.current {
             for (key, value) in prefix.payload { payload[key] = value }
@@ -232,7 +241,7 @@ extension SwiftNativeTurnEngine {
             payload["sessionId"] = .string(sessionId)
         }
 
-        if segments != nil {
+        if request.segments != nil {
             let stablePreview = snapshotPreview(stable, maxCharacters: contextSnapshotStableLimit)
             let dynamicPreview = snapshotPreview(dynamic, maxCharacters: contextSnapshotDynamicLimit)
             payload["stablePreview"] = .array(stablePreview.chunks)
@@ -293,24 +302,35 @@ extension SwiftNativeTurnEngine {
             surface: surface,
             payload: .object(payload)
         )
-        if let sessionId, !sessionId.isEmpty {
-            ContextFedRecord.save(sessionId: sessionId, surface: surface, fed: dynamic,
-                                  brief: ridesVolatileBlock ? "" : volatileBlock)
+        if let publication {
+            do {
+                let saved = try ContextFedRecord.save(publication: publication, surface: surface, fed: dynamic,
+                    brief: ridesVolatileBlock ? "" : volatileBlock)
+                TurnTraceBus.fireFromContext(kind: "context.fed.saved", sessionId: sessionId, surface: surface,
+                    payload: .object(["status": .string(saved ? "saved" : "superseded")]))
+            } catch {
+                TurnTraceBus.fireFromContext(kind: "context.fed.failed", sessionId: sessionId, surface: surface,
+                    payload: .object(["reason": .string(error.localizedDescription)]))
+            }
+        } else if let sessionId, !sessionId.isEmpty {
+            TurnTraceBus.fireFromContext(kind: "context.fed.failed", sessionId: sessionId, surface: surface,
+                payload: .object(["reason": .string("No owning data root was supplied for this session's context record.")]))
         }
         return sessionId
     }
 
     private nonisolated static func promptFingerprint(
         systemPrompt: String,
-        userMessage: String,
-        imageBlocks: [LLMContentBlock]
+        messages: [LLMMessage]
     ) -> String {
         var hasher = SHA256()
         updateFingerprint(&hasher, label: "system", data: Data(systemPrompt.utf8))
-        updateFingerprint(&hasher, label: "user", data: Data(userMessage.utf8))
-        for (index, block) in imageBlocks.enumerated() {
-            let prefix = "image.\(index)"
-            updateFingerprint(&hasher, label: prefix, block: block, imageLabel: prefix)
+        for (index, message) in messages.enumerated() {
+            let prefix = "message.\(index)"
+            updateFingerprint(&hasher, label: prefix + ".role", data: Data(message.role.rawValue.utf8))
+            for (blockIndex, block) in message.content.enumerated() {
+                updateFingerprint(&hasher, label: prefix + ".block.\(blockIndex)", block: block)
+            }
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
@@ -436,6 +456,39 @@ extension SwiftNativeTurnEngine {
 /// turn brief. The trace keeps a preview; this keeps the text, one small file
 /// per conversation, overwritten each turn, so the composer can show it.
 public enum ContextFedRecord {
+    /// Reserved synchronously at dispatch admission, before bookkeeping escapes.
+    /// Identity orders publications without assuming task scheduling or wall clocks.
+    final class Publication: @unchecked Sendable {
+        let sessionId: String
+        let dataRoot: URL
+        let at = Date()
+        var key: String { ContextFedRecord.key(sessionId: sessionId, dataRoot: dataRoot) }
+        init(sessionId: String, dataRoot: URL) {
+            self.sessionId = sessionId
+            self.dataRoot = dataRoot
+        }
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var pending: [String: Publication] = [:]
+    /// The writer's actual failure remains visible until a successful write
+    /// for this root/session (or process exit); an older file cannot hide it.
+    nonisolated(unsafe) private static var writeFailures: [String: String] = [:]
+
+    private static func key(sessionId: String, dataRoot: URL) -> String {
+        dataRoot.standardizedFileURL.path + "\u{1F}" + sessionId
+    }
+
+    static func begin(sessionId: String, dataRoot: URL) -> Publication {
+        let publication = Publication(sessionId: sessionId, dataRoot: dataRoot)
+        lock.withLock { pending[publication.key] = publication }
+        return publication
+    }
+
+    public enum ReadResult: Sendable {
+        case missing
+        case loaded(Record)
+        case unavailable(String)
+    }
     public struct Record: Codable, Sendable {
         public let at: Date
         public let surface: String
@@ -449,24 +502,45 @@ public enum ContextFedRecord {
             .appendingPathComponent(safe + ".json")
     }
 
-    static func save(sessionId: String, surface: String, fed: String, brief: String,
-                     dataRoot: URL = defaultDataRoot()) {
-        guard let url = url(sessionId: sessionId, dataRoot: dataRoot) else { return }
-        let record = Record(at: Date(), surface: surface, fed: fed, brief: brief)
-        DispatchQueue.global(qos: .utility).async {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            guard let data = try? encoder.encode(record) else { return }
-            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? data.write(to: url, options: .atomic)
+    static func save(publication: Publication, surface: String, fed: String, brief: String) throws -> Bool {
+        try lock.withLock {
+            guard pending[publication.key] === publication else { return false }
+            defer { pending.removeValue(forKey: publication.key) }
+            do {
+                guard let url = url(sessionId: publication.sessionId, dataRoot: publication.dataRoot) else {
+                    throw CocoaError(.fileReadInvalidFileName)
+                }
+                let record = Record(at: publication.at, surface: surface, fed: fed, brief: brief)
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                let data = try encoder.encode(record)
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try data.write(to: url, options: .atomic)
+                writeFailures[publication.key] = nil
+                return true
+            } catch {
+                writeFailures[publication.key] = error.localizedDescription
+                throw error
+            }
         }
     }
 
-    public static func load(sessionId: String, dataRoot: URL) -> Record? {
-        guard let url = url(sessionId: sessionId, dataRoot: dataRoot),
-              let data = try? Data(contentsOf: url) else { return nil }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(Record.self, from: data)
+    public static func load(sessionId: String, dataRoot: URL) -> ReadResult {
+        guard let url = url(sessionId: sessionId, dataRoot: dataRoot) else {
+            return .unavailable("Invalid conversation identity; no context file was read.")
+        }
+        if let failure = lock.withLock({ writeFailures[key(sessionId: sessionId, dataRoot: dataRoot)] }) {
+            return .unavailable("The latest context save failed: \(failure). Repair \(url.path); any previous saved record was preserved.")
+        }
+        do {
+            let data: Data
+            do { data = try Data(contentsOf: url) }
+            catch let error as CocoaError where error.code == .fileReadNoSuchFile { return .missing }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            return .loaded(try decoder.decode(Record.self, from: data))
+        } catch {
+            return .unavailable("\(url.path): \(error.localizedDescription) Repair this saved context record; its bytes have been preserved.")
+        }
     }
 }

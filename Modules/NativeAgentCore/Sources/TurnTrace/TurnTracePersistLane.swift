@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TurnTracePersistLane.swift` | One diagnostic writer for daily turn traces and standalone receipts; owns the filename/day calendar, guarded appends and durable terminal notifications |
+// Blueprint: | `TurnTracePersistLane.swift` | One diagnostic writer for daily turn traces and standalone receipts; owns the filename/day calendar, guarded appends, durable terminal and appended dispatch-closure notifications |
 
 /// One diagnostic writer: correlated events use bounded daily files;
 /// standalone receipts use the shared feed and its retention policy.
@@ -118,13 +118,13 @@ public struct TurnTracePersistLane: Sendable {
             // Terminal notification follows durable persistence.
             durable: TurnTraceEvent.isTerminalKind(event.kind)
         )
-        postTerminalIfNeeded(event, trace: target)
+        postCompletionIfNeeded(event, trace: target)
     }
 
-    /// Only a durably persisted live terminal wakes turn-end observers;
-    /// reconciliation does not announce that a turn just finished.
-    private func postTerminalIfNeeded(_ event: TurnTraceEvent, trace: URL) {
-        guard TurnTraceEvent.isTerminalKind(event.kind) else { return }
+    /// Terminal observers hear only a durable live terminal; dispatch observers
+    /// hear only an appended closing row. Reconciliation announces neither.
+    private func postCompletionIfNeeded(_ event: TurnTraceEvent, trace: URL) {
+        guard TurnTraceEvent.isTerminalKind(event.kind) || event.kind == "tool.dispatch.closed" else { return }
         if case .object(let payload) = event.payload,
            case .string("terminal_reconciliation")? = payload["observedBy"] {
             return
@@ -136,7 +136,8 @@ public struct TurnTracePersistLane: Sendable {
             if case .string(let part)? = fields["part"] { info["part"] = part }
             if case .string(let steer)? = fields["steered_by"] { info["agent"] = steer }
         }
-        NotificationCenter.default.post(name: .turnTraceTerminalPersisted, object: nil, userInfo: info)
+        NotificationCenter.default.post(name: event.kind == "tool.dispatch.closed" ? .turnTraceDispatchClosedPersisted : .turnTraceTerminalPersisted,
+                                        object: nil, userInfo: info)
     }
 
     /// Under sorted day/sibling locks, decode once, evaluate the predicate, then durably append.
@@ -171,7 +172,7 @@ public struct TurnTracePersistLane: Sendable {
                 validatedExistingCounts: (existing.report.physicalLineCount, data.count + (data.isEmpty || data.last == 0x0A ? 0 : 1)),
                 durable: true
             )
-            postTerminalIfNeeded(event, trace: target)
+            postCompletionIfNeeded(event, trace: target)
             return true
         }
     }
@@ -216,6 +217,12 @@ public struct TurnTracePersistLane: Sendable {
 }
 
 extension Notification.Name {
+    /// Posted once the dispatch owner's closing coverage row has been appended.
+    /// The same turnId/trace envelope lets off-turn readers join terminal and
+    /// dispatch completion in either order, without polling a private keep.
+    public static let turnTraceDispatchClosedPersisted =
+        Notification.Name("turnTraceDispatchClosedPersisted")
+
     /// Posted after a turn's TERMINAL row (`turn.terminal` / `turn.cancelled` /
     /// `turn.failed`) has been durably appended to the trace. userInfo carries
     /// `turnId`, `kind`, `trace` (the day file), and `sessionId`, `surface`,

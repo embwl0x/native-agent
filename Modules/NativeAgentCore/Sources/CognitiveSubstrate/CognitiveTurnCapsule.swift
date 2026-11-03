@@ -140,7 +140,7 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
     /// experience. Event turn-kind filtering remains independent.
     public var allowNonLiveProjection: Bool
     /// Accepted chat provenance, when supplied by the shared turn owner.
-    /// Bare diagnostic callers retain legacy inference for compatibility.
+    /// An unclassified diagnostic read never becomes a live exchange.
     public var turnKind: CognitiveTurnKind?
     /// Phase 5 B2: User started this turn himself, from one of his doors (Mac,
     /// phone, Telegram). Her wakes, peer threads and bridge lanes are not him,
@@ -155,7 +155,7 @@ public struct CognitiveCapsuleRequest: Sendable, Equatable {
     public var speaker: String?
 
     public var resolvedTurnKind: CognitiveTurnKind {
-        turnKind ?? .live
+        turnKind ?? .debug
     }
     public init(
         surface: String,
@@ -223,15 +223,18 @@ public struct CognitiveCapsule: Sendable, Equatable {
 /// state. The substrate applies it only after the provider accepts that exact
 /// turn; previews, reflections, failures, and retries merely discard it.
 public struct CognitiveCapsulePresentationCommit: Sendable, Equatable {
+    public let mindEpoch: UInt64
     public let fixedAt: Date
     public let expected: CognitiveCapsulePresentationState
     public let next: CognitiveCapsulePresentationState
 
     public init(
+        mindEpoch: UInt64,
         fixedAt: Date,
         expected: CognitiveCapsulePresentationState,
         next: CognitiveCapsulePresentationState
     ) {
+        self.mindEpoch = mindEpoch
         self.fixedAt = fixedAt
         self.expected = expected
         self.next = next

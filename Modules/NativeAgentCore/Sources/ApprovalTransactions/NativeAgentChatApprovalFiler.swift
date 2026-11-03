@@ -59,9 +59,6 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
             "input": payload,
             "origin": origin,
         ]
-        if toolName == "agent_message", AgentConversationApproval.exactProtocol {
-            request["agentExactProtocol"] = .bool(true)
-        }
         request["peer"] = PeerDataTaint.carriedRecord(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                                       peerID: envelope.verifiedUserId)
         request["fileAccess"] = ChatToolSessionContext.fileAccess.map(JSONValue.string) ?? .null
@@ -147,7 +144,6 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
             && left["surface"] == right["surface"]
             && left["input"] == right["input"]
             && left["telegram"] == right["telegram"]
-            && left["agentExactProtocol"] == right["agentExactProtocol"]
             // Which answer asked is attribution, not identity: the same request from a
             // later turn is the same pending card (and the card keeps its first answer).
             && attributionFree(left["origin"]) == attributionFree(right["origin"])

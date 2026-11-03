@@ -2,11 +2,8 @@
   // A repeated attach or concurrent manifest injection replaces the reader
   // coherently, including its observers, timers and trusted-input listeners.
   globalThis.__nativeAgentPageAgent?.();
-  // Leave ten seconds of the host's thirty-second request deadline for the
-  // content reply, extension receipt, and native-messaging transport.
-  const MAX_TYPING_DURATION_MS = 20_000;
-  const TYPE_YIELD_EVERY = 32;
   const snapshots = new Map();
+  const inputTargets = new Map();
   let scrollObservation = null;
   const elementIdentities = new WeakMap();
   const elementFragments = new WeakMap();
@@ -26,6 +23,16 @@
   for (const [kind, input] of [["pointerdown", "pointer"], ["keydown", "keyboard"], ["wheel", "scroll"], ["touchstart", "touch"]]) {
     const listener = (event) => {
       if (event.isTrusted !== true) return;
+      // Consume only the keydown armed by this exact admitted action.
+      if (kind === "keydown") for (const target of inputTargets.values()) {
+        const expected = target.expectedKeydown;
+        if (expected && event.composedPath().includes(target.host) && performance.now() < target.expiresAt
+          && Object.keys(expected).every(key => event[key] === expected[key])) {
+          target.expectedKeydown = null;
+          return;
+        }
+      }
+      inputTargets.clear();
       stopChangeStream();
       snapshots.clear();
       scrollObservation = null;
@@ -128,7 +135,7 @@
     if (!message?.type?.startsWith("nativeagent.page.")) return false;
     try {
       // The same request identity governs synchronous and suspended handlers.
-      if (cancelledActions.has(message.actionId)) throw pageError("action_cancelled", "The page action was cancelled before dispatch.");
+      if (!["nativeagent.page.input.readback", "nativeagent.page.input.release", "nativeagent.page.input.keyup"].includes(message.type) && cancelledActions.has(message.actionId)) throw pageError("action_cancelled", "The page action was cancelled before dispatch.");
       let result;
       switch (message.type) {
         case "nativeagent.page.observe":
@@ -137,6 +144,7 @@
             ready: document.readyState !== "loading", url: location.href };
           break;
         case "nativeagent.page.tab.invalidated":
+          for (const target of inputTargets.values()) { target.expectedKeydown = null; target.invalidated = true; }
           if (observedTab?.tabId === message.tabId) stopChangeStream();
           if (scrollObservation?.tabId === message.tabId) scrollObservation = null;
           for (const run of activeRuns) {
@@ -149,6 +157,8 @@
           break;
         case "nativeagent.page.action.cancel":
           cancelledActions.add(message.requestId);
+          const inputTarget = inputTargets.get(message.requestId);
+          if (inputTarget) inputTarget.expectedKeydown = null;
           if (cancelledActions.size > 128) cancelledActions.delete(cancelledActions.values().next().value);
           for (const run of activeRuns) if (run.actionId === message.requestId) stopRun(run, "action_cancelled");
           result = { cancelled: true };
@@ -156,20 +166,40 @@
         case "nativeagent.page.snapshot":
           result = createSnapshot(message);
           break;
+        case "nativeagent.page.document":
+          result = documentEvidence();
+          break;
         case "nativeagent.page.click":
           result = clickNode(message);
           break;
-        case "nativeagent.page.fill":
-          result = fillNode(message);
+        case "nativeagent.page.input.prepare":
+          result = prepareInput(message);
           break;
-        case "nativeagent.page.type":
-          result = typeIntoNode(message);
+        case "nativeagent.page.input.focus":
+          result = focusInput(message);
           break;
+        case "nativeagent.page.input.check":
+          result = checkInput(message);
+          break;
+        case "nativeagent.page.input.atomic":
+          checkInput({ ...message, requireFocus: false });
+          result = fillAtomic(inputTargets.get(message.actionId).host, message);
+          break;
+        case "nativeagent.page.input.readback":
+          result = readInput(message);
+          break;
+        case "nativeagent.page.input.release":
+          inputTargets.delete(message.actionId);
+          result = { released: true };
+          break;
+        case "nativeagent.page.input.keyup": {
+          const target = inputTargets.get(message.actionId);
+          if (target) target.expectedKeydown = null;
+          result = { settling: true };
+          break;
+        }
         case "nativeagent.page.select":
           result = selectNode(message);
-          break;
-        case "nativeagent.page.keypress":
-          result = keypressNode(message);
           break;
         case "nativeagent.page.set_checked":
           result = setCheckedNode(message);
@@ -213,6 +243,7 @@
     domObserver.disconnect();
     observedShadowRoots.clear();
     snapshots.clear();
+    inputTargets.clear();
     scrollObservation = null;
     for (const [kind, listener] of inputBindings) window.removeEventListener(kind, listener, { capture: true });
     for (const run of activeRuns) stopRun(run, "tab_not_owned");
@@ -237,6 +268,12 @@
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", announcePageReady, { once: true });
   else announcePageReady();
+
+  function documentEvidence() {
+    if (document.contentType === "application/pdf" || (!normalizedText(document.body?.innerText ?? "")
+      && document.querySelector('embed[type="application/pdf"], object[type="application/pdf"]'))) return { kind: "pdf", status: "unread" };
+    return { kind: document.contentType.startsWith("image/") ? "image" : "dom" };
+  }
 
   function createSnapshot(message) {
     // Authored anchors and section labels are evidence of this capture only.
@@ -394,7 +431,8 @@
       if (kind === "image" && !meaningfulImageName(element)) continue;
       if (kind === "link" && representedLinks.has(stableElementPath(element))) continue;
       const fragmented = element.children.length > 0 && glyphCounts.get(element) >= 2 && !element.closest("pre, code");
-      const runs = fragmented ? [] : inlineText(element);
+      const linksByPath = new Map();
+      const runs = fragmented ? [] : inlineText(element, linksByPath);
       const fullText = fragmented ? normalizedText(visibleFragmentedText(element)) : snapshotText(element, runs);
       let textOffset = element === continuedElement ? (cursor?.textOffset ?? 0) : 0;
       if (textOffset > fullText.length) { pageMoved = true; textOffset = 0; }
@@ -461,37 +499,48 @@
         }
         if (!optionOffset && !elementMore) delete selectInfo.optionOffset;
       }
-      let nodeTextCost = text.length + name.length + (selectInfo ? JSON.stringify(selectInfo).length : 0);
       const choiceText = selectInfo ? JSON.stringify(selectInfo) : "";
-      const nameBytes = utf8.encode(name + choiceText).length;
-      const textBytes = utf8.encode(text).length;
-      if (aggregateNodeText + nodeTextCost > maxTextChars || aggregateNodeBytes + nameBytes + textBytes > nodeByteBudget) {
-        truncationReasons.push("text_limit");
+      // A prose prefix and every link proof it names are budgeted together.
+      // Prefix costs only grow, so a bounded binary search finds a window
+      // that advances without ever leaving dangling action references.
+      const groupFor = value => {
+        const inline = inlineTextWindow(runs, textOffset, value.length);
+        const proofs = [];
+        for (const path of new Set(inline.map(part => part.elementPath).filter(Boolean))) {
+          const link = linksByPath.get(path);
+          if (!link) throw pageError("inline_proof_unavailable", "An inline link lost its action evidence during capture.");
+          if (link === element || nodeIdByElement.has(link)) continue;
+          const text = snapshotText(link), name = bounded(accessibleName(link, text), 500);
+          proofs.push({ link, text, name, path });
+        }
+        const chars = name.length + value.length + choiceText.length + proofs.reduce((sum, proof) => sum + 2 * proof.name.length, 0);
+        const bytes = utf8.encode(name + value + choiceText).length + proofs.reduce((sum, proof) => sum + 2 * utf8.encode(proof.name).length, 0);
+        return { inline, proofs, chars, bytes, fits: nodes.length + 1 + proofs.length <= maxNodes
+          && aggregateNodeText + chars <= maxTextChars && aggregateNodeBytes + bytes <= nodeByteBudget };
+      };
+      let group = groupFor(text);
+      if (!group.fits) {
+        truncationReasons.push(nodes.length + 1 + group.proofs.length > maxNodes ? "node_limit" : "text_limit");
         if (foldAtBoundary()) break;
-        const room = maxTextChars - aggregateNodeText - name.length - choiceText.length;
-        const byteRoom = nodeByteBudget - aggregateNodeBytes - nameBytes;
-        if (room <= 0 || byteRoom <= 0) {
-          nextRead = readAt(element, { textOffset });
-          if (!nodes.length) throw pageError("read_budget_too_small", "The read budget cannot hold this element's name and choices. Increase max_text_chars.");
+        const characters = Array.from(text);
+        let low = 0, high = characters.length;
+        while (low < high) {
+          const middle = Math.ceil((low + high) / 2);
+          if (groupFor(characters.slice(0, middle).join("")).fits) low = middle;
+          else high = middle - 1;
+        }
+        const prefix = characters.slice(0, low).join("");
+        group = groupFor(prefix);
+        if (!group.fits || (!prefix && text)) {
+          if (!nodes.length) throw pageError("read_budget_too_small", "The read budget cannot hold the next prose character and its link proof. Increase max_nodes or max_text_chars.");
+          nextRead = readAt(element, { textOffset, optionOffset });
           break;
         }
-        let end = 0, bytes = 0;
-        for (const character of text) {
-          const size = utf8.encode(character).length;
-          if (end + character.length > room || bytes + size > byteRoom) break;
-          end += character.length; bytes += size;
-        }
-        if (!end && text.length) {
-          nextRead = readAt(element, { textOffset });
-          if (!nodes.length) throw pageError("read_budget_too_small", "The read budget cannot hold the next character. Increase max_text_chars.");
-          break;
-        }
-        text = text.slice(0, end);
-        nextRead = readAt(element, { textOffset: textOffset + end });
-      } else {
-        aggregateNodeText += nodeTextCost;
-        aggregateNodeBytes += nameBytes + textBytes;
+        text = prefix;
+        nextRead = readAt(element, { textOffset: textOffset + text.length, optionOffset });
       }
+      aggregateNodeText += group.chars;
+      aggregateNodeBytes += group.bytes;
 
       retainNode(element, {
         readPosition: walk.positions.get(element),
@@ -501,7 +550,7 @@
         sectionName,
         sectionPath: sectionStart ? stableElementPath(sectionStart.element) : null,
         paragraphPath: stableElementPath(paragraph),
-        inlineText: inlineTextWindow(runs, textOffset, text.length),
+        inlineText: group.inline,
         inline: ["inline", "inline-block", "contents"].includes(getComputedStyle(element).display),
         ...(selectInfo ? { select: selectInfo } : {}),
         ...(elementMore ? { more: elementMore } : {}),
@@ -515,8 +564,13 @@
           },
         } : {}),
       }, fragmented ? snapshotText(element) : fullText, selectInfo);
-      // Earlier windows already represented these links, even after the last window.
-      for (const part of runs) if (part.elementPath) representedLinks.add(part.elementPath);
+      for (const proof of group.proofs) retainNode(proof.link, {
+        readPosition: walk.positions.get(element), textOffset, sectionName,
+        sectionPath: sectionStart ? stableElementPath(sectionStart.element) : null,
+        paragraphPath: stableElementPath(paragraph),
+        parentNodeId: null, name: proof.name, text: proof.name, inlineProof: true,
+      }, proof.text);
+      for (const part of group.inline) if (part.elementPath) representedLinks.add(part.elementPath);
       if (nextRead) break;
     }
     if (!cursor?.elementOnly && !nextRead && walk.nextElement
@@ -524,31 +578,6 @@
       const nextSection = bounded(sectionHeading(walk.nextElement) || sectionName, 160);
       if (!foldAtBoundary()) nextRead = readAt(walk.nextElement, { textOffset: 0, name: nextSection });
     }
-    // A prose row and the links it names are one semantic unit. Retain their
-    // action proofs together, even when the next ordinary row is folded.
-    const inlinePaths = new Set(nodes.flatMap(node => node.inlineText ?? []).map(part => part.elementPath).filter(Boolean));
-    const inlineSections = new Map(nodes.flatMap(node => (node.inlineText ?? [])
-      .filter(part => part.elementPath).map(part => [part.elementPath, node.sectionName])));
-    const inlineElements = new Set(candidates);
-    for (const element of elementByNodeId.values()) for (const link of element.querySelectorAll("a")) inlineElements.add(link);
-    for (const element of inlineElements) {
-      if (nodeIdByElement.has(element) || !inlinePaths.has(stableElementPath(element))) continue;
-      const text = snapshotText(element), name = bounded(accessibleName(element, text), 500);
-      // A proof is a row like any other: it spends the same node and text
-      // budgets (its name is also its text), and running out is truncation.
-      const proofBytes = 2 * utf8.encode(name).length;
-      if (nodes.length >= maxNodes || aggregateNodeText + 2 * name.length > maxTextChars || aggregateNodeBytes + proofBytes > nodeByteBudget) {
-        truncationReasons.push(nodes.length >= maxNodes ? "node_limit" : "text_limit");
-        break;
-      }
-      aggregateNodeText += 2 * name.length;
-      aggregateNodeBytes += proofBytes;
-      retainNode(element, {
-        sectionName: inlineSections.get(stableElementPath(element)) ?? sectionName,
-        parentNodeId: null, name, text: name, inlineProof: true, value: null, frameId: 0,
-      }, text);
-    }
-
     // A body prefix keeps returning old feed items after scrolling and can
     // consume the budget before replies. Summarize the same viewport evidence
     // as the nodes. Keep container prose too: an article can have direct text
@@ -558,6 +587,7 @@
       : (!document.body?.children?.length ? normalizedText(document.body?.innerText ?? "") : "");
     const summaryText = bounded(rawSummary, maxTextChars);
     if (summaryText.length < rawSummary.length) truncationReasons.push("text_limit");
+    const documentInfo = documentEvidence();
     const snapshot = {
       snapshotId,
       tabId: message.tabId,
@@ -565,10 +595,7 @@
       capturedAt: new Date().toISOString(),
       url: location.href,
       title: bounded(document.title ?? "", 1_024),
-      ...(document.contentType.startsWith("image/") ? { document: { kind: "image" } } : {}),
-      ...(document.contentType === "application/pdf" || (!normalizedText(document.body?.innerText ?? "")
-        && document.querySelector('embed[type="application/pdf"], object[type="application/pdf"]'))
-        ? { document: { kind: "pdf", status: "unread" } } : {}),
+      ...(documentInfo.kind === "dom" ? {} : { document: documentInfo }),
       language: bounded(document.documentElement?.lang ?? navigator.language ?? "", 64),
       rendering: {
         visibility: ["visible", "hidden"].includes(document.visibilityState) ? document.visibilityState : "unknown",
@@ -651,7 +678,8 @@
     const actions = [];
     // A text field is clickable too: clicking or double-clicking it is normal.
     if (isClickable(element, role) || isEditable(element)) actions.push("click", "double_click");
-    if (isEditable(element)) actions.push("fill", "type");
+    if (isEditable(element)) actions.push("fill");
+    if (isSequentialEditable(element)) actions.push("type");
     if (isSelectable(element)) actions.push("select");
     if (isCheckable(element, role)) actions.push("set_checked");
     if (isKeypressable(element, role)) actions.push("keypress");
@@ -671,141 +699,115 @@
       outcome: "succeeded", verification: "page_acknowledged" };
   }
 
-  function fillNode(message) {
-    const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "fill");
-    if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
-    requireEnabledNode(element, "fill");
-    focusWithoutActivation(element);
-    const contentEditable = element.isContentEditable;
-    try {
-      replaceEditableValue(element, message.value);
-      dispatchEditableEvent(element, "input", message.value);
-      dispatchEditableEvent(element, "change", message.value);
-      const observed = String((contentEditable ? element.textContent : element.value) ?? "");
-      if (!element.isConnected || observed !== message.value) throw new Error("fill_readback_mismatch");
-    } catch {
-      throw pageError("action_outcome_unknown", "Fill was dispatched but its immediate value could not be confirmed. Observe before retrying; do not blindly repeat the fill.");
-    }
-    return {
-      snapshotId: message.snapshotId,
-      nodeId: message.nodeId,
-      filled: true,
-      outcome: "succeeded", verification: "page_acknowledged",
-      valueLength: message.value.length,
-    };
+  // Retain the exact host across this action's own DOM mutations for readback.
+  function editingHost(element) {
+    if (!element.isContentEditable) return element;
+    let host = element;
+    for (let parent = composedParent(host); parent?.isContentEditable; parent = composedParent(host)) host = parent;
+    return host;
   }
 
-  async function typeIntoNode(message) {
-    const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "type");
-    requireEnabledNode(element, "type");
-    const snapshot = requireSnapshot(message.snapshotId);
-    const identity = editableIdentity(element);
-    const parent = composedParent(element);
-    const characters = Array.from(message.text);
-    const startedAt = performance.now();
-    const run = { tabId: snapshot.tabId, actionId: message.actionId, stopReason: null };
-    let typedCount = 0;
-    let nextUTF16Offset = 0;
-    let appendInFlight = false;
-    const valueBefore = readEditableValue(element);
-    function currentStopReason() {
-      if (run.stopReason) return run.stopReason;
-      if (cancelledActions.has(run.actionId)) return "action_cancelled";
-      if (message.tabId !== snapshot.tabId) return "tab_not_owned";
-      if (performance.now() - startedAt >= MAX_TYPING_DURATION_MS) return "execution_deadline";
-      if (!element.isConnected) return "target_detached";
-      if (composedParent(element) !== parent || editableIdentity(element) !== identity) return "target_changed";
-      if (!isEditable(element)) return "target_not_editable";
-      if (!isVisible(element)) return "target_not_visible";
-      return null;
-    }
-    activeRuns.add(run);
-    try {
-      run.stopReason = currentStopReason();
-      if (!run.stopReason && characters.length > 0) focusWithoutActivation(element);
-      for (const character of characters) {
-        run.stopReason = currentStopReason();
-        if (run.stopReason) break;
-        appendInFlight = true;
-        appendEditableValue(element, character);
-        typedCount += 1;
-        nextUTF16Offset += character.length;
-        appendInFlight = false;
-        dispatchEditableEvent(element, "input", character);
-        if (typedCount < characters.length && (message.delayMs > 0 || typedCount % TYPE_YIELD_EVERY === 0)) {
-          const remaining = MAX_TYPING_DURATION_MS - (performance.now() - startedAt);
-          await delay(Math.max(0, Math.min(message.delayMs ?? 0, remaining)), run);
-        }
-      }
-      run.stopReason = currentStopReason();
-      if (typedCount > 0 && !run.stopReason) dispatchEditableEvent(element, "change", null);
-    } catch (error) {
-      if (appendInFlight) {
-        throw pageError("action_outcome_unknown", "The editable value setter failed after dispatch; observe before retrying.");
-      }
-      if (typedCount === 0) throw error;
-      run.stopReason = "page_event_failed";
-    } finally {
-      activeRuns.delete(run);
-      cancelledActions.delete(run.actionId);
-    }
-    // Judge typing by what the field retained, excluding rewritten prior content.
-    let valueAfter = null;
-    let enteredText = null;
-    let valueRetained = true;
-    let valueRewritten = false;
-    try {
-      valueAfter = readEditableValue(element);
-      valueRewritten = !valueAfter.startsWith(valueBefore);
-      enteredText = valueRewritten ? null : valueAfter.slice(valueBefore.length);
-      valueRetained = valueAfter === valueBefore + characters.slice(0, typedCount).join("");
-      // Same policy as `safeValue`: never echo a secret back, even though the
-      // type action is only ever advertised on non-password editables.
-      if (isPasswordField(element)) {
-        enteredText = null;
-        valueAfter = null;
-      }
-    } catch {
-      valueRetained = false;
-    }
-    if (!valueRetained && run.stopReason === null) {
-      run.stopReason = valueRewritten ? "value_rewritten" : "value_not_retained";
-    }
-    const completed = typedCount === characters.length && valueRetained
-      && !valueRewritten && run.stopReason === null;
-    const enteredCharacterCount = valueRewritten ? 0 : enteredText === null ? null : Array.from(enteredText).length;
-    const landedCount = enteredCharacterCount ?? typedCount;
-    return {
-      snapshotId: message.snapshotId,
-      nodeId: message.nodeId,
-      typed: completed,
-      outcome: completed ? "succeeded" : landedCount > 0 ? "partially_completed" : "refused",
-      verification: !completed && landedCount === 0 ? "not_verified" : "page_acknowledged",
-      completed,
-      characterCount: typedCount,
-      requestedCharacterCount: characters.length,
-      remainingCharacterCount: characters.length - typedCount,
-      characterUnit: "unicode_code_point",
-      nextCharacterIndex: typedCount,
-      nextUTF16Offset,
-      valueRetained,
-      valueRewritten,
-      // Only on a rewrite, and only where echoing is allowed: the caller needs
-      // to see what the field turned its text into to decide what to do next.
-      valueBefore: valueRewritten && valueAfter !== null ? bounded(valueBefore, 500) : null,
-      valueAfter: valueRewritten && valueAfter !== null ? bounded(valueAfter, 500) : null,
-      enteredText: enteredText === null ? null : bounded(enteredText, 500),
-      enteredCharacterCount,
-      elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
-      stopReason: completed ? null : run.stopReason,
-    };
+  function activeElement() {
+    let active = document.activeElement;
+    while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+    return active;
   }
 
-  function editableIdentity(element) {
-    return JSON.stringify([
-      element.tagName, element.type ?? "", Boolean(element.isContentEditable),
-      ...["id", "name", "role", "aria-label", "aria-labelledby"].map((name) => element.getAttribute(name)),
-    ]);
+  function prepareInput(message) {
+    const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, message.action);
+    const host = editingHost(element);
+    if (!isVisible(element) || !isVisible(host)) throw pageError("node_not_visible", "The editing target is no longer visible.");
+    requireEnabledNode(host, message.action);
+    if (isPasswordField(host)) throw pageError("node_not_actionable", "Password fields cannot receive this action.");
+    const atomic = message.action === "fill" && !isSequentialEditable(host);
+    if (atomic && host.type === "file" && message.value !== "") throw pageError("file_value_prohibited", "Chrome only permits clearing a file input through its value setter.");
+    for (const [id, target] of inputTargets) if (performance.now() >= target.expiresAt) inputTargets.delete(id);
+    inputTargets.set(message.actionId, { host, before: readEditableValue(host), action: message.action,
+      identity: inputIdentity(host), parent: composedParent(host), atomic,
+      expectedKeydown: null, expiresAt: performance.now() + 20_000 });
+    return { prepared: true, mode: atomic ? "atomic" : "keyboard" };
+  }
+
+  function focusInput(message) {
+    checkInput({ ...message, requireFocus: false });
+    const target = inputTargets.get(message.actionId), host = target.host;
+    const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, message.action);
+    if (editingHost(element) !== host) throw pageError("node_identity_changed", "The exact editing host changed before focus.");
+    focusWithoutActivation(host);
+    if (activeElement() !== host || !document.hasFocus()) throw pageError("focus_failed", "The exact target did not take focus; no keys or text were sent.");
+    const before = readEditableValue(host);
+    let selection = null;
+    if (message.action !== "keypress") {
+      if (!isSequentialEditable(host)) throw pageError("node_not_editable", "This target does not support sequential text editing.");
+      if (host.isContentEditable) {
+        const selection = window.getSelection();
+        if (!selection) throw pageError("selection_unavailable", "The editing host has no readable selection.");
+        const range = document.createRange();
+        range.selectNodeContents(host);
+        if (message.action === "type") range.collapse(false);
+        selection.removeAllRanges(); selection.addRange(range);
+      } else if (typeof host.setSelectionRange === "function" && !["email", "number"].includes(host.type)) {
+        host.setSelectionRange(message.action === "fill" ? 0 : before.length, before.length);
+      } else {
+        // Email/number expose no range setter. Chrome positions their caret.
+        selection = "native_selection";
+      }
+    }
+    target.before = before;
+    return { focused: true, selection };
+  }
+
+  function checkInput(message) {
+    const target = inputTargets.get(message.actionId);
+    if (!target || target.invalidated || performance.now() >= target.expiresAt) throw pageError("input_target_expired", "The admitted input target expired; no further input was sent.");
+    const { host } = target;
+    if (!host.isConnected || editingHost(host) !== host
+      || inputIdentity(host) !== target.identity || composedParent(host) !== target.parent) throw pageError("node_identity_changed", "The admitted editing host changed; no further input was sent.");
+    if (!isVisible(host)) throw pageError("node_not_visible", "The editing host is no longer visible.");
+    requireEnabledNode(host, target.action);
+    if (isPasswordField(host)) throw pageError("node_not_actionable", "The target became a password field.");
+    if (message.requireFocus !== false && (activeElement() !== host || !document.hasFocus())) throw pageError("focus_changed", "The admitted editing host lost focus; no further input was sent.");
+    if (target.action !== "keypress" && !(target.atomic ? isEditable(host) : isSequentialEditable(host))) throw pageError("node_not_editable", "The target is no longer editable.");
+    target.expectedKeydown = message.expectedKeydown ?? null;
+    return { current: true };
+  }
+
+  function readInput(message) {
+    const target = inputTargets.get(message.actionId);
+    if (!target) throw pageError("input_readback_unavailable", "The exact input target is unavailable. Observe the page before doing anything further.");
+    const { host, before, action } = target;
+    if (isPasswordField(host)) throw pageError("input_readback_unavailable", "The target became a password field; its value is protected.");
+    if (!host.isConnected) return { outcome: "outcome_unknown", verification: "outcome_unknown", landed: "unknown", reason: "target_detached" };
+    const after = readEditableValue(host);
+    const expected = action === "fill" ? message.sentText : before + message.sentText;
+    const landed = action === "keypress" ? (after === before ? "no_value_change" : "landed")
+      : after === expected ? "landed" : after !== before ? "changed_by_page" : "not_landed";
+    return { outcome: action === "keypress" || landed !== "not_landed" ? "succeeded" : "refused",
+      verification: "page_acknowledged", landed,
+      valueBefore: bounded(before, 2000), valueAfter: bounded(after, 2000),
+      valueTruncated: before.length > 2000 || after.length > 2000,
+      valueRetained: after === expected, valueRewritten: landed === "changed_by_page",
+      focused: activeElement() === host };
+  }
+
+  function inputIdentity(host) {
+    return JSON.stringify([host.tagName, host.type, host.isContentEditable,
+      ...["id", "name", "role", "aria-label", "aria-labelledby"].map(key => host.getAttribute(key))]);
+  }
+
+  function fillAtomic(element, message) {
+    const before = readEditableValue(element);
+    if (element.type === "file" && message.value !== "") throw pageError("file_value_prohibited", "Chrome only permits clearing a file input through its value setter.");
+    try {
+      setNativeValue(element, message.value);
+      dispatchEditableEvent(element, "input");
+      dispatchEditableEvent(element, "change");
+    } catch { throw pageError("action_outcome_unknown", "The atomic value setter or page handler failed; observe before acting again."); }
+    if (!element.isConnected) throw pageError("action_outcome_unknown", "The atomic control was replaced after dispatch; observe its state.");
+    const after = readEditableValue(element);
+    return { mode: "atomic", filled: true, outcome: after === before && after !== message.value ? "refused" : "succeeded",
+      verification: "page_acknowledged", landed: after === message.value ? "landed" : after !== before ? "changed_by_page" : "not_landed",
+      valueBefore: bounded(before, 2000), valueAfter: bounded(after, 2000), valueRewritten: after !== message.value };
   }
 
   function selectNode(message) {
@@ -856,27 +858,6 @@
     };
   }
 
-  function keypressNode(message) {
-    const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "keypress");
-    if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
-    requireEnabledNode(element, "keypress");
-    const spec = parseKeySpec(message.key);
-    focusWithoutActivation(element);
-    const downAccepted = dispatchKeyboardEvent(element, "keydown", spec);
-    // Synthetic keys need explicit defaults; report any scrolling they cause.
-    const moved = downAccepted ? applyKeyDefault(element, spec) : null;
-    dispatchKeyboardEvent(element, "keyup", spec);
-    return {
-      snapshotId: message.snapshotId,
-      nodeId: message.nodeId,
-      keypressed: true,
-      outcome: "succeeded", verification: "page_acknowledged",
-      key: message.key,
-      defaultPrevented: !downAccepted,
-      ...(moved ? moved : {}),
-    };
-  }
-
   function setCheckedNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "set_checked");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
@@ -885,25 +866,19 @@
     let after;
     try {
       if (before !== message.checked) {
-        if (isNativeCheckable(element)) {
-          element.checked = message.checked;
-          dispatchEditableEvent(element, "input", null);
-          dispatchEditableEvent(element, "change", null);
-        } else {
-          element.click();
-        }
+        element.click();
       }
       after = checkedState(element);
-      if (requireActionableSnapshotNode(message.snapshotId, message.nodeId, "set_checked") !== element
-        || after !== message.checked) throw new Error("checked_readback_mismatch");
+      if (!element.isConnected || typeof after !== "boolean") throw new Error("checked_readback_unavailable");
     } catch {
       throw pageError("action_outcome_unknown", "Checkable control was dispatched but its immediate state could not be confirmed. Observe before retrying; do not blindly repeat the action.");
     }
     return {
       snapshotId: message.snapshotId,
       nodeId: message.nodeId,
-      setChecked: true,
-      outcome: "succeeded", verification: "page_acknowledged",
+      setChecked: after === message.checked,
+      outcome: after === message.checked ? "succeeded" : "refused", verification: "page_acknowledged",
+      requestedChecked: message.checked,
       checked: after,
       changed: before !== after,
     };
@@ -1195,12 +1170,15 @@
   }
 
   // Inline runs keep DOM order and each link's structural address.
-  function inlineText(element) {
+  function inlineText(element, linkTargets) {
     const parts = [];
     const preformatted = isPreformatted(element);
     function visit(parent, link = null, code = false) {
       for (const child of parent.childNodes ?? []) {
-        if (child.nodeType === 3) parts.push({ text: child.textContent ?? "", ...(link ? { elementPath: stableElementPath(link), href: safeURL(link) } : {}), ...(code ? { code: true } : {}) });
+        if (child.nodeType === 3) {
+          if (link) linkTargets?.set(stableElementPath(link), link);
+          parts.push({ text: child.textContent ?? "", ...(link ? { elementPath: stableElementPath(link), href: safeURL(link) } : {}), ...(code ? { code: true } : {}) });
+        }
         else if (child.nodeType === 1) {
           if (!isPageContentElement(child)) continue;
           if (elementKind(child) === "image") continue;
@@ -1666,7 +1644,13 @@
     if (tag === "textarea" || element.isContentEditable) return true;
     if (tag !== "input" || isPasswordField(element)) return false;
     const type = (element.type || "text").toLowerCase();
-    return ["text", "search", "email", "url", "tel", "number", "date", "datetime-local", "month", "time", "week"].includes(type);
+    return ["text", "search", "email", "url", "tel", "number", "date", "datetime-local", "month", "time", "week", "color", "range", "file"].includes(type);
+  }
+
+  function isSequentialEditable(element) {
+    if (!isEditable(element)) return false;
+    return element.isContentEditable || element.tagName.toLowerCase() === "textarea"
+      || ["text", "search", "email", "url", "tel", "number"].includes(element.type);
   }
 
   function isSelectable(element) {
@@ -1707,6 +1691,7 @@
   function isKeypressable(element, role) {
     if (isPasswordField(element)) return false;
     const tag = element.tagName.toLowerCase();
+    if (tag === "input" && isEditable(element) && !isSequentialEditable(element)) return false;
     return isEditable(element) || isSelectable(element) || isClickable(element, role)
       || element.tabIndex >= 0 || ["combobox", "listbox", "option"].includes(role);
   }
@@ -1716,206 +1701,32 @@
   }
 
   function focusWithoutActivation(element) {
-    if (typeof element.focus !== "function") return;
-    try { element.focus({ preventScroll: true }); } catch { element.focus(); }
+    if (typeof element.focus !== "function") throw pageError("focus_unavailable", "The target cannot take focus.");
+    try { element.focus({ preventScroll: true }); }
+    catch { throw pageError("focus_failed", "Chrome refused focus on the exact target; no keys or text were sent."); }
   }
 
   // Read retained field content; attempted character counts do not prove retention.
   function readEditableValue(element) {
-    if (element.isContentEditable) return String(element.textContent ?? "");
+    if (element.isContentEditable) return String(element.innerText);
     return String(element.value ?? "");
   }
 
-  function replaceEditableValue(element, value) {
-    if (element.isContentEditable) {
-      element.textContent = value;
-      return;
-    }
-    setNativeValue(element, value);
-  }
-
-  function appendEditableValue(element, value) {
-    if (element.isContentEditable) {
-      element.textContent = `${element.textContent ?? ""}${value}`;
-      return;
-    }
-    setNativeValue(element, `${element.value ?? ""}${value}`);
-  }
-
   function setNativeValue(element, value) {
-    const prototype = Object.getPrototypeOf(element);
-    const setter = prototype ? Object.getOwnPropertyDescriptor(prototype, "value")?.set : undefined;
-    if (setter) setter.call(element, value);
-    else element.value = value;
+    const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype
+      : element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLSelectElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+    if (!setter) throw pageError("value_setter_unavailable", "The native control has no value setter.");
+    setter.call(element, value);
   }
 
-  function dispatchEditableEvent(element, type, data) {
-    if (typeof element.dispatchEvent !== "function") return;
-    let event;
-    if (type === "input" && typeof InputEvent === "function") {
-      event = new InputEvent(type, { bubbles: true, composed: true, inputType: "insertText", data });
-    } else {
-      event = new Event(type, { bubbles: true, composed: true });
-    }
-    element.dispatchEvent(event);
+  function dispatchEditableEvent(element, type) {
+    element.dispatchEvent(new Event(type, { bubbles: true, composed: true }));
   }
 
   function checkedState(element) {
     if (typeof element.checked === "boolean" && isNativeCheckable(element)) return element.checked;
     return nullableAriaBoolean(element.getAttribute("aria-checked"));
-  }
-
-  function parseKeySpec(value) {
-    const parts = String(value).split("+");
-    const namedKey = parts.pop();
-    return {
-      key: namedKey === "Space" ? " " : namedKey,
-      altKey: parts.includes("Alt"),
-      ctrlKey: parts.includes("Control"),
-      metaKey: parts.includes("Meta"),
-      shiftKey: parts.includes("Shift"),
-    };
-  }
-
-  function dispatchKeyboardEvent(element, type, spec) {
-    if (typeof KeyboardEvent !== "function") return true;
-    return element.dispatchEvent(new KeyboardEvent(type, { ...spec, bubbles: true, composed: true, cancelable: true }));
-  }
-
-  function applyKeyDefault(element, spec) {
-    const selectAll = spec.key === "A" && (spec.ctrlKey || spec.metaKey);
-    if (selectAll && typeof element.select === "function") {
-      element.select();
-      return;
-    }
-    if (spec.key === "Tab") {
-      moveFocus(element, spec.shiftKey ? -1 : 1);
-      return;
-    }
-    if (spec.key === "Enter") {
-      const tag = element.tagName.toLowerCase();
-      if (["button", "a", "summary"].includes(tag)) element.click();
-      // Textarea Enter without Control or Meta inserts a newline.
-      else if (tag === "textarea" && !spec.ctrlKey && !spec.metaKey) insertIntoEditable(element, "\n");
-      else if (element.form && typeof element.form.requestSubmit === "function") element.form.requestSubmit();
-      return;
-    }
-    if (spec.key === " " && (isNativeCheckable(element) || isClickable(element, element.getAttribute("role") ?? implicitRole(element)))) {
-      element.click();
-      return;
-    }
-    if (["Backspace", "Delete"].includes(spec.key)) {
-      deleteFromEditable(element, spec.key === "Backspace");
-      return;
-    }
-    // Page keys scroll only outside anything that moves its own selection or
-    // caret with them (fields, selects, list/combo boxes, sliders, menus).
-    const ownsKeys = isEditable(element) || element.isContentEditable
-      || ["input", "select", "textarea"].includes(element.tagName.toLowerCase())
-      || ["listbox", "combobox", "menu", "menubar", "slider", "spinbutton", "radiogroup", "tree", "grid", "tablist", "option"]
-        .includes(element.getAttribute("role") ?? implicitRole(element));
-    if (!ownsKeys && ["PageDown", "PageUp", " ", "ArrowDown", "ArrowUp", "Home", "End"].includes(spec.key)) {
-      return scrollForKey(element, spec);
-    }
-    if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(spec.key)) {
-      moveEditableCaret(element, spec.key);
-    }
-  }
-
-  // The nearest scrollable box around the element, else the page, moved the
-  // way the key would move it natively.
-  function scrollForKey(element, spec) {
-    let box = element;
-    while (box && box !== document.body && box !== document.documentElement && !isScrollable(box)) box = composedParent(box);
-    const page = !box || box === document.body || box === document.documentElement;
-    const scroller = page ? (document.scrollingElement ?? document.documentElement) : box;
-    const view = page ? window.innerHeight : scroller.clientHeight;
-    const beforeY = scroller.scrollTop;
-    const step = { PageDown: view * 0.875, PageUp: -view * 0.875, " ": (spec.shiftKey ? -1 : 1) * view * 0.875, ArrowDown: 40, ArrowUp: -40 };
-    if (spec.key === "Home") scroller.scrollTop = 0;
-    else if (spec.key === "End") scroller.scrollTop = scroller.scrollHeight;
-    else scroller.scrollTop = beforeY + Math.round(step[spec.key] ?? 0);
-    const movedY = Math.round(scroller.scrollTop - beforeY);
-    // A hidden tab defers native scroll events; tell the feed, as scrollPage does.
-    if (movedY !== 0 && document.visibilityState === "hidden") {
-      (page ? document : box).dispatchEvent(new Event("scroll", { bubbles: page }));
-    }
-    return { movedX: 0, movedY };
-  }
-
-  function moveFocus(element, direction) {
-    const focusable = composedElementWalk(document.body).elements.filter((candidate) => {
-      if (!isVisible(candidate) || isEffectivelyDisabled(candidate)) return false;
-      const tag = candidate.tagName.toLowerCase();
-      return candidate.tabIndex >= 0 || ["a", "button", "input", "select", "textarea", "summary"].includes(tag);
-    });
-    if (focusable.length === 0) return;
-    const current = focusable.indexOf(element);
-    const next = current < 0
-      ? (direction > 0 ? 0 : focusable.length - 1)
-      : (current + direction + focusable.length) % focusable.length;
-    focusWithoutActivation(focusable[next]);
-  }
-
-  function insertIntoEditable(element, text) {
-    if (!isEditable(element) || !("value" in element)) return;
-    const current = String(element.value ?? "");
-    const hasSelection = typeof element.selectionStart === "number" && typeof element.selectionEnd === "number";
-    const start = hasSelection ? element.selectionStart : current.length;
-    const end = hasSelection ? element.selectionEnd : current.length;
-    setNativeValue(element, `${current.slice(0, start)}${text}${current.slice(end)}`);
-    if (hasSelection && typeof element.setSelectionRange === "function") {
-      const caret = start + text.length;
-      element.setSelectionRange(caret, caret);
-    }
-    dispatchEditableEvent(element, "input", text);
-  }
-
-  // Segment indices and DOM selections are both UTF-16 offsets. Keep complete
-  // user-perceived characters, including emoji and combining sequences.
-  const editingGraphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-  function adjacentGrapheme(text, offset, backward) {
-    let previous = 0;
-    for (const { index, segment } of editingGraphemes.segment(text)) {
-      const end = index + segment.length;
-      if (backward && end >= offset) return index;
-      if (!backward && end > offset) return end;
-      previous = end;
-    }
-    return backward ? previous : text.length;
-  }
-
-  function deleteFromEditable(element, backward) {
-    if (!isEditable(element) || !("value" in element) || typeof element.selectionStart !== "number" || typeof element.selectionEnd !== "number") return;
-    let start = element.selectionStart;
-    let end = element.selectionEnd;
-    const current = String(element.value ?? "");
-    if (start === end) {
-      for (const { index, segment } of editingGraphemes.segment(current)) {
-        const boundary = index + segment.length;
-        if (backward ? index < start && boundary >= start : index <= end && boundary > end) {
-          start = index; end = boundary;
-          break;
-        }
-      }
-    }
-    if (start === end) return;
-    setNativeValue(element, `${current.slice(0, start)}${current.slice(end)}`);
-    if (typeof element.setSelectionRange === "function") element.setSelectionRange(start, start);
-    dispatchEditableEvent(element, "input", null);
-  }
-
-  function moveEditableCaret(element, key) {
-    if (!("value" in element) || typeof element.selectionStart !== "number") return;
-    const text = String(element.value ?? "");
-    const length = text.length;
-    let caret = element.selectionStart;
-    const selected = element.selectionEnd > caret;
-    if (key === "ArrowLeft") caret = selected ? caret : adjacentGrapheme(text, caret, true);
-    if (key === "ArrowRight") caret = selected ? element.selectionEnd : adjacentGrapheme(text, caret, false);
-    if (key === "Home") caret = 0;
-    if (key === "End") caret = length;
-    if (typeof element.setSelectionRange === "function") element.setSelectionRange(caret, caret);
   }
 
   function readingViewport(target) {

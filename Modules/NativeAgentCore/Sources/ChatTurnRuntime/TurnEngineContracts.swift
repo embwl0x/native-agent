@@ -14,7 +14,7 @@ import Context
 import CognitiveSubstrate
 import ToolRegistry
 import TurnTrace
-// Blueprint: | `TurnEngineContracts.swift` | `TurnContext` value projections with module-scoped setters, immutable admitted routing and retained sent-context/window metadata; `TurnEngineResult` aliases TurnTraceEvent's terminal status vocabulary |
+// Blueprint: | `TurnEngineContracts.swift` | `TurnContext` carries the prepared parts delivery callback; value projections with module-scoped setters, immutable admitted routing and retained sent-context/window metadata; `TurnEngineResult` aliases TurnTraceEvent's terminal status vocabulary |
 
 // MARK: - TurnEngineError
 
@@ -33,10 +33,8 @@ public enum TurnEngineError: Error, LocalizedError {
     case streamCancelled(partial: String, underlying: Error)
     /// Her turn part failed with no clean version left to swap in.
     case turnPartFailed(String)
-    /// No helper can start to run her turn part, and waiting will not change that.
+    /// The helper owner's single admission attempt could not start her turn part.
     case turnHelperUnavailable(String)
-    /// A handback wait lost observation or control before it could resume.
-    case macControlWaitUnavailable(String)
 
     public var errorDescription: String? {
         switch self {
@@ -46,7 +44,6 @@ public enum TurnEngineError: Error, LocalizedError {
             return "I couldn't load my context for this reply: "
                 + ((e as? LocalizedError)?.errorDescription ?? String(describing: e))
                 + ". Open Diagnostics → Doctor and follow the Context Flow check, then send again."
-                + " To reply without it meanwhile, set Setup → Memory in every reply to Off."
         case .toolCatalogLoadFailed(let e):
             return "I couldn't load my tools: "
                 + ((e as? LocalizedError)?.errorDescription ?? String(describing: e))
@@ -59,8 +56,6 @@ public enum TurnEngineError: Error, LocalizedError {
             return "turn_part_failed: \(why) The shipped turn part also failed. Read app {action:\"trace.recent\"} for the failing step; repair that cause before starting new work. This turn ended incomplete."
         case .turnHelperUnavailable(let why):
             return "turn_helper_unavailable: \(why) This turn ended before its helper started."
-        case .macControlWaitUnavailable(let why):
-            return "I couldn't wait for Mac control to return: \(why) This turn ended without resuming."
         }
     }
 }
@@ -128,7 +123,7 @@ public struct TurnContext: Sendable {
     /// byte-identical to pre-multimodal behavior.
     public let imageBlocks: [LLMContentBlock]
     /// Pins one immutable ContextFlow generation through the complete
-    /// provider/tool loop. nil keeps the legacy/off path unchanged.
+    /// provider/tool loop. nil denotes explicitly selected direct context assembly.
     public let fluidContextTurn: ContextPreparedTurn?
     /// SessionHistoryMessages replays bounded prior turns oldest first for byte-stable caching; other callers leave this empty.
     public internal(set) var historyMessages: [LLMMessage]
@@ -137,21 +132,20 @@ public struct TurnContext: Sendable {
     /// lifted out of `systemSegments.dynamic` — see `splittingVolatileBlock()`.
     /// nil until that split runs.
     public internal(set) var turnVolatileBlock: String?
-    /// What the replayed-prefix window cursor did for this turn. Set by
-    /// history assembly (resident or helper) from the shared cursor, so
-    /// every downstream receipt reports the same decision instead of re-reading
-    /// it from disk or guessing zero. nil on non-history callers.
-    public internal(set) var historyWindowReceipt: HistoryWindowReceipt?
     /// Only metadata attached to user turns that the projection actually replays.
+    package var historyReplaySpec: SessionReplaySpec? = nil
+    package var historyRowCharacters: [String: Int] = [:]
     package var replayedTurnContexts: [SentTurnContext] = []
-    /// Cursor boundary and retained recollection identities, not turn-varying text.
+    /// Retained recollection identities, not turn-varying text.
     package var historyContextWindow = "0:"
     /// Frozen duration from the context preparation summary, absent if unmeasured.
     public var preparationMs: Int64?
     /// The memory records this context delivers (packet provenance, or the
-    /// legacy lane's rendered rows). Their usage credit is written once the
+    /// direct lane's rendered rows). Their usage credit is written once the
     /// provider accepts the context, never at assembly.
     public internal(set) var usageCreditMemoryIDs: [String] = []
+    /// Exact parts stamps carried by this preparation; no state changes until provider output.
+    var partsDelivery: (@Sendable (String) -> Void)? = nil
     var cognitiveRuntimeContext: String? = nil
     public internal(set) var turnReach: TurnReach
     /// Recall provenance for stamping: untrimmed Off-mode hits, then packet IDs,
@@ -189,7 +183,6 @@ public struct TurnContext: Sendable {
         fluidContextTurn: ContextPreparedTurn? = nil,
         historyMessages: [LLMMessage] = [],
         turnVolatileBlock: String? = nil,
-        historyWindowReceipt: HistoryWindowReceipt? = nil,
         preparationMs: Int64? = nil,
         turnReach: TurnReach
     ) {
@@ -209,7 +202,6 @@ public struct TurnContext: Sendable {
         self.fluidContextTurn = fluidContextTurn
         self.historyMessages = historyMessages
         self.turnVolatileBlock = turnVolatileBlock
-        self.historyWindowReceipt = historyWindowReceipt
         self.preparationMs = preparationMs
         self.turnReach = turnReach
     }
@@ -336,7 +328,7 @@ public struct TurnEngineResult: Sendable {
             self.init(
                 reasoningEffort: context.reasoningEffort,
                 toolSchemaCount: context.toolSchemas.count,
-                contextSource: context.fluidContextTurn == nil ? "legacy" : "fluid_context",
+                contextSource: context.fluidContextTurn == nil ? "direct" : "fluid_context",
                 contextSelectedAtomCount: context.fluidContextTurn?.packet.selectedItems.count ?? 0,
                 contextPacketCharacters: context.fluidContextTurn?.packet.characterCount ?? 0,
                 contextExpandablePointerCount: context.fluidContextTurn?.packet.expandablePointers.count ?? 0
@@ -352,7 +344,7 @@ public struct TurnEngineResult: Sendable {
     public let toolDispatches: [ToolDispatchRecord]
     public let elapsedMs: Int
     /// Exact number of provider completions issued by this engine invocation.
-    /// A default keeps non-loop/legacy construction source-compatible; owners
+    /// Non-loop callers may supply their terminal observation directly; owners
     /// that cannot prove the count leave it nil rather than inventing zero.
     public let providerCallCount: Int?
     /// Engine-owned terminal truth, independent of any nonempty fallback prose.
@@ -362,11 +354,9 @@ public struct TurnEngineResult: Sendable {
     public let loopCounters: LoopCounters?
     /// Memory recording and private work released by the saved answer.
     public internal(set) var afterReply: AfterReply?
-    /// How many LEADING characters of `reply` are working commentary — the
-    /// narration the model spoke before each tool round — rather than the
-    /// finished answer. The bytes are unchanged and every one of them is still
-    /// persisted; this is only the boundary the transcript needs to fold the
-    /// commentary away once the turn is done (third conversation pass, item 3).
+    /// How many LEADING characters of `reply` were spoken before tool rounds.
+    /// Person-facing replies retain these words, live and settled. The boundary
+    /// remains available to machine callers that explicitly request answerOnly.
     /// nil/0 for single-round turns, which have no commentary at all.
     public let workingCommentaryCharacters: Int?
 

@@ -23,8 +23,8 @@ import ScreenCaptureKit
 extension SwiftNativeMacControl {
     /// Milliseconds waited after a scroll before the next walk. A scroll is
     /// delivered to the app asynchronously and an app that lays out on the next
-    /// runloop turn would otherwise be walked mid-scroll — which reads as "the
-    /// content did not change" and ends the accumulation one screen early.
+    /// runloop turn would otherwise be walked mid-scroll. A position that has
+    /// not advanced after this wait is reported as unconfirmed progress.
     static let documentReadSettleMilliseconds = 140
     /// READ. The whole document, in words, and never through `look`'s budgets.
     ///
@@ -165,13 +165,13 @@ extension SwiftNativeMacControl {
     /// THE ACCUMULATE ROUTE. Read the selected container's text. An uncut frame
     /// entirely from AXTextArea values is already whole, even in a background
     /// window. Otherwise scroll one viewport (minus an overlap band), walk
-    /// again, merge on the seam, and stop the moment a frame adds nothing.
+    /// again and merge on the seam. Only the observed scrollbar boundary proves
+    /// the end; text overlap is solely an accumulation rule.
     ///
     /// WHEN SCROLLING, WHAT IT EMITS: one `.move` to aim the wheel at the
     /// container's centre, and vertical `.scroll` events. No key, no button, no
     /// AX action, no attribute write. That emission set is the whole reason this
-    /// verb is graded a read, and `MacDocumentReadTests` greps the sink to keep
-    /// it true.
+    /// verb is graded a read.
     ///
     /// AND IT PUTS THE SCROLL BACK. The user's document is left where it was
     /// found, using its captured scrollbar value and readback. Without a
@@ -183,11 +183,18 @@ extension SwiftNativeMacControl {
         window selectedWindow: MacAXElementRef?
     ) async -> MacControlResult {
         let passive = MacObservationMode.current == .passive
-        if passive, MacScreenLock.isCovered() {
-            let message = MacScreenLock.passiveReply
-            return MacControlResult(ok: false, action: "read",
-                output: .object(["message": .string(message)]),
-                error: "passive_observation", durationMs: 0)
+        if passive {
+            do {
+                if try MacScreenLock.isCovered() {
+                    return MacControlResult(ok: false, action: "read",
+                        output: .object(["message": .string(MacScreenLock.passiveReply)]),
+                        error: "passive_observation", durationMs: 0)
+                }
+            } catch {
+                return MacControlResult(ok: false, action: "read",
+                    output: .object(["message": .string(error.localizedDescription)]),
+                    error: "screen_readiness_unavailable", durationMs: 0)
+            }
         }
         func result(ok: Bool, _ output: [String: JSONValue], error: String? = nil) -> MacControlResult {
             return MacControlResult(
@@ -297,6 +304,7 @@ extension SwiftNativeMacControl {
         let containerRole = chosen.attributes.role
         let containerFrame = walkShouldStop() ? nil : accessibilitySource.attributes(of: container)?.frame
         let scrollContainer = container
+        let scrollSource = accessibilitySource
         let takeover = MacDocumentReadTakeover()
         let observation = attentionEventSource.start { _ in takeover.mark() }
         defer { observation.stop() }
@@ -310,7 +318,7 @@ extension SwiftNativeMacControl {
             if Task.isCancelled { return "cancelled" }
             if takeover.occurred { return "yielded_to_user" }
             guard let frame = containerFrame,
-                  accessibilitySource.documentScrollTargetIsCurrent(
+                  scrollSource.documentScrollTargetIsCurrent(
                     window: window, container: scrollContainer, frame: frame, pid: app.processIdentifier
                   ) else { return "scroll_target_changed" }
             return nil
@@ -356,11 +364,19 @@ extension SwiftNativeMacControl {
             let centreX = frame.x + frame.w / 2
             let centreY = frame.y + frame.h / 2
             if truncationReason == nil { truncationReason = await stopReason() }
+            var position = scrollRestoration?.observedPosition
             if truncationReason == nil {
+                if let position {
+                    reachedEnd = position.atEnd == true && !firstFrame.truncated
+                } else {
+                    truncationReason = "scroll_position_unavailable"
+                }
+            }
+            if truncationReason == nil && !reachedEnd {
                 eventSink.post(mouse: MacMouseEvent(phase: .move, button: .left, x: centreX, y: centreY))
             }
             while framesRead < MacDocumentRead.maxFrames {
-                if truncationReason != nil { break }
+                if truncationReason != nil || reachedEnd { break }
                 if let reason = await stopReason() { truncationReason = reason; break }
                 // THE WALL CLOCK, checked BEFORE the next scroll rather than
                 // after it: a step already taken has to be put back, and there
@@ -385,15 +401,23 @@ extension SwiftNativeMacControl {
                 framesRead += 1
                 framesTruncated = framesTruncated || next.truncated
                 framesRedacted = framesRedacted || next.didRedact
-                let nothingNew = accumulator.absorb(next.lines)
+                _ = accumulator.absorb(next.lines)
                 if Task.isCancelled { truncationReason = "cancelled"; break }
                 if now() >= deadline { truncationReason = MacDocumentRead.deadlineTruncationReason; break }
-                if nothingNew {
-                    // The container can be replaced during the walk: invalid
-                    // AX attributes also yield an empty, non-truncated frame.
-                    // Accept its end only while the original target is current.
-                    truncationReason = await stopReason()
-                    reachedEnd = !next.truncated && truncationReason == nil
+                // The target can change during the walk. Neither absent text
+                // nor repeated text establishes a boundary or successful motion.
+                if let reason = await stopReason() { truncationReason = reason; break }
+                guard let observed = scrollRestoration?.observedPosition, let previous = position else {
+                    truncationReason = "scroll_position_unavailable"
+                    break
+                }
+                position = observed
+                if observed.atEnd == true && !next.truncated && !next.lines.isEmpty {
+                    reachedEnd = true
+                    break
+                }
+                if observed.value <= previous.value {
+                    truncationReason = "scroll_progress_unconfirmed"
                     break
                 }
                 if accumulator.characters >= MacDocumentRead.maxAccumulatedChars {

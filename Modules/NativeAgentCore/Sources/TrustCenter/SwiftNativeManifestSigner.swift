@@ -10,12 +10,10 @@ import PersistenceCore
 // Local backup includes it; export and phone sync exclude it. PrivacyMap counts it under Tools, including hidden files.
 
 public enum ManifestSigningError: Error, LocalizedError {
-    case canonicalizationFailed(String)
     case keyUnavailable(String)
 
     public var errorDescription: String? {
         switch self {
-        case .canonicalizationFailed(let m): return "manifest_canonicalization_failed: \(m). Replace the named value in the signing input with a finite JSON number before signing."
         case .keyUnavailable(let m): return "manifest_signing_key_unavailable: \(m). Ask the owner to repair or restore the original 32-byte signing key as a regular 0600 file at tools/.manifest_signing_key; never replace an existing signing identity."
         }
     }
@@ -152,14 +150,8 @@ public actor SwiftNativeManifestSigner {
         if sig.isEmpty {
             return ["Manifest is unsigned; validate/recreate the tool so NativeAgent can sign it."]
         }
-        var ver = ""
-        switch manifest["signatureVersion"] ?? .null {
-        case .int(let i): ver = String(i)
-        case .string(let s): ver = s
-        default: ver = ""
-        }
-        if ver != "2" {
-            return ["Manifest signatureVersion must be 2."]
+        guard manifest["signatureVersion"] == .int(2) else {
+            return ["Manifest signatureVersion must be the integer 2."]
         }
         guard let keyData = try existingSigningKey() else {
             throw ToolFailureError("Manifest signing authority is missing; verification never creates it.",

@@ -16,7 +16,7 @@ import NativeAgentShared
 import Senses
 import AgentConversations
 import StandingBots
-// Blueprint: | `WindowPixels.swift` | `FourVerbPixelAttachment` class; call-scoped captured pixels, region cropping, attachment deduplication and bounded JPEG delivery |
+// Blueprint: | `WindowPixels.swift` | Call-scoped pixel attachments require successful region cropping before geometry-bound deduplication and bounded JPEG delivery; failed crops attach no image; delivered frames retain capture provenance |
 
 /// One attachment per screen call, reusing its captured frame and thin-AX reason.
 /// Background window capture raises nothing; attach runs after the verb.
@@ -30,6 +30,7 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
     private let lock = NSLock()
     private var recorded = false
     private var frameID = ""
+    private var capture: MacImageCapture?
     private var reason: String?
     private var screenRecording = false
     private var png: String?
@@ -48,12 +49,13 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         self.forced = forced
     }
 
-    func record(frameID: String, reason: String?, screenRecording: Bool, png: String?, image: CGImage?, unavailable: String?,
+    func record(frameID: String, capture: MacImageCapture?, reason: String?, screenRecording: Bool, png: String?, image: CGImage?, unavailable: String?,
                 origin: (x: Double, y: Double), logicalSize: (width: Double, height: Double),
                 background: Bool, window: String, captureDetail: String? = nil, captureRemedy: JSONValue? = nil) {
         lock.lock(); defer { lock.unlock() }
         recorded = true
         self.frameID = frameID
+        self.capture = capture
         discarded = false
         self.reason = reason
         self.screenRecording = screenRecording
@@ -114,6 +116,7 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
     /// saying (an AX-rich window she did not ask pixels of).
     func attach() -> String? {
         lock.lock(); defer { lock.unlock() }
+        imageFrame = nil
         guard recorded, reason != nil || forced else { return nil }
         let why = reason.map { "thin accessibility: \($0)" } ?? "pixels:true"
         guard screenRecording else {
@@ -132,31 +135,37 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         }
         var scope = "the window"
         if let region { scope = "\(region.name), cropped at higher detail" }
-        // Same window, same region, byte-identical source frame → the image
-        // already in her context stands. Checked before JPEG fitting.
-        let key = window + "|" + (region?.name ?? "")
-        let fingerprint = SHA256.hash(data: Data(png.utf8)).map { String(format: "%02x", $0) }.joined()
-        let turn = forced ? nil : ChatTurnExecution.current
-        if let previousID = turn?.attachedPixelFrame(window: key, fingerprint: fingerprint),
-           let previous = MacImageFrames.frame(previousID) {
-            let frame = MacImageFrames.remember(previous.geometry, id: frameID)
-            imageFrame = frame.fields
-            turn?.notePixelsAttached(window: key, fingerprint: fingerprint, frameID: frameID)
-            return "Pixels (\(why)): \(scope) is unchanged since its image was attached earlier this turn; not sent again. " + frame.words
-        }
         guard let image else {
             return "Pixels (\(why)): the window capture could not be decoded; the words above are all I have."
         }
         var source = (image: image, origin: origin, logicalSize: logicalSize)
-        if let region, logicalSize.width > 0, logicalSize.height > 0 {
+        if let region {
             let padX = max(24, region.frame.w * 0.25), padY = max(24, region.frame.h * 0.25)
-            let crop = VisionImageCropper.crop(
+            guard let crop = VisionImageCropper.crop(
                 image,
                 to: MacAXFrame(x: region.frame.x - padX, y: region.frame.y - padY,
                                w: region.frame.w + padX * 2, h: region.frame.h + padY * 2),
                 origin: origin, logicalSize: logicalSize
-            )
+            ) else {
+                return "Pixels (\(why)): region_crop_failed. The requested region could not be cropped; no image was attached."
+            }
             source = (crop.image, crop.origin, crop.logicalSize)
+        }
+        // Same window, same region, byte-identical source frame → the image
+        // already in her context stands. Checked before JPEG fitting.
+        let key = window + "|" + (region?.name ?? "")
+        let geometryKey = [source.origin.x, source.origin.y, source.logicalSize.width, source.logicalSize.height]
+            .map { String($0) }.joined(separator: "|")
+        let fingerprint = SHA256.hash(data: Data((png + "|" + geometryKey).utf8)).map { String(format: "%02x", $0) }.joined()
+        let turn = forced ? nil : ChatTurnExecution.current
+        if let previousID = turn?.attachedPixelFrame(window: key, fingerprint: fingerprint),
+           let previous = MacImageFrames.frame(previousID) {
+            let old = previous.geometry
+            let frame = MacImageFrames.remember(MacScreenViewGeometry(bounds: old.bounds,
+                pixelWidth: old.pixelWidth, pixelHeight: old.pixelHeight, capture: capture), id: frameID)
+            imageFrame = frame.fields
+            turn?.notePixelsAttached(window: key, fingerprint: fingerprint, frameID: frameID)
+            return "Pixels (\(why)): \(scope) is unchanged since its image was attached earlier this turn; not sent again. " + frame.words
         }
         guard let jpeg = Self.boundedJPEG(source.image) else {
             return "Pixels (\(why)): the image could not be fitted under \(Self.maxBytes / 1000) KB; none was attached."
@@ -177,7 +186,7 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         guard source.logicalSize.width > 0, source.logicalSize.height > 0 else { return attached }
         let frame = MacImageFrames.remember(MacScreenViewGeometry(
             bounds: MacAXFrame(x: source.origin.x, y: source.origin.y, w: source.logicalSize.width, h: source.logicalSize.height),
-            pixelWidth: jpeg.width, pixelHeight: jpeg.height), id: frameID)
+            pixelWidth: jpeg.width, pixelHeight: jpeg.height, capture: capture), id: frameID)
         imageFrame = frame.fields
         ChatTurnExecution.current?.notePixelsAttached(window: key, fingerprint: fingerprint, frameID: frameID, image: name)
         return attached + " " + frame.words

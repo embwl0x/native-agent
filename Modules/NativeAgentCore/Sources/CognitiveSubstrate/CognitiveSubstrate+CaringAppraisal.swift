@@ -1,5 +1,4 @@
 import Foundation
-import TurnTrace
 
 // Blueprint: | `CognitiveSubstrate+CaringAppraisal.swift` | `CaringAppraisalRequest`, verdict and lane contracts: semantic caring judgments, distinctness and admission/refusal interfaces |
 
@@ -147,59 +146,23 @@ public enum CaringAppraisalLane {
     /// which the caller treats as a failed call and doses nothing.
     static let wireKinds: [String: OrganismCaringEvent.Kind] = [
         "cared_for": .caredFor,
-        "caredfor": .caredFor,
         "room_made": .roomMade,
-        "roommade": .roomMade,
         "need_met": .needMet,
-        "needmet": .needMet,
         "repair": .repair,
     ]
 
     /// Parse the decoded reply. `nil` is malformed; a verdict with `kind == nil`
     /// is the successful answer "none".
     public static func parse(_ object: [String: Any]) -> CaringAppraisalVerdict? {
-        guard let rawKind = object["kind"] as? String else { return nil }
-        let normalized = rawKind
+        guard let kind = object["kind"] as? String,
+              let rawWhy = object["why"] as? String,
+              let rawDistinctness = object["distinct"] as? String,
+              let distinctness = CaringAppraisalVerdict.Distinctness(rawValue: rawDistinctness) else { return nil }
+        let why = rawWhy
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "-", with: "_")
-            .replacingOccurrences(of: " ", with: "_")
-        let why = ((object["why"] as? String) ?? "")
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let verdict: CaringAppraisalVerdict
-        if normalized == "none" || normalized.isEmpty {
-            verdict = CaringAppraisalVerdict(kind: nil, why: why)
-        } else {
-            guard let kind = wireKinds[normalized] else { return nil }
-            verdict = CaringAppraisalVerdict(
-                kind: kind,
-                why: why,
-                distinctness: distinctness(in: object)
-            )
-        }
-        if rawKind != normalized || normalized.isEmpty
-            || normalized == "caredfor" || normalized == "roommade" || normalized == "needmet"
-            || (verdict.kind != nil && (object["distinct"] as? String) != verdict.distinctness.rawValue) {
-            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("M20"), "site": .string("CognitiveSubstrate+CaringAppraisal.swift:parse")]))
-        }
-        return verdict
-    }
-
-    /// The relay's distinctness answer. A field the model did not write is
-    /// `.unstated` — the only case the six-hour floor still decides — and
-    /// anything it wrote that is not one of the three words is `.unsure`, which
-    /// never doses.
-    static func distinctness(in object: [String: Any]) -> CaringAppraisalVerdict.Distinctness {
-        if let number = object["distinct"] as? NSNumber, let flag = number as? Bool {
-            return flag ? .distinct : .retelling
-        }
-        guard let raw = object["distinct"] as? String else { return .unstated }
-        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "": return .unstated
-        case "distinct", "yes", "true", "new", "fresh": return .distinct
-        case "retelling", "no", "false", "retold", "repeat": return .retelling
-        default: return .unsure
-        }
+        if kind == "none" { return CaringAppraisalVerdict(kind: nil, why: why, distinctness: distinctness) }
+        guard let caringKind = wireKinds[kind] else { return nil }
+        return CaringAppraisalVerdict(kind: caringKind, why: why, distinctness: distinctness)
     }
 }

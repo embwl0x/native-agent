@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `VectorMath.swift` | `VectorMath.cosine`: shared finite-checked Double cosine core for recall, cognition and context; `standout`: linear leave-one-out deviation scores; `chanceBar`: the one bar every similarity decision clears (chance among n, plus 1 for attention, 2 for an action) |
+// Blueprint: | `VectorMath.swift` | `requireUsable`: shared finite/nonzero/dimension vector gate; `cosine`: shared finite-checked Double cosine core; `standout`: linear leave-one-out deviation scores used by recall and care settlement at the memory bar; `chanceBar`: unsolicited attention/action bar (chance among n, plus 1 or 2) |
 
 /// Shared vector math for the recall / consolidation / context surfaces.
 ///
@@ -16,6 +16,22 @@ import Foundation
 /// (Context still clamps to `[0, 1]`; consolidation compares the raw value
 /// against a threshold).
 public enum VectorMath {
+    public struct UnusableVector: Error, LocalizedError {
+        public let reason: String
+        public var errorDescription: String? { reason }
+    }
+
+    /// Admission, activation and inference share this gate. A missing expected
+    /// width permits checking stored bytes, never inventing a model's width.
+    public static func requireUsable(_ vector: [Float], dimensions: Int? = nil) throws {
+        if let dimensions, dimensions <= 0 || vector.count != dimensions {
+            throw UnusableVector(reason: "Embedding has \(vector.count) dimensions; expected \(dimensions).")
+        }
+        guard !vector.isEmpty, vector.allSatisfy(\.isFinite), vector.contains(where: { $0 != 0 }) else {
+            throw UnusableVector(reason: "Embedding must be nonempty, finite and nonzero.")
+        }
+    }
+
     /// Raw cosine similarity of two equal-length embeddings, guarded for empty
     /// input, length mismatch, and non-finite components. Returns a value in
     /// `[-1, 1]` (unclamped) or `0` when the comparison is undefined.
@@ -59,8 +75,8 @@ public enum VectorMath {
         /// into the turn, a moment she is reminded of. One deviation past chance.
         case attention
         /// Something is done for her without asking. Two deviations past
-        /// chance. (No caller since the first-read habit was replaced by
-        /// expansion at the door, which predicts by value flow, not similarity.)
+        /// chance. AfterTurnSurpriseLedger uses this margin when a labelled
+        /// precedent nominates whether the after-turn fold has anything new.
         case action
 
         public var margin: Double {
@@ -71,12 +87,14 @@ public enum VectorMath {
         }
     }
 
-    /// The one law for every similarity decision: the best of `candidates`
+    /// The chance bar for unsolicited attention and action: the best of `candidates`
     /// stands out by about √(2 ln n) deviations by chance alone (the expected
     /// maximum of n draws), so a candidate counts only when its `standout`
     /// reaches that plus the decision's margin. Derived from chance, not
     /// fitted, and it rises as the candidates grow: 3.5 for attention among 23
     /// cares, 4.0 among 80 memories; 4.0 to 4.6 for an action among 7 to 32.
+    /// Addressed recall and care birth/night use the memory standout bar in
+    /// ContextSelectionConfiguration instead; ambient touches retain this bar.
     public static func chanceBar(_ decision: Decision, among candidates: Int) -> Double {
         decision.margin + (2 * log(Double(max(1, candidates)))).squareRoot()
     }

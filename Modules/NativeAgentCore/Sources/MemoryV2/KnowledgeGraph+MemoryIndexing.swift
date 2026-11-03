@@ -44,18 +44,21 @@ public struct KnowledgeGraphMemoryFact: Sendable, Equatable {
     }
 
     init?(row: Row) throws {
+        let id = try row.decode(String.self, forColumn: "id")
+        let validFrom = try row.decode(String?.self, forColumn: "valid_from")
         let validTo = try row.decode(String?.self, forColumn: "valid_to")
+        try MemoryStorage.validateTemporalEvidence(id: id, validFrom: validFrom, validTo: validTo, observedAt: nil)
         guard MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: validTo, at: Date()) else { return nil }
         let metadata = try row.decode(String?.self, forColumn: "metadata_json")
         self.init(
-            id: try row.decode(String.self, forColumn: "id"),
+            id: id,
             content: try row.decode(String.self, forColumn: "content"),
             source: try row.decode(String?.self, forColumn: "source"),
             status: try row.decode(String?.self, forColumn: "status") ?? "active",
             createdAt: try row.decode(String?.self, forColumn: "created_at") ?? "",
             updatedAt: try row.decode(String?.self, forColumn: "updated_at") ?? "",
-            metadata: metadata.flatMap { try? JSONValue.parse(Data($0.utf8)) },
-            validFrom: try row.decode(String?.self, forColumn: "valid_from"), validTo: validTo
+            metadata: try metadata.map { try JSONValue.parse(Data($0.utf8)) },
+            validFrom: validFrom, validTo: validTo
         )
     }
 }
@@ -95,7 +98,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     private enum IndexingControl: Error {
         case requiresCanonicalRebuild
     }
-    // v5 uses the on-device name tagger; rows re-index on their next touch or rebuild.
+    // The ownership stamp is stable; fact fingerprints identify derivation changes.
     static let indexVersion = "swift-memory-kg-v5"
     /// Insert-only metadata_json provenance proves indexer ownership for GC; unstamped entities are never swept.
     static let createdByKey = "created_by_indexer"
@@ -107,8 +110,6 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     /// and profile renames take effect without restarting, never once per fact.
     private let explicitPrimaryUserName: String?
     private let primaryUserProfileURL: URL
-    /// Resolve known people once at init; indexing and GC share this list for synchronous extraction.
-    nonisolated let knownPeople: [String]
 
     private var projectionGeneration = 0
     private var reconciledProjectionGeneration: Int?
@@ -119,6 +120,10 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     }
 
     public func reconcileProjectionIfNeeded(producing: Bool) async throws {
+        // A wake is not a certification that profile identity stayed unchanged.
+        // Check canonical fingerprints on every operation, including retained
+        // launch indexers, rather than trusting a prior memory-only generation.
+        projectionGeneration += 1
         if projectionProducing != producing {
             projectionProducing = producing
             projectionGeneration += 1
@@ -146,12 +151,18 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         self.explicitPrimaryUserName = primaryUserName
         self.primaryUserProfileURL = memorySQLitePath.deletingLastPathComponent()
             .appendingPathComponent("profile.json")
-        let profileNames = Self.profileNames(profileURL: self.primaryUserProfileURL)
-        let resolved = if let primaryUserName {
-            Self.resolvePrimaryUserName(explicit: primaryUserName, profileURL: self.primaryUserProfileURL)
-        } else {
-            profileNames.user ?? "the user"
-        }
+    }
+
+    struct ExtractionIdentity: Sendable {
+        let primaryUserName: String
+        let knownPeople: [String]
+        let fingerprint: String
+    }
+
+    /// One checked identity read for an indexing/reconciliation/GC operation.
+    func resolvedExtractionIdentity() throws -> ExtractionIdentity {
+        let profileNames = try Self.profileNames(profileURL: primaryUserProfileURL)
+        let resolved = Self.primaryUserName(explicit: explicitPrimaryUserName, saved: profileNames.user)
         // The agent's own name always identifies a person in her graph.
         let agent = profileNames.agent
         var people: [String] = []
@@ -164,7 +175,11 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         for peer in Self.builtInPeerAgents where !people.contains(where: { $0.lowercased() == peer.lowercased() }) {
             people.append(peer)
         }
-        self.knownPeople = people
+        let fields = [profileNames.agent, profileNames.user, explicitPrimaryUserName]
+        let fingerprint = Self.contentHash(fields.map { field in
+            field.map { "\($0.utf8.count):\($0)" } ?? "unset"
+        }.joined(separator: "|"))
+        return ExtractionIdentity(primaryUserName: resolved, knownPeople: people, fingerprint: fingerprint)
     }
 
     private static let builtInPeerAgents = ["Claude", "Codex"]
@@ -182,7 +197,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         // production is disabled, so subsequent mutations have nothing to do.
         guard !memoryID.isEmpty, producing else { return }
         let dbPool = try await pool()
-        let primaryUserName = resolvedPrimaryUserName()
+        let identity = try resolvedExtractionIdentity()
         do {
             try await dbPool.write { db in
                 // Hook payloads are wake hints, not authority. In the production
@@ -208,7 +223,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
 
                 let content = canonicalFact.content
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                let contentHash = Self.factFingerprint(canonicalFact, content: content)
+                let contentHash = Self.factFingerprint(canonicalFact, content: content, identity: identity)
                 // The hash check shares the upserts' write transaction. A
                 // changed hash cannot be incrementally overlaid: entities and
                 // edges from the old claim would survive. Escape the transaction and run
@@ -227,22 +242,15 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                     content: content,
                     contentHash: contentHash,
                     now: Self.nowISO8601(),
-                    extracted: Self.extractEntities(from: content, knownPeople: knownPeople),
-                    primaryUserName: primaryUserName
+                    extracted: Self.extractEntities(from: content, knownPeople: identity.knownPeople),
+                    primaryUserName: identity.primaryUserName
                 )
             }
         } catch IndexingControl.requiresCanonicalRebuild {
             // Eligibility can change while acquiring the rebuild transaction.
             // Its canonical read decides removal; never carry an exclusion.
-            _ = try await rebuildMemoryDerivedGraphFromCanonicalStore()
+            _ = try await rebuildMemoryDerivedGraphFromCanonicalStore(producing: true, identity: identity)
         }
-    }
-
-    func resolvedPrimaryUserName() -> String {
-        Self.resolvePrimaryUserName(
-            explicit: explicitPrimaryUserName,
-            profileURL: primaryUserProfileURL
-        )
     }
 
     static func indexActiveFact(
@@ -258,8 +266,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         let userID = try upsertPrimaryUserEntity(
             db,
             primaryUserName: primaryUserName,
-            now: now,
-            fact: fact
+            now: now
         )
         let factID = try upsertMemoryFactEntity(
             db,
@@ -399,18 +406,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         case "decision": return "decided"
         case "schedule": return "scheduled_for"
         case "project", "operational", "milestone": return "tracks"
-        default:
-            let lower = fact.content.lowercased()
-            if lower.contains("prefer") || lower.contains("favorite") || lower.contains("favourite") {
-                return "prefers"
-            }
-            if lower.contains("want") || lower.contains("need") {
-                return "wants"
-            }
-            if lower.contains("decided") || lower.contains("decision") || lower.contains("should") {
-                return "decided"
-            }
-            return "remembers"
+        default: return "remembers"
         }
     }
 
@@ -456,12 +452,15 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             LIMIT 1
             """, arguments: [name, type]) {
             let id: String = try row.decode(forColumn: "id")
+            var metadata = try metadataObject(row.decode(forColumn: "metadata_json"))
+            // indexActiveFact already updated this profile-backed hub. A name
+            // extracted from the fact must not overwrite it with fact content.
+            if metadata["role"]?.stringValue == "primary_user" { return id }
             let count: Int64? = try row.decode(forColumn: "mention_count")
             let (nextCount, overflow) = (count ?? 0).addingReportingOverflow(1)
             guard !overflow else {
                 throw MemoryStorageError.databaseUnavailable("kg_entities mention_count overflow for row \(id)")
             }
-            var metadata = metadataObject(try row.decode(forColumn: "metadata_json"))
             metadata["embedding_text"] = .string("\(type): \(name)")
             metadata["last_memory_id"] = .string(fact.id)
             if let source = fact.source { metadata["last_memory_source"] = .string(source) }
@@ -520,7 +519,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                 throw MemoryStorageError.databaseUnavailable("kg_relationships mention_count overflow for row \(id)")
             }
             let oldWeight: Double = row["weight"] ?? 0.5
-            var metadata = metadataObject(row["metadata_json"])
+            var metadata = try metadataObject(row["metadata_json"])
             if metadata["first_seen"] == nil { metadata["first_seen"] = .string(now) }
             metadata["last_seen"] = .string(now)
             metadata["last_memory_id"] = .string(fact.id)
@@ -567,20 +566,17 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         }
     }
 
-    static func metadataObject(_ raw: String?) -> [String: JSONValue] {
-        guard let raw, let data = raw.data(using: .utf8),
-              let parsed = try? JSONValue.parse(data),
-              case .object(let obj) = parsed else {
-            return [:]
+    static func metadataObject(_ raw: String?) throws -> [String: JSONValue] {
+        guard let raw else { return [:] }
+        guard case .object(let obj) = try JSONValue.parse(Data(raw.utf8)) else {
+            throw MemoryStorageError.databaseUnavailable("Knowledge graph metadata_json is not an object; repair the row before reading or changing it.")
         }
         return obj
     }
 
-    static func metadataJSON(_ metadata: [String: JSONValue]) -> String? {
-        guard !metadata.isEmpty,
-              let data = try? JSONValue.object(metadata).serializedData(pretty: false) else {
-            return nil
-        }
+    static func metadataJSON(_ metadata: [String: JSONValue]) throws -> String? {
+        guard !metadata.isEmpty else { return nil }
+        let data = try JSONValue.object(metadata).serializedData(pretty: false)
         return String(decoding: data, as: UTF8.self)
     }
 
@@ -589,9 +585,10 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    static func factFingerprint(_ fact: KnowledgeGraphMemoryFact, content: String) -> String {
+    static func factFingerprint(_ fact: KnowledgeGraphMemoryFact, content: String, identity: ExtractionIdentity) -> String {
         let kind = metadataString(fact.metadata, "kind") ?? "fact"
-        let fields = [indexVersion, kind, fact.validFrom ?? "", fact.validTo ?? "", content]
+        let fields = [indexVersion, "canonical-profile-hub-declared-kind-language-v2", identity.fingerprint,
+                      kind, fact.validFrom ?? "", fact.validTo ?? "", content]
         return contentHash(fields.map { "\($0.utf8.count):\($0)" }.joined())
     }
 

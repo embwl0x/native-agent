@@ -12,10 +12,11 @@ extension SwiftNativeMemoryV2 {
 
     // MARK: - Byte-identical collapse: keep the collapse, keep BOTH identities
 
-    /// How many occurrences of one collapsed memory keep their provenance.
+    /// How many occurrences of one collapsed memory appear in its preview.
     /// Bounded because a lane that repeats forever must not grow one row's
     /// metadata forever; the oldest occurrences fall off, `recall_count` keeps
-    /// counting past the cap.
+    /// counting past the cap. Correction counts read the full canonical
+    /// correction_occurrences record, never this preview or recall_count.
     static let duplicateProvenanceCap = 10
 
     /// Metadata keys that are POLICY or shape, not the identity of a
@@ -107,11 +108,10 @@ extension SwiftNativeMemoryV2 {
         //    First-class column (`observed_at` maps to observedAt);
         //    only ever moves FORWARD by instant, never by ISO string order:
         //    offsets and fractional seconds need not sort chronologically.
-        //    Match new-record alias precedence; an explicit malformed value
+        //    Read the writer's one temporal key; an explicit malformed value
         //    must not overwrite canonical observation time.
         var observedAt: String?
         if case .string(let value)? = newMeta["observed_at"] { observedAt = value }
-        if case .string(let value)? = newMeta["observedAt"] { observedAt = value }
         if let raw = observedAt,
            let observed = MemoryRecallScoring.parseTimestamp(raw) {
             let current = existing.observedAt.flatMap(MemoryRecallScoring.parseTimestamp)
@@ -134,7 +134,7 @@ extension SwiftNativeMemoryV2 {
         if try await storage.isTombstoned(content: content) { return true }
         // A cold model leaves the paraphrase check to the owed-vector fill.
         guard let embedded = try await residentWriteEmbedding(content) else { return false }
-        return try await storage.matchesTombstone(embedding: embedded.vector, embeddingEpoch: embedded.epoch)
+        return try await storage.matchesTombstone(content: content, embedding: embedded.vector, embeddingEpoch: embedded.epoch)
     }
 
     /// The forgotten or rejected claims nearest `text`, closest first, by the
@@ -187,11 +187,8 @@ extension SwiftNativeMemoryV2 {
         if case .object(let metaObj)? = metadata {
             if case .double(let c)? = metaObj["confidence"] { liftedConfidence = c }
             if case .string(let value)? = metaObj["valid_from"] { liftedValidFrom = value }
-            if case .string(let value)? = metaObj["validFrom"] { liftedValidFrom = value }
             if case .string(let value)? = metaObj["valid_to"] { liftedValidTo = value }
-            if case .string(let value)? = metaObj["validTo"] { liftedValidTo = value }
             if case .string(let value)? = metaObj["observed_at"] { liftedObservedAt = value }
-            if case .string(let value)? = metaObj["observedAt"] { liftedObservedAt = value }
             liftedEvidence = metaObj["evidence"]
         }
         let record = StoredMemory(

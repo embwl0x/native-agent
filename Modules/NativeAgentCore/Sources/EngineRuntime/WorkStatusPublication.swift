@@ -7,7 +7,7 @@ import NativeAgentShared
 import Desk
 import TriggerScheduler
 import WorkshopExecution
-// Blueprint: | `WorkStatusPublication.swift` | Per-AppModel MainActor publication: one board read, coalesced requests, needs-owner push evaluation and change-suppressed widget status |
+// Blueprint: | `WorkStatusPublication.swift` | Per-AppModel MainActor publication: one board read, coalesced requests, needs-owner push evaluation and change-suppressed widget status; unavailable identity withholds only the widget publication |
 @MainActor
 public final class WorkStatusPublication {
     private var widgetContainerUnavailableLogged = false
@@ -35,6 +35,9 @@ public final class WorkStatusPublication {
     @available(macOS 27, *)
     private func publishWidgetStatus(_ board: DeskBoardRead, engine: NativeAgentEngine, name: String,
                                      waiting: Int?, reload: @escaping @Sendable () -> Void) async {
+        // Loading/unavailable identity has no name to publish. Profile refresh
+        // will publish again; Desk and needs-you evaluation above still proceed.
+        guard !name.isEmpty else { return }
         guard !widgetContainerUnavailableLogged else { return }
         let busy = engine.turns.visiblyWorkingSessionIDs
         let replying = engine.turns.replyingSessions

@@ -7,7 +7,6 @@ public enum OrganismRepairOperationKind: String, Codable, Sendable, Equatable, C
     case strengthenWarmAssociation
     case weakenNoisyLoop
     case flagContradiction
-    case proposeStandingView
 }
 
 public struct OrganismRepairOperation: Codable, Sendable, Equatable, Identifiable {
@@ -481,10 +480,7 @@ public enum OrganismDreamRepair {
     }
 
     private static func feltDaySummary(from metadata: [String: JSONValue], limit: Int) -> String {
-        for key in ["feltDaySummary", "felt_day_summary", "feltSummary", "summary"] {
-            guard case .string(let raw)? = metadata[key] else { continue }
-            return String(raw.trimmingCharacters(in: .whitespacesAndNewlines).prefix(limit))
-        }
-        return ""
+        guard case .string(let raw)? = metadata["feltDaySummary"] else { return "" }
+        return String(raw.trimmingCharacters(in: .whitespacesAndNewlines).prefix(limit))
     }
 }

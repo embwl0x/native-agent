@@ -1,9 +1,9 @@
 /* NativeAgent ability
 {
-  "id": "today-readout", "kind": "tool", "version": 1,
+  "id": "today-readout", "kind": "ability", "version": 1,
   "reach": {"capabilities": [], "readPaths": [], "hosts": [], "apps": []},
   "face": {"projection":true},
-  "record": {"description": "Compose my Today rows from frozen, provenance-checked sources. Returned source keys are rebound by the native owner; the waiting sentence is a cached pure face.", "actions": [], "inputSchema": {"type": "object", "required": ["moments","dream","nextDream","toward","recollections","conversations","builders","notes","clusters"]}}
+  "record": {"description": "Compose my Today rows from frozen, provenance-checked sources, including thinking per turn today against the week and the next five clock intentions in Ahead. Returned source keys are rebound by the native owner; the waiting sentence is a cached pure face.", "actions": [], "inputSchema": {"type": "object", "required": ["moments","dream","nextDream","toward","thinking","intentions","recollections","conversations","builders","notes","clusters"]}}
 }
 */
 function run(input) {
@@ -24,6 +24,10 @@ function run(input) {
     const row = (id,title,line,sources,details=[]) => ({id,title,line,sources,details});
     let did = [], ahead = [], earlier = [];
     const omitted = [];
+    if (input.thinking.state === "available") {
+        const ratio = counts => counts.turns > 0 ? (counts.calls/counts.turns).toFixed(1) : "unmeasured";
+        did.push(row("thinking","Thinking: "+ratio(input.thinking.today)+" model calls a turn today (week "+ratio(input.thinking.week)+")","",["thinking"]));
+    }
     const moments = ["available","partial"].includes(input.moments.state) ? input.moments.rows.slice().sort((a,b)=>a.at-b.at) : [];
     if (moments.length) did.push(row("kept","I kept "+spelled(moments.length).toLowerCase()+" "+(moments.length === 1 ? "moment" : "moments")+" today",
         "",moments.map(m=>m.key),moments.slice(-6).map(m=>"“"+m.quote+"”")));
@@ -76,6 +80,12 @@ function run(input) {
             ahead.push(row("facing",label,due,["facing"]));
         }
     }
+    const intentions = input.intentions.state === "available" ? input.intentions.rows : [];
+    intentions.slice().sort((a,b)=>a.at-b.at || a.key.localeCompare(b.key)).slice(0,5).forEach(i=>{
+        const words=bounded(plain(i.words));
+        // The gutter shows the clock time; the line names the day only when it is not today.
+        ahead.push(row(i.key,words,i.time.startsWith("at ") ? "" : i.time,[i.key]));
+    });
     const recollection=input.recollections.filter(r=>r.text).slice().sort((a,b)=>b.at-a.at)[0];
     if (recollection) did.push(row(recollection.key,"I wrote down what we talked about","A note to myself, so I remember it later.",[recollection.key]));
     if (input.conversations.length) {
@@ -89,7 +99,7 @@ function run(input) {
     }
     const earlierGroups=new Map();
     input.notes.filter(n=>!n.today).forEach(n=>{
-        const lower=n.title.toLowerCase(), key=n.source.toLowerCase()+"|"+lower;
+        const lower=n.title.toLowerCase(), key=n.job ? "job:"+n.job : n.key;
         if (!earlierGroups.has(key)) earlierGroups.set(key,{title:n.title || "A note I left you",sources:[],failure:lower.includes("fail") || lower.includes("lost") || lower.includes("didn't finish")});
         earlierGroups.get(key).sources.push(n.key);
     });
@@ -104,13 +114,13 @@ function run(input) {
                 title="The connected agent finished"; summary="";
                 if (n.job) id="claude:"+n.job+":"+n.key.slice(6);
             }
-            return {value:row(id,title || "I left you a note",summary,[n.key]), at:n.at, job:n.job};
+            return {value:row(id,title || "I left you a note",summary,[n.key]), at:n.at, job:n.job,
+                collaboration:id.startsWith("claude:")};
         }).filter(n=>n.value.title || n.value.line).sort((a,b)=>a.at-b.at).slice(-4);
     const byJob=new Map();
     notes.forEach(n=>{
-        if (n.value.id.startsWith("claude:")) {
-            // The retained identity is the same first colon-delimited job key.
-            const job=n.value.id.split(":")[1];
+        if (n.collaboration && n.job) {
+            const job=n.job;
             if (!byJob.has(job)) byJob.set(job,[]);
             byJob.get(job).push(n.value);
         } else did.push(n.value);
@@ -123,10 +133,11 @@ function run(input) {
         did.push(row("claude-fold:"+job,title,"",group.flatMap(n=>n.sources)));
     });
     const facts=new Map();
-    [...moments,...input.recollections,...input.notes,...input.conversations,...input.builders].forEach(f=>facts.set(f.key,f));
+    [...moments,...intentions,...input.recollections,...input.notes,...input.conversations,...input.builders].forEach(f=>facts.set(f.key,f));
     if (dreamAvailable) facts.set("dream",{at:input.dream.at});
     if (input.nextDream.state === "available") facts.set("nextDream",{at:input.nextDream.at});
     if (input.toward.state === "available") facts.set("facing",{at:input.toward.at});
+    if (input.thinking.state === "available") facts.set("thinking",{at:input.thinking.at});
     function boundRows(rows,area) {
         return rows.filter((r,index)=>{
             const missing=r.sources.filter(key=>!facts.has(key));

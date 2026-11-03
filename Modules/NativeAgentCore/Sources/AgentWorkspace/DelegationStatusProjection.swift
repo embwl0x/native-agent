@@ -4,7 +4,7 @@ import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
 import Darwin
-// Blueprint: | `DelegationStatusProjection.swift` | Delegation source inventory and read snapshots; retained facts preserve originating DataRootLife and unknown delivery |
+// Blueprint: | `DelegationStatusProjection.swift` | Delegation source inventory and read snapshots; retained facts preserve originating DataRootLife and unknown delivery; lifecycle decode and transcript-origin failures name item gaps in partial source coverage while readable siblings proceed |
 
 public struct DelegationStatusProjector: Sendable {
     /// Default: `~/.config/claude-bridge/wake-jobs`.
@@ -24,7 +24,7 @@ public struct DelegationStatusProjector: Sendable {
     /// Every source read by the projection, including existing jobs updated in place.
     package var watchedPaths: [URL] {
         let directories = [claudeJobsDirectory, codexJobsDirectory, codexJobsDirectory.appendingPathComponent("undelivered"), ompJobsDirectory]
-            + CodexCompletionReadout.directories(
+            + CodexCompletionReadout.delegationDirectories(
                 configRoot: claudeJobsDirectory.deletingLastPathComponent().deletingLastPathComponent(), dataRoot: dataRoot)
         return directories.flatMap { directory in
             [directory] + ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []).sorted { $0.path < $1.path }
@@ -107,7 +107,7 @@ public struct DelegationStatusProjector: Sendable {
 
     /// Read each source once. Availability describes this same observation, while the historical array APIs still return every readable job.
     package func readSnapshot(now: Date, limit: Int? = nil, offset: Int = 0,
-                      agent: String? = nil, messageID: String? = nil) -> DelegationStatusReadSnapshot {
+                      agent: String? = nil, messageID: String? = nil, jobID: String? = nil) -> DelegationStatusReadSnapshot {
         let life: String
         do { life = try DataRootLife.current(in: dataRoot) }
         catch { return .init(jobs: [], sources: [.init(source: "life-id", agent: "self", status: "unavailable")], matchedCount: 0) }
@@ -124,16 +124,21 @@ public struct DelegationStatusProjector: Sendable {
         sources.append(claude.availability)
         for (url, object) in claude.objects {
             if let row = Self.projectClaude(url: url, now: now, object: object) { rows.append(inLife(row, object)) }
+            else {
+                sources[sources.count - 1].status = "partial"
+                sources[sources.count - 1].malformedRecords += 1
+                sources[sources.count - 1].detail = "A Claude job has no messageId: " + url.path + ". Repair it from the writer's retained identity evidence."
+            }
         }
         // A live-session reply has a linked receipt, but no wake job. Exact reads must include that receipt without inventing a runner.
-        if let messageID, agent == nil || agent == "claude",
-           !rows.contains(where: { $0.acceptedMessageIDs.contains(messageID) }) {
-            if let reply = liveReplies([messageID])[messageID] {
+        if let messageID = messageID ?? jobID, agent == nil || agent == "claude",
+           !rows.contains(where: { $0.acceptedMessageIDs.contains(messageID) }) { do {
+            if let reply = try liveReplies([messageID])[messageID] {
                 let stamp = reply.createdAt
                 var row = DelegationReadout(id: messageID, acceptedMessageIDs: [messageID],
                     source: "claude", agent: "claude", topicSlug: nil,
                     deskHandle: nil, state: "replied", status: "replied", runStatus: nil, createdAt: nil,
-                    claimedAt: nil, startedAt: nil, lastLiveness: nil, completedAt: stamp, elapsedSeconds: nil,
+                    claimedAt: nil, startedAt: nil, lastLiveness: nil, completedAt: nil, elapsedSeconds: nil,
                     stalled: false, stallBasis: .terminal, deliveryLost: nil, deliveryOutcome: nil,
                     completionTextHead: nil, recordKind: "linked_reply")
                 Self.retainReply(reply.text, truncated: reply.truncated, in: &row)
@@ -141,7 +146,11 @@ public struct DelegationStatusProjector: Sendable {
                 rows.append(row)
                 sources.append(DelegationSourceAvailability(source: "claude_replies", agent: "claude", readableRecords: 1))
             }
-        }
+        } catch {
+            var unavailable = DelegationSourceAvailability(source: "claude_replies", agent: "claude")
+            unavailable.status = "unavailable"; unavailable.unreadableFiles = 1; unavailable.detail = error.localizedDescription
+            sources.append(unavailable)
+        } }
         var codexRows: [String: DelegationReadout] = [:]
         for (directory, source, undelivered) in [
             (codexJobsDirectory, "codex_jobs", false),
@@ -152,6 +161,11 @@ public struct DelegationStatusProjector: Sendable {
             for (url, object) in read.objects {
                 if let row = Self.projectCodex(url: url, undelivered: undelivered, now: now, object: object) {
                     codexRows[row.id] = inLife(row, object)
+                } else {
+                    sources[sources.count - 1].status = "partial"
+                    sources[sources.count - 1].malformedRecords += 1
+                    sources[sources.count - 1].detail = [sources.last?.detail,
+                        "A Codex job has no valid recorded id: " + url.path].compactMap { $0 }.joined(separator: "\n")
                 }
             }
         }
@@ -167,17 +181,20 @@ public struct DelegationStatusProjector: Sendable {
                 : "Delivered receipt(s) also reference accepted message ID(s): \(ids.joined(separator: ", ")). Compare thread/turn identity and completion before treating this retained reply as consumed; no replay or deletion performed."
             codexRows[key] = retained
         }
+        // A job reconciled into its delivered receipts keeps answering to its own id (job.N).
+        var reconciledReceipts: [String: Set<String>] = [:]
         for key in Array(codexRows.keys) {
             guard let job = codexRows[key], !job.acceptedMessageIDs.isEmpty else { continue }
             let reconciled = job.acceptedMessageIDs.allSatisfy { id in
                 guard let receipt = deliveries.byID[id] else { return false }
                 if receipt.completionDeliveryID == job.completionDeliveryID,
-                   ["owed", "failed_before_answer", "legacy_before_receipts", "let_go"].contains(receipt.deliveryOutcome ?? "") { return true }
+                   ["owed", "failed_before_answer", "let_go"].contains(receipt.deliveryOutcome ?? "") { return true }
                 guard let thread = job.recordedThreadID, let turn = job.recordedTurnID,
                       receipt.recordedThreadID == thread, receipt.recordedTurnID == turn else { return false }
                 return job.deliveryOutcome != "unknown" || receipt.deliveryOutcome == "delivered"
             }
             if reconciled {
+                reconciledReceipts[job.id] = job.acceptedMessageIDs
                 codexRows.removeValue(forKey: key)
             }
         }
@@ -186,9 +203,16 @@ public struct DelegationStatusProjector: Sendable {
         sources.append(omp.availability)
         for (url, object) in omp.objects {
             if let row = Self.projectOMP(url: url, now: now, object: object) { rows.append(inLife(row, object)) }
+            else {
+                sources[sources.count - 1].status = "partial"
+                sources[sources.count - 1].malformedRecords += 1
+                sources[sources.count - 1].detail = [sources.last?.detail,
+                    "An OMP job has no valid recorded messageId: " + url.path].compactMap { $0 }.joined(separator: "\n")
+            }
         }
         func matches(_ row: DelegationReadout) -> Bool {
             (agent == nil || row.agent == agent) && (messageID == nil || row.acceptedMessageIDs.contains(messageID!))
+                && (jobID == nil || row.id == jobID || reconciledReceipts[jobID!]?.contains(row.id) == true)
         }
         rows = rows.filter(matches)
         // Cached terminal rows are already ordered. Only retain enough candidates for this page; full reconciliation deliberately retains every receipt.
@@ -198,34 +222,49 @@ public struct DelegationStatusProjector: Sendable {
                     rows.append(row)
                 }
             } else {
-                for row in deliveries.ordered {
+                for row in deliveries.ordered where matches(row) {
                     rows.append(row)
                 }
             }
         }
         var states: [String: (state: CodexCompletionReadout, path: URL)] = [:]
         let matchedLifecycles = Set(rows.compactMap(\.completionDeliveryID))
-        for directory in CodexCompletionReadout.directories(
+        for directory in CodexCompletionReadout.delegationDirectories(
             configRoot: claudeJobsDirectory.deletingLastPathComponent().deletingLastPathComponent(), dataRoot: dataRoot) {
             var lifecycles = Self.readDirectory(directory, source: "completion_lifecycle", agent: "self")
             for (url, fields) in lifecycles.objects {
-                guard let state = try? JSONDecoder().decode(CodexCompletionReadout.self,
-                    from: JSONValue.object(fields).serializedData(pretty: false)).reading(life: life) else {
-                    lifecycles.availability.status = "unreadable"
+                let state: CodexCompletionReadout
+                do {
+                    state = try JSONDecoder().decode(CodexCompletionReadout.self,
+                        from: JSONValue.object(fields).serializedData(pretty: false)).reading(life: life)
+                } catch {
+                    lifecycles.availability.status = "partial"
+                    lifecycles.availability.malformedRecords += 1
+                    let gap = "Lifecycle record \(url.path) could not be decoded: \(error.localizedDescription)"
+                    lifecycles.availability.detail = [lifecycles.availability.detail, gap].compactMap { $0 }.joined(separator: "\n")
                     continue
                 }
                 guard let status = state.status else { continue }
                 let id = state.deliveryId
                 states[id] = (state: state, path: url)
                 guard !matchedLifecycles.contains(id) else { continue }
-                let principal = (try? state.knownPrincipal(dataRoot: dataRoot)) ?? "unattributed"
+                let principal: String
+                do { principal = try state.knownPrincipal(dataRoot: dataRoot) ?? "unattributed" }
+                catch {
+                    lifecycles.availability.status = "partial"
+                    lifecycles.availability.unreadableFiles += 1
+                    let gap = "Transcript origin for lifecycle \(id) at \(url.path) could not be read: \(error.localizedDescription)"
+                    lifecycles.availability.detail = [lifecycles.availability.detail, gap].compactMap { $0 }.joined(separator: "\n")
+                    continue
+                }
                 let terminal = status != "owed"
                 var row = DelegationReadout(id: id, source: state.source ?? principal, agent: principal,
                     topicSlug: nil, deskHandle: nil, state: status, status: nil, runStatus: nil,
                     createdAt: nil, claimedAt: nil, startedAt: nil, lastLiveness: nil,
-                    completedAt: terminal ? state.updatedAt : nil, elapsedSeconds: nil, stalled: false,
+                    completedAt: nil, elapsedSeconds: nil, stalled: false,
                     stallBasis: terminal ? .terminal : .none, deliveryLost: nil, deliveryOutcome: nil, completionTextHead: nil)
                 row.completionDeliveryID = id
+                row.deliveryUpdatedAt = state.updatedAt
                 row.recordKind = "completion_lifecycle"
                 row.recoveryNote = status == "stopped" ? DataRootLife.stoppedReason : url.path
                 row.recencyKey = Self.firstDate(state.updatedAt)
@@ -235,19 +274,19 @@ public struct DelegationStatusProjector: Sendable {
         }
         for index in rows.indices {
             if rows[index].recordKind == "delivery_receipt",
-               ["owed", "failed_before_answer", "legacy_before_receipts"].contains(rows[index].deliveryOutcome ?? "") {
+               ["owed", "failed_before_answer"].contains(rows[index].deliveryOutcome ?? "") {
                 rows[index].recoveryNote = codexDeliveriesFile.path
             }
             guard let id = rows[index].completionDeliveryID, let lifecycle = states[id] else { continue }
             let state = lifecycle.state
             if let status = state.status,
-               status == "stopped" || !["delivered", "owed", "failed_before_answer", "legacy_before_receipts", "let_go"].contains(rows[index].deliveryOutcome ?? "") {
+               status == "stopped" || !["delivered", "owed", "failed_before_answer", "let_go"].contains(rows[index].deliveryOutcome ?? "") {
                 rows[index].deliveryOutcome = status
+                rows[index].deliveryUpdatedAt = state.updatedAt
                 rows[index].state = status == "delivered" ? "settled" : status
                 if status == "stopped" { rows[index].recoveryNote = DataRootLife.stoppedReason }
                 if status == "failed_before_answer" {
                     rows[index].recoveryNote = lifecycle.path.path
-                    rows[index].completedAt = rows[index].completedAt ?? state.updatedAt
                 }
             }
             rows[index].deliveryLost = nil
@@ -255,7 +294,7 @@ public struct DelegationStatusProjector: Sendable {
         var answers: [String: DelegationReadout] = [:]
         rows = rows.sorted { $0.id < $1.id }.filter { row in
             guard let id = row.completionDeliveryID,
-                  states[id] != nil || ["delivered", "owed", "failed_before_answer", "legacy_before_receipts", "let_go"].contains(row.deliveryOutcome ?? "") else { return true }
+                  states[id] != nil || ["delivered", "owed", "failed_before_answer", "let_go"].contains(row.deliveryOutcome ?? "") else { return true }
             let key = row.source + ":" + id
             if var prior = answers[key] {
                 prior.acceptedMessageIDs.formUnion(row.acceptedMessageIDs)
@@ -275,20 +314,24 @@ public struct DelegationStatusProjector: Sendable {
         var page = Array(rows.dropFirst(min(offset, rows.count)).prefix(limit ?? rows.count))
         // A thread reads as ask and answer. Only the returned page is joined, from the tail of the inbox, so this stays a bounded read.
         let wanted = Set(page.flatMap { $0.acceptedMessageIDs })
-        if !wanted.isEmpty {
-            let asks = Self.requestRecords(inbox: codexDeliveriesFile.deletingLastPathComponent()
+        if !wanted.isEmpty { do {
+            let asks = try Self.requestRecords(inbox: codexDeliveriesFile.deletingLastPathComponent()
                 .appendingPathComponent("codex-inbox.jsonl"), ids: wanted)
             for index in page.indices where page[index].requestTextHead == nil {
                 page[index].requestTextHead = page[index].acceptedMessageIDs.sorted().lazy.compactMap { asks[$0]?["text"] }.first.flatMap(Self.head)
             }
-        }
+        } catch {
+            var unavailable = DelegationSourceAvailability(source: "codex_inbox", agent: "codex")
+            unavailable.status = "unavailable"; unavailable.unreadableFiles = 1; unavailable.detail = error.localizedDescription
+            sources.append(unavailable)
+        } }
         // Conversation handles come from the bridge inbox.
         let claudeIDs = Set(page.filter { $0.agent == "claude" }.flatMap { $0.acceptedMessageIDs })
-        if !claudeIDs.isEmpty {
-            let handles = Self.requestRecords(inbox: claudeJobsDirectory.deletingLastPathComponent()
+        if !claudeIDs.isEmpty { do {
+            let handles = try Self.requestRecords(inbox: claudeJobsDirectory.deletingLastPathComponent()
                 .appendingPathComponent("claude-inbox.jsonl"), ids: claudeIDs)
             // Live replies join by accepted message ID from the bridge chat.
-            let replies = liveReplies(claudeIDs)
+            let replies = try liveReplies(claudeIDs)
             for index in page.indices where page[index].agent == "claude" {
                 page[index].conversationID = page[index].acceptedMessageIDs.sorted().lazy.compactMap { handles[$0]?["conversationId"] }.first
                 if page[index].agentReplyTextHead == nil,
@@ -296,41 +339,56 @@ public struct DelegationStatusProjector: Sendable {
                     Self.retainReply(reply.text, truncated: reply.truncated, in: &page[index])
                 }
             }
-        }
+        } catch {
+            var unavailable = DelegationSourceAvailability(source: "claude_conversation", agent: "claude")
+            unavailable.status = "unavailable"; unavailable.unreadableFiles = 1; unavailable.detail = error.localizedDescription
+            sources.append(unavailable)
+        } }
         return DelegationStatusReadSnapshot(jobs: page, sources: sources, matchedCount: matchedCount)
     }
 
     /// Live-session answers retain full text or a 400-character head.
-    private func liveReplies(_ ids: Set<String>) -> [String: (text: String, truncated: Bool, createdAt: String?)] {
+    private func liveReplies(_ ids: Set<String>) throws -> [String: (text: String, truncated: Bool, createdAt: String?)] {
         let url = claudeJobsDirectory.deletingLastPathComponent().appendingPathComponent("claude-replies.jsonl")
         // Read whole: the bridge's own retention (500 answers) bounds this file, and a tail window would drop older answers it still keeps.
-        return Self.requestRecords(inbox: url, ids: ids, window: .max).compactMapValues { record in
+        return try Self.requestRecords(inbox: url, ids: ids, window: .max).compactMapValues { record in
             guard let text = record["replyText"] ?? record["replyTextHead"] else { return nil }
             return (text, record["replyText"] != nil ? record["replyTruncated"] == "true" : text.hasSuffix("…"), record["createdAt"])
         }
     }
 
-    public static func requestRecords(inbox url: URL, ids: Set<String>, window: Int = 524_288) -> [String: [String: String]] {
+    public static func requestRecords(inbox url: URL, ids: Set<String>, window: Int = 524_288) throws -> [String: [String: String]] {
         let key = url.standardizedFileURL.path + "#" + String(window)
         let stamp = try? DelegationFileCache.stamp(url)
         let all: [String: [String: String]]
         if let stamp, let cached = fileCache.tail(key, stamp: stamp) {
             all = cached
         } else {
-            all = tailTexts(inbox: url, window: window)
+            all = try tailTexts(inbox: url, window: window)
             if let stamp { fileCache.putTail(key, stamp: stamp, all) }
         }
         return all.filter { ids.contains($0.key) }
     }
 
-    private static func tailTexts(inbox url: URL, window: Int) -> [String: [String: String]] {
-        guard let read = try? SwiftNativePersistenceCore.tailPhysicalLines(url, limit: .max, maxBytes: window) else { return [:] }
-        var lines = read.lines.filter { !$0.isEmpty }
-        if read.truncatedToByteWindow, !lines.isEmpty { lines.removeFirst() }
+    private static func tailTexts(inbox url: URL, window: Int) throws -> [String: [String: String]] {
+        let file: FileHandle
+        do { file = try FileHandle(forReadingFrom: url) }
+        catch let error as CocoaError where error.isFileAbsent { return [:] }
+        defer { try? file.close() }
+        let size = try file.seekToEnd(), offset = size > UInt64(window) ? size - UInt64(window) : 0
+        try file.seek(toOffset: offset)
+        let bytes = try file.readToEnd() ?? Data()
+        let end = bytes.lastIndex(of: 0x0A).map { $0 + 1 } ?? bytes.startIndex
+        var lines = bytes[..<end].split(separator: 0x0A).map { Data($0) }
+        if offset > 0, !lines.isEmpty { lines.removeFirst() }
         var found: [String: [String: String]] = [:]
         for line in lines {
             // A true flag (the inbox's `read`) reads as "true"; false is absent.
-            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            guard let object = try JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  ["id", "messageId"].contains(where: { (object[$0] as? String)?.isEmpty == false }) else {
+                throw ToolFailureError("Malformed bridge ledger row in " + url.path, effects: .none, owner: url.path,
+                    instruction: "Repair the complete record from retained message evidence; do not infer an identity or replay a send.", recovery: .repair)
+            }
             let fields = object.compactMapValues { value -> String? in
                 guard let text = value as? String ?? ((value as? Bool) == true ? "true" : nil), !text.isEmpty else { return nil }
                 return text

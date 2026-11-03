@@ -19,21 +19,21 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `MemoryV2+PolicyGate.swift` | `MemoryPolicyGate` enum; `isEnabled`, `knowledgeGraphEnabled` |
+// Blueprint: | `MemoryV2+PolicyGate.swift` | `MemoryPolicyGate` enum; checked throwing graph/recall/promotion flags and explicit knowledgeGraphFailure distinguish unavailable Trust from operator-disabled memory; unavailable graph authority never authorizes projection retirement |
 
 public enum MemoryPolicyGate {
 
     /// One boolean out of `memoryPolicy` in the saved trust policy. Missing
     /// file, missing block or missing key → `fallback`; unavailable, malformed
-    /// or otherwise damaged saved authority → false.
+    /// or otherwise damaged saved authority throws its owner failure.
     ///
     /// Shared `SavedTrustPolicyAuthority` validation fails closed on damage anywhere in the saved policy.
     public static func isEnabled(
         _ key: String,
         default fallback: Bool,
         dataRoot: URL? = nil
-    ) -> Bool {
-        SavedTrustPolicyAuthority.flag(
+    ) throws -> Bool {
+        try SavedTrustPolicyAuthority.flag(
             block: "memoryPolicy",
             key: key,
             default: fallback,
@@ -42,23 +42,18 @@ public enum MemoryPolicyGate {
     }
 
     /// Settings ▸ "Knowledge graph".
-    public static func knowledgeGraphEnabled(dataRoot: URL? = nil) -> Bool {
-        knowledgeGraphFailure(dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()) == nil
+    public static func knowledgeGraphEnabled(dataRoot: URL? = nil) throws -> Bool {
+        try isEnabled("knowledge_graph_enabled", default: true, dataRoot: dataRoot)
     }
 
     /// The checked authority distinguishes a person's switch from damaged Trust.
     public static func knowledgeGraphFailure(dataRoot: URL) -> ToolFailureError? {
         let authority = SavedTrustPolicyAuthority.read(dataRoot: dataRoot)
-        if case .damaged = authority {
-            return ToolFailureError(
-                "Knowledge graph authority is unavailable: the saved Trust policy is unreadable or invalid.",
-                effects: .none, owner: "Trust policy",
-                nextCall: ToolFailureError.call("app", ["action": .string("doctor.run")]),
-                code: "memory_trust_unavailable",
-                instruction: "Repair the saved Trust policy, preserving its original bytes; enabling the graph cannot repair it.")
-        }
         // Match TrustCenter+Defaults for absent policy, block or key.
-        if authority.flag(block: "memoryPolicy", key: "knowledge_graph_enabled", default: true) { return nil }
+        do {
+            if try authority.flag(block: "memoryPolicy", key: "knowledge_graph_enabled", default: true) { return nil }
+        } catch let failure as ToolFailureError { return failure }
+        catch { return SavedTrustPolicyAuthority.unavailable(error.localizedDescription) }
         return ToolFailureError(knowledgeGraphOffMessage, effects: .none,
             owner: "Knowledge graph", tap: "Trust ▸ Living Memory ▸ Knowledge graph", personDecides: true,
             code: "knowledge_graph_disabled", status: .refused,
@@ -66,13 +61,13 @@ public enum MemoryPolicyGate {
     }
 
     /// Settings ▸ "Remember across conversations".
-    public static func crossSessionRecallEnabled(dataRoot: URL? = nil) -> Bool {
-        isEnabled("cross_session_recall", default: true, dataRoot: dataRoot)
+    public static func crossSessionRecallEnabled(dataRoot: URL? = nil) throws -> Bool {
+        try isEnabled("cross_session_recall", default: true, dataRoot: dataRoot)
     }
 
     /// Trusted facts are accepted immediately; untrusted facts wait for review.
-    public static func adaptivePromotionEnabled(dataRoot: URL? = nil) -> Bool {
-        isEnabled("adaptive_promotion", default: true, dataRoot: dataRoot)
+    public static func adaptivePromotionEnabled(dataRoot: URL? = nil) throws -> Bool {
+        try isEnabled("adaptive_promotion", default: true, dataRoot: dataRoot)
     }
 
     /// The one sentence every knowledge-graph surface says when the switch is

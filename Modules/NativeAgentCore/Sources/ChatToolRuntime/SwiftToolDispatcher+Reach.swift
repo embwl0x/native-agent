@@ -19,14 +19,14 @@ extension SwiftToolDispatcher {
     /// A part's program: the shell tools' own access check, then their one
     /// launch. `program.access` is the check alone, asked again at each talk.
     func programReach(_ operation: String, _ args: [String: JSONValue], surface: String) async throws -> JSONValue {
-        guard await fullMacToolAccess(surface: surface).fileOpsAllowed else {
+        guard try await fullMacToolAccess(surface: surface).fileOpsAllowed else {
             throw SenseFailure(code: "trust_center_full_mac_required",
                 message: "A program is a command line: Full Mac with file operations on must be active, as for the shell. Turn on Full Mac in Trust.")
         }
         guard operation == "program.launch" else { return .object([:]) }
         let cwd = JSONValue.object(args).stringFields["cwd"] ?? Self.builderWorkspaceRoot(dataRoot: dataRoot).path
         guard case .string(let executable)? = args["executable"], case .array(let rows)? = args["args"] ?? .array([]),
-              let launch = await Self.builderLaunch(executable: executable, args: rows.compactMap { if case .string(let text) = $0 { text } else { nil } },
+              let launch = try await Self.builderLaunch(executable: executable, args: rows.compactMap { if case .string(let text) = $0 { text } else { nil } },
                                                     cwd: cwd, dataRoot: dataRoot) else {
             throw SenseFailure(code: "bad_input", message: "cwd must be a folder a command may start in: inside \(Self.builderWorkspaceRoot(dataRoot: dataRoot).path) unless Full Mac lifts the sandbox.")
         }

@@ -1,4 +1,5 @@
 import Foundation
+import Experiences
 import NativeAgentShared
 import NativeAgentCore
 import ChatTurnRuntime
@@ -11,7 +12,7 @@ import WorkshopExecution
 import TrustCenter
 import NotificationInbox
 import AgentWorkspace
-// Blueprint: | `WorkshopBackgroundWork.swift` | `WorkshopBackgroundWork` enum; `makeWorkshopExecutor`, `unattendedWorkAllowed`, Full Mac unattended override |
+// Blueprint: | `WorkshopBackgroundWork.swift` | `WorkshopBackgroundWork` enum; `makeWorkshopExecutor`, `unattendedWorkAllowed`, Full Mac unattended override; unavailable checked policy holds work and owes its actual cause |
 
 public typealias WorkshopInboxNotification = @Sendable (URL, String, String, String, String, String) async -> Void
 
@@ -104,13 +105,9 @@ public enum WorkshopBackgroundWork {
     /// or checked YOLO authority. Partial saved pairs require checked authority;
     /// damaged policy fails closed.
     public static func unattendedWorkAllowed(dataRoot: URL) async -> Bool {
-        let trust = SwiftNativeTrustCenter(dataRoot: dataRoot)
-        let policy = await trust.loadTrustPolicy()
+        guard let policy = await checkedPolicy(dataRoot: dataRoot) else { return false }
         if case .bool(true) = policy["enableAutonomy"] ?? .null { return true }
         if policy["permissionLevel"] == .string("full_mac_os") { return true }
-        if policy["permissionLevel"] == .string("wide_open_receipts"),
-           case .object(let filePolicy)? = policy["filePolicy"],
-           filePolicy["outsideWorkspaceDefault"] == .string("allow") { return true }
         return await isWideOpenTrust(dataRoot: dataRoot)
     }
 
@@ -132,9 +129,25 @@ public enum WorkshopBackgroundWork {
     /// Require shared unattended authority and the submit-side workshop policy on this data root.
     public static func workshopExecutorGate(dataRoot: URL) async -> Bool {
         guard await unattendedWorkAllowed(dataRoot: dataRoot) else { return false }
-        let trust = SwiftNativeTrustCenter(dataRoot: dataRoot)
-        let policy = await trust.loadTrustPolicy()
+        guard let policy = await checkedPolicy(dataRoot: dataRoot) else { return false }
         return SwiftNativeWorkshopRunner.workshopPolicyAllows(policy)
+    }
+
+    /// The executor's Boolean gate cannot carry an error; retain its cause as
+    /// an owed repair instead of substituting a disabled policy.
+    private static func checkedPolicy(dataRoot: URL) async -> [String: JSONValue]? {
+        let operation = "workshop.trust_policy"
+        do {
+            let policy = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked()
+            RepairOwed.settle(dataRoot, operation: operation,
+                             evidence: .init(source: "trust/policy.json", id: operation))
+            return policy
+        } catch {
+            RepairOwed.owe(dataRoot, id: operation, kind: .run, operation: operation,
+                owner: "trust/policy.json", words: "Unattended work cannot read Trust authority: \(error.localizedDescription)",
+                lever: "Preserve the policy bytes and repair the reported cause. No unattended work was admitted by this read.")
+            return nil
+        }
     }
 
     /// execution.step approval stager: ONE ApprovalInbox record per blocked
@@ -233,7 +246,7 @@ public enum WorkshopBackgroundWork {
             "detail": .string(
                 "Approve to execute the blocked step and continue the Desk task; "
                 + "deny to reject the step and fail the Desk task.\n\n\(req.reason)"),
-            "related_mission_id": .string(req.executionId),
+            "related_execution_id": .string(req.executionId),
             "related_approval_id": .string(approvalId),
             "related_paths": .array([
                 .string(ExecutionRecordFile.canonicalPath(

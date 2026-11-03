@@ -160,10 +160,13 @@ func telegramAuthorizationHasUnsavedChanges(
 
 func telegramReasoningEffortMismatch(
     from catalog: ModelCatalogResponse?,
+    providers: [ProviderInfo],
+    providerID: String,
     model: String,
     selected: String
 ) -> String? {
-    let normalized = ProvidersFacade.normalizedReasoningEffort(from: catalog, model: model, selected: selected)
+    let normalized = ProvidersFacade.normalizedReasoningEffort(from: catalog, providers: providers,
+        providerID: providerID, model: model, selected: selected)
     guard normalized != selected else { return nil }
     return "Saved think level '\(selected)' is unsupported for \(model). Save to use \(normalized)."
 }

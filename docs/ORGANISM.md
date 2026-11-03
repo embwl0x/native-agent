@@ -32,12 +32,16 @@ attentional continuity. Its `ContinuityField` and the organism's
 - The adapter carries event identity, topology, intensity and typed outcomes.
   It does not re-appraise conversational text. Provider lifecycle ownership is
   marked so the same provider failure does not produce a second body signal.
+  Generic tool dispatches carry one fresh invocation ID through start, receipt,
+  cognitive observation and prediction correlation; both ends name the action
+  an `app` call runs. Concurrent calls to the same action remain distinct.
+  An observation without correlation supplies no operational prediction.
 - `OrganismChemistry.applying` owns signal-driven body compatibility updates
   and typed-reading invalidation; predictive application returns only its ledger
   and chemistry. `OrganismBodySchemaSampler` owns sampled readings.
 - The runtime samples body evidence and canonical affect before projection.
   `NativeCognitionRuntime.organismBodySample` caches its base body read for
-  two seconds; provider health is derived from lifecycle evidence.
+  two seconds; provider health is derived only from checked lifecycle evidence. Unreadable trace history owes repair and never selects a cumulative capability belief as a substitute. Status-less outcomes remain unknown; summaries cannot attest success. The unproduced Workshop cognitive event/node and memory-hygiene signal vocabularies are removed.
 - The shared after-turn interpretation supplies caring judgments.
   The door (`NativeCognitionRuntime.foldTurnMoment`) folds a lived moment:
   `CognitiveSubstrate.foldTurn` applies affect and validates caring admission,
@@ -48,6 +52,10 @@ attentional continuity. Its `ContinuityField` and the organism's
 - `OrganismKernel.settleElapsedTime` applies elapsed-time decay on live
   touches. Residual repair uses a derived quiet deadline in
   `NativeCognitionRuntime+Deadlines.swift`, with bounded exact repair targets.
+  `mind.residual_repair` enters that same repair with only its quiet wait
+  satisfied; current pressure/evidence/targets and live-turn admission still
+  decide, and continuity must save before the result says `repaired`.
+  [The clock contract](SUBCONSCIOUS.md#run-a-clock-owner-now) owns its reply and proof.
   `OrganismDreamRepair` defines the charge/noise predicates used by selection, mutation and generation acknowledgement.
   Live and frozen snapshots share one renderer: live reads settle the owner,
   while frozen reads decay a copy at their supplied clock.
@@ -57,7 +65,7 @@ Disabled kernel ingestion returns without recording the signal.
 Lifetime signal, prediction, outcome, repair-receipt and co-activation tallies saturate at
 `Int.max`; elapsed-time decay and live outcomes still run at that limit.
 Capability display counts saturate too, while beliefs continue to use their
-fractional evidence weights. A restored large tally cannot abort a fold.
+fractional evidence weights. Those current weights are required on restore; no old tally seeds them and no bounded prediction sample replaces absent cumulative evidence. An unobserved capability has a neutral prior, zero evidence and full uncertainty. A restored large tally cannot abort a fold.
 Repair evidence formats whole-second timestamps without integer narrowing;
 the empty repair receipt constructs its constant zero UUID directly.
 
@@ -124,6 +132,9 @@ Per-signal settling has an elapsed-time ceiling
 (`maximumSettlePerHour = 0.20`). The kernel uses local ingestion time to
 measure the gap, so a delayed source timestamp cannot buy extra settling.
 Elapsed-time continuity decay also runs during restore.
+`mind.settle_body` applies six hours' chemical relaxation to the current value
+and anchors it at the current instant. It does not advance field age or
+prediction expiry into the future; the next real elapsed interval still runs.
 
 ### 3. Fatigue — a day that costs something
 
@@ -141,6 +152,10 @@ A caring judgment arrives through the shared interpretation in
 `ChatTurnRuntime/MindMemoryManager.swift`. `CognitiveSubstrate+CaringEvent.swift`
 checks the originating turn and relay/encounter evidence before admitting it.
 Failed or unavailable interpretation supplies no caring verdict. A verdict
+uses exactly `none`, `cared_for`, `room_made`, `need_met` or `repair`, a string
+`why`, and `distinct` equal to `unstated`, `distinct`, `retelling` or `unsure`.
+Malformed fields refuse the interpretation; alternate spellings and boolean
+distinctness are removed. A verdict
 for a turn admitted before the body's last Reset Body or Clear is refused
 (`forgotten`): the body's forgetting epoch is saved in its file with the
 emptied state. The lapse refusals are removed: a late verdict still folds,
@@ -160,9 +175,9 @@ policy. Dream completion does not dose tenderness.
 
 `NativeCognitionRuntime+Organism.swift` builds `OrganismDiurnalClock` from
 the existing `TurnQuietHoursWindow` reader; hours are read on the Mac's local
-clock, whatever zone it is in now. With no quiet-hours window it uses the
-default trough. A kernel with no clock
-has no diurnal contribution.
+clock, whatever zone it is in now. With no configured quiet-hours window, or
+an unavailable preference read, it supplies no clock and no diurnal contribution.
+The default 4 AM trough is removed; a clock requires two valid, distinct hours.
 
 `OrganismChemistry` supplies projected curiosity/arousal offsets and nightliness.
 The felt-signal builder applies a negative arousal offset directly but allows
@@ -176,16 +191,35 @@ within the existing 48-character bound; other runs normalize to separators.
 
 `NativeCognitionRuntime+Expectations.swift` composes dated expectations from
 Desk deferrals, staged approvals, unanswered completions and peer jobs.
-Scheduled-job availability only settles legacy horizons. Source invalidations and meaningful boundaries
+Scheduled-job horizons and their availability-only drain are removed. Source invalidations and meaningful boundaries
 refresh through one retained, coalesced task, without a minimum interval.
 
 `OrganismPrediction+Semantic.swift` owns conversational metadata, scope, minting and IDs.
 One reaction admission serves expiry protection and settlement. Shared settlement
 and retention stay in `OrganismPrediction.swift`.
-`OrganismPrediction+Horizon.swift` owns horizon vocabulary, reads and transitions;
-it only treats a missing source as settled
-when that source kind was read completely. Expiry means waiting, not a failed
-tool prediction. The horizon shares the existing prediction ledger.
+Conversational belief evidence comes from the existing turn interpretation's
+optional `affect.beliefReaction`, independently of affect valence. It must judge
+an actual disagreement/correction (`pushback`) or explicit confirmation
+(`confirmed`) of the supplied prior completion, with exact supporting spans
+from that completion and the incoming words. Journal folds, including replay,
+read the full incoming words from the moment's recorded `turn.asked`, not the
+500-character event summary; missing recorded words give no reaction verdict.
+The substrate checks those spans,
+the recorded completion/session scope and the ten-minute reaction window on
+both admission and journal folding. Missing, malformed, unrelated or ungrounded
+readings do not settle a prediction; neither mood sign nor moving on confirms
+or contradicts a belief. Unknown labels (including the retired `neutral` label)
+do not settle. An unanswered conversational expectation expires after its
+24-hour horizon without a confidence penalty or violation effect. This removes
+the former valence-sign verdict, neutral-as-satisfaction and silence-as-miss.
+`OrganismPrediction+Horizon.swift` owns horizon vocabulary, reads and transitions.
+A missing source proves no terminal outcome, even after a complete inventory
+read. Empty, unreadable and truncated source sets do not award success, confidence
+or relief. Held rows reach their actual due instants and expire as waiting,
+without a confidence penalty or violation effect; capacity eviction likewise
+awards no outcome. Source completeness remains visible in `mind.horizon` replies,
+but its old somatic settlement key and absence-to-success path are removed.
+The horizon shares the existing prediction ledger.
 Stated plans have the identity their source gives them: Desk titles supply
 bounded canonical labels and name identity; memory atoms have no name and carry
 empty labels, keyed by their due instants at whole-second resolution (the legacy
@@ -212,8 +246,7 @@ from its copied ledger at the same instant; the standalone read uses this path.
 
 `OrganismConfiguration` defaults to disabled.
 `NativeCognitionRuntime.organismConfigurationForLaunch` respects public
-pre-onboarding neutralization, explicit organism settings and the subconscious
-master. After onboarding and a configured Chat provider, the runtime initializes
+pre-onboarding neutralization and the explicit organism setting. It no longer inherits or writes the retired subconscious-master choice during launch. After onboarding and a configured Chat provider, the runtime initializes
 missing inner-life preferences to enabled. An explicit stored choice is
 preserved.
 
@@ -245,25 +278,45 @@ shared two-hour Workshop slot, unused-claim release and spent-window retention.
 
 `NativeCognitionRuntime+BodyContinuity.swift` owns
 `<dataRoot>/cognition/organism_state.json`; `OrganismPersistence.swift` defines
-the stored state and restoration/decay behavior. Capability outcome weights
+the stored state and restoration/decay behavior. Only its current schema is accepted: encounter, epoch, lived watermark, field identities, outcome weights and current body fields are checked, with no rekeying or invented old defaults. The persisted body bits remain the continuity representation and transient typed readings rebuild from their sensors. Capability outcome weights
 spend the full elapsed interval on their seven-day half-life, independently of
-the 72-hour tissue-decay cap. `NativeCognitionRuntime+BodyEvidence.swift`
+the 72-hour tissue-decay cap. Dream completion evidence reads only the checked
+`ChatSessionRecollections.dreamConsolidationMark` owner (`lastDreamedAt`);
+diary modification times and parent writability cannot establish completion or
+store health. Missing marks contribute no completion evidence; damaged marks
+make the reading unavailable. The completion effect follows the
+[dream settlement law](COGNITION_WIRING.md#the-subconscious-loops--schedule-artifacts-re-entry): its original section
+UUID, time and felt summary are saved before publication. An enabled kernel stores
+that UUID with dream repair and wakefulness reset; retry saves that owner state
+without reapplying the signal. A disabled body records an explicit journal skip.
+Stop or a recovered diary publication cannot discard this step.
+Every actual provider call, including diagnostic
+and bridge calls, contributes vitals evidence; no debug-session exclusion exists.
+`NativeCognitionRuntime+BodyEvidence.swift`
 rebuilds typed domain evidence rather than restoring it as fresh health. The
 provider and body evidence identities share `BodyEvidenceReference.digest`;
-construction hashes supplied identifiers, while decoding preserves canonical digests.
+construction hashes supplied identifiers, while decoding requires canonical
+64-character lowercase SHA-256 digests and rejects raw IDs. Current dream repair
+reads only `feltDaySummary`; pressure signal metadata uses only `resourcePressure`
+with the enum's current raw values. Cognitive session metadata uses only `sessionId`.
 The sampler derives compatibility values from those readings; configuration availability
-remains exact and separate. Damaged
+remains exact and separate. APNs receipts with no HTTP answer remain unknown;
+only an actual HTTP rejection supplies provider-failure evidence. A missing
+fan-out receipt or diagnostic error alone never establishes a rejected write.
+Signed-phone, notification-target, APNs and ability/trace read failures carry `sourceUnavailable` and an owner repair obligation; failed inventory is never off/unconfigured, damaged newest outcomes never select older rows, and missing metadata never becomes now. Signed-phone writes first read the existing record under the same lock and refuse to overwrite unreadable evidence. Damaged
+remains exact and separate. Signed-phone, notification-target and ability/trace read failures carry `sourceUnavailable` and an owner repair obligation; failed inventory is never off/unconfigured, damaged newest outcomes never select older rows, and missing metadata never becomes now. Notification delivery reads the live kernel's current keyless publication-failure/signed-phone-receipt prediction, never optional APNS outcomes. Missing, pending and expired predictions supply no terminal evidence; the optional `notificationPathHealthy` projection becomes unknown without a supported delivery verdict, including when unconfigured. Its neutral value is unknown; a delivery start clears it, a signed receipt supports true and publication failure supports false. Reachable/stale peer signals change reachability alone. Current notification readings replace persisted compatibility values rather than preserving unsupported health. Neither publication nor process receipt proves display or user attention. Signed-phone writes first read the existing record under the same lock and refuse to overwrite unreadable evidence. Damaged
 saved continuity remains unavailable and is not overwritten by a freshly initialized snapshot. Nothing
 writes the file before its restore has finished: the caring sink, the
 after-turn reaction, settle and reset join the cognition opening first (see
 SUBCONSCIOUS.md, Opening).
 
 Reflexes were retired in Phase 5 F (frozen since 08-16, never active in a
-prompt). The stored file keeps an empty `reflexState` so an older build can
-still restore it.
+prompt). Current continuity writes omit the retired `reflexState` field;
+restoration ignores it in older files.
 
-Repair receipts retain operations and evidence, ignoring retired proposal keys.
-Historical `proposeStandingView` operations still decode; mobile proposal fields stay nil.
+Repair receipts retain current operations and evidence, ignoring retired proposal keys.
+The unproduced `proposeStandingView` operation and its decode support are removed;
+mobile proposal fields stay nil.
 
 ## Turning it on / observing it
 

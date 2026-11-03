@@ -7,33 +7,14 @@ import TurnTrace
 import Transcripts
 import ChatTurnContracts
 
-// Blueprint: | `MacChatTurnCommands.swift` | `NativeChatTurnOptions` and `MacChatTurnRuntime`: shared Mac turn options, memory facts, notes and scratch commands; transcript commands live on NativeAgentEngine |
+// Blueprint: | `MacChatTurnCommands.swift` | `NativeChatTurnOptions` normalizes picker persona; `MacChatTurnRuntime` owns memory facts, notes and scratch commands; transcript commands live on NativeAgentEngine |
 
-/// The two Mac chat entry points share their provider-facing tier setting.
-/// Core resolves the installation's persona for every door.
+/// Picker persona normalization shared with Core.
 public struct NativeChatTurnOptions: Sendable, Equatable {
-    public let serviceTier: String?
-
-    public static func resolve(
-        fastModeEnabled: Bool,
-        surface: String
-    ) -> NativeChatTurnOptions {
-        return NativeChatTurnOptions(
-            serviceTier: surface == "chat" && fastModeEnabled ? "priority" : nil
-        )
-    }
-
     /// The picker displays the same normalized value Core compiles.
-    public static func normalizedPickerPersona(_ raw: String?, fallback: String = "AI") -> String {
+    public static func normalizedPickerPersona(_ raw: String?, fallback: String = "canonical") -> String {
         let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? fallback : trimmed
-    }
-
-    public static func current(surface: String, defaults: UserDefaults = .standard) -> NativeChatTurnOptions {
-        resolve(
-            fastModeEnabled: defaults.bool(forKey: "chatFastMode"),
-            surface: surface
-        )
     }
 }
 

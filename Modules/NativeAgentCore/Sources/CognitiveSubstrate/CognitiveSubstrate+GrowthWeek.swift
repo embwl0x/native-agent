@@ -4,7 +4,7 @@ import Experiences
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+GrowthWeek.swift` | Frozen REM timeline and decoded disposition transitions; `growthWeek`/`growthWeekLines` share the owned `growth-week.js` face. Readout grouping, titles, reasons, alternatives, ordering, cap and undertone prose are removed from Swift; canonical timeline source titles stay in Replay for its other consumers. |
+// Blueprint: | `CognitiveSubstrate+GrowthWeek.swift` | Frozen REM timeline and decoded disposition transitions; `growthWeek`/`growthWeekLines` share the owned `growth-week.js` face, retaining its detail in agent reads. Readout grouping, titles, reasons, alternatives, ordering, cap and undertone prose are removed from Swift; canonical timeline source titles stay in Replay for its other consumers. |
 
 public enum CognitiveGrowthOutcome: String, Sendable, Equatable, CaseIterable {
     /// Formed and still waiting on an answer. Never counts as a change she made.
@@ -64,11 +64,27 @@ public struct CognitiveGrowthWeek: Sendable, Equatable {
         if projection.status != .ready {
             return ["Growth week \(projection.status.rawValue): \(projection.error?.message ?? projection.status.rawValue)"]
         }
-        return projection.face?.sections.flatMap { $0.rows.map(\.title) } ?? []
+        return projection.face?.sections.flatMap { section in
+            section.rows.map { row in
+                [row.title, row.detail].compactMap { $0 }.joined(separator: "\n")
+            }
+        } ?? []
     }
 }
 
 extension CognitiveSubstrate {
+    struct GrowthWeekInput: Sendable {
+        let proposals: [CognitiveSchemaProposal]
+        let events: [CognitiveDevelopmentalTimelineEvent]
+        let transitions: [CognitiveDispositionTransition]
+        let end: Date
+    }
+
+    func growthWeekInput(at end: Date) -> GrowthWeekInput {
+        GrowthWeekInput(proposals: Array(schemaProposals.values), events: Array(developmentalTimeline.values),
+                        transitions: dispositionTransitions, end: end)
+    }
+
     static func growthOutcomeTag(_ outcome: CognitiveGrowthOutcome) -> String {
         "outcome:\(outcome.rawValue)"
     }
@@ -86,19 +102,13 @@ extension CognitiveSubstrate {
         return [Self.growthOutcomeTag(outcome)]
     }
 
-    /// Outcome of a single timeline event, from its tag — or, for rows written
-    /// before the tag existed, from the summary prefixes those rows have always
-    /// used. Nil when the event is not a transition at all (a revisit).
+    /// Only an explicit outcome tag attests a timeline transition.
     static func growthOutcome(of event: CognitiveDevelopmentalTimelineEvent) -> CognitiveGrowthOutcome? {
         for id in event.externalEvidenceIds where id.hasPrefix("outcome:") {
             if let outcome = CognitiveGrowthOutcome(rawValue: String(id.dropFirst("outcome:".count))) {
                 return outcome
             }
         }
-        // Untagged REM resolutions use titles: accepted is `held`, rejected is `letGo`.
-        let title = event.title.lowercased()
-        if title.hasPrefix("schema proposal accepted") { return .held }
-        if title.hasPrefix("schema proposal rejected") { return .letGo }
         return nil
     }
 
@@ -106,14 +116,22 @@ extension CognitiveSubstrate {
     /// Captured before suspension: disposition numbers and revision evidence
     /// cannot come from a different read than this timeline packet.
     public func growthWeek(at now: Date? = nil) async -> CognitiveGrowthWeek {
-        await growthWeek(from: await developmentalTimelineSnapshot(limit: 240), at: now)
+        await growthWeek(input: growthWeekInput(at: now ?? dependencies.now()))
+    }
+
+    func growthWeek(input: GrowthWeekInput) async -> CognitiveGrowthWeek {
+        let resolved = await schemaProposalSnapshot(from: input.proposals)
+        let timeline = developmentalTimelineSnapshot(proposals: resolved, events: input.events, limit: 240)
+        return await growthWeek(from: timeline, transitions: input.transitions, at: input.end)
     }
 
     public func growthWeek(from timeline: [CognitiveDevelopmentalTimelineEvent], at now: Date? = nil) async -> CognitiveGrowthWeek {
-        let end = now ?? dependencies.now()
+        await growthWeek(from: timeline, transitions: dispositionTransitions, at: now ?? dependencies.now())
+    }
+
+    private func growthWeek(from timeline: [CognitiveDevelopmentalTimelineEvent], transitions: [CognitiveDispositionTransition], at end: Date) async -> CognitiveGrowthWeek {
         let start = end.addingTimeInterval(-7 * 24 * 60 * 60)
-        let events: [JSONValue] = timeline.filter { $0.occurredAt >= start && $0.occurredAt <= end
-            && !Self.isRetiredViewTimelineEvent($0) }.map { event in
+        let events: [JSONValue] = timeline.filter { $0.occurredAt >= start && $0.occurredAt <= end }.map { event in
             .object([
                 "id": .string(event.id.uuidString), "artifactId": event.artifactId.map { .string($0.uuidString) } ?? .null,
                 "kind": .string(event.kind.rawValue), "title": .string(event.title), "summary": .string(event.summary),
@@ -141,7 +159,7 @@ extension CognitiveSubstrate {
         let input: JSONValue = .object([
             "clusters": .array(clusters.map(JSONValue.string)),
             "events": .array(events),
-            "transitions": .array(dispositionTransitions.filter { $0.at >= start && $0.at <= end }.map { move in
+            "transitions": .array(transitions.filter { $0.at >= start && $0.at <= end }.map { move in
                 .object([
                     "source": .string(move.source),
                     "before": .string(String(format: "%.2f", move.before)),

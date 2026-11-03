@@ -4,7 +4,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentHostConfigWriter.swift` | `AgentHostConfigWriter` enum; `edit` owns file transactions, backups and replacement; `checkEntry`, `writeEnvironment`, `ensureEnvironment`; absent/exact entries, same-peer reconciliation and stale-install helper replacement; foreign-entry refusal; `checking` validates without writing; removal names missing ownership receipts and preserves unproven bytes |
+// Blueprint: | `AgentHostConfigWriter.swift` | `AgentHostConfigWriter` enum; `edit` prepares backups before replacement and commits ownership/prunes undo afterward; `grantMessaging`/`removeMessaging` share recipe-declared two-tool allowances, conflict checks and receipts for Claude Code, Antigravity and Zed; `checkEntry`, `writeEnvironment`, `ensureEnvironment`; same-peer reconciliation, stale-install replacement and foreign-entry refusal; `checking` validates without writing; removal preserves unproven bytes |
 
 /// Write one owned entry into another program's configuration file.
 /// JSON, TOML and YAML splicers replace only the entry's bytes; foreign bytes,
@@ -18,9 +18,10 @@ public enum AgentHostConfigWriter {
         case tooLarge
         case backupFailed
         case writeFailed
+        case receiptFailed(path: String, detail: String)
         case cleanupFailed(path: String, detail: String)
         case removalFailed(path: String, displaced: String, detail: String)
-        case rollbackFailed(String)
+        case publicationUnconfirmed(String)
         case changedUnderneath
         case entryExists(String)
         /// This app's entry name, written by another install of it (a copy since
@@ -40,10 +41,11 @@ public enum AgentHostConfigWriter {
             case .tooLarge: return "The configuration file exceeds the bounded size this writer will edit. Nothing was changed."
             case .backupFailed: return "A timestamped backup could not be written beside the configuration file, so the file was left untouched."
             case .writeFailed: return "The configuration replacement failed. Inspect the configuration and its recorded backup before another change."
+            case .receiptFailed(let path, let detail): return "The configuration was saved, but its ownership receipt or backup cleanup failed at \(path): \(detail). Inspect the settings, receipt and retained backups before another change."
             case .cleanupFailed(let path, let detail): return "The configuration was saved, but its previous file remains at \(path): \(detail). Inspect both files before removing the previous file."
             case .removalFailed(let path, let displaced, let detail):
                 return "Configuration removal failed: \(detail). The file was moved from \(path) to \(displaced); either path may now exist. Inspect both paths before another change."
-            case .rollbackFailed(let path): return "The settings changed during replacement and could not be restored safely. The displaced file was preserved at \(path); review both files before retrying."
+            case .publicationUnconfirmed(let path): return "The configuration replacement was published, but a concurrent host save could not be reconciled. Both versions are preserved, including \(path). Inspect both files and repair the current configuration before another change."
             }
         }
     }
@@ -166,85 +168,163 @@ public enum AgentHostConfigWriter {
     }
 
     /// Only this connection's two conversation tools, never an MCP wildcard.
-    static func antigravityMessagingRules(server: String) throws -> [String] {
+    static func messagingRules(server: String, syntax: AgentHostRow.MessagingPermissionSyntax) throws -> [String] {
         guard !server.isEmpty, server.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }) else {
             throw Failure.unparsable("invalid messaging server name")
         }
-        return ["mcp(\(server)/agent_message)", "mcp(\(server)/agent_reply)"]
+        return ["agent_message", "agent_reply"].map { syntax.rule(server: server, tool: $0) }
     }
 
-    static func grantAntigravityMessaging(path: String, server: String, peerID: String,
+    static func grantMessaging(path: String, server: String, syntax: AgentHostRow.MessagingPermissionSyntax, peerID: String,
                                           recordURL: URL) throws -> Outcome {
-        let rules = try antigravityMessagingRules(server: server)
+        let rules = try messagingRules(server: server, syntax: syntax)
+        let allowanceOwner = path + " " + (syntax == .toolDefaults ? toolPermissionPath.joined(separator: ".") : "permissions.allow")
+        // The original receipt tag and filename remain valid for already-connected
+        // Antigravity contacts. They are an on-disk protocol, not a host selector.
         // Existing ownership is not a reason to undo a person's later edit.
         if let owner = try backupRecords(at: recordURL).last?.jsonOwnership {
             guard owner.command == "antigravity-messaging", owner.peerID == peerID, owner.name == server else {
                 throw Failure.unparsable("messaging permission ownership belongs to another connection")
             }
             let (current, _) = try read(path: path)
-            try checkMessagingConflicts(current, server: server, rules: rules, path: path)
-            let allowed = try permissionRules(current, "allow")
+            try checkMessagingConflicts(current, server: server, syntax: syntax, rules: rules, path: path)
+            let allowed = try messagingAllow(current, rules: rules, syntax: syntax).rules
             guard rules.allSatisfy(allowed.contains) else {
-                throw Failure.unparsable("this connection's messaging allowances were changed or removed; review them in Antigravity. They were not restored automatically")
+                throw Failure.unparsable("this connection's messaging allowances were changed or removed; review \(allowanceOwner). They were not restored automatically")
             }
             return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false)
         }
         return try edit(path: path, backupRecordURL: recordURL, initial: Data("{}".utf8), ownership: { data in
-            let original = try JSONEntrySplice.entry(data, name: "allow", containerKey: "permissions",
-                comments: true, trailingCommas: true)
+            let original = try messagingAllow(data, rules: rules, syntax: syntax)
             return JSONOwnership(command: "antigravity-messaging", peerID: peerID, name: server,
-                original: original?.value, originalMember: original?.member)
+                original: original.value, originalMember: original.member)
         }) { data in
-            try checkMessagingConflicts(data, server: server, rules: rules, path: path)
-            let existing = try permissionRules(data, "allow")
+            try checkMessagingConflicts(data, server: server, syntax: syntax, rules: rules, path: path)
+            let existing = try messagingAllow(data, rules: rules, syntax: syntax).rules
             let added = rules.filter { !existing.contains($0) }
             guard !added.isEmpty else { return nil }
-            let json = String(decoding: try JSONSerialization.data(withJSONObject: existing + added, options: [.withoutEscapingSlashes]), as: UTF8.self)
-            return try JSONEntrySplice.upsert(data, name: "allow", entryJSON: json,
-                containerKey: "permissions", comments: true, trailingCommas: true, fragment: true)
+            if checking == true {
+                throw ToolFailureError("This contact's messaging allowances in \(path) need reconciliation. Connect it again to add its two messaging tools.",
+                    effects: .none, owner: allowanceOwner, nextCall: ToolFailureError.call("app", [
+                        "action": .string("agent.connect"), "args": .object(["name": .string("peer:" + peerID)])]))
+            }
+            return try spliceMessagingAllow(data, rules: rules, allowed: existing + added, syntax: syntax)
         }
     }
 
-    static func removeAntigravityMessaging(path: String, server: String, peerID: String,
+    static func removeMessaging(path: String, server: String, syntax: AgentHostRow.MessagingPermissionSyntax, peerID: String,
                                            recordURL: URL) throws {
         guard let owner = try backupRecords(at: recordURL).last?.jsonOwnership else { return }
         guard owner.command == "antigravity-messaging", owner.peerID == peerID, owner.name == server else {
             throw Failure.unparsable("messaging permission ownership does not match this connection")
         }
         let baseline = try permissionArray(owner.original)
-        let added = try antigravityMessagingRules(server: server).filter { !baseline.contains($0) }
+        let rules = try messagingRules(server: server, syntax: syntax)
+        let added = rules.filter { !baseline.contains($0) }
         _ = try edit(path: path, backupRecordURL: recordURL, removing: true) { data in
-            let current = try permissionRules(data, "allow")
+            let current = try messagingAllow(data, rules: rules, syntax: syntax).rules
             let retained = current.filter { !added.contains($0) }
             guard current != retained else { return nil }
-            if retained.isEmpty, owner.original == nil {
-                return try JSONEntrySplice.remove(data, name: "allow", containerKey: "permissions", comments: true, trailingCommas: true)
-            }
-            let json = String(decoding: try JSONSerialization.data(withJSONObject: retained, options: [.withoutEscapingSlashes]), as: UTF8.self)
-            return try JSONEntrySplice.upsert(data, name: "allow", entryJSON: json,
-                containerKey: "permissions", comments: true, trailingCommas: true,
-                originalMember: retained == baseline ? owner.originalMember : nil, fragment: true)
+            return try spliceMessagingAllow(data, rules: rules, allowed: retained, syntax: syntax,
+                removeEmpty: owner.original == nil, originalMember: retained == baseline ? owner.originalMember : nil)
         }
         try removeBackups(path: path, recordURL: recordURL)
+    }
+
+    private static let toolPermissionPath = ["agent", "tool_permissions", "tools"]
+    private static let toolAllowance = "{\"default\":\"allow\"}"
+
+    private static func messagingAllow(_ data: Data, rules: [String], syntax: AgentHostRow.MessagingPermissionSyntax) throws
+        -> (value: String?, member: String?, rules: [String]) {
+        if syntax == .toolDefaults {
+            var allowed: [String] = []
+            for rule in rules {
+                if let value = try JSONEntrySplice.member(data, path: toolPermissionPath + [rule]),
+                   try isToolAllowance(value) { allowed.append(rule) }
+            }
+            let value = String(decoding: try JSONSerialization.data(withJSONObject: allowed), as: UTF8.self)
+            return (value, nil, allowed)
+        }
+        let entry = try JSONEntrySplice.entry(data, name: "allow", containerKey: "permissions", comments: true, trailingCommas: true)
+        return (entry?.value, entry?.member, try permissionArray(entry?.value))
+    }
+
+    private static func spliceMessagingAllow(_ data: Data, rules: [String], allowed: [String],
+        syntax: AgentHostRow.MessagingPermissionSyntax, removeEmpty: Bool = false, originalMember: String? = nil) throws
+        -> (data: Data, replaced: Bool, removed: Bool)? {
+        if syntax == .toolDefaults {
+            var output = data
+            for rule in rules {
+                let path = toolPermissionPath + [rule]
+                let current = try JSONEntrySplice.member(output, path: path)
+                if allowed.contains(rule) {
+                    if current == nil { output = try JSONEntrySplice.setMember(output, path: path, value: toolAllowance) }
+                } else if let current, try isToolAllowance(current) {
+                    output = try JSONEntrySplice.setMember(output, path: path, value: nil)
+                }
+            }
+            return output == data ? nil : (output, false, allowed.isEmpty)
+        }
+        if allowed.isEmpty && removeEmpty {
+            return try JSONEntrySplice.remove(data, name: "allow", containerKey: "permissions", comments: true, trailingCommas: true)
+        }
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: allowed, options: [.withoutEscapingSlashes]), as: UTF8.self)
+        return try JSONEntrySplice.upsert(data, name: "allow", entryJSON: json,
+            containerKey: "permissions", comments: true, trailingCommas: true, originalMember: originalMember, fragment: true)
+    }
+
+    private static func isToolAllowance(_ value: String) throws -> Bool {
+        let bytes = try JSONEntrySplice.validatedBytes(Data(value.utf8), comments: true, trailingCommas: true)
+        _ = try JSONEntrySplice.member(Data(value.utf8), path: ["default"])
+        let object = try JSONSerialization.jsonObject(with: Data(bytes)) as? NSDictionary
+        return object == ["default": "allow"] as NSDictionary
     }
 
     private static func permissionEntry(_ data: Data, _ key: String) throws -> String? {
         try JSONEntrySplice.entry(data, name: key, containerKey: "permissions", comments: true, trailingCommas: true)?.value
     }
 
-    private static func checkMessagingConflicts(_ data: Data, server: String, rules: [String], path: String) throws {
+    private static func checkMessagingConflicts(_ data: Data, server: String,
+        syntax: AgentHostRow.MessagingPermissionSyntax, rules: [String], path: String) throws {
+        if syntax == .toolDefaults {
+            // Zed's global default is only a fallback; an explicit per-tool
+            // default takes precedence. Preserve restrictions on the tools themselves.
+            for rule in rules {
+                if let value = try JSONEntrySplice.member(data, path: toolPermissionPath + [rule]),
+                   try !isToolAllowance(value) {
+                    throw ToolFailureError("An existing tool permission for \(rule) in \(path) constrains this connection's messaging. It was left intact and nothing was connected.",
+                        effects: .none, owner: path + " agent.tool_permissions.tools." + rule,
+                        tap: "Zed settings › agent › tool_permissions › tools (\(path))", personDecides: true)
+                }
+            }
+            return
+        }
         for key in ["deny", "ask"] {
             let blocked = try permissionRules(data, key).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             // The documented wildcards are mcp(*) and mcp(server/*). Refuse
             // ambiguous broad spellings too, rather than assume they do not
             // constrain this connection on a different CLI version.
-            guard !blocked.contains(where: {
-                ["*", "mcp", "mcp(\(server))", "mcp(*)", "mcp(\(server)/*)"].contains($0) || rules.contains($0)
+            guard !blocked.contains(where: { rule in
+                switch syntax {
+                case .mcpCall:
+                    return ["*", "mcp", "mcp(\(server))", "mcp(*)", "mcp(\(server)/*)"].contains(rule) || rules.contains(rule)
+                case .doubleUnderscore:
+                    // Ask/Deny accept full-name globs, including partial server
+                    // and tool names. Bare server rules cover all its tools.
+                    let tool = String(rule.prefix { $0 != "(" })
+                    let pattern = "^" + NSRegularExpression.escapedPattern(for: tool)
+                        .replacingOccurrences(of: "\\*", with: ".*") + "$"
+                    return rules.contains { name in
+                        name.range(of: pattern, options: .regularExpression) != nil
+                            || (tool.hasPrefix("mcp__") && name.hasPrefix(tool + "__"))
+                    }
+                case .toolDefaults: return false // Checked above, at its per-tool owner.
+                }
             }) else {
                 // The person's own Ask/Deny rule is his decision, never a repair of ours.
                 throw ToolFailureError("An existing \(key) rule in \(path) covers or ambiguously constrains this connection's messaging tools. That rule is the person's decision; it was left intact and nothing was connected.",
                     effects: .none, owner: path + " permissions." + key,
-                    tap: "Antigravity settings › permissions › \(key) (\(path))", personDecides: true)
+                    tap: "Settings › permissions › \(key) (\(path))", personDecides: true)
             }
         }
     }
@@ -419,10 +499,20 @@ public enum AgentHostConfigWriter {
                 throw Failure.removalFailed(path: path, displaced: claimed, detail: error.localizedDescription)
             }
         } else {
-            try replaceAtomically(path: path, data: result.data, unchangedSince: identity, original: existing)
+            do {
+                try replaceAtomically(path: path, data: result.data, unchangedSince: identity, original: existing)
+            } catch let failure as Failure {
+                // This error occurs after the validated swap committed; its
+                // displaced-file cleanup failed. Publish that committed write.
+                if case .cleanupFailed = failure, let backup {
+                    try commitBackup(backup, path: path, recordURL: backupRecordURL)
+                }
+                throw failure
+            }
         }
+        if let backup { try commitBackup(backup, path: path, recordURL: backupRecordURL) }
         if removing && cleanupBackups { try removeBackups(path: path, recordURL: backupRecordURL) }
-        return Outcome(path: path, backupPath: removing ? nil : backup,
+        return Outcome(path: path, backupPath: backup?.record.path,
                        replacedExistingEntry: result.replaced, removed: result.removed, replacedInstall: replacing.helper)
     }
 
@@ -483,10 +573,15 @@ public enum AgentHostConfigWriter {
     /// The person's own undo, beside the file they can already find.
     private static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
 
+    private struct PreparedBackup {
+        let record: BackupRecord
+        let previous: [BackupRecord]
+    }
+
     private static func writeBackup(path: String, data: Data, written: Data, originallyAbsent: Bool,
                                     restoresOriginal: Bool, jsonOwnership: JSONOwnership? = nil,
-                                    tomlOwnership: JSONOwnership? = nil, recordURL: URL) throws -> String {
-        var records = try backupRecords(at: recordURL)
+                                    tomlOwnership: JSONOwnership? = nil, recordURL: URL) throws -> PreparedBackup {
+        let records = try backupRecords(at: recordURL)
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
@@ -499,19 +594,29 @@ public enum AgentHostConfigWriter {
             if write(data, to: backup) {
                 do {
                     let (_, identity) = try read(path: backup)
-                    records.append(BackupRecord(path: backup, identity: identity, writtenDigest: digest(written),
+                    let record = BackupRecord(path: backup, identity: identity, writtenDigest: digest(written),
                                                 originallyAbsent: originallyAbsent, restoresOriginal: restoresOriginal,
-                                                jsonOwnership: jsonOwnership, tomlOwnership: tomlOwnership))
-                    try saveBackupRecords(records, at: recordURL)
+                                                jsonOwnership: jsonOwnership, tomlOwnership: tomlOwnership)
+                    return PreparedBackup(record: record, previous: records)
                 } catch {
                     _ = Darwin.unlink(backup)
                     throw error
                 }
-                try removeBackups(path: path, recordURL: recordURL, keeping: backup)
-                return backup
             }
         }
         throw Failure.backupFailed
+    }
+
+    private static func commitBackup(_ backup: PreparedBackup, path: String, recordURL: URL) throws {
+        // The settings replacement has committed. Only now publish its ownership
+        // and prune the preceding undo. A failed replacement keeps the old receipt
+        // and backups intact, plus the newly prepared undo beside the settings.
+        do {
+            try saveBackupRecords(backup.previous + [backup.record], at: recordURL)
+            try removeBackups(path: path, recordURL: recordURL, keeping: backup.record.path)
+        } catch {
+            throw Failure.receiptFailed(path: recordURL.path, detail: error.localizedDescription)
+        }
     }
 
     struct JSONOwnership: Codable {
@@ -578,8 +683,7 @@ public enum AgentHostConfigWriter {
             return
         }
         // Swap keeps the host pathname present, including across a crash.
-        // The displaced file stays beside it until validation or rollback.
-        let (_, replacementIdentity) = try read(path: temporary)
+        // The displaced file stays beside it until checked publication settles.
         let (beforeSwap, beforeSwapIdentity) = try read(path: path)
         guard beforeSwapIdentity == identity, original == nil || beforeSwap == original else { throw Failure.changedUnderneath }
         guard renamex_np(temporary, path, UInt32(RENAME_SWAP)) == 0 else { throw Failure.changedUnderneath }
@@ -588,22 +692,9 @@ public enum AgentHostConfigWriter {
             let (current, currentIdentity) = try read(path: temporary)
             guard currentIdentity == identity, original == nil || current == original else { throw Failure.changedUnderneath }
         } catch {
-            // Check before and after rollback; a host can save between them.
-            // A collision retains both versions for explicit recovery.
-            guard let (published, publishedIdentity) = try? read(path: path),
-                  publishedIdentity == replacementIdentity, published == data,
-                  renamex_np(temporary, path, UInt32(RENAME_SWAP)) == 0 else {
-                throw Failure.rollbackFailed(temporary)
-            }
-            guard let (rolledBack, rolledBackIdentity) = try? read(path: temporary),
-                  rolledBackIdentity == replacementIdentity, rolledBack == data else {
-                // Restore the detected newer save with one compensating swap.
-                // Even if another save races this swap, delete neither version.
-                _ = renamex_np(temporary, path, UInt32(RENAME_SWAP))
-                throw Failure.rollbackFailed(temporary)
-            }
-            removeTemporary = true
-            throw error
+            // Publication already happened. Keep both generations; never swap
+            // old bytes over a current or concurrently saved configuration.
+            throw Failure.publicationUnconfirmed(temporary)
         }
         guard Darwin.unlink(temporary) == 0 else {
             throw Failure.cleanupFailed(path: temporary, detail: String(cString: strerror(errno)))
@@ -636,4 +727,5 @@ public enum AgentHostConfigWriter {
         _ = path.withCString { Darwin.unlink($0) }
         return false
     }
+
 }

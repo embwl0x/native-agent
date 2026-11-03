@@ -174,7 +174,7 @@ struct OAuthSignInButton: View {
         _ = await appModel.engine.providers.connectOAuthProvider(
             platform: NativeOAuthPlatform.self, providerID: provider.id,
             present: { result in
-                NSApp.activate(ignoringOtherApps: true)
+                NSApp.activate()
                 if !result.ok {
                     lastError = result.error ?? "OAuth failed (no details)"
                 }

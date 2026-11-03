@@ -1,6 +1,6 @@
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `AdvancedView.swift` | More navigation reads the pairing-owned surface layout and composes Status and Runs |
+// Blueprint: | `AdvancedView.swift` | More navigation includes Memories and renders the Mac's checked surface layout or its path/repair failure; undelivered/damaged snapshots show connection/read recovery without a local seed; composes Status and Runs |
 
 enum MoreAboutPresentation {
     static let text = "Some advanced controls require a live Mac connection. Skill installs, eval runs, and Desk policy editing are Mac-only today. Desk changes sync with the paired Mac."
@@ -10,9 +10,12 @@ enum MoreAboutPresentation {
 
 struct AdvancedView: View {
     @Binding var deskTaskNavigationTarget: NativeAgentNotificationLaunchIntent?
+    @Binding var opensMemories: Bool
 
-    init(deskTaskNavigationTarget: Binding<NativeAgentNotificationLaunchIntent?> = .constant(nil)) {
+    init(deskTaskNavigationTarget: Binding<NativeAgentNotificationLaunchIntent?> = .constant(nil),
+         opensMemories: Binding<Bool> = .constant(false)) {
         _deskTaskNavigationTarget = deskTaskNavigationTarget
+        _opensMemories = opensMemories
     }
     @EnvironmentObject private var pairingStore: PairingStore
     @EnvironmentObject private var bridgeClient: MacBridgeClient
@@ -42,11 +45,17 @@ struct AdvancedView: View {
 
                 // More's sections in the layout's order, as the phone's
                 // profile shows them.
-                let layout = sync.surfaceLayout ?? SurfaceLayout.seed(from: "", at: "")
+                if sync.surfaceLayout?.value != nil,
+                   let failure = sync.snapshotHealth.damageSentence(for: ["ui_layout.json"]) {
+                    AliveNote("Showing the last received Mac layout. " + failure)
+                }
+                if let layout = sync.surfaceLayout?.value {
                 ForEach(layout.shown("more", profile: layout.phone).map(\.name), id: \.self) { block in
                     switch block {
                     case "rooms":
                         AliveSection("Rooms") {
+                            link("Memories", "What I remember and memories to review") { MemoryView(embedInNavigationStack: false) }
+                            AliveDivider()
                             link("Scheduler", "Things set to happen later") { MobileSchedulerView() }
                             AliveDivider()
                             link("Helpers", "Run and manage helpers") { MobileHelpersView() }
@@ -91,10 +100,24 @@ struct AdvancedView: View {
                         EmptyView()
                     }
                 }
+                } else {
+                    AliveSection("Layout unavailable") {
+                        if let failure = sync.surfaceLayout?.failure {
+                            Text(failure.localizedDescription)
+                        } else {
+                            Text(sync.snapshotHealth.damageSentence(for: ["ui_layout.json"])
+                                 ?? "The Mac layout has not arrived.")
+                        }
+                        Text("Keep NativeAgent open on the paired Mac and refresh after the connection is restored.")
+                    }
+                }
             }
             .navigationDestination(item: $deskTaskNavigationTarget) { intent in
                 WorkshopView(notifiedTaskID: intent.taskID)
                     .id(intent.id)
+            }
+            .navigationDestination(isPresented: $opensMemories) {
+                MemoryView(embedInNavigationStack: false)
             }
             #if DEBUG
             .navigationDestination(isPresented: $showDesignScreen) {
@@ -136,6 +159,7 @@ struct AdvancedView: View {
         #if DEBUG
         switch MobileDesignSamples.screen {
         case "settings": SettingsViewFull()
+        case "memories", "memory": MemoryView(embedInNavigationStack: false)
         case "providers": ProviderSettingsView()
         case "pairing": PairingView()
         case "approvals": ApprovalsView().environmentObject(designApprovals)
@@ -171,8 +195,6 @@ struct AdvancedView: View {
     private static func sampleSettingsStore() -> SettingsStore {
         let personality = PersonalityProfile(
             name: "Sample", personaKind: "Companion",
-            essence: "A steady, curious presence that keeps the day simple and the next step clear.",
-            voice: "Plain and warm. Short sentences, one idea at a time, no filler.",
             traits: PersonalityTraits(warmth: 0.8, directness: 0.7, humor: 0.45, proactivity: 0.6,
                                       rigor: 0.75, autonomy: 0.55, creativity: 0.65, brevity: 0.7))
         let store = SettingsStore(sync: iCloudSyncEngine(personality: personality))

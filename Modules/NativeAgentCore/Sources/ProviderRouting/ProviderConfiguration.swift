@@ -26,20 +26,12 @@ extension SwiftNativeProviderRouting {
         let path = dataRoot
             .appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("\(trimmedId).json")
-        guard FileManager.default.fileExists(atPath: path.path) else { return ProviderConfigRead() }
+        do { _ = try FileManager.default.attributesOfItem(atPath: path.path) }
+        catch CocoaError.fileReadNoSuchFile { return ProviderConfigRead() }
+        catch { return ProviderConfigRead(unreadable: "Provider \(trimmedId) at \(path.path) could not be read: \(error.localizedDescription)") }
         do {
             return try CredentialFileLock.withLock(path) { () -> ProviderConfigRead in
-                let data: Data?
-                if trimmedId == "xai_oauth_direct" {
-                    data = try ProviderStateValidation.dataIfPresent(at: path)
-                } else {
-                    data = try? Data(contentsOf: path)
-                }
-                guard let data else {
-                    return ProviderConfigRead(
-                        unreadable: "provider \(trimmedId) configuration could not be read"
-                    )
-                }
+                guard let data = try ProviderStateValidation.dataIfPresent(at: path) else { return ProviderConfigRead() }
                 let read = try configurationGenerations.withLockUnchecked { generations -> ProviderConfigRead in
                     if let generation = generations[trimmedId], generation.bytes == data { return generation.read }
                     guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -60,6 +52,9 @@ extension SwiftNativeProviderRouting {
                     object = try XAIOAuthCredentialStore.resolve(object, at: path)
                 }
                 // Resolve the Keychain reference under the config writer's lock so readiness and model settings share one credential generation.
+                guard object["api_key"] == nil else {
+                    throw ProviderRoutingError.configurationFailed("Provider \(trimmedId) has plaintext API-key bytes. Save its key in Providers to repair its storage.")
+                }
                 if object[ProviderAPIKeyStore.referenceField] != nil {
                     let key = try LLMCredentialResolver.checkedAPIKey(providerConfigObject: object)
                     object.removeValue(forKey: ProviderAPIKeyStore.referenceField)
@@ -69,7 +64,7 @@ extension SwiftNativeProviderRouting {
             }
         } catch {
             return ProviderConfigRead(
-                unreadable: "provider \(trimmedId) configuration is locked: \(error.localizedDescription)"
+                unreadable: "provider \(trimmedId) configuration is unavailable: \(error.localizedDescription)"
             )
         }
     }

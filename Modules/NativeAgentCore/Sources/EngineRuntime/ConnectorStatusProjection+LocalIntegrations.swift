@@ -78,10 +78,10 @@ enum MacAssistantParts {
 }
 
 extension ConnectorReadiness {
-    public static func actionStatusEvidence(actionID: String, root: URL, platform: AppConnectorStatusPlatform) async -> ConnectorActionStatusEvidence? {
-        let connectors = (try? await ConnectorReadiness.readConnectorRecords(
+    public static func actionStatusEvidence(actionID: String, root: URL, platform: AppConnectorStatusPlatform) async throws -> ConnectorActionStatusEvidence? {
+        let connectors = try await ConnectorReadiness.readConnectorRecords(
             root: root, platform: platform
-        )) ?? []
+        )
         let actions = ConnectorActionRecord.records(connectors: connectors)
         return actions.first { $0.id == actionID }.map {
             ConnectorActionStatusEvidence(connectorStatus: $0.connectorStatus, authState: $0.authState, enabled: $0.enabled)
@@ -93,13 +93,13 @@ extension ConnectorReadiness {
 /// still "ok" after `ConnectorHealthDecay` (a real call succeeded in the last
 /// 7 days). Local files only; one registry read per status call.
 extension ConnectorReadiness {
-    static func isProven(id: String, root: URL, platform: AppConnectorStatusPlatform) async -> Bool {
-        let rows = (try? await readConnectorRecords(root: root, platform: platform)) ?? []
+    static func isProven(id: String, root: URL, platform: AppConnectorStatusPlatform) async throws -> Bool {
+        let rows = try await readConnectorRecords(root: root, platform: platform)
         let row = rows.first { $0.id == id }
         if row?.healthStatus == "ok" { return true }
         // An owner with no registry row (the Mac bridge) is proven the same
         // way a row is: a successful receipt of its own within the window.
-        if row == nil, let proof = ConnectorProofLedger.latestByConnector(root: root)[ConnectorProofLedger.canonicalID(id)],
+        if row == nil, let proof = try ConnectorProofLedger.latestByConnector(root: root)[ConnectorProofLedger.canonicalID(id)],
            proof.succeeded, Date().timeIntervalSince(proof.at) < ConnectorHealthDecay.provenWindow {
             return true
         }
@@ -107,24 +107,20 @@ extension ConnectorReadiness {
     }
 }
 
-/// iPhone push is ready when a notification can actually reach a phone: the
-/// person hasn't switched phone delivery off, and either the paired iPhone
-/// advertised CloudKit visual notifications or direct APNs has a target.
+/// Phone delivery uses the same checked pairing authority as pairing/access
+/// pages. Optional direct APNS wakes do not determine notification support.
 extension ConnectorReadiness {
     static func mobilePushStatus(deviceSync: DeviceSync) async -> [String: JSONValue] {
         guard NotificationChannelPreference.push() else {
             return ["status": .string("off"), "nextStep": .string("Turn on Deliver to the phone in Settings.")]
         }
-        let apnsTargets: Int
         do {
-            apnsTargets = try await deviceSync.apns.deliverableTargetCount()
+            let phone = try await deviceSync.apns.notificationReadiness(dataRoot: deviceSync.dataRoot)
+            return ["status": .string(phone.supported ? "ready" : "needs_setup"),
+                    "nextStep": .string(phone.supported ? phone.detail : "Pair the companion iPhone app with this Mac.")]
         } catch {
             return ["status": .string("unavailable"), "nextStep": .string(error.localizedDescription)]
         }
-        if apnsTargets > 0 {
-            return ["status": .string("ready"), "tokenConfigured": .bool(apnsTargets > 0)]
-        }
-        return ["status": .string("needs_setup"), "nextStep": .string("Configure mobile push in NativeAgent settings")]
     }
 }
 
@@ -133,7 +129,7 @@ extension ConnectorReadiness {
 public struct AppConnectorStatusPlatform: Sendable {
     public func calendarEventKitReadState() -> String {
         switch EKEventStore.authorizationStatus(for: .event) {
-        case .authorized, .fullAccess:
+        case .fullAccess:
             return "ready"
         case .notDetermined:
             return "probe_needed"
@@ -201,8 +197,8 @@ public struct AppConnectorActionPlatform: ConnectorActionPlatform {
         macAssistant
     }
 
-    public func statusEvidence(actionID: String) async -> ConnectorActionStatusEvidence? {
-        await ConnectorReadiness.actionStatusEvidence(actionID: actionID, root: dataRoot, platform: statusPlatform)
+    public func statusEvidence(actionID: String) async throws -> ConnectorActionStatusEvidence? {
+        try await ConnectorReadiness.actionStatusEvidence(actionID: actionID, root: dataRoot, platform: statusPlatform)
     }
 
     public func runGit(_ arguments: [String], repoRoot: URL, timeout: TimeInterval) async throws -> (status: Int32, stdout: String, stderr: String) {

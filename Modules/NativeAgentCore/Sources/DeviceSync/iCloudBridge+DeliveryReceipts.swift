@@ -56,7 +56,7 @@ extension iCloudBridge {
         transport: String,
         status: ChatDeliveryReceiptStatus,
         dataRoot: URL
-    ) async {
+    ) async -> Bool {
         let preview = String((response["message"] ?? response["status"] ?? "").prefix(240))
         let row: JSONValue = .object([
             "at": .string(ISO8601DateFormatter().string(from: Date())),
@@ -74,7 +74,7 @@ extension iCloudBridge {
             "textPreview": .string(preview),
             "attachmentCount": .int(0),
         ])
-        _ = try? await upsertChatDeliveryReceipt(appendRow: row, dataRoot: dataRoot)
+        return (try? await upsertChatDeliveryReceipt(appendRow: row, dataRoot: dataRoot)) == true
     }
 
     static func appendInboundSuccessReceipt(
@@ -82,8 +82,8 @@ extension iCloudBridge {
         transport: String,
         secret: Data,
         dataRoot: URL
-    ) async {
-        await appendChatDeliveryReceipt(
+    ) async -> Bool {
+        return await appendChatDeliveryReceipt(
             message,
             direction: "ios_to_mac",
             transport: transport,
@@ -98,7 +98,7 @@ extension iCloudBridge {
         action: String,
         transport: String,
         dataRoot: URL
-    ) async {
+    ) async -> Bool {
         let row: JSONValue = .object([
             "at": .string(ISO8601DateFormatter().string(from: Date())),
             "messageId": .string(messageID),
@@ -115,7 +115,7 @@ extension iCloudBridge {
             "textPreview": .string(String(action.prefix(240))),
             "attachmentCount": .int(0),
         ])
-        _ = try? await upsertChatDeliveryReceipt(appendRow: row, dataRoot: dataRoot)
+        return (try? await upsertChatDeliveryReceipt(appendRow: row, dataRoot: dataRoot)) == true
     }
 
     @discardableResult
@@ -155,7 +155,7 @@ extension iCloudBridge {
             "confirmationChannel": .string(cleanChannel),
         ])
         do {
-            return try await upsertChatDeliveryReceipt(
+            let saved = try await upsertChatDeliveryReceipt(
                 appendRow: fallback,
                 match: ChatDeliveryReceiptMatch(
                     direction: cleanDirection,
@@ -172,15 +172,20 @@ extension iCloudBridge {
                 ],
                 dataRoot: dataRoot
             )
+            if saved, cleanDirection == "mac_to_ios" {
+                try await NotificationDeliveryLedger(dataRoot: dataRoot).confirmPhone([cleanEventID])
+            }
+            return saved
         } catch {
+            nativeLog("Phone notification receipt %@ remains unsettled: %@", cleanEventID, error.localizedDescription)
             return false
         }
     }
 
     /// The device-event ids the phone has signed as arrived (Mac → iOS): the
-    /// destination's acceptance. An unreadable ledger confirms nothing.
-    public nonisolated static func phoneConfirmedEventIDs(dataRoot: URL) -> Set<String> {
-        let rows = (try? loadChatDeliveryReceiptRows(path: chatDeliveryReceiptsURL(dataRoot: dataRoot))) ?? []
+    /// destination's acceptance. Unreadable evidence remains unavailable.
+    public nonisolated static func phoneConfirmedEventIDs(dataRoot: URL) throws -> Set<String> {
+        let rows = try loadChatDeliveryReceiptRows(path: chatDeliveryReceiptsURL(dataRoot: dataRoot))
         return Set(rows.compactMap { fields in
             fields["direction"] == .string("mac_to_ios")
                 && fields["status"] == .string(ChatDeliveryReceiptStatus.confirmedByPeer.rawValue)
@@ -266,8 +271,7 @@ extension iCloudBridge {
                 throw CocoaError(.fileReadCorruptFile)
             }
             if fields["direction"] == .string("mac_to_ios"),
-               [JSONValue.string("reply"), .string("codex_completion")].contains(fields["kind"] ?? .null)
-                  || fields["kind"] == .string("rejection") && fields["canonicalAnswerRunId"] != nil {
+               isRetainedChatReply(kind: fields["kind"]?.stringValue, canonicalRun: fields["canonicalAnswerRunId"]?.stringValue) {
                 guard status != "delivered_to_mac",
                       case .string(let correlation)? = fields["correlationId"], !correlation.isEmpty,
                       case .string(let identity) = fields["assistantRunId"] ?? fields["correlationId"] ?? .null,

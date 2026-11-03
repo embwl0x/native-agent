@@ -34,17 +34,14 @@ extension WeeklySelfImprovementLoop {
             for file in files where file.pathExtension == "jsonl" {
                 let text = try String(contentsOf: file, encoding: .utf8)
                 let sessionId = file.deletingPathExtension().lastPathComponent
-                // Rows without createdAt use file modification time for ordering and day buckets.
-                guard let mtime = try fm.attributesOfItem(atPath: file.path)[.modificationDate] as? Date else {
-                    throw Self.sourceError(file, "modification date is unavailable")
-                }
                 var sessionHadRecent = false
                 for (index, line) in text.split(separator: "\n").enumerated() {
                     guard let data = line.data(using: .utf8),
                           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                     else { throw Self.sourceError(file, "malformed transcript row \(index + 1)") }
-                    let stamp = (obj["createdAt"] as? String).flatMap(Self.parseISO)
-                    let at = stamp ?? mtime
+                    guard let at = (obj["createdAt"] as? String).flatMap(Self.parseISO) else {
+                        throw Self.sourceError(file, "transcript row \(index + 1) has no readable createdAt; its occurrence time is unknown")
+                    }
                     if at < weekAgo { continue }
                     totalMessages += 1
                     sessionHadRecent = true
@@ -271,19 +268,24 @@ extension MaintenanceBackgroundWork {
     /// The previous pass's cards, by the ids its digest recorded — its
     /// one-tap proposals (`approval:`) and its standing lessons (`rem:`) — and
     /// what became of each, its execution receipt included.
-    static func passOutcomes(cards: [String], inbox: SwiftNativeApprovalInbox, dataRoot: URL) async -> String {
-        let rem = REMProposalStore(dataRoot: dataRoot).loadAll()
+    static func passOutcomes(cards: [String], inbox: SwiftNativeApprovalInbox, dataRoot: URL) async throws -> String {
+        let rem = try REMProposalStore(dataRoot: dataRoot).loadAllStrictly()
         var lines: [String] = []
         for card in cards {
             var what = card, approvalID: String?
             if card.hasPrefix("approval:") {
                 approvalID = String(card.dropFirst("approval:".count))
             } else if let row = rem.first(where: { "rem:" + $0.id == card }) {
-                what = "standing lesson: " + row.proposalText
+                what = "standing lesson: " + row.proposalText + "\n" + REMReplacement.describe(row.replaced)
                 approvalID = row.approvalId
             }
-            guard let approvalID else { lines.append("- \(what): not on a card now (it is staged again)"); continue }
-            guard let record = try? await inbox.get(approvalID) else { lines.append("- \(what): its card is gone"); continue }
+            guard let approvalID else { lines.append("- \(what): no linked approval record was found; its outcome is unknown"); continue }
+            let record: ApprovalRecord
+            do { record = try await inbox.get(approvalID) }
+            catch ApprovalInboxError.notFound(_) {
+                lines.append("- \(what): no matching approval record was found; its outcome is unknown")
+                continue
+            }
             if card.hasPrefix("approval:") { what = record.title }
             var failed = false
             if case .object(let executed)? = record.executedAction { failed = executed["error"] != nil }

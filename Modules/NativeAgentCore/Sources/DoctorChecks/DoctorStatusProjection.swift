@@ -83,9 +83,13 @@ public enum DoctorReadout {
         liveChecks: [CheckResult],
         runCoreChecks: () async -> [CheckResult]
     ) async -> (checks: [CheckResult], measuredAt: String) {
-        if let cached = readCachedReadings(at: cachePath) {
-            let liveIDs = Set(liveChecks.map(\.id))
-            return (cached.checks.filter { !liveIDs.contains($0.id) } + liveChecks, cached.measuredAt)
+        do {
+            if let cached = try readCachedReadings(at: cachePath) {
+                let liveIDs = Set(liveChecks.map(\.id))
+                return (cached.checks.filter { !liveIDs.contains($0.id) } + liveChecks, cached.measuredAt)
+            }
+        } catch {
+            return ([cacheFailure(error, path: cachePath)] + liveChecks, now)
         }
         let measuredAt = ISO8601DateFormatter().string(from: Date())
         let raw = await runCoreChecks()
@@ -95,7 +99,7 @@ public enum DoctorReadout {
         do {
             try await persistDoctorSnapshot(core, to: cachePath, runAt: now, measuredAt: measuredAt, inPlace: true)
         } catch {
-            nativeLog("health_card: doctor snapshot cache write failed: \(error.localizedDescription)")
+            return (core + [cacheFailure(error, path: cachePath)] + liveChecks, measuredAt)
         }
         return (core + liveChecks, measuredAt)
     }
@@ -118,8 +122,8 @@ public enum DoctorReadout {
                     let fresh = Dictionary(results.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
                     let previousIDs = Set(previous.checks.map(\.id))
                     rows = previous.checks.map { fresh[$0.id] ?? $0 } + results.filter { !previousIDs.contains($0.id) }
-                    if previous.checks.contains(where: { fresh[$0.id] == nil }), let older = previous.measuredAt {
-                        measured = min(older, measuredAt)
+                    if previous.checks.contains(where: { fresh[$0.id] == nil }) {
+                        measured = min(previous.measuredAt, measuredAt)
                     }
                 }
             }
@@ -132,24 +136,36 @@ public enum DoctorReadout {
         }
     }
 
-    private static func readCachedReadings(at path: URL) -> (checks: [CheckResult], measuredAt: String)? {
-        guard let data = try? Data(contentsOf: path),
-              let payload = try? JSONDecoder().decode(CachedDoctorPayload.self, from: data),
-              payload.launchID == launchID,
-              let runAtString = payload.runAt,
-              let runAt = ISO8601DateFormatter().date(from: runAtString),
-              Date().timeIntervalSince(runAt) >= 0,
-              Date().timeIntervalSince(runAt) < 60,
-              let measuredAt = payload.measuredAt
-        else { return nil }
-        return (payload.checks, measuredAt)
+    private static func cacheFailure(_ error: Error, path: URL) -> CheckResult {
+        CheckResult(source: path.path, id: "doctor.cache", title: "Saved health readings", status: "fail",
+            detail: "Doctor readings could not be read or published: \(error.localizedDescription)",
+            human_action: ToolFailureError.fileRepairInstruction(path, shape: "Preserve the measured checks and their runAt, measuredAt and launchID; repair the unreadable Doctor snapshot."))
+    }
+
+    private static func readCachedReadings(at path: URL) throws -> (checks: [CheckResult], measuredAt: String)? {
+        let data: Data
+        do { data = try Data(contentsOf: path) }
+        catch CocoaError.fileReadNoSuchFile { return nil }
+        let payload = try JSONDecoder().decode(CachedDoctorPayload.self, from: data)
+        guard !payload.launchID.isEmpty,
+              let runAt = NativeTimestampFormat.parseISO8601FractionalFirst(payload.runAt),
+              NativeTimestampFormat.parseISO8601FractionalFirst(payload.measuredAt) != nil else {
+            throw PersistenceCoreError.ioFailure("Invalid Doctor snapshot metadata at \(path.path): launchID, runAt and measuredAt must identify the retained measurements.")
+        }
+        guard payload.launchID == launchID else { return nil }
+        let age = Date().timeIntervalSince(runAt)
+        guard age >= 0 else {
+            throw PersistenceCoreError.ioFailure("Doctor snapshot runAt is in the future at \(path.path); verify the clock and repair its measurement metadata.")
+        }
+        guard age < 60 else { return nil }
+        return (payload.checks, payload.measuredAt)
     }
 
     private struct CachedDoctorPayload: Decodable {
         let checks: [CheckResult]
-        let runAt: String?
-        let measuredAt: String?
-        let launchID: String?
+        let runAt: String
+        let measuredAt: String
+        let launchID: String
     }
 
     public static func supportSnapshotOfflineRollup(_ checks: [CheckResult]) -> String {
@@ -164,6 +180,8 @@ public enum DoctorReadout {
         let buckets = statuses.map(DoctorPlainCopy.bucket)
         if buckets.contains("failing") { return "fail" }
         if buckets.contains("warning") { return "warn" }
+        if buckets.isEmpty || buckets.contains("unclear") { return "unknown" }
+        if buckets.contains("reading") { return "unmeasured" }
         return "ok"
     }
 }
@@ -172,7 +190,7 @@ extension DoctorReadout {
     public static func categoryID(for id: String) -> String {
         switch id {
         case "codex_login", "llm", "codex_login_helper", "live.providers": "Provider"
-        case "daemon_lifecycle", "legacy_launch_agent", "launch_agent", "live.background_loops", "live.bridges",
+        case "live.background_loops", "live.bridges",
              // Per-turn prompt-prefix cache health is a property of the running
              // app, not of stored data.
              "prompt_prefix_health", "model.shims": "Runtime"
@@ -224,6 +242,7 @@ public enum DoctorPlainCopy {
             if failing > 0 { return "failed" }
             if warning > 0 { return "warn" }
             if total == 0 { return "unknown" }
+            if unclear > 0 { return "unknown" }
             if reading > 0 { return "info" }
             return "ok"
         }

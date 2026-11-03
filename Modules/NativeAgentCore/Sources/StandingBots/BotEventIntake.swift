@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import Experiences
 // Blueprint: | `BotEventIntake.swift` | `BotEventIntake` enum; `router`, `slackMessage` |
 
 // Event waking for bots (0.4.12). One listener, no loop of its own: the Slack
@@ -17,19 +18,21 @@ public enum BotEventIntake {
         channelId: String,
         text: String,
         userId: String,
+        eventId: String,
         dataRoot: URL,
         isAutonomyEnabled: @escaping @Sendable () async -> Bool
-    ) async {
+    ) async throws {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let summary = "Slack message in \(channelId): " + String(trimmed.prefix(200))
         let event = BotIncomingEvent(
+            id: eventId,
             source: .slack,
             target: channelId,
             summary: summary,
             detail: "From \(userId) in \(channelId):\n" + trimmed,
             verifiedUserID: userId
         )
-        _ = await router(dataRoot: dataRoot, isAutonomyEnabled: isAutonomyEnabled).deliver(event)
+        _ = try await router(dataRoot: dataRoot, isAutonomyEnabled: isAutonomyEnabled).deliver(event)
     }
 }

@@ -91,11 +91,8 @@ extension SwiftNativeDeskStore {
         }
         try await appendOpUnlocked(op)
         changeBus.emit(StoreChange(store: .desk, path: opsPath))
-        // `integrity` CARRIES FORWARD: this is the post-append view of the SAME
-        // file, so the rows the read could not decode are still in it. Dropping
-        // it here would hand `compactIfNeededUnlocked` a clean-looking feed and
-        // defeat the unknown-row gate on exactly the append that trips the
-        // threshold — the one path the gate exists for.
+        // Carry the same physical row accounting into the post-append feed.
+        // Functional reads admitted every retained row before reaching here.
         var next = DeskFeed(
             base: feed.base, ops: feed.ops + [op],
             fileOpCount: feed.fileOpCount, integrity: feed.integrity
@@ -109,19 +106,31 @@ extension SwiftNativeDeskStore {
         return (state, next)
     }
     func appendOpUnlocked(_ op: DeskOp) async throws {
+        let encoded = op.toJSON()
+        guard let decoded = DeskOp.fromJSON(encoded), decoded.toJSON() == encoded else {
+            throw DeskError.invalidOperation(token: op.op)
+        }
         // Reject projections read before or during the awaited write, even if it throws.
         Self.truthRevision.withLock { $0 += 1 }
         defer { Self.truthRevision.withLock { $0 += 1 } }
-        try await SwiftNativePersistenceCore.appendJSONLDurable(op.toJSON(), to: opsPath)
+        try await SwiftNativePersistenceCore.appendJSONLDurable(encoded, to: opsPath)
     }
-    /// Read the op tail plus the accounting of what the scan threw away.
-    /// `DeskOp.fromJSON` returns nil for an op token this build does not know
-    /// (DeskModels' tolerant `default:` arm) — tolerant on READ, but the count
-    /// has to survive to `compactIfNeededUnlocked`, which would otherwise
-    /// snapshot state folded without those rows and then delete them.
+    /// A functional read is total over the retained feed. No rejected row can
+    /// disappear before alias allocation, finding lookup, mutation or compaction.
     func readOpsWithIntegrityUnlocked() async throws -> (ops: [DeskOp], integrity: SnapshotTailOpLog.OpLogIntegrity) {
         let (raw, report) = try await SwiftNativePersistenceCore.readJSONLReporting(opsPath)
-        let ops = raw.compactMap { DeskOp.fromJSON($0) }
+        guard report.malformedLineCount == 0, !report.trailingPartialLine else {
+            throw DeskError.journalUnavailable(path: opsPath.path,
+                reason: "\(report.malformedLineCount) malformed lines; partial tail: \(report.trailingPartialLine)")
+        }
+        var ops: [DeskOp] = []
+        for (index, row) in raw.enumerated() {
+            guard let op = DeskOp.fromJSON(row) else {
+                throw DeskError.journalUnavailable(path: opsPath.path,
+                    reason: "record \(index + 1) (\(row.objectValue?["op"]?.stringValue ?? "missing op")) does not decode")
+            }
+            ops.append(op)
+        }
         let integrity = SnapshotTailOpLog.OpLogIntegrity(
             malformedLineCount: report.malformedLineCount,
             undecodableRowCount: raw.count - ops.count,
@@ -138,17 +147,22 @@ extension SwiftNativeDeskStore {
             feed: Self.logLabel,
             path: opsPath,
             physicalRowCount: integrity.physicalRowCount,
-            byteCount: SnapshotTailOpLog.OpLogHealth.fileSize(opsPath),
+            byteCount: try SnapshotTailOpLog.OpLogHealth.fileSize(opsPath),
             compactionThreshold: opsCompactionThreshold,
             integrity: integrity
         )
     }
     /// The readable counter behind the log line: what the desk's op-log feed
-    /// currently cannot decode. Zero on a healthy desk. Non-zero means
-    /// compaction is (correctly) refusing to run and the feed is growing —
-    /// surface it rather than letting "the desk looks fine" be the only signal.
+    /// currently cannot decode. Nonzero integrity makes functional reads and
+    /// mutations unavailable; diagnostics still report the original evidence.
     public func opLogIntegrity() async throws -> SnapshotTailOpLog.OpLogIntegrity {
-        try await readOpsWithIntegrityUnlocked().integrity
+        // Diagnostics count rejected rows without presenting a reduced Desk.
+        let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(opsPath)
+        return SnapshotTailOpLog.OpLogIntegrity(
+            malformedLineCount: report.malformedLineCount,
+            undecodableRowCount: rows.reduce(0) { $0 + (DeskOp.fromJSON($1) == nil ? 1 : 0) },
+            trailingPartialLine: report.trailingPartialLine,
+            physicalRowCount: report.physicalLineCount)
     }
     /// Reads the replayable feed: compaction base (if any) + the ops that
     /// FOLLOW it. Ops are read FIRST, base second — a cross-process reader

@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+DreamResidue.swift` | `CognitiveSubstrate` dream contribution: single-flight integration, night claims, residue minting, consumption and persistence; `CognitiveDreamResidue` |
+// Blueprint: | `CognitiveSubstrate+DreamResidue.swift` | `CognitiveSubstrate` dream contribution: single-flight integration, durable cross-night disposition/residue claims, residue minting, consumption and persistence; `CognitiveDreamResidue` |
 
 extension CognitiveSubstrate {
     /// Persist explicit dream tone through night claims, disposition decay and residue, without classifying prose.
@@ -12,6 +12,7 @@ extension CognitiveSubstrate {
         at now: Date,
         dreamId: String? = nil
     ) async -> Bool {
+        guard configuration.enabled, configuration.persistenceEnabled else { return false }
         let night = dreamResidueKey(for: dreamId, at: now)
         if let integration = dreamIntegrations[night] { return await integration.value }
         // Publish before suspending so duplicate deliveries join both writes and share their durable outcome.
@@ -25,9 +26,10 @@ extension CognitiveSubstrate {
 
     private func integrateDreamDispositionOnce(tone: Double, at now: Date, dreamId: String?) async -> Bool {
         await waitForMaintenanceTransition()
+        guard configuration.enabled, configuration.persistenceEnabled else { return false }
         // Each dream-integration write holds its own durable night claim so retries apply each half once.
         let night = dreamResidueKey(for: dreamId, at: now)
-        let dispositionPersisted = dreamDispositionNight == night
+        let dispositionPersisted = dreamDispositionNights.contains(night)
             ? true
             : await integrateDisposition(
                 tone: tone, at: now, dreamNight: night, source: "dream \(night)", undoable: true)
@@ -61,16 +63,14 @@ extension CognitiveSubstrate {
     /// Returns whether the residue claim is durable; nothing to mint counts as durable.
     @discardableResult
     func mintDreamResidue(tone: Double, at now: Date, dreamId: String? = nil) async -> Bool {
-        guard configuration.enabled, tone != 0 else {
-            return true
-        }
+        guard configuration.enabled, configuration.persistenceEnabled else { return false }
+        guard tone != 0 else { return true }
         let key = dreamResidueKey(for: dreamId, at: now)
         // A durable night claim prevents residue re-minting across rerenders and restarts.
-        guard dreamResidueClaimKey != key else { return true }
+        guard !dreamResidueClaims.contains(key) else { return true }
         let valence = (tone.clampedSigned() * 0.35).clampedSigned()
-        let previousClaimKey = dreamResidueClaimKey
         let previousResidue = dreamResidue
-        dreamResidueClaimKey = key
+        dreamResidueClaims.insert(key)
         dreamResidue = CognitiveDreamResidue(
             valence: valence,
             mintedAt: now,
@@ -80,8 +80,8 @@ extension CognitiveSubstrate {
         let claimPersisted = await persistDreamResidueClaimChecked()
         // A claim that fails to reach disk must also be released in memory.
         guard claimPersisted else {
-            if dreamResidueClaimKey == key {
-                dreamResidueClaimKey = previousClaimKey
+            if dreamResidue == CognitiveDreamResidue(valence: valence, mintedAt: now, turnsRemaining: Self.dreamResidueTurns) {
+                dreamResidueClaims.remove(key)
                 dreamResidue = previousResidue
             }
             return false
@@ -133,7 +133,7 @@ extension CognitiveSubstrate {
 
     /// Minting checks the durable night claim before admitting its felt node.
     func persistDreamResidueClaimChecked() async -> Bool {
-        guard configuration.enabled, configuration.persistenceEnabled else { return true }
+        guard configuration.enabled, configuration.persistenceEnabled else { return false }
         do {
             try await persistArtifactChecked(
                 kind: "dream_residue",
@@ -151,7 +151,7 @@ extension CognitiveSubstrate {
     func dreamResidueArtifactPayload(at now: Date) -> JSONValue {
         var object: [String: JSONValue] = [
             "updatedAt": .double(now.timeIntervalSince1970),
-            "claimKey": .string(dreamResidueClaimKey ?? ""),
+            "claimKeys": .array(dreamResidueClaims.sorted().map(JSONValue.string)),
         ]
         if let residue = dreamResidue {
             object["valence"] = .double(residue.valence)
@@ -164,10 +164,10 @@ extension CognitiveSubstrate {
     /// Reset before restore so a missing or corrupt artifact cannot retain a stale in-memory night.
     func restoreDreamResidue(from payloads: [JSONValue]) {
         dreamResidue = nil
-        dreamResidueClaimKey = nil
+        dreamResidueClaims = []
         guard case .object(let object)? = payloads.first else { return }
-        if let key = object["claimKey"]?.stringValue, !key.isEmpty {
-            dreamResidueClaimKey = key
+        if case .array(let keys)? = object["claimKeys"] {
+            dreamResidueClaims = Set(keys.compactMap(\.stringValue))
         }
         guard let valence = object["valence"]?.numberValue(coercingStrings: false, finiteOnly: false),
               let mintedAt = dateValue(object["mintedAt"]),

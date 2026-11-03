@@ -106,7 +106,11 @@ extension AppToolExecutor {
 
     private static func jsonObjectToAny(_ input: [String: JSONValue]) throws -> [String: Any] {
         let data = try JSONValue.object(input).serializedData(pretty: false)
-        return (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ToolFailureError("The native action arguments did not serialize as an object. Nothing ran.",
+                effects: .none, code: "invalid_arguments")
+        }
+        return object
     }
 
 

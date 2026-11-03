@@ -26,10 +26,7 @@ extension SwiftNativeDeskStore {
         var archived: Set<String> = []
         var accounting = base?.state ?? DeskState(items: [], generatedTs: "")
         if let base {
-            for var item in base.state.items {
-                if item.origin == .system, item.findingKey == nil {
-                    item.findingKey = item.notes.lazy.compactMap(\.legacyFindingKey).first
-                }
+            for item in base.state.items {
                 byHandle[item.handle] = item
                 createOrder.append(item.handle)
             }
@@ -101,10 +98,9 @@ extension SwiftNativeDeskStore {
                     item.updatedAt = op.ts
                 }
                 byHandle[op.handle] = item
-            case let .appendNote(text, author):
+            case let .appendNote(text, author, releaseCondition):
                 guard var item = byHandle[op.handle] else { continue }
-                let note = DeskNote(ts: op.ts, text: text, author: author)
-                if item.origin == .system, item.findingKey == nil { item.findingKey = note.legacyFindingKey }
+                let note = DeskNote(ts: op.ts, text: text, author: author, releaseCondition: releaseCondition)
                 Self.appendNoteCapped(&item, note)
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
@@ -161,10 +157,6 @@ extension SwiftNativeDeskStore {
                     ))
                     accounting.chargeWorkSlot(handle: op.handle, day: day, id: attemptId)
                 }
-                if var pursuit = item.pursuit {
-                    Self.recomputePursuitCounters(&pursuit, slotsByDay: accounting.workSlotsByDay, handle: op.handle)
-                    item.pursuit = pursuit
-                }
                 item.updatedAt = op.ts
                 byHandle[op.handle] = item
             case let .completeWorkAttempt(attemptId, receipt, disposition, artifactRefs):
@@ -180,7 +172,6 @@ extension SwiftNativeDeskStore {
                 Self.appendNoteCapped(&item, DeskNote(ts: op.ts, text: receipt))
                 if var pursuit = item.pursuit, item.workAttempts[index].lane == .pursuit {
                     if disposition != .unstarted { pursuit.lastWorkedAt = op.ts }
-                    Self.recomputePursuitCounters(&pursuit, slotsByDay: accounting.workSlotsByDay, handle: op.handle)
                     item.pursuit = pursuit
                 } else if disposition != .unstarted {
                     item.cadence.lastRefreshAt = op.ts
@@ -298,18 +289,6 @@ extension SwiftNativeDeskStore {
         }
         return result
     }
-    /// Recompute a pursuit's derived counters from durable slot identities — pure
-    /// (no wall clock): `workSessionsToday` = reservations sharing the NEWEST
-    /// reservation day (lexicographic max on yyyy-MM-dd). Pruning never removes
-    /// those identities; this field is the display denorm.
-    static func recomputePursuitCounters(_ p: inout Pursuit, slotsByDay: [String: [String: [String]]], handle: String) {
-        guard let newestDay = slotsByDay.keys.filter({ slotsByDay[$0]?[handle] != nil }).max() else {
-            p.workSessionsToday = 0
-            return
-        }
-        p.workSessionsToday = slotsByDay[newestDay]?[handle]?.count ?? 0
-    }
-
     static func nextCadenceRefresh(after completedAt: String, cadence: Cadence) -> String? {
         guard let completed = DeskClock.parseISO(completedAt) else { return nil }
         let seconds: TimeInterval

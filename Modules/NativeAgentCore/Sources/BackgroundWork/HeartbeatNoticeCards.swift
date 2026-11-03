@@ -11,7 +11,7 @@ import AgentWorkspace
 import NotificationInbox
 import Privacy
 import Cognition
-// Blueprint: | `HeartbeatNoticeCards.swift` | HeartbeatBackgroundWork stable notice cards, attention delivery and inactive-condition retirement |
+// Blueprint: | `HeartbeatNoticeCards.swift` | HeartbeatBackgroundWork stable notice cards, retained attention intent across active refreshes and inactive-condition retirement |
 extension HeartbeatBackgroundWork {
     public func upsertHeartbeatNoticeCard(dataRoot: URL, notice: HeartbeatNotice) async throws {
         let body = notice.body.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -28,7 +28,7 @@ extension HeartbeatBackgroundWork {
             "detail": .string(body),
             "condition_id": .string(notice.conditionId),
             "condition_active": .bool(true),
-            "related_mission_id": .null,
+            "related_execution_id": .null,
             "related_approval_id": .null,
             "related_paths": .array([]),
             "related_groups": .array([]),
@@ -44,6 +44,12 @@ extension HeartbeatBackgroundWork {
                        previous["condition_active"] != .bool(false) {
                         for key in ["status", "read_at", "created_at"] {
                             if let value = previous[key] { updated[key] = value }
+                        }
+                        // The refreshed source gets its own revision, but the
+                        // retained knock must survive for ledger admission/retry.
+                        // Delivery settlement belongs only to the ledger.
+                        for (key, value) in previous where key.hasPrefix("held_") {
+                            updated[key] = value
                         }
                         return (.object(updated), false)
                     }

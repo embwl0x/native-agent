@@ -8,7 +8,7 @@ import PersonaEngine
 import ProviderRouting
 import CognitiveSubstrate
 import Transcripts
-// Blueprint: | `REMConsolidator.swift` | `REMConsolidator` actor; `runWeeklyREM` shares one checked diary window with distillation, filters a fresh tombstone batch and resolves committed causal refs for reflection; `rankedByRecurrence` |
+// Blueprint: | `REMConsolidator.swift` | `REMConsolidator` actor; `runWeeklyREM` reads active diary sections, reports damaged evidence while distilling readable siblings and resolves committed causal refs for reflection; pins require a checked live GROWTH read; `rankedByRecurrence` |
 
 // USER.md is owned by MemoryV2 and lives in the active persona root beside
 // SOUL/VOICE/GROWTH. REM reads selected persona context, but approval
@@ -129,7 +129,7 @@ public actor REMConsolidator {
                 skipReason: "already_running"
             )
             await persistRunReport(
-                outcome: .skipped,
+                outcome: report.outcome,
                 reason: "rem_already_running",
                 report: report,
                 startedAt: runStartedAt
@@ -143,35 +143,20 @@ public actor REMConsolidator {
         // records too, without manufacturing a marker mutation to undo.
         var rollback: (@Sendable () async -> Void)?
         do {
-            // Check cancellation before legacy import can write proposals.
+            // Check cancellation before the pass can write proposals.
             try Task.checkCancellation()
 
-            // Tombstones are durable rejection state. Validate before importing,
+            // Tombstones are durable rejection state. Validate before
             // claiming the weekly marker, calling the LLM, or writing proposals so
             // a corrupt denylist cannot be treated as empty and later overwritten.
             let tombStore = REMTombstoneStore(dataRoot: dataRoot)
             _ = try await tombStore.loadAll()
 
-            // (1a) Canonical store open — first open in the pipeline triggers the
-            // one-time legacy harness-file import (idempotent; NOT at app boot).
-            // Import failure is non-fatal: the legacy file just waits for the
-            // next pass.
+            // (1a) Read the sole canonical proposal store.
             let store = REMProposalStore(dataRoot: dataRoot)
             // Validate eviction evidence before import, marker claims, or proposal
             // staging. A malformed log must not leave new rows/cards for a retry.
             let growthProposalRows = try store.loadAllStrictly()
-            do {
-                let imported = try await store.importLegacyHarnessFileIfNeeded()
-                if imported > 0 {
-                    FileHandle.standardError.write(Data(
-                        "REMConsolidator: imported \(imported) legacy proposals\n".utf8
-                    ))
-                }
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "REMConsolidator: legacy proposal import failed: \(error)\n".utf8
-                ))
-            }
 
         // (1b) Six-day exclusion claim shared by the weekly drivers, stamped
         // BEFORE distillation, not proof of completion. Failure releases it
@@ -211,7 +196,7 @@ public actor REMConsolidator {
                 skipReason: "weekly_reservation_fresh"
             )
             await persistRunReport(
-                outcome: .skipped,
+                outcome: report.outcome,
                 reason: "weekly_reservation_fresh",
                 report: report,
                 startedAt: runStartedAt
@@ -226,12 +211,28 @@ public actor REMConsolidator {
             rollback = restore
         }
 
-        // (2) Read the inclusive local-day window once for eligibility and LLM input.
-        let calendar = DreamREMSchedule.localCalendar()
-        let start = calendar.startOfDay(for: now)
-        let since = calendar.date(byAdding: .day, value: -7, to: start) ?? start
-        let entries = try FileBackedDreamDiary(dataRoot: dataRoot).entriesSince(since)
-        let sourceRefs = Set(entries.flatMap { $0.content.map { DreamEntryProvenance.sources(in: $0) } ?? [] })
+        // Active entries include sections retained for repair after an earlier pass.
+        // Age cannot make a damaged section disappear from its owner's next reading.
+        let pendingEntries = try FileBackedDreamDiary(dataRoot: dataRoot).entriesSince(nil)
+        var entries: [DreamEntry] = []
+        var unavailableSections: [String] = []
+        var entrySources: [String: [String]] = [:]
+        for var entry in pendingEntries {
+            guard let content = entry.content else {
+                unavailableSections.append("dream_diary/\(entry.filename ?? entry.date): content unavailable")
+                continue
+            }
+            let sections = DreamEntryProvenance.readClaims(in: content, as: DreamEntryProvenance.self)
+            unavailableSections += sections.compactMap { section in
+                section.unavailable.map { "dream_diary/\(entry.filename ?? entry.date): \($0)" }
+            }
+            let readable = sections.filter { $0.unavailable == nil }
+            guard !readable.isEmpty else { continue }
+            entry.content = readable.map(\.content).joined(separator: "\n")
+            entrySources[entry.filename ?? entry.date] = Array(Set(readable.flatMap { $0.claims.flatMap(\.sourceRefs) })).sorted()
+            entries.append(entry)
+        }
+        let sourceRefs = Set(entrySources.values.flatMap { $0 })
         let resolver = ChatSessionRecollections.ExperienceResolver(dataRoot: dataRoot)
         let resolved = try await resolver.resolve(for: Array(sourceRefs), includingSourceRows: true)
         let identities = resolved.identities
@@ -239,7 +240,7 @@ public actor REMConsolidator {
             messages: resolved.messages)
         for entry in entries {
             if let content = entry.content {
-                let sources = DreamEntryProvenance.sources(in: content)
+                let sources = entrySources[entry.filename ?? entry.date] ?? []
                 var cause = CognitiveReflectionCause(text: content,
                     sources: sources, material: reflectionMaterial)
                 cause.sourcePeerIds = CognitiveReflectionCause.unionPeerIds([DreamEntryProvenance.peerIds(in: content)]
@@ -287,7 +288,7 @@ public actor REMConsolidator {
             if rawProposals.isEmpty {
                 let zeroMsg = "REMConsolidator: LLM distillation yielded ZERO usable proposals over "
                     + "\(entries.count) diary entries — check the drops above; an empty week "
-                    + "should be the model returning [], not a parse casualty.\n"
+                    + "should be the model returning {\"proposals\": []}, not a parse casualty.\n"
                 FileHandle.standardError.write(Data(zeroMsg.utf8))
             }
             // A reply that did not decode releases the weekly claim for retry.
@@ -374,6 +375,7 @@ public actor REMConsolidator {
             dweltOnKept: dweltOnKept == 0 ? nil : dweltOnKept,
             provenanceUnavailableKept: unavailableKept == 0 ? nil : unavailableKept
         )
+        report.unavailableDreamSections = unavailableSections.isEmpty ? nil : unavailableSections
         let keptIds = Set(kept.map(\.id))
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -390,9 +392,15 @@ public actor REMConsolidator {
             cause.sourcePeerIds = sourcePeers
             report.reflectionMaterial["rem_proposal:\(row.id)"] = cause
         }
+        // A partial read is a failed pass too. Release only our own weekly
+        // claim while no proposals have landed; durable rows keep their IDs.
+        if !unavailableSections.isEmpty, let release = rollback {
+            await release()
+            rollback = nil
+        }
         await persistRunReport(
-            outcome: .completed,
-            reason: nil,
+            outcome: report.outcome,
+            reason: unavailableSections.isEmpty ? nil : "dream_evidence_unavailable",
             report: report,
             startedAt: runStartedAt
         )
@@ -487,9 +495,12 @@ public actor REMConsolidator {
     /// Current GROWTH target; other persona documents are read-only context.
     private func readGrowthBody() throws -> String {
         let url = personaRoot.appendingPathComponent("GROWTH.md")
-        let raw = FileManager.default.fileExists(atPath: url.path)
-            ? try String(contentsOf: url, encoding: .utf8) : ""
-        return SwiftNativePersonaEngine.filterEpisodicGrowthLines(raw)
+        do { return try SwiftNativePersonaEngine.readPersonaDocument(at: url) }
+        catch {
+            throw PersonaEngineError.rootUnreadable(
+                reason: "cannot read \(url.path): \(error.localizedDescription). Repair or restore this document before continuing."
+            )
+        }
     }
 
     /// Private REM reflection with selected persona documents and USER context.
@@ -574,24 +585,14 @@ public actor REMConsolidator {
         var out: [String: [REMPin]] = [:]
         if !approved.isEmpty {
             let doc = "GROWTH.md"
-            let document: String?
-            // An absent document retires pins; an unreadable one preserves
-            // them until its authority can be checked again.
             let url = personaRoot.appendingPathComponent(doc)
-            if FileManager.default.fileExists(atPath: url.path) {
-                do {
-                    document = try String(contentsOf: url, encoding: .utf8)
-                } catch {
-                    document = nil
-                    FileHandle.standardError.write(Data(
-                        "REMConsolidator: \(doc) unreadable (\(error)); keeping its pins\n".utf8
-                    ))
-                }
-            } else {
-                document = ""
-                FileHandle.standardError.write(Data(
-                    "REMConsolidator: \(doc) is absent; retiring its pins\n".utf8
-                ))
+            let document: String
+            do {
+                document = try SwiftNativePersonaEngine.readPersonaDocument(at: url)
+            } catch {
+                throw PersistenceCoreError.ioFailure(
+                    "REM pins could not be derived from \(url.path): \(error.localizedDescription). "
+                        + "Preserve the existing index and repair the document before rebuilding pins.")
             }
             let live = approved.filter { Self.pinIsLive($0.proposalText, inDocument: document) }
             let sorted = live.sorted { $0.createdAt > $1.createdAt }.prefix(3)
@@ -603,9 +604,8 @@ public actor REMConsolidator {
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: pinsURL)
     }
 
-    /// A standalone entry keeps its pin; unreadable documents preserve pins, while absent documents retire them.
-    static func pinIsLive(_ text: String, inDocument document: String?) -> Bool {
-        guard let document else { return true }
+    /// Only a successfully read document can establish a live standalone entry.
+    static func pinIsLive(_ text: String, inDocument document: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         return REMGrowthWriter.containsEntryParagraph(document, trimmed)

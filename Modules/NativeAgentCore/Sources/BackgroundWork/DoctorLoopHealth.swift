@@ -387,28 +387,31 @@ public enum DoctorLoopHealth {
         receiptsFile: URL,
         maxBytes: Int = 512 * 1024,
         maxReceipts: Int = 500
-    ) -> [String: [FailureIncident]] {
-        guard let read = try? SwiftNativePersistenceCore.tailPhysicalLines(receiptsFile, limit: .max, maxBytes: maxBytes),
-              let text = String(data: Data(read.lines.joined(separator: [0x0A])), encoding: .utf8) else { return [:] }
+    ) throws -> [String: [FailureIncident]] {
+        guard let read = try SwiftNativePersistenceCore.tailPhysicalLines(receiptsFile, limit: .max, maxBytes: maxBytes) else { return [:] }
         var result: [String: [FailureIncident]] = [:]
         // Drop the first line when we started mid-file: it is almost certainly
         // a partial JSON row.
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
-        let usable = read.truncatedToByteWindow ? lines.dropFirst() : lines[...]
+        let usable = read.lines.dropFirst(read.leadingFragment ? 1 : 0)
         for line in usable.suffix(maxReceipts) {
-            guard let rowData = line.data(using: .utf8),
-                  let row = try? JSONSerialization.jsonObject(with: rowData) as? [String: Any],
-                  let loopId = row["loopId"] as? String else { continue }
+            guard let row = try JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  let loopId = row["loopId"] as? String else {
+                throw PersistenceCoreError.ioFailure("Loop failure history at \(receiptsFile.path) contains a malformed row; repair the retained ledger before judging loop health")
+            }
             let timestamp = (row["lastAt"] as? String) ?? (row["createdAt"] as? String) ?? ""
             guard let date = NativeTimestampFormat.parseISO8601(timestamp) else {
-                continue
+                throw PersistenceCoreError.ioFailure("Loop failure history at \(receiptsFile.path) has an invalid lastAt/createdAt timestamp for \(loopId); repair the retained ledger before judging loop health")
             }
             let firstTimestamp = (row["firstAt"] as? String) ?? (row["createdAt"] as? String) ?? ""
             let firstAt = NativeTimestampFormat.parseISO8601(firstTimestamp)
+            guard let firstAt, firstAt <= date,
+                  let occurrences = row["occurrences"] as? Int, occurrences > 0 else {
+                throw PersistenceCoreError.ioFailure("Loop failure history at \(receiptsFile.path) has invalid firstAt/occurrences for \(loopId); repair the retained ledger before judging loop health")
+            }
             result[loopId, default: []].append(FailureIncident(
                 firstAt: firstAt,
                 lastAt: date,
-                cumulativeOccurrences: max(1, row["occurrences"] as? Int ?? 1)
+                cumulativeOccurrences: occurrences
             ))
         }
         return result

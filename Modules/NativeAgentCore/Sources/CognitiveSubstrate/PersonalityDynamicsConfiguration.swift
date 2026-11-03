@@ -1,9 +1,10 @@
 import Foundation
 
-// Blueprint: | `PersonalityDynamicsConfiguration.swift` | `PersonalityDynamicsConfiguration`: fixed felt-layer bounds and persona-derived warmth/humor parameters |
+// Blueprint: | `PersonalityDynamicsConfiguration.swift` | `PersonalityDynamicsConfiguration`: fixed felt-layer bounds and persona-derived warmth/humor parameters; cold unreadable warmth/humor remain absent while fixed rates stay available |
 
 /// Fixed felt-layer constants with bounded warmth and humor derived from the persona.
 public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
+    private static let baseWarmthEarnedSpan = 0.30
 
     // MARK: - Felt warmth range (CognitiveSubstrate+Capsule.swift)
 
@@ -11,7 +12,7 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// word gate and clear of `tender`, so an agent has a reachable neutral.
     public let feltWarmthRest: Double = 0.55
     /// The span of the warmth scale earned through live social warmth.
-    public let feltWarmthEarnedSpan: Double
+    public let feltWarmthEarnedSpan: Double?
     /// How strongly uncertainty cools felt warmth (a tense working moment reads
     /// cool rather than cold).
     public let feltWarmthUncertaintyCooling: Double = 0.45
@@ -108,20 +109,22 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     // MARK: - Trait-derived fields
 
     /// Weight of `play` mode in exemplar selection, derived from the persona's humor trait.
-    public let playModeWeight: Double
+    public let playModeWeight: Double?
 
-    private init(feltWarmthEarnedSpan: Double = 0.30, playModeWeight: Double = 0.5) {
+    private init(feltWarmthEarnedSpan: Double? = PersonalityDynamicsConfiguration.baseWarmthEarnedSpan, playModeWeight: Double? = 0.5) {
         self.feltWarmthEarnedSpan = feltWarmthEarnedSpan
         self.playModeWeight = playModeWeight
     }
 
     public static let `default` = PersonalityDynamicsConfiguration()
+    /// Fixed rates remain usable; no warmth/humor is invented before a good read.
+    public static let unavailable = PersonalityDynamicsConfiguration(feltWarmthEarnedSpan: nil, playModeWeight: nil)
 
     /// Warmth changes only the earned span, never the resting warmth.
     public static func derived(warmth: Double, humor: Double) -> PersonalityDynamicsConfiguration {
         let centeredWarmth = (warmth.clamped01() - 0.5) * 2
         return PersonalityDynamicsConfiguration(
-            feltWarmthEarnedSpan: Self.default.feltWarmthEarnedSpan * (1 + centeredWarmth * 0.5),
+            feltWarmthEarnedSpan: baseWarmthEarnedSpan * (1 + centeredWarmth * 0.5),
             playModeWeight: humor.clamped01()
         )
     }

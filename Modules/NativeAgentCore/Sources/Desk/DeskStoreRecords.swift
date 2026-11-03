@@ -15,6 +15,7 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case archiveRefusedStanding(handle: String)
     case archiveRefusedNonTerminalSelf(handle: String, status: DeskStatus)
     case archiveRefusedUnresolvedContinuation(handle: String)
+    case archiveRefusedPendingMigration(handle: String)
     case queueCreationRequiresQueuePath
     // Pursuit invariants.
     case pursuitCapReached(openCount: Int)
@@ -44,6 +45,8 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case compactionBaseCorrupt(path: String)
     /// Unreadable bytes remain a retryable I/O error, distinct from a corrupt compaction base.
     case compactionBaseUnreadable(path: String)
+    case journalUnavailable(path: String, reason: String)
+    case invalidOperation(token: String)
 
     public var errorDescription: String? {
         switch self {
@@ -67,6 +70,8 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
             return "desk: cannot archive \(handle) — item is not terminal (status \(status.rawValue)); close it first"
         case .archiveRefusedUnresolvedContinuation(let handle):
             return "desk: cannot archive \(handle) — its continuation has unfinished steps; verify them through their domains first"
+        case .archiveRefusedPendingMigration(let handle):
+            return "desk: cannot archive \(handle) while its scheduled-intention migration is unfinished; repair the launch migration first"
         case .queueCreationRequiresQueuePath:
             return "desk: use queue.add to add a step to my queue so its readiness and origin are preserved"
         case .pursuitCapReached(let openCount):
@@ -112,6 +117,10 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
             return "desk: compaction base at \(path) exists but does not decode — refusing to replay from the tail alone (that would silently drop every compacted item)"
         case .compactionBaseUnreadable(let path):
             return "desk: compaction base at \(path) exists but its bytes could not be read (transient IO) — retry rather than treating the desk as corrupt"
+        case let .journalUnavailable(path, reason):
+            return "desk: journal at \(path) is unavailable: \(reason). Preserve the file and reconcile the named record to the current writer's shape before replaying."
+        case .invalidOperation(let token):
+            return "desk: \(token) does not encode a complete current operation; no journal row was written. Repair its arguments at the mutation owner."
         }
     }
 }
@@ -134,7 +143,8 @@ struct DeskNonTerminalRecord: Sendable, Equatable {
     static func fromJSON(_ value: JSONValue) -> DeskNonTerminalRecord? {
         guard case .object(let obj) = value,
               case .string(let raw)? = obj["status"],
-              let status = DeskStatus(rawValue: raw) else { return nil }
+              let status = DeskStatus(rawValue: raw), !status.isTerminal,
+              DeskJSON.optionalStringsAreValid(obj, keys: ["blockedReason", "waitingOn"]) else { return nil }
         func str(_ k: String) -> String? {
             if case .string(let s)? = obj[k] { return s }
             return nil
@@ -174,14 +184,17 @@ struct DeskCompactionBase: Sendable {
     /// Compaction-base decode requires every row and ledger key; the tail cannot replace missing data.
     static func fromJSON(_ value: JSONValue) -> DeskCompactionBase? {
         guard case .object(let obj) = value,
+              case .int(1)? = obj["version"],
               let stateVal = obj["state"], let state = DeskState.fromJSON(stateVal),
-              // The sole surviving snapshot must decode stably and preserve all data outside named migrations.
+              // The sole surviving snapshot must preserve every stored value.
               deskBaseRoundTripIsFaithful(decoded: state, onDisk: stateVal),
               case .string(let lastCompactedOpId)? = obj["lastCompactedOpId"],
               !lastCompactedOpId.isEmpty,
               case .string(let compactedAt)? = obj["compactedAt"],
               case .object(let hw)? = obj["aliasHighWater"],
-              case .object(let lnt)? = obj["lastNonTerminal"] else { return nil }
+              case .object(let lnt)? = obj["lastNonTerminal"],
+              case .int(let rawCount)? = obj["compactedOpCount"], rawCount >= 0,
+              let compactedOpCount = Int(exactly: rawCount) else { return nil }
         var aliasHighWater: [String: Int] = [:]
         for (k, v) in hw {
             guard case .int(let i) = v else { return nil }
@@ -192,8 +205,6 @@ struct DeskCompactionBase: Sendable {
             guard let rec = DeskNonTerminalRecord.fromJSON(v) else { return nil }
             lastNonTerminal[k] = rec
         }
-        var compactedOpCount = 0
-        if case .int(let c)? = obj["compactedOpCount"] { compactedOpCount = Int(c) }
         return DeskCompactionBase(
             state: state,
             aliasHighWater: aliasHighWater,
@@ -205,56 +216,10 @@ struct DeskCompactionBase: Sendable {
     }
 }
 
-/// The compaction base's round-trip gate (see `DeskCompactionBase.fromJSON`).
-/// True when re-encoding the decoded state is FAITHFUL to the tree on disk:
-///
-///   1. DECODE-STABILITY — decoding the re-encoded tree and encoding it again
-///      reproduces the same tree. Normalization applied once must be a fixed
-///      point, so whatever the decoder rewrote it has now finished rewriting.
-///   2. SHAPE-PRESERVATION — the re-encoded tree has the same object key sets,
-///      the same array counts, and the same scalar JSON kinds as the tree on
-///      disk, recursively. Only scalar VALUES may differ.
-///
-/// (2) is the fail-loud half. The store's migration vocabulary rewrites scalars
-/// in place (the retired origin raw value → "agent"; a Pursuit bound clamped
-/// into range) and that is a faithful read of an intact snapshot. Everything
-/// the decoder cannot represent — an unknown extra key, a skipped ref, a
-/// wrong-typed `notify.on` that collapses to [] and drops the key, a scalar
-/// whose TYPE the decoder had to coerce — changes the shape and is refused.
+/// The current snapshot preserves its exact JSON tree. No scalar migration,
+/// synthesized ledger or clamped saved bound is admitted here.
 func deskBaseRoundTripIsFaithful(decoded state: DeskState, onDisk: JSONValue) -> Bool {
-    let encoded = state.toJSON()
-    guard let restable = DeskState.fromJSON(encoded), restable.toJSON() == encoded else { return false }
-    guard case .object(var original) = onDisk,
-          case .object(let encodedObject) = encoded else { return false }
-    if original["version"] == .int(1), original["workSlotsByDay"] == nil {
-        original["workSlotsByDay"] = encodedObject["workSlotsByDay"]
-        original["version"] = .int(2)
-    }
-    return deskJSONShapeMatches(encoded, .object(original))
-}
-
-/// Recursive equality preserves keys, array counts, scalar kinds and values except named scalar migrations.
-private let deskScalarMigrationKeys: Set<String> = ["origin", "maxSessions", "maxDays"]
-
-private func deskJSONShapeMatches(_ a: JSONValue, _ b: JSONValue, key: String? = nil) -> Bool {
-    switch (a, b) {
-    case let (.object(ao), .object(bo)):
-        guard Set(ao.keys) == Set(bo.keys) else { return false }
-        for (k, av) in ao {
-            guard let bv = bo[k], deskJSONShapeMatches(av, bv, key: k) else { return false }
-        }
-        return true
-    case let (.array(aa), .array(ba)):
-        guard aa.count == ba.count else { return false }
-        return zip(aa, ba).allSatisfy { deskJSONShapeMatches($0, $1, key: key) }
-    case (.null, .null):
-        return true
-    case (.bool, .bool), (.int, .int), (.double, .double), (.string, .string):
-        if a == b { return true }
-        return key.map { deskScalarMigrationKeys.contains($0) } ?? false
-    default:
-        return false
-    }
+    state.toJSON() == onDisk
 }
 
 /// One consistent read of the replayable feed: compaction base (if any), the
@@ -264,10 +229,8 @@ struct DeskFeed: Sendable {
     let base: DeskCompactionBase?
     var ops: [DeskOp]
     var fileOpCount: Int
-    /// What the raw op-log scan could not use — malformed lines and rows whose
-    /// op token this build does not know. Compaction REFUSES to run while this
-    /// is non-clean (see `SnapshotTailOpLog`'s unknown-row policy): the
-    /// truncate would erase exactly the rows we just skipped.
+    /// Physical feed integrity. Functional reads require every row before a
+    /// feed is returned; diagnostics may report rejected records separately.
     var integrity: SnapshotTailOpLog.OpLogIntegrity = .clean
 
     /// Compaction thresholds count physical `desk_ops.jsonl` rows, including undecodable ops.

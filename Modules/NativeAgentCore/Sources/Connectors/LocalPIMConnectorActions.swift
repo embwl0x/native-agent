@@ -7,7 +7,7 @@ import PersistenceCore
 import Privacy
 import MacIntegration
 import ToolExecution
-// Blueprint: | `LocalPIMConnectorActions.swift` | Shared EventKit authorization facts, scalar interpretation and argument refusals for Calendar and Reminders |
+// Blueprint: | `LocalPIMConnectorActions.swift` | Shared EventKit authorization facts, checked query booleans and argument refusals for Calendar and Reminders |
 
 @MainActor
 public enum LocalPIMConnectorActions {
@@ -26,6 +26,7 @@ public enum LocalPIMConnectorActions {
             switch tool {
             case "mac_calendar_modify_event": _ = try calendarModifyArguments(input: input)
             case "mac_calendar_delete_event": _ = try calendarDeleteExpectation(input: input)
+            case "mac_reminders_query": _ = try remindersQueryFlags(input: input)
             case "mac_reminders_delete": _ = try reminderDeleteExpectation(input: input)
             case "mac_reminders_update": _ = try reminderUpdateArguments(input: input)
             default: break
@@ -135,11 +136,12 @@ public enum LocalPIMConnectorActions {
         ])
     }
 
-    static func inputBool(_ raw: JSONValue?, defaultValue: Bool) -> Bool {
-        switch raw {
-        case .bool, .string: return ConnectorInputValue.bool(raw, default: defaultValue)
-        default: return defaultValue
+    static func inputBool(_ input: [String: JSONValue], key: String, defaultValue: Bool, action: String) throws(CalendarArgumentError) -> Bool {
+        guard let raw = input[key] else { return defaultValue }
+        guard case .bool(let value) = raw else {
+            throw CalendarArgumentError(action: action, reason: "Invalid field: \(key) (must be a boolean)")
         }
+        return value
     }
 
     nonisolated static func iso(_ date: Date) -> String {

@@ -32,8 +32,8 @@ import os
 ///   • `label: value` on one line where the label names a secret and the value
 ///     is a single token — "API key: sk-live-…";
 ///   • a code-shaped token sitting immediately right of / below a SHORT label
-///     that names a secret — the same proximity heuristic the legend uses to
-///     name an unlabeled control, because a form reads the same way either way.
+///     that names a secret. This masks possible secrets; it does not assign
+///     an unrelated caption as a control's action identity.
 ///
 /// Each detector below guards against matching ordinary prose.
 public enum MacScreenViewTextRedaction {
@@ -330,10 +330,18 @@ public enum MacScreenViewTextRedaction {
         let attributes = node.attributes
         var object: [String: JSONValue] = [
             "role": .string(attributes.role),
-            "enabled": .bool(attributes.enabled),
-            "actions": .array(attributes.actions.map { .string($0) }),
+            "enabled": attributes.enabled.map(JSONValue.bool) ?? .null,
             "path": .array(node.path.map { .int(Int64($0)) }),
         ]
+        if !attributes.attributeGaps.isEmpty {
+            object["attribute_gaps"] = .array(attributes.attributeGaps.map(JSONValue.string))
+        }
+        if attributes.labelUnreadable { object["label_source"] = .string("unreadable") }
+        if let reason = attributes.actionsUnreadable {
+            object["actions_unreadable"] = .string(reason)
+        } else {
+            object["actions"] = .array(attributes.actions.map { .string($0) })
+        }
         if let subrole = attributes.subrole { object["subrole"] = .string(subrole) }
         if let selected = attributes.selected { object["selected"] = .bool(selected) }
         if let state = attributes.state { object["state"] = .string(state) }
@@ -357,7 +365,15 @@ public enum MacScreenViewTextRedaction {
             )
         }
         if let value = node.attributes.value {
-            object["value"] = MacScreenViewBuilder.isSecretField(
+            // A value whose secrecy evidence did not read (its label: title,
+            // description or caption, or the subrole that marks a secure field)
+            // cannot be proven non-secret, as an unreadable "CVV" caption: withheld.
+            let editable = ["AXTextField", "AXTextArea", "AXComboBox"].contains(node.attributes.role)
+            let secrecyUnread = node.attributes.attributeGaps.contains { gap in
+                [kAXTitleAttribute, kAXDescriptionAttribute, "caption read"].contains { gap.hasPrefix($0 + ":") }
+                    || (editable && gap.hasPrefix(kAXSubroleAttribute + ":"))
+            }
+            object["value"] = secrecyUnread || MacScreenViewBuilder.isSecretField(
                 role: node.attributes.role,
                 subrole: node.attributes.subrole,
                 label: node.attributes.title
@@ -547,15 +563,25 @@ public enum MacScreenViewTextRedaction {
         deadline: Date, nonnegativeFrames: Bool = true) throws -> [MacAXNode] {
         try MacAXLimits.$readDeadline.withValue(deadline) {
             let snapshot = MacAccessibilityReader.walk(source: source, root: root, limits: .whole,
-                read: source.maskingAttributes, deadline: deadline, stopAtCut: true)
-            guard !snapshot.truncated else { throw SenseFailure(code: "redaction_coverage_unavailable", message: "AX inspection was cut: \(snapshot.truncationReasons.joined(separator: ", ")).") }
+                read: { try source.checkedMaskingAttributes(of: $0) }, deadline: deadline, stopAtCut: true)
+            guard !snapshot.truncated else {
+                throw SenseFailure(code: "redaction_coverage_unavailable", message: "AX inspection was cut: \(snapshot.truncationReasons.joined(separator: ", ")). "
+                    + snapshot.readFailures.joined(separator: "; "))
+            }
             guard !snapshot.nodes.isEmpty else { throw SenseFailure(code: "redaction_coverage_unavailable", message: "AX inspection returned no nodes.") }
-            guard snapshot.nodes.allSatisfy({ node in
-                guard MacScreenViewBuilder.isMarkable(node.attributes) else { return true }
-                guard let frame = node.attributes.frame else { return false }
-                return (!nonnegativeFrames || frame.w >= 0 && frame.h >= 0)
-                    && [frame.x, frame.y, frame.w, frame.h].allSatisfy(\.isFinite)
-            }) else { throw SenseFailure(code: "redaction_coverage_unavailable", message: "An AX control has no finite frame for secret masking.") }
+            for node in snapshot.nodes {
+                let attributes = node.attributes
+                // Static prose and container captions can reveal secrets too.
+                guard MacScreenViewBuilder.isMarkable(attributes)
+                    || MacScreenViewBuilder.textRoles.contains(attributes.role)
+                    || attributes.title != nil || attributes.value != nil else { continue }
+                guard let frame = attributes.frame,
+                      (!nonnegativeFrames || frame.w >= 0 && frame.h >= 0),
+                      [frame.x, frame.y, frame.w, frame.h].allSatisfy(\.isFinite) else {
+                    throw SenseFailure(code: "redaction_coverage_unavailable",
+                        message: "Secret masking element at path \(node.path) (\(attributes.role)) has unreadable AXPosition/AXSize: no finite frame.")
+                }
+            }
             return snapshot.nodes
         }
     }
@@ -583,7 +609,7 @@ public enum MacScreenViewTextRedaction {
                 return false
             }
             let control = MacScreenViewBuilder.isMarkable(attributes)
-            let name = control ? MacScreenViewBuilder.inferLabel(for: node, frame: frame, in: names).label : attributes.title
+            let name = control ? MacScreenViewBuilder.inferLabel(for: node, in: names).label : attributes.title
             if withheld(name, under: nil) || withheld(attributes.value, under: name)
                 || (control && MacScreenViewBuilder.isSecretField(role: attributes.role, subrole: attributes.subrole,
                         label: name, value: attributes.value)) {

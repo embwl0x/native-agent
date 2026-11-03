@@ -40,6 +40,8 @@ public struct TelegramPresentationSnapshot: Equatable, Sendable {
     public var receiptsIssue: String? = nil
     public var blockedIssue: String? = nil
     public var errorsIssue: String? = nil
+    public var credentialIssue: String? = nil
+    public var routingIssue: String? = nil
     public init(
         transport: TelegramBot.TelegramStatus,
         configuration: TelegramConfigurationSummary,
@@ -101,11 +103,12 @@ extension TelegramPresentationSnapshot {
 
     public var isOperational: Bool {
         enabled && tokenConfigured && pollerEnabled && actionableError == nil
+            && credentialIssue == nil && routingIssue == nil
     }
 }
 
 public struct TelegramReceipt: Identifiable, Codable, Hashable, Sendable {
-    public var eventId: String?
+    public var eventId: String
     public var at: String
     public var kind: String?
     public var chatId: String?
@@ -117,7 +120,7 @@ public struct TelegramReceipt: Identifiable, Codable, Hashable, Sendable {
     public var model: String?
     public var reasoningEffort: String?
 
-    public var id: String { eventId ?? "\(at)-\(chatId ?? "")-\(messageId ?? 0)" }
+    public var id: String { eventId }
 
     enum CodingKeys: String, CodingKey {
         case eventId = "id"
@@ -133,7 +136,7 @@ public struct TelegramReceipt: Identifiable, Codable, Hashable, Sendable {
         case reasoningEffort
     }
     public init(
-        eventId: String? = nil,
+        eventId: String,
         at: String,
         kind: String? = nil,
         chatId: String? = nil,
@@ -161,7 +164,7 @@ public struct TelegramReceipt: Identifiable, Codable, Hashable, Sendable {
 }
 
 public struct TelegramBlockedEvent: Identifiable, Codable, Hashable, Sendable {
-    public var eventId: String?
+    public var eventId: String
     public var at: String
     public var reason: String?
     public var chatId: String?
@@ -169,7 +172,7 @@ public struct TelegramBlockedEvent: Identifiable, Codable, Hashable, Sendable {
     public var updateId: Int?
     public var textPreview: String?
 
-    public var id: String { eventId ?? "\(at)-\(chatId ?? "")-\(userId ?? "")-\(reason ?? "")" }
+    public var id: String { eventId }
 
     enum CodingKeys: String, CodingKey {
         case eventId = "id"
@@ -181,7 +184,7 @@ public struct TelegramBlockedEvent: Identifiable, Codable, Hashable, Sendable {
         case textPreview
     }
     public init(
-        eventId: String? = nil,
+        eventId: String,
         at: String,
         reason: String? = nil,
         chatId: String? = nil,
@@ -201,12 +204,12 @@ public struct TelegramBlockedEvent: Identifiable, Codable, Hashable, Sendable {
 }
 
 public struct TelegramErrorEvent: Identifiable, Codable, Hashable, Sendable {
-    public var eventId: String?
+    public var eventId: String
     public var at: String
     public var context: String?
     public var error: String
 
-    public var id: String { eventId ?? "\(at)-\(context ?? "")-\(error)" }
+    public var id: String { eventId }
 
     enum CodingKeys: String, CodingKey {
         case eventId = "id"
@@ -214,7 +217,7 @@ public struct TelegramErrorEvent: Identifiable, Codable, Hashable, Sendable {
         case context
         case error
     }
-    public init(eventId: String? = nil, at: String, context: String? = nil, error: String) {
+    public init(eventId: String, at: String, context: String? = nil, error: String) {
         self.eventId = eventId
         self.at = at
         self.context = context
@@ -239,7 +242,9 @@ extension TelegramPresentationSnapshot {
         let latestError = datedErrors.max(by: { $0.1 < $1.1 })
         let latestBlocked = datedBlocked.max(by: { $0.1 < $1.1 })
         let errorHistoryStatus: String
-        if status.actionableError != nil {
+        if status.errorsIssue != nil {
+            errorHistoryStatus = "unavailable"
+        } else if status.actionableError != nil {
             errorHistoryStatus = "active_error"
         } else if let errorsAfterLastSuccessfulPoll, errorsAfterLastSuccessfulPoll > 0 {
             errorHistoryStatus = "newer_than_last_successful_poll"
@@ -249,7 +254,7 @@ extension TelegramPresentationSnapshot {
             errorHistoryStatus = "recovered_history"
         }
         var object: [String: JSONValue] = [
-            "status": .string(status.isOperational ? "ok" : "attention"),
+            "status": .string(status.isOperational && status.receiptsIssue == nil && status.blockedIssue == nil && status.errorsIssue == nil ? "ok" : "attention"),
             "enabled": .bool(status.enabled),
             "token_configured": .bool(status.tokenConfigured),
             "poller_running": .bool(status.pollerEnabled),
@@ -263,7 +268,7 @@ extension TelegramPresentationSnapshot {
             "error_entries_since_last_successful_poll": errorsAfterLastSuccessfulPoll
                 .map { .int(Int64($0)) } ?? .null,
             "error_entries_with_unreadable_timestamp": .int(Int64(status.errors.count - datedErrors.count)),
-            "blocked_history_status": .string(status.blocked.isEmpty ? "empty" : "historical_policy_events"),
+            "blocked_history_status": .string(status.blockedIssue != nil ? "unavailable" : status.blocked.isEmpty ? "empty" : "historical_policy_events"),
             "blocked_entries_with_unreadable_timestamp": .int(Int64(status.blocked.count - datedBlocked.count)),
             "ledger_scope_note": .string("error and blocked ledger counts are bounded history, not current failure counts; active_error and errors since the last successful poll carry current-health meaning; blocked rows are policy decisions, not transport failures"),
             "active_error": .bool(status.actionableError != nil),
@@ -289,6 +294,18 @@ extension TelegramPresentationSnapshot {
         object["last_error"] = status.lastError.map {
             .string(String(NativeAppSecretRedactor.redactText($0).prefix(600)))
         } ?? .null
+        // A partial/unreadable feed supplies no complete count or history verdict.
+        for (prefix, issue, keys) in [
+            ("receipts", status.receiptsIssue, ["recent_receipt_ledger_entries"]),
+            ("blocked", status.blockedIssue, ["recent_blocked_ledger_entries", "blocked_entries_with_unreadable_timestamp", "latest_blocked_at", "latest_blocked_age_seconds"]),
+            ("errors", status.errorsIssue, ["recent_error_ledger_entries", "error_entries_since_last_successful_poll", "error_entries_with_unreadable_timestamp", "latest_error_at", "latest_error_age_seconds"])
+        ] {
+            object[prefix + "_feed_status"] = .string(issue == nil ? "available" : "unavailable")
+            object[prefix + "_feed_issue"] = issue.map(JSONValue.string) ?? .null
+            if issue != nil { for key in keys { object[key] = .null } }
+        }
+        object["credential_issue"] = status.credentialIssue.map(JSONValue.string) ?? .null
+        object["routing_issue"] = status.routingIssue.map(JSONValue.string) ?? .null
         if let voice = status.voiceTranscription {
             object["voice_transcription"] = .object([
                 "enabled": .bool(voice.enabled),

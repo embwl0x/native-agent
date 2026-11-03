@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-// Blueprint: | `WorkshopWireVocabulary.swift` | Workshop wire vocabularies: canonical surface/event/approval/inbox/environment spelling and centralized legacy translation |
+// Blueprint: | `WorkshopWireVocabulary.swift` | Workshop wire vocabularies: canonical surface/event/approval/inbox/environment spelling and current writes and data-retained historical reads |
 
 // Wire aliases are translated here, without rewriting stored records.
 // Comparisons canonicalize both sides; callers use these vocabularies rather than open-coded aliases.
@@ -92,132 +92,55 @@ public enum WorkshopStepApprovalAction {
     public static let legacy = "mission.step"
 }
 
-/// Approval payload: write `execution_id`; read it before the permanent `mission_id` alias.
+/// Approval payload: the current writer and reader use `execution_id`.
 public enum WorkshopStepApprovalPayload {
     /// The only key any writer may emit.
     public static let canonicalExecutionIdKey = "execution_id"
-    /// Accepted keys, in resolution order: canonical first, legacy fallback.
-    public static let executionIdKeys = [canonicalExecutionIdKey, "mission_id"]
-
-    /// First non-empty accepted value, or nil when none is present.
+    /// The canonical execution identity, or nil when it is absent.
     public static func executionId(_ lookup: (String) -> String?) -> String? {
-        for key in executionIdKeys {
-            if let value = lookup(key), !value.isEmpty { return value }
-        }
-        return nil
+        guard let value = lookup(canonicalExecutionIdKey), !value.isEmpty else { return nil }
+        return value
     }
 }
 
 // MARK: - Cross-device keys
 
-// Cross-device writers emit `wireKey`; readers accept both spellings with `futureKey` precedence.
-
-/// Trust policy block: emit `missionPolicy`; accept `workshopPolicy` first.
+/// The current Trust policy block shared by Mac and phone.
 public enum WorkshopPolicyBlockVocabulary {
-    public static let wireKey = "missionPolicy"
-    public static let futureKey = "workshopPolicy"
-    /// Both spellings, future first — matching decoder resolution order.
-    public static let bothSpellings: [String] = [futureKey, wireKey]
+    public static let wireKey = "workshopPolicy"
 
-    /// Read the policy block under either spelling, future-first.
     public static func block<V>(_ policy: [String: V]) -> V? {
-        policy[futureKey] ?? policy[wireKey]
-    }
-
-    /// Fold onto `wireKey` for merging/gating; `futureKey` wins when both are present.
-    public static func foldToWireKey<V>(_ policy: [String: V]) -> [String: V] {
-        guard let future = policy[futureKey] else { return policy }
-        var out = policy
-        out.removeValue(forKey: futureKey)
-        out[wireKey] = future
-        return out
+        policy[wireKey]
     }
 }
 
-/// Inbox execution link: emit `related_mission_id`; accept `related_execution_id` first.
+/// Inbox execution link: emit `related_execution_id`; InboxItemRecord alone
+/// reads retained `related_mission_id` (present on the live root, 2026-11-01).
 public enum InboxExecutionLinkVocabulary {
-    public static let wireKey = "related_mission_id"
-    public static let futureKey = "related_execution_id"
-    public static let bothSpellings: [String] = [futureKey, wireKey]
+    public static let wireKey = "related_execution_id"
+    public static let legacyKey = "related_mission_id"
 }
 
-/// Inbox action/response execution ID: emit `missionId`; accept `executionId` first.
+/// Inbox action/response execution ID: the current phone and Mac use `executionId`.
 public enum InboxActionExecutionIdVocabulary {
-    public static let wireKey = "missionId"
-    public static let futureKey = "executionId"
-    public static let bothSpellings: [String] = [futureKey, wireKey]
+    public static let wireKey = "executionId"
 
-    /// First non-empty value among `bothSpellings`, future-first.
+    /// No identity is inferred from an older key or another object.
     public static func executionId(_ payload: [String: String]) -> String? {
-        for key in bothSpellings {
-            if let value = payload[key], !value.isEmpty { return value }
-        }
-        return nil
+        guard let value = payload[wireKey], !value.isEmpty else { return nil }
+        return value
     }
 }
 
 // MARK: - Environment variable vocabulary
 
-/// Environment aliases: non-empty legacy values win; each logs one info-level notice per process.
+/// Only current execution environment names are accepted.
 public enum ExecutionEnvVocabulary {
-    /// legacy name -> canonical name.
-    public static let renames: [(legacy: String, canonical: String)] = [
-        ("NATIVE_AGENT_MAX_ACTIVE_MISSIONS", "NATIVE_AGENT_MAX_ACTIVE_EXECUTIONS"),
-        ("NATIVE_AGENT_MAX_PENDING_MISSIONS", "NATIVE_AGENT_MAX_PENDING_EXECUTIONS"),
-        ("NATIVE_AGENT_MISSION_STEP_TIMEOUT_SECONDS", "NATIVE_AGENT_EXECUTION_STEP_TIMEOUT_SECONDS"),
-        (
-            "NATIVE_AGENT_MISSION_APPROVAL_TIMEOUT_SECONDS",
-            "NATIVE_AGENT_EXECUTION_APPROVAL_TIMEOUT_SECONDS"
-        ),
-    ]
-
-    private static let logger = Logger(
-        subsystem: "com.nativeagent.core", category: "env-vocabulary"
-    )
-    private static let noticed = OSAllocatedUnfairLock(initialState: Set<String>())
-
-    /// First non-empty trimmed value, legacy before canonical.
-    public static func value(
-        legacy: String,
-        canonical: String,
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> String? {
-        let legacyValue = environment[legacy]?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let legacyValue, !legacyValue.isEmpty {
-            noteDeprecation(legacy: legacy, canonical: canonical)
-            return legacyValue
-        }
-        let canonicalValue = environment[canonical]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let canonicalValue, !canonicalValue.isEmpty { return canonicalValue }
-        return nil
-    }
-
-    /// Convenience for the renames table: resolve by canonical name alone.
     public static func value(
         canonical: String,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> String? {
-        guard let pair = renames.first(where: { $0.canonical == canonical }) else {
-            let raw = environment[canonical]?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (raw?.isEmpty == false) ? raw : nil
-        }
-        return value(legacy: pair.legacy, canonical: pair.canonical, environment: environment)
+        let raw = environment[canonical]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw?.isEmpty == false ? raw : nil
     }
-
-    /// One deprecation notice per legacy variable per process.
-    private static func noteDeprecation(legacy: String, canonical: String) {
-        let isNew = noticed.withLock { seen -> Bool in
-            seen.insert(legacy).inserted
-        }
-        guard isNew else { return }
-        logger.info(
-            """
-            \(legacy, privacy: .public) is deprecated; \
-            use \(canonical, privacy: .public). \
-            The old name still wins while both are set.
-            """
-        )
-    }
-
 }

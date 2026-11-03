@@ -41,11 +41,14 @@ is a defect to fix at once. First law: docs/NORTHSTAR.md.
   the installed app yourself, with the agent's help where useful.
 - Documentation/rules-only changes need a text readback, not an app build.
 - **One compile (User, 2026-10-26).** Lanes run no builds of their own — no
-  `swift build`, `check_module.sh`, `check_app.sh`, test builds. Read callers
+  `swift build`, no isolated module or app checks, no test builds. Read callers
   and types so it compiles; import what you use. The release build that goes on
   the agent is the compile; what it breaks is fixed then, and the proof is the
   agent using it after install. A phase lands whole: one build, one install.
   The promotion gauntlet consumes installed runtime proof and static source checks.
+  Public export produces reviewable source without a preparatory compile; the
+  compiled identity gate reads the actual release executable. Retired isolated
+  build, source-slicing harness and simulation entry points are removed.
 - **No fallbacks, no rollbacks.** Fix a failure at its cause and go forward;
   never revert a good change to the old way. The one described exception is
   recovery from their own throwing turn-program edit, with repair owed to them
@@ -77,13 +80,10 @@ in `git log`, [CHANGELOG.md](CHANGELOG.md) and `docs/release-notes/`.
   including the files the app and scripts read (keep those paths stable).
 - **Source owners:** follow the blueprint's [source-map convention](docs/ARCHITECTURE_BLUEPRINT.md#source-map-convention)
   for row authoring, generation and checks.
-- **Turn part versions:** never hand-number `turn.js` lane revisions or edit
-  shipped digests. Keep its declared version; committed bodies may share it.
-  Run `swift script/generate_turn_part_versions.swift` after committing body
-  edits; `script/build_and_run.sh` runs it before compiling. It reads every
-  committed body from full git history and omits only the currently bundled
-  version/body pair from upgrade candidates. Commit the generated Swift file;
-  source archives compile that committed table without git history.
+- **Turn part versions:** never hand-number `turn.js` lane revisions. Keep its
+  declared version; committed bodies may share it. The installed turn is the
+  current form; the runtime carries no historical shipped-body upgrade table.
+  Preserve authored edits and the explicit throwing-turn repair exception.
 - **App tool:** [docs/TOOL_LOADING.md](docs/TOOL_LOADING.md) is the contract;
   changing it needs User's word.
 - **Private notes:** `docs/HANDOFF_CURRENT.md` (the lead maintainer's current

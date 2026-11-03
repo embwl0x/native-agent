@@ -5,13 +5,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `AbilityFile.swift` | Canonical authored file, header, slot and reach representation |
+// Blueprint: | `AbilityFile.swift` | Canonical authored file, header, slot and reach representation; shared header argument schemas for saving abilities and making senses |
 extension AbilityStore {
     public enum Kind: String, CaseIterable, Sendable {
         /// Authored abilities use `ability` in their headers.
         case part = "ability", sense, turn
-        /// A header's kind; `tool`, `skill` and `part` are an ability's older spellings.
-        public init?(stored: String) { self.init(rawValue: ["tool", "skill", "part"].contains(stored) ? "ability" : stored) }
     }
     public static let sourceLimit = 512 * 1024
     public static let didChange = Notification.Name("NativeAgent.abilityDidChange")
@@ -20,6 +18,25 @@ extension AbilityStore {
     /// A payload carrying another agent's words names it as `agent`.
     public static let signalled = Notification.Name("NativeAgent.partSignalled")
     public static let partKeys: Set<String> = ["reach", "wake", "face", "resident", "learned", "choices"]
+    private static let partActionPattern = "^[a-z][a-z0-9_]*[.][a-z][a-z0-9_.]*$"
+    /// Header shapes live with the normalizer and are shared by both authoring doors.
+    public static let partArgumentSchemas: [String: JSONValue] = {
+        let strings: JSONValue = .object(["type": .string("array"), "items": .object(["type": .string("string"), "minLength": .int(1)])])
+        return [
+            "reach": .object(["type": .string("object"), "properties": .object([
+                "capabilities": strings, "readPaths": strings, "hosts": strings, "apps": strings]),
+                "required": .array([]), "additionalProperties": .bool(false)]),
+            "face": .object(["type": .string("object"), "properties": .object([
+                "page": .object(["type": .string("string"), "enum": .array(AppDoorNames.partPages.sorted().map(JSONValue.string))]),
+                "action": .object(["type": .string("string"), "pattern": .string(partActionPattern)]),
+                "projection": .object(["type": .string("boolean")])]), "required": .array([]), "additionalProperties": .bool(false)]),
+            "wake": .object(["type": .string("array"), "items": .object(["type": .string("string")]),
+                "description": .string("Posted signals: schedule:<cron>, app.installed, file.changed:<path>, turn.ended, message.arrived:slack, message.arrived:telegram, held, resumed, person.away, person.here, network.down, network.up. Omit to inherit; [] clears.")]),
+            "resident": .object(["type": .string("boolean"), "description": .string("Retain JS and held resources across successful runs; default false, inherited on revision.")]),
+            "learned": .object(["description": .string("Any JSON retained as declared learned metadata; no shape is enforced and it earns no competence. Omit to inherit.")]),
+            "choices": .object(["description": .string("Any JSON retained as reserved choices metadata; no shape is enforced. Omit to inherit.")])
+        ]
+    }()
     /// Shared identity normalization below Parts.
     public static func normalizedID(_ given: String) -> String {
         given.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -31,8 +48,7 @@ extension AbilityStore {
         if ["app_data_read", "app_data_write", "network_localhost", "network_public", "network", "shell", "computer_files", "arbitrary_file_write", "model", "calendar", "reminders", "contacts", "screen.watch", "hands"].contains(name) { return true }
         let pieces = name.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
         if pieces.count == 2, pieces[0] == "secret" { return Keyring.validName(String(pieces[1])) }
-        // `connector:<id>` still reads, so an older ability loads; it grants nothing since 10-21.
-        return pieces.count == 2 && ["app_read", "app_write", "connector"].contains(pieces[0])
+        return pieces.count == 2 && ["app_read", "app_write"].contains(pieces[0])
             && !pieces[1].isEmpty && pieces[1].allSatisfy { $0.isLetter || $0.isNumber || "._-".contains($0) }
     }
     /// Exact app-action reach, independent of where an action's face is drawn.
@@ -49,15 +65,13 @@ extension AbilityStore {
         return Set(capabilities.flatMap { actions[$0] ?? [] }).sorted()
     }
     /// The same header for every part. Abilities consume reach.capabilities;
-    /// readPaths/hosts/apps serve senses. Legacy authority is projected.
-    /// `saving` holds a new version to the wakes that are posted; a kept file
-    /// reads as it was accepted, so one stale wake never stops the catalog.
-    public static func partHeader(_ fields: [String: JSONValue], saving: Bool = false) throws -> [String: JSONValue] {
+    /// readPaths/hosts/apps serve senses. Reads and saves accept the same wakes.
+    public static func partHeader(_ fields: [String: JSONValue]) throws -> [String: JSONValue] {
         var header = fields.filter { partKeys.contains($0.key) }
-        var reach = header["reach"] ?? .object([:])
+        let reach = header["reach"] ?? .object([:])
         guard case .object(var scope) = reach else { throw headerFailure("reach", accepted: "{capabilities?: [string], readPaths?: [string], hosts?: [string], apps?: [string]}") }
-        if scope["capabilities"] == nil { scope["capabilities"] = fields["permissions"] ?? .array([]) }
-        for key in ["capabilities", "readPaths", "hosts", "apps"] {
+        let reachKeys = Self.partArgumentSchemas["reach"]!.objectValue!["properties"]!.objectValue!.keys.sorted()
+        for key in reachKeys {
             if scope[key] == nil { scope[key] = .array([]) }
             guard case .array(let values)? = scope[key], values.allSatisfy({ if case .string(let text) = $0 { return !text.isEmpty }; return false }) else {
                 throw headerFailure("reach.\(key)", accepted: "an array of nonempty strings")
@@ -66,26 +80,27 @@ extension AbilityStore {
                 throw headerFailure("reach.capabilities", accepted: "known reach names; use app {find:\"ability.save\"} for declarations", detail: "Unknown reach name: \(invalid).")
             }
         }
-        if let key = scope.keys.sorted().first(where: { !["capabilities", "readPaths", "hosts", "apps"].contains($0) }) { throw headerFailure("reach.\(key)", accepted: "capabilities, readPaths, hosts or apps", detail: "Unknown reach key: \(key). Remove it or use an accepted key.", code: "unknown_header_reach_key") }
+        if let key = scope.keys.sorted().first(where: { !reachKeys.contains($0) }) { throw headerFailure("reach.\(key)", accepted: "capabilities, readPaths, hosts or apps", detail: "Unknown reach key: \(key). Remove it or use an accepted key.", code: "unknown_header_reach_key") }
         header["reach"] = .object(scope)
         let wake = header["wake"] ?? .array([])
         guard case .array(let signals) = wake else { throw headerFailure("wake", accepted: "an array of signal-name strings") }
         for signal in signals {
             guard case .string(let name) = signal else { throw headerFailure("wake", accepted: "an array of signal-name strings") }
-            let valid = ["app.installed", "turn.ended", "held", "resumed", "person.away", "person.here"].contains(name)
+            let valid = ["app.installed", "turn.ended", "held", "resumed", "person.away", "person.here", "network.down", "network.up"].contains(name)
                 || ["message.arrived:slack", "message.arrived:telegram"].contains(name)
-                || (saving ? ["schedule:", "file.changed:"] : ["schedule:", "file.changed:", "message.arrived:"]).contains { prefix in
+                || ["schedule:", "file.changed:"].contains { prefix in
                     name.hasPrefix(prefix) && !name.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 }
-            guard valid else { throw headerFailure("wake", accepted: "schedule:<cron>, app.installed, file.changed:<path>, turn.ended, message.arrived:slack, message.arrived:telegram, held, resumed, person.away or person.here", detail: "Unknown wake name: \(name). Replace it with an accepted signal.") }
+            guard valid else { throw headerFailure("wake", accepted: "schedule:<cron>, app.installed, file.changed:<path>, turn.ended, message.arrived:slack, message.arrived:telegram, held, resumed, person.away, person.here, network.down or network.up", detail: "Unknown wake name: \(name). Replace it with an accepted signal.") }
         }
         header["wake"] = wake
         guard case .object(let face) = header["face"] ?? .object([:]) else { throw headerFailure("face", accepted: "{page?: string, action?: string, projection?: bool}") }
-        if let key = face.keys.sorted().first(where: { !["page", "action", "projection"].contains($0) }) { throw headerFailure("face.\(key)", accepted: "page, action or projection", detail: "Unknown face key: \(key). Remove it or use an accepted key.", code: "unknown_header_face_key") }
+        let faceKeys = Self.partArgumentSchemas["face"]!.objectValue!["properties"]!.objectValue!.keys
+        if let key = face.keys.sorted().first(where: { !faceKeys.contains($0) }) { throw headerFailure("face.\(key)", accepted: "page, action or projection", detail: "Unknown face key: \(key). Remove it or use an accepted key.", code: "unknown_header_face_key") }
         if let projection = face["projection"], projection != .bool(true), projection != .bool(false) {
             throw headerFailure("face.projection", accepted: "a Boolean; true declares function face(input)")
         }
-        if let action = face["action"], action.stringValue?.range(of: "^[a-z][a-z0-9_]*[.][a-z][a-z0-9_.]*$", options: .regularExpression) == nil {
+        if let action = face["action"], action.stringValue?.range(of: partActionPattern, options: .regularExpression) == nil {
             throw headerFailure("face.action", accepted: "a lowercase app action id, such as weather.forecast")
         }
         if let page = face["page"] {
@@ -156,13 +171,9 @@ extension AbilityStore {
             let candidate = metadata["candidate"]?.objectValue ?? [:]
             let manifest = candidate["manifest"]?.objectValue ?? [:]
             let record = metadata["record"]?.objectValue ?? manifest["record"]?.objectValue ?? manifest
-            var properties = record.merging(manifest.filter { AbilityStore.partKeys.contains($0.key) }) { _, value in value }
+            let properties = record.merging(manifest.filter { AbilityStore.partKeys.contains($0.key) }) { _, value in value }
                 .merging(metadata) { _, value in value }
-            let program = candidate["program"]?.objectValue ?? [:]
-            if properties["reach"] == nil { properties["reach"] = program["reach"] }
-            if properties["permissions"] == nil { properties["permissions"] = program["permissions"] }
             self.metadata.merge(try AbilityStore.partHeader(properties)) { _, value in value }
-            self.metadata.removeValue(forKey: "permissions")
             if var row = self.metadata["record"]?.objectValue {
                 row.removeValue(forKey: "permissions")
                 for key in AbilityStore.partKeys.union(kind == .sense ? ["kind"] : ["kind", "version"]) { row.removeValue(forKey: key) }

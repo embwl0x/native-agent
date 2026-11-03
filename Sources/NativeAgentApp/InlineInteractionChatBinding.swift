@@ -34,7 +34,7 @@ final class InlineInteractionChatBinding {
     /// Keyed by interaction id, valued by the conversation that raised it:
     /// the person can switch conversations while they are away in Trust or
     /// Providers, and the answer still belongs to the transcript that asked.
-    private var awaitingReturn: [String: String] = [:]
+    private var awaitingReturn: [String: (sessionID: String, revision: Int)] = [:]
 
     struct ConnectorSheetRequest: Identifiable, Equatable {
         let id: String
@@ -43,6 +43,7 @@ final class InlineInteractionChatBinding {
         /// conversation switch, and what it settles belongs to the transcript
         /// that asked, never to whichever one is open when it closes.
         let sessionID: String
+        let revision: Int
     }
 
     // MARK: - Actions
@@ -141,6 +142,7 @@ final class InlineInteractionChatBinding {
             current = prepared.interaction
             descriptor = prepared.descriptor
         } catch {
+            appModel.setFailureStatus(error, action: "begin that request")
             await refreshCurrent()
             return
         }
@@ -186,17 +188,17 @@ final class InlineInteractionChatBinding {
                     }
                 case .pairDevice:
                     // The route lands on the page's first tab, so the tab is chosen after it.
-                    self.openPage(.connectors, for: interaction.id, sessionID: sessionID)
+                    self.openPage(.connectors, for: interaction.id, sessionID: sessionID, revision: interaction.revision)
                     UserDefaults.standard.set("iphone", forKey: ShellRailTab.storageKey(.connectors))
                 case .connectorManualToken where descriptor.target == "telegram":
-                    self.openPage(.telegram, for: interaction.id, sessionID: sessionID)
+                    self.openPage(.telegram, for: interaction.id, sessionID: sessionID, revision: interaction.revision)
                 case .connectorManualToken:
                     self.connectorSheet = ConnectorSheetRequest(
-                        id: interaction.id, provider: descriptor.target, sessionID: sessionID)
+                        id: interaction.id, provider: descriptor.target, sessionID: sessionID, revision: interaction.revision)
                 case .trustPostureRequired:
-                    self.openPage(.trust, for: interaction.id, sessionID: sessionID)
+                    self.openPage(.trust, for: interaction.id, sessionID: sessionID, revision: interaction.revision)
                 case .providerGroupModel:
-                    self.openPage(.providers, for: interaction.id, sessionID: sessionID)
+                    self.openPage(.providers, for: interaction.id, sessionID: sessionID, revision: interaction.revision)
                 default: break
                 }
             },
@@ -208,8 +210,8 @@ final class InlineInteractionChatBinding {
     /// A page a card (or the chat's own empty state) needs: the panel in
     /// Simple view, the page itself in Advanced. With an interaction, coming
     /// back is what asks its owner whether the thing is done.
-    func openPage(_ item: SidebarItem, for id: String? = nil, sessionID: String = "") {
-        if let id { awaitingReturn[id] = sessionID }
+    func openPage(_ item: SidebarItem, for id: String? = nil, sessionID: String = "", revision: Int? = nil) {
+        if let id, let revision { awaitingReturn[id] = (sessionID, revision) }
         if SimpleViewMode.isShowing {
             panelPage = item
         } else {
@@ -229,7 +231,7 @@ final class InlineInteractionChatBinding {
     /// the owner says done, and close it. Writes nothing until then.
     func settlePanelIfDone() async {
         var waiting = awaitingReturn
-        if let sheet = connectorSheet { waiting[sheet.id] = sheet.sessionID }
+        if let sheet = connectorSheet { waiting[sheet.id] = (sheet.sessionID, sheet.revision) }
         guard !waiting.isEmpty else { return }
         guard await InlineInteractionResolver.settleVerifiedControls(waiting, dataRoot: dataRoot, didSettle: { id in
             self.awaitingReturn[id] = nil
@@ -247,13 +249,13 @@ final class InlineInteractionChatBinding {
     func connectorSheetClosed() async {
         guard let request = connectorSheet else { return }
         connectorSheet = nil
-        await settleOrReopen(request.id, sessionID: request.sessionID)
+        await settleOrReopen(request.id, sessionID: request.sessionID, revision: request.revision)
     }
 
     /// Settle if the owner now says done; otherwise put a card this tap left
     /// running back to pending.
-    private func settleOrReopen(_ id: String, sessionID: String) async {
-        await InlineInteractionResolver.settleOrReopen(id, sessionID: sessionID, dataRoot: dataRoot)
+    private func settleOrReopen(_ id: String, sessionID: String, revision: Int) async {
+        await InlineInteractionResolver.settleOrReopen(id, sessionID: sessionID, expectedRevision: revision, dataRoot: dataRoot)
         await refreshCurrent()
     }
 

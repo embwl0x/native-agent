@@ -96,7 +96,7 @@ final class NativeAgentHotkeyBootstrap {
         // Tapping the hotkey opens the app; holding it arms voice.
         hotkeyManager.onOpenWindow = {
             Task { @MainActor in
-                NSApp.activate(ignoringOtherApps: true)
+                NSApp.activate()
                 NSApp.windows
                     .first { $0.identifier?.rawValue.contains("main") == true }?
                     .makeKeyAndOrderFront(nil)
@@ -252,16 +252,7 @@ struct NativeAgentApp: App {
             resources: Bundle.main.resourceURL,
             publicReleaseUnavailable: AppDelegate.presentPublicReleaseDataRootError,
             backupRestoreUnavailable: AppDelegate.presentBackupRestoreError,
-            confirmMissingRoots: AppDelegate.confirmLaunchWithMissingRoots,
-            macRecoveryUnavailable: {
-                NSApp.setActivationPolicy(.regular)
-                let alert = NSAlert()
-                alert.alertStyle = .critical
-                alert.messageText = "NativeAgent could not recover interrupted Mac actions."
-                alert.informativeText = "NativeAgent stopped before accepting actions. The details are in the log."
-                alert.addButton(withTitle: "Quit")
-                alert.runModal()
-            }
+            confirmMissingRoots: AppDelegate.confirmLaunchWithMissingRoots
         ) else { return false }
         SensesAssembly.install(dataRoot: dataRoot)
         await NativeAgentEngine.installBotProviderCheck()
@@ -323,7 +314,7 @@ struct NativeAgentApp: App {
                 .navigationTitle(coordinator.appModel?.agentAddressName ?? "NativeAgent")
                 // AppearanceController always supplies dark or light; Off follows the system.
                 .preferredColorScheme(appearance.colorScheme)
-                .tint((HazeColor(rawValue: hazeRaw) ?? .defaultValue).windowTint(dark: appearance.colorScheme == .dark))
+                .tint(HazeColor(stored: hazeRaw).windowTint(dark: appearance.colorScheme == .dark))
                 .onChange(of: preferDarkAppearance, initial: true) { _, dark in
                     appearance.setPreferDark(dark)
                 }
@@ -374,13 +365,16 @@ struct NativeAgentApp: App {
                 Divider()
                 // Navigate shortcuts derive from the rail's order, never a separate list.
                 if let appModel = coordinator.appModel {
-                    ForEach(NavigateMenuPresentation.entries(appModel.engine.layout.layout)) { entry in
+                    ForEach(NavigateMenuPresentation.entries(appModel.engine.layout.availability)) { entry in
                         Button(entry.title) {
                             ApplicationLifetime.shared.request(.sidebar(entry.item))
                         }
                         .keyboardShortcut(entry.shortcut.map {
                             KeyboardShortcut(KeyEquivalent($0), modifiers: .command)
                         })
+                    }
+                    if let failure = appModel.engine.layout.availability.failure {
+                        Text(failure.localizedDescription)
                     }
                 }
                 // Knowledge graph carries no digit: the digits belong to the
@@ -534,7 +528,16 @@ extension NativeAgentEnginePorts {
             macIntegration: MacIntegrationDeliveryActions(),
             a2aPushConfiguration: { peer in
                 let port = await ClaudeBridgeRuntime.shared.activePort
-                guard port != 0, let secret = try? AgentPeerCredentials.read(peerID: peer.id), !secret.isEmpty else { return nil }
+                guard port != 0 else {
+                    throw ToolFailureError("The local A2A callback receiver is not listening. No message was sent.", effects: .none,
+                        owner: "NativeAgent bridge listener", tap: "Open NativeAgent",
+                        code: "agent_callback_receiver_unavailable", instruction: "Repair the bridge listener before sending to this local webhook-capable contact.")
+                }
+                guard let secret = try AgentPeerCredentials.read(peerID: peer.id) else {
+                    throw ToolFailureError(AgentPeerCredentials.unavailableDetail, effects: .none,
+                        owner: "Keychain peer:" + peer.id, tap: "Agents → \(peer.name) → Connect",
+                        code: "agent_callback_credential_missing", instruction: "Restore this contact's confirmed missing credential before sending.")
+                }
                 return .object(["url": .string("http://127.0.0.1:\(port)/a2a/notifications"),
                     "authentication": .object(["scheme": .string("Bearer"), "credentials": .string(secret)])])
             },

@@ -195,40 +195,47 @@ struct MacSyncErrorBanner: View {
     var body: some View {
         Group {
             if let message {
-                HStack(alignment: .top, spacing: 8) {
-                    HStack(alignment: .top, spacing: 8) {
+                // A headline and its detail at full width, the action on its
+                // own row: nothing is squeezed into a side column (10-31).
+                let split = MacSyncErrorBannerPresentation.headline(message)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Image(systemName: "exclamationmark.icloud")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(AlivePalette.secondary)
                             .accessibilityHidden(true)
-                        Text(message)
-                            .font(.footnote)
-                            .foregroundStyle(.primary)
-                            .lineLimit(nil)
+                        Text(split.headline)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(AlivePalette.text)
                             .fixedSize(horizontal: false, vertical: true)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .accessibilityLabel("Sync warning: \(message)")
+                        Button {
+                            dismissedMessage = message
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(AlivePalette.secondary)
+                                .frame(width: 32, height: 32)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Dismiss sync warning")
+                    }
+                    if let detail = split.detail {
+                        Text(detail)
+                            .font(.footnote)
+                            .foregroundStyle(AlivePalette.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Button("Connection") { showsConnection = true }
-                        .font(.footnote)
+                        .font(.footnote.weight(.semibold))
                         .buttonStyle(.plain)
-                    Button {
-                        dismissedMessage = message
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 44, height: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Dismiss sync warning")
+                        .padding(.top, 2)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(NativeAgentMobileTheme.Colors.contentSurface)
-                .overlay(alignment: .bottom) {
-                    Rectangle().fill(Color.orange.opacity(0.35)).frame(height: 0.5)
-                }
+                .padding(14)
+                .aliveGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .padding(.horizontal, 12)
+                .padding(.top, 4)
+                .accessibilityLabel("Sync warning: \(message)")
                 .contentShape(Rectangle())
                 .accessibilityElement(children: .contain)
                 .transition(.move(edge: .top).combined(with: .opacity))
@@ -256,6 +263,13 @@ enum MacSyncErrorBannerPresentation {
         guard let syncError else { return nil }
         let message = syncError.trimmingCharacters(in: .whitespacesAndNewlines)
         return message.isEmpty ? nil : message
+    }
+
+    /// The first sentence leads; the rest is detail. A one-sentence message has no detail.
+    static func headline(_ message: String) -> (headline: String, detail: String?) {
+        guard let end = message.range(of: ". ") else { return (message, nil) }
+        let detail = message[end.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+        return (String(message[..<end.upperBound]).trimmingCharacters(in: .whitespaces), detail.isEmpty ? nil : detail)
     }
 
     static func visibleMessage(syncError: String?, dismissedMessage: String?) -> String? {

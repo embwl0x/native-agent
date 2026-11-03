@@ -21,7 +21,7 @@ public struct ConversationSurfaceProfile: Sendable, Equatable, Hashable {
 
     public var isRemote: Bool { Self.remoteSurfaceIDs.contains(id) }
 
-    /// Saved bridge spellings remain readable as peer surfaces. A transport
+    /// Current named bridge transports classify as peer surfaces. A transport
     /// label alone never admits the caller as the local operator.
     public static let agentBridgeID = "agent-bridge"
     public var isAgentBridge: Bool { id == Self.agentBridgeID }
@@ -37,10 +37,6 @@ public struct ConversationSurfaceProfile: Sendable, Equatable, Hashable {
     ]
 
     private static let aliases: [String: String] = [
-        "i-phone": "iphone",
-        "i-pad": "ipad",
-        "agentbridge": agentBridgeID,
-        "agent bridge": agentBridgeID,
         "claude-bridge": agentBridgeID,
         "codex-bridge": agentBridgeID,
         "omp-bridge": agentBridgeID,

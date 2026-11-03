@@ -36,7 +36,9 @@ extension NativeOAuthFlow {
                 return InlineSetupOutcome(error: "Telegram didn't accept that bot token: \(error.localizedDescription)")
             }
             // The saved allowlist is kept; the card only ever adds to it.
-            let existing = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: dataRoot)
+            let existing: TelegramBot.TelegramConfig?
+            do { existing = try TelegramBot.TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: false) }
+            catch { return InlineSetupOutcome(error: error.localizedDescription) }
             var chats = (existing?.allowedChatIds ?? []).map(String.init)
             if !chatID.isEmpty, !chats.contains(chatID) { chats.append(chatID) }
             let users = (existing?.allowedUserIds ?? []).map(String.init)

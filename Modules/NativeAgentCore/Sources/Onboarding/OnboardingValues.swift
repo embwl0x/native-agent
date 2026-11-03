@@ -32,7 +32,7 @@ public struct OnboardingStartResult: Sendable, Equatable {
         return .fresh
     }
     public let hasExisting: Bool
-    /// Nil without persona state; otherwise the pending name or raw profile name (empty if missing).
+    /// Pending identity or the name from the checked current profile; nil while unavailable.
     public let currentPersonaName: String?
     public let abilityOverview: [AbilityOverviewEntry]
     /// A durable completion intent exists; only its exact identity may resume it.
@@ -42,8 +42,7 @@ public struct OnboardingStartResult: Sendable, Equatable {
     /// explicit, backup-preserving reset; treating this as complete would hide
     /// a broken first run, while treating it as fresh would dead-end submit.
     public let resetRequired: Bool
-    /// True when onboarding really completed — the `.onboarded` sentinel, or
-    /// on pre-sentinel installs the complete SOUL/VOICE/USER/GROWTH set — but
+    /// True when onboarding really completed — the `.onboarded` sentinel — but
     /// `<dataRoot>/memory/profile.json` is GONE. A lone SOUL.md is an
     /// interrupted first run, not a completed one, and takes `resetRequired`.
     /// Deliberately absence-only — a profile that exists but is malformed

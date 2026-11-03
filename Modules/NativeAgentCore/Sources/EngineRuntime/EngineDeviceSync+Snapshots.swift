@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import ChatTurnRuntime
 import ChatSessionWork
 import ChatToolParsing
@@ -22,10 +23,11 @@ import NotificationInbox
 import PersistenceCore
 import ProviderRouting
 import ToolRegistry
+import ToolExecution
 import Transcripts
 import StandingBots
 import ChatTurnContracts
-// Blueprint: | `EngineDeviceSync+Snapshots.swift` | Phone snapshot/action adapter; remote Mac control translates through engine Trust and the platform native route; engine owners: retained Desk board/overview and checked inbox/approval lanes, connectors through `engine.connectors`, persona through `engine.persona` (PersonaFacade), runs through `engine.runs`, skill inventory through engine.tools; shared transcript/card/navigation, other-room exchange and live layout projections; conversation rows carry engine classification and assistant rows carry persisted tool evidence; Trust serialization delegates to `engine.trust.snapshotData`; proposal first_seen/last_seen/staged_at project createdAt and resolved_at is unset; signed incoming-turn delivery and handoff ordering; approvals carry the selected Mac turn ID for transcript anchoring; native presentation and cross-area assembly through ports |
+// Blueprint: | `EngineDeviceSync+Snapshots.swift` | Phone snapshot/action adapter; remote Mac control translates through engine Trust and the platform native route; engine owners: retained Desk board/overview and checked inbox/approval lanes, connectors through `engine.connectors`, persona through `engine.persona` (PersonaFacade), runs through `engine.runs`, guidance through engine.tools and all-kind abilities through Parts.rows in the Tools snapshot; shared transcript/card/navigation, other-room exchange and live layout projections; conversation rows carry engine classification and assistant rows carry persisted tool evidence; Trust serialization delegates to `engine.trust.snapshotData`; proposal first_seen/last_seen/staged_at project createdAt and resolved_at is unset; signed incoming-turn delivery and handoff ordering; approvals carry the selected Mac turn ID for transcript anchoring; native presentation and cross-area assembly through ports |
 
 // The phone's memory_proposals.json row. Mac views read ProposalRecord.
 // Legacy wire timestamps: first_seen, last_seen and staged_at all project
@@ -35,7 +37,8 @@ extension MemoryProposalRecord {
         self.init(id: proposal.id, text: proposal.content,
                   supportingSessionIds: proposal.evidence.sessionIDs,
                   recurrenceCount: proposal.evidence.recurrenceCount, status: proposal.status,
-                  createdAt: proposal.createdAt, rejectionReason: proposal.rejectionReason)
+                  createdAt: proposal.createdAt, rejectionReason: proposal.rejectionReason,
+                  evidenceError: proposal.evidence.error)
     }
 }
 
@@ -76,7 +79,8 @@ extension NAProviderCatalogProvider {
                     supportsJSONMode: model.supports_json_mode,
                     defaultReasoningEffort: model.default_reasoning_effort,
                     supportedReasoningEfforts: model.supported_reasoning_efforts,
-                    supportsFast: model.supports_fast
+                    supportsFast: model.supports_fast,
+                    controlsNote: model.controls_note
                 )
             }
         )
@@ -108,7 +112,7 @@ extension NativeAgentEngine {
         }
         for message in messages {
             let events = message.runId.flatMap { lastReplyByRun[$0] == message.id ? toolsByRun[$0] : nil } ?? []
-            var row = ChatMessageRecord(id: message.id, sessionId: message.sessionId, role: message.role,
+            var row = ChatMessageRecord(id: Self.phoneMessageID(message.id), sessionId: message.sessionId, role: message.role,
                 content: message.content, createdAt: message.createdAt, runId: message.runId,
                 source: message.source, metadata: message.metadata, isPersonVisible: !message.isHerOwnTurnInput)
             row.toolEvents = events.isEmpty ? nil : events
@@ -137,6 +141,20 @@ extension NativeAgentEngine {
 
 /// A needs-User knock the router did not get onto any channel. Thrown so the
 /// edge is not committed as delivered and the next pass retries it.
+extension NativeAgentEngine {
+    /// The phone's message identity is a UUID. A transcript row with another live id
+    /// (an interaction mirror is `interaction-mirror-<card>`) gets one stable UUID
+    /// derived from that id, so every snapshot names the row the same way.
+    nonisolated static func phoneMessageID(_ id: String) -> String {
+        if UUID(uuidString: id) != nil { return id }
+        var bytes = Array(SHA256.hash(data: Data(("nativeagent.message:" + id).utf8)).prefix(16))
+        bytes[6] = (bytes[6] & 0x0F) | 0x50  // name-based (v5 layout)
+        bytes[8] = (bytes[8] & 0x3F) | 0x80  // RFC 4122 variant
+        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                           bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15])).uuidString
+    }
+}
+
 struct NeedsUserNotifyUndelivered: LocalizedError {
     let projection: AttentionOutcome.Delivery
     var errorDescription: String? { "needs-owner knock not delivered (\(projection.rawValue))" }
@@ -207,7 +225,7 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     public func getChatSessions() async throws -> [NativeAgentShared.ChatSession] { try await engine.transcripts.list() }
     public func getChatTranscriptGenerations() async throws -> [String: Int?] { try await engine.transcripts.transcriptGenerations() }
     @MainActor public func sessionNavigation(for sessions: [NativeAgentShared.ChatSession]) -> ChatSessionNavigation { engine.transcripts.navigation(for: sessions) }
-    @MainActor public func surfaceLayout() -> SurfaceLayout { engine.layout.layout }
+    @MainActor public func surfaceLayout() -> SurfaceLayoutAvailability { engine.layout.availability }
     public func getChatMessages(sessionId: String) async throws -> [ChatMessageRecord] {
         try await engine.mobileChatMessages(sessionId: sessionId)
     }
@@ -222,7 +240,22 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     public func activeMemories() async throws -> [MemoryV2.MemoryRecord] { try await engine.memory.activeMemories() }
     public func getConnectors() async throws -> [MobileConnectorSnapshot] { try await engine.connectors.mobileConnectors() }
     public func mobileToolCatalog() async throws -> [MobileToolCatalogRecord] {
-        MobileToolCatalog.records(from: try await engine.tools.loadCatalog())
+        let native = MobileToolCatalog.records(from: try await engine.tools.loadCatalog())
+        let root = engine.dataRoot
+        // Same checked, all-kind owner used by the Mac's Tools page. Guidance
+        // remains in skills_snapshot; executable parts must not disappear with it.
+        let abilities = try await Task.detached(priority: .utility) {
+            try Parts(root: root).rows(kind: nil).map { row in
+                let checked = try JSONRow(.object(row))
+                let id = try checked.string("id")
+                let kind = try checked.string("kind")
+                // Parts supplies the display name and any row-local name damage.
+                return MobileToolCatalogRecord(id: "ability:" + id, name: try checked.string("name"),
+                    kind: kind, status: try checked.optionalString("status"),
+                    description: try checked.optionalString("unavailableReason") ?? checked.optionalString("description"))
+            }
+        }.value
+        return abilities + native
     }
     public func providers() async throws -> (providers: DeviceSyncSnapshotRows, routing: ProviderRoutingSnapshot) { try await engine.providers.list() }
     public func providerCatalogSnapshot() async throws -> (providers: [NAProviderCatalogProvider], routing: ProviderRoutingSnapshot) {
@@ -235,11 +268,14 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     public func getPersonality() async throws -> PersonalityProfile {
         try await engine.persona.loadProfile()
     }
-    public func knowledgeGraphSnapshotData() async throws -> Data { try await AgentGraphReads.canonicalKnowledgeGraphSnapshotData() }
+    public func knowledgeGraphSnapshotData() async throws -> Data {
+        try await AgentGraphReads.canonicalKnowledgeGraphSnapshotData(
+            graphPath: engine.dataRoot.appendingPathComponent("memory/memory.sqlite"), surface: "ios")
+    }
     public func getRunsStrict() async -> [RunRecord]? { try? await engine.runs.refresh(dataRoot: engine.dataRoot) }
     public func submitWorkshopExecution(title: String, objective: String) async throws -> DeviceSyncWorkshopSubmission {
         let result = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective)
-        return DeviceSyncWorkshopSubmission(executionId: result.executionId, id: result.executionId,
+        return DeviceSyncWorkshopSubmission(executionId: result.executionId,
                                             desk_handle: result.deskItem.handle, desk_alias: result.deskItem.alias)
     }
     public func resolveWorkshopStep(executionId: String, stepId: String, decision: String, provenance: ApprovalResolutionProvenance) async throws {
@@ -289,11 +325,10 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
             return ["status": "error", "message": "Unknown mac_control method: \(method)"]
         }
         if Set(["runShell", "readFile", "writeFile", "listDirectory", "moveFile", "trashFile"]).contains(method) {
-            guard let policy = try? await engine.trust.load(),
-                  policy.macControlPolicy?.remoteFromIosAllowed == true,
+            let policy = try await engine.trust.load()
+            guard policy.macControlPolicy?.remoteFromIosAllowed == true,
                   policy.filePolicy?.outsideWorkspaceDefault == "allow"
-                    || policy.permissionLevel == "full_mac_os"
-                    || policy.permissionLevel == "wide_open_receipts" else {
+                    || policy.permissionLevel == "full_mac_os" else {
                 return [
                     "status": "error",
                     "message": "\(method) requires Full Mac access with iOS remote enabled on the Mac.",
@@ -372,13 +407,11 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
             body: body,
             userInfo: userInfo
         )
-        // Only a knock that actually reached a channel — or one the ledger
-        // had already delivered — is a delivery. `.noChannel`, `.deferred`
-        // and `.failed` all mean nothing reached User, so throw: the caller
-        // treats delivery as the commit point and a throw keeps the episode
-        // unwritten for the next overview read to retry.
+        // Only checked delivery (including an already-delivered ledger row)
+        // projects as accepted. Queued/unknown, deferred, suppressed and failed
+        // outcomes cannot commit the episode; a throw keeps it owed.
         let projection = outcome.deliveryProjection
-        guard projection.reachedAChannel || projection == .previouslyHandled else {
+        guard projection.reachedAChannel else {
             throw NeedsUserNotifyUndelivered(projection: projection)
         }
     }
@@ -454,7 +487,12 @@ extension EngineDeviceSyncHost {
             let result = await NativeOAuthFlow.startOAuthFlow(
                 platform: platform.oauthPlatform, providerId: id, dataRoot: root
             )
-            let signedIn = result.ok && NativeOAuthFlow.isSignedIn(providerId: id, dataRoot: root)
+            guard result.ok else {
+                throw ProviderRoutingError.configurationFailed(result.error ?? "Provider sign-in did not complete.")
+            }
+            let status = NativeOAuthFlow.signInStatus(providerID: id, dataRoot: root)
+            if let error = status.error { throw ProviderRoutingError.configurationFailed(error) }
+            let signedIn = status.isSignedIn
             if signedIn {
                 await platform.adoptProvider(id)
             }
@@ -482,15 +520,10 @@ extension AttentionDeliveryPorts {
         AttentionDeliveryPorts(
         phone: phone,
         telegram: { token, destination, text in
-            try await TelegramPollLoop.defaultSendMessage(token, destination, text)
+            await TelegramPollLoop.notificationOutcome(token, destination, text)
         },
         slack: { input, dataRoot in
-            let result = try await SlackWebAPI.postMessage(input: input, dataRoot: dataRoot)
-            guard case .object(let envelope) = result, envelope["ok"] == .bool(true) else {
-                throw NSError(domain: "AttentionRouter", code: -502, userInfo: [
-                    NSLocalizedDescriptionKey: "Slack did not accept the notification."
-                ])
-            }
+            await SlackWebAPI.notificationOutcome(input: input, dataRoot: dataRoot)
         }
     )
     }

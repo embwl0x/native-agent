@@ -11,13 +11,16 @@ import PersistenceCore
 import Transcripts
 import NativeAgentShared
 import AppKit
-// Blueprint: | `BotsShelfView.swift` | shared helper status and transcript messages/streaming tail; no private transcript rows or JSONL observation |
+// Blueprint: | `BotsShelfView.swift` | shared helper status and transcript messages/streaming tail; palette selection opens the exact helper reply, including older runs; no private transcript rows or JSONL observation |
 
 struct BotsShelfView: View {
     @Environment(AppModel.self) private var appModel
     @State var records: [BotsShelfRecord] = []
     @State private var shelfRead = LatestRead()
     @State var selectedID: UUID?
+    @State private var selectedEntryID: UUID?
+    @State private var revealSelectedReply = false
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     var onContinue: (NativeAgentNavigationDestination) -> Void = { _ in }
     var isVisible = true
     private struct WatchIdentity: Equatable {
@@ -62,6 +65,8 @@ struct BotsShelfView: View {
                 HStack(alignment: .firstTextBaseline) {
                     Button {
                         selectedID = nil
+                        selectedEntryID = nil
+                        revealSelectedReply = false
                         sessionOpen = false
                         messagesLoading = true
                         messagesError = nil
@@ -74,6 +79,10 @@ struct BotsShelfView: View {
             }
             if let notice { Text(notice).font(ShellType.label).foregroundStyle(NativeAgentShell.secondary) }
             if let shelfError { Text(shelfError).font(ShellType.label).foregroundStyle(NativeAgentShell.trouble) }
+            if selectedID != nil, selected == nil, shelfLoaded, shelfError == nil {
+                Text("The selected helper is unavailable in the current shelf.")
+                    .font(ShellType.label).foregroundStyle(NativeAgentShell.trouble)
+            }
             if let selected { detail(selected) } else { groupList }
         }
         .foregroundStyle(NativeAgentShell.text)
@@ -118,6 +127,10 @@ struct BotsShelfView: View {
         }
         .onChange(of: isVisible) { _, visible in
             if !visible { editTarget = nil }
+            else { acceptPaletteDestination() }
+        }
+        .onChange(of: appModel.pendingPaletteDestination, initial: true) { _, _ in
+            acceptPaletteDestination()
         }
         .transformPreference(MoodTintProseRectKey.self) { rect in
             if !isVisible { rect = nil }
@@ -135,7 +148,12 @@ struct BotsShelfView: View {
                 if !records.isEmpty {
                     AliveGroupCard {
                         ForEach(records) { record in
-                            Button { selectedID = record.id; notice = nil } label: {
+                            Button {
+                                selectedID = record.id
+                                selectedEntryID = nil
+                                revealSelectedReply = false
+                                notice = nil
+                            } label: {
                                 BotRow(record: record)
                                     .contentShape(Rectangle())
                             }.buttonStyle(.plain)
@@ -197,9 +215,29 @@ struct BotsShelfView: View {
     }
 
     private func detail(_ record: BotsShelfRecord) -> some View {
+        ScrollViewReader { proxy in
+            detailScroll(record)
+                .onChange(of: revealSelectedReply && isVisible, initial: true) { _, reveal in
+                    guard reveal else { return }
+                    proxy.scrollTo(record.id, anchor: .top)
+                    revealSelectedReply = false
+                }
+        }
+    }
+
+    private func detailScroll(_ record: BotsShelfRecord) -> some View {
         let messages = appModel.engine.transcripts.messages(for: record.definition.sessionID)
         return ScrollView {
             VStack(alignment: .leading, spacing: 12) {
+                if let selectedEntryID {
+                    if let entry = record.entries.first(where: { $0.id == selectedEntryID }) {
+                        BotRunCard(entry: entry)
+                            .accessibilityIdentifier("helpers.selected-reply.\(selectedEntryID.uuidString)")
+                    } else {
+                        Text("The selected reply is unavailable in this helper's current history.")
+                            .font(ShellType.label).foregroundStyle(NativeAgentShell.trouble)
+                    }
+                }
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 10) {
                         BotMark(state: record, allowsMotion: isVisible)
@@ -243,7 +281,7 @@ struct BotsShelfView: View {
 
                 // One settled card per run, newest first; earlier runs stay in
                 // the transcript below.
-                let feed = BotRunFeed.rows(record.sortedEntries)
+                let feed = BotRunFeed.rows(record.sortedEntries.filter { $0.id != selectedEntryID })
                 LazyVStack(alignment: .leading, spacing: 10) {
                     ForEach(feed.prefix(BotRunCard.shown)) { row in
                         switch row {
@@ -287,6 +325,7 @@ struct BotsShelfView: View {
                 }
             }
             .frame(maxWidth: 760, alignment: .leading).padding(.bottom, 20)
+            .id(record.id)
         }
     }
 
@@ -295,6 +334,18 @@ struct BotsShelfView: View {
             try await Task.detached(priority: .utility, operation: action).value
             await reloadNow()
         } catch { notice = Self.problem(error, action: "change that helper") }
+    }
+
+    private func acceptPaletteDestination() {
+        guard isVisible, !quietOffscreenRead,
+              case .botReply(let botID, let entryID)? = appModel.pendingPaletteDestination else { return }
+        selectedID = botID
+        selectedEntryID = entryID
+        // Each accepted navigation reveals its reply, even when reselecting it.
+        // The detail consumes this after mounting, including a late shelf read.
+        revealSelectedReply = true
+        notice = nil
+        appModel.pendingPaletteDestination = nil
     }
     private func reload() {
         // Coalesce shelf events into one active read and one pending refresh.

@@ -3,7 +3,7 @@ import SwiftUI
 import AppKit
 import Desk
 import WorkshopExecution
-// Blueprint: | `DeskItemInspector.swift` | `DeskItemInspector` struct |
+// Blueprint: | `DeskItemInspector.swift` | Item controls and pursuit detail; today's count is supplied by the current board accounting projection, with unavailable evidence kept explicit |
 
 /// Item-level controls on the primary Desk; all writes use its tool router.
 struct DeskItemInspector: View {
@@ -12,6 +12,7 @@ struct DeskItemInspector: View {
     let items: [DeskItem]
     let plan: DeskSequencing.Plan
     let now: Date
+    let pursuitSessionsToday: Int?
     let isBusy: Bool
     let mode: DeskPaletteQuery.Verb?
     let perform: (DeskQuickAction) -> Void
@@ -158,7 +159,12 @@ struct DeskItemInspector: View {
             if let pursuit = item.pursuit {
                 Text(pursuit.why)
                 Text("Done when: \(pursuit.doneLooksLike)")
-                Text("\(pursuit.sessionsUsed(in: item.workAttempts))/\(pursuit.maxSessions) sessions · \(pursuit.workSessionsToday) today")
+                Text("\(pursuit.sessionsUsed(in: item.workAttempts))/\(pursuit.maxSessions) sessions")
+                if let pursuitSessionsToday {
+                    Text("\(pursuitSessionsToday) today")
+                } else {
+                    Text("Today's sessions unavailable").foregroundStyle(.orange)
+                }
                 if let last = pursuit.lastWorkedAt { Text("Worked \(DeskRelativeTimePresentation.text(forISO: last, now: now))") }
             }
             let rationale = DeskPursuitVetoRationale.row(for: item, now: now)

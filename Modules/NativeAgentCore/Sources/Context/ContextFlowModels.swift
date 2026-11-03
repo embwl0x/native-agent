@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `ContextFlowModels.swift` | ContextFlow value vocabulary: source/atom/relationship identity, authority, privacy, injection policy and immutable generation records |
+// Blueprint: | `ContextFlowModels.swift` | ContextFlow value vocabulary: source/atom identity, authority, privacy, injection policy and immutable generation records |
 
 // MARK: - Stable identifiers
 
@@ -30,18 +30,6 @@ public struct ContextAtomID: RawRepresentable, Codable, Hashable, Sendable, Comp
     }
 }
 
-public struct ContextRelationshipID: RawRepresentable, Codable, Hashable, Sendable, Comparable {
-    public let rawValue: String
-
-    public init(rawValue: String) {
-        self.rawValue = rawValue
-    }
-
-    public static func < (lhs: Self, rhs: Self) -> Bool {
-        lhs.rawValue < rhs.rawValue
-    }
-}
-
 public enum ContextStableID {
     public static func source(owner: String, locator: String) -> ContextSourceID {
         ContextSourceID(rawValue: "source:" + digest(parts: [owner, locator]))
@@ -58,18 +46,6 @@ public enum ContextStableID {
             kind.rawValue,
             headingPath.joined(separator: "/"),
             blockAnchor,
-        ]))
-    }
-
-    public static func relationship(
-        source: ContextAtomID,
-        target: ContextAtomID,
-        kind: String
-    ) -> ContextRelationshipID {
-        ContextRelationshipID(rawValue: "relationship:" + digest(parts: [
-            source.rawValue,
-            target.rawValue,
-            kind,
         ]))
     }
 
@@ -183,7 +159,6 @@ public enum ContextPrivacy: String, Codable, CaseIterable, Sendable {
 public enum ContextInjectionPolicy: String, Codable, CaseIterable, Sendable {
     case always
     case adaptive
-    case onDemand = "on_demand"
     case neverInject = "never_inject"
 }
 
@@ -320,6 +295,7 @@ public struct ContextAtomDraft: Codable, Equatable, Sendable {
     public let injectionPolicy: ContextInjectionPolicy
     public let contentRole: ContextContentRole
     public let entities: [ContextEntity]
+    public let memoryProvenance: ContextMemoryProvenance?
     public let triggers: [String]
     public let activation: Double
     public let recentUsefulness: Double
@@ -343,6 +319,7 @@ public struct ContextAtomDraft: Codable, Equatable, Sendable {
         injectionPolicy: ContextInjectionPolicy,
         contentRole: ContextContentRole,
         entities: [ContextEntity] = [],
+        memoryProvenance: ContextMemoryProvenance? = nil,
         triggers: [String] = [],
         activation: Double = 0,
         recentUsefulness: Double = 0,
@@ -365,6 +342,7 @@ public struct ContextAtomDraft: Codable, Equatable, Sendable {
         self.injectionPolicy = injectionPolicy
         self.contentRole = contentRole
         self.entities = entities
+        self.memoryProvenance = memoryProvenance
         self.triggers = triggers
         self.activation = min(1, max(0, activation))
         self.recentUsefulness = min(1, max(0, recentUsefulness))
@@ -373,47 +351,19 @@ public struct ContextAtomDraft: Codable, Equatable, Sendable {
     }
 }
 
-public struct ContextRelationshipDraft: Codable, Equatable, Sendable {
-    public let id: ContextRelationshipID
-    public let sourceAtomID: ContextAtomID
-    public let targetAtomID: ContextAtomID
-    public let kind: String
-    public let weight: Double
-    public let provenance: String
-
-    public init(
-        id: ContextRelationshipID,
-        sourceAtomID: ContextAtomID,
-        targetAtomID: ContextAtomID,
-        kind: String,
-        weight: Double,
-        provenance: String
-    ) {
-        self.id = id
-        self.sourceAtomID = sourceAtomID
-        self.targetAtomID = targetAtomID
-        self.kind = kind
-        self.weight = min(1, max(0, weight))
-        self.provenance = provenance
-    }
-}
-
 public struct ContextCompiledSource: Codable, Equatable, Sendable {
     public let descriptor: ContextSourceDescriptor
     public let sourceHash: String
     public let atoms: [ContextAtomDraft]
-    public let relationships: [ContextRelationshipDraft]
 
     public init(
         descriptor: ContextSourceDescriptor,
         sourceHash: String,
-        atoms: [ContextAtomDraft],
-        relationships: [ContextRelationshipDraft] = []
+        atoms: [ContextAtomDraft]
     ) {
         self.descriptor = descriptor
         self.sourceHash = sourceHash
         self.atoms = atoms
-        self.relationships = relationships
     }
 }
 
@@ -510,41 +460,19 @@ public struct ContextStoredAtom: Codable, Equatable, Sendable {
     }
 }
 
-public struct ContextStoredRelationship: Codable, Equatable, Sendable {
-    public let versionKey: String
-    public let draft: ContextRelationshipDraft
-    public let validFromGeneration: Int64
-    public let validToGeneration: Int64?
-
-    public init(
-        versionKey: String,
-        draft: ContextRelationshipDraft,
-        validFromGeneration: Int64,
-        validToGeneration: Int64?
-    ) {
-        self.versionKey = versionKey
-        self.draft = draft
-        self.validFromGeneration = validFromGeneration
-        self.validToGeneration = validToGeneration
-    }
-}
-
 public struct ContextStoredGeneration: Codable, Equatable, Sendable {
     public let generation: ContextGenerationRecord
     public let sources: [ContextStoredSource]
     public let atoms: [ContextStoredAtom]
-    public let relationships: [ContextStoredRelationship]
 
     public init(
         generation: ContextGenerationRecord,
         sources: [ContextStoredSource],
-        atoms: [ContextStoredAtom],
-        relationships: [ContextStoredRelationship]
+        atoms: [ContextStoredAtom]
     ) {
         self.generation = generation
         self.sources = sources
         self.atoms = atoms
-        self.relationships = relationships
     }
 }
 
@@ -552,18 +480,15 @@ public struct ContextStorePruneResult: Codable, Equatable, Sendable {
     public let deletedGenerations: Int
     public let deletedAtomVersions: Int
     public let deletedSourceVersions: Int
-    public let deletedRelationshipVersions: Int
 
     public init(
         deletedGenerations: Int,
         deletedAtomVersions: Int,
-        deletedSourceVersions: Int,
-        deletedRelationshipVersions: Int
+        deletedSourceVersions: Int
     ) {
         self.deletedGenerations = deletedGenerations
         self.deletedAtomVersions = deletedAtomVersions
         self.deletedSourceVersions = deletedSourceVersions
-        self.deletedRelationshipVersions = deletedRelationshipVersions
     }
 
     /// Total rows deleted across every category. A5.5(b): used to decide whether
@@ -571,7 +496,6 @@ public struct ContextStorePruneResult: Codable, Equatable, Sendable {
     /// pages, so a rewrite would be pure churn).
     public var totalDeleted: Int {
         deletedGenerations + deletedAtomVersions + deletedSourceVersions
-            + deletedRelationshipVersions
     }
 }
 
@@ -581,8 +505,6 @@ public enum ContextFlowStoreError: Error, Equatable, Sendable, CustomStringConve
     case sourceRemovedAndChanged(String)
     case duplicateAtom(String)
     case atomSourceMismatch(atomID: String, expectedSourceID: String)
-    case relationshipSourceMissing(String)
-    case relationshipTargetMissing(String)
     case generationNotFound(Int64)
     case malformedStoredValue(String)
 
@@ -598,10 +520,6 @@ public enum ContextFlowStoreError: Error, Equatable, Sendable, CustomStringConve
             "duplicate active atom id: \(id)"
         case .atomSourceMismatch(let atomID, let expectedSourceID):
             "atom \(atomID) does not belong to source \(expectedSourceID)"
-        case .relationshipSourceMissing(let id):
-            "relationship source atom missing: \(id)"
-        case .relationshipTargetMissing(let id):
-            "relationship target atom missing: \(id)"
         case .generationNotFound(let id):
             "context generation not found: \(id)"
         case .malformedStoredValue(let field):

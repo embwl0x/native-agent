@@ -6,6 +6,8 @@ import ChatSessionWork
 import ChatToolParsing
 import Foundation
 import MacControl
+import MacIntegration
+import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Privacy
@@ -13,7 +15,8 @@ import PersonaEngine
 import Senses
 import TrustCenter
 import ToolRegistry
-// Blueprint: | `AppScriptRunner.swift` | Shared-runner app host adapter, the signing key's file revision for invocation bindings, dependency shapes and ordinary turn-chain re-entry; NativeAgentSecretRedactor owns recursive credential recognition for ordinary typing and flow steps, alongside declared credential args; digest-only saved pins retain their historical encoding, while full saved contracts ignore retired scriptability metadata; an older door id or an older spelling of a part's action in a part's code resolves through `partAlias`, as a turn's call does; declarations grant no action authority |
+import ToolExecution
+// Blueprint: | `AppScriptRunner.swift` | Shared-runner app host adapter, the signing key's file revision for invocation bindings, dependency shapes and ordinary turn-chain re-entry; save refusals use the door's action ranking; self-dependencies bind the enclosing part identity; NativeAgentSecretRedactor owns recursive credential recognition for ordinary typing and flow steps, alongside declared credential args; live schemas, canonical name/scalar normalization and the door's scalar-list expansion feed the shared call-fit reader; Contacts call-fit preserves known raw values even beside unknown expressions; self-calls use their candidate schema; dependency snapshots are historical evidence, never execution gates; action IDs and argument names must match their current declared contracts; declarations grant no action authority |
 
 /// The app door supplies its registry and gate chain to the shared executor.
 /// Receipt classification, journal/replay, quotas and the VM have one owner.
@@ -37,7 +40,10 @@ enum AppScriptRunner {
     /// object carries expected_version or preview); anything else is
     /// positional, in the order the action's line declares.
     static func doorInput(id: String, given: [JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) -> Result<[String: JSONValue], ScriptError> {
-        guard let action = AppActions.action(id, dataRoot: dataRoot) ?? AppActions.pagePrefixedAction(id) else {
+        let checked: AppAction?
+        do { checked = try AppActions.action(id, dataRoot: dataRoot) ?? AppActions.pagePrefixedAction(id, dataRoot: dataRoot) }
+        catch { return .failure(ScriptError(reason: "action_catalog_unavailable", detail: "The action catalog could not be read: \(error.localizedDescription). Repair its owner before running this call.")) }
+        guard let action = checked else {
             // Let the door return its exact nearest-action recovery; it executes no unknown action.
             return .success(["action": .string(id), "args": given.first ?? .object([:]),
                              AppToolExecutor.doorScriptKey: .bool(true)])
@@ -96,26 +102,25 @@ enum AppScriptRunner {
         }
         func dependencyRevision(_ dependencies: [String]) throws -> [String] {
             try [String(AppActionBinding.registeredToolCount),
-                AppActions.senses().map { $0.id + ":" + $0.page }.sorted().joined(separator: ","),
+                AppActions.senses(dataRoot: dataRoot).map { $0.id + ":" + $0.page }.sorted().joined(separator: ","),
                 AbilityStore.fileRevision(SwiftNativeManifestSigner(dataRoot: dataRoot).keyPath)]
         }
-        var actionIDs: [String] { (AppActions.all + AppActions.authored(dataRoot: dataRoot) + AppActions.senses()).map(\.id) }
+        var actionIDs: [String] { get throws { try AppActions.checkedInventory(dataRoot: dataRoot).actions.map(\.id) } }
         var floorReasons: Set<String> { AppToolExecutor.doorFloorReasons }
         var scriptKey: String { AppToolExecutor.doorScriptKey }
-        func action(_ id: String) -> OwnedProgramAction? {
-            if let action = resolved(id) {
+        func nearestActions(_ id: String) async throws -> [String] {
+            let pages = Dictionary(QuietToolPage.all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            return try await AppActions.ranked(id, pages: pages, dataRoot: dataRoot,
+                memory: SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)).actions.filter { !$0.isItemRead }.prefix(3).map(\.id)
+        }
+        func action(_ id: String) throws -> OwnedProgramAction? {
+            if let action = try resolved(id) {
                 return OwnedProgramAction(id: action.id, page: action.page, read: action.read, advisory: action.advisory, partID: action.partAction ? action.tool : nil,
                                           program: action.authored, versioned: !action.versionExempt, readOnly: { action.readOnly(args: $0) })
             }
-            // An older door, or an older spelling of a part's own action: the
-            // door answers it through its alias, with the alias note.
-            guard let alias = AppToolExecutor.partAlias(id, [:], root: dataRoot) else { return nil }
-            let target = AppActions.action(alias.id, dataRoot: dataRoot)
-            return OwnedProgramAction(id: id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), page: target?.page ?? "tools",
-                                      read: target?.read ?? false, program: target?.authored ?? alias.id.hasPrefix("authored."),
-                                      readOnly: { target?.readOnly(args: $0) ?? false })
+            return nil
         }
-        func canonicalAction(_ id: String) -> String { resolved(id)?.id ?? AppActions.pagePrefixedAction(id)?.id ?? id }
+        func canonicalAction(_ id: String) throws -> String { try resolved(id)?.id ?? AppActions.pagePrefixedAction(id, dataRoot: dataRoot)?.id ?? id }
         /// A part's call takes its args by name, or positionally as the action's line declares them.
         func doorInput(id: String, given: [JSONValue]) -> Result<[String: JSONValue], ScriptError> {
             AppScriptRunner.doorInput(id: id, given: given, dataRoot: dataRoot)
@@ -159,36 +164,82 @@ enum AppScriptRunner {
             if let validation { return await validation(input, fixture) }
             return await fixture.reply(input)
         }
-        func resolved(_ id: String) -> AppAction? {
-            AppActions.action(id, dataRoot: dataRoot)
+        func resolved(_ id: String) throws -> AppAction? {
+            try AppActions.action(id, dataRoot: dataRoot)
         }
-        /// An alias's contract is the alias itself: the one form answers it.
-        func dependencyShape(_ id: String) -> JSONValue? {
-            if let action = resolved(id) { return AppActions.dependencyContract(action, dataRoot: dataRoot) }
-            return AppToolExecutor.partAlias(id, [:], root: dataRoot).map { _ in
-                .object(["alias": .string(id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())])
+        /// Only a current action has a dependency contract.
+        func dependencyShape(_ id: String) throws -> JSONValue? {
+            if let action = try resolved(id) { return try AppActions.dependencyContract(action, dataRoot: dataRoot) }
+            return nil
+        }
+        func callProblem(_ id: String, given: [OwnedProgram.Calls.Argument], schema ownSchema: JSONValue?) throws -> String? {
+            let action = try resolved(id)
+            guard let schema = try ownSchema ?? action.flatMap({ try AppActions.discovery($0, dataRoot: dataRoot).objectValue?["args_schema"] }) else { return nil }
+            typealias Argument = OwnedProgram.Calls.Argument
+            func normalize(_ argument: Argument, schema: JSONValue, root: Bool = false) -> Argument {
+                switch argument {
+                case .object(let fields):
+                    let known = fields.compactMapValues(\.value)
+                    let values: [String: JSONValue]
+                    if root, ownSchema == nil, let action {
+                        values = AppToolExecutor.doorValidationArgs(action,
+                            AppToolExecutor.normalizedCallArguments(action, known, schema: schema, recordShims: false))
+                    } else { values = ToolArguments.normalized(known, schema: schema, recordShims: false) }
+                    var result = values.mapValues(Argument.value)
+                    let properties = schema.objectValue?["properties"]?.objectValue ?? [:]
+                    for (key, value) in fields where value.value == nil {
+                        result[key] = properties[key].map { normalize(value, schema: $0) } ?? value
+                    }
+                    return .object(result)
+                case .array(let items):
+                    guard let itemSchema = schema.objectValue?["items"], itemSchema.arrayValue == nil else { return argument }
+                    return .array(items.map { normalize($0, schema: itemSchema) })
+                case .value(let value):
+                    let wrapper: JSONValue = .object(["type": .string("object"), "properties": .object(["value": schema]), "required": .array([.string("value")])])
+                    return .value(ToolArguments.normalized(["value": value], schema: wrapper, recordShims: false)["value"] ?? value)
+                case .unknown: return argument
+                }
             }
-        }
-        func dependencyPin(_ id: String) -> String? {
-            dependencyShape(id).flatMap(pin)
-        }
-        private func pin(_ shape: JSONValue) -> String? {
-            guard case .object(var legacy) = shape else { return nil }
-            // Preserve admitted digest-only pins; this retired field is hash
-            // compatibility, never discovery or a callability decision.
-            legacy["scriptable"] = .bool(true)
-            guard let digest = try? OwnedProgramStore.hash(.object(legacy)) else { return nil }
-            return AppActions.legacyContractPins[digest] ?? digest
-        }
-        func dependencyMatches(_ id: String, _ saved: JSONValue?) -> Bool {
-            // Whatever an older door's contract was, its alias answers every call it took.
-            if resolved(id) == nil, AppToolExecutor.partAlias(id, [:], root: dataRoot) != nil { return saved != nil }
-            guard let saved, let current = dependencyShape(id) else { return false }
-            if saved == current || saved == pin(current).map(JSONValue.string) { return true }
-            // A full shape (older authored tools stored theirs inside discovery) still
-            // matches while the current contract accepts every call it did. A digest
-            // alone can only match exactly.
-            return AppActions.acceptsEveryCall(current, of: AppActions.legacyDependencyContract(saved) ?? saved)
+            let arguments: Argument
+            if let first = given.first, case .object = first { arguments = first }
+            else if given.isEmpty { arguments = .object([:]) }
+            else {
+                // A self-call being saved has no live positional declaration
+                // for its new schema yet; its actual call checks that mapping.
+                if ownSchema != nil { return nil }
+                let values = given.compactMap(\.value)
+                guard values.count == given.count else { return nil }
+                switch doorInput(id: id, given: values) {
+                case .failure(let error): return error.detail
+                case .success(let input): arguments = .object((input["args"]?.objectValue ?? [:]).mapValues(Argument.value))
+                }
+            }
+            guard case .object(let fields) = arguments else { return nil }
+            let corrected = fields
+            if ownSchema == nil, let action,
+               let (key, values) = AppToolExecutor.doorPlural(action, corrected, discovery: ["args_schema": schema]) {
+                let known = corrected.compactMapValues(\.value)
+                // A conditional read cannot be judged using missing values.
+                // Folded actions re-enter their own gates for each element.
+                if !action.isFold, !action.read, known.count != corrected.count { return nil }
+                if action.isFold || action.readOnly(args: known) {
+                    for (index, value) in values.enumerated() {
+                        let expanded = corrected.merging([key: value]) { _, new in new }
+                        if let problem = try callProblem(id, given: [.object(expanded)], schema: nil) {
+                            return "plural args.\(key)[\(index)]: \(problem)"
+                        }
+                    }
+                    return nil
+                }
+            }
+            // Runtime Contacts admission is raw. Static inspection must not
+            // coerce a known numeric/null entry merely because a sibling is
+            // an unknown expression; unknowns still defer to the live owner.
+            let checked: Argument
+            if ownSchema == nil, let action, MacContactsExecutor.parameters(for: action.tool) != nil {
+                checked = .object(corrected)
+            } else { checked = normalize(.object(corrected), schema: schema, root: true) }
+            return checked.problem(schema: schema)
         }
         func admitTool(_ id: String, input: [String: JSONValue]) async -> JSONValue? { await admit(id, input) }
         func performReach(_ operation: String, arguments: JSONValue) async throws -> JSONValue {

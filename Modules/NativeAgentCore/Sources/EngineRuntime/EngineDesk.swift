@@ -37,6 +37,7 @@ public final class DeskFacade {
 
     public private(set) var workflows: [WorkflowRecord] = []
     public private(set) var workflowsReadError: String?
+    public private(set) var hasLoadedWorkflows = false
 
     /// Every scheduled job, as of the last read that returned rows.
     public private(set) var jobs: [ScheduledJob] = []
@@ -64,7 +65,7 @@ public final class DeskFacade {
             catch { return .failure(error) }
         }, publish: { result in
             switch result {
-            case .success(let rows): workflows = rows; workflowsReadError = nil
+            case .success(let rows): workflows = rows; workflowsReadError = nil; hasLoadedWorkflows = true
             case .failure(let error): workflowsReadError = error.localizedDescription
             }
         })
@@ -327,13 +328,7 @@ public final class DeskFacade {
     /// Research lab runs from `research/lab/runs.json`, newest first. Damage
     /// fails the read, preserving the retained history and the original bytes.
     public nonisolated func listResearchRuns() async throws -> [ResearchLabRun] {
-        let rows = try await SwiftNativeResearchClient(dataRoot: dataRoot).researchLabRuns()
-        let runs = rows.compactMap(ResearchLabRun.init(row:))
-        guard runs.count == rows.count else {
-            throw ResearchClientError.malformedResponse(
-                "Saved research history is unavailable: \(rows.count - runs.count) of \(rows.count) runs are malformed. Original contents have been preserved.")
-        }
-        return runs
+        try await SwiftNativeResearchClient(dataRoot: dataRoot).researchLabRuns()
     }
 }
 
@@ -415,17 +410,22 @@ extension DeskFacade {
             await bindLiveUpdates()
             _ = await refreshJobs()
             let dataRoot = self.dataRoot
-            let timing = try? await bots.effectiveSchedule()
-            snapshot.missedBots = await Task.detached(priority: .userInitiated) {
-                timing.map { DeskMissedBot.load(root: dataRoot, timing: $0) } ?? []
-            }.value
-            if let timing, timing.unattended {
-                snapshot.timedBots = await Task.detached(priority: .userInitiated) {
-                    DeskTimedBot.load(root: dataRoot, timing: timing)
+            do {
+                let timing = try await bots.effectiveSchedule()
+                snapshot.missedBots = try await Task.detached(priority: .userInitiated) {
+                    try DeskMissedBot.load(root: dataRoot, timing: timing)
                 }.value
+                if timing.unattended {
+                    snapshot.timedBots = try await Task.detached(priority: .userInitiated) {
+                        try DeskTimedBot.load(root: dataRoot, timing: timing)
+                    }.value
+                }
+            } catch {
+                snapshot.botScheduleError = "Helper schedules could not be read: \(error.localizedDescription). Repair the saved helper definitions and schedules."
             }
             snapshot.now = Date()
-            snapshot.nagConfig = await DeskNagConfigStore(dataRoot: dataRoot).load()
+            do { snapshot.nagConfig = try await DeskNagConfigStore(dataRoot: dataRoot).loadChecked() }
+            catch { snapshot.nagConfigError = "Reminder settings are unavailable: \(error.localizedDescription). Repair the saved reminder settings before changing them." }
             let hour: StudioWanderLane.TraceEntry?
             do {
                 hour = try await Self.residentHour(dataRoot: dataRoot)

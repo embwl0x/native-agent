@@ -1,6 +1,6 @@
 import SwiftUI
 
-// Blueprint: | `ChatPacedReveal.swift` | `ChatStreamPacer` and shared streaming views: paragraph-aware paced reveal, edge fade and settle crossfade for Mac/iPhone |
+// Blueprint: | `ChatPacedReveal.swift` | `ChatStreamPacer` and shared streaming views: paragraph-aware paced reveal, explicit inline outcomes, edge fade and settle crossfade for Mac/iPhone |
 
 // Mac and iPhone share paced reply reveal, edge fade and settle crossfade.
 
@@ -74,8 +74,18 @@ public struct StreamingParagraphText: View {
         inline: ChatInlineMarkdown? = nil,
         atEdge: Bool = false
     ) -> Text {
-        if let inline, let styled = inline.parse(atEdge ? closingEdge(text) : String(text)) {
-            return paragraph(text, styled: styled, fades: fades)
+        if let inline {
+            let outcome = inline.parse(atEdge ? closingEdge(text) : String(text))
+            switch outcome {
+            case .parsed(let styled):
+                return paragraph(text, styled: styled, fades: fades)
+            case .failed(_, let reason):
+                // The notice is not a subsequence of the source, so source
+                // fade offsets must not be applied to it. Show the actual
+                // revealed source, without the live edge's closing markers.
+                return Text(ChatRichContentParser.InlineOutcome.failed(
+                    source: String(text), reason: reason).presentation)
+            }
         }
         guard let first = fades.first else { return Text(text) }
         let utf8 = text.base.utf8
@@ -212,11 +222,11 @@ private struct FinishedParagraph: View, Equatable {
 }
 
 /// The platform's settled-reply inline markdown parse, handed to the live
-/// reply so both draw the same words. Nil from `parse` streams raw text.
+/// reply so both draw the same words and expose the same parse failures.
 public struct ChatInlineMarkdown: Sendable {
-    let parse: @Sendable (String) -> AttributedString?
+    let parse: @Sendable (String) -> ChatRichContentParser.InlineOutcome
 
-    public init(_ parse: @escaping @Sendable (String) -> AttributedString?) {
+    public init(_ parse: @escaping @Sendable (String) -> ChatRichContentParser.InlineOutcome) {
         self.parse = parse
     }
 }

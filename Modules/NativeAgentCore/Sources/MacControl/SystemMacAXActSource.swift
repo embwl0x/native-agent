@@ -16,7 +16,7 @@ import AppKit
 import Carbon
 import NativeAgentShared
 #endif
-// Blueprint: | `SystemMacAXActSource.swift` | Native AX execution lane, CF-equal source-owned handles, resolution and driver-checked mutations; admission failures retain their own identity |
+// Blueprint: | `SystemMacAXActSource.swift` | Native AX execution lane and CF-equal handles; unique marked-target reads propagate evidence failures; performNative/setNativeAttribute read the actual element pid's integration Write switch before mutation; looking, driver authority and typed admission failures retain their identities |
 /// AX mutations can synchronously invoke action handlers inside the target
 /// application. SwiftUI/AppKit handlers are main-thread isolated, so issuing
 /// `AXUIElementPerformAction` from a model/tool executor can crash the target
@@ -29,6 +29,13 @@ enum MacAXExecutionLane {
         let background = MacDriverContext.background
         let continuation = MacWorkContinuation.current
         let readDeadline = MacAXLimits.readDeadline
+        let observationMode = MacObservationMode.current
+        let consentRoot = MacAppActGate.dataRoot
+        let looking = MacAppActGate.looking
+        let fullMacAdmitted = MacAppActGate.fullMacAdmitted
+        #if canImport(ApplicationServices) && os(macOS)
+        let evidence = MacAXAttributeRead.evidence
+        #endif
         return withoutActuallyEscaping(body) { operation in
             // GCD sync completes this nonescaping operation before returning.
             nonisolated(unsafe) let synchronousOperation = operation
@@ -36,7 +43,21 @@ enum MacAXExecutionLane {
                 MacDriverContext.$binding.withValue(binding) {
                     MacDriverContext.$background.withValue(background) {
                         MacWorkContinuation.$current.withValue(continuation) {
-                            MacAXLimits.$readDeadline.withValue(readDeadline) { synchronousOperation() }
+                            MacAXLimits.$readDeadline.withValue(readDeadline) {
+                                MacObservationMode.$current.withValue(observationMode) {
+                                    MacAppActGate.$dataRoot.withValue(consentRoot) {
+                                        MacAppActGate.$fullMacAdmitted.withValue(fullMacAdmitted) {
+                                            MacAppActGate.$looking.withValue(looking) {
+                                                #if canImport(ApplicationServices) && os(macOS)
+                                                MacAXAttributeRead.$evidence.withValue(evidence) { synchronousOperation() }
+                                                #else
+                                                synchronousOperation()
+                                                #endif
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -46,15 +67,19 @@ enum MacAXExecutionLane {
 }
 #if canImport(ApplicationServices) && os(macOS)
 package enum MacNativeActionFailure: Error, LocalizedError {
-    case driver, selfTarget
+    case driver(String), selfTarget, renderer(String), evidence(String), appPermission(MacAppActRefusal)
     package var errorDescription: String? {
         switch self {
-        case .driver: "The Mac driver does not permit foreground input. Return control to NativeAgent before continuing; the Accessibility action did not run."
+        case .driver(let detail): detail
         case .selfTarget: "NativeAgent does not act on its own app through Accessibility."
+        case .renderer(let detail): detail
+        case .evidence(let detail): detail
+        case .appPermission(let refusal): refusal.message
         }
     }
 }
-/// Live AX element resolution and mutation use a locked, source-owned handle table, separate from the read organ.
+/// Live AX resolution and mutation use a locked table owned by the dispatch or
+/// its retained sight binding, separate from the read organ.
 public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     let lock = NSLock()
     private var table: [Int: AXUIElement] = [:]
@@ -83,26 +108,17 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     public func isTrusted() -> Bool {
         MacAXExecutionLane.sync { AXIsProcessTrusted() }
     }
-    public func resolve(path: [Int]) -> MacAXActTarget? {
-        MacAXExecutionLane.sync { resolveOnExecutionLane(path: path) }
-    }
-    private func resolveOnExecutionLane(path: [Int]) -> MacAXActTarget? {
-        #if canImport(AppKit)
-        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
-        guard case .resolved(let target) = resolveOnExecutionLane(
-            path: path,
-            pid: app.processIdentifier
-        ) else { return nil }
-        return target
-        #else
-        return nil
-        #endif
-    }
     public func resolve(path: [Int], inAppPid pid: Int32) -> MacAXPidResolution {
-        MacAXExecutionLane.sync { resolveOnExecutionLane(path: path, pid: pid) }
+        MacAXExecutionLane.sync {
+            do { return try MacAXAttributeRead.checked { resolveOnExecutionLane(path: path, pid: pid) } }
+            catch { return .unavailable(error.localizedDescription) }
+        }
     }
     public func resolve(menuPath: [Int], inAppPid pid: Int32, titlePath: [String]?) -> MacAXPidResolution {
-        MacAXExecutionLane.sync { resolveMenuOnExecutionLane(path: menuPath, pid: pid, titlePath: titlePath) }
+        MacAXExecutionLane.sync {
+            do { return try MacAXAttributeRead.checked { resolveMenuOnExecutionLane(path: menuPath, pid: pid, titlePath: titlePath) } }
+            catch { return .unavailable(error.localizedDescription) }
+        }
     }
     private func resolveMenuOnExecutionLane(path: [Int], pid: Int32, titlePath: [String]?) -> MacAXPidResolution {
         #if canImport(AppKit)
@@ -127,8 +143,6 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         guard NSRunningApplication(processIdentifier: pid) != nil else { return .appGone }
         let appElement = AXUIElementCreateApplication(pid)
         guard let current = MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute)
-            ?? MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute)
-            ?? MacAXAttributeRead.copyElementArray(appElement, kAXWindowsAttribute).first
         else { return .appGone }
         return resolveDescendant(path: path, from: current)
         #else
@@ -136,8 +150,10 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         #endif
     }
     /// Inventory every window so the caller can identify the observed one rather than whichever is focused.
-    public func windows(pid: Int32) -> [MacAXWindowRef] {
-        MacAXExecutionLane.sync { windowsOnExecutionLane(pid: pid) }
+    public func windows(pid: Int32) throws -> [MacAXWindowRef] {
+        try MacAXExecutionLane.sync {
+            Result { try MacAXAttributeRead.checked { try windowsOnExecutionLane(pid: pid) } }
+        }.get()
     }
     public func windowPresence(_ window: MacAXWindowRef) -> Bool? {
         MacAXExecutionLane.sync {
@@ -161,7 +177,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             return windows.contains { CFEqual($0, target) }
         }
     }
-    private func windowsOnExecutionLane(pid: Int32) -> [MacAXWindowRef] {
+    private func windowsOnExecutionLane(pid: Int32) throws -> [MacAXWindowRef] {
         #if canImport(AppKit)
         // Same self-process fence as `resolveOnExecutionLane(path:pid:)`.
         guard pid != getpid() else { return [] }
@@ -173,10 +189,10 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             main: MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute),
             equal: { CFEqual($0, $1) }
         )
-        return windows.enumerated().map { index, window in
+        return try windows.enumerated().map { index, window in
             MacAXWindowRef(
                 handle: mint(window),
-                identity: MacAXAttributeRead.copyWindowIdentity(window, pid: pid, index: index)
+                identity: try MacAXAttributeRead.copyWindowIdentity(window, pid: pid, index: index)
             )
         }
         #else
@@ -184,12 +200,15 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         #endif
     }
     public func focusedWindow(pid: Int32) -> MacAXWindowRef? {
-        MacAXExecutionLane.sync { focusedWindowOnExecutionLane(pid: pid) }
+        MacAXExecutionLane.sync {
+            do { return try MacAXAttributeRead.checked { try focusedWindowOnExecutionLane(pid: pid) } }
+            catch { MacAXAttributeRead.failed(error); return nil }
+        }
     }
     /// `AXFocusedWindow` of that app, carrying the SAME composite identity
     /// `windows(pid:)` mints, so the caller can compare it against the frame's
     /// recorded window with the ordinary matcher rather than by title alone.
-    private func focusedWindowOnExecutionLane(pid: Int32) -> MacAXWindowRef? {
+    private func focusedWindowOnExecutionLane(pid: Int32) throws -> MacAXWindowRef? {
         #if canImport(AppKit)
         // Same self-process fence as `resolveOnExecutionLane(path:pid:)`.
         guard pid != getpid() else { return nil }
@@ -209,7 +228,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
         let index = windows.firstIndex(where: { CFEqual($0, focused) }) ?? 0
         return MacAXWindowRef(
             handle: mint(focused),
-            identity: MacAXAttributeRead.copyWindowIdentity(focused, pid: pid, index: index)
+            identity: try MacAXAttributeRead.copyWindowIdentity(focused, pid: pid, index: index)
         )
         #else
         return nil
@@ -218,10 +237,10 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     public func resolve(path: [Int], inWindow window: MacAXWindowRef) -> MacAXPidResolution {
         MacAXExecutionLane.sync { resolveOnExecutionLane(path: path, inWindow: window) }
     }
-    public func uniqueTarget(role: String, label: String, labelSource: String, inWindow window: MacAXWindowRef) -> MacAXActTarget? {
+    public func uniqueTarget(role: String, label: String, labelSource: String, inWindow window: MacAXWindowRef) throws -> MacAXActTarget? {
         // This is read-only resolution. Do not hold the main lane across an
         // app-wide search; use the common reader's ranged fetches and deadline.
-        do { return try MacAccessibilityReader.withReadBudget {
+        return try MacAccessibilityReader.withReadBudget {
             guard window.identity.pid != getpid(),
                   NSRunningApplication(processIdentifier: window.identity.pid) != nil,
                   let root = element(window.handle),
@@ -237,7 +256,9 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
                         guard budget > 0 else { return nil }
                         budget -= 1
                         let childRole = MacAXAttributeRead.copyString(child, kAXRoleAttribute) ?? ""
-                        if let text = MacAXAttributeRead.copyLabel(child, role: childRole).identity
+                        let names = MacAXAttributeRead.copyLabel(child, role: childRole)
+                        guard !names.unreadable else { return nil }
+                        if let text = names.identity
                             ?? MacAXAttributeRead.copyRaw(child, kAXValueAttribute)
                                 .flatMap(SystemMacAXElementSource.stringifiedValue) {
                             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -262,9 +283,9 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
                         } else if labelSource == "descendant_text" {
                             // Only an element with no name of its own is named
                             // by its child, as the view builder did.
-                            let own = MacAXAttributeRead.copyLabel(current, role: currentRole).identity?
-                                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                            if own.isEmpty { currentLabel = try descendantText(current) }
+                            let names = MacAXAttributeRead.copyLabel(current, role: currentRole)
+                            let own = names.identity?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            if !names.unreadable, own.isEmpty { currentLabel = try descendantText(current) }
                             else { currentLabel = nil }
                         } else {
                             currentLabel = MacAXAttributeRead.copyRaw(current, kAXValueAttribute)
@@ -278,13 +299,12 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
                     }
                 }
                 try Task.checkCancellation()
-                guard MacAXLimits.readDeadline.map({ Date() < $0 }) == true else { return nil }
+                guard MacAXLimits.readDeadline.map({ Date() < $0 }) == true else {
+                    throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility search for a unique marked control exhausted the shared reader time budget. Read this control again before acting.")
+                }
                 return match
             }
             return try search(root).flatMap { describe($0) }
-        } } catch {
-            nativeLog("MacControl marked-control read incomplete: %@", String(error.localizedDescription.prefix(512)))
-            return nil
         }
     }
     private func resolveOnExecutionLane(path: [Int], inWindow window: MacAXWindowRef) -> MacAXPidResolution {
@@ -306,6 +326,10 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     // The caller selects and validates the root on the AX execution lane.
     // This shared walk never substitutes a different window or menu root.
     private func resolveDescendant(path: [Int], from root: AXUIElement, titlePath: [String]? = nil) -> MacAXPidResolution {
+        do { return try MacAXAttributeRead.checked { resolveCheckedDescendant(path: path, from: root, titlePath: titlePath) } }
+        catch { return .unavailable(error.localizedDescription) }
+    }
+    private func resolveCheckedDescendant(path: [Int], from root: AXUIElement, titlePath: [String]?) -> MacAXPidResolution {
         var current = root
         var titles: [String] = []
         var validAncestry = true
@@ -338,45 +362,88 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     /// owner and driver authority as resolved actions, retaining the AX status.
     package func performNative(_ element: AXUIElement, action: String) -> Result<AXError, MacNativeActionFailure> {
         MacAXExecutionLane.sync {
-            guard MacDriverContext.binding?.allowsAction == true else { return .failure(.driver) }
+            // Scroll actions and AXRaise support reading/opening an app.
+            if !["AXScrollUpByPage", "AXScrollDownByPage", "AXScrollLeftByPage", "AXScrollRightByPage", "AXScrollToVisible", kAXRaiseAction].contains(action),
+               let refusal = MacAppActGate.elementRefusal(element) {
+                MacAppActGate.admit(refusal)
+                return .failure(.appPermission(refusal))
+            }
+            guard MacDriverContext.binding?.allowsAction == true else { return .failure(.driver(MacAttentionSessionStore.driverRefusal)) }
+            do { try SystemMacAXElementSource.ensureRenderer(element, refresh: true) }
+            catch { return .failure(.renderer(error.localizedDescription)) }
+            do {
+                guard try MacAXAttributeRead.checkedBool(element, kAXEnabledAttribute) == true else {
+                    return .failure(.evidence("The target is disabled or has no readable AXEnabled state. Read the app again before performing \(action)."))
+                }
+                guard try MacAXAttributeRead.copyActions(element).contains(action) else {
+                    return .failure(.evidence("The target does not advertise \(action). Inspect this app's supported actions before continuing."))
+                }
+            } catch { return .failure(.evidence(error.localizedDescription)) }
+            guard MacDriverContext.binding?.allowsAction == true else { return .failure(.driver(MacAttentionSessionStore.driverRefusal)) }
             NativeAgentMotorEpoch.noteAgentMotorEvent()
             return .success(recordMutationStatus(AXUIElementPerformAction(element, action as CFString)))
         }
     }
     package func setNativeAttribute(_ element: AXUIElement, attribute: String, value: CFTypeRef) -> Result<AXError, MacNativeActionFailure> {
         MacAXExecutionLane.sync {
-            guard MacDriverContext.binding?.allowsAction == true else { return .failure(.driver) }
+            if let refusal = MacAppActGate.elementRefusal(element) {
+                MacAppActGate.admit(refusal)
+                return .failure(.appPermission(refusal))
+            }
+            guard MacDriverContext.binding?.allowsAction == true else { return .failure(.driver(MacAttentionSessionStore.driverRefusal)) }
+            do { try SystemMacAXElementSource.ensureRenderer(element, refresh: true) }
+            catch { return .failure(.renderer(error.localizedDescription)) }
+            guard MacDriverContext.binding?.allowsAction == true else { return .failure(.driver(MacAttentionSessionStore.driverRefusal)) }
             NativeAgentMotorEpoch.noteAgentMotorEvent()
             return .success(recordMutationStatus(AXUIElementSetAttributeValue(element, attribute as CFString, value)))
         }
     }
-    package func enableManualAccessibility(pid: Int32) -> Result<AXError, MacNativeActionFailure> {
-        guard pid != getpid() else { return .failure(.selfTarget) }
-        return setNativeAttribute(AXUIElementCreateApplication(pid), attribute: "AXManualAccessibility", value: kCFBooleanTrue)
+    private func actionOutcome(_ result: Result<AXError, MacNativeActionFailure>) -> MacAXActOutcome {
+        switch result {
+        case .success(.success): return .performed
+        case .success(let status):
+            return MacAXActOutcome(status: .failed, emissionAttempted: true,
+                cause: "The native AX mutation returned \(status.rawValue); its effect is unknown.",
+                nativeCode: Int(status.rawValue))
+        case .failure(let failure):
+            let remedy: JSONValue?
+            if case .appPermission(let refusal) = failure { remedy = refusal.fields["remedy"] }
+            else { remedy = nil }
+            return MacAXActOutcome(status: .failed, emissionAttempted: false,
+                cause: failure.localizedDescription, remedy: remedy)
+        }
+    }
+    private func settableOutcome(_ element: AXUIElement, attribute: String) -> MacAXActOutcome? {
+        guard MacDriverContext.binding?.allowsAction == true else {
+            return actionOutcome(.failure(.driver(MacAttentionSessionStore.driverRefusal)))
+        }
+        do { try SystemMacAXElementSource.ensureRenderer(element, refresh: true) }
+        catch { return actionOutcome(.failure(.renderer(error.localizedDescription))) }
+        guard MacDriverContext.binding?.allowsAction == true,
+              MacAXAttributeRead.prepareMessage(element) else {
+            return actionOutcome(.failure(.evidence("The AX settable probe was stopped or exhausted its read budget.")))
+        }
+        var settable: DarwinBoolean = false
+        let status = AXUIElementIsAttributeSettable(element, attribute as CFString, &settable)
+        guard status == .success else {
+            return MacAXActOutcome(status: status == .attributeUnsupported ? .unsupported : .failed,
+                emissionAttempted: false, cause: "Reading AX settable state for \(attribute) returned \(status.rawValue).",
+                nativeCode: Int(status.rawValue))
+        }
+        return settable.boolValue ? nil : MacAXActOutcome(status: .unsupported, emissionAttempted: false,
+            cause: "The target does not permit writing \(attribute).")
     }
     private func performOnExecutionLane(_ target: MacAXActTarget, action: String) -> MacAXActOutcome {
         guard let element = element(target.handle) else { return .invalidTarget }
-        guard target.actions.contains(action) else { return .unsupported }
-        guard case .success(let status) = performNative(element, action: action) else { return .failed }
-        switch status {
-        case .success: return .performed
-        default: return .failed
-        }
+        return actionOutcome(performNative(element, action: action))
     }
     public func setValue(_ target: MacAXActTarget, value: String) -> MacAXActOutcome {
         MacAXExecutionLane.sync { setValueOnExecutionLane(target, value: value) }
     }
     private func setValueOnExecutionLane(_ target: MacAXActTarget, value: String) -> MacAXActOutcome {
         guard let element = element(target.handle) else { return .invalidTarget }
-        var settable: DarwinBoolean = false
-        let probe = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
-        guard probe == .success else { return probe == .attributeUnsupported ? .unsupported : .failed }
-        guard settable.boolValue else { return .unsupported }
-        guard case .success(let status) = setNativeAttribute(element, attribute: kAXValueAttribute, value: value as CFTypeRef) else { return .failed }
-        switch status {
-        case .success: return .performed
-        default: return .failed
-        }
+        if let refusal = settableOutcome(element, attribute: kAXValueAttribute) { return refusal }
+        return actionOutcome(setNativeAttribute(element, attribute: kAXValueAttribute, value: value as CFTypeRef))
     }
     public func setFocused(_ target: MacAXActTarget) -> MacAXActOutcome {
         MacAXExecutionLane.sync { setFocusedOnExecutionLane(target) }
@@ -404,21 +471,16 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     public func isFocusedElement(_ target: MacAXActTarget, pid: Int32) -> Bool {
         MacAXExecutionLane.sync {
             guard pid != getpid(), let element = element(target.handle) else { return false }
-            var focused: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(
-                AXUIElementCreateApplication(pid),
-                kAXFocusedUIElementAttribute as CFString,
-                &focused
-            ) == .success, let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return false }
+            guard let focused = MacAXAttributeRead.copyElement(
+                AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute
+            ) else { return false }
             // A field's focus can sit on a child (a web combo's inner input):
             // a few parents up is still the field.
-            var node = focused as! AXUIElement
+            var node = focused
             for _ in 0..<5 {
                 if CFEqual(node, element) { return true }
-                var parent: CFTypeRef?
-                guard AXUIElementCopyAttributeValue(node, kAXParentAttribute as CFString, &parent) == .success,
-                      let parent, CFGetTypeID(parent) == AXUIElementGetTypeID() else { return false }
-                node = parent as! AXUIElement
+                guard let parent = MacAXAttributeRead.copyElement(node, kAXParentAttribute) else { return false }
+                node = parent
             }
             return false
         }
@@ -445,6 +507,7 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     public func elementAtPosition(x: Double, y: Double, pid: Int32) -> MacAXActTarget? {
         MacAXExecutionLane.sync {
             guard pid > 0, pid != getpid(), x.isFinite, y.isFinite else { return nil }
+            guard (try? SystemMacAXElementSource.ensureRenderer(AXUIElementCreateApplication(pid), refresh: true)) != nil else { return nil }
             var target: AXUIElement?
             guard AXUIElementCopyElementAtPosition(
                 AXUIElementCreateApplication(pid), Float(x), Float(y), &target
@@ -459,6 +522,25 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
                     AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute
                   ) else { return nil }
             return describe(focused)
+        }
+    }
+    public func acceptsTextInput(_ target: MacAXActTarget) -> Bool {
+        MacAXExecutionLane.sync {
+            guard let element = element(target.handle), let current = describe(element, reusing: target.handle),
+                  current.enabled, !MacActClosedLoop.isSecureField(role: current.role) else { return false }
+            if MacActClosedLoop.canType(role: current.role)
+                || MacAXAttributeRead.copyBool(element, "AXEditable") == true { return true }
+            // Canvas editors may expose a caret without exposing their text.
+            if let raw = MacAXAttributeRead.copyRaw(element, kAXSelectedTextRangeAttribute),
+               CFGetTypeID(raw) == AXValueGetTypeID() {
+                let value = raw as! AXValue
+                var range = CFRange()
+                if AXValueGetType(value) == .cfRange, AXValueGetValue(value, .cfRange, &range),
+                   range.location >= 0, range.length >= 0 { return true }
+            }
+            var settable: DarwinBoolean = false
+            return AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable) == .success
+                && settable.boolValue
         }
     }
     public func textInput(_ target: MacAXActTarget) -> MacAXTextInput? {
@@ -482,58 +564,55 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
             return MacAXTextInput(target: current, value: value, selection: NSRange(location: range.location, length: range.length))
         }
     }
+    public func url(of target: MacAXActTarget) throws -> URL? {
+        try MacAXExecutionLane.sync {
+            Result<URL?, Error> {
+            guard let element = element(target.handle) else {
+                throw MacAccessibilityReader.NativeReadFailure(detail: "The directory control no longer resolves.")
+            }
+            guard let raw = try MacAXAttributeRead.checkedRaw(element, kAXURLAttribute) else { return nil }
+            if CFGetTypeID(raw) == CFURLGetTypeID() {
+                let url = raw as! CFURL as URL
+                guard url.isFileURL else {
+                    throw MacAccessibilityReader.NativeReadFailure(detail: "The directory control's AXURL is not a file URL.")
+                }
+                return url
+            }
+            if CFGetTypeID(raw) == CFStringGetTypeID(), let url = URL(string: raw as! CFString as String), url.isFileURL { return url }
+            throw MacAccessibilityReader.NativeReadFailure(detail: "The directory control's AXURL is not a file URL.")
+            }
+        }.get()
+    }
     public func setSelectedTextRange(_ target: MacAXActTarget, range: NSRange) -> MacAXActOutcome {
         MacAXExecutionLane.sync {
             guard let element = element(target.handle) else { return .invalidTarget }
-            var settable: DarwinBoolean = false
-            let probe = AXUIElementIsAttributeSettable(element, kAXSelectedTextRangeAttribute as CFString, &settable)
-            guard probe == .success else { return probe == .attributeUnsupported ? .unsupported : .failed }
-            guard settable.boolValue else { return .unsupported }
+            if let refusal = settableOutcome(element, attribute: kAXSelectedTextRangeAttribute) { return refusal }
             var selection = CFRange(location: range.location, length: range.length)
-            guard let value = AXValueCreate(.cfRange, &selection) else { return .failed }
-            guard case .success(let status) = setNativeAttribute(element, attribute: kAXSelectedTextRangeAttribute, value: value) else { return .failed }
-            switch status {
-            case .success: return .performed
-            default: return .failed
+            guard let value = AXValueCreate(.cfRange, &selection) else {
+                return MacAXActOutcome(status: .failed, emissionAttempted: false,
+                    cause: "Could not construct the AX selection range.")
             }
+            return actionOutcome(setNativeAttribute(element, attribute: kAXSelectedTextRangeAttribute, value: value))
         }
     }
     public func setSelectedText(_ target: MacAXActTarget, text: String) -> MacAXActOutcome {
         MacAXExecutionLane.sync {
             guard let element = element(target.handle) else { return .invalidTarget }
-            var settable: DarwinBoolean = false
-            let probe = AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable)
-            guard probe == .success else { return probe == .attributeUnsupported ? .unsupported : .failed }
-            guard settable.boolValue else { return .unsupported }
-            guard case .success(let status) = setNativeAttribute(element, attribute: kAXSelectedTextAttribute, value: text as CFTypeRef) else { return .failed }
-            switch status {
-            case .success: return .performed
-            default: return .failed
-            }
+            if let refusal = settableOutcome(element, attribute: kAXSelectedTextAttribute) { return refusal }
+            return actionOutcome(setNativeAttribute(element, attribute: kAXSelectedTextAttribute, value: text as CFTypeRef))
         }
     }
     public func setSelected(_ target: MacAXActTarget) -> MacAXActOutcome {
-        MacAXExecutionLane.sync { setSelectedOnExecutionLane(target) }
-    }
-    private func setSelectedOnExecutionLane(_ target: MacAXActTarget) -> MacAXActOutcome {
-        guard let element = element(target.handle) else { return .invalidTarget }
-        var settable: DarwinBoolean = false
-        let probe = AXUIElementIsAttributeSettable(element, "AXSelected" as CFString, &settable)
-        guard probe == .success, settable.boolValue else { return .unsupported }
-        guard case .success(let status) = setNativeAttribute(element, attribute: "AXSelected", value: true as CFTypeRef) else { return .failed }
-        return status == .success ? .performed : .failed
+        MacAXExecutionLane.sync {
+            guard let element = element(target.handle) else { return .invalidTarget }
+            if let refusal = settableOutcome(element, attribute: "AXSelected") { return refusal }
+            return actionOutcome(setNativeAttribute(element, attribute: "AXSelected", value: kCFBooleanTrue))
+        }
     }
     private func setFocusedOnExecutionLane(_ target: MacAXActTarget) -> MacAXActOutcome {
         guard let element = element(target.handle) else { return .invalidTarget }
-        var settable: DarwinBoolean = false
-        let probe = AXUIElementIsAttributeSettable(element, kAXFocusedAttribute as CFString, &settable)
-        guard probe == .success, settable.boolValue else { return .unsupported }
-        guard case .success(let status) = setNativeAttribute(element, attribute: kAXFocusedAttribute, value: kCFBooleanTrue) else { return .failed }
-        switch status {
-        case .success: return .performed
-        case .attributeUnsupported, .actionUnsupported: return .unsupported
-        default: return .failed
-        }
+        if let refusal = settableOutcome(element, attribute: kAXFocusedAttribute) { return refusal }
+        return actionOutcome(setNativeAttribute(element, attribute: kAXFocusedAttribute, value: kCFBooleanTrue))
     }
     public func reread(_ target: MacAXActTarget) -> MacAXActTarget? {
         MacAXExecutionLane.sync { rereadOnExecutionLane(target) }
@@ -544,8 +623,26 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
     }
     // MARK: raw AX reads used to describe the target (nil-tolerant)
     private func describe(_ element: AXUIElement, reusing handle: Int? = nil) -> MacAXActTarget? {
-        guard let role = MacAXAttributeRead.copyString(element, kAXRoleAttribute) else { return nil }
-        return MacAXActTarget(
+        do { return try MacAXAttributeRead.checked { describeChecked(element, reusing: handle) } }
+        catch { MacAXAttributeRead.failed(error); return nil }
+    }
+    private func describeChecked(_ element: AXUIElement, reusing handle: Int?) -> MacAXActTarget? {
+        do { try SystemMacAXElementSource.ensureRenderer(element, refresh: true) }
+        catch { nativeLog("AX target renderer preparation refused: %@", error.localizedDescription); return nil }
+        let role: String, enabled: Bool, actions: [String]
+        do {
+            role = try MacAXAttributeRead.checkedText(element, kAXRoleAttribute)
+            guard !role.isEmpty, let observedEnabled = try MacAXAttributeRead.checkedBool(element, kAXEnabledAttribute) else {
+                MacAXAttributeRead.failed(MacAccessibilityReader.NativeReadFailure(detail: "AX target evidence unavailable: role or AXEnabled is missing. Read this control again before acting."))
+                return nil
+            }
+            enabled = observedEnabled
+            actions = try MacAXAttributeRead.copyActions(element)
+        } catch { MacAXAttributeRead.failed(error); return nil }
+        // Optional name, value and frame are this element's own: one that
+        // will not read is its gap, never a refusal of an act whose identity,
+        // enabled state and actions did read.
+        return MacAXAttributeRead.collectingAttributeGaps { _ in MacAXActTarget(
             handle: handle ?? mint(element),
             role: role,
             // Same name rule as perception, or a caption-named field ("Save
@@ -557,10 +654,10 @@ public final class SystemMacAXActSource: MacAXActSource, @unchecked Sendable {
                 if CFGetTypeID($0) == CFStringGetTypeID() { return $0 as! CFString as String }
                 return SystemMacAXElementSource.stringifiedValue($0)
             },
-            enabled: MacAXAttributeRead.copyBool(element, kAXEnabledAttribute) ?? true,
+            enabled: enabled,
             frame: MacAXAttributeRead.copyFrame(element),
-            actions: MacAXAttributeRead.copyActions(element)
-        )
+            actions: actions
+        ) }
     }
 }
 #endif

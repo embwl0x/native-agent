@@ -30,9 +30,8 @@ public struct NAProviderCatalogProvider: Codable, Equatable, Sendable {
     public var providerID: String
     public var displayName: String
     public var authState: String
-    /// ProviderRouting's published eligibility; nil from an older Mac, whose
-    /// "ready" authState meant eligible.
-    public var eligible: Bool?
+    /// ProviderRouting's published eligibility.
+    public var eligible: Bool
     public var authModes: [String]
     public var models: [NAProviderCatalogModel]
 
@@ -64,6 +63,7 @@ public struct NAProviderCatalogModel: Codable, Equatable, Sendable {
     public var defaultReasoningEffort: String?
     public var supportedReasoningEfforts: [String]?
     public var supportsFast: Bool?
+    public var controlsNote: String?
 
     public init(
         id: String,
@@ -75,7 +75,8 @@ public struct NAProviderCatalogModel: Codable, Equatable, Sendable {
         supportsJSONMode: Bool,
         defaultReasoningEffort: String?,
         supportedReasoningEfforts: [String]?,
-        supportsFast: Bool?
+        supportsFast: Bool?,
+        controlsNote: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -87,6 +88,7 @@ public struct NAProviderCatalogModel: Codable, Equatable, Sendable {
         self.defaultReasoningEffort = defaultReasoningEffort
         self.supportedReasoningEfforts = supportedReasoningEfforts
         self.supportsFast = supportsFast
+        self.controlsNote = controlsNote
     }
 }
 

@@ -4,7 +4,7 @@ import ImageIO
 #if canImport(UIKit)
 import UIKit
 #endif
-// Blueprint: | `ConversationModels.swift` | Shared conversations and `ChatThreadKind` declarations, navigation, tool evidence, transcripts, attachments and oriented thumbnail decoding; engine-resolved display titles default to title; Mac-owned navigation retains pin/anchor order, thread kind and exact helper owner |
+// Blueprint: | `ConversationModels.swift` | Shared conversations and `ChatThreadKind` declarations, navigation, canonical transcript/phone metadata codec with retained receipt spellings, tool evidence, transcripts, attachments and oriented thumbnail decoding; engine-resolved display titles default to title; Mac-owned navigation retains pin/anchor order, thread kind and exact helper owner |
 
 public struct MultimodalAttachment: Identifiable, Codable, Hashable, Sendable {
     public var id: String
@@ -306,15 +306,37 @@ public struct ChatTranscriptSnapshot: Identifiable, Codable, Hashable, Sendable 
     public var sessionId: String
     public var messages: [ChatMessageRecord]
     public var readError: String? = nil
-    /// A newer Mac write/clear counter authorizes empty transcripts; unversioned empty rows stay inert.
+    /// The Mac write/clear counter authorizes empty transcripts.
     public var transcriptGeneration: Int? = nil
-    /// The Mac holds rows older than this window. Absent on older Mac builds.
+    /// The Mac holds rows older than this window.
     public var hasOlder: Bool? = nil
     /// Reading copies beside the transcript, never canonical chat messages.
     public var otherRooms: [OtherRoomExchange]? = nil
     public init(sessionId: String, messages: [ChatMessageRecord], transcriptGeneration: Int?, hasOlder: Bool = false) {
         self.sessionId = sessionId; self.messages = messages
         self.transcriptGeneration = transcriptGeneration; self.hasOlder = hasOlder
+    }
+    private enum CodingKeys: String, CodingKey {
+        case sessionId, messages, readError, transcriptGeneration, hasOlder, otherRooms
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try c.decode(String.self, forKey: .sessionId)
+        guard !sessionId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw DecodingError.dataCorruptedError(forKey: .sessionId, in: c, debugDescription: "Transcript snapshot has no session identity")
+        }
+        messages = try c.decode([ChatMessageRecord].self, forKey: .messages)
+        readError = try c.decodeIfPresent(String.self, forKey: .readError)
+        if readError == nil {
+            transcriptGeneration = try c.decode(Int.self, forKey: .transcriptGeneration)
+            hasOlder = try c.decode(Bool.self, forKey: .hasOlder)
+        } else {
+            // An explicitly unavailable projection makes no claim about its
+            // generation or paging. It cannot authorize clearing local rows.
+            transcriptGeneration = try c.decodeIfPresent(Int.self, forKey: .transcriptGeneration)
+            hasOlder = try c.decodeIfPresent(Bool.self, forKey: .hasOlder)
+        }
+        otherRooms = try c.decodeIfPresent([OtherRoomExchange].self, forKey: .otherRooms)
     }
     public func omittingAttachmentPreviews() -> Self {
         var copy = self
@@ -369,9 +391,9 @@ public struct ChatMessageMetadata: Codable, Hashable, Sendable {
     public var attachments: [PersistedAttachment]?
     /// Origin of user rows not authored by the human at this Mac; absence is never proof of human trust.
     public var origin: ChatMessageOriginMetadata?
-    /// Decode-only surface/agent projection of the recorded turn envelope for presentation.
+    /// Decode-only surface/agent projection of the recorded turn envelope: the provenance every row carries.
     public var envelope: ChatMessageOriginMetadata?
-    /// Engine-stamped leading working-commentary characters, folded away by the settled bubble.
+    /// Engine-stamped leading pre-tool characters; person-facing bubbles keep them visible.
     /// Absent on single-round turns and user rows.
     public var workingCommentaryChars: Int?
     /// Opaque identity of the turn that produced this assistant row.
@@ -411,9 +433,56 @@ public struct ChatMessageMetadata: Codable, Hashable, Sendable {
     /// Payload-free guard against text-only regeneration when an unsaved user row had attachments.
     public var syntheticInputHadAttachments: Bool?
 
-    /// Transport decoding is strict for the phone's consumed fields; canonical parsing is separate.
+    /// Retained Mac receipts use these spellings; all new encoded projections
+    /// use CodingKeys. Presence chooses the schema, never a failed decode.
+    private enum RetainedKeys: String, CodingKey {
+        case toolName, resultSummary, resultStatus, approvalId, inputJSON
+        case interaction, interactionId, interactionSessionId, envelope, mechanicalKind
+    }
+    private struct InteractionState: Decodable {
+        struct State: Decodable { let name: String }
+        let state: State
+    }
+
+    /// One checked codec for canonical transcript reads and phone projections.
     public init(from decoder: Decoder) throws {
         let fields = try decoder.container(keyedBy: CodingKeys.self)
+        let retained = try decoder.container(keyedBy: RetainedKeys.self)
+        func toolString(_ key: CodingKeys, _ retainedKey: RetainedKeys) throws -> String? {
+            if fields.contains(key) { return try fields.decodeIfPresent(String.self, forKey: key) }
+            return try retained.decodeIfPresent(String.self, forKey: retainedKey)
+        }
+        model = try fields.decodeIfPresent(String.self, forKey: .model)
+        requestedModel = try fields.decodeIfPresent(String.self, forKey: .requestedModel)
+        reasoningEffort = try fields.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        fileAccessMode = try fields.decodeIfPresent(String.self, forKey: .fileAccessMode)
+        codexSandbox = try fields.decodeIfPresent(String.self, forKey: .codexSandbox)
+        providerRefusal = try fields.decodeIfPresent(Bool.self, forKey: .providerRefusal)
+        providerRefusalDraft = try fields.decodeIfPresent(Bool.self, forKey: .providerRefusalDraft)
+        kind = try fields.decodeIfPresent(String.self, forKey: .kind)
+        toolName = try toolString(.toolName, .toolName)
+        resultSummary = try toolString(.resultSummary, .resultSummary)
+        resultStatus = try toolString(.resultStatus, .resultStatus)
+        approvalId = try toolString(.approvalId, .approvalId)
+        inputJSON = try toolString(.inputJSON, .inputJSON)
+        interactionState = try retained.decodeIfPresent(InteractionState.self, forKey: .interaction)?.state.name
+        mirrorInteractionId = try retained.decodeIfPresent(String.self, forKey: .interactionId)
+        mirrorInteractionSessionId = try retained.decodeIfPresent(String.self, forKey: .interactionSessionId)
+        mechanicalKind = try retained.decodeIfPresent(String.self, forKey: .mechanicalKind)
+        ok = try fields.decodeIfPresent(Bool.self, forKey: .ok)
+        durationMs = try fields.decodeIfPresent(Int.self, forKey: .durationMs)
+        beforeContent = try fields.decodeIfPresent(String.self, forKey: .beforeContent)
+        afterContent = try fields.decodeIfPresent(String.self, forKey: .afterContent)
+        workingCommentaryChars = try fields.decodeIfPresent(Int.self, forKey: .workingCommentaryChars)
+        // Unreadable provenance is a visible attribution gap, never human authorship.
+        if fields.contains(.origin) {
+            do { origin = try fields.decode(ChatMessageOriginMetadata.self, forKey: .origin) }
+            catch { origin = ChatMessageOriginMetadata(surface: "unreadable") }
+        }
+        if retained.contains(.envelope) {
+            do { envelope = try retained.decode(ChatMessageOriginMetadata.self, forKey: .envelope) }
+            catch { envelope = ChatMessageOriginMetadata(surface: "unreadable") }
+        }
         turnTraceId = try fields.decodeIfPresent(String.self, forKey: .turnTraceId)
         attachments = try fields.decodeIfPresent([PersistedAttachment].self, forKey: .attachments)
         completionState = try fields.decodeIfPresent(String.self, forKey: .completionState)
@@ -437,10 +506,32 @@ public struct PersistedAttachment: Codable, Hashable, Sendable {
     public init(id: String, type: String, mime: String, name: String?, byteSize: Int64, path: String? = nil) {
         self.id = id; self.type = type; self.mime = mime; self.name = name; self.byteSize = byteSize; self.path = path
     }
-
+    private enum CodingKeys: String, CodingKey {
+        case id, type, mime, name, byteSize, path, utterance, preview
+    }
+    public init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        id = try fields.decode(String.self, forKey: .id)
+        type = try fields.decode(String.self, forKey: .type)
+        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !type.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath,
+                debugDescription: "Attachment identity and type must be nonempty."))
+        }
+        mime = try fields.decodeIfPresent(String.self, forKey: .mime)
+        name = try fields.decodeIfPresent(String.self, forKey: .name)
+        byteSize = try fields.decodeIfPresent(Int64.self, forKey: .byteSize)
+        if let byteSize, byteSize < 0 {
+            throw DecodingError.dataCorruptedError(forKey: .byteSize, in: fields,
+                debugDescription: "Attachment byteSize must be a nonnegative integer.")
+        }
+        path = try fields.decodeIfPresent(String.self, forKey: .path)
+        utterance = try fields.decodeIfPresent(SpeechUtterance.self, forKey: .utterance)
+        preview = try fields.decodeIfPresent(TranscriptAttachmentPreview.self, forKey: .preview)
+    }
 }
 
-public struct ChatMessageOriginMetadata: Encodable, Hashable, Sendable {
+public struct ChatMessageOriginMetadata: Codable, Hashable, Sendable {
     public var surface: String?
     public var agent: String?
     public var authored: String?

@@ -1,22 +1,8 @@
 import Foundation
-// Blueprint: | `ProviderRecoveryPolicy.swift` | Shared failure classification and helper-start backoff; surfaces never replay a provider call (delivery redials live in ProviderStreamGuard's `ProviderWire`) |
+// Blueprint: | `ProviderRecoveryPolicy.swift` | Shared failure classification; surfaces never replay a provider call (delivery redials live in ProviderStreamGuard's `ProviderWire`) |
 
-/// Shared provider failure classification and helper-start backoff.
+/// Shared provider failure classification.
 public enum ProviderRecoveryPolicy {
-    /// 1, 2, 4, 8, 15, then 30 held flat to avoid hammering a provider outage.
-    public static let maxBackoffSeconds: TimeInterval = 30
-
-    public static func backoffSeconds(forRetry n: Int) -> TimeInterval {
-        switch n {
-        case ..<2: return 1
-        case 2: return 2
-        case 3: return 4
-        case 4: return 8
-        case 5: return 15
-        default: return maxBackoffSeconds
-        }
-    }
-
     /// One typed recovery verdict serves every adapter and surface while preserving the selected model.
     public static func isRecoverable(_ error: Error) -> Bool {
         if let wrapped = error as? any ProviderFailureWrapping {

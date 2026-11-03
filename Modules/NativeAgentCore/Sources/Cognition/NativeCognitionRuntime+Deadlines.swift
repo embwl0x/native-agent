@@ -155,13 +155,13 @@ extension NativeCognitionRuntime {
     }
 
     @discardableResult
-    public func runMaintenance(reason: String) async -> LoopTickOutcome {
+    public func runMaintenance(reason: String, runNow: Bool = false) async -> LoopTickOutcome {
         await bootstrap()
         if let bootstrapFailure { return .failed(error: bootstrapFailure) }
         do {
             let configuration = await substrate.configurationSnapshot()
             let persistenceEnabled = configuration.persistenceEnabled
-            let ran = try await substrate.runMaintenanceChecked(reason: reason)
+            let ran = try await substrate.runMaintenanceChecked(reason: reason, satisfyWait: runNow)
             guard ran else {
                 // A not-ran outcome includes "still due
                 // but excluded by the microcycle commit window" — re-arming at
@@ -209,12 +209,13 @@ extension NativeCognitionRuntime {
         // The forward register's source dirty bit and real eligibility/expiry
         // boundaries gate its retained read task (+Expectations).
         considerHorizonExpectations()
+        considerRhythm()
         // Her hour shares this deadline and performs no reads or writes while disabled.
         considerStudioWander()
         // Reach uses source invalidations plus quiet, expiry and cooldown
         // boundaries, sharing this deadline (+Reach).
         considerReach()
-        let carriedDeadline = await considerCarried()
+        let carriedDeadline = await considerCarried().next
         guard generation == residualDeadline.generation else { return }
         // The same exact-deadline owner also wakes at pending prediction/model
         // expiry. That wake only re-derives pressure and may schedule the quiet

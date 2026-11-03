@@ -72,16 +72,14 @@ extension TelegramFacade {
         }
         let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedEffort = reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
-        let migratedModel = trimmedModel.isEmpty ? existing?.model : trimmedModel
-        let migratedEffort = trimmedEffort.isEmpty ? existing?.reasoningEffort : trimmedEffort
-        if migratedModel?.isEmpty == false || migratedEffort?.isEmpty == false {
+        if !trimmedModel.isEmpty || !trimmedEffort.isEmpty {
             var body: [String: JSONValue] = ["surface": .string("telegram")]
-            if let migratedModel, !migratedModel.isEmpty {
+            if !trimmedModel.isEmpty {
                 // S12a: the model only; Telegram keeps its chosen route.
-                body["model"] = .string(migratedModel)
+                body["model"] = .string(trimmedModel)
             }
-            if let migratedEffort, !migratedEffort.isEmpty {
-                body["reasoningEffort"] = .string(migratedEffort)
+            if !trimmedEffort.isEmpty {
+                body["reasoningEffort"] = .string(trimmedEffort)
             }
             _ = try await SwiftNativeProviderRouting(dataRoot: root).saveModelConfig(.object(body))
         }
@@ -91,8 +89,6 @@ extension TelegramFacade {
             allowedUserIds: userIds,
             requireMention: requireMention,
             enabled: effectiveEnabled,
-            model: nil,
-            reasoningEffort: nil,
             voiceTranscriptionEnabled: existing?.voiceTranscriptionEnabled ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionEnabled,
             voiceMaxBytes: existing?.voiceMaxBytes ?? TelegramBot.TelegramConfig.defaultVoiceMaxBytes
         )
@@ -138,7 +134,7 @@ extension TelegramFacade {
     public nonisolated func sendTelegramTestReply(chatId: String?, manager: BackgroundLoopLifetimes) async throws -> TelegramTestResponse {
         let testMessage = "NativeAgent Telegram test reply: online."
         let root = dataRoot
-        guard let configuration = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: root),
+        guard let configuration = try TelegramBot.TelegramConfig.loadSavedConfiguration(dataRoot: root),
               configuration.enabled,
               !configuration.botToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
@@ -245,11 +241,10 @@ extension TelegramFacade {
 extension TelegramFacade {
     private enum TelegramReloadError: Error { case pollerUnavailable }
 
-    public nonisolated func disconnectTelegram(restartPollLoop: @Sendable () async -> Bool) async throws {
+    public nonisolated func disconnectTelegram(restartPollLoop: (@Sendable () async -> Bool)? = nil) async throws {
         let root = dataRoot
         try await SwiftNativePersistenceCore.withFileLock(root.appendingPathComponent("telegram/config.json")) {
-            try TelegramConfig.validateMobileConfiguration(at: root)
-            let existing = TelegramConfig.loadFromDisk(dataRoot: root, includeDisconnected: true)
+            let existing = try TelegramConfig.loadSavedConfiguration(dataRoot: root, resolveCredential: false)
             // Validate readback before replacing config, including on disconnect.
             _ = try await SwiftNativeProviderRouting(dataRoot: root).checkedRoutingSnapshot()
             try TelegramConfig.saveToDisk(TelegramConfig(
@@ -258,16 +253,16 @@ extension TelegramFacade {
                 allowedUserIds: existing?.allowedUserIds ?? [],
                 requireMention: existing?.requireMention ?? false,
                 enabled: false,
-                model: existing?.model,
-                reasoningEffort: existing?.reasoningEffort,
                 voiceTranscriptionEnabled: existing?.voiceTranscriptionEnabled ?? TelegramConfig.defaultVoiceTranscriptionEnabled,
                 voiceMaxBytes: existing?.voiceMaxBytes ?? TelegramConfig.defaultVoiceMaxBytes
             ), dataRoot: root)
         }
         // A draining turn must not hold the settings lock; reload from latest disk state.
-        try await SwiftNativePersistenceCore.withFileLock(root.appendingPathComponent("telegram/poll_reload")) {
-            guard await restartPollLoop() else {
-                throw TelegramReloadError.pollerUnavailable
+        if let restartPollLoop {
+            try await SwiftNativePersistenceCore.withFileLock(root.appendingPathComponent("telegram/poll_reload")) {
+                guard await restartPollLoop() else {
+                    throw TelegramReloadError.pollerUnavailable
+                }
             }
         }
     }
@@ -277,16 +272,19 @@ extension TelegramFacade {
         let url = root.appendingPathComponent("telegram/config.json")
         return try await SwiftNativePersistenceCore.withFileLock(url) {
             let observedAt = Date().timeIntervalSince1970
-            // Validate before decoding legacy spellings or a disconnected state,
+            // Validate before projecting current metadata or a disconnected state,
             // so malformed settings never appear as saved defaults.
             try TelegramConfig.validateMobileConfiguration(at: root)
             let routing = try await SwiftNativeProviderRouting(dataRoot: root).checkedRoutingSnapshot()
-            guard let preference = routing.preferences["telegram"] else {
-                throw TelegramConfigurationError.existingConfigurationUnreadable
-            }
             let status = try await TelegramFacade(dataRoot: root).loadStatus(
                 manager: manager, routingSnapshot: routing
             )
+            if let issue = status.routingIssue {
+                throw ProviderRoutingError.configurationFailed(issue)
+            }
+            guard let model = status.model else {
+                throw TelegramConfigurationError.existingConfigurationUnreadable
+            }
             let enabled = status.tokenConfigured && status.enabled
             return MobileTelegramSnapshot(
                 observedAt: observedAt,
@@ -294,7 +292,7 @@ extension TelegramFacade {
                 enabled: enabled, requireMention: status.requireMention,
                 allowedChatIDs: status.allowedChatIds,
                 allowedUserIDs: status.allowedUserIds,
-                model: preference.model,
+                model: model,
                 pollerRunning: enabled && status.pollerEnabled,
                 pollStatusMessage: status.pollStatusMessage,
                 lastSuccessfulPollAt: status.lastPollAt

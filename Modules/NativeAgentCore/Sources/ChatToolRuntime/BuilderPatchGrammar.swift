@@ -20,53 +20,6 @@ import MacIntegration
 import TurnTrace
 // Blueprint: | `BuilderPatchGrammar.swift` | Patch grammar, path authority and range-less application |
 extension SwiftToolDispatcher {
-    static func builderParseArgString(_ raw: String) -> (args: [String]?, error: String?) {
-        var args: [String] = []
-        var current = ""
-        var quote: Character?
-        var escaping = false
-        for ch in raw {
-            if escaping {
-                current.append(ch)
-                escaping = false
-                continue
-            }
-            if ch == "\\" {
-                escaping = true
-                continue
-            }
-            if let activeQuote = quote {
-                if ch == activeQuote {
-                    quote = nil
-                } else {
-                    current.append(ch)
-                }
-                continue
-            }
-            if ch == "'" || ch == "\"" {
-                quote = ch
-                continue
-            }
-            if ch.isWhitespace {
-                if !current.isEmpty {
-                    args.append(current)
-                    current = ""
-                }
-            } else {
-                current.append(ch)
-            }
-        }
-        if escaping {
-            current.append("\\")
-        }
-        if quote != nil {
-            return (nil, "unclosed_quote")
-        }
-        if !current.isEmpty {
-            args.append(current)
-        }
-        return (args, nil)
-    }
     struct BuilderContextPatchHunk {
         var oldLines: [String]
         var newLines: [String]

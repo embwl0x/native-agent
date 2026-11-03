@@ -31,10 +31,9 @@ extension SecurityOriginContext {
     /// allowlist is consulted. The envelope is the one value that knows what
     /// the turn actually is, so it is the one value this reads.
     ///
-    /// `TurnEnvelope.current(surface:)` is the ONLY path to the task-locals:
-    /// when no envelope is bound it composes one from them, so a pre-envelope
-    /// adapter keeps its exact behavior and there is no second place that can
-    /// disagree about identity.
+    /// `TurnEnvelope.current(surface:)` reads only the ingress-bound envelope.
+    /// Missing provenance stays unbound and cannot acquire local authority
+    /// from a tool's supplied surface spelling.
     public static func currentTurn(
         verifiedSessionId: String?,
         surface: String

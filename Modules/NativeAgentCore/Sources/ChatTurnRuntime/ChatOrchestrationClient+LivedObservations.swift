@@ -176,6 +176,7 @@ extension SwiftNativeChatOrchestrationClient {
         sessionId: String,
         runId: String?,
         toolName: String,
+        invocationID: String,
         resultSummary: String,
         ok: Bool,
         cognitiveResult: ChatToolOutcome.CognitiveResult?,
@@ -192,6 +193,7 @@ extension SwiftNativeChatOrchestrationClient {
             "sessionId": .string(sessionId),
             "messageId": .string(messageId),
             "toolName": .string(toolName),
+            "toolInvocationId": .string(invocationID),
             "ok": .bool(ok),
             "source": .string(source),
             "trustRisk": .string(canonicalToolRisk.rawValue),
@@ -233,7 +235,9 @@ extension SwiftNativeChatOrchestrationClient {
             // terminal state and would leave false pending physiology. An app
             // call is judged as the tool it runs.
             let ranInput: [String: JSONValue] = if case .object(let fields) = input { fields } else { [:] }
-            guard !ChatToolOutcome.hasCanonicalMotorOwner(ToolNameAliases.ranTool(safeName, input: ranInput)) else { return }
+            let ranTool = ToolNameAliases.ranTool(safeName, input: ranInput)
+            guard !ChatToolOutcome.hasCanonicalMotorOwner(ranTool),
+                  let invocationID = ToolReceipt.currentInvocationID else { return }
             // Persisted physiology uses by-tool redaction before cutting its preview.
             let inputPreview = Self.compactCognitiveJSON(
                 MacInjectionArgRedaction.redactedPayload(tool: safeName, payload: input),
@@ -241,16 +245,17 @@ extension SwiftNativeChatOrchestrationClient {
             )
             var metadata: [String: JSONValue] = [
                 "sessionId": .string(sessionId),
-                "toolName": .string(safeName),
+                "toolName": .string(ranTool),
+                "toolInvocationId": .string(invocationID),
                 "surface": .string(surface),
                 "phase": .string("started"),
                 "inputPreview": .string(inputPreview),
             ]
             if let runId { metadata["runId"] = .string(runId) }
             await cognitiveRuntime.observe(CognitiveEvent(
-                id: "chat-tool-start:\(sessionId):\(runId ?? "no-run"):\(safeName):\(Self.cognitiveDigest(inputPreview))",
+                id: "chat-tool-start:\(invocationID)",
                 kind: .toolStarted,
-                subject: CognitiveSubjectReference(type: "tool", id: safeName, label: safeName),
+                subject: CognitiveSubjectReference(type: "tool", id: ranTool, label: ranTool),
                 sourceClass: .observed,
                 occurredAt: occurredAt,
                 summary: inputPreview.isEmpty
@@ -289,8 +294,8 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     nonisolated private static func compactCognitiveJSON(_ value: JSONValue, maxCharacters: Int) -> String {
-        let serialized = (try? value.serialize(pretty: false)) ?? ""
-        return String(serialized.prefix(max(0, maxCharacters)))
+        do { return String(try value.serialize(pretty: false).prefix(max(0, maxCharacters))) }
+        catch { return "[Observation unavailable: JSON encoding failed (\(error.localizedDescription)). Repair its producing owner.]" }
     }
 
     nonisolated private static func cognitiveDigest(_ value: String) -> String {

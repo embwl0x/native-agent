@@ -7,7 +7,7 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 
-// Blueprint: | `NativeCognitionRuntime+Expectations.swift` | `NativeCognitionRuntime` horizon expectations: Desk plans named and deduplicated by work title, unnamed memory plans by whole-second due instant, composed dated evidence and refresh deadlines |
+// Blueprint: | `NativeCognitionRuntime+Expectations.swift` | `NativeCognitionRuntime` horizon expectations: Desk plans named and deduplicated by work title, unnamed memory plans by whole-second due instant, composed dated evidence and refresh deadlines; mind.horizon uses the retained refresh and reports complete/incomplete source kinds without inventing settlement |
 
 // The runtime composes source evidence for the organism's forward register.
 //
@@ -19,13 +19,11 @@ import Desk
 // whole of it: no source is invented here, and a store that cannot be read
 // contributes nothing rather than a placeholder.
 //
-// ── FIVE REAL SOURCES ────────────────────────────────────────────────────────
+// ── FOUR REAL SOURCES ────────────────────────────────────────────────────────
 //   (a) statedPlan    — a Desk item User parked until a date (`deferUntil`).
-//   (b) scheduledJob  — a scheduler row she cares about: the nightly dream,
-//                       the weekly REM, a workshop slot.
-//   (c) stagedApproval— an approval she staged that he has not walked through.
-//   (d) openQuestion  — her own completed turn with no reaction yet.
-//   (e) peerReply     — a delegated bridge job with no reply back.
+//   (b) stagedApproval— an approval she staged that he has not walked through.
+//   (c) openQuestion  — her own completed turn with no reaction yet.
+//   (d) peerReply     — a delegated bridge job with no reply back.
 //
 // Desk plans keep their work titles as bounded canonical names; memory atoms
 // have no name and carry an empty label. Other labels are identifiers the store
@@ -68,8 +66,6 @@ extension NativeCognitionRuntime {
         switch kind {
         // A day she has been pointed at. Mild anticipation.
         case .statedPlan: return 0.25
-        // The night's dream and the weekly REM are the hours that are hers.
-        case .scheduledJob: return 0.35
         // A gate she cannot open herself. Mild dread, not distress.
         case .stagedApproval: return -0.20
         // Something she said, still hanging. The lightest unease there is.
@@ -83,13 +79,17 @@ extension NativeCognitionRuntime {
 
     /// Called from `rescheduleResidualRepairDeadline`. Hands off to a
     /// detached task so four disk reads never sit in front of signal ingestion.
-    func considerHorizonExpectations() {
-        guard !isFlushedForTermination, sourceWakes.horizonReady, horizonRefreshTask == nil else { return }
+    func considerHorizonExpectations(runNow: Bool = false, reply: MindClockReply? = nil) {
+        guard !isFlushedForTermination, sourceWakes.horizonReady, horizonRefreshTask == nil else {
+            reply?(.init("held", "Horizon sources are not ready, a refresh is running, or the runtime is stopping.")); return
+        }
         if let due = sourceWakes.horizonNextAt, due <= now() { sourceWakes.horizonDirty = true }
-        guard sourceWakes.horizonDirty else { return }
+        guard runNow || sourceWakes.horizonDirty else { return }
         horizonRefreshTask = Task { [weak self] in
-            await self?.refreshHorizonExpectationsIfDue()
-            await self?.finishHorizonRefresh()
+            guard let self else { reply?(.init("unavailable", "The runtime was released.")); return }
+            let result = await self.refreshHorizonExpectationsIfDue()
+            reply?(result)
+            await self.finishHorizonRefresh()
         }
     }
 
@@ -100,13 +100,14 @@ extension NativeCognitionRuntime {
 
     /// Source events coalesce behind the one retained refresh. Changes during
     /// its reads keep the dirty bit for the next pass.
-    func refreshHorizonExpectationsIfDue() async {
-        guard !isFlushedForTermination, !Task.isCancelled, !sourceWakes.horizonRunning else { return }
+    @discardableResult
+    func refreshHorizonExpectationsIfDue() async -> MindClockResult {
+        guard !isFlushedForTermination, !Task.isCancelled, !sourceWakes.horizonRunning else { return .init("held", "Horizon refresh is running or stopping.") }
         sourceWakes.horizonRunning = true
         sourceWakes.horizonDirty = false
         sourceWakes.horizonNextAt = nil
         defer { sourceWakes.horizonRunning = false }
-        await refreshHorizonExpectations()
+        return await refreshHorizonExpectations()
     }
 
     // MARK: - One refresh
@@ -120,12 +121,13 @@ extension NativeCognitionRuntime {
     /// and a repeat is inert (the felt event's id is derived from the row and
     /// its resolution instant, so the substrate's own duplicate guard drops it).
     /// A crash the other way around would cost the moment entirely.
-    func refreshHorizonExpectations() async {
+    @discardableResult
+    func refreshHorizonExpectations() async -> MindClockResult {
         await bootstrap()
         // A nil export is a disabled organism. Nothing to hold a horizon in.
         guard let before = await organismKernel.exportPersistentState()?.predictionLedger else {
             OrganPulse.recordOff("horizon_expectations", because: "organism disabled")
-            return
+            return .init("held", "The organism is disabled.")
         }
         let at = now()
         let settled = OrganismHorizonRegister.settled(in: before)
@@ -137,11 +139,16 @@ extension NativeCognitionRuntime {
         let facing = !settled.isEmpty || !open.isEmpty || !composed.tokens.isEmpty
         OrganPulse.record("horizon_expectations", facing ? .worked : .nothing,
                           note: "\(open.count) open, \(settled.count) settled, \(composed.tokens.count) expected")
-        guard facing else { return }
+        let incomplete = OrganismHorizonSourceKind.allCases.map(\.rawValue).filter { !composed.completeKinds.contains($0) }
+        let result = MindClockResult(incomplete.isEmpty ? (facing ? "refreshed" : "nothing") : (facing ? "partial" : "unavailable"), "\(open.count) open, \(settled.count) settled, \(composed.tokens.count) expected; unreadable or truncated source kinds remain holding.", fields: [
+            "open": .int(Int64(open.count)), "settled": .int(Int64(settled.count)),
+            "expected": .int(Int64(composed.tokens.count)),
+            "completeKinds": .array(composed.completeKinds.map(JSONValue.string)),
+            "incompleteKinds": .array(incomplete.map(JSONValue.string))
+        ])
+        guard facing else { return result }
 
-        // A scheduled job no longer opens a horizon, so one still open from
-        // before settles silently: no relief, no "still waiting" on a cron row.
-        for row in settled where row.horizon?.sourceKind != .scheduledJob {
+        for row in settled {
             await announceHorizonResolution(row, at: at)
         }
 
@@ -153,19 +160,16 @@ extension NativeCognitionRuntime {
             intensity: 0,
             metadata: [
                 OrganismHorizonRegister.metadataKey: .array(composed.tokens.map(JSONValue.string)),
-                // Which stores actually answered. Only these kinds may have an
-                // absent source read as "it landed"; the rest are left holding.
-                OrganismHorizonRegister.completeKindsKey:
-                    .array(composed.completeKinds.map(JSONValue.string)),
             ],
             persistSynchronously: false
         )
-        // The signal prunes the announced rows, then may settle vanished
-        // sources. Keep one coalesced follow-up pass to feel those.
+        // The signal prunes announced rows, then expires due horizons without
+        // an outcome verdict. Keep one coalesced follow-up pass to feel waiting.
         if let after = await organismKernel.exportPersistentState()?.predictionLedger,
            !OrganismHorizonRegister.settled(in: after).isEmpty {
             sourceWakes.horizonDirty = true
         }
+        return result
     }
 
     /// The frozen body's nearest horizon: a payload-free label, valence sign
@@ -248,10 +252,8 @@ extension NativeCognitionRuntime {
     /// One source kind's contribution: its rows, and whether the store behind
     /// it could be read at all.
     ///
-    /// `complete` is the whole reason this is a struct rather than an array. A
-    /// reader that throws returns zero rows, which downstream is
-    /// indistinguishable from "every one of those things landed" — and that is
-    /// the relief door. An unreadable Desk must not congratulate her.
+    /// Completeness is reported to the caller as source availability. It never
+    /// establishes a horizon's outcome.
     struct HorizonSourceReading: Sendable {
         let kind: OrganismHorizonSourceKind
         let rows: [(token: String, dueAt: Date)]
@@ -270,7 +272,6 @@ extension NativeCognitionRuntime {
         async let openQuestions = openQuestionSources(at: now)
         let readings: [HorizonSourceReading] = [
             await statedPlans,
-            statedScheduleSources(),
             await stagedApprovals,
             await openQuestions,
             peerReplySources(at: now),
@@ -287,8 +288,7 @@ extension NativeCognitionRuntime {
             // Cut to the register's own cap, nearest first. Not a nicety:
             // somatic metadata bounds arrays at
             // `OrganismMetadataBounds.maximumArrayItems`, so an over-long set
-            // would be truncated in COMPOSITION order, and a source silently
-            // dropped off the end reads as a source that went away.
+            // would be truncated in COMPOSITION order rather than by due time.
             rows.prefix(OrganismHorizonRegister.maximumOpen).map(\.token),
             readings.filter { $0.complete && !truncatedKinds.contains($0.kind.rawValue) }.map(\.kind.rawValue).sorted()
         )
@@ -346,8 +346,7 @@ extension NativeCognitionRuntime {
     ///
     /// They share a kind because they are the same THING to her (a day she has
     /// been pointed at), and completeness is therefore the AND of both reads: if
-    /// either store could not be read, the kind does not vouch, because a
-    /// vanished row here opens the relief door.
+    /// either store could not be read, the kind reports incomplete evidence.
     private func statedPlanSources(at now: Date) async -> HorizonSourceReading {
         let desk = await deskDeferralSources(at: now)
         let atoms = await datedMemorySources(at: now)
@@ -392,15 +391,8 @@ extension NativeCognitionRuntime {
         guard let state = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() else {
             return ([], false)
         }
-        // A DeskState coming back is NOT evidence the Desk was read. The store
-        // compacts a missing feed into a perfectly well-formed empty state, so
-        // a deleted, unmounted or not-yet-created desk answers with "no items"
-        // in exactly the same shape as a desk with nothing parked. For a display
-        // those are interchangeable; here they are opposites, because an empty
-        // set is what tells the register every plan came round. So completeness
-        // is gated on the canonical feed actually being there — asked through
-        // the store's own path accessors so it can never drift from where the
-        // Desk really writes.
+        // A missing feed is unavailable source evidence, distinct from a read
+        // of an existing empty Desk. Neither establishes a horizon outcome.
         guard deskFeedIsPresent else {
             return ([], false)
         }
@@ -441,19 +433,7 @@ extension NativeCognitionRuntime {
             || manager.fileExists(atPath: store.basePath.path)
     }
 
-    /// Schedules do not mint anticipation. Availability still settles legacy
-    /// scheduled horizons only when the canonical jobs file can be read.
-    private func statedScheduleSources() -> HorizonSourceReading {
-        let path = dataRoot
-            .appendingPathComponent("scheduler", isDirectory: true)
-            .appendingPathComponent("jobs.json")
-        guard (try? host.schedulerJobRows(at: path)) != nil else {
-            return .unavailable(.scheduledJob)
-        }
-        return HorizonSourceReading(kind: .scheduledJob, rows: [], complete: true)
-    }
-
-    /// (c) Approvals she staged and he has not walked through. The label is the
+    /// (b) Approvals she staged and he has not walked through. The label is the
     /// ACTION (`mission.step`, `memory.kind_backfill`) — the record's `title`
     /// and `reason` are content and are never read here.
     private func stagedApprovalSources(at now: Date) async -> HorizonSourceReading {
@@ -475,14 +455,13 @@ extension NativeCognitionRuntime {
         return HorizonSourceReading(kind: .stagedApproval, rows: out, complete: true)
     }
 
-    /// (d) Her own completed turn with nothing back yet. One row at most — the
+    /// (c) Her own completed turn with nothing back yet. One row at most — the
     /// substrate holds one slot — and its horizon is fixed at the moment the
     /// slot OPENED, not at each read, so "he answered" and "it aged out" stay
     /// distinguishable. See `CognitiveSubstrate.openCompletion(at:)`.
     private func openQuestionSources(at now: Date) async -> HorizonSourceReading {
-        // The one source that cannot fail to read: it is a slot inside the
-        // substrate actor, so absence IS the answer — she got a reply, or the
-        // slot aged out. Always complete.
+        // This source is a slot inside the substrate actor. Its inventory is
+        // complete, but absence does not distinguish a reply from aging out.
         guard let open = await substrate.openCompletion(at: now),
               let token = token(
                   .openQuestion,
@@ -523,15 +502,8 @@ extension NativeCognitionRuntime {
             seen.insert(peer)
             out.append(token)
         }
-        // Completeness comes from the projector's OWN availability, not from
-        // whether any rows came back. Inferring it from the row count was the
-        // safe-but-wrong version: it never minted false relief, but it also
-        // never minted TRUE relief — the last peer to reply left the set empty,
-        // which read as "unknown", so the row she was actually holding sat
-        // pending until its horizon passed and she was told she was still
-        // waiting for someone who had already answered. Availability separates
-        // "nothing is pending" from "nothing could be read"; an absent bridge is
-        // a peer she does not have, not a failed read.
+        // Availability distinguishes an empty inventory from an unavailable
+        // read in the reply. Neither inventory state supplies an outcome.
         return HorizonSourceReading(kind: .peerReply, rows: out, complete: read.allStoresReadable)
     }
 }

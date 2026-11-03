@@ -63,8 +63,6 @@ public struct StudioEncounterCandidate: Sendable, Equatable, Hashable {
         case named
         /// A work the knowledge graph holds that the journal never answered.
         case unjournaledWork
-        /// No producer; screen encounters require explicit capture consent.
-        case crossedTheScreen
     }
 
     public var source: Source

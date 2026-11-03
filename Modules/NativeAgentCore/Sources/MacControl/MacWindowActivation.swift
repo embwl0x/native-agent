@@ -17,11 +17,11 @@ import UserNotifications
 import Experiences
 import Senses
 #endif
-// Blueprint: | `MacWindowActivation.swift` | `SystemMacAXActSource`: driver-checked window raising and measured app activation with Automation diagnostics; app-only activation preserves the self-AX fence |
+// Blueprint: | `MacWindowActivation.swift` | `SystemMacAXActSource`: driver-checked window raising and measured ordinary app activation; app-only activation preserves the self-AX fence |
 
 #if canImport(ApplicationServices) && os(macOS)
 extension SystemMacAXActSource {
-    /// Only individual AX calls use the main lane; activation waits and Apple Events stay on the caller's thread.
+    /// Only individual AX calls use the main lane; activation waits stay on the caller's thread.
     public func raise(_ window: MacAXWindowRef) -> MacAXActOutcome {
         #if canImport(AppKit)
         // Clear diagnostics before every early return so a refusal cannot inherit another call's cause.
@@ -34,6 +34,9 @@ extension SystemMacAXActSource {
         // AXRaise orders the window inside its app; app activation is measured separately.
         let raiseStatus: AXError? = MacAXExecutionLane.sync {
             guard let element = element(window.handle) else { return nil }
+            guard MacDriverContext.binding?.allowsEmission == true else { return nil }
+            do { try SystemMacAXElementSource.ensureRenderer(element, refresh: true) }
+            catch { setRaiseDiagnostic(error.localizedDescription); return nil }
             guard MacDriverContext.binding?.allowsEmission == true else { return nil }
             NativeAgentMotorEpoch.noteAgentMotorEvent()
             return AXUIElementPerformAction(element, kAXRaiseAction as CFString)
@@ -57,7 +60,7 @@ extension SystemMacAXActSource {
 
     /// App ordering alone, using the same measured activation as `raise`.
     /// No AX window read: this can also restore our own app without crossing
-    /// the self-process AX fence. The async entry keeps waits and Apple Events
+    /// the self-process AX fence. The async entry keeps waits
     /// off the main/AX lane while inheriting the caller's driver binding.
     public func activate(pid: Int32) async -> MacAXActOutcome {
         #if canImport(AppKit)
@@ -70,12 +73,13 @@ extension SystemMacAXActSource {
         #endif
     }
 
-    /// The latest raise or activation's Automation diagnostic, cleared before every attempt.
+    /// The latest raise or activation's diagnostic, cleared before every attempt.
     public var raiseDiagnostic: String? {
         lock.lock()
         defer { lock.unlock() }
         return lastRaiseDiagnostic
     }
+
 
     private func setRaiseDiagnostic(_ value: String?) {
         lock.lock()
@@ -97,9 +101,7 @@ extension SystemMacAXActSource {
             return app.activate()
         }
         if awaitFrontAndFocused(app: app, window: window) { return true }
-        guard MacDriverContext.binding?.allowsEmission == true else { return nil }
-        activateViaAppleEvent(app)
-        return awaitFrontAndFocused(app: app, window: window)
+        return false
     }
 
     /// The app is frontmost; when a window is supplied, it is also focused.
@@ -127,48 +129,6 @@ extension SystemMacAXActSource {
         return isFrontAndFocused(app: app, window: window)
     }
 
-    /// Send activation off the AX lane: a synchronous Apple Event may wait for Automation consent.
-    /// Record consent denial and other errors for diagnosis; front/focus readback decides the outcome.
-    private func activateViaAppleEvent(_ app: NSRunningApplication) {
-        guard let bundleID = app.bundleIdentifier, !bundleID.isEmpty else { return }
-
-        // Refuse an existing Automation denial; an unasked permission must reach the Apple Event so macOS can request consent.
-        let permission = bundleID.withCString { cString -> OSStatus in
-            var target = AEAddressDesc()
-            let built = AECreateDesc(
-                AEKeyword(typeApplicationBundleID),
-                cString,
-                strlen(cString),
-                &target
-            )
-            guard built == noErr else { return OSStatus(built) }
-            defer { AEDisposeDesc(&target) }
-            return AEDeterminePermissionToAutomateTarget(&target, typeWildCard, typeWildCard, false)
-        }
-        if permission == OSStatus(errAEEventNotPermitted) {
-            setRaiseDiagnostic(automationDeniedNote(app, bundleID: bundleID))
-            return
-        }
-        let event = NSAppleEventDescriptor.appleEvent(withEventClass: kAEMiscStandards, eventID: kAEActivate,
-            targetDescriptor: NSAppleEventDescriptor(processIdentifier: app.processIdentifier),
-            returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
-        guard MacDriverContext.binding?.allowsEmission == true else { return }
-        let code: Int
-        do {
-            let reply = try event.sendEvent(options: [.waitForReply, .canInteract], timeout: 5)
-            code = Int(reply.paramDescriptor(forKeyword: keyErrorNumber)?.int32Value ?? 0)
-        } catch { code = (error as NSError).code }
-        if code == Int(errAEEventNotPermitted) {
-            setRaiseDiagnostic(automationDeniedNote(app, bundleID: bundleID))
-        } else if code != 0 {
-            setRaiseDiagnostic("activating \(bundleID) by Apple Event failed with error \(code)")
-        }
-    }
-
-    private func automationDeniedNote(_ app: NSRunningApplication, bundleID: String) -> String {
-        "automation_not_trusted: macOS denied NativeAgent's activation request to \(app.localizedName ?? bundleID) (\(bundleID)). "
-        + "Ask the owner to enable System Settings > Privacy & Security > Automation > NativeAgent > \(app.localizedName ?? bundleID)."
-    }
     #endif
 }
 #endif

@@ -62,6 +62,21 @@ extension SwiftNativeSecurityCenter {
         }
     }
 
+    /// The most a driven-agent launch may hold right now, whatever its origin: the Mac's own
+    /// posture. A queued launch asks this when it launches and runs at the lower of it and its stamp.
+    public func drivenAgentLaunchCeiling() async -> DrivenAgentLaunchPermission {
+        let snapshot: TrustPolicyAuthorizationSnapshot
+        do { snapshot = try await trustCenter.loadAuthorizationSnapshotChecked() }
+        catch { return .denied(reason: "saved trust policy is unavailable: \(error.localizedDescription)") }
+        let authority = Self.fullMacYoloAuthority(
+            originAssessment: OriginAssessment(trusted: true, reason: "the Mac's own posture", isRemote: false), snapshot: snapshot)
+        switch authority.state {
+        case .admitted: return .fullMac
+        case .inactive, .untrustedOrigin: return .restricted
+        case .explicitlyBlocked, .unavailable: return .denied(reason: authority.reason)
+        }
+    }
+
     /// Shared pure evaluator for owners that already hold one checked
     /// authorization generation. This is the single YOLO vocabulary: there is
     /// intentionally no tool exclusion list and no saved per-tool entry.

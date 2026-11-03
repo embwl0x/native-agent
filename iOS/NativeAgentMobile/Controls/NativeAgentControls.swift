@@ -9,11 +9,11 @@ struct NativeAgentControls: WidgetBundle {
 struct QuickAskControl: ControlWidget {
     var body: some ControlWidgetConfiguration {
         StaticControlConfiguration(kind: "NativeAgentMobile.QuickAsk") {
-            ControlWidgetButton(action: MobileQuickAskIntent()) {
-                Label("Quick Ask", systemImage: "bubble.left.and.bubble.right")
+            ControlWidgetButton(action: MobileOpenTalkIntent()) {
+                Label("Talk", systemImage: "phone.fill")
             }
         }
-        .displayName("Quick Ask")
-        .description("Open a message to your agent in NativeAgent.")
+        .displayName("Talk to Your Agent")
+        .description("Start a hands-free conversation with your agent in NativeAgent.")
     }
 }

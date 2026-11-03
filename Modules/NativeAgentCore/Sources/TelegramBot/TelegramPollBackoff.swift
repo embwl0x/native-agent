@@ -2,6 +2,7 @@
 // Both double with ±20% jitter clamped to the cap and reset on success.
 
 import Foundation
+import Darwin
 import NativeAgentCore
 import PersistenceCore
 import BackgroundLoops
@@ -54,53 +55,33 @@ public actor TelegramExponentialBackoff {
 
 // MARK: - TelegramErrorLog
 
-/// Appends to `<dataRoot>/telegram/errors.jsonl` under a sidecar flock.
-/// At the size cap, replaces the single `<name>.1` backup before appending.
-/// Append/rotation failures are logged without interrupting polling.
+/// Rotation and append are one locked transaction; failure prevents append.
 public enum TelegramErrorLog {
-
-    /// Live-log rotation threshold: 5 MiB.
     public static let maxBytes = 5 * 1024 * 1024
 
-    /// Appends under flock, rotating first at `maxBytes`; logs failures without throwing.
-    public static func append(
-        _ row: JSONValue,
-        to logURL: URL
-    ) async {
-        do {
-            try FileManager.default.createDirectory(
-                at: logURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try await SwiftNativePersistenceCore.withFileLock(logURL) {
-                rotateIfNeeded(logURL)
-                try await SwiftNativePersistenceCore.appendJSONL(row, to: logURL)
-            }
-        } catch {
-            FileHandle.standardError.write(
-                Data("TelegramErrorLog: append failed (fail-open): \(error)\n".utf8)
-            )
+    public static func append(_ row: JSONValue, to logURL: URL) async throws {
+        try FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try await SwiftNativePersistenceCore.withFileLock(logURL) {
+            try rotateIfNeeded(logURL)
+            try await SwiftNativePersistenceCore.appendJSONL(row, to: logURL)
         }
     }
 
-    /// Replaces `<name>.1` when the live log reaches `maxBytes`; caller holds the flock.
-    /// A rotation error is logged and append proceeds on the live file.
-    static func rotateIfNeeded(_ logURL: URL) {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
-              let size = (attrs[.size] as? NSNumber)?.intValue,
-              size >= maxBytes
-        else { return }
-        let backup = logURL.appendingPathExtension("1")
-        do {
-            let fm = FileManager.default
-            if fm.fileExists(atPath: backup.path) {
-                try fm.removeItem(at: backup)
-            }
-            try fm.moveItem(at: logURL, to: backup)
-        } catch {
-            FileHandle.standardError.write(
-                Data("TelegramErrorLog: rotation failed (fail-open): \(error)\n".utf8)
-            )
+    /// Only a checked missing live file needs no rotation. Caller holds its lock.
+    static func rotateIfNeeded(_ logURL: URL) throws {
+        var info = stat()
+        guard lstat(logURL.path, &info) == 0 else {
+            if errno == ENOENT { return }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: nil)
         }
+        guard (info.st_mode & S_IFMT) == S_IFREG else {
+            throw PersistenceCoreError.ioFailure("Telegram error log must be a regular file: \(logURL.path)")
+        }
+        guard info.st_size >= Int64(maxBytes) else { return }
+        let backup = logURL.appendingPathExtension("1")
+        let fm = FileManager.default
+        if fm.fileExists(atPath: backup.path) { try fm.removeItem(at: backup) }
+        try fm.moveItem(at: logURL, to: backup)
     }
 }

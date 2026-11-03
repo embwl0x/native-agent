@@ -169,7 +169,7 @@ extension CognitiveSubstrate {
         if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return false }
         guard configuration.enabled, tone != 0 else { return true }
         let previousDisposition = disposition
-        let previousDreamNight = dreamDispositionNight
+        let previousDreamNights = dreamDispositionNights
         let previousTransitions = dispositionTransitions
         integrateDispositionInMemory(tone: tone, at: now, dreamNight: dreamNight, source: source)
         // A newer revision keeps failed maintenance from replacing this writer.
@@ -196,7 +196,7 @@ extension CognitiveSubstrate {
             // Restore only this failed write; a later writer owns its own value.
             guard disposition == written else { return false }
             disposition = previousDisposition
-            dreamDispositionNight = previousDreamNight
+            dreamDispositionNights = previousDreamNights
             dispositionTransitions = previousTransitions
             return false
         }
@@ -233,7 +233,7 @@ extension CognitiveSubstrate {
                 dispositionTransitions.count - Self.maximumDispositionTransitions)
         }
         // The night claim and its undertone value share one write so retrying residue cannot nudge twice.
-        if let dreamNight { dreamDispositionNight = dreamNight }
+        if let dreamNight { dreamDispositionNights.insert(dreamNight) }
     }
 
     /// Pattern tone from her own felt-resolution nodes.
@@ -299,8 +299,9 @@ extension CognitiveSubstrate {
     func restoreDisposition(from payloads: [JSONValue]) {
         disposition = CognitiveDisposition()
         resolutionPatternNudgeDay = [:]
-        dreamDispositionNight = nil
+        dreamDispositionNights = []
         dispositionTransitions = []
+        reflectionDispositionClaims = []
         guard case .object(let object)? = payloads.first,
               let updatedAt = dateValue(object["updatedAt"]),
               let valence = object["valence"]?.numberValue(coercingStrings: false, finiteOnly: false) else { return }
@@ -309,6 +310,9 @@ extension CognitiveSubstrate {
             valence: min(cap, max(-cap, valence)),
             updatedAt: updatedAt
         )
+        if case .array(let ids)? = object["reflectionClaims"] {
+            reflectionDispositionClaims = Set(ids.compactMap { $0.stringValue.flatMap(UUID.init(uuidString:)) })
+        }
         // Day claims prevent another nudge after a same-day restart.
         if case .object(let claims)? = object["patternNudgeDays"] {
             var restored: [String: String] = [:]
@@ -317,9 +321,8 @@ extension CognitiveSubstrate {
             }
             resolutionPatternNudgeDay = restored
         }
-        // A night already absorbed cannot nudge again after restart.
-        if let night = object["dreamNight"]?.stringValue, !night.isEmpty {
-            dreamDispositionNight = night
+        if case .array(let nights)? = object["dreamNights"] {
+            dreamDispositionNights = Set(nights.compactMap(\.stringValue))
         }
         // Historical rows without transitions retain an empty trail.
         if case .array(let rows)? = object["transitions"] {
@@ -350,9 +353,8 @@ extension CognitiveSubstrate {
         if !resolutionPatternNudgeDay.isEmpty {
             object["patternNudgeDays"] = .object(resolutionPatternNudgeDay.mapValues { .string($0) })
         }
-        if let dreamDispositionNight {
-            object["dreamNight"] = .string(dreamDispositionNight)
-        }
+        object["reflectionClaims"] = .array(reflectionDispositionClaims.map(\.uuidString).sorted().map(JSONValue.string))
+        object["dreamNights"] = .array(dreamDispositionNights.sorted().map(JSONValue.string))
         // Transitions share the disposition value's durable write; rows without a trail restore an empty one.
         if !dispositionTransitions.isEmpty {
             object["transitions"] = .array(dispositionTransitions.map { $0.toJSON() })

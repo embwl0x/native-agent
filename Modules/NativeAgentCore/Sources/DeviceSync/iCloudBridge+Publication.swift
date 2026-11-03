@@ -11,9 +11,14 @@ import PersistenceCore
 import ProviderRouting
 import OSLog
 import Network
-// Blueprint: | `iCloudBridge+Publication.swift` | Provider catalog, snapshot status, presence and progress publication |
+// Blueprint: | `iCloudBridge+Publication.swift` | Pairing-bound provider catalog and snapshot status publication under each group's canonical CloudKit key, explicit publication invalidation, presence and progress publication |
 
 extension iCloudBridge {
+    /// Forced repair revokes accepted-byte suppression at the publication owner.
+    func invalidateMobileSnapshotPublication() {
+        lastPublishedMobileSnapshotStatus.removeAll()
+    }
+
     /// Publish the Mac-owned provider/model catalog to the paired phone without
     /// copying credentials or requiring the legacy iCloud Drive snapshot lane.
     /// The status record is a bounded LWW projection with one publication owner;
@@ -37,6 +42,10 @@ extension iCloudBridge {
             guard let deviceTransport, speaksToPhone else { return false }
             let generation = setupGeneration
             do {
+                guard let encoded = try PairingSecret.existingSecretBase64(),
+                      let secret = Data(base64Encoded: encoded), secret.count == 32 else {
+                    throw DeviceSyncError.notConfigured
+                }
                 let snapshot = try await sync.host.providerCatalogSnapshot()
                 guard generation == setupGeneration, speaksToPhone else { continue }
                 let catalog = NAProviderCatalogStatus(
@@ -45,10 +54,10 @@ extension iCloudBridge {
                     routingRevision: snapshot.routing.revision
                 )
                 let value = try NAProviderCatalogStatusCodec.encode(catalog)
-                if value != lastPublishedProviderCatalogStatus {
-                    try await deviceTransport.setStatus(key: NAProviderCatalogStatusCodec.statusKey, value: value)
+                if lastPublishedProviderCatalogStatus?.pairing != secret || lastPublishedProviderCatalogStatus?.value != value {
+                    try await deviceTransport.setStatus(key: NAProviderCatalogStatusCodec.statusKey, value: value, pairingSecret: secret)
                     guard generation == setupGeneration, speaksToPhone else { continue }
-                    lastPublishedProviderCatalogStatus = value
+                    lastPublishedProviderCatalogStatus = (secret, value)
                     // Reread current configuration after every send. Only a
                     // stable projection, or an unqueued failure, ends this owner.
                     providerCatalogPublicationQueued = true
@@ -98,19 +107,25 @@ extension iCloudBridge {
         var failures: [NAMobileSnapshotGroup: DeviceSyncError] = [:]
         for group in NAMobileSnapshotGroup.allCases where groups.contains(group) {
             do {
+                guard let encoded = try PairingSecret.existingSecretBase64(),
+                      let secret = Data(base64Encoded: encoded), secret.count == 32 else {
+                    throw DeviceSyncError.notConfigured
+                }
                 guard let value = try await MobileSnapshotBuilder.shared.status(
                     group: group, directory: snapshotDirectory, committed: committed
                 ) else { throw DeviceSyncError.underlying(message: "Snapshot \(group.rawValue) is absent; it was not published.") }
                 guard shouldPublish() else { return nil }
-                if lastPublishedMobileSnapshotStatus[group] == value {
+                if lastPublishedMobileSnapshotStatus[group]?.pairing == secret,
+                   lastPublishedMobileSnapshotStatus[group]?.value == value {
                     continue
                 }
                 try await deviceTransport.setStatus(
                     key: group.statusKey,
-                    value: value
+                    value: value,
+                    pairingSecret: secret
                 )
                 guard shouldPublish() else { return nil }
-                lastPublishedMobileSnapshotStatus[group] = value
+                lastPublishedMobileSnapshotStatus[group] = (secret, value)
                 await recordSendResult(operation: group.statusKey)
             } catch {
                 guard shouldPublish() else { return nil }
@@ -159,25 +174,15 @@ extension iCloudBridge {
         sessionID: String,
         correlationID: String,
         metadata: [String: String],
-        key: String = NativeAgentICloudBridgeConstants.KVSKey.chatProgressLatest,
-        mirrorKey: String? = nil
+        key: String = NativeAgentICloudBridgeConstants.KVSKey.chatProgressLatest
     ) async -> Bool {
         let msg: BridgeMessage
-        let mirror: BridgeMessage?
         do {
-            (msg, mirror) = try await sync.storage.perform {
+            msg = try await sync.storage.perform {
                 let secret = try PairingSecret.loadOrGenerateSecret()
                 let msg = try Self.makeKVSChatProgressMessage(text: text, sessionID: sessionID,
                     correlationID: correlationID, metadata: metadata, secret: secret)
-                var mirror: BridgeMessage?
-                if let mirrorKey, mirrorKey != key {
-                    // Old phones admit only progress; both copies retain the same id.
-                    var mirrorMetadata = metadata
-                    mirrorMetadata["kind"] = "progress"
-                    mirror = try Self.makeKVSChatProgressMessage(id: msg.id, text: text, sessionID: sessionID,
-                        correlationID: correlationID, metadata: mirrorMetadata, secret: secret)
-                }
-                return (msg, mirror)
+                return msg
             }
         } catch {
             syncStatus = "iPhone pairing unavailable — repair the Mac pairing key"
@@ -186,12 +191,11 @@ extension iCloudBridge {
         }
 
         let data: Data
-        let mirrorData: Data?
         do {
-            (data, mirrorData) = try await sync.storage.perform {
+            data = try await sync.storage.perform {
                 let encoder = JSONEncoder()
                 encoder.dateEncodingStrategy = .iso8601
-                return (try encoder.encode(msg), try mirror.map { try encoder.encode($0) })
+                return try encoder.encode(msg)
             }
         } catch {
             nativeLog("[iCloudBridge] failed to encode KVS progress msg=%@: %@", correlationID, "\(error)")
@@ -203,23 +207,12 @@ extension iCloudBridge {
             seconds: 3
         ) { () -> ICloudKVSProgressDeliveryResult in
             let kvs = NSUbiquitousKeyValueStore.default
-            var existingKeys = Set(kvs.dictionaryRepresentation.keys)
+            let existingKeys = Set(kvs.dictionaryRepresentation.keys)
             let admission = ICloudKVSProgressWriteAdmission.assess(
                 keys: existingKeys,
                 progressKey: key
             )
             guard admission.isAllowed else { return .blocked(admission) }
-            // Both key formats carry the same message ID so the phone deduplicates mirrored events.
-            if let mirrorKey, let mirrorData, mirrorKey != key {
-                // Mirror admission includes the primary key in its projected keyspace.
-                existingKeys.insert(key)
-                let mirrorAdmission = ICloudKVSProgressWriteAdmission.assess(
-                    keys: existingKeys,
-                    progressKey: mirrorKey
-                )
-                guard mirrorAdmission.isAllowed else { return .blocked(mirrorAdmission) }
-                kvs.set(mirrorData, forKey: mirrorKey)
-            }
             kvs.set(data, forKey: key)
             return kvs.synchronize() ? .synchronized : .synchronizeFailed
         } ?? .timedOut

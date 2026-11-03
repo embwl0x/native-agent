@@ -4,14 +4,14 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `ProviderRoutingValues.swift` | Provider and surface scalar interpretation with stable saved JSON vocabulary |
+// Blueprint: | `ProviderRoutingValues.swift` | Provider and surface scalar interpretation with stable saved JSON vocabulary; saved reasoning-effort projection normalizes spelling and checks the exact route descriptor without substituting another effort; declared OpenRouter no-selector rows admit omission only |
 
 extension SwiftNativeProviderRouting {
     nonisolated static func normalizeProviderId(_ raw: String) -> String {
         ProviderFamilyIdentity.normalize(raw)
     }
     /// Reads `providers/surfaces.json` and returns the explicitly-pinned model for `surface` only when the key is present (and non-empty). Returns nil for any unpinned surface, so dream / REM can fall back to the chat-surface picker
-    /// without confusing a catalog seed for a user pin. Parse `providers/surfaces.json` as nested model/effort/tier controls or flat model strings. The checked state boundary has already validated string-valued controls.
+    /// without confusing a catalog seed for a user pin. Parse `providers/surfaces.json` as nested model/effort/tier controls only as objects. The checked state boundary has already validated string-valued controls.
     nonisolated static func parseSurfacesFile(_ raw: JSONValue) -> (JSONValue, JSONValue, JSONValue) {
         guard case .object(let obj) = raw, !obj.isEmpty else {
             return (.object([:]), .object([:]), .object([:]))
@@ -21,23 +21,15 @@ extension SwiftNativeProviderRouting {
         var tiers: [String: JSONValue] = [:]
         for (surface, entry) in obj {
             switch entry {
-            case .string(let s):
-                if !s.isEmpty { models[surface] = .string(s) }
             case .object(let inner):
                 if let m = Self.stringFrom(.object(inner), key: "model") {
                     models[surface] = .string(m)
                 }
                 if case .string(let e)? = inner["reasoningEffort"], !e.isEmpty {
                     efforts[surface] = .string(e)
-                } else if case .string(let e)? = inner["reasoning_effort"], !e.isEmpty {
-                    efforts[surface] = .string(e)
                 }
                 if case .string(let tier)? = inner["serviceTier"], !tier.isEmpty {
                     tiers[surface] = .string(tier)
-                } else if case .string(let tier)? = inner["service_tier"], !tier.isEmpty {
-                    tiers[surface] = .string(tier)
-                } else if case .bool(let fast)? = inner["fastMode"] {
-                    tiers[surface] = .string(fast ? "priority" : "default")
                 }
             default:
                 continue
@@ -92,37 +84,26 @@ extension SwiftNativeProviderRouting {
     }
     nonisolated static func normalizeReasoningEffortStatic(
         _ raw: String,
-        fallback: String,
         model: String?,
         providerID: String? = nil,
         supportedReasoningEfforts: [String]? = nil
-    ) -> String {
+    ) throws -> String {
         let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard REASONING_EFFORT_OPTIONS.contains(normalized) else { return fallback }
-        let lowerModel = model?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-        let route = providerID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-        // The model's row declares its efforts, never its spelling: the account's own row when the caller has it, else the route's shipped row (Moonshot's live-only ids from its catalog), else any shipped row.
-        let supported = Set(supportedReasoningEfforts
-            ?? FirstPartyModelCatalog.routeSupportedEfforts(lowerModel, providerID: route)
-            ?? (route == "moonshot" ? MoonshotModelCatalog.supportedReasoningEfforts(for: lowerModel) : nil)
-            ?? FirstPartyModelCatalog.descriptor(for: lowerModel)?.supportedReasoningEfforts
-            ?? ["low", "medium", "high", "xhigh"])
+        guard let model, !model.isEmpty else { return normalized }
+        let supported = supportedReasoningEfforts
+            ?? FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: providerID ?? "")
+        guard let supported else {
+            throw ProviderRoutingError.configurationFailed("The Think controls for \(model) on \(providerID ?? "the selected account") are unknown. Refresh its catalog in Providers.")
+        }
+        if providerID == "openrouter", supported.isEmpty,
+           normalized.isEmpty || normalized == "default" { return normalized }
         guard supported.contains(normalized) else {
-            let cleanFallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if supported.contains(cleanFallback) { return cleanFallback }
-            if supported.contains("high") { return "high" }
-            for candidate in REASONING_EFFORT_OPTIONS where supported.contains(candidate) {
-                return candidate
-            }
-            return "high"
+            throw ProviderRoutingError.configurationFailed("Think level '\(raw)' is unsupported for \(model). Choose one of \(supported.joined(separator: ", ")) in Providers.")
         }
         return normalized
     }
     nonisolated static func normalizeServiceTierStatic(_ raw: String) -> String {
-        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "priority", "fast": return "priority"
-        default: return "default"
-        }
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
     /// Read a nonempty string from already checked routing state.
     nonisolated static func stringFrom(_ node: JSONValue, key: String) -> String? {

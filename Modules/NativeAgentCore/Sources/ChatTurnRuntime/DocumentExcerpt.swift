@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `DocumentExcerpt.swift` | `DocumentExcerpt.selected`: query-scored attachment line windows rendered in document order with explicit line ranges |
+// Blueprint: | `DocumentExcerpt.swift` | `DocumentExcerpt.selected`: explicit passages/no-match/unavailable selection; query-scored line windows in document order with line ranges, without prefix substitution |
 
 /// Selective reading for an attachment that does not fit its per-turn
 /// allowance (third conversation pass, item 4).
@@ -13,23 +13,25 @@ import Foundation
 ///
 /// PURE AND CHEAP. No clock, no I/O, one pass over the lines plus a bounded
 /// sort; it runs once per over-long attachment, never on a keystroke or a
-/// stream chunk. Nothing is added to any prompt when it declines (`nil` → the
-/// caller keeps the prefix it always used).
+/// stream chunk. A declined selection stays explicit; it never sends a prefix.
 enum DocumentExcerpt {
+    enum Selection {
+        case passages(String)
+        case noMatch
+        case unavailable(String)
+    }
     /// Lines per scored window. Big enough that a clause or a paragraph lands
     /// in one window with its context, small enough that a 40k allowance holds
     /// several windows from different parts of a long document.
     static let windowLines = 24
 
-    /// Returns nil when selection cannot beat a plain prefix: no usable query
-    /// terms, or nothing in the document matched them.
-    static func selected(text: String, query: String, allowance: Int) -> String? {
-        guard allowance > 200 else { return nil }
+    /// Preserve no-match separately from a query or budget that cannot be read.
+    static func selected(text: String, query: String, allowance: Int) -> Selection {
+        guard allowance > 200 else { return .unavailable("The remaining passage allowance is too small.") }
         let terms = self.terms(query)
-        guard !terms.isEmpty else { return nil }
+        guard !terms.isEmpty else { return .unavailable("The request contains no usable passage-selection terms.") }
 
         let lines = text.components(separatedBy: "\n")
-        guard lines.count > windowLines else { return nil }
 
         var scored: [(start: Int, score: Int)] = []
         var start = 0
@@ -41,7 +43,7 @@ enum DocumentExcerpt {
             if score > 0 { scored.append((start, score)) }
             start = end
         }
-        guard !scored.isEmpty else { return nil }
+        guard !scored.isEmpty else { return .noMatch }
 
         // Best-matching windows first, ties broken by position so the choice is
         // deterministic; then re-ordered into document order for output.
@@ -67,7 +69,7 @@ enum DocumentExcerpt {
             chosen.append(window.start)
             used += cost
         }
-        guard !chosen.isEmpty else { return nil }
+        guard !chosen.isEmpty else { return .unavailable("The matching passage does not fit the remaining allowance.") }
 
         // Clamp on the real thing. The per-window estimate cannot know which
         // windows end up adjacent (no marker between them) or how the joins
@@ -76,10 +78,10 @@ enum DocumentExcerpt {
         // "never longer than the allowance" has to be a fact, not an estimate.
         while !chosen.isEmpty {
             let rendered = render(chosen: chosen, lines: lines)
-            if rendered.count <= allowance { return rendered }
+            if rendered.count <= allowance { return .passages(rendered) }
             chosen.removeLast()  // `chosen` is in ranked order: weakest goes first
         }
-        return nil
+        return .unavailable("The matching passages do not fit the remaining allowance.")
     }
 
     /// What one window costs beyond its body once rendered: its own line-range

@@ -20,7 +20,7 @@ struct TextMarkerCodec: Sendable {
     let schemas: [LLMToolSchema]
     /// The catalog's names — what the turn can call at all.
     let catalogNames: Set<String>
-    /// What the session has loaded; the bounces name these first.
+    /// The tools offered for this turn; the bounces name these first.
     let turnActiveTools: Set<String>
 
     /// `catalogNames` defaults to the schemas' names; the loop passes the
@@ -34,17 +34,17 @@ struct TextMarkerCodec: Sendable {
     // MARK: - Calls
 
     /// The round's marker calls in wire order, `<tool_use>` and `<invoke>`.
-    func calls(in text: String, recordShims: Bool = true) -> [ParsedToolCall] {
-        ToolCallParser.parse(text, parseInvoke: true, recordShims: recordShims).map { call in
+    func calls(in text: String, recordShims: Bool = true) throws -> [ParsedToolCall] {
+        try ToolCallParser.parse(text, parseInvoke: true, recordShims: recordShims).map { call in
             guard call.undeclaredKeys.isEmpty else { return call }
-            let schema = schemas.first(where: { $0.name == call.name })
-                .flatMap { try? JSONSerialization.jsonObject(with: $0.parametersJSON) as? [String: Any] }
-            let properties = schema?["properties"] as? [String: Any]
+            guard let descriptor = schemas.first(where: { $0.name == call.name }) else { return call }
+            let schema = try descriptor.checkedParameters().objectValue!
+            let properties = schema["properties"]?.objectValue
             var input = call.input
             // String-schema parameters preserve raw <invoke> text even when it parses as a number or boolean.
             if let properties {
                 for (key, raw) in call.invokeRawText {
-                    guard (properties[key] as? [String: Any])?["type"] as? String == "string" else { continue }
+                    guard properties[key]?.objectValue?["type"] == .string("string") else { continue }
                     switch input[key] {
                     case .int?, .double?, .bool?, .null?:
                         input[key] = .string(raw)
@@ -57,9 +57,9 @@ struct TextMarkerCodec: Sendable {
             }
             var parsed = ParsedToolCall(id: call.id, name: call.name, input: input)
             // Closed, nonempty property schemas reject undeclared fields; unknown, open, empty and composed schemas permit them.
-            let composed = ["oneOf", "anyOf", "allOf"].contains { schema?[$0] != nil }
+            let composed = ["oneOf", "anyOf", "allOf"].contains { schema[$0] != nil }
             if let properties, !properties.isEmpty, !composed,
-               schema?["additionalProperties"] as? Bool != true {
+               schema["additionalProperties"] != .bool(true) {
                 parsed.undeclaredKeys = input.keys.filter { properties[$0] == nil }.sorted()
             }
             return parsed
@@ -137,18 +137,14 @@ struct TextMarkerCodec: Sendable {
         baseSystem: String?,
         segments: SystemPromptSegments?,
         context: TurnContext
-    ) -> (system: String, segments: SystemPromptSegments?) {
-        let floorBlock = renderFloor(rows: catalogSections(
+    ) throws -> (system: String, segments: SystemPromptSegments?) {
+        let floorBlock = renderFloor(rows: try catalogSections(
             schemas: context.toolSchemas, names: context.toolsAvailable
         ).floor, appDoor: context.toolSchemas.contains { $0.name == "app" })
         guard let segments,
               let baseSystem,
               segments.reassembles(into: baseSystem) else {
-            guard let base = baseSystem?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !base.isEmpty else {
-                return (floorBlock, nil)
-            }
-            return (base + "\n\n" + floorBlock, nil)
+            throw ProviderRoutingError.configurationFailed("The text-marker request requires coherent system segments; its offered tool contract was not assembled.")
         }
         let stable = segments.stable.isEmpty
             ? floorBlock
@@ -160,10 +156,9 @@ struct TextMarkerCodec: Sendable {
         return (reordered.combined, reordered)
     }
 
-    /// The session-loaded run the v2 seed delivers in the volatile block, so
-    /// a mid-session tool_load/promotion cannot invalidate replayed history.
-    static func volatileCatalogAppendix(for context: TurnContext) -> String {
-        catalogSections(schemas: context.toolSchemas, names: context.toolsAvailable).appended
+    /// Additional offered descriptors ride in the volatile block without moving the prefix.
+    static func volatileCatalogAppendix(for context: TurnContext) throws -> String {
+        try catalogSections(schemas: context.toolSchemas, names: context.toolsAvailable).appended
     }
 
     /// The advertised catalog, split the way the cache needs it.
@@ -184,7 +179,7 @@ struct TextMarkerCodec: Sendable {
     static func catalogSections(
         schemas: [LLMToolSchema],
         names: [String]
-    ) -> CatalogSections {
+    ) throws -> CatalogSections {
         let core = SwiftToolDispatcher.alwaysOnCoreNames
         var floorRows: [String] = []
         var appendedRows: [String] = []
@@ -198,13 +193,13 @@ struct TextMarkerCodec: Sendable {
                 .sorted { $0.name < $1.name }
             let appendedSchemas = schemas.filter { !core.contains($0.name) }
             appendedTotal = appendedSchemas.count
-            let row: (LLMToolSchema) -> String = { schema in
-                let params = parameterSummary(schema.parametersJSON)
+            let row: (LLMToolSchema) throws -> String = { schema in
+                let params = try parameterSummary(schema)
                 let suffix = params.isEmpty ? "" : "(\(params))"
                 return "- \(schema.name)\(suffix): \(compact(schema.description, limit: 180))"
             }
-            floorRows = floorSchemas.map(row)
-            appendedRows = appendedSchemas.prefix(80).map(row)
+            floorRows = try floorSchemas.map(row)
+            appendedRows = try appendedSchemas.prefix(80).map(row)
         } else {
             let floorNames = names.filter { core.contains($0) }.sorted()
             let appendedNames = names.filter { !core.contains($0) }
@@ -258,24 +253,22 @@ struct TextMarkerCodec: Sendable {
         """
     }
 
-    private static func parameterSummary(_ data: Data) -> String {
-        guard let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let properties = raw["properties"] as? [String: Any] else {
-            return ""
-        }
-        let required = Set((raw["required"] as? [String]) ?? [])
+    private static func parameterSummary(_ schema: LLMToolSchema) throws -> String {
+        let raw = try schema.checkedParameters().objectValue!
+        guard let properties = raw["properties"]?.objectValue else { return "" }
+        let required = Set(raw["required"]?.arrayValue?.compactMap(\.stringValue) ?? [])
         // List every parameter, required first and alphabetical within each group.
         let ordered = properties.keys.sorted { a, b in
             required.contains(a) != required.contains(b) ? required.contains(a) : a < b
         }
         return ordered.map { key in
             let requiredMarker = required.contains(key) ? "*" : ""
-            guard let property = properties[key] as? [String: Any],
-                  let rawEnum = property["enum"] as? [Any],
+            guard let property = properties[key]?.objectValue,
+                  let rawEnum = property["enum"]?.arrayValue,
                   (1...8).contains(rawEnum.count) else {
                 return "\(key)\(requiredMarker)"
             }
-            let values = rawEnum.compactMap { $0 as? String }
+            let values = rawEnum.compactMap(\.stringValue)
             guard values.count == rawEnum.count,
                   values.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 40 }) else {
                 return "\(key)\(requiredMarker)"

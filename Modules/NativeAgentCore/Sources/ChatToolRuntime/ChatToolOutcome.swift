@@ -52,10 +52,10 @@ extension ChatToolOutcome {
         let inner: String? = if case .object(let detail)? = object["detail"], case .string(let error)? = detail["error"] { error } else { nil }
         let genericCodes: Set<String> = ["failed", "error", "dispatch_error", "tool_failed"]
         let suppliedCodes = [text("failure_code"), text("error_code"), text("errorCode"), text("code")].compactMap { $0 }
-        let legacyCodes = [oldReason, text("error"), inner].compactMap { $0 }.filter(isCode)
+        let domainCodes = [oldReason, text("error"), inner].compactMap { $0 }.filter(isCode)
         let code = oldReason.flatMap { isCode($0) && !genericCodes.contains($0) ? $0 : nil }
-            ?? (suppliedCodes + legacyCodes).first { !genericCodes.contains($0) }
-            ?? suppliedCodes.first ?? legacyCodes.first ?? "tool_failed"
+            ?? (suppliedCodes + domainCodes).first { !genericCodes.contains($0) }
+            ?? suppliedCodes.first ?? domainCodes.first ?? "tool_failed"
         let candidates = ["message", "spoken", "text", "detail", "output", "error", "content", "result", "fix", "recovery_hint", "hint"].flatMap { explanations(object[$0]) }
         // A process that failed says why on stderr and in its exit code.
         let exit = [object["exit_code"], object["exitCode"]].lazy.compactMap { value -> Int? in
@@ -108,25 +108,21 @@ extension ChatToolOutcome {
         return .object(object)
     }
 
-    /// Repair identity includes the setting, so its success settles only its own debt.
+    /// Repair identity is the act and its declared subject, so its success settles only its own debt.
     static func repairOperation(_ action: String, _ input: [String: JSONValue]) -> String {
         let args = if case .object(let args)? = input["args"] { args } else { input }
-        if action == "setting.set", case .string(let setting)? = args["setting"] { return action + ":" + setting }
-        if action == "permissions.request", case .string(let capability)? = args["capability"] {
-            return action + ":" + capability + (capability == "calendars" && args["mode"] == .string("write") ? ":write" : "")
-        }
-        return action
+        return AppActionBinding.repairOperation(action, args)
     }
 
     /// Name a lever as its act; reads and restarts change no owner and settle no repair.
-    static func leverOperation(_ remedy: JSONValue?) -> String? {
+    static func leverOperation(_ remedy: JSONValue?) throws -> String? {
         guard case .object(let fields)? = remedy, case .object(let call)? = fields["next_call"],
               case .string(let tool)? = call["tool"] else { return nil }
         let input: [String: JSONValue] = if case .object(let given)? = call["input"] { given } else { [:] }
         guard case .string(let action)? = input["action"], !action.isEmpty else {
             return tool == "app" ? nil : ToolNameAliases.appAction(tool) ?? tool
         }
-        guard !action.hasSuffix(".restart"), AppActionBinding.action(input: input)?.read != true else { return nil }
+        guard !action.hasSuffix(".restart"), try AppActionBinding.action(input: input)?.read != true else { return nil }
         return repairOperation(action, input)
     }
 

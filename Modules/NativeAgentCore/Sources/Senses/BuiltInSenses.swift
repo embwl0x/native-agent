@@ -1,8 +1,10 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `BuiltInSenses.swift` | Bundle-owned native adapters and JavaScript defaults; file overrides win and accounting lives in AbilityStore state; bundled records have built-in origin and no creation/enable placeholders |
+// Blueprint: | `BuiltInSenses.swift` | Bundle-owned native adapters and JavaScript defaults read once per resource root under a lock, with failures uncached; one schemaVersion-1 object manifest requires every identity, string corner, version, mode, entry and verbs; file overrides win and accounting lives in AbilityStore state; bundled records have built-in origin and no creation/enable placeholders |
 
 public enum BuiltInSenses {
+    private static let defaultsLock = NSLock()
+    nonisolated(unsafe) private static var defaultsByRoot: [String: [FileSenseRegistry.Version]] = [:]
     fileprivate static let native: [(String, SenseCorner)] = [
         ("builtin-screen", .app(bundleID: "*")),
         ("builtin-chrome", .site(host: "*")),
@@ -43,7 +45,16 @@ public enum BuiltInSenses {
     }
 
     static func defaults(resources: URL? = nil) throws -> [FileSenseRegistry.Version] {
-        let root = resources ?? resourceRoot()
+        try defaultsLock.withLock {
+            let root = (resources ?? resourceRoot()).standardizedFileURL
+            if let known = defaultsByRoot[root.path] { return known }
+            let versions = try readDefaults(root)
+            defaultsByRoot[root.path] = versions
+            return versions
+        }
+    }
+
+    private static func readDefaults(_ root: URL) throws -> [FileSenseRegistry.Version] {
         let entries = try manifest(at: root.appendingPathComponent("builtin.json"))
         for entry in entries where native.contains(where: { $0.0 == entry.id }) {
             throw SenseFailure(code: "bad_output", message: "Built-in sense identity collision: \(entry.id).")
@@ -73,32 +84,30 @@ public enum BuiltInSenses {
         enum CodingKeys: String, CodingKey { case id, corner, version, entry, verbs, mode }
         init(from decoder: Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
-            if case .string = try fields.decode(JSONValue.self, forKey: .corner) {
-                let key = try fields.decode(String.self, forKey: .corner)
-                guard let value = SenseCorner(key: key) else {
-                    throw SenseFailure(code: "bad_output", message: "Invalid built-in corner: \(key).")
-                }
-                corner = value
-            } else {
-                corner = try fields.decode(SenseCorner.self, forKey: .corner)
+            let key = try fields.decode(String.self, forKey: .corner)
+            guard let value = SenseCorner(key: key) else {
+                throw SenseFailure(code: "bad_output", message: "Invalid built-in corner: \(key).")
             }
-            id = try fields.decodeIfPresent(String.self, forKey: .id)
-                ?? "builtin-" + corner.key.replacingOccurrences(of: ":", with: "-")
-            version = try fields.decodeIfPresent(Int.self, forKey: .version) ?? 1
+            corner = value
+            id = try fields.decode(String.self, forKey: .id)
+            version = try fields.decode(Int.self, forKey: .version)
             entry = try fields.decode(String.self, forKey: .entry)
-            verbs = try fields.decodeIfPresent([String].self, forKey: .verbs) ?? []
-            let defaultMode: SenseMode = if case .app = corner { .live } else { .onCall }
-            mode = try fields.decodeIfPresent(SenseMode.self, forKey: .mode) ?? defaultMode
+            verbs = try fields.decode([String].self, forKey: .verbs)
+            mode = try fields.decode(SenseMode.self, forKey: .mode)
         }
     }
 
+    private struct Manifest: Decodable {
+        let schemaVersion: Int
+        let senses: [Entry]
+    }
+
     private static func manifest(at url: URL) throws -> [Entry] {
-        let data = try Data(contentsOf: url)
-        let value = try JSONValue.parse(data)
-        let rows: JSONValue
-        if case .object(let object) = value, let senses = object["senses"] { rows = senses }
-        else { rows = value }
-        let entries = try JSONDecoder().decode([Entry].self, from: JSONEncoder().encode(rows))
+        let manifest = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: url))
+        guard manifest.schemaVersion == 1 else {
+            throw SenseFailure(code: "bad_output", message: "Unsupported built-in senses schema: \(manifest.schemaVersion).")
+        }
+        let entries = manifest.senses
         var ids: Set<String> = [], corners: Set<SenseCorner> = []
         for entry in entries {
             guard safeComponent(entry.id), entry.version > 0, safeRelativePath(entry.entry),

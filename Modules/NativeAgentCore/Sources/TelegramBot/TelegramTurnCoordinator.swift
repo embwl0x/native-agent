@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 
 // Blueprint: | `TelegramTurnCoordinator.swift` | `TelegramTurns`: active/queued turn ownership, durable update recovery exclusion and control claims; Stop presentation keeps tasks owned and joinable through operation/receipt/ingress/card settlement until completion releases the slot |
 
@@ -50,13 +51,15 @@ struct TelegramQueuedTurnSnapshot: Sendable, Equatable {
 }
 
 public actor TelegramTurns {
-    private var approvalRecoveryAttempted = false
+    private var approvalWaiters: [Int: ScopedWaiter] = [:]
+    private var approvalResults: [Int: Result<Void, Error>] = [:]
 
-    func claimApprovalRecovery() -> Bool {
-        guard !approvalRecoveryAttempted else { return false }
-        approvalRecoveryAttempted = true
-        return true
+    private func completeApproval(_ id: Int, _ result: Result<Void, Error>) {
+        guard let done = approvalWaiters[id], approvalResults[id] == nil else { return }
+        approvalResults[id] = result
+        done.resume()
     }
+
 
     public static let shared = TelegramTurns()
     static let maximumQueuedTurnsPerChat = 20
@@ -102,6 +105,10 @@ public actor TelegramTurns {
 
     public func beginUpdateProcessing(_ updateId: Int) {
         inFlightUpdateIds.insert(updateId)
+    }
+
+    func claimUpdateProcessing(_ updateId: Int) -> Bool {
+        inFlightUpdateIds.insert(updateId).inserted
     }
 
     public func endUpdateProcessing(_ updateId: Int) {
@@ -190,25 +197,28 @@ public actor TelegramTurns {
         guard !isShuttingDown else { throw CancellationError() }
         let updateID = nextInternalUpdateID
         nextInternalUpdateID &+= 1
+        let done = ScopedWaiter()
+        approvalWaiters[updateID] = done
+        defer { approvalWaiters[updateID] = nil; approvalResults[updateID] = nil }
         try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                let queued = QueuedTurn(
-                    updateId: updateID, text: text, acknowledgementMessageId: nil,
-                    operation: { _ in
-                        do {
-                            try Task.checkCancellation()
-                            try await operation()
-                            continuation.resume()
-                        } catch {
-                            continuation.resume(throwing: error)
-                        }
-                    },
-                    onStart: { _ in },
-                    onDiscard: { continuation.resume(throwing: CancellationError()) }
-                )
-                queuedTurns[destination, default: []].append(queued)
-                startNextQueuedTurn(destination: destination)
-            }
+            let queued = QueuedTurn(
+                updateId: updateID, text: text, acknowledgementMessageId: nil,
+                operation: { _ in
+                    do {
+                        try Task.checkCancellation()
+                        try await operation()
+                        await self.completeApproval(updateID, .success(()))
+                    } catch {
+                        await self.completeApproval(updateID, .failure(error))
+                    }
+                },
+                onStart: { _ in },
+                onDiscard: { Task { await self.completeApproval(updateID, .failure(CancellationError())) } }
+            )
+            queuedTurns[destination, default: []].append(queued)
+            startNextQueuedTurn(destination: destination)
+            await Task { await done.park() }.value
+            try approvalResults[updateID]!.get()
         } onCancel: {
             Task { await self.cancelApprovalContinuation(destination: destination, updateID: updateID) }
         }
@@ -485,14 +495,15 @@ public actor TelegramTurns {
     ) async -> Bool {
         guard !isShuttingDown else { return false }
         let id = UUID()
-        return await withCheckedContinuation { (admission: CheckedContinuation<Bool, Never>) in
-            commandDestinations[id] = destination
-            commandTasks[id] = Task {
-                await operation { admission.resume(returning: true) }
-                commandTasks.removeValue(forKey: id)
-                commandDestinations.removeValue(forKey: id)
-            }
+        let done = ScopedWaiter()
+        commandDestinations[id] = destination
+        commandTasks[id] = Task {
+            await operation { done.resume() }
+            commandTasks.removeValue(forKey: id)
+            commandDestinations.removeValue(forKey: id)
         }
+        await Task { await done.park() }.value
+        return true
     }
 
     public func shutdown() async {

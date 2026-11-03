@@ -1,8 +1,9 @@
 import Foundation
+import ChatTurnContracts
 import NativeAgentShared
 import ProviderRouting
 
-// Blueprint: | `InlineInteractionResolver+MissingProvider.swift` | `InlineInteractionResolver.raiseMissingChatProvider`: setup card before provider dispatch; only text-only questions can resume |
+// Blueprint: | `InlineInteractionResolver+MissingProvider.swift` | `InlineInteractionResolver.raiseMissingChatProvider`: setup card records the accepted request's origin before provider dispatch; only text-only questions can resume |
 
 public extension InlineInteractionResolver {
     static func raiseMissingChatProvider(
@@ -25,6 +26,7 @@ public extension InlineInteractionResolver {
             sessionID: sessionID,
             resumeText: hasAttachments ? nil : userContent,
             resumable: !hasAttachments,
+            origin: TurnEnvelope.current(surface: "chat"),
             dataRoot: dataRoot
         )
     }

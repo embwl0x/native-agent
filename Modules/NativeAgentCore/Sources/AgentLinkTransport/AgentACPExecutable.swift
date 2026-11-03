@@ -121,14 +121,22 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
         try? output.fileHandleForWriting.close()
         defer { try? output.fileHandleForReading.close() }
         guard let reader = try? AgentACPPipeReader(handle: output.fileHandleForReading) else {
-            await AgentACPProcess.finish(pid, snapshot: tree, grace: .zero)
+            if let failure = await AgentACPProcess.finish(pid, snapshot: tree, grace: .zero) {
+                throw ToolFailureError(failure, effects: .unknown, owner: "ACP version probe process group",
+                    code: "process_termination_incomplete", instruction: "Repair the retained probe process before reconnecting.", recovery: .repair)
+            }
             throw AgentACPClient.Failure.unavailable
         }
         // Whichever ends first stops the other: the reader's end cancels the
         // ceiling's wait, so the tree is stopped at once; the ceiling's stop
         // ends a reader a descendant still holds open.
+        let terminationFailure = OSAllocatedUnfairLock(initialState: Optional<String>.none)
         let bytes = await withTaskGroup(of: Data?.self) { group in
-            group.addTask { await AgentACPProcess.finish(pid, snapshot: tree, grace: grace); return nil }
+            group.addTask {
+                let failure = await AgentACPProcess.finish(pid, snapshot: tree, grace: grace)
+                terminationFailure.withLock { $0 = failure }
+                return nil
+            }
             group.addTask {
                 var bytes = Data()
                 do {
@@ -148,6 +156,10 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
             return read
         }
         reader.cancel()
+        if let failure = terminationFailure.withLock({ $0 }) {
+            throw ToolFailureError(failure, effects: .unknown, owner: "ACP version probe process group",
+                code: "process_termination_incomplete", instruction: "Repair the retained probe process before reconnecting.", recovery: .repair)
+        }
         try Task.checkCancellation()
         guard isCurrent else { throw AgentACPClient.Failure.unavailable }
         let text = String(decoding: bytes.prefix(limit), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)

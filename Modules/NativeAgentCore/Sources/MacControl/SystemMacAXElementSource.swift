@@ -17,15 +17,15 @@ import os
 import CoreText
 import ScreenCaptureKit
 #endif
-// Blueprint: | `SystemMacAXElementSource.swift` | Native read-only AX source with instance-locked references |
+// Blueprint: | `SystemMacAXElementSource.swift` | Observation-scoped locked AX references and snapshot-derived focus paths; continuation capture suspends renderer preparation while preserving app/window/focus identity and retains only window/focus references; per-node checked topology preserves sibling reads; masking requires readable labels, values and geometry |
 #if canImport(ApplicationServices) && os(macOS)
 /// Live `AXUIElement` reader.
 ///
-/// READ-ONLY BY CONSTRUCTION: only `AXUIElementCopyAttributeValue` /
-/// `AXUIElementCopyActionNames` / `AXUIElementCreateApplication` are called.
-/// No `AXUIElementPerformAction`, no `AXUIElementSetAttributeValue`.
+/// Emits no UI input. Shared attribute reads prepare settable renderer modes
+/// through the extension in MacChromiumAccessibility; passive reads never do.
 ///
-/// Each instance is one snapshot session; its locked table owns the native handles.
+/// Dispatch creates a fresh instance; a captured continuation retains only its
+/// window/focus references. The client never retains a growing live table.
 /// The lock serializes every AXUIElement reference access under @unchecked Sendable.
 public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Sendable {
     private let lock = NSLock()
@@ -60,12 +60,58 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         }
         return element
     }
-    func captureContinuation(pid: Int32?, taskReference: String) -> MacWorkContinuation {
+    private struct ContinuationAnchor: @unchecked Sendable {
+        let launch: Date
+        let window: AXUIElement
+        let focus: AXUIElement
+    }
+    func captureContinuation(pid: Int32?, taskReference: String) async -> MacWorkContinuation {
+        guard isTrusted() else {
+            return .unsupported("accessibility_permission_missing", taskReference: taskReference)
+        }
+        guard let pid, pid != getpid() else {
+            return .unsupported("previous_app_unavailable", taskReference: taskReference)
+        }
+        do {
+            // Preserve the selected app/window/focus before the cold settle.
+            // These basic identity reads must not themselves prepare a renderer.
+            let anchor = try MacAXExecutionLane.sync {
+                Result { try MacAccessibilityReader.withReadBudget {
+                    try Self.$preparingRenderer.withValue(true) {
+                        guard isTrusted(), let app = NSRunningApplication(processIdentifier: pid),
+                              !app.isTerminated, let launch = app.launchDate else {
+                            throw MacAccessibilityReader.NativeReadFailure(detail: "Previous app identity is unavailable.")
+                        }
+                        let application = AXUIElementCreateApplication(pid)
+                        guard let window = MacAXAttributeRead.copyElement(application, kAXFocusedWindowAttribute),
+                              let focus = MacAXAttributeRead.copyElement(application, kAXFocusedUIElementAttribute) else {
+                            throw MacAccessibilityReader.NativeReadFailure(detail: "Previous window or focus identity is unavailable.")
+                        }
+                        return ContinuationAnchor(launch: launch, window: window, focus: focus)
+                    }
+                } }
+            }.get()
+            try await Self.prepareRenderer(pid: pid)
+            return try MacAXExecutionLane.sync {
+                Result { try MacAccessibilityReader.withReadBudget {
+                    capturePreparedContinuation(pid: pid, anchor: anchor, taskReference: taskReference)
+                } }
+            }.get()
+        } catch {
+            return .unsupported("continuation_capture_unavailable: \(error.localizedDescription)", taskReference: taskReference)
+        }
+    }
+    private func retainReferences(_ refs: [MacAXElementRef]) {
+        lock.lock(); defer { lock.unlock() }
+        let ids = Set(refs.map(\.id))
+        table = table.filter { ids.contains($0.key) }
+    }
+    private func capturePreparedContinuation(pid: Int32, anchor: ContinuationAnchor, taskReference: String) -> MacWorkContinuation {
         func unsupported(_ reason: String) -> MacWorkContinuation {
             .unsupported(reason, taskReference: taskReference)
         }
         guard isTrusted() else { return unsupported("accessibility_permission_missing") }
-        guard let pid, pid != getpid(), let app = appInfo(pid: pid) else {
+        guard pid != getpid(), let app = appInfo(pid: pid) else {
             return unsupported("previous_app_unavailable")
         }
         // The session's cover (screensaver, lock) is not an app he works in:
@@ -73,16 +119,17 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         guard app.bundleIdentifier != MacWakeGuard.loginWindowBundleID else {
             return unsupported("screen_covered")
         }
-        guard let launchDate = NSRunningApplication(processIdentifier: pid)?.launchDate else {
+        guard let launchDate = NSRunningApplication(processIdentifier: pid)?.launchDate, launchDate == anchor.launch else {
             return unsupported("app_identity_unsupported")
         }
         let application = AXUIElementCreateApplication(pid)
-        guard let rawWindow = MacAXAttributeRead.copyElement(application, kAXFocusedWindowAttribute),
+        guard let rawWindow = MacAXAttributeRead.copyElement(application, kAXFocusedWindowAttribute), CFEqual(rawWindow, anchor.window),
               Self.isWindow(rawWindow) else { return unsupported("focused_window_unavailable") }
         let root = mint(rawWindow)
-        guard let attributes = attributes(of: root),
-              let path = focusedElementPathOnExecutionLane(relativeTo: root, siblingLimit: MacAXLimits.hardMaxNodes),
-              let rawFocus = MacAXAttributeRead.copyElement(application, kAXFocusedUIElementAttribute) else {
+        let snapshot = MacAccessibilityReader.walk(source: self, root: root, limits: .deepPage)
+        guard let attributes = snapshot.nodes.first?.attributes,
+              let path = focusedElementPath(in: snapshot, relativeTo: root),
+              let rawFocus = MacAXAttributeRead.copyElement(application, kAXFocusedUIElementAttribute), CFEqual(rawFocus, anchor.focus) else {
             return unsupported("focused_element_unavailable")
         }
         let capturedTitle = attributes.title
@@ -94,13 +141,13 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         }
         let document = MacAXAttributeRead.copyString(rawWindow, kAXDocumentAttribute)
         guard document == nil || document!.count <= 1024 else { return unsupported("document_identity_over_budget") }
-        let snapshot = MacAccessibilityReader.walk(source: self, root: root, limits: MacAXLimits())
         let percept = MacPerceptionCompiler.compile(snapshot: snapshot,
             secretContext: MacScreenViewTextRedaction.nodeSecretContext(snapshot.nodes), app: app,
             windowTitle: attributes.title, focusPath: path)
         guard let focus = percept.focus else { return unsupported("focused_element_outside_capture") }
         let identity = MacAXWindowIdentity(pid: pid, index: nil, role: attributes.role,
-            subrole: attributes.subrole, title: attributes.title, frame: attributes.frame)
+            subrole: attributes.subrole, title: attributes.title, frame: attributes.frame,
+            attributeGaps: attributes.attributeGaps)
         let capturedAt = Date()
         let evidence: JSONValue = .object([
             "status": .string("captured"), "task_reference": .string(taskReference),
@@ -115,9 +162,11 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
                 "unit": .string("utf16"),
             ]),
         ])
+        retainReferences([root, focused])
         return MacWorkContinuation(app: app, window: identity, focusPath: path,
             selectionRange: range, evidence: evidence, check: { [self] in
                 MacAXExecutionLane.sync {
+                    defer { retainReferences([root, focused]) }
                     guard Date().timeIntervalSince(capturedAt) <= MacLookFrameStore.ttlSeconds else { return "stale_capture" }
                     guard isTrusted(), appInfo(pid: pid) == app,
                           NSRunningApplication(processIdentifier: pid)?.launchDate == launchDate else { return "stale_app" }
@@ -128,7 +177,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
                           MacAXAttributeRead.copyString(liveWindow, kAXTitleAttribute) == capturedTitle else { return "stale_window_or_document" }
                     guard let liveFocus = MacAXAttributeRead.copyElement(application, kAXFocusedUIElementAttribute),
                           let originalFocus = element(focused), CFEqual(liveFocus, originalFocus),
-                          focusedElementPathOnExecutionLane(relativeTo: root, siblingLimit: MacAXLimits.hardMaxNodes) == path else { return "stale_focused_element" }
+                          focusedElementPath(relativeTo: root) == path else { return "stale_focused_element" }
                     guard MacAXAttributeRead.copyTextRange(liveFocus) == range else { return "stale_selection_range" }
                     return nil
                 }
@@ -170,7 +219,9 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     }
     package func nativeApplication(pid: Int32) -> AXUIElement? {
         guard pid != getpid(), isTrusted() else { return nil }
-        return AXUIElementCreateApplication(pid)
+        let app = AXUIElementCreateApplication(pid)
+        guard (try? Self.ensureRenderer(app, refresh: true)) != nil else { return nil }
+        return app
     }
     /// Exact native inventory: a failed AXWindows read is never zero windows.
     package func nativeWindows(pid: Int32) throws -> [AXUIElement] {
@@ -343,12 +394,12 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             main: MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute),
             equal: { CFEqual($0, $1) }
         ).filter(Self.isWindow)
-        return windows.enumerated().map { index, window in
-            MacAXWindowHandle(
-                ref: mint(window),
-                identity: MacAXAttributeRead.copyWindowIdentity(window, pid: pid, index: index)
-            )
-        }
+        do {
+            return try windows.enumerated().map { index, window in
+                MacAXWindowHandle(ref: mint(window),
+                    identity: try MacAXAttributeRead.copyWindowIdentity(window, pid: pid, index: index))
+            }
+        } catch { MacAXAttributeRead.failed(error); return [] }
         #else
         return []
         #endif
@@ -366,13 +417,7 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         return nil
         #endif
     }
-    /// Walk UP from the app's focused element to the window root, recording the
-    /// index of each element in its parent's children. Cheap and exact: one
-    /// `AXParent` chain, no second tree walk — and still read-only.
-    ///
-    /// nil when there is no focused element, when the chain does not reach the
-    /// same root `frontmostWindowRoot()` returned (a focused element in another
-    /// window), or when any hop is unreadable. Absence over a wrong answer.
+    /// Standalone callers use the same bounded observed topology as other reads.
     public func focusedElementPath() -> [Int]? {
         focusedElementPath(relativeTo: nil)
     }
@@ -383,53 +428,33 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     /// Runs on the AX execution lane like every other live call that can
     /// re-enter the target app.
     public func focusedElementPath(relativeTo rootRef: MacAXElementRef?) -> [Int]? {
-        MacAXExecutionLane.sync { focusedElementPathOnExecutionLane(relativeTo: rootRef) }
-    }
-    private func focusedElementPathOnExecutionLane(relativeTo rootRef: MacAXElementRef?, siblingLimit: Int = MacAXLimits.hardMaxNodes) -> [Int]? {
-        #if canImport(AppKit)
-        let pid: pid_t
-        if let rootRef, let root = element(rootRef) {
-            var owner: pid_t = 0
-            guard AXUIElementGetPid(root, &owner) == .success else { return nil }
-            pid = owner
-        } else {
-            guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
-            pid = app.processIdentifier
+        MacAXExecutionLane.sync {
+            do {
+                return try MacAccessibilityReader.withReadBudget {
+                    guard let root = rootRef ?? frontmostWindowRoot() else { return nil }
+                    let snapshot = MacAccessibilityReader.walk(source: self, root: root, limits: .deepPage,
+                        read: { try self.checkedTopologyAttributes(of: $0) })
+                    return focusedElementPath(in: snapshot, relativeTo: root)
+                }
+            } catch { MacAXAttributeRead.failed(error); return nil }
         }
-        // Same self-process fence as `windowRoot(pid:)` — a focused element in
-        // our own window must never be walked over AX.
+    }
+    public func focusedElementPath(in snapshot: MacAXTreeSnapshot, relativeTo rootRef: MacAXElementRef) -> [Int]? {
+        MacAXExecutionLane.sync {
+        #if canImport(AppKit)
+        guard let root = element(rootRef) else { return nil }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(root, &pid) == .success else { return nil }
         guard pid != getpid() else { return nil }
         let appElement = AXUIElementCreateApplication(pid)
         guard let focused = MacAXAttributeRead.copyElement(appElement, kAXFocusedUIElementAttribute) else { return nil }
-        let root: AXUIElement
-        if let rootRef {
-            // The walked root, by handle — not whatever window is focused NOW.
-            guard let anchored = element(rootRef) else { return nil }
-            root = anchored
-        } else {
-            guard let live = MacAXAttributeRead.copyElement(appElement, kAXFocusedWindowAttribute)
-                ?? MacAXAttributeRead.copyElement(appElement, kAXMainWindowAttribute)
-                ?? MacAXAttributeRead.copyElementArray(appElement, kAXWindowsAttribute).first
-            else { return nil }
-            root = live
-        }
-        var path: [Int] = []
-        var current = focused
-        // Bounded by the reader's own depth ceiling: a cycle or a pathological
-        // chain cannot spin here.
-        for _ in 0..<MacAXLimits.hardMaxDepth {
-            if CFEqual(current, root) { return path.reversed() }
-            guard let parent = MacAXAttributeRead.copyElement(current, kAXParentAttribute) else { return nil }
-            let siblings = MacAXAttributeRead.copyElementArray(parent, kAXChildrenAttribute,
-                limit: siblingLimit, preservingIndices: true)
-            guard let index = siblings.firstIndex(where: { CFEqual($0, current) }) else { return nil }
-            path.append(index)
-            current = parent
-        }
-        return nil
+        return snapshot.nodes.first { node in
+            node.element.flatMap { element($0) }.map { CFEqual($0, focused) } == true
+        }?.path
         #else
         return nil
         #endif
+        }
     }
     public func settableAttributes(of ref: MacAXElementRef) -> [String] {
         guard let element = element(ref) else { return [] }
@@ -442,53 +467,85 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
         }
     }
     public func attributes(of ref: MacAXElementRef) -> MacAXAttributes? {
-        guard let element = element(ref) else { return nil }
-        guard let role = MacAXAttributeRead.copyString(element, kAXRoleAttribute) else { return nil }
-        let isHiddenMenuItem = hiddenMenuItem(element, role: role)
-        let menuCommandKey: String? = role == "AXMenuItem" ? {
-            let identifier = MacAXAttributeRead.copyString(element, kAXIdentifierAttribute) ?? ""
-            let key = MacAXAttributeRead.copyString(element, kAXMenuItemCmdCharAttribute) ?? ""
-            return identifier.isEmpty && key.isEmpty ? nil : identifier + "|" + key
-        }() : nil
-        let names = MacAXAttributeRead.copyLabel(element, role: role, prepare: prepareForRead)
-        let rawValue = MacAXAttributeRead.copyRaw(element, kAXValueAttribute)
-        let textValue = (rawValue as? String).flatMap { $0.isEmpty ? nil : $0 }
-        let state = MacAXAttributeRead.valueState(rawValue, role: role)
-        return MacAXAttributes(
-            role: role,
-            subrole: names.subrole,
-            // A field or popup named by a separate label ("Save As:") takes
-            // that label's text — the same rule the act-side drift check reads.
-            title: names.identity,
-            // AXHeading's numeric value is a heading level. Preserve a genuine
-            // string value, but never stringify its level as document text.
-            value: role == "AXHeading" ? textValue : state == nil ? rawValue.flatMap(Self.stringifiedValue) : nil,
-            enabled: MacAXAttributeRead.copyBool(element, kAXEnabledAttribute) ?? true,
-            selected: MacAXAttributeRead.copyBool(element, kAXSelectedAttribute),
-            frame: names.frame,
-            actions: MacAXAttributeRead.copyActions(element),
-            placeholder: MacAXAttributeRead.placeholderRoles.contains(role)
-                ? names.placeholder : nil,
-            selectionRange: MacAXAttributeRead.placeholderRoles.contains(role)
-                ? MacAXAttributeRead.copyTextRange(element) : nil,
-            state: state,
-            liveRegion: (role == "AXGroup" && (MacAXAttributeRead.copyString(element, "AXARIALive")
-                .map { $0 != "off" } ?? false))
-                || ["AXApplicationStatus", "AXApplicationAlert"].contains(
-                    names.subrole ?? role),
-            valueIsHelp: textValue.map { $0 == names.help } ?? false,
-            titleIsHelp: names.identity != names.display,
-            displayTitle: names.display,
-            listSummary: MacAXAttributeRead.listSummary(element, role: role),
-            isHiddenMenuItem: isHiddenMenuItem,
-            menuCommandKey: menuCommandKey
-        )
+        do { return try checkedAttributes(of: ref) }
+        catch { MacAXAttributeRead.failed(error); return nil }
+    }
+    public func checkedAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes {
+        try MacAXAttributeRead.checked {
+            do { return try readAttributes(of: ref) }
+            catch { MacAXAttributeRead.failed(error); throw error }
+        }
+    }
+    private func readAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes {
+        guard let element = element(ref) else {
+            throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility element reference is unavailable.")
+        }
+        let role = try MacAXAttributeRead.checkedText(element, kAXRoleAttribute)
+        guard !role.isEmpty else {
+            throw MacAccessibilityReader.NativeReadFailure(detail: "The element exposes no AXRole (unsupported or no value).")
+        }
+        return try MacAXAttributeRead.collectingAttributeGaps { gaps in
+            let actions = try MacAXAttributeRead.observationActions(element)
+            let isHiddenMenuItem = hiddenMenuItem(element, role: role)
+            let menuCommandKey: String? = role == "AXMenuItem" ? {
+                let identifier = MacAXAttributeRead.copyString(element, kAXIdentifierAttribute) ?? ""
+                let key = MacAXAttributeRead.copyString(element, kAXMenuItemCmdCharAttribute) ?? ""
+                return identifier.isEmpty && key.isEmpty ? nil : identifier + "|" + key
+            }() : nil
+            let names = MacAXAttributeRead.copyLabel(element, role: role, prepare: prepareForRead)
+            let rawValue = MacAXAttributeRead.copyRaw(element, kAXValueAttribute)
+            let textValue = (rawValue as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let state = MacAXAttributeRead.valueState(rawValue, role: role)
+            return MacAXAttributes(
+                role: role,
+                subrole: names.subrole,
+                // A field or popup named by a separate label ("Save As:") takes
+                // that label's text — the same rule the act-side drift check reads.
+                title: names.identity,
+                // AXHeading's numeric value is a heading level. Preserve a genuine
+                // string value, but never stringify its level as document text.
+                value: role == "AXHeading" ? textValue : state == nil ? rawValue.flatMap(Self.stringifiedValue) : nil,
+                enabled: MacAXAttributeRead.copyBool(element, kAXEnabledAttribute),
+                selected: MacAXAttributeRead.copyBool(element, kAXSelectedAttribute),
+                frame: names.frame,
+                actions: actions.names,
+                actionsUnreadable: actions.unreadable,
+                placeholder: MacAXAttributeRead.placeholderRoles.contains(role)
+                    ? names.placeholder : nil,
+                selectionRange: MacAXAttributeRead.placeholderRoles.contains(role)
+                    ? MacAXAttributeRead.copyTextRange(element) : nil,
+                state: state,
+                liveRegion: (role == "AXGroup" && (MacAXAttributeRead.copyString(element, "AXARIALive")
+                    .map { $0 != "off" } ?? false))
+                    || ["AXApplicationStatus", "AXApplicationAlert"].contains(
+                        names.subrole ?? role),
+                valueIsHelp: textValue.map { $0 == names.help } ?? false,
+                titleIsHelp: names.identity != names.display,
+                displayTitle: names.display,
+                listSummary: MacAXAttributeRead.listSummary(element, role: role),
+                isHiddenMenuItem: isHiddenMenuItem,
+                menuCommandKey: menuCommandKey,
+                attributeGaps: gaps.values,
+                labelUnreadable: names.unreadable
+            )
+        }
     }
     /// Native navigation needs the same traversal metadata, without fetching
     /// any field value. Hidden modifier alternates have one owner here.
     package func topologyAttributes(of ref: MacAXElementRef) -> MacAXAttributes? {
-        guard let element = element(ref),
-              let role = MacAXAttributeRead.copyString(element, kAXRoleAttribute) else { return nil }
+        try? checkedTopologyAttributes(of: ref)
+    }
+    package func checkedTopologyAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes {
+        try MacAXAttributeRead.node { try readTopologyAttributes(of: ref) }
+    }
+    private func readTopologyAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes {
+        guard let element = element(ref) else {
+            throw MacAccessibilityReader.NativeReadFailure(detail: "The native AX element reference is unavailable.")
+        }
+        let role = try MacAXAttributeRead.checkedText(element, kAXRoleAttribute)
+        guard !role.isEmpty else {
+            throw MacAccessibilityReader.NativeReadFailure(detail: "The element exposes no AXRole (unsupported or no value).")
+        }
         return MacAXAttributes(role: role, subrole: MacAXAttributeRead.copyString(element, kAXSubroleAttribute),
             isHiddenMenuItem: hiddenMenuItem(element, role: role))
     }
@@ -501,20 +558,51 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
             || primary.map { !CFEqual($0, element) } == true
     }
     public func maskingAttributes(of ref: MacAXElementRef) -> MacAXAttributes? {
-        guard let element = element(ref) else { return nil }
-        guard let role = MacAXAttributeRead.copyString(element, kAXRoleAttribute) else { return nil }
-        let names = MacAXAttributeRead.copyLabel(element, role: role, prepare: prepareForRead)
-        let rawValue = MacAXAttributeRead.copyRaw(element, kAXValueAttribute)
-        return MacAXAttributes(
-            role: role,
-            subrole: names.subrole,
-            title: names.identity,
-            // The same value rule as `attributes(of:)`.
-            value: role == "AXHeading" ? (rawValue as? String).flatMap { $0.isEmpty ? nil : $0 }
-                : MacAXAttributeRead.valueState(rawValue, role: role) == nil ? rawValue.flatMap(Self.stringifiedValue) : nil,
-            frame: names.frame,
-            actions: MacAXAttributeRead.copyActions(element)
-        )
+        do { return try checkedMaskingAttributes(of: ref) }
+        catch { MacAXAttributeRead.failed(error); return nil }
+    }
+    public func checkedMaskingAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes {
+        try MacAXAttributeRead.checked {
+            do { return try readMaskingAttributes(of: ref) }
+            catch {
+                let failure = MacAccessibilityReader.NativeReadFailure(
+                    detail: "Secret masking element \(ref.id): \(error.localizedDescription)")
+                MacAXAttributeRead.failed(failure)
+                throw failure
+            }
+        }
+    }
+    private func readMaskingAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes {
+        guard let element = element(ref) else {
+            throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility masking element reference is unavailable.")
+        }
+        let role = try MacAXAttributeRead.checkedText(element, kAXRoleAttribute)
+        guard !role.isEmpty else {
+            throw MacAccessibilityReader.NativeReadFailure(detail: "The element exposes no AXRole (unsupported or no value).")
+        }
+        return try MacAXAttributeRead.collectingAttributeGaps { gaps in
+            let actions = try MacAXAttributeRead.observationActions(element)
+            let names = MacAXAttributeRead.copyLabel(element, role: role, prepare: prepareForRead)
+            // All name/geometry reads may establish a secret or its caption.
+            // Their failure is fatal for pixels, even when optional for looks.
+            if let gap = gaps.values.first {
+                throw MacAccessibilityReader.NativeReadFailure(detail: "Required secret-masking read failed: \(gap)")
+            }
+            let rawValue = try MacAXAttributeRead.checkedRaw(element, kAXValueAttribute)
+            return MacAXAttributes(
+                role: role,
+                subrole: names.subrole,
+                title: names.identity,
+                // The same value rule as `attributes(of:)`.
+                value: role == "AXHeading" ? (rawValue as? String).flatMap { $0.isEmpty ? nil : $0 }
+                    : MacAXAttributeRead.valueState(rawValue, role: role) == nil ? rawValue.flatMap(Self.stringifiedValue) : nil,
+                enabled: MacAXAttributeRead.copyBool(element, kAXEnabledAttribute),
+                frame: names.frame,
+                actions: actions.names,
+                actionsUnreadable: actions.unreadable,
+                attributeGaps: gaps.values
+            )
+        }
     }
     public func children(of ref: MacAXElementRef) -> [MacAXElementRef] {
         guard let element = element(ref) else { return [] }
@@ -522,15 +610,31 @@ public final class SystemMacAXElementSource: MacAXElementSource, @unchecked Send
     }
     public func childCount(of ref: MacAXElementRef) -> Int? {
         guard let element = element(ref) else { return nil }
-        let attribute = MacAXAttributeRead.childAttribute(element)
+        let attribute: String
+        do { attribute = try MacAXAttributeRead.childAttribute(element) }
+        catch { MacAXAttributeRead.failed(error); return nil }
         guard MacAXAttributeRead.prepare(element) else { return nil }
         defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
         var count: CFIndex = 0
-        switch AXUIElementGetAttributeValueCount(element, attribute as CFString, &count) {
+        let status = AXUIElementGetAttributeValueCount(element, attribute as CFString, &count)
+        switch status {
         case .success: return max(0, Int(count))
         case .attributeUnsupported, .noValue: return 0
-        default: return nil
+        default:
+            MacAXAttributeRead.failed(MacAccessibilityReader.NativeReadFailure(detail: "Accessibility \(attribute) count read failed (AX error \(status.rawValue))."))
+            return nil
         }
+    }
+    public func checkedChildCount(of ref: MacAXElementRef) throws -> Int {
+        try MacAXAttributeRead.checked {
+            guard let count = childCount(of: ref) else {
+                throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility child count is unavailable.")
+            }
+            return count
+        }
+    }
+    public func checkedChildren(of ref: MacAXElementRef, limit: Int) throws -> [MacAXElementRef] {
+        try MacAXAttributeRead.checked { children(of: ref, limit: limit) }
     }
     public func children(of ref: MacAXElementRef, limit: Int) -> [MacAXElementRef] {
         guard limit > 0, let element = element(ref) else { return [] }

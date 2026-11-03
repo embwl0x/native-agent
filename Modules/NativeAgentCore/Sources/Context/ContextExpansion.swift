@@ -22,6 +22,7 @@ public enum ContextExpansionError: Error, Equatable, Sendable {
     case atomGenerationMismatch(ContextAtomID)
     case sourceGenerationMismatch(ContextSourceID)
     case sourceRemoved(ContextSourceID)
+    case sourceUnavailable(ContextSourceID)
     case atomNotExpandable(policy: ContextInjectionPolicy)
     case sourceInjectionDenied(ContextSourceID)
     case originDenied(ContextOriginClass)
@@ -80,7 +81,7 @@ public struct ContextExpander: Sendable {
     public init() {}
 
     /// - Parameter offeredSelectedItems: selected representations whose
-    ///   pointers this turn's packet offered. Empty admits only `.onDemand`.
+    ///   pointers this turn's packet offered. Empty offers no expansions.
     public func expand(
         _ pointer: ContextAtomPointer,
         for need: NeedSignal,
@@ -180,7 +181,7 @@ public struct ContextExpander: Sendable {
                 item.pointer == pointer
                     && item.isExpandable(thresholdChars: need.packetAtomExpandThresholdChars)
             }
-        guard atom.draft.injectionPolicy == .onDemand || omittedInPacket else {
+        guard omittedInPacket else {
             throw ContextExpansionError.atomNotExpandable(policy: atom.draft.injectionPolicy)
         }
 

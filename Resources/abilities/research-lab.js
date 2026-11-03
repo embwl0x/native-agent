@@ -1,5 +1,6 @@
 /* NativeAgent ability
-{"id":"research-lab","kind":"tool","version":1,
+{"id":"research-lab","kind":"ability","version":1,
+ "reach":{"apps":[],"capabilities":[],"hosts":[],"readPaths":[]},
  "face":{"page":"web"},
  "record":{"description":"Select sources and compose a Research Lab brief from the native SearXNG evidence packet. NativeAgent commits the run and its receipts; this part owns selection and wording.","actions":[],"inputSchema":{"type":"object","readOnly":true,"properties":{"objective":{"type":"string"},"maxResults":{"type":"integer"},"search":{"type":"object"}},"required":["objective","maxResults","search"],"additionalProperties":false}}}
 */

@@ -1,14 +1,14 @@
 import Foundation
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `XAIOAuthCredentialStore.swift` | Locked xAI token migration, immutable Keychain references, refresh reads and sign-out cleanup |
+// Blueprint: | `XAIOAuthCredentialStore.swift` | Locked xAI token storage, immutable Keychain references, refresh reads and sign-out cleanup |
 
 /// xAI credentials retain their locked metadata file; only immutable Keychain
-/// references are committed there. Legacy token bytes migrate before use.
+/// references are committed there. Token bytes are resolved only from the checked Keychain reference.
 enum XAIOAuthCredentialStore {
     static let referenceField = "oauth_tokens_keychain_ref"
     private static let service = "NativeAgent.xai-oauth"
-    private static let secretFields = ["access_token", "refresh_token", "id_token", "tokens"]
+    private static let secretFields = ["access_token", "refresh_token", "id_token"]
 
     static func read(at path: URL) throws -> [String: Any] {
         try CredentialFileLock.withLock(path) {
@@ -19,14 +19,18 @@ enum XAIOAuthCredentialStore {
 
     /// The caller validates and locks this metadata generation before resolving it.
     static func resolve(_ object: [String: Any], at path: URL) throws -> [String: Any] {
-        let object = secretFields.contains(where: { object[$0] != nil })
-            ? try write(object, to: path) : object
+        guard object["tokens"] == nil, !secretFields.contains(where: { object[$0] != nil }) else {
+            throw ProviderRoutingError.configurationFailed("Saved xAI credentials contain plaintext tokens. Save the account through Providers to repair its Keychain storage.")
+        }
         guard let reference = object[referenceField] as? String else { return object }
         guard UUID(uuidString: reference) != nil,
               let data = try DeviceSecretKeychain.read(service: service, account: reference) else {
             throw DeviceSecretKeychain.Failure.unavailable
         }
         let secrets = try ProviderStateValidation.credential(data: data)
+        guard secrets["tokens"] == nil else {
+            throw ProviderRoutingError.configurationFailed("Saved xAI credentials require a flat token set. Reconnect the account in Providers.")
+        }
         var resolved = object
         for key in secretFields { resolved[key] = secrets[key] }
         return resolved
@@ -35,9 +39,13 @@ enum XAIOAuthCredentialStore {
     @discardableResult
     static func write(_ object: [String: Any], to path: URL) throws -> [String: Any] {
         try CredentialFileLock.withLock(path) {
+            guard object["tokens"] == nil else {
+                throw ProviderRoutingError.configurationFailed("xAI credentials require a flat token set; no credential was saved.")
+            }
             try ProviderStateValidation.credential(object)
             let previous = try ProviderStateValidation.dataIfPresent(at: path)
-            let oldReference = previous.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?[referenceField] as? String
+            let oldMetadata = try previous.map { try ProviderStateValidation.credential(data: $0) }
+            let oldReference = oldMetadata?[referenceField] as? String
             let secrets = object.filter { secretFields.contains($0.key) }
             guard !secrets.isEmpty else { throw DeviceSecretKeychain.Failure.unavailable }
             let reference = UUID().uuidString
@@ -48,16 +56,31 @@ enum XAIOAuthCredentialStore {
             metadata[referenceField] = reference
             do {
                 let data = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path.resolvingSymlinksInPath())
                 guard try Data(contentsOf: path) == data else { throw DeviceSecretKeychain.Failure.unavailable }
-            } catch {
-                if let previous { try SwiftNativePersistenceCore.writeDataAtomicDurable(previous, to: path) }
-                else {
-                    if FileManager.default.fileExists(atPath: path.path) { try FileManager.default.removeItem(at: path) }
-                    try SwiftNativePersistenceCore.syncDirectory(path.deletingLastPathComponent())
+                guard try DeviceSecretKeychain.read(service: service, account: reference) == secretData else {
+                    throw DeviceSecretKeychain.Failure.unavailable
                 }
-                try? DeviceSecretKeychain.delete(service: service, account: reference)
-                throw error
+            } catch {
+                let persistenceFailure = error.localizedDescription
+                let state: String
+                do {
+                    if let current = try ProviderStateValidation.dataIfPresent(at: path) {
+                        let saved = try ProviderStateValidation.credential(data: current)
+                        if saved[referenceField] as? String == reference {
+                            state = "The new credential reference is on disk."
+                        } else if current == previous {
+                            state = "The preceding credential metadata is still on disk; its refresh grant may have been consumed."
+                        } else {
+                            state = "Different credential metadata is on disk."
+                        }
+                    } else { state = "The credential metadata is absent." }
+                } catch {
+                    throw ProviderRoutingError.configurationFailed("xAI credential save failed: \(persistenceFailure). Committed reference could not be read: \(error.localizedDescription). Keychain items were retained; repair the saved account in Providers.")
+                }
+                // Rotation may already be committed or may have consumed the
+                // preceding grant. Retain both items; never restore old authority.
+                throw ProviderRoutingError.configurationFailed("xAI credential save failed: \(persistenceFailure). \(state) Keychain items were retained; repair the saved account in Providers.")
             }
             if let oldReference, oldReference != reference {
                 do { try DeviceSecretKeychain.delete(service: service, account: oldReference) }

@@ -1,11 +1,12 @@
 import Foundation
+import CoreFoundation
 import Privacy
 import CryptoKit
 import Darwin
 import PersistenceCore
 import NativeAgentShared
 import TurnTrace
-// Blueprint: | `NativeOAuthFlow+Helpers.swift` | PKCE and OAuthGrantOperations.post, the redirect-refusing transport for all token grants; adapters retain sessions, encoding, 20/30-second request bounds and error classification; owned sessions and device polls have elapsed resource bounds. Device authorization polls at the server interval through expiry, denial or cancel |
+// Blueprint: | `NativeOAuthFlow+Helpers.swift` | PKCE and OAuthGrantOperations.post, the redirect-refusing transport for all token grants; one token-response validator for required access, optional refresh and optional positive expiry before persistence; initial native grants require refresh authority; adapters retain sessions, encoding, 20/30-second request bounds and error classification; owned sessions and device polls have elapsed resource bounds. Device authorization requires the server code lifetime and polls at its valid interval through expiry, denial or cancel |
 
 extension NativeOAuthFlow {
     public struct InlineSetupOutcome: Sendable {
@@ -119,6 +120,70 @@ public struct PKCE {
 
 public enum OAuthGrantOperations {
     public static let renewalMargin: TimeInterval = 120
+
+    /// Provider answers are admitted here, never by the saved-state reader.
+    /// Keep tokens opaque and diagnostics fixed: no response values are echoed.
+    public struct TokenResponse {
+        public let fields: [String: Any]
+        public let accessToken: String
+        public let refreshToken: String?
+        public let expiresIn: TimeInterval?
+    }
+
+    public static func malformedTokenResponse() -> ProviderFailure.Diagnostic {
+        ProviderFailure.Diagnostic(cause: .malformedResponse,
+            detail: "OAuth token endpoint returned malformed credential data; no saved credential was changed. Try again.")
+    }
+
+    public static func validateTokenResponse(_ data: Data, requiringRefreshToken: Bool) throws -> TokenResponse {
+        let fields: [String: Any]
+        do {
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw malformedTokenResponse()
+            }
+            fields = object
+        } catch { throw malformedTokenResponse() }
+        return try validateTokenResponse(fields, requiringRefreshToken: requiringRefreshToken)
+    }
+
+    public static func validateTokenResponse(_ fields: [String: Any], requiringRefreshToken: Bool) throws -> TokenResponse {
+        do {
+            let invalidCharacters = CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+            func token(_ raw: Any?) throws -> String {
+                guard let value = raw as? String, !value.isEmpty,
+                      value.rangeOfCharacter(from: invalidCharacters) == nil else {
+                    throw malformedTokenResponse()
+                }
+                return value
+            }
+            let access = try token(fields["access_token"])
+            // Optional JSON null carries no value, just like omission. Network
+            // metadata is not a saved credential and has no saved-file schema.
+            func supplied(_ key: String) -> Any? {
+                guard let value = fields[key], !(value is NSNull) else { return nil }
+                return value
+            }
+            let refresh = try supplied("refresh_token").map { try token($0) }
+            guard !requiringRefreshToken || refresh != nil else {
+                throw malformedTokenResponse()
+            }
+            let lifetime = try supplied("expires_in").map { raw -> TimeInterval in
+                let seconds: TimeInterval?
+                if let string = raw as? String {
+                    seconds = TimeInterval(string)
+                } else if let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
+                    seconds = number.doubleValue
+                } else {
+                    throw malformedTokenResponse()
+                }
+                guard let seconds, seconds.isFinite, seconds > 0 else {
+                    throw malformedTokenResponse()
+                }
+                return seconds
+            }
+            return TokenResponse(fields: fields, accessToken: access, refreshToken: refresh, expiresIn: lifetime)
+        } catch { throw malformedTokenResponse() }
+    }
     public static func base64URLEncode(_ data: Data) -> String {
         data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
@@ -142,8 +207,7 @@ public enum OAuthGrantOperations {
                 userInfo: [NSLocalizedDescriptionKey: "The token endpoint answered HTTP \(status)."])
         }
         guard let answer else {
-            throw NSError(domain: "NativeOAuthFlow", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Token endpoint returned non-JSON."])
+            throw malformedTokenResponse()
         }
         return answer
     }
@@ -249,9 +313,17 @@ public enum OAuthGrantOperations {
         let link = { (key: String) in (answer?[key] as? String).flatMap(URL.init(string:)).flatMap { $0.scheme == "https" ? $0 : nil } }
         guard let answer, let deviceCode = answer["device_code"] as? String, let userCode = answer["user_code"] as? String,
               let uri = link("verification_uri") ?? link("verification_url") else { throw DeviceSignInFailure.refused("its answer was incomplete") }
+        let lifetime = try deviceCodeLifetime(answer)
+        let interval: TimeInterval
+        if let raw = answer["interval"] {
+            guard let supplied = seconds(raw), supplied > 0 else {
+                throw DeviceSignInFailure.refused("its polling interval was invalid")
+            }
+            interval = supplied
+        } else { interval = 5 } // RFC 8628's omitted-interval default.
         return DeviceCode(deviceCode: deviceCode, userCode: userCode, verificationURI: uri,
                           verificationURIComplete: link("verification_uri_complete"),
-                          expiresAt: Date().addingTimeInterval(seconds(answer["expires_in"]) ?? 900), interval: seconds(answer["interval"]) ?? 5)
+                          expiresAt: Date().addingTimeInterval(lifetime), interval: interval)
     }
 
     /// Asks the token endpoint at the server's interval (5 seconds more at
@@ -275,9 +347,16 @@ public enum OAuthGrantOperations {
             guard Date() < code.expiresAt else { throw DeviceSignInFailure.expired }
             guard reply.status < 500, let answer = reply.answer else { continue }
             switch answer["error"] as? String {
-            case nil where reply.status < 400: return answer
+            case nil where reply.status < 400:
+                return answer
             case "authorization_pending"?: continue
-            case "slow_down"?: interval = max(seconds(answer["interval"]) ?? 0, interval + 5)
+            case "slow_down"?:
+                if let raw = answer["interval"] {
+                    guard let supplied = seconds(raw), supplied > 0 else {
+                        throw DeviceSignInFailure.refused("its polling interval was invalid")
+                    }
+                    interval = max(supplied, interval + 5)
+                } else { interval += 5 }
             default: throw DeviceSignInFailure(answer, status: reply.status)
             }
         }
@@ -285,10 +364,29 @@ public enum OAuthGrantOperations {
     }
 
     /// A number of seconds an answer gives as a number or a string, within
-    /// what a date and a sleep hold (0 to about 68 years); any other reads as not given.
+    /// what a date and a sleep hold (0 to about 68 years); invalid input is nil.
     public static func seconds(_ raw: Any?) -> TimeInterval? {
-        ((raw as? NSNumber)?.doubleValue ?? (raw as? String).flatMap(TimeInterval.init))
-            .flatMap { (0...Double(Int32.max)).contains($0) ? $0 : nil }
+        if let number = raw as? NSNumber {
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            let seconds = number.doubleValue
+            return seconds.isFinite && (0...Double(Int32.max)).contains(seconds) ? seconds : nil
+        }
+        guard let string = raw as? String, let seconds = TimeInterval(string),
+              seconds.isFinite, (0...Double(Int32.max)).contains(seconds) else { return nil }
+        return seconds
+    }
+
+    /// Device codes must expire to bound their polling; token expiry is optional.
+    private static func deviceCodeLifetime(_ response: [String: Any]) throws -> TimeInterval {
+        guard let raw = response["expires_in"] else {
+            throw NSError(domain: "NativeOAuthFlow", code: -22,
+                userInfo: [NSLocalizedDescriptionKey: "OAuth response is missing required expires_in; no credential was saved."])
+        }
+        guard let value = seconds(raw), value > 0 else {
+            throw NSError(domain: "NativeOAuthFlow", code: -22,
+                userInfo: [NSLocalizedDescriptionKey: "OAuth response has invalid expires_in; no credential was saved."])
+        }
+        return value
     }
 
     public static func formEncode(_ params: [String: String]) -> String {
@@ -333,7 +431,7 @@ public enum OAuthGrantOperations {
         let data = try JSONSerialization.data(withJSONObject: obj,
             options: [.prettyPrinted, .sortedKeys])
         try CredentialFileLock.withLock(url) {
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url.resolvingSymlinksInPath())
         }
     }
 

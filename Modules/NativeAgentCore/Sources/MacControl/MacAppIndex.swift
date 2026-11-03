@@ -1,9 +1,10 @@
 import Foundation
+import AppKit
 import CoreServices
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `MacAppIndex.swift` | One in-process live Spotlight metadata query over local volumes; rows excluding bundles inside packages materialize only on gathering/update edges on its owning queue; cancellation removes async initial-gather waiters; startup failure retires query/tokens and completes gathering once; terminal `shutdown()` closes admission, stops query/tokens and finishes streams on that queue (engine caller integration remains required); sync/async reads and exact lookup share kept rows; newest-only edges emit when bundle id/version/path changes; actionable index failures propagate; `mac.apps` names its Spotlight source; Launch Services remains the launch fallback after an index miss |
+// Blueprint: | `MacAppIndex.swift` | One resident Spotlight query materializes app rows and named directory gaps in one snapshot on gather/update edges; ancestor read failures never override an app's own classification; synchronous reads consume only the kept snapshot or report not ready, async gathering has a cancellable four-second ceiling capped by the inherited deadline without stopping the query; unavailable install facts retain per-row causes; classification/gap changes emit edges; the engine termination drain calls shutdown after consumers settle |
 
 /// The Mac's app index, kept live by Spotlight. No app is opened or activated.
 public final class MacAppIndex: @unchecked Sendable {
@@ -15,17 +16,31 @@ public final class MacAppIndex: @unchecked Sendable {
         public let name: String
         public let bundleID: String?
         public let version: String
-        /// "mac" or "ios" (a simulator or device build the Mac also indexes), from the bundle's own platforms.
+        /// "mac" or "ios", from the bundle's own platforms (no declaration is a Mac app).
         public let platform: String
-        /// "installed": the copy Launch Services opens for this bundle id; "copy": another copy of it (a build, a backup).
+        /// "installed", "copy", or "unavailable" when installation evidence is missing.
         public let kind: String
-        public var scriptable: Bool { info?["OSAScriptingDefinition"] is String }
+        public let classificationFailures: [String]
+        /// A known copy or iOS build is already outside the Mac installed
+        /// projection; its missing sibling facts cannot block another app.
+        public var installationUncertain: Bool {
+            kind != "copy" && platform != "ios" && kind == "unavailable"
+        }
+        public var scriptable: Bool? { info.map { $0["OSAScriptingDefinition"] is String } }
         public var json: JSONValue { .object([
             "name": .string(name), "file_name": .string(url.deletingPathExtension().lastPathComponent),
             "bundle_id": bundleID.map(JSONValue.string) ?? .null,
-            "path": .string(url.path), "version": .string(version), "scriptable": .bool(scriptable),
+            "path": .string(url.path), "version": .string(version), "scriptable": scriptable.map(JSONValue.bool) ?? .null,
             "platform": .string(platform), "kind": .string(kind),
+            "classification_failures": .array(classificationFailures.map(JSONValue.string)),
         ]) }
+    }
+
+    /// One materialization: directory evidence belongs to the directory,
+    /// rather than making every readable app below it unavailable.
+    public struct Inventory: Sendable {
+        public let apps: [App]
+        public let directoryGaps: [String]
     }
 
     /// Rows that share a shown name: launch by bundle id or file name, never by that name alone.
@@ -52,21 +67,20 @@ public final class MacAppIndex: @unchecked Sendable {
     public static func installed(_ apps: [App]) -> [App] { apps.filter { $0.kind == "installed" && $0.platform == "mac" } }
 
     private let queue = DispatchQueue(label: "NativeAgent.MacAppIndex", qos: .utility)
-    private let gathered = DispatchGroup()
     private var query: MDQuery!
     private var failure: Error?
     private var rows: [App] = []
+    private var directoryGaps: [String] = []
     /// The last materialized rows, readable without the indexing queue.
     private let snapshotLock = NSLock()
-    private var snapshot: [App]?
+    private var snapshot: Result<Inventory, Error>?
     private var observers: [NSObjectProtocol] = []
     private var listeners: [UUID: AsyncStream<Void>.Continuation] = [:]
     private var gathering = true
     private var stopped = false
-    private var gatherWaiters: [UUID: AsyncThrowingStream<Void, Error>.Continuation] = [:]
+    private var gatherWaiters: [UUID: ContinuationOnce<Result<Void, Error>>] = [:]
 
     private init() {
-        gathered.enter()
         queue.async { [self] in
             query = MDQueryCreate(nil, "kMDItemContentTypeTree == 'com.apple.application-bundle'" as CFString, nil, nil)
             guard let query else { return failedToStart() }
@@ -85,7 +99,9 @@ public final class MacAppIndex: @unchecked Sendable {
     }
 
     private func failedToStart() {
-        failure = MacControlError.ioFailure("The Mac's app index could not start. Check Spotlight indexing in System Settings → Spotlight, then try again.")
+        let cause = MacControlError.ioFailure("The Mac's app index could not start. Check Spotlight indexing in System Settings → Spotlight, then try again.")
+        failure = cause
+        snapshotLock.withLock { snapshot = .failure(cause) }
         stopQuery()
         finishGather()
     }
@@ -93,24 +109,42 @@ public final class MacAppIndex: @unchecked Sendable {
     private func finishGather() {
         guard gathering else { return }
         gathering = false
-        gathered.leave()
+        if failure == nil { snapshotLock.withLock { snapshot = .success(Inventory(apps: rows, directoryGaps: directoryGaps)) } }
         let pending = Array(gatherWaiters.values)
         gatherWaiters.removeAll()
-        for waiter in pending { waiter.finish(throwing: failure) }
+        for waiter in pending {
+            if let failure { waiter.resume(.failure(failure)) }
+            else { waiter.resume(.success(())) }
+        }
     }
 
-    private func initialGather() async throws {
+    private func initialGather(bounded: Bool = true) async throws {
         try Task.checkCancellation()
-        let id = UUID()
-        let (stream, continuation) = AsyncThrowingStream<Void, Error>.makeStream()
-        continuation.onTermination = { [self] _ in queue.async { self.gatherWaiters[id] = nil } }
-        // Enqueue registration before entering the cancellable stream wait, so
-        // its termination removal cannot overtake insertion.
-        queue.async { [self] in
-            if gathering { gatherWaiters[id] = continuation }
-            else { continuation.finish(throwing: failure) }
+        if let snapshot = snapshotLock.withLock({ self.snapshot }) {
+            _ = try snapshot.get()
+            return
         }
-        for try await _ in stream {}
+        let id = UUID()
+        let answer = ContinuationOnce<Result<Void, Error>>()
+        queue.async { [self] in
+            guard answer.isPending else { return }
+            if gathering { gatherWaiters[id] = answer }
+            else if let failure { answer.resume(.failure(failure)) }
+            else { answer.resume(.success(())) }
+        }
+        defer { queue.async { self.gatherWaiters[id] = nil } }
+        let ceiling = ContinuousClock.now.advanced(by: .seconds(4))
+        // A resident observer lives until an edge or shutdown/Stop. Requests
+        // instead have a finite cold-gather wait even without a tool deadline.
+        let deadline: ContinuousClock.Instant? = bounded ? TaskWaitDeadline.current.map { min($0, ceiling) } ?? ceiling : TaskWaitDeadline.current
+        let pending = MacControlError.ioFailure("app_index_not_ready: The request's wait ended before Spotlight finished gathering. The live query remains active; no installed-app verdict is available yet.")
+        try await TaskWaitDeadline.$current.withValue(deadline) {
+            guard !TaskWaitDeadline.expired else { throw pending }
+            try await answer.wait(cancellingWith: .failure(TaskWaitDeadline.expired ? pending : TaskWaitDeadline.cancellationError), onCancel: { [self] in
+                queue.async { self.gatherWaiters[id] = nil }
+            }).get()
+            guard !TaskWaitDeadline.expired else { throw pending }
+        }
         try Task.checkCancellation()
     }
 
@@ -127,13 +161,16 @@ public final class MacAppIndex: @unchecked Sendable {
         await withCheckedContinuation { done in
             queue.async { [self] in
                 stopped = true
-                failure = failure ?? CancellationError()
+                let cause = failure ?? CancellationError()
+                failure = cause
                 stopQuery()
                 finishGather()
                 listeners.values.forEach { $0.finish() }
                 listeners.removeAll()
                 rows.removeAll()
-                snapshotLock.withLock { snapshot = nil }
+                directoryGaps.removeAll()
+                snapshotLock.withLock { snapshot = .failure(cause) }
+                nativeLog("MacAppIndex: shutdown complete; query and listeners retired")
                 done.resume()
             }
         }
@@ -141,7 +178,7 @@ public final class MacAppIndex: @unchecked Sendable {
 
     /// Initial gathering and subsequent updates use this same query.
     public func changes() async throws -> AsyncStream<Void> {
-        try await initialGather()
+        try await initialGather(bounded: false)
         let id = UUID()
         let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         continuation.onTermination = { [self] _ in queue.async { self.listeners[id] = nil } }
@@ -168,27 +205,35 @@ public final class MacAppIndex: @unchecked Sendable {
     }
 
     public func apps() async throws -> [App] {
+        try await inventory().apps
+    }
+
+    public func inventory() async throws -> Inventory {
         try await initialGather()
-        let answer: [App] = try await withCheckedThrowingContinuation { result in
-            queue.async { [self] in
-                if let failure { result.resume(throwing: failure) }
-                else { result.resume(returning: rows) }
-            }
-        }
         try Task.checkCancellation()
-        return answer
+        return try checkedSnapshot()
     }
 
     /// The kept rows if the first gather has finished, else nil: a lookup on a hot
     /// path never waits for Spotlight.
-    public func readyApps() -> [App]? { snapshotLock.withLock { snapshot } }
+    public func readyApps() -> [App]? {
+        snapshotLock.withLock {
+            if case .success(let inventory)? = snapshot { return inventory.apps }
+            return nil
+        }
+    }
 
-    /// Existing synchronous system adapters read the kept rows on their owning queue.
+    /// A synchronous request never waits for a cold query or its materialization queue.
     public func apps() throws -> [App] {
-        gathered.wait()
-        return try queue.sync {
-            if let failure { throw failure }
-            return rows
+        try checkedSnapshot().apps
+    }
+
+    private func checkedSnapshot() throws -> Inventory {
+        try snapshotLock.withLock {
+            guard let snapshot else {
+                throw MacControlError.ioFailure("app_index_not_ready: Spotlight has not finished gathering apps; no installed-app verdict is available. Try again after gathering completes.")
+            }
+            return try snapshot.get()
         }
     }
 
@@ -198,16 +243,26 @@ public final class MacAppIndex: @unchecked Sendable {
         let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
         // Facts last one materialization; home stops source inheritance, not package exclusion.
         var directories: [URL: (excluded: Bool, workingTree: Bool)] = [:]
+        var gaps: [String] = []
         func classify(_ parent: URL) -> (excluded: Bool, workingTree: Bool) {
             guard parent.path != "/" else { return (false, false) }
             if let facts = directories[parent] { return facts }
             let above = classify(parent.deletingLastPathComponent())
-            let excluded = above.excluded || parent.lastPathComponent == "Library" || !parent.pathExtension.isEmpty
-                || (try? parent.resourceValues(forKeys: [.isPackageKey]))?.isPackage == true
-            let workingTree = !excluded && parent.standardizedFileURL.path != home && (above.workingTree
+            var excluded = above.excluded || parent.lastPathComponent == "Library" || !parent.pathExtension.isEmpty
+            if !excluded {
+                do {
+                    let values = try parent.resourceValues(forKeys: [.isPackageKey])
+                    if let package = values.isPackage { excluded = package }
+                    else { gaps.append("\(parent.path): package classification unavailable") }
+                } catch { gaps.append("\(parent.path): \(error.localizedDescription)") }
+            }
+            var workingTree = !excluded && parent.standardizedFileURL.path != home && (above.workingTree
                 || FileManager.default.fileExists(atPath: parent.appendingPathComponent(".git").path)
-                || FileManager.default.fileExists(atPath: parent.appendingPathComponent("Package.swift").path)
-                || ((try? FileManager.default.contentsOfDirectory(atPath: parent.path))?.contains { $0.hasSuffix(".xcodeproj") } ?? false))
+                || FileManager.default.fileExists(atPath: parent.appendingPathComponent("Package.swift").path))
+            if !excluded, !workingTree, parent.standardizedFileURL.path != home {
+                do { workingTree = try FileManager.default.contentsOfDirectory(atPath: parent.path).contains { $0.hasSuffix(".xcodeproj") } }
+                catch { gaps.append("\(parent.path): working-tree classification unavailable: \(error.localizedDescription)") }
+            }
             let facts = (excluded, workingTree)
             directories[parent] = facts
             return facts
@@ -216,18 +271,28 @@ public final class MacAppIndex: @unchecked Sendable {
             let item = Unmanaged<MDItem>.fromOpaque(MDQueryGetResultAtIndex(query, index)).takeUnretainedValue()
             guard let path = MDItemCopyAttribute(item, kMDItemPath) as? String else { return nil }
             let url = URL(fileURLWithPath: path)
-            // An app the person could open from the Apps screen: a real .app with a
-            // bundle id, not a helper inside another bundle (an .app, a .framework,
+            // A real .app, not a helper inside another bundle (an .app, a .framework,
             // a .service, an .xpc…), not a copy under a Library folder (an installer's
             // staging area, a tool's own versions, a cache).
             guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame else { return nil }
             let ancestors = classify(url.deletingLastPathComponent())
             guard !ancestors.excluded else { return nil }
+            var failures: [String] = []
             let info = CFBundleCopyInfoDictionaryInDirectory(url as CFURL) as NSDictionary?
-            guard let bundleID = info?["CFBundleIdentifier"] as? String ?? MDItemCopyAttribute(item, kMDItemCFBundleIdentifier) as? String,
-                  !bundleID.isEmpty else { return nil }
-            let platforms = (info?["CFBundleSupportedPlatforms"] as? [String] ?? [info?["DTPlatformName"] as? String ?? "MacOSX"]).map { $0.lowercased() }
-            let platform = platforms.contains(where: { $0.hasPrefix("iphone") || $0.hasPrefix("ipad") || $0.hasPrefix("ios") }) && !platforms.contains("macosx") ? "ios" : "mac"
+            if info == nil { failures.append("\(path): bundle information dictionary unavailable") }
+            let identifier = info?["CFBundleIdentifier"] as? String ?? MDItemCopyAttribute(item, kMDItemCFBundleIdentifier) as? String
+            let bundleID = identifier.flatMap { $0.isEmpty ? nil : $0 }
+            if bundleID == nil { failures.append("\(path): bundle identifier unavailable in bundle and Spotlight metadata") }
+            let platforms: [String]
+            if let supported = info?["CFBundleSupportedPlatforms"] as? [String], !supported.isEmpty {
+                platforms = supported.map { $0.lowercased() }
+            } else if let builtFor = info?["DTPlatformName"] as? String, !builtFor.isEmpty {
+                platforms = [builtFor.lowercased()]
+            } else { platforms = [] }
+            // A bundle is a Mac app unless it declares only an iPhone/iPad platform: macOS
+            // launches an app that names no platform as a Mac app (Chrome declares none).
+            let platform = !platforms.contains("macosx")
+                && platforms.contains(where: { $0.hasPrefix("iphone") || $0.hasPrefix("ipad") || $0.hasPrefix("ios") }) ? "ios" : "mac"
             // Build output is a copy whatever its bundle id: the folders build tools write
             // into, and anything built inside a working tree (a .git, a Package.swift, an
             // .xcodeproj above it). The Desktop and ~/Applications are not working trees.
@@ -235,20 +300,35 @@ public final class MacAppIndex: @unchecked Sendable {
             // Installed: every bundle in the Mac's own app folders (what the Apps screen shows,
             // a beta beside its release included), and elsewhere the one copy Launch Services
             // opens for that bundle id. Build output is never installed.
-            let preferred = LSCopyApplicationURLsForBundleIdentifier(bundleID as CFString, nil)?.takeRetainedValue() as? [URL]
             let inAppFolder = Self.appFolders.contains { NativeAgentWorkspaceRoot.relativePath(url.standardizedFileURL.path, under: $0)?.isEmpty == false }
-            let kind = !buildOutput && (inAppFolder || (preferred?.first.map { $0.standardizedFileURL.path == url.standardizedFileURL.path } ?? true)) ? "installed" : "copy"
+            let kind: String
+            if let bundleID, failures.isEmpty {
+                if buildOutput { kind = "copy" }
+                else if inAppFolder { kind = "installed" }
+                else if let preferred = NSWorkspace.shared.urlsForApplications(withBundleIdentifier: bundleID).first {
+                    kind = preferred.standardizedFileURL.path == url.standardizedFileURL.path ? "installed" : "copy"
+                } else {
+                    kind = "unavailable"
+                    failures.append("\(path): Launch Services returned no preferred application for \(bundleID) outside the app folders")
+                }
+            } else {
+                kind = "unavailable"
+            }
             return App(url: url, info: info,
                 // The name the Apps screen and Finder show: the Mac's own localized display name ("Find My").
                 name: Self.shownName(url),
                 bundleID: bundleID,
                 version: info?["CFBundleShortVersionString"] as? String ?? info?["CFBundleVersion"] as? String ?? MDItemCopyAttribute(item, kMDItemVersion) as? String ?? "",
-                platform: platform, kind: kind)
+                platform: platform, kind: kind, classificationFailures: failures)
         }.sorted { ($0.name.localizedLowercase, $0.url.path) < ($1.name.localizedLowercase, $1.url.path) }
-        let changed = Set(next.map { [$0.bundleID ?? "", $0.version, $0.url.path] })
-            != Set(rows.map { [$0.bundleID ?? "", $0.version, $0.url.path] })
+        func identity(_ app: App) -> [String] {
+            [app.bundleID ?? "", app.version, app.url.path, app.name, app.platform, app.kind] + app.classificationFailures
+        }
+        let nextGaps = gaps.sorted()
+        let changed = Set(next.map(identity)) != Set(rows.map(identity)) || nextGaps != directoryGaps
         rows = next
-        snapshotLock.withLock { snapshot = next }
+        directoryGaps = nextGaps
+        if !gathering { snapshotLock.withLock { snapshot = .success(Inventory(apps: next, directoryGaps: nextGaps)) } }
         nativeLog("MacAppIndex: materialized %ld rows (%ld plist reads), changed=%@", rows.count, rows.count, changed ? "true" : "false")
         return changed
     }

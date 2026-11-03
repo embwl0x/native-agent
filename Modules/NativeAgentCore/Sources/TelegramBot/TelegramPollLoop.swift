@@ -14,7 +14,7 @@ import ChatTurnRuntime
 import ChatTurnContracts
 import Experiences
 
-// Blueprint: | `TelegramPollLoop.swift` | `TelegramPollLoop`: authenticated update intake; tracked media preparation retains unstarted updates on shutdown and settles explicit Stop; saved reply recovery and checkpoint settlement |
+// Blueprint: | `TelegramPollLoop.swift` | `TelegramPollLoop`: authenticated update intake; tracked media preparation retains unstarted updates on shutdown and settles explicit Stop; saved reply recovery and successors retain notification policy and checkpoint settlement |
 
 // MARK: - TelegramPollLoop
 
@@ -89,7 +89,6 @@ public struct TelegramPollLoop: LoopRunner {
         }
     }
     let offsetURL: URL
-    let legacyOffsetURL: URL
     var botIdentity: String { String(token.prefix { $0 != ":" }) }
     let answerCallbackQuery: @Sendable (_ token: String, _ callbackId: String, _ text: String) async throws -> Void
     let syncCommandMenu: TelegramCommandMenuSync?
@@ -150,7 +149,6 @@ public struct TelegramPollLoop: LoopRunner {
         let resolvedDataRoot = dataRoot ?? Self.inferDataRoot(from: offsetURL)
         self.dataRoot = resolvedDataRoot
         self.partFace = partFace
-        self.legacyOffsetURL = offsetURL
         self.offsetURL = offsetURL.deletingLastPathComponent()
             .appendingPathComponent("bots", isDirectory: true)
             .appendingPathComponent(Self.botStorageIdentity(token), isDirectory: true)
@@ -188,15 +186,7 @@ public struct TelegramPollLoop: LoopRunner {
             do { _ = try await recoverReply(claim) }
             catch { _ = await quarantineRecovery(claim, error: error) }
         }
-        for approval in try await approvalInbox.list(filter: .resolved) {
-            guard case .object(let state)? = approval.chatContinuation, state["done"] != .bool(true),
-                  state["assistantDelivery"] != nil, let queued = state["delivery"] else { continue }
-            let continuation = try JSONDecoder().decode(TelegramPendingApprovalContinuation.self, from: queued.serializedData(pretty: false))
-            guard Self.inboundAuthorizationDecision(allowedChatIds: allowedChatIds, allowedUserIds: allowedUserIds,
-                chatId: continuation.chatId, fromUserId: continuation.fromUserId) == .allowed else { continue }
-            guard !(await turnCoordinator.snapshot(destination: continuation.destination).isRunning) else { continue }
-            _ = try await recoverApprovalAnswer(approvalId: approval.id, destination: continuation.destination)
-        }
+
     }
 
     private func quarantineRecovery(_ claim: TelegramUpdateClaim, error: Error) async -> TelegramUpdateClaim? {
@@ -244,13 +234,13 @@ public struct TelegramPollLoop: LoopRunner {
             try await inbox.withAssistantDeliveryLock(updateId: claim.updateId) {
                 try await inbox.prepareSuccessor(updateId: claim.updateId, runId: runId, sessionId: sessionId,
                     delivery: TelegramAssistantDeliveryState(reply: TelegramRichMessageRenderer.sanitize(
-                        TelegramRichMessageRenderer.stripBoldMarkers(reply)), imagePaths: imagePaths))
+                        TelegramRichMessageRenderer.stripBoldMarkers(reply)), imagePaths: imagePaths, silent: prior.silent ?? silent))
             }
         } else if claim.assistantDelivery == nil {
             try await inbox.withAssistantDeliveryLock(updateId: claim.updateId) {
                 _ = try await inbox.recordAssistantDelivery(updateId: claim.updateId,
                     delivery: TelegramAssistantDeliveryState(reply: TelegramRichMessageRenderer.sanitize(
-                        TelegramRichMessageRenderer.stripBoldMarkers(reply)), imagePaths: imagePaths), recovering: true)
+                        TelegramRichMessageRenderer.stripBoldMarkers(reply)), imagePaths: imagePaths, silent: silent), recovering: true)
             }
         }
         return try await recoverReply(claim)
@@ -305,9 +295,10 @@ public struct TelegramPollLoop: LoopRunner {
             }
         }
         let failedBeforeAnswer = try inbox.claim(updateId: claim.updateId).failedBeforeAnswer
+        let failedNoticeDelivered = failedBeforeAnswer && phase == .completed
         _ = try await inbox.transition(updateId: claim.updateId,
-            from: [.processing, .outcomeUnknown, .completed, .sentUnconfirmed], to: failedBeforeAnswer ? .failedBeforeAnswer : phase)
-        let verdict = failedBeforeAnswer ? "failed_before_answer" : phase == .completed ? "completed" : "sent_unconfirmed"
+            from: [.processing, .outcomeUnknown, .completed, .sentUnconfirmed], to: failedNoticeDelivered ? .failedBeforeAnswer : phase)
+        let verdict = failedNoticeDelivered ? "failed_before_answer" : phase == .completed ? "completed" : "sent_unconfirmed"
         if let session = claim.assistantSessionId, let run = claim.assistantRunId {
             try await settleReplyCheckpoint(sessionId: session, runId: run, verdict: verdict)
         }
@@ -350,7 +341,6 @@ public struct TelegramPollLoop: LoopRunner {
             await recordError(context: "bot_ingress_storage", error: String(describing: error))
             return .failed(error: "Telegram bot ingress storage unavailable")
         }
-        await recoverApprovalRepliesIfNeeded()
         let cursor = TelegramOffsetCursor(fileURL: offsetURL)
         var offset: Int
         do {
@@ -816,11 +806,9 @@ public struct TelegramPollLoop: LoopRunner {
             }
             let turnBody: @Sendable (UUID) async -> Void = { turnId in
                 if let queuedMessageId = claim.queueAcknowledgementMessageId {
-                    let preview = String(text.replacingOccurrences(of: "\n", with: " ").prefix(120))
                     await clearQueueAcknowledgement(
                         chatId: msg.chatId,
-                        messageId: queuedMessageId,
-                        runningText: "Running now · \(preview)"
+                        messageId: queuedMessageId
                     )
                 }
                 let preparedText = await runTurn(turnId: turnId, update: update, message: msg,
@@ -938,8 +926,7 @@ public struct TelegramPollLoop: LoopRunner {
                         }
                         await turnCoordinator.endUpdateProcessing(update.updateId)
                         if let acknowledgement = removed.acknowledgementMessageId {
-                            await clearQueueAcknowledgement(chatId: msg.chatId, messageId: acknowledgement,
-                                                            runningText: "Read in the reply in progress · \(preview)")
+                            await clearQueueAcknowledgement(chatId: msg.chatId, messageId: acknowledgement)
                         }
                         signalArrival(offer.receivingTurnID ?? queuedTurnId.uuidString, text)
                         return true

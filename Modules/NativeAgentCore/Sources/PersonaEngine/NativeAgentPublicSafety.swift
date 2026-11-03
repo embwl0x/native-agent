@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `NativeAgentPublicSafety.swift` | `NativeAgentPublicSafety`: checked onboarding completion/legacy anchors and neutral organism admission before resident cognition wakes |
+// Blueprint: | `NativeAgentPublicSafety.swift` | `NativeAgentPublicSafety`: canonical onboarding completion and neutral organism admission before resident cognition wakes |
 
 public enum NativeAgentPublicSafety {
     public static let publicSafeModeEnvironmentKey = "NATIVEAGENT_PUBLIC_SAFE_MODE"
@@ -40,38 +40,7 @@ public enum NativeAgentPublicSafety {
             return true
         }
 
-        // Legacy public installs may predate the sentinel. Accept them only as
-        // a complete bundle: a valid named profile plus every required persona
-        // document inside this exact data root. This is a compatibility read,
-        // not a second onboarding owner or a write-side migration.
-        let profileURL = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("profile.json")
-        return hasLegacyCompletionAnchor(
-            personaRoot: PersonaRootResolver.resolveIsolated(dataRoot: dataRoot),
-            profileURL: profileURL
-        )
-    }
-
-    /// Missing profiles may be repaired only when the legacy documents are complete.
-    public static func hasLegacyCompletionAnchor(
-        personaRoot: URL, profileURL: URL, allowMissingProfile: Bool = false
-    ) -> Bool {
-        let fm = FileManager.default
-        guard ["SOUL.md", "VOICE.md", "USER.md", "GROWTH.md"].allSatisfy({ fileName in
-            let url = personaRoot.appendingPathComponent(fileName)
-            guard let attributes = try? fm.attributesOfItem(atPath: url.path),
-                  let size = attributes[.size] as? NSNumber else { return false }
-            return size.intValue > 0
-        }) else { return false }
-        if allowMissingProfile, !fm.fileExists(atPath: profileURL.path) { return true }
-        guard let profileData = try? Data(contentsOf: profileURL),
-              let profile = try? JSONSerialization.jsonObject(with: profileData) as? [String: Any],
-              let name = profile["name"] as? String,
-              !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return false
-        }
-        return true
+        return false
     }
 
     public static func shouldForceNeutralOrganism(

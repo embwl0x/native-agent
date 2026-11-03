@@ -6,7 +6,7 @@ import TrustCenter
 import CryptoKit
 import GRDB
 import PersonaEngine
-// Blueprint: | `ContextPreparation+SourceReconciliation.swift` | Source compilation and immutable generation publication through the actor's single admission gate; durable baselines, degradation, arena rehydration and bounded store maintenance |
+// Blueprint: | `ContextPreparation+SourceReconciliation.swift` | Source compilation and generation publication through one admission gate; committed source-read faults retain source identity before a first row and reach health and turn selection; checked reads recover degradation |
 
 extension ContextPreparation {
     struct PendingRegistration: Sendable {
@@ -28,6 +28,7 @@ extension ContextPreparation {
         let removedSourceIDs: Set<ContextSourceID>
         let successfulSources: [ContextSourceID: ContextCompiledSource]
         let compileFailures: [ContextSourceID: String]
+        let projectionReadResults: [String: [ContextSourceID: String]]
     }
 
     public func sourceDidChange(_ changes: [DerivedSourceChange]) async {
@@ -130,9 +131,13 @@ extension ContextPreparation {
         guard isCurrent(lifecycleID) else { return }
         var affected: [ContextSourceRegistration] = []
         for directory in dirtyDirectories.sorted(by: { $0.path < $1.path }) {
-            if let rows = try? await registry.registrations(affectedBy: directory) {
+            do {
+                let rows = try await registry.registrations(affectedBy: directory)
                 guard isCurrent(lifecycleID) else { return }
                 affected.append(contentsOf: rows)
+            } catch {
+                recordReconciliationFailure(error)
+                return
             }
         }
         guard isCurrent(lifecycleID) else { return }
@@ -185,15 +190,8 @@ extension ContextPreparation {
     private func reconcilePending(requestID: UInt64) async -> Bool {
         // The newest request compiles all accumulated pending demand.
         while compileInProgress, !reconciliationClosed, !Task.isCancelled {
-            let id = UUID()
-            await withTaskCancellationHandler {
-                await withCheckedContinuation { continuation in
-                    guard !Task.isCancelled else { continuation.resume(); return }
-                    compileWaiters[id] = continuation
-                }
-            } onCancel: {
-                Task { await self.cancelCompileWaiter(id) }
-            }
+            let done = compileDone
+            await done.park()
         }
         guard !reconciliationClosed, requestID == nextReconciliationRequestID, !Task.isCancelled else { return false }
         // A push's compiler may already have answered this flight's demand.
@@ -281,15 +279,11 @@ extension ContextPreparation {
                 // A retry may still carry this now-retired registration.
                 continue
             }
-            guard FileManager.default.fileExists(atPath: registration.fileURL.path) else {
-                if previousBySource[sourceID] != nil {
-                    removedSourceIDs.insert(sourceID)
-                }
-                continue
-            }
             do {
                 let attributes = try FileManager.default.attributesOfItem(atPath: registration.fileURL.path)
-                let updatedAt = (attributes[.modificationDate] as? Date) ?? Date()
+                guard let updatedAt = attributes[.modificationDate] as? Date else {
+                    throw ContextFlowStoreError.malformedStoredValue("Source modification time is unavailable for \(registration.fileURL.lastPathComponent)")
+                }
                 let data = try Data(contentsOf: registration.fileURL, options: [.mappedIfSafe])
                 guard data.count <= registration.maximumUTF8Bytes else {
                     throw ContextMarkdownCompilerError.sourceTooLarge(
@@ -327,12 +321,22 @@ extension ContextPreparation {
         let projectionIdentifiers = active?.generation.id != activeStoredGeneration?.generation.id
             ? Set(compiledProjectionProviders.map(\.projectionIdentifier))
             : batch.compiledProjectionIdentifiers
+        var projectionReadResults: [String: [ContextSourceID: String]] = [:]
         if !projectionIdentifiers.isEmpty {
             for provider in compiledProjectionProviders where
                 projectionIdentifiers.contains(provider.projectionIdentifier) {
                 try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
                 let result = try await provider.compiledProjection(previousSources: previousBySource)
                 try checkCandidateAdmission(batch.requestID, enabled: stopWhenSuperseded)
+                for source in result.verifiedSources { successfulSources[source.descriptor.id] = source }
+                var failures: [ContextSourceID: String] = [:]
+                for (id, reason) in result.sourceFailures {
+                    let safeReason = String(ContextSecretContentPolicy.redactedFragment(reason).prefix(2_048))
+                    failures[id] = safeReason
+                    // Failure evidence exists even before the first stored row.
+                    compileFailures[id] = safeReason
+                }
+                projectionReadResults[provider.projectionIdentifier] = failures
                 for source in result.changedSources {
                     if changedSources.contains(where: { $0.descriptor.id == source.descriptor.id }) {
                         throw ContextFlowCoordinatorError.duplicateProjectedSource(source.descriptor.id)
@@ -349,7 +353,8 @@ extension ContextPreparation {
             changedSources: changedSources,
             removedSourceIDs: removedSourceIDs,
             successfulSources: successfulSources,
-            compileFailures: compileFailures
+            compileFailures: compileFailures,
+            projectionReadResults: projectionReadResults
         )
     }
 
@@ -365,12 +370,22 @@ extension ContextPreparation {
                 var compileFailures: [ContextSourceID: String] = [:]
                 candidate = try await makeCandidate(for: candidate.batch, compileFailures: &compileFailures)
             }
-            let persistedDegradedCount = try? await store.healthSnapshot().degradedSources
-            let hasUnknownPersistedDegradation = (persistedDegradedCount ?? 0) > degradedSourceIDs.count
-            for (sourceID, error) in candidate.compileFailures.sorted(by: { $0.key < $1.key }) {
-                await markSourceDegraded(sourceID, error: error)
+            var admittedReadFailures = sourceReadFailures
+            for (id, failures) in candidate.projectionReadResults {
+                admittedReadFailures[.projection(id)] = failures.isEmpty ? nil : failures
             }
-
+            var registeredFailures = admittedReadFailures[.registered] ?? [:]
+            for registration in candidate.batch.registrations {
+                let id = registration.descriptor.id
+                registeredFailures[id] = candidate.compileFailures[id]
+            }
+            for id in candidate.removedSourceIDs { registeredFailures[id] = nil }
+            admittedReadFailures[.registered] = registeredFailures.isEmpty ? nil : registeredFailures
+            let persistedDegradedCount = try await store.healthSnapshot().degradedSources
+            let hasUnknownPersistedDegradation = persistedDegradedCount > degradedSourceIDs.count
+            for (sourceID, error) in candidate.compileFailures.sorted(by: { $0.key < $1.key }) {
+                try await markSourceDegraded(sourceID, error: error)
+            }
             var changedBySource = Dictionary(candidate.changedSources.map {
                 ($0.descriptor.id, $0)
             }, uniquingKeysWith: { first, _ in first })
@@ -397,6 +412,7 @@ extension ContextPreparation {
                 degradedSourceIDs.subtract(healthRecoverySourceIDs)
                 degradedSourceIDs.subtract(candidate.removedSourceIDs)
             } else if try await store.activeGeneration() == nil {
+                sourceReadFailures = admittedReadFailures
                 await pruneStoreIfDue()
                 lastReconciledAt = Date()
                 acknowledge(candidate.batch)
@@ -414,7 +430,7 @@ extension ContextPreparation {
                 }
                 stored = loaded
             }
-            try await activate(stored)
+            try await activate(stored, requestID: candidate.batch.requestID, readFailures: admittedReadFailures)
             lastReconciledAt = Date()
             acknowledge(candidate.batch)
             await pruneStoreIfDue()
@@ -431,8 +447,10 @@ extension ContextPreparation {
 
     /// Make `stored` the generation turns read: its mirrors, arena snapshot
     /// and projection identities publish together or not at all.
-    func activate(_ stored: ContextStoredGeneration) async throws {
+    func activate(_ stored: ContextStoredGeneration, requestID: UInt64,
+                  readFailures: [SourceReadOwner: [ContextSourceID: String]]? = nil) async throws {
         let mirrors = try await mirrorProvider.requiredDocumentMirrors()
+        guard !reconciliationClosed, requestID == nextReconciliationRequestID, !Task.isCancelled else { throw CancellationError() }
         let currentSnapshot = arena.currentSnapshot()
         let snapshot: ContextGenerationSnapshot
         if let currentSnapshot,
@@ -455,7 +473,9 @@ extension ContextPreparation {
         switch outcome {
         case nil, .published, .rehydrated:
             lastError = nil
+            reconciliationFailure = nil
             activateStoredGeneration(stored)
+            if let readFailures { sourceReadFailures = readFailures }
             for provider in compiledProjectionProviders {
                 provider.didPublish(generation: stored)
             }
@@ -495,13 +515,14 @@ extension ContextPreparation {
         guard await beginPublication(for: batch.requestID) else { return }
         defer { finishPublication() }
         for (sourceID, compileError) in compileFailures.sorted(by: { $0.key < $1.key }) {
-            await markSourceDegraded(sourceID, error: compileError)
+            do { try await markSourceDegraded(sourceID, error: compileError) }
+            catch { recordReconciliationFailure(error); return }
         }
         recordReconciliationFailure(error)
     }
 
-    private func markSourceDegraded(_ sourceID: ContextSourceID, error: String) async {
-        try? await store.markSourceDegraded(sourceID, error: error)
+    private func markSourceDegraded(_ sourceID: ContextSourceID, error: String) async throws {
+        try await store.markSourceDegraded(sourceID, error: error)
         degradedSourceIDs.insert(sourceID)
         guard let stored = activeStoredGeneration else { return }
         invalidateGenerationDerivedCache()
@@ -518,8 +539,7 @@ extension ContextPreparation {
                     validToGeneration: source.validToGeneration
                 )
             },
-            atoms: stored.atoms,
-            relationships: stored.relationships
+            atoms: stored.atoms
         )
     }
 
@@ -530,6 +550,10 @@ extension ContextPreparation {
 
     private func recordReconciliationFailure(_ error: any Error) {
         lastError = String(describing: error)
+        reconciliationFailure = lastError
+        // Failed discovery/health demand supersedes any older publisher too.
+        // Reuse the admission owner's existing request identity; no second clock.
+        nextReconciliationRequestID &+= 1
         // Leave failed demand pending. A later external reconciliation will
         // coalesce and retry it without scheduling an immediate retry loop.
     }
@@ -553,7 +577,7 @@ extension ContextPreparation {
             return false
         } catch {
             guard isCurrent(lifecycleID) else { return false }
-            lastError = String(describing: error)
+            recordReconciliationFailure(error)
             return false
         }
     }
@@ -563,22 +587,13 @@ extension ContextPreparation {
     ) -> [ContextSourceID: ContextCompiledSource] {
         guard let stored else { return [:] }
         let atomsBySource = Dictionary(grouping: stored.atoms.map(\.draft), by: \.sourceID)
-        let sourcesByAtom = Dictionary(grouping: stored.atoms, by: \.draft.id)
-            .mapValues { Set($0.map(\.draft.sourceID)) }
-        var relationshipsBySource: [ContextSourceID: [ContextRelationshipDraft]] = [:]
-        for relationship in stored.relationships {
-            for sourceID in sourcesByAtom[relationship.draft.sourceAtomID] ?? [] {
-                relationshipsBySource[sourceID, default: []].append(relationship.draft)
-            }
-        }
         var result: [ContextSourceID: ContextCompiledSource] = [:]
         for source in stored.sources {
             let sourceAtoms = atomsBySource[source.descriptor.id] ?? []
             result[source.descriptor.id] = ContextCompiledSource(
                 descriptor: source.descriptor,
                 sourceHash: source.sourceHash,
-                atoms: sourceAtoms,
-                relationships: relationshipsBySource[source.descriptor.id] ?? []
+                atoms: sourceAtoms
             )
         }
         return result

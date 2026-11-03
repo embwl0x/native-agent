@@ -9,7 +9,7 @@ final class OwnedProgramProcess: @unchecked Sendable {
     enum Event: Sendable { case line(Data), ended(String) }
     let events: AsyncStream<Event>
     private let sink: AsyncStream<Event>.Continuation
-    private let process = Process()
+    private let process = ManagedProcess()
     private let input = Pipe()
     private let output = Pipe()
     private let errors = Pipe()
@@ -33,10 +33,11 @@ final class OwnedProgramProcess: @unchecked Sendable {
     var pid: Int32 { process.processIdentifier }
     var isRunning: Bool { process.isRunning }
     var failure: SenseFailure? { lock.withLock { terminalFailure } }
-    func processIdentities() -> [ProcessTreeIdentity] {
+    func processIdentities() throws -> [ProcessTreeIdentity] {
         lock.lock(); defer { lock.unlock() }
         let snapshot = ProcessTreeReaper.snapshot(rootPID: pid, retaining: tree)
         tree = snapshot
+        if let failure = snapshot.inspectionFailure { throw SenseFailure(code: "resource_unavailable", message: failure) }
         return snapshot.descendants + (snapshot.rootIdentity.map { [$0] } ?? [])
     }
     init(helper: URL, profile: String, scratch: URL, memoryBytes: UInt64? = nil,
@@ -63,16 +64,18 @@ final class OwnedProgramProcess: @unchecked Sendable {
             process.terminationHandler = nil
             lock.lock()
             let tail = String(decoding: stderr, as: UTF8.self)
+            if let detail = process.terminationError {
+                let failure = SenseFailure(code: "termination_incomplete", message: detail)
+                terminalFailure = failure; onFailure(failure)
+                stopping = true; execution = nil
+            }
             if !stopping {
                 let failure = SenseFailure(code: "crashed", message: "Program helper exited (\(process.terminationStatus)): \(tail)")
                 terminalFailure = failure; onFailure(failure)
                 stopping = true; execution = nil
             }
-            if let tree {
-                _ = ProcessTreeReaper.quiesceAndKill(ProcessTreeReaper.snapshot(rootPID: pid, retaining: tree))
-            }
             lock.unlock()
-            sink.yield(.ended("Sense helper at \(helper.path) exited (\(process.terminationStatus)): \(tail) Tell the person about this NativeAgent helper failure; preserve its error output."))
+            sink.yield(.ended(process.terminationError ?? "Sense helper at \(helper.path) exited (\(process.terminationStatus)): \(tail) Tell the person about this NativeAgent helper failure; preserve its error output."))
             sink.finish()
             lock.withLock { deadlineTask?.cancel(); resources?.cancel() }
             writeQueue.sync { closeWriter() }
@@ -90,7 +93,6 @@ final class OwnedProgramProcess: @unchecked Sendable {
             source.setCancelHandler { [input] in try? input.fileHandleForWriting.close() }
             writeSource = source
             try process.run()
-            ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(pid)
             lock.lock(); tree = ProcessTreeReaper.snapshot(rootPID: pid)
             // Process-tree RSS has no confirmed equivalent threshold event. Retain the
             // one-second sample, owned and cancelled by this helper transport.
@@ -100,10 +102,19 @@ final class OwnedProgramProcess: @unchecked Sendable {
                     guard let self else { return }
                     var memory: UInt64 = 0
                     var accounted = false
-                    for identity in self.processIdentities() {
+                    let identities: [ProcessTreeIdentity]
+                    do { identities = try self.processIdentities() }
+                    catch {
+                        self.fail(SenseFailure(code: "resource_unavailable", message: error.localizedDescription))
+                        return
+                    }
+                    for identity in identities {
                         var info = proc_taskinfo()
                         let size = Int32(MemoryLayout<proc_taskinfo>.size)
-                        guard proc_pidinfo(identity.pid, PROC_PIDTASKINFO, 0, &info, size) == size else { continue }
+                        guard proc_pidinfo(identity.pid, PROC_PIDTASKINFO, 0, &info, size) == size else {
+                            self.fail(SenseFailure(code: "resource_unavailable", message: "Resource accounting for helper process \(identity.pid) is unavailable; its memory use is unknown."))
+                            return
+                        }
                         memory += info.pti_resident_size; accounted = true
                     }
                     if !accounted {
@@ -272,6 +283,10 @@ final class OwnedProgramProcess: @unchecked Sendable {
         // identity-checked tree, including observed descendants after a crash.
         let snapshot = ProcessTreeReaper.snapshot(rootPID: pid, retaining: tree)
         tree = ProcessTreeReaper.quiesceAndKill(snapshot)
+        if let detail = process.terminationError {
+            let failure = SenseFailure(code: "termination_incomplete", message: detail)
+            terminalFailure = failure; onFailure(failure)
+        }
         writeQueue.sync { closeWriter() }
     }
 }

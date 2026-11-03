@@ -8,10 +8,10 @@
 #      no launch).
 #   2. Copy the signed dist/NativeAgent.app → temp bundle next to ~/Applications.
 #   3. Verify the transferred signature (--deep --strict).
-#   4. Remove the Python LaunchAgent and quit the running NativeAgent.app.
+#   4. Quit the running NativeAgent.app.
 #   5. Atomically swap the temp bundle into ~/Applications/NativeAgent.app.
 #   6. Launch and prove authenticated chat/source readiness; only then delete
-#      the previous bundle. Failed readiness restores the prior install.
+#      the previous bundle. Failed readiness retains the selected app and evidence.
 #
 # After this, you double-click ~/Applications/NativeAgent.app to start. The
 # app stays in the menu bar.
@@ -22,10 +22,6 @@ trap 'echo "[install_app.sh] FAILED line $LINENO: $BASH_COMMAND" >&2' ERR
 
 for arg in "$@"; do
     case "$arg" in
-        --with-st)
-            echo "[install_app.sh] ERROR: --with-st is retired. NativeAgent bundles zero Python; embeddings must use the Swift/CoreML path." >&2
-            exit 2
-            ;;
         --force-checkout-switch)
             FORCE_CHECKOUT_SWITCH=1
             ;;
@@ -34,8 +30,7 @@ for arg in "$@"; do
 Usage:
   ./script/install_app.sh [--force-checkout-switch]
 
-NativeAgent app bundles are Swift-native and zero-Python. The retired
---with-st / sentence-transformers install path is intentionally rejected.
+NativeAgent app bundles are Swift-native and use CoreML embeddings.
 
 --force-checkout-switch allows reinstalling over an installed app whose
 REPO_PATH stamp names a DIFFERENT live checkout (see the guard below).
@@ -65,10 +60,6 @@ FORCE_CHECKOUT_SWITCH="${FORCE_CHECKOUT_SWITCH:-0}"
 nativeagent_require_installed_checkout "$APP_DEST" "$ROOT" "$FORCE_CHECKOUT_SWITCH" \
   "[install_app.sh]" "Reinstalling would repoint the live app's data root and bounce it."
 
-if [ "${NATIVE_AGENT_INSTALL_WITH_ST:-0}" = "1" ]; then
-    echo "[install_app.sh] ERROR: NATIVE_AGENT_INSTALL_WITH_ST is retired. NativeAgent bundles zero Python; embeddings must use the Swift/CoreML path." >&2
-    exit 2
-fi
 # Rotate logs in the checkout's live data directory.
 DATA="$ROOT/data"
 
@@ -93,12 +84,8 @@ fi
 TEMP_BUNDLE="$(dirname "$APP_DEST")/.NativeAgent.app.tmp.$$"
 APP_OLD="${APP_DEST}.old.$$"
 trap '
-    # The previous bundle comes back before anything else is cleaned: a failed
-    # cleanup under set -e must never strand it at .old.
     if [ -d "$APP_OLD" ] && [ ! -d "$APP_DEST" ]; then
-        echo "[install_app.sh] mid-swap failure — restoring previous bundle"
-        mv "$APP_OLD" "$APP_DEST"
-        /usr/bin/open "$APP_DEST" 2>/dev/null || true
+        echo "[install_app.sh] installation incomplete; previous artifact retained at $APP_OLD. Fix the selected install forward." >&2
     fi
     rm -rf "$TEMP_BUNDLE" || true
 ' EXIT
@@ -133,18 +120,6 @@ for dsym in "$DSYM_PRODUCTS"/*.dSYM; do
     uuid_set="$(release_executable_uuids "$dsym")"
     uuid_key="$(printf '%s\n' "$uuid_set" | shasum -a 256 | awk '{print $1}')"
     retained="$DSYM_ARCHIVE/objects/$(basename "$dsym")/$uuid_key/$(basename "$dsym")"
-    if [[ ! -e "$retained" ]]; then
-        # Older installs archived one dSYM per revision directory; the keyed
-        # objects/ store was checked above and holds no dSYM at this depth.
-        for candidate in "$DSYM_ARCHIVE"/*/"$(basename "$dsym")"; do
-            [[ -d "$candidate" && "$candidate" != "$DSYM_ARCHIVE/objects/"* ]] || continue
-            candidate_uuids="$(release_executable_uuids "$candidate")"
-            if [[ "$candidate_uuids" == "$uuid_set" ]]; then
-                retained="$candidate"
-                break
-            fi
-        done
-    fi
     symbol_ref="${retained#"$DSYM_ARCHIVE/"}"
     if [[ -e "$retained" ]]; then
         if ! diff -qr "$dsym/Contents/Resources/DWARF" "$retained/Contents/Resources/DWARF"; then
@@ -188,23 +163,11 @@ codesign --verify --deep --strict --verbose=2 "$TEMP_BUNDLE"
 # built, signed, and codesign-verified — only now is it safe to take the
 # running app down.
 
-# 4a. Remove the installed Python LaunchAgent.
-LABEL="local.nativeagent.NativeAgentDaemon"
-PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-if [[ -f "$PLIST" ]]; then
-  echo "tearing down legacy LaunchAgent at $PLIST"
-  launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
-  rm -f "$PLIST"
-fi
-# Match the installed bundle's Python process; source-path prefixes can select sibling checkouts.
-pkill -f "$APP_DEST/Contents/Resources/native_agentd.py" 2>/dev/null || true
-
-# 4b. Quit any running app
+# 4. Quit any running app
 # Allow 30s for the app's 20s turn wait and 3s shutdown drain before force-stop.
 APP_EXECUTABLE_PATTERN="$(printf '%s' "$APP_DEST/Contents/MacOS/NativeAgentApp" | sed 's/[][\.^$*+?(){}|]/\\&/g')"
 APP_PROCESS_PATTERN="$APP_EXECUTABLE_PATTERN([[:space:]].*)?"
-APP_HELPER_PATTERN="^[0-9]+[[:space:]]+$APP_EXECUTABLE_PATTERN[[:space:]]+--nativeagent-(install-helper|relaunch-after-exit)([[:space:]]|$)"
+APP_HELPER_PATTERN="^[0-9]+[[:space:]]+${APP_EXECUTABLE_PATTERN}[[:space:]]+--nativeagent-(install-helper|relaunch-after-exit)([[:space:]]|$)"
 # The same executable also hosts detached helpers. They own installation or
 # relaunch across app exit, so every quit/wait/stop selects only app-mode PIDs.
 _nativeagent_app_pids() {
@@ -236,11 +199,14 @@ if _nativeagent_app_pids >/dev/null 2>&1; then
   _stop_nativeagent
 fi
 # Wait for app-mode processes to exit before swapping bundles or launching a new instance.
-gone_deadline=$((SECONDS + 15))
-while _nativeagent_app_pids >/dev/null 2>&1 && (( SECONDS < gone_deadline )); do
-  sleep 0.2
-done
-if _nativeagent_app_pids >/dev/null 2>&1; then
+_wait_for_nativeagent_exit() {
+  local gone_deadline=$((SECONDS + 15))
+  while _nativeagent_app_pids >/dev/null 2>&1 && (( SECONDS < gone_deadline )); do
+    sleep 0.2
+  done
+  ! _nativeagent_app_pids >/dev/null 2>&1
+}
+if ! _wait_for_nativeagent_exit; then
   echo "[install_app.sh] ERROR: NativeAgentApp still running after forced stop; refusing to launch a duplicate." >&2
   exit 1
 fi
@@ -250,8 +216,8 @@ if [ -d "$APP_DEST" ]; then
     mv "$APP_DEST" "$APP_OLD"
 fi
 mv "$TEMP_BUNDLE" "$APP_DEST"
-# Staging is now installed. The previous bundle stays recoverable until
-# the replacement proves its authenticated runtime identity and chat readiness.
+# Staging is now installed. Keep the previous artifact for diagnosis until
+# the selected app proves its authenticated runtime identity and chat readiness.
 trap - EXIT ERR INT TERM HUP
 
 # Rotate logs over 5 MB, keeping three copies.
@@ -268,11 +234,10 @@ _rotate_log "$DATA/logs/daemon.err.log"
 _rotate_log "$DATA/logs/daemon.out.log"
 
 # 6. Launch
-# Register the bundle, launch through LaunchServices, and retry once with open -n.
+# Register the bundle and issue one checked LaunchServices request.
 # Bundle launches preserve macOS Accessibility/TCC attribution.
 # Authenticated bridge readiness must prove chat is ready and the running
 # content identity matches the replacement bundle.
-INSTALL_VERIFY_STARTED="$(date +%s)"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 _wait_for_nativeagent_launch() { # $1 = bounded seconds
@@ -285,16 +250,9 @@ _wait_for_nativeagent_launch() { # $1 = bounded seconds
 }
 
 _launch_nativeagent_bundle() {
-  [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DEST" >/dev/null 2>&1 || true
-  /usr/bin/open "$APP_DEST" 2>&1 || true
-  if _wait_for_nativeagent_launch 10; then
-    return 0
-  fi
-
-  echo "[install_app.sh] no NativeAgentApp process 10s after the first bundle launch; retrying through LaunchServices"
-  [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DEST" >/dev/null 2>&1 || true
-  /usr/bin/open -n "$APP_DEST" 2>&1 || true
-  _wait_for_nativeagent_launch 20
+  "$LSREGISTER" -f "$APP_DEST" || return $?
+  /usr/bin/open "$APP_DEST" || return $?
+  _wait_for_nativeagent_launch 30
 }
 
 echo
@@ -310,7 +268,7 @@ _verify_ready() {
   [[ "$INSTALL_LAUNCH_OK" == "1" ]] && "$ROOT/script/verify_installed_runtime_ready.sh" \
     "$APP_DEST" "$INSTALL_SOURCE_CONTENT_ID" 45
 }
-# Failed readiness restores the previous bundle without another replacement launch attempt.
+# No further launch or executable-version substitution follows failed readiness.
 INSTALL_READY=0
 if _verify_ready; then INSTALL_READY=1; fi
 if [[ "$INSTALL_READY" == "1" ]]; then
@@ -329,31 +287,11 @@ if [[ "$INSTALL_READY" == "1" ]]; then
   fi
   trap - EXIT ERR INT TERM HUP
   rm -rf "$APP_OLD" 2>/dev/null || true
-  # A good install supersedes every earlier failed replacement kept for triage.
-  rm -rf "${APP_DEST:?}".failed.* 2>/dev/null || true
   exit 0
 fi
 
 echo "[install_app.sh] replacement failed authenticated readiness verification." >&2
-_quit_nativeagent
-rollback_deadline=$((SECONDS + 5))
-while _nativeagent_app_pids >/dev/null 2>&1 \
-    && (( SECONDS < rollback_deadline )); do
-  sleep 0.1
-done
-_stop_nativeagent
-if [[ -d "$APP_OLD" ]]; then
-  FAILED_APP="${APP_DEST}.failed.$(date +%Y%m%d-%H%M%S)"
-  mv "$APP_DEST" "$FAILED_APP"
-  mv "$APP_OLD" "$APP_DEST"
-  # The restored bundle uses the same LaunchServices rule; report launch failure.
-  if ! _launch_nativeagent_bundle; then
-    echo "[install_app.sh] WARNING: restored the previous bundle, but LaunchServices could not start it." >&2
-  fi
-  echo "[install_app.sh] restored the previous bundle; failed replacement retained at:" >&2
-  echo "  $FAILED_APP" >&2
-else
-  echo "[install_app.sh] no previous bundle existed; failed fresh install retained at $APP_DEST." >&2
-fi
+echo "[install_app.sh] selected app retained at $APP_DEST; launch/readiness evidence is above. Fix this build forward." >&2
+[[ ! -d "$APP_OLD" ]] || echo "[install_app.sh] previous artifact retained for diagnosis at $APP_OLD (not launched)." >&2
 trap - EXIT ERR INT TERM HUP
 exit 1

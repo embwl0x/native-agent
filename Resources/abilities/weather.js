@@ -1,8 +1,8 @@
 /* NativeAgent ability
-{"id":"weather","kind":"tool","version":1,
+{"id":"weather","kind":"ability","version":1,
  "reach":{"capabilities":["network_public"],"hosts":["geocoding-api.open-meteo.com","api.open-meteo.com"]},
  "face":{"page":"web","action":"weather.forecast"},
- "record":{"description":"Read current weather and daily temperature high/low, rain chance, wind, sunrise and sunset from Open-Meteo. place is a city or postal code, qualified by state or country when needed; when omitted, uses the fix this Mac holds through mac.location, with its age, and asks the paired iPhone through phone.location only when the Mac holds none; it says which. Mac Location Services permissions apply. NativeAgent must be open on the phone; phone location permissions apply. day: today (default), tomorrow or yyyy-MM-dd within 16 days. days: 1–16 daily forecasts starting at day, in one read (a week is days:7). hours: optional 1–24 hourly forecasts, from now today or midnight on another day. Units follow the Mac's locale (°F/mph for US).","actions":["mac.location","phone.location"],"inputSchema":{"type":"object","readOnly":true,"properties":{"place":{"type":"string"},"day":{"type":"string"},"days":{"type":"integer"},"hours":{"type":"integer"}},"required":[],"additionalProperties":false}}}
+ "record":{"description":"Read current weather and daily temperature high/low, rain chance, wind, sunrise and sunset from Open-Meteo. place is a city or postal code, qualified by state or country when needed; when omitted, uses only the fix this Mac holds through mac.location, with its age. An unavailable Mac fix stops the forecast with its repair guidance; give place to choose another location. Mac Location Services permissions apply. day: today (default), tomorrow or yyyy-MM-dd within 16 days. days: 1–16 daily forecasts starting at day, in one read (a week is days:7). hours: optional 1–24 hourly forecasts, from now today or midnight on another day. Units follow the Mac's locale (°F/mph for US).","actions":["mac.location"],"inputSchema":{"type":"object","readOnly":true,"properties":{"place":{"type":"string"},"day":{"type":"string"},"days":{"type":"integer"},"hours":{"type":"integer"}},"required":[],"additionalProperties":false}}}
 */
 function run(input) {
     const text = v => ["string", "number", "boolean"].includes(typeof v) ? String(v) : "";
@@ -23,23 +23,16 @@ function run(input) {
     const located = values => text(values.latitude).trim() && text(values.longitude).trim() && Number.isFinite(+values.latitude) && Number.isFinite(+values.longitude) && +values.latitude >= -90 && +values.latitude <= 90 && +values.longitude >= -180 && +values.longitude <= 180;
     let location = {}, locationSource = "GeoNames";
     if (!place) {
-        // Where the Mac is, is a fact it holds, said with its age; the phone is asked only when the Mac holds none.
-        let mac, phone;
-        try { mac = app.mac.location(); } catch (e) { if (e.reason === "cancelled") throw e; mac = e.receipt; }
+        // Implicit "here" belongs to this Mac; a failed fix never picks another device.
+        let mac;
+        try { mac = app.mac.location(); } catch (e) { if (e.name !== "AppError" || e.reason === "cancelled") throw e; return e.receipt; }
         if (object(mac) && mac.status === "ok" && located(mac)) {
             const minutes = Math.round((+mac.age_seconds || 0) / 60);
             location = mac; locationSource = (text(mac.source) || "this Mac") + ", fix " + (minutes < 120 ? minutes + " minutes" : Math.round(minutes / 60) + " hours") + " old";
         } else {
-            locationSource = "paired iPhone";
-            try { phone = app.phone.location(); } catch (e) { if (e.reason === "cancelled") throw e; phone = e.receipt; }
-            location = object(phone) && phone.status === "completed" && object(phone.values) ? phone.values : {};
-        }
-        if (!located(location)) {
-            const macCard = object(mac) && text(mac.card_id);
-            return Object.assign(fail("location_unavailable", "Neither this Mac nor the paired iPhone provided a location. No weather was read."), {effects:"none", mac_result:mac, phone_result:phone,
-                remedy: macCard
-                    ? {kind:"card", instruction:"A Location Services card (" + macCard + ") is waiting for the owner. When it is allowed, call again; or give args.place.", next_call:null}
-                    : {kind:"phone_location", instruction:"Open NativeAgent on the paired iPhone, allow location access, then make next_call; or give args.place.", next_call:{tool:"app",input:{action:"phone.location"}}}});
+            if (object(mac) && mac.status !== "ok") return mac;
+            return Object.assign(fail("location_unavailable", "This Mac did not provide a valid location. No weather was read. Repair Mac Location Services or give args.place."), {effects:"none", mac_result:mac,
+                remedy:{kind:"mac_location", instruction:"Read mac.location to inspect its Location Services failure, or give args.place for an explicitly chosen location.", next_call:{tool:"app",input:{action:"mac.location"}}}});
         }
     } else {
         const geocoded = fetch("https://geocoding-api.open-meteo.com/v1/search", {name:place,count:"1"});

@@ -18,9 +18,11 @@ extension SwiftToolDispatcher {
     ) -> JSONValue? {
         guard !categories.isEmpty, categories.allSatisfy(InlineInteractionRegistry.isMacControlCategory)
         else { return nil }
-        guard categories.contains(where: {
-            !InlineInteractionRegistry.macControlCategoryAllowed($0, dataRoot: dataRoot)
-        }) else { return nil }
+        do {
+            guard try categories.contains(where: {
+                try !InlineInteractionRegistry.macControlCategoryAllowed($0, dataRoot: dataRoot)
+            }) else { return nil }
+        } catch { return ChatToolOutcome.failure(error: error, tool: InlineInteractionWire.toolName) }
         guard let need = InlineInteractionRegistry.permission(
             categories, why: why, mode: mode, declineConsequence: declineConsequence
         ) else { return nil }

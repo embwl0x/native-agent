@@ -3,10 +3,38 @@ import NativeAgentCore
 import PersistenceCore
 #if canImport(CoreGraphics)
 import CoreGraphics
-// Blueprint: | `MacControl+HandAndWake.swift` | `SwiftNativeMacControl`: `waitForTextInput`, `handleHand`, `watchedWindowMiss` (a watch's events land on its window, read at each event), `handleNudge`; text input verifies focus, selection and value with cancellable 25ms polling bounded to 750ms; hand text mismatch excerpts are always redacted because its readback lacks canonical caption/group redaction context |
+// Blueprint: | `MacControl+HandAndWake.swift` | `SwiftNativeMacControl`: bounded text-focus admission independent of readable value/selection; click typing requires related compact editor or clicked focused geometry; captured-image checks and per-event foreground/focus guards remain; unreadable edits are unverified |
 #endif
 
 extension SwiftNativeMacControl {
+    /// A caret/editor is enough to send text; AX readback is separate proof.
+    /// Unknown focus and noneditable controls never admit literal keystrokes.
+    func waitForTextFocus(pid: Int32, target: MacAXActTarget?, clickPoint: CGPoint?) async -> MacAXActTarget? {
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
+        repeat {
+            guard !Task.isCancelled,
+                  accessibilitySource.frontmostApp()?.processIdentifier == pid else { return nil }
+            if let focused = accessibilityActSource.focusedElement(pid: pid),
+               accessibilityActSource.acceptsTextInput(focused) {
+                let related = target.map { accessibilityActSource.matchesTextInputTarget(focused, target: $0) } ?? (clickPoint == nil)
+                let containsPoint = clickPoint.map { point in
+                    focused.frame.map { CGRect(x: $0.x, y: $0.y, width: $0.w, height: $0.h).contains(point) } ?? false
+                } ?? true
+                let compactEditorOwner = target.map { hit in
+                    if MacActClosedLoop.canType(role: hit.role) || ["AXStaticText", "AXText"].contains(hit.role) { return true }
+                    guard ["AXButton", "AXPopUpButton", "AXMenuButton"].contains(hit.role),
+                          let frame = hit.frame, frame.w <= 320, frame.h <= 80, let point = clickPoint else { return false }
+                    return CGRect(x: frame.x, y: frame.y, width: frame.w, height: frame.h).contains(point)
+                } ?? false
+                // Hit-testing a canvas can return only its broad container.
+                // A broad container requires the focused editor to contain the
+                // point; only compact editor owners can vouch by ancestry.
+                if clickPoint == nil ? related : containsPoint || (related && compactEditorOwner) { return focused }
+            }
+            if ContinuousClock.now >= deadline { return nil }
+            do { try await Task.sleep(for: .milliseconds(25)) } catch { return nil }
+        } while true
+    }
     /// Wait for the focused editor, not merely AXFocused on its outer control.
     /// Also serves as the acknowledgement for select-all and text delivery.
     func waitForTextInput(
@@ -78,7 +106,13 @@ extension SwiftNativeMacControl {
                   x.isFinite, y.isFinite, abs(x) <= 100_000, abs(y) <= 100_000 else { return nil }
             return CGPoint(x: x, y: y)
         }
-        let waitMs = Self.handWaitMilliseconds(seconds: body["seconds"]?.numberValue(coercingStrings: false, finiteOnly: true))
+        let waitMs: Int
+        let suppliedTravelMs: Int?
+        do {
+            waitMs = try Self.handDurationMilliseconds(body["seconds"], field: "seconds", defaultMilliseconds: 600, range: 0...10)
+            suppliedTravelMs = body["travel_seconds"] == nil ? nil : try Self.handDurationMilliseconds(
+                body["travel_seconds"], field: "travel_seconds", defaultMilliseconds: 240, range: 0.08...2)
+        } catch { return injectionRefusal(action: "hand", error: error.localizedDescription, status: 400) }
         var dragTravelMs: Int?
         var plan: [MacHandStep]
         do {
@@ -125,7 +159,7 @@ extension SwiftNativeMacControl {
                 }
                 // Named drags use travel_seconds; low-level seconds remains endpoint dwell.
                 if body["travel_seconds"] != nil {
-                    dragTravelMs = Self.handDragMilliseconds(seconds: body["travel_seconds"]?.numberValue(coercingStrings: false, finiteOnly: true))
+                    dragTravelMs = suppliedTravelMs
                 }
                 plan = try MacHandRepertoire.drag(
                     button: button,
@@ -261,6 +295,15 @@ extension SwiftNativeMacControl {
         let surfaceWindowBefore = surfacePid.flatMap { accessibilityActSource.focusedWindow(pid: $0) }
         // A watch's hand: every event lands on that exact window, read at the event.
         let requiredWindow = body["require_front_window"]?.integerValue.flatMap(Int.init(exactly:))
+        let requiredIdentity: MacAXWindowIdentity?
+        if let frameID = body["require_frame_id"]?.stringValue {
+            guard let identity = await lookFrameStore.frame(frameId: frameID)?.windowIdentity,
+                  identity.pid == requiredFront else {
+                return injectionRefusal(action: "hand", error: "stale_frame",
+                    extra: ["requested_events_emitted": .int(0)])
+            }
+            requiredIdentity = identity
+        } else { requiredIdentity = nil }
         let chords = gesture == "key" ? body["keys"]?.stringValue.flatMap { try? MacKeySyntax.parseChords($0) } : nil
         let selectsAll = chords?.count == 1 && chords?.first?.keyCode == 0x00 && chords?.first?.modifiers == .command
         let selectionTarget = selectsAll ? accessibilitySource.frontmostApp().flatMap {
@@ -275,10 +318,51 @@ extension SwiftNativeMacControl {
             return injectionRefusal(action: "hand", error: missed, extra: ["requested_events_emitted": .int(0)])
         }
         var textInput: MacAXTextInput?
+        var textFocus: MacAXActTarget?
         var checkedTextInput = false
-        var clickTarget: (pid: Int32, element: MacAXActTarget, point: CGPoint)?
+        var clickTarget: (pid: Int32, element: MacAXActTarget?, point: CGPoint)?
+        // Freeze the session's selected image once. Never rebind an implicit
+        // point to a newer image while this gesture is suspended.
+        let imageCapture: MacImageCapture?
+        if let imageID = body["image_frame"]?.stringValue {
+            guard let capture = MacImageFrames.frame(imageID)?.geometry.capture else {
+                return injectionRefusal(action: "hand", error: MacLookFrameStore.ResolveFailure.staleFrame.rawValue,
+                    extra: ["requested_events_emitted": .int(0),
+                            "guidance": .string("That image has no capture identity. Look again with pixels:true before pointing.")])
+            }
+            imageCapture = capture
+        } else { imageCapture = nil }
+        // The gesture acts where it presses and releases; the path between
+        // crosses unnamed background a capture never described (10-31 review).
+        func imageMiss(_ step: MacHandStep) -> MacControlResult? {
+            guard let imageCapture, case .mouse(let event) = step, event.phase == .down || event.phase == .up else { return nil }
+            guard let point = MacPointerPosition(x: event.x, y: event.y) else {
+                return injectionRefusal(action: "hand", error: MacLookFrameStore.ResolveFailure.staleFrame.rawValue,
+                    extra: ["requested_events_emitted": .int(Int64(emittedEvents)),
+                            "effects_may_have_occurred": .bool(emittedEvents > 0),
+                            "guidance": .string("The image point is not finite; look again with pixels:true.")])
+            }
+            guard let failure = imageCapture.refusal(at: point, now: now()) else { return nil }
+            return injectionRefusal(action: "hand", error: failure.code, extra: [
+                "requested_events_emitted": .int(Int64(emittedEvents)),
+                "effects_may_have_occurred": .bool(emittedEvents > 0),
+                "guidance": .string(failure.reason),
+            ])
+        }
+        // Preflight the whole drag before any mouse or modifier goes out.
+        for step in executionPlan {
+            if let refusal = imageMiss(step) { return refusal }
+        }
         let execution = await executeHand(executionPlan, action: "hand", body: body) { step in
             let posts: Bool = if case .wait = step { false } else { true }
+            if let requiredIdentity, posts {
+                guard let focused = accessibilityActSource.focusedWindow(pid: requiredIdentity.pid),
+                      case .matched = MacAXWindowIdentity.match(requiredIdentity, among: [(focused, focused.identity)]) else {
+                    return injectionRefusal(action: "hand", error: "front_window_changed", extra: [
+                        "requested_events_emitted": .int(Int64(emittedEvents)),
+                        "effects_may_have_occurred": .bool(emittedEvents > 0)])
+                }
+            }
             if let requiredFront, posts, accessibilitySource.frontmostApp()?.processIdentifier != requiredFront {
                 return injectionRefusal(action: "hand", error: "front_changed", extra: [
                     "requested_events_emitted": .int(Int64(emittedEvents)),
@@ -293,6 +377,8 @@ extension SwiftNativeMacControl {
                 ])
             }
             if Task.isCancelled { return injectionRefusal(action: "hand", error: "gesture_cancelled") }
+            // After every suspending gate, immediately before pointer input.
+            if let refusal = imageMiss(step) { return refusal }
             switch step {
             case .key(let event):
                 if event.unicodeText != nil, !checkedTextInput {
@@ -305,19 +391,17 @@ extension SwiftNativeMacControl {
                     if gesture == "click_type", clickTarget?.pid != pid {
                         return injectionRefusal(action: "hand", error: "front_changed")
                     }
-                    let editorBefore = gesture == "click_type" ? clickTarget?.element
-                        : accessibilityActSource.focusedElement(pid: pid).flatMap {
-                            MacActClosedLoop.canType(role: $0.role) ? $0 : nil
-                        }
-                    textInput = await waitForTextInput(
+                    let editorBefore = gesture == "click_type" ? clickTarget?.element : nil
+                    textFocus = await waitForTextFocus(
                         pid: pid, target: editorBefore, clickPoint: clickTarget?.point
                     )
-                    guard textInput != nil else {
+                    guard let textFocus else {
                         return injectionRefusal(action: "hand", error: "text_editor_not_ready", extra: [
                             "requested_events_emitted": .int(Int64(emittedEvents)),
                             "text_events_emitted": .int(0),
                         ])
                     }
+                    textInput = accessibilityActSource.textInput(textFocus)
                     if Task.isCancelled { return injectionRefusal(action: "hand", error: "gesture_cancelled") }
                     if let refusal = await attentionActionRefusal(action: "hand", body: body) {
                         return refusal
@@ -326,9 +410,9 @@ extension SwiftNativeMacControl {
                         return injectionRefusal(action: "hand", error: "front_changed")
                     }
                 }
-                if let input = textInput, event.down,
+                if let input = textFocus, event.down,
                    let pid = requiredFront ?? accessibilitySource.frontmostApp()?.processIdentifier,
-                   !accessibilityActSource.isFocusedElement(input.target, pid: pid) {
+                   !accessibilityActSource.isFocusedElement(input, pid: pid) {
                     return injectionRefusal(action: "hand", error: "focus_moved", extra: [
                         "requested_events_emitted": .int(Int64(emittedEvents)),
                     ])
@@ -338,12 +422,7 @@ extension SwiftNativeMacControl {
                     guard let pid = requiredFront ?? accessibilitySource.frontmostApp()?.processIdentifier else {
                         return injectionRefusal(action: "hand", error: "front_unknown")
                     }
-                    guard let target = accessibilityActSource.elementAtPosition(x: event.x, y: event.y, pid: pid) else {
-                        return injectionRefusal(action: "hand", error: "text_editor_not_ready", extra: [
-                            "requested_events_emitted": .int(Int64(emittedEvents)),
-                            "text_events_emitted": .int(0),
-                        ])
-                    }
+                    let target = accessibilityActSource.elementAtPosition(x: event.x, y: event.y, pid: pid)
                     clickTarget = (pid, target, CGPoint(x: event.x, y: event.y))
                 }
             default: break
@@ -374,6 +453,7 @@ extension SwiftNativeMacControl {
         // Compare complete values; excerpts lack caption/group context and stay redacted.
         let verdict = MacActClosedLoop.verify(declaration,
             value: (selectionTarget ?? textInput?.target).flatMap { accessibilityActSource.reread($0)?.value },
+            valueBefore: selectionTarget == nil ? textInput?.value : nil,
             selection: selectionTarget.flatMap { accessibilityActSource.textInput($0)?.selection },
             dismissed: surfaceWindowBefore.flatMap { accessibilityActSource.windowPresence($0) }.map { !$0 },
             processGone: surfacePid.map { accessibilitySource.appInfo(pid: $0) == nil } ?? false, redactingText: true)
@@ -426,11 +506,18 @@ extension SwiftNativeMacControl {
             if Task.isCancelled { return stopped(cancelled()) }
             switch step {
             case .key(let event):
-                if let toPid {
-                    guard eventSink.post(key: event, toPid: toPid) else {
-                        return stopped(injectionRefusal(action: action, error: "needs_front"))
-                    }
-                } else { eventSink.post(key: event) }
+                // A read-scroll exemption belongs to its navigation, never to
+                // an arbitrary chord wrapped around it by `holding`.
+                let posted = MacAppActGate.$looking.withValue(MacAppActGate.looking && MacAppActGate.holdingAllowsLooking(body)) {
+                    if let toPid { return eventSink.post(key: event, toPid: toPid) }
+                    eventSink.post(key: event)
+                    return true
+                }
+                guard posted else {
+                    if let refusal = MacDriverContext.binding?.takeAppActRefusal() { return stopped(refusal.result(action: action)) }
+                    return stopped(injectionRefusal(action: action, error: "needs_front"))
+                }
+                if let refusal = MacDriverContext.binding?.takeAppActRefusal() { return stopped(refusal.result(action: action)) }
                 emitted += 1
                 if event.down { heldKeys.append(event.keyCode) }
                 else { heldKeys.removeAll { $0 == event.keyCode } }
@@ -460,6 +547,7 @@ extension SwiftNativeMacControl {
                 } catch { return stopped(cancelled()) }
                 if let refusal = await attentionActionRefusal(action: action, body: body) { return stopped(refusal) }
             }
+            if let refusal = MacDriverContext.binding?.takeAppActRefusal() { return stopped(refusal.result(action: action)) }
         }
         return Task.isCancelled ? stopped(cancelled()) : (emitted, 0, nil)
     }

@@ -1,6 +1,6 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `TurnDeadline.swift` | `TurnDeadline`: active-work deadlines pause for a person and renew on progress; wall-clock ceilings never pause or renew; `secondsLeft` reads the tightest ceiling; `TurnBodyLifetime` admits one body inside its deadline scope, cancels and joins its actual result through settlement |
+// Blueprint: | `TurnDeadline.swift` | `TurnDeadline`: active-work ceilings pause for a person and renew on progress; wall-clock ceilings never pause or renew; response-only expiry leaves work running and is excluded from secondsLeft; Stop requests cancellation; `TurnBodyLifetime` admits one body and cancels/joins its actual result through settlement |
 
 public final class TurnDeadline: @unchecked Sendable {
     public enum Clock: Sendable, Equatable { case activeWork, wallClock }
@@ -15,9 +15,12 @@ public final class TurnDeadline: @unchecked Sendable {
 
     private let full: Duration
     private let clock: Clock
+    /// A response-only ceiling participates in progress/person waits, but
+    /// cannot become a transport/effect budget read by the work it observes.
+    private let boundsWork: Bool
 
-    private init(seconds: TimeInterval, clock: Clock) {
-        remaining = .seconds(seconds); full = .seconds(seconds); self.clock = clock
+    private init(seconds: TimeInterval, clock: Clock, boundsWork: Bool) {
+        remaining = .seconds(seconds); full = .seconds(seconds); self.clock = clock; self.boundsWork = boundsWork
     }
 
     /// Work that shows progress (a part that carried itself one more run)
@@ -31,7 +34,7 @@ public final class TurnDeadline: @unchecked Sendable {
     /// no ceiling binds this work. A paused ceiling (a person's wait) leaves
     /// what it had; one that has fired leaves nothing.
     public static var secondsLeft: TimeInterval? {
-        current.map { $0.left() }.min()
+        current.filter { $0.boundsWork }.map { $0.left() }.min()
     }
 
     private func left() -> TimeInterval {
@@ -103,21 +106,6 @@ public final class TurnDeadline: @unchecked Sendable {
         lock.withLock { expiry = nil; started = nil; sleeper?.cancel(); sleeper = nil }
     }
 
-    /// Run `work` with the chosen ceiling, returning nil when the ceiling
-    /// wins. Work runs as an unstructured child so the caller returns
-    /// the moment the ceiling passes: a task group would still wait for a
-    /// stuck operation to observe its cancellation before the scope closes.
-    /// The loser is cancelled and its late result is discarded.
-    /// This bounds the response, not execution. Callers must keep exclusion
-    /// and resources inside `work` until its actual exit, even after timeout.
-    public static func withDeadline<T: Sendable>(
-        seconds: TimeInterval,
-        clock: Clock = .activeWork,
-        _ work: @escaping @Sendable () async throws -> T
-    ) async -> T? {
-        try? await withThrowingDeadline(seconds: seconds, clock: clock, work)
-    }
-
     public struct DeadlineExceeded: Error, LocalizedError, Sendable {
         public var errorDescription: String? { "The operation exceeded its deadline." }
     }
@@ -127,16 +115,19 @@ public final class TurnDeadline: @unchecked Sendable {
     }
 
     /// Preserve provider/storage errors separately from deadline expiry and Stop.
+    /// `cancelWorkOnExpiry:false` ends only the response wait. The original
+    /// work must own its terminal receipt; Stop still requests cancellation.
     public static func withThrowingDeadline<T: Sendable>(
         seconds: TimeInterval,
         clock: Clock = .activeWork,
+        cancelWorkOnExpiry: Bool = true,
         _ work: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         try Task.checkCancellation()
         guard seconds.isFinite, seconds >= 0, seconds < Double(Int64.max) else {
             throw InvalidDeadline()
         }
-        let deadline = TurnDeadline(seconds: seconds, clock: clock)
+        let deadline = TurnDeadline(seconds: seconds, clock: clock, boundsWork: cancelWorkOnExpiry)
         let deadlines = current + [deadline]
         let child = Task { () -> Result<T, Error> in
             do { return .success(try await Self.$current.withValue(deadlines) { try await work() }) }
@@ -145,7 +136,9 @@ public final class TurnDeadline: @unchecked Sendable {
         let once = ContinuationOnce<Result<T, Error>>()
         deadline.lock.withLock {
             deadline.expiry = {
-                once.resume(.failure(DeadlineExceeded())) { child.cancel() }
+                once.resume(.failure(DeadlineExceeded())) {
+                    if cancelWorkOnExpiry { child.cancel() }
+                }
             }
             deadline.arm()
         }
@@ -180,6 +173,13 @@ public final class TurnBodyLifetime<T: Sendable>: @unchecked Sendable {
 
     public init() {}
 
+    /// Retained owners can still stop the body after its response wait ended.
+    /// Closing admission also covers cancellation before the body starts.
+    public func cancel() {
+        let running = lock.withLock { closed = true; return task }
+        running?.cancel()
+    }
+
     public func run(_ work: @escaping @Sendable () async throws -> T) async throws -> T {
         try await withTaskCancellationHandler {
             let running: Task<T, Error> = try lock.withLock {
@@ -191,8 +191,7 @@ public final class TurnBodyLifetime<T: Sendable>: @unchecked Sendable {
             }
             return try await running.value
         } onCancel: {
-            let running = self.lock.withLock { self.closed = true; return self.task }
-            running?.cancel()
+            self.cancel()
         }
     }
 

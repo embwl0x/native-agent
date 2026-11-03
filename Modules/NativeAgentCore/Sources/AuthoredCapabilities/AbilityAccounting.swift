@@ -5,20 +5,51 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `AbilityAccounting.swift` | Locked execution settlement and learned-use accounting |
+// Blueprint: | `AbilityAccounting.swift` | Locked execution settlement and learned-use accounting; observed dependency snapshots and refresh receipts share the terminal state write without changing sealed candidate identity |
 extension AbilityStore {
     /// Terminal accounting survives caller cancellation with its causal act.
     /// A run owns this once; projections do not manufacture run evidence.
-    public func settleRun(id: String, version: String, receipt: JSONValue, input: JSONValue?) async -> JSONValue {
+    public func settleRun(id: String, version: String, receipt: JSONValue, input: JSONValue?, dependencySnapshot: JSONValue? = nil) async -> JSONValue {
         let cause = Experience.currentAct
         return await settle {
             Experience.$currentAct.withValue(cause) {
                 var fields = receipt.objectValue ?? [:]
                 do {
-                    if let upgrade = try recordRun(id: id, version: version, receipt: receipt, input: input) {
-                        fields["upgrade"] = .string(upgrade)
+                    try Self.withLock {
+                        let recorded = try accounting(id: id) {
+                            // Observed contracts are evidence of this invocation,
+                            // not a replacement for the candidate's sealed inputs.
+                            if let snapshot = dependencySnapshot?.objectValue, try readFile(id: id, slot: .current) != nil,
+                               let file = try [Slot.current, .previous].compactMap({ try readFile(id: id, slot: $0) }).first(where: { identity($0) == version }) {
+                                let selected = version + "@" + String(file.metadata["version"]?.integer ?? 1)
+                                let evidence = try readState()[id]?.objectValue?["runs"]?.objectValue?["versions"]?.objectValue?[selected]?.objectValue
+                                let before = evidence?["dependencySnapshot"]?.objectValue ?? [:]
+                                let sealed = file.metadata["candidate"]?.objectValue?["dependencyShapes"]?.objectValue ?? [:]
+                                let changed = snapshot.keys.sorted().filter { action in
+                                    guard snapshot[action] != .null else { return false }
+                                    let prior = before[action].flatMap { $0 == .null ? nil : $0 } ?? sealed[action]
+                                    // No observation is not evidence that a schema changed.
+                                    return prior != nil && prior != .null && prior != snapshot[action]
+                                }
+                                fields["dependencySnapshot"] = .object(snapshot)
+                                if !changed.isEmpty {
+                                    fields["refreshed"] = .array(changed.map { .string("refreshed: \($0) schema changed; this ability's statically readable calls still fit; computed arguments are checked at the door") })
+                                }
+                            }
+                            let recorded = try recordRunEvidence(id: id, version: version, receipt: .object(fields), input: input, nativeSense: nil)
+                            return (recorded.written, recorded)
+                        }
+                        if !recorded.written {
+                            fields.removeValue(forKey: "refreshed"); fields.removeValue(forKey: "dependencySnapshot")
+                        }
+                        if let upgrade = recorded.upgrade {
+                            fields["upgrade"] = .string(upgrade)
+                        }
                     }
-                } catch { fields["accounting_error"] = .string(error.localizedDescription) }
+                } catch {
+                    fields.removeValue(forKey: "refreshed"); fields.removeValue(forKey: "dependencySnapshot")
+                    fields["accounting_error"] = .string(error.localizedDescription)
+                }
                 return .object(fields)
             }
         }
@@ -38,7 +69,6 @@ extension AbilityStore {
     public func recordRounds(id: String, rounds: Int) throws {
         try accounting(id: id) {
             try Self.withLock {
-                try migrate()
                 guard try readFile(id: id, slot: .current) != nil else { return (false, ()) }
                 var state = try readState(), row = state[id]?.objectValue ?? [:], runs = row["runs"]?.objectValue ?? [:]
                 runs["rounds"] = .array(Array(((runs["rounds"]?.arrayValue ?? []) + [.int(Int64(rounds))]).suffix(CapabilityLifecycle.inputLimit)))
@@ -70,7 +100,6 @@ extension AbilityStore {
     /// Not written when the run's part or version is gone.
     private func recordRunEvidence(id: String, version: String, receipt: JSONValue, input: JSONValue?, nativeSense: JSONValue?) throws -> (written: Bool, upgrade: String?) {
         try Self.withLock {
-            try migrate()
             // Native/bundled reads have a registry record but no executable file.
             guard let current = try readFile(id: id, slot: .current) ?? nativeSense.map({
                 try File(id: id, kind: .sense, metadata: ["record": $0, "version": $0.objectValue?["version"] ?? .int(1)], body: "", pathExtension: "js")
@@ -85,23 +114,19 @@ extension AbilityStore {
             var runs = row["runs"]?.objectValue ?? [:], versions = runs["versions"]?.objectValue ?? [:]
             let currentKey = (currentIdentity ?? current.bodyDigest) + "@" + String(current.metadata["version"]?.integer ?? 1)
             let previousKey = previous.map { (previousIdentity ?? $0.bodyDigest) + "@" + String($0.metadata["version"]?.integer ?? 1) }
-            if let previousKey, versions[previousKey] == nil,
-               row["lastCleanVersion"] == previousIdentity.map(JSONValue.string),
-               row["lastRunVersion"] == row["lastCleanVersion"], row["lastRun"]?.objectValue?["status"] == .string("ok"),
-               let at = row["lastUsedAt"] {
-                versions[previousKey] = .object(["last": .object(["outcome": .string("ok"), "at": at]), "ok": .int(1), "count": .int(1)])
-            }
             let selected = version + "@" + String(file.metadata["version"]?.integer ?? 1), now = Date()
             let at = NativeTimestampFormat.plainZulu(now)
             var evidence = versions[selected]?.objectValue ?? [:]
             let outcome = Self.runOutcome(receipt)
             let field = "state.\(id).runs.versions.\(selected)"
-            let priorCount = try evidence["count"] ?? .int(Self.outcomeCount(evidence, at: field))
+            // Existing evidence was checked by readState; only a new version starts at zero.
+            let priorCount = evidence["count"] ?? .int(0)
             let count = try Self.increment(priorCount, field: field + ".count")
             evidence["count"] = .int(count)
             evidence["last"] = .object(["outcome": .string(outcome), "at": .string(at)])
             evidence[outcome] = .int(try Self.increment(evidence[outcome], field: field + "." + outcome))
             let fields = Self.redactedEvidence(receipt).objectValue ?? [:]
+            if let snapshot = fields["dependencySnapshot"] { evidence["dependencySnapshot"] = snapshot }
             if file.kind == .sense, outcome == "ok", fields["read"] == .bool(true) {
                 evidence["reads"] = .int(try Self.increment(evidence["reads"], field: field + ".reads"))
             }
@@ -154,7 +179,7 @@ extension AbilityStore {
             }
             row["lastUsedAt"] = file.kind == .sense ? .double(now.timeIntervalSinceReferenceDate) : .string(at)
             row["lastRunVersion"] = .string(version)
-            row["lastRun"] = .object(fields.filter { ["status", "effects", "version", "calls", "error", "stopped"].contains($0.key) }
+            row["lastRun"] = .object(fields.filter { ["status", "effects", "version", "calls", "error", "stopped", "refreshed"].contains($0.key) }
                 .merging(evidence["last"]?.objectValue ?? [:]) { _, new in new })
             if outcome == "ok" { row["lastCleanVersion"] = .string(version) }
             state[id] = .object(row); try writeState(state)
@@ -206,9 +231,9 @@ extension AbilityStore {
         if fault["origin"] == .string("javascript") || fields["status"] == .string("error") && reason.isEmpty { return "error" }
         return "refused"
     }
-    /// Migrates legacy storage on disk before reading accounting; unsuitable for a filesystem-read-only audit.
+    /// Read-only accounting snapshot, cached only for the exact checked file identity.
     public func states() throws -> [String: JSONValue] {
-        try Self.withLock { try migrate(); return try readState() }
+        try Self.withLock { return try readState() }
     }
     public func saveState(id: String, fields: [String: JSONValue]) throws {
         try updateState(id: id) { $0 = fields }
@@ -216,7 +241,6 @@ extension AbilityStore {
     /// One part's accounting, changed under the store's lock.
     public func updateState(id: String, _ change: (inout [String: JSONValue]) -> Void) throws {
         try Self.withLock {
-            try migrate()
             var stats = try readState(), fields = stats[id]?.objectValue ?? [:]
             let before = stats[id]
             change(&fields); stats[id] = .object(fields)

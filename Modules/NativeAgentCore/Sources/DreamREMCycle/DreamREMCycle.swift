@@ -45,7 +45,7 @@ public struct DreamEntry: Sendable, Codable, Equatable, Identifiable {
     }
 
     private static let knownKeys: Set<String> = [
-        "date", "filename", "content", "size", "modified_at", "modifiedAt", "extras",
+        "date", "filename", "content", "size", "modified_at", "extras",
     ]
 
     public init(from decoder: Decoder) throws {
@@ -64,10 +64,7 @@ public struct DreamEntry: Sendable, Codable, Equatable, Identifiable {
         self.filename = try str("filename")
         self.content = try str("content")
         self.size = try intV("size")
-        // Prefer snake_case `modified_at` while accepting camelCase input.
-        let modAtSnake = try str("modified_at")
-        let modAtCamel = try str("modifiedAt")
-        self.modifiedAt = modAtSnake ?? modAtCamel
+        self.modifiedAt = try str("modified_at")
 
         var unknown = c.unknownFields(excluding: Self.knownKeys)
         if let explicit = try jv("extras") {
@@ -127,10 +124,10 @@ public enum DreamREMCycleError: Error, LocalizedError {
 // dream_diary writes; REMConsolidator owns weekly REM distillation, proposal
 // staging, GROWTH.md cap/eviction, and archival.
 
-/// The two gates the dream/REM cycle consults, in the legacy policy shape.
+/// The gates the dream/REM cycle consults from checked saved authority.
 /// Construct from the Trust policy the Swift app already decodes
 /// (`TrustTrainingPolicy` + `personalityPolicy.dream_cycle_enabled`). Defaults
-/// preserve the pre-cutover behavior for older policy files.
+/// apply only when policy, block or key is genuinely absent.
 public struct DreamREMGatePolicy: Sendable, Equatable {
     /// `trainingPolicy.dream_scheduler` — shipped default true.
     public var dreamScheduler: Bool
@@ -150,8 +147,8 @@ public struct DreamREMGatePolicy: Sendable, Equatable {
     }
 
     /// All three flags come from the same validated authority snapshot.
-    public init(authority: SavedTrustPolicyAuthority) {
-        self.init(
+    public init(authority: SavedTrustPolicyAuthority) throws {
+        try self.init(
             dreamScheduler: authority.flag(block: "trainingPolicy", key: "dream_scheduler", default: true),
             dreamCycleEnabled: authority.flag(block: "personalityPolicy", key: "dream_cycle_enabled", default: true),
             remCycleEnabled: authority.flag(block: "trainingPolicy", key: "rem_cycle_enabled", default: true)
@@ -238,14 +235,18 @@ public struct FileBackedDreamDiary: Sendable {
     public struct DiaryFile: Sendable {
         public let name: String
         public let url: URL
-        /// Calendar-day prefix, including session-suffixed entries; nil for other Markdown.
+        /// Calendar day for a nightly filename; nil for other Markdown.
         public let day: String?
         public var stem: String { (name as NSString).deletingPathExtension }
     }
 
     private static func day(from stem: String) -> String? {
-        guard stem.range(of: #"^\d{4}-\d{2}-\d{2}(?:_.+)?$"#, options: .regularExpression) != nil else { return nil }
-        return String(stem.prefix(10))
+        let day = String(stem.prefix(10))
+        guard day.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil else { return nil }
+        if stem == day { return day }
+        // DreamArchiver's live collision writer retains both copies as <day>_<UUID>.md.
+        guard stem.dropFirst(10).first == "_", UUID(uuidString: String(stem.dropFirst(11))) != nil else { return nil }
+        return day
     }
 
     /// Discovery only: callers choose active/history coverage and filename policy.
@@ -278,10 +279,7 @@ public struct FileBackedDreamDiary: Sendable {
     /// REM reads active dated entries, oldest first, with the day prefix as identity.
     public func entriesSince(_ since: Date?) throws -> [DreamEntry] {
         try discover(in: .active, matching: .dated, since: since).map { file in
-            var entry = try materialize(file, date: file.day!)
-            entry.size = entry.size ?? (try? Data(contentsOf: file.url))?.count ?? 0
-            entry.modifiedAt = entry.modifiedAt ?? ISO8601DateFormatter().string(from: Date())
-            return entry
+            try materialize(file, date: file.day!)
         }.sorted {
             $0.date == $1.date ? ($0.filename ?? "") < ($1.filename ?? "") : $0.date < $1.date
         }
@@ -443,6 +441,7 @@ public actor SwiftNativeDreamREMCycle {
         dataRoot: URL,
         gate: DreamREMGatePolicy? = nil,
         dreamMemoryDeltaProvider: DreamMemoryDeltaProvider? = nil,
+        dreamSurpriseProvider: DreamSurpriseProvider? = nil,
         dreamFeltSummaryProvider: DreamFeltSummaryProvider? = nil,
         dreamFeltOriginProvider: DreamFeltOriginProvider? = nil,
         dreamCareNightProvider: DreamCareNightProvider? = nil,
@@ -450,9 +449,9 @@ public actor SwiftNativeDreamREMCycle {
         dreamMoodSink: DreamDatedMoodSink? = nil,
         remStageApproval: REMApprovalStager? = nil,
         lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
-    ) {
+    ) throws {
         self.dataRoot = dataRoot
-        let effectiveGate = gate ?? DreamREMGatePolicy(authority: .read(dataRoot: dataRoot))
+        let effectiveGate = try gate ?? DreamREMGatePolicy(authority: .read(dataRoot: dataRoot))
         let llm = makeResidentProviderLLMClient(
             dataRoot: dataRoot, lifecycleObserver: lifecycleObserver, stallOnlyTransport: true)
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
@@ -463,11 +462,12 @@ public actor SwiftNativeDreamREMCycle {
             personaRoot: personaRoot,
             llm: llm,
             memoryDeltaProvider: dreamMemoryDeltaProvider ?? { _ in [] },
+            surpriseProvider: dreamSurpriseProvider ?? { _, _ in "" },
             feltSummaryProvider: dreamFeltSummaryProvider ?? { nil },
             feltOriginProvider: dreamFeltOriginProvider ?? { [] },
-            careNightProvider: dreamCareNightProvider ?? { nil },
-            receiptSink: dreamReceiptSink ?? { _, _ in },
-            datedMoodSink: dreamMoodSink ?? { _, _ in true },
+            careNightProvider: dreamCareNightProvider ?? { throw PersistenceCoreError.ioFailure("care night evidence provider is unavailable") },
+            receiptSink: dreamReceiptSink ?? { _, _ in throw PersistenceCoreError.ioFailure("dream receipt delivery is unavailable") },
+            datedMoodSink: dreamMoodSink,
             gate: effectiveGate
         )
         // The app wires the same approval stager for manual and scheduled REM.
@@ -481,11 +481,18 @@ public actor SwiftNativeDreamREMCycle {
     }
 
     /// Manual and scheduled dreams share one gate, runner and dedupe; the trigger selects receipt and target day.
-    public func runDream(force: Bool, trigger: DreamTrigger) async throws -> DreamReport {
+    public func previewDream() async throws -> DreamReport {
+        try requireLiveProviders()
+        // No lifecycle observer, owed repair, reservation, diary, mark, lesson,
+        // mood or care write. The runner owns assembly, generation and decode.
+        return try await dreamRunner.runNightlyDreamCycle(trigger: .manual, preview: true)
+    }
+
+    public func runDream(force: Bool, trigger: DreamTrigger, delivery: DreamEffectSink? = nil) async throws -> DreamReport {
         try requireLiveProviders()
         let report: DreamReport
         do {
-            report = try await dreamRunner.runNightlyDreamCycle(force: force, trigger: trigger)
+            report = try await dreamRunner.runNightlyDreamCycle(force: force, trigger: trigger, delivery: delivery)
         } catch {
             await RepairOwed.owe(dataRoot, id: "dream-repair:" + UUID().uuidString, kind: .run,
                 operation: "dream", owner: "dream cycle", words: error.localizedDescription,
@@ -506,7 +513,7 @@ public actor SwiftNativeDreamREMCycle {
                 operation: "dream", owner: owner, words: report.errors.joined(separator: "\n"),
                 nextCall: tap == nil ? ToolFailureError.call("app", ["action": .string("mind.dream")]) : nil,
                 tap: tap).value
-        } else if report.entriesWritten > 0 {
+        } else if report.entriesWritten > 0 || report.effectsSettled > 0 {
             await RepairOwed.settle(dataRoot, operation: "dream",
                 evidence: .init(source: "dream_diary", id: NativeTimestampFormat.fractionalZulu(Date()))).value
         }
@@ -546,11 +553,11 @@ public func makeDreamREMCycle(
     remStageApproval: REMApprovalStager? = nil,
     dreamMoodSink: DreamDatedMoodSink? = nil,
     lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
-) -> SwiftNativeDreamREMCycle {
-    return SwiftNativeDreamREMCycle(
+) throws -> SwiftNativeDreamREMCycle {
+    return try SwiftNativeDreamREMCycle(
         dataRoot: root, gate: gate,
         dreamMoodSink: dreamMoodSink, remStageApproval: remStageApproval,
         lifecycleObserver: lifecycleObserver)
 }
 import CognitiveSubstrate
-// Blueprint: | `DreamREMCycle.swift` | `FileBackedDreamDiary`: typed active/archive discovery, filename/day extraction, checked browsing and by-date reads |
+// Blueprint: | `DreamREMCycle.swift` | `FileBackedDreamDiary`: typed active/archive discovery and checked reads; `SwiftNativeDreamREMCycle` threads shared self/surprise/felt providers into real and preview dream generation; preview bypasses the facade's repair writes |

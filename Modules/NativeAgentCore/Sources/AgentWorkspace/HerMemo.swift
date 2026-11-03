@@ -10,7 +10,7 @@ import StandingBots
 import WorkshopExecution
 import SwarmRuns
 import NativeAgentShared
-// Blueprint: | `HerMemo.swift` | `HerMemo` singleton retained workspace reads; file and owner lifecycle invalidations track revisions, publish completion and rebind child watches; observations share the 30-minute/128-key window, including keys without values; shutdown closes admission and cancels passive resources; serialized seen-file access, turn-pinned glances and repeated-home retention |
+// Blueprint: | `HerMemo.swift` | `HerMemo` singleton retained workspace reads; file and owner invalidations publish a checked Result on completion, including source failure, and rebind child watches; observations share the 30-minute/128-key window, including keys without values; shutdown closes admission and cancels passive resources; serialized seen-file access, turn-pinned glances and repeated-home retention |
 
 /// Retained world parts by input stamp; older reads never replace newer stored values.
 package final class HerMemo: @unchecked Sendable {
@@ -55,7 +55,7 @@ package final class HerMemo: @unchecked Sendable {
         prune(now)
     }
 
-    func value<T>(_ key: String, stamp: [String], compute: () async -> T) async -> T {
+    func value<T>(_ key: String, stamp: [String], compute: () async throws -> T) async rethrows -> T {
         let (hit, generation): (T?, Int) = lock.withLock {
             let now = Date()
             prune(now)
@@ -64,7 +64,7 @@ package final class HerMemo: @unchecked Sendable {
             return (store[key].flatMap { $0.stamp == stamp ? $0.value as? T : nil }, store[key]?.generation ?? 0)
         }
         if let hit { return hit }
-        let value = await compute()
+        let value = try await compute()
         lock.withLock {
             if (store[key]?.generation ?? 0) == generation { keep(key, stamp: stamp, value: value) }
         }
@@ -104,7 +104,7 @@ package final class HerMemo: @unchecked Sendable {
 
     /// Owner events invalidate before reading; completions publish the retained picture.
     func observe<T>(_ key: String, paths: @escaping @Sendable () -> [URL], notifications: [Notification.Name],
-                    compute: @escaping @Sendable () async -> T?) {
+                    compute: @escaping @Sendable () async throws -> T) {
         let ports = AgentWorkspacePorts.current
         lock.withLock {
             prune(Date())
@@ -136,8 +136,10 @@ package final class HerMemo: @unchecked Sendable {
                                 guard !Task.isCancelled else { break }
                                 guard paths() == watched else { break }
                                 let revision = lock.withLock { observations[key]?.revision ?? 0 }
-                                let value = await AgentWorkspacePorts.$binding.withValue(ports) { await compute() }
-                                if let value, !Task.isCancelled {
+                                let value: Result<T, Error>
+                                do { value = .success(try await AgentWorkspacePorts.$binding.withValue(ports) { try await compute() }) }
+                                catch { value = .failure(error) }
+                                if !Task.isCancelled {
                                     lock.withLock {
                                         if observations[key]?.id == id { keep(key, stamp: [String(revision)], value: value) }
                                     }

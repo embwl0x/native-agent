@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import NativeAgentShared
+import Observation
 import UserNotifications
 import SwiftUI
 // Blueprint: | `ApprovalsStore.swift` | Signed approval decisions, refresh state and pending-arrival notifications |
@@ -68,6 +69,24 @@ final class ApprovalsStore: ObservableObject {
     var isVisible = false
     private var hasLoadedApprovals = false
     private var notifiedPendingIDs = Set<String>()
+    private var notifyingPendingIDs = Set<String>()
+
+    init() {
+        observeSnapshotAvailability()
+    }
+
+    private func observeSnapshotAvailability() {
+        let loaded = withObservationTracking {
+            iCloudSyncEngine.shared.approvalsSnapshotLoaded
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.observeSnapshotAvailability()
+            }
+        }
+        // The first successful delivery can leave the rows unchanged at [].
+        // Seed from its availability, independently of view array observers.
+        if loaded { applySyncedApprovalsFromSnapshot() }
+    }
 
     // MARK: - Fetch
 
@@ -82,13 +101,14 @@ final class ApprovalsStore: ObservableObject {
     }
 
     func applySyncedApprovalsFromSnapshot(notifyNewPending: Bool = true) {
+        guard iCloudSyncEngine.shared.approvalsSnapshotLoaded else { return }
+        bannerWarning = nil
+        bannerError = iCloudSyncEngine.shared.snapshotHealth.damageSentence(for: ["approvals.json"])
         if notifyNewPending {
             notifyForNewPendingApprovals(approvals)
         } else {
             rememberPendingApprovals(approvals)
         }
-        bannerWarning = nil
-        bannerError = nil
     }
 
     // MARK: - Decide
@@ -135,30 +155,44 @@ final class ApprovalsStore: ObservableObject {
     private func notifyForNewPendingApprovals(_ next: [PendingApproval]) {
         let pending = next.filter { $0.outcome == .pending }
         let pendingIDs = pending.map(\.id)
-        defer {
-            notifiedPendingIDs.formUnion(pendingIDs)
-            hasLoadedApprovals = true
+        guard hasLoadedApprovals, !isVisible else {
+            rememberPendingApprovals(next)
+            return
         }
 
         let plan = ApprovalPendingNotificationPresentation.plan(
             hasLoadedApprovals: hasLoadedApprovals,
             isVisible: isVisible,
             pendingIDs: pendingIDs,
-            notifiedIDs: notifiedPendingIDs
+            notifiedIDs: notifiedPendingIDs.union(notifyingPendingIDs)
         )
         for id in plan.individualApprovalIDs {
             guard let approval = pending.first(where: { $0.id == id }) else { continue }
-            fireApprovalNotification(approval)
+            postNotification(ids: [id]) { try await Self.fireApprovalNotification(approval) }
         }
         if let summaryCount = plan.summaryCount {
-            fireApprovalSummaryNotification(count: summaryCount)
+            let ids = Set(pendingIDs).subtracting(notifiedPendingIDs).subtracting(notifyingPendingIDs)
+            postNotification(ids: ids) { try await Self.fireApprovalSummaryNotification(count: summaryCount) }
         }
     }
 
-    private func fireApprovalNotification(_ approval: PendingApproval) {
-        Task.detached {
+    private func postNotification(ids: Set<String>, post: @escaping @MainActor () async throws -> Void) {
+        notifyingPendingIDs.formUnion(ids)
+        Task {
+            defer { notifyingPendingIDs.subtract(ids) }
+            do {
+                try await post()
+                notifiedPendingIDs.formUnion(ids)
+            } catch {
+                bannerError = "Approval notification: \(error.localizedDescription)"
+                NSLog("[NativeAgentMobile] Approval notification failed: %@", error.localizedDescription)
+            }
+        }
+    }
+
+    private static func fireApprovalNotification(_ approval: PendingApproval) async throws {
             let center = UNUserNotificationCenter.current()
-            _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
+            try await NativeAgentNotificationEventGate.requireAuthorization(center: center)
             let content = UNMutableNotificationContent()
             content.title = "NativeAgent approval needed"
             content.body = ApprovalText.title(approval)
@@ -167,28 +201,21 @@ final class ApprovalsStore: ObservableObject {
             let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
             userInfo["eventId"] = eventID
             content.userInfo = userInfo
-            _ = try? await NativeAgentNotificationEventGate.add(
+            _ = try await NativeAgentNotificationEventGate.add(
                 content: content, eventID: eventID, trigger: nil, center: center
             )
-        }
     }
 
-    private func fireApprovalSummaryNotification(count: Int) {
-        Task.detached {
+    private static func fireApprovalSummaryNotification(count: Int) async throws {
             let center = UNUserNotificationCenter.current()
-            _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
+            try await NativeAgentNotificationEventGate.requireAuthorization(center: center)
             let content = UNMutableNotificationContent()
             content.title = "NativeAgent approvals needed"
             content.body = "\(count) new actions are waiting for review."
             content.sound = .default
             content.userInfo = ["screen": "activity", "source": "approval_summary"]
-            do {
                 let request = UNNotificationRequest(identifier: "nativeagent.approval.summary.\(UUID().uuidString)",
                     content: try await CommunicationNotification.decorate(content), trigger: nil)
                 try await center.add(request)
-            } catch {
-                NSLog("[NativeAgentMobile] Approval summary notification failed: %@", error.localizedDescription)
-            }
-        }
     }
 }

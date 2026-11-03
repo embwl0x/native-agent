@@ -4,9 +4,12 @@ import Darwin
 #endif
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ChatChecks.swift` | ChatSessionsCheck and ChatMessagesIntegrityCheck read session and transcript stores without mutation; ChatMessagesScanCache memoizes canonical-path fingerprints and scan counts |
+import Transcripts
+import NativeAgentShared
+import ChatSessionWork
+// Blueprint: | `ChatChecks.swift` | ChatSessionsCheck uses ChatSession.init(row:); ChatMessagesIntegrityCheck uses SessionHistoryReader's full checked history without mutation; ChatMessagesScanCache memoizes canonical-path fingerprints and scan counts |
 
-/// Read `chat/sessions.json` without mutation: absence is ok/zero; unreadable, empty or non-array data fails.
+/// Read the canonical index without mutation: absence is a new index; unreadable or malformed rows fail.
 public struct ChatSessionsCheck: DoctorCheck {
     public let id: String = "chat_sessions"
     public let title: String = "Persistent Chat Sessions"
@@ -20,40 +23,18 @@ public struct ChatSessionsCheck: DoctorCheck {
         let sessionsPath = root
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("sessions.json")
-        let fm = FileManager.default
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: sessionsPath.path, isDirectory: &isDir) else {
-            // Fresh install: no sessions.json yet.
-            return CheckResult(source: "chat/sessions.json",
-                id: id, title: title, status: "ok",
-                detail: "Chat session storage is available with 0 session(s).",
-                repair: nil
-            )
-        }
-        if isDir.boolValue {
-            return failResult("sessions.json is a directory, not a file")
-        }
-        let data: Data
+        let count: Int
         do {
-            data = try Data(contentsOf: sessionsPath)
-        } catch {
-            return failResult("could not read sessions.json: \(error.localizedDescription)")
-        }
-        if data.isEmpty {
-            return failResult("sessions.json is empty (not valid JSON)")
-        }
-        guard let parsed = try? JSONSerialization.jsonObject(with: data, options: []) else {
-            return failResult("sessions.json is not valid JSON")
-        }
-        guard let list = parsed as? [Any] else {
-            return failResult("sessions.json is not a JSON list")
-        }
-        // Count only objects with nonempty string IDs.
-        let count = list.reduce(into: 0) { acc, row in
-            if let dict = row as? [String: Any],
-               let sid = dict["id"] as? String, !sid.isEmpty {
-                acc += 1
+            let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+            var rejected: [String] = []
+            for (index, row) in rows.enumerated() {
+                do { _ = try ChatSession(row: row) }
+                catch { rejected.append("Row \(index + 1): \(error.localizedDescription)") }
             }
+            guard rejected.isEmpty else { return failResult(rejected.joined(separator: "; ")) }
+            count = rows.count
+        } catch {
+            return failResult(error.localizedDescription)
         }
         return CheckResult(source: "chat/sessions.json",
             id: id, title: title, status: "ok",
@@ -153,6 +134,7 @@ public struct ChatMessagesIntegrityCheck: DoctorCheck {
         var malformedFiles: [URL] = []
 
         var scannedPaths: Set<String> = []
+        let history = SessionHistoryReader(dataRoot: root)
 
         for file in files {
             let cacheKey = Self.cacheKey(file)
@@ -164,28 +146,21 @@ public struct ChatMessagesIntegrityCheck: DoctorCheck {
                 if memo.unreadable || memo.malformedLines > 0 { malformedFiles.append(file) }
                 continue
             }
-            guard let text = try? String(contentsOf: file, encoding: .utf8) else {
-                malformedFiles.append(file)
-                if let fingerprint {
-                    await Self.sharedScanCache.store(
-                        path: cacheKey,
-                        entry: .init(
-                            stamp: fingerprint,
-                            totalLines: 0, malformedLines: 0, unreadable: true
-                        )
-                    )
-                }
-                continue
-            }
             var fileMalformed = 0
             var fileTotal = 0
-            for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
-                let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
-                if line.isEmpty { continue }
-                fileTotal += 1
-                if (try? JSONValue.parse(Data(line.utf8))) == nil {
-                    fileMalformed += 1
-                }
+            var unreadable = false
+            do {
+                let result = try await history.messagesWithStats(
+                    forSessionId: file.deletingPathExtension().lastPathComponent,
+                    strictEvidence: true, transcriptURL: file
+                )
+                fileTotal = result.stats.linesRead
+                fileMalformed = result.stats.malformedRowCount + result.stats.invalidShapeRowCount
+                // A listed file disappearing during this read is not an empty transcript.
+                if result.stats.mode == "missing" { throw CocoaError(.fileReadNoSuchFile) }
+                _ = try result.checkedMessages()
+            } catch {
+                unreadable = true
             }
             totalLines += fileTotal
             if let fingerprint {
@@ -193,14 +168,12 @@ public struct ChatMessagesIntegrityCheck: DoctorCheck {
                     path: cacheKey,
                     entry: .init(
                         stamp: fingerprint,
-                        totalLines: fileTotal, malformedLines: fileMalformed, unreadable: false
+                        totalLines: fileTotal, malformedLines: fileMalformed, unreadable: unreadable
                     )
                 )
             }
-            if fileMalformed > 0 {
-                malformedLines += fileMalformed
-                malformedFiles.append(file)
-            }
+            malformedLines += fileMalformed
+            if unreadable || fileMalformed > 0 { malformedFiles.append(file) }
         }
 
         await Self.sharedScanCache.retain(
@@ -212,7 +185,7 @@ public struct ChatMessagesIntegrityCheck: DoctorCheck {
                 id: id,
                 title: title,
                 status: "fail",
-                detail: "\(malformedLines) malformed chat JSONL row(s) across \(malformedFiles.count) file(s).",
+                detail: "\(malformedLines) malformed or invalid chat message row(s); \(malformedFiles.count) transcript file(s) damaged or unavailable.",
                 harm: "Parts of saved conversations cannot be read.",
                 repair: nil,
                 human_action: malformedLines == 0 ? malformedFiles.first.map { ToolFailureError.fileRepairInstruction($0,

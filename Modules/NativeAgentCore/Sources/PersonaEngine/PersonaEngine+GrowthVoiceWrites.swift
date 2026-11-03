@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `PersonaEngine+GrowthVoiceWrites.swift` | `SwiftNativePersonaEngine`: shared document-kind normalization and selection, locked persona mutations and private backups; ordinary persona mutations; skill-specific aliases are retired |
+// Blueprint: | `PersonaEngine+GrowthVoiceWrites.swift` | `SwiftNativePersonaEngine`: shared document-kind normalization and selection; locked mutations require checked existing documents and exact-byte private backups; skill-specific aliases are retired |
 
 // Persona tool writes hold one cross-process file lock around each target's
 // read, backup and mutation. USER.md remains owned by MemoryV2.
@@ -55,17 +55,9 @@ extension SwiftNativePersonaEngine {
 
         let contentBytes = Array(content.utf8)
         let backupPath: String? = try await SwiftNativePersistenceCore.withFileLock(target) {
-            let original = FileManager.default.fileExists(atPath: target.path)
-                ? try Data(contentsOf: target) : nil
-            if let keeping, let original {
-                guard let current = String(data: original, encoding: .utf8) else {
-                    throw CocoaError(.fileReadInapplicableStringEncoding, userInfo: [
-                        NSFilePathErrorKey: target.path, NSStringEncodingErrorKey: String.Encoding.utf8.rawValue
-                    ])
-                }
-                try keeping(current)
-            }
-            let backup = try Self.backup(target, data: original)
+            let original = try Self.readPersonaDocumentForMutation(at: target)
+            try keeping?(original.text)
+            let backup = try Self.backup(target, data: original.data)
             try Self.atomicWriteText(content, to: target)
             return backup
         }
@@ -109,10 +101,9 @@ extension SwiftNativePersonaEngine {
         let newSectionBytes = Array(newSection.utf8).count
 
         let backupPath: String? = try await SwiftNativePersistenceCore.withFileLock(target) {
-            let existing = FileManager.default.fileExists(atPath: target.path)
-                ? try Self.readPersonaTextForAppend(at: target) : nil
-            let backup = try Self.backup(target, data: existing?.data)
-            let newContent = Self.rstrip(existing?.text ?? "") + newSection
+            let existing = try Self.readPersonaDocumentForMutation(at: target)
+            let backup = try Self.backup(target, data: existing.data)
+            let newContent = Self.rstrip(existing.text) + newSection
             try Self.atomicWriteText(newContent, to: target)
             return backup
         }
@@ -130,22 +121,15 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - shared write helpers
 
-    /// Append operations are read-modify-write transitions over canonical
-    /// persona documents. An existing unreadable file is authority we cannot
-    /// safely merge, never an empty document; fail before backup/write so the
-    /// original bytes remain the only state until an explicit repair occurs.
-    private static func readPersonaTextForAppend(at url: URL) throws -> (text: String, data: Data) {
+    /// Ordinary edits require the canonical document, even for replacement.
+    /// Read under its lock and fail before backup/write; only explicit setup
+    /// creates documents. Missing or unreadable content is never an empty base.
+    static func readPersonaDocumentForMutation(at url: URL) throws -> (text: String, data: Data) {
         do {
-            let data = try Data(contentsOf: url)
-            guard let text = String(data: data, encoding: .utf8) else {
-                throw CocoaError(.fileReadInapplicableStringEncoding, userInfo: [
-                    NSFilePathErrorKey: url.path, NSStringEncodingErrorKey: String.Encoding.utf8.rawValue
-                ])
-            }
-            return (text, data)
+            return try readPersonaDocumentContents(at: url)
         } catch {
-            throw PersonaWriteError.ioFailure(
-                "Cannot append to unreadable \(url.lastPathComponent): \(error.localizedDescription)"
+            throw PersonaEngineError.rootUnreadable(
+                reason: "cannot read \(url.path): \(error.localizedDescription). Repair or restore this document before continuing."
             )
         }
     }
@@ -169,9 +153,8 @@ extension SwiftNativePersonaEngine {
         return String(String.UnicodeScalarView(scalars))
     }
 
-    /// Copy prior bytes to `<file>.pre-<UTC timestamp>-<8 lowercase hex digits>.bak`; nil means no prior file.
-    static func backup(_ target: URL, data: Data?) throws -> String? {
-        guard let data else { return nil }
+    /// Copy checked prior bytes to `<file>.pre-<UTC timestamp>-<8 lowercase hex digits>.bak`.
+    static func backup(_ target: URL, data: Data) throws -> String {
         let ts = backupTimestamp()
         let uid = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(8))
         let backupURL = target.deletingPathExtension()
@@ -181,8 +164,12 @@ extension SwiftNativePersonaEngine {
         } catch {
             throw PersonaWriteError.ioFailure("Could not create backup: \(error.localizedDescription)")
         }
-        // Keep the newest backupRetention siblings per target; pruning failure cannot fail the write.
-        pruneOldBackups(for: target, keeping: backupRetention)
+        // The edit has not run yet. Refuse it if its backup retention cannot
+        // be maintained, preserving the prior bytes and the newly made copy.
+        do { try pruneOldBackups(for: target, keeping: backupRetention) }
+        catch {
+            throw PersonaWriteError.ioFailure("Created the recovery copy at \(backupURL.path), but could not prune older copies. The edit has not been applied. Repair access to \(target.deletingLastPathComponent().path). \(error.localizedDescription)")
+        }
         return backupURL.path
     }
 
@@ -190,22 +177,22 @@ extension SwiftNativePersonaEngine {
     static let backupRetention = 10
 
     /// Delete all but the newest `keeping` `<basename>.pre-*.bak` siblings of
-    /// `target`. Best-effort: any filesystem error is swallowed. Scoped by an
+    /// `target`. Inspection and deletion failures refuse the pending edit. Scoped by an
     /// exact `<basename>.pre-` prefix so it can only ever touch this file's own
     /// timestamped backups, never another file or a non-backup sibling.
-    static func pruneOldBackups(for target: URL, keeping: Int) {
+    static func pruneOldBackups(for target: URL, keeping: Int) throws {
         guard keeping >= 0 else { return }
         let dir = target.deletingLastPathComponent()
         let prefix = target.lastPathComponent + ".pre-"
-        guard let entries = try? FileManager.default.contentsOfDirectory(
+        let entries = try FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
-        ) else { return }
+        )
         let backups = entries
             .filter { $0.lastPathComponent.hasPrefix(prefix) && $0.lastPathComponent.hasSuffix(".bak") }
             .sorted { $0.lastPathComponent > $1.lastPathComponent }   // newest first
         guard backups.count > keeping else { return }
         for stale in backups.dropFirst(keeping) {
-            try? FileManager.default.removeItem(at: stale)
+            try FileManager.default.removeItem(at: stale)
         }
     }
 

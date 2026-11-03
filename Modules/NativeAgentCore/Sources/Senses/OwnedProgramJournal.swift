@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `OwnedProgramJournal.swift` | Request-owned mutable replay, receipt and read-freshness journal |
+// Blueprint: | `OwnedProgramJournal.swift` | Request-owned mutable replay, receipt and read-freshness journal; a host result joined after Stop keeps its actual classified effects and replay answer; each program owns its execution verdict and aggregates every call's effects, never its last child's verdict |
 extension OwnedProgramRunner {
     final class Journal {
         let lines: [Substring]
@@ -79,15 +79,21 @@ extension OwnedProgramRunner {
             self.recheckReads = replay?.recheckReads ?? true
             self.host = host; self.actionsInFlight = actionsInFlight
             self.notebookRoot = notebookRoot; self.partID = partID
-            self.ownWrites = (replay?.journal ?? []).enumerated().compactMap { at, entry in
+            var resolutionFailure: Error?
+            var ownWrites: [(at: Int, page: String, item: String?, version: String?)] = []
+            do { ownWrites = try (replay?.journal ?? []).enumerated().compactMap { at, entry in
                 // A write that landed, or may have: a failure caught after it changed something counts too.
-                guard let target = OwnedProgramRunner.target(entry, host: host), target.write, case .object(let fields) = entry,
+                guard let target = try OwnedProgramRunner.target(entry, host: host), target.write, case .object(let fields) = entry,
                       case .object(let row)? = fields["row"],
                       ["ok", "unconfirmed"].contains(row["status"]?.scalarText ?? "")
                           || ["occurred", "partial", "unknown"].contains(row["effects"]?.scalarText ?? "") else { return nil }
                 let out = fields["out"]?.scalarText.map(OwnedProgramRunner.readValue)
                 let version: String? = if case .object(let value)? = out { value["page_version"]?.scalarText } else { nil }
                 return (at, target.page, target.item, version)
+            } } catch { resolutionFailure = error }
+            self.ownWrites = ownWrites
+            if let resolutionFailure {
+                stopped = ["reason": .string("action_catalog_unavailable"), "detail": .string(resolutionFailure.localizedDescription)]
             }
             for version in OwnedProgramRunner.ownVersions(replay?.journal ?? []) { own(version) }
         }
@@ -106,14 +112,17 @@ extension OwnedProgramRunner {
                         + "Top-level await is not supported: app.* calls return synchronously. Use const result = app.read(\"inbox\"); return result; without await.")
                 }
                 if let name = message.range(of: #"(?<=Can't find variable: )\w+"#, options: .regularExpression).map({ String(message[$0]) }) {
-                    if host.actionIDs.contains(where: { $0.hasPrefix(name + ".") }) {
+                    do {
+                    let actionIDs = try host.actionIDs
+                    if actionIDs.contains(where: { $0.hasPrefix(name + ".") }) {
                         report["reason"] = .string("script_name")
-                        report["instruction"] = .string("Inside a script, actions live under app: use app.\(name).… (for example app.\(name).\(host.actionIDs.first { $0.hasPrefix(name + ".") }.map { String($0.dropFirst(name.count + 1)) } ?? "…")()).")
+                        report["instruction"] = .string("Inside a script, actions live under app: use app.\(name).… (for example app.\(name).\(actionIDs.first { $0.hasPrefix(name + ".") }.map { String($0.dropFirst(name.count + 1)) } ?? "…")()).")
                     } else if name == "host" {
                         // Drive wave 10-28: `host` is an ability's door, not a script's.
                         report["reason"] = .string("script_name")
                         report["instruction"] = .string("`host` exists only inside a saved ability (ability.save): an ad-hoc app script has app.* and nothing else. Use app.<page>.<action>() here, or save the code as an ability and run authored.<id>.")
                     }
+                    } catch { report["catalog_error"] = .string(error.localizedDescription) }
                 }
                 report.removeValue(forKey: "name")
                 if case .int(let line)? = report["line"], line > 0 { report["source"] = sourceLine(Int(line)) }
@@ -126,7 +135,8 @@ extension OwnedProgramRunner {
             }
             if stopped == nil, case .string(let detail)? = fields["unreadableReturn"] {
                 if strict { stopped = ["reason": .string("unreadable_return"), "detail": .string(detail)] }
-                else { error = ["reason": .string("unreadable_return"), "message": .string(detail)] }
+                else { error = ["reason": .string("unreadable_return"), "message": .string(detail),
+                                "origin": .string("javascript")] }
             }
             returned = fields["returned"] ?? .null
             returnedNote = fields["returnedNote"]?.scalarText
@@ -168,9 +178,17 @@ extension OwnedProgramRunner {
         /// call that can land or stop, and a resumed one answers them from
         /// its journal (`Replay`).
         func call(kind: String, id: String, args: String, line: Int) async -> String {
+            // Validate the transport before replay classification or any host call.
+            guard case .array? = try? JSONValue.parse(Data(args.utf8)) else {
+                stopped = ["line": .int(Int64(line)), "reason": .string("invalid_args"),
+                           "detail": .string("The helper call arguments are not a JSON array. Repair the helper protocol; no call ran.")]
+                return encode(["ok": .bool(false), "reason": .string("invalid_args"),
+                               "detail": stopped?["detail"] ?? .null, "stopped": .bool(true)], line: line, n: ledger.count + 1)
+            }
             // host.call(id, args) is app.<id>(args) unless id is one of the host's own primitives.
             let kind = kind == "primitive" && host.primitiveAction(id) == nil ? "action" : kind
-            let id = kind == "action" ? (host.canonicalAction(id)) : id
+            do {
+            let id = try kind == "action" ? (host.canonicalAction(id)) : id
             guard strict, ["action", "primitive", "read", "find", "decide", "state"].contains(kind), stopped == nil else {
                 return await dispatch(kind: kind, id: id, args: args, line: line)
             }
@@ -199,13 +217,15 @@ extension OwnedProgramRunner {
             if case .object(let fields) = row, let declared = fields["read_only"] {
                 read = declared == .bool(true)
             } else if kind == "primitive" {
-                let given: [JSONValue] = if case .array(let list)? = try? JSONValue.parse(Data(args.utf8)) { list } else { [] }
+                guard case .array(let given)? = try? JSONValue.parse(Data(args.utf8)) else {
+                    return encode(["ok": .bool(false), "reason": .string("invalid_args"), "stopped": .bool(true)], line: line, n: n)
+                }
                 let named: [String: JSONValue] = if case .object(let named)? = given.first { named } else { [:] }
                 read = host.primitiveAction(id)?.readOnly(named) == true
             } else {
-                read = host.action(id)?.read == true
+                read = try host.action(id)?.read == true
             }
-            let reread = recheckReads && Self.status(row) != "answered"
+            let reread = try recheckReads && Self.status(row) != "answered"
                 && (kind == "read" || kind == "find" || (["action", "primitive"].contains(kind) && read))
                 && (kind != "action" || host.action(id)?.advisory != true)
             /// What it went on from reads differently now: nothing more runs.
@@ -225,7 +245,7 @@ extension OwnedProgramRunner {
                     fields["status"] = .string("answered")
                     row = .object(fields)
                 }
-            } else if reread, let mine = writtenLater(replay[replayed - 1], at: replayed - 1) {
+            } else if reread, let mine = try writtenLater(replay[replayed - 1], at: replayed - 1) {
                 // A read the run itself later wrote over replays as saved, below, once what
                 // its last such write left reads the same now: a change since is another's.
                 if let left = mine.version, let now = await currentVersion(left), now != left {
@@ -263,6 +283,11 @@ extension OwnedProgramRunner {
                                     "read_content": entry["read_content"] ?? .null,
                                     "read_projections": entry["read_projections"] ?? .array([])]))
             return out
+            } catch {
+                let detail = "The action catalog could not be read: \(error.localizedDescription). Repair its source before resuming; completed effects must not be repeated."
+                stopped = ["line": .int(Int64(line)), "reason": .string("action_catalog_unavailable"), "detail": .string(detail)]
+                return encode(["ok": .bool(false), "reason": .string("action_catalog_unavailable"), "detail": .string(detail), "stopped": .bool(true)], line: line, n: ledger.count + 1)
+            }
         }
         func sameCall(_ saved: JSONValue?, _ current: JSONValue) -> Bool {
             guard case .array(var was)? = saved, case .array(var now) = current,
@@ -276,8 +301,8 @@ extension OwnedProgramRunner {
         }
         /// Where the stopped run itself wrote, after this read, the page or
         /// item it read (a landed write, exempt or versioned): the last such.
-        func writtenLater(_ entry: JSONValue, at index: Int) -> (at: Int, page: String, item: String?, version: String?)? {
-            guard let read = OwnedProgramRunner.target(entry, host: host), !read.write else { return nil }
+        func writtenLater(_ entry: JSONValue, at index: Int) throws -> (at: Int, page: String, item: String?, version: String?)? {
+            guard let read = try OwnedProgramRunner.target(entry, host: host), !read.write else { return nil }
             return ownWrites.last { $0.at > index && $0.page == read.page
                 && (read.item == nil || $0.item == nil || $0.item == read.item) }
         }
@@ -308,14 +333,21 @@ extension OwnedProgramRunner {
         }
         func append(_ row: JSONValue) {
             guard !unjournaled else { return }
-            if part { ledgerBytes += (try? row.serializedData(pretty: false).count) ?? 0 }
+            if part { account(row) }
             ledger.append(row)
         }
         /// A strict run's replay entry: its full reply, args and projections
         /// are kept too, so they count against the same budget as the ledger.
         func retain(_ entry: JSONValue) {
-            if part { ledgerBytes += (try? entry.serializedData(pretty: false).count) ?? 0 }
+            if part { account(entry) }
             journal.append(entry)
+        }
+        private func account(_ value: JSONValue) {
+            do { ledgerBytes += try value.serializedData(pretty: false).count }
+            catch {
+                stopped = ["reason": .string("serialization_failed"),
+                           "detail": .string("The produced receipt could not be serialized: \(error.localizedDescription). Its effects remain recorded; repair the receipt before continuing.")]
+            }
         }
         /// One call, run: checks the stop and the limits, hands the call to
         /// the caller's task, waits, and records it.
@@ -331,7 +363,9 @@ extension OwnedProgramRunner {
             let n = ledger.count + 1
             var row: [String: JSONValue] = ["n": .int(Int64(n)), "line": .int(Int64(line))]
             if strict, !steps.isEmpty { row["step"] = .int(Int64(steps.count)) }
-            let given: [JSONValue] = if case .array(let list)? = try? JSONValue.parse(Data(args.utf8)) { list } else { [] }
+            guard case .array(let given)? = try? JSONValue.parse(Data(args.utf8)) else {
+                return encode(["ok": .bool(false), "reason": .string("invalid_args"), "stopped": .bool(true)], line: line, n: n)
+            }
             let named: [String: JSONValue] = if case .object(let named)? = given.first { named } else { [:] }
             func answer(_ fields: [String: JSONValue]) -> String { encode(fields, line: line, n: n) }
             func refuse(_ reason: String, _ detail: String, stop: Bool) -> String {
@@ -361,6 +395,9 @@ extension OwnedProgramRunner {
                 let at = stopped["line"]?.scalarText ?? "?"
                 return refuse("stopped", "The script stopped at line \(at); no app call runs after that.", stop: true)
             }
+            let registeredAction: OwnedProgramAction?
+            do { registeredAction = kind == "action" ? try host.action(id) : nil }
+            catch { return mark("action_catalog_unavailable", "The action catalog could not be read: \(error.localizedDescription). Repair its source before running this call.") }
             if kind == "state" {
                 if programEntry == .face { return refuse("projection_only", "A face reads only its frozen sources, never a notebook.", stop: true) }
                 guard case .array(let values)? = try? JSONValue.parse(Data(args.utf8)),
@@ -491,7 +528,7 @@ extension OwnedProgramRunner {
                 }
                 // A strict run's write goes on the version of the page it read.
                 let callArgs: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
-                if strict, let action = host.action(id), action.versioned, !action.readOnly(callArgs) {
+                if strict, let action = registeredAction, action.versioned, !action.readOnly(callArgs) {
                     if case .string(let given)? = input["expected_version"], !given.isEmpty {
                         guard seen.contains(given) else {
                             return refused("not_own_version", "\(id) passed a version this run never read; an ability's write goes on its own read's version. It was not run.", call: name)
@@ -528,7 +565,7 @@ extension OwnedProgramRunner {
             row["call"] = .string(name)
             let arguments = if case .object(let args)? = input["args"] { args } else { named }
             let write = kind == "primitive" ? host.primitiveAction(id)?.readOnly(named) != true
-                : kind == "action" && host.action(id)?.readOnly(arguments) != true
+                : kind == "action" && registeredAction?.readOnly(arguments) != true
             // read_only is the call's class (what it may do, what a resume re-runs); effects is what it did.
             row["read_only"] = .bool(!write)
             let readContent = ReadContent()
@@ -544,15 +581,16 @@ extension OwnedProgramRunner {
                 .object(fields.filter { $0.key != "result" })
             } else { receipt }
             if case .object(let fields) = envelope { row["effects"] = OwnedProgramRunner.effects(fields) }
+            var readIdentityFailure: String?
             if strict, !write {
-                self.readContent = .string(readContent.digest(receipt))
-                readProjections = readContent.projections
-            }
-            guard !isCancelled, !actionsInFlight.isCancelled else {
-                row["status"] = .string("cancelled")
-                if write, row["effects"] == nil { row["effects"] = .string("unknown") }
-                append(.object(row))
-                return stopCall("cancelled", "The turn was stopped while this call was running.", call: name, receipt: receipt)
+                do {
+                    self.readContent = .string(try readContent.digest(receipt))
+                    readProjections = readContent.projections
+                } catch {
+                    let detail = "The call returned data that cannot have a JSON identity: \(error.localizedDescription). Its returned effects are retained; repair the producing action before resuming."
+                    readIdentityFailure = detail
+                    stopped = ["line": .int(Int64(line)), "reason": .string("read_identity_unavailable"), "detail": .string(detail)]
+                }
             }
             // A primitive's result is data, never another receipt. All outcome
             // and effect classification reads only the broker's envelope.
@@ -561,7 +599,9 @@ extension OwnedProgramRunner {
                     && (!host.evidence(envelope).successful || fields["result"] != nil)
             } else { false }
             let (outcome, reason, detail): (Outcome, String, String)
-            if kind == "primitive", !receipted {
+            if let readIdentityFailure {
+                (outcome, reason, detail) = (.unclear, "read_identity_unavailable", readIdentityFailure)
+            } else if kind == "primitive", !receipted {
                 (outcome, reason, detail) = (.unclear, "not_a_receipt", "The primitive returned no terminal status, effects or result.")
             } else {
                 (outcome, reason, detail) = OwnedProgramRunner.classify(envelope, strict: strict || kind == "primitive", write: write, host: host)
@@ -584,6 +624,14 @@ extension OwnedProgramRunner {
                 if kind == "action", fields["reason"]?.scalarText == "stale_version", let was = input["expected_version"]?.scalarText {
                     stale = ["target": .string(OwnedProgramRunner.versionScope(was)), "was": .string(was), "now": fields["current_version"] ?? .null]
                 }
+            }
+            if isCancelled || actionsInFlight.isCancelled {
+                // Stop ends JavaScript, not the completed call's truth. Keep
+                // its classified row and actual replay answer before returning
+                // the terminal receipt; a resume never repeats this write.
+                stopped = ["n": .int(Int64(n)), "line": .int(Int64(line)), "source": sourceLine(line),
+                    "call": .string(name), "reason": .string("cancelled"),
+                    "detail": .string("The turn was stopped; this call's actual result was kept.")]
             }
             switch outcome {
             case .ok, .preview:
@@ -615,6 +663,11 @@ extension OwnedProgramRunner {
                 row["detail"] = .string(detail)
                 if write, row["effects"] == nil { row["effects"] = .string("unknown") }
                 append(.object(row))
+                if let readIdentityFailure {
+                    return answer(["ok": .bool(false), "reason": .string("read_identity_unavailable"),
+                        "detail": .string(readIdentityFailure), "stopped": .bool(true),
+                        "receipt": receipt, "effects": row["effects"] ?? .string("unknown"), "call": .string(name)])
+                }
                 if let code = expected { return unexpected(code, receipt) }
                 return answer(["ok": .bool(true), "value": hand(receipt)])
             case .stop:
@@ -677,8 +730,13 @@ extension OwnedProgramRunner {
                                 "argument_path", "accepted"] { body.removeValue(forKey: key) }
                     shown = .object(body)
                 }
-                let bytes = (try? shown.serializedData(pretty: false).count) ?? 0
-                if bytes <= 600 { row["result"] = shown } else { row["result_bytes"] = .int(Int64(bytes)) }
+                do {
+                    let bytes = try shown.serializedData(pretty: false).count
+                    if bytes <= 600 { row["result"] = shown } else { row["result_bytes"] = .int(Int64(bytes)) }
+                } catch {
+                    row["result_unavailable"] = .string("Receipt serialization failed: \(error.localizedDescription). Inspect the completed call before repeating any effect.")
+                    stopped = ["reason": .string("serialization_failed"), "detail": row["result_unavailable"] ?? .null]
+                }
                 // Where a write landed rides its row however long its result:
                 // the file (a move's destination), or a shell call's directory.
                 if fields["read_only"] != .bool(true), case .object(let body) = result {
@@ -727,7 +785,7 @@ extension OwnedProgramRunner {
                 let label = "#\(n) line \(line) \(call)"
                 if ok { landed.append(.string(label)) }
                 // Receipted effects win over static read policy and call status.
-                if fields["effects"] != nil ? took : ok && (fields["read_only"] ?? .bool(host.action(call)?.read == true)) != .bool(true) {
+                if fields["effects"] != nil ? took : ok && fields["read_only"] == .bool(false) {
                     changed.append(.string(label))
                 }
                 if fields["status"] == .string("outcome_unknown"), fields["effects"] == nil { unknown.append(label) }
@@ -736,6 +794,9 @@ extension OwnedProgramRunner {
             let status = stopped != nil ? "stopped" : timedOut ? "timed_out" : error != nil ? "error" : "ok"
             var out: [String: JSONValue] = [
                 "status": .string(status),
+                // This program ran. A nested call's not_run verdict belongs to
+                // that call; it cannot erase earlier work by this program.
+                "execution": .string(preview ? "preview" : status == "ok" ? "executed" : "attempted"),
                 "returned": returned,
                 "calls": .array(ledger),
                 "landed": .array(landed),

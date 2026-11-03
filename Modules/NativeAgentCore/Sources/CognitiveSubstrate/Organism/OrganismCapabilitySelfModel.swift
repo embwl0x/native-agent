@@ -4,7 +4,7 @@ import Foundation
 public struct OrganismCapabilityBelief: Sendable, Equatable, Identifiable {
     public enum EvidenceBasis: String, Sendable, Equatable {
         case cumulativeOutcomes = "cumulative_outcomes"
-        case legacyBodyConfidence = "legacy_body_confidence"
+        case unobserved
     }
     public var id: String { kind.rawValue }
     public var kind: OrganismPredictionKind
@@ -59,29 +59,20 @@ public enum OrganismCapabilitySelfModel {
         at now: Date
     ) -> [OrganismCapabilityBelief] {
         OrganismPredictionKind.allCases.map { kind in
-            let evidence = ledger.predictions.values.filter { $0.kind == kind }
-            let resolved = evidence.filter { $0.status == .satisfied || $0.status == .violated }
-            let expired = evidence.filter { $0.status == .expired }
-            let cumulative = ledger.outcomeCountsByKind?[kind.rawValue]
-            let bodyPrior = OrganismProspectiveAffect.pathConfidence(for: kind, in: ledger.bodyConfidence)
-            // Prefer the forgotten weights over the lifetime tally: the belief
-            // is about what this capability does now, not about everything it
-            // ever did. `effectiveWeights(at:)` seeds from the tally for states
-            // written before forgetting existed — aged to now, so an upgrade
-            // cannot make stale history read fresh — and nothing is lost.
-            let weights = cumulative?.effectiveWeights(at: now)
-            let expiredWeight = weights?.expired ?? Double(expired.count)
-            // Eight pseudo-observations preserve the pre-counter body model as
-            // a bounded prior while real per-kind outcomes take over.
+            let cumulative = ledger.outcomeCountsByKind[kind.rawValue]
+            let weights = cumulative?.weights
+            let expiredWeight = weights?.expired ?? 0
+            // An unobserved kind has a neutral prior, no evidence and full uncertainty.
+            let bodyPrior = 0.5
             let priorStrength = 8.0
             let posterior = weights.map {
                 ($0.satisfied + bodyPrior * priorStrength)
                     / ($0.satisfied + $0.violated + priorStrength)
             } ?? bodyPrior
             let resolvedWeight = weights.map { $0.satisfied + $0.violated }
-                ?? Double(resolved.count)
+                ?? 0
             let evidenceWeight = weights.map { $0.satisfied + $0.violated + $0.expired }
-                ?? Double(evidence.count)
+                ?? 0
             let resolutionUncertainty = 1 / sqrt(resolvedWeight + 1)
             // Smoothed by the SAME prior the posterior uses. As a bare ratio
             // this penalty is scale-free, so forgetting shrinks numerator and
@@ -95,7 +86,7 @@ public enum OrganismCapabilitySelfModel {
                 cumulative == nil ? 0.5 : 0,
                 max(resolutionUncertainty, missingEvidencePenalty)
             )
-            let last = cumulative?.lastEvidenceAt ?? evidence.map(\.lastUpdatedAt).max()
+            let last = cumulative?.lastEvidenceAt
             let freshness = last.map {
                 OrganismAnalyticDecay(
                     valueAtAnchor: 1,
@@ -112,7 +103,7 @@ public enum OrganismCapabilitySelfModel {
                 expiredEvidenceCount: displayedCount(expiredWeight),
                 freshness: (freshness).clamped01(),
                 lastEvidenceAt: last,
-                evidenceBasis: cumulative == nil ? .legacyBodyConfidence : .cumulativeOutcomes
+                evidenceBasis: cumulative == nil ? .unobserved : .cumulativeOutcomes
             )
         }
     }

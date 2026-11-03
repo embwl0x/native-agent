@@ -6,7 +6,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
-// Blueprint: | `OnboardingCompletion.swift` | Durable completion intent and recovery; persona and profile bytes verify before the sentinel |
+// Blueprint: | `OnboardingCompletion.swift` | Durable completion intent and recovery; all five canonical persona documents and profile bytes verify before the sentinel |
 extension SwiftNativeOnboardingClient {
     struct OnboardingTargetIntent: Codable, Sendable {
         let role: String
@@ -36,12 +36,9 @@ extension SwiftNativeOnboardingClient {
     /// Retries resume only that intent; unrelated bytes or identities fail closed.
     public func completeOnboarding(payload: OnboardingCompletePayload) async throws -> OnboardingCompleteResult {
         let agentName = payload.agentName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let userNameTrimmed = payload.userName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let userName = userNameTrimmed.isEmpty ? "User" : userNameTrimmed
+        let userName = payload.userName.trimmingCharacters(in: .whitespacesAndNewlines)
         let personaType = payload.personaType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if agentName.isEmpty {
-            return OnboardingCompleteResult(ok: false, error: "missing_agent_name")
-        }
+        if let refusal = Self.nameRefusal(agent: agentName, user: userName) { return refusal }
         if !PersonaTemplates.validTypes.contains(personaType) {
             return OnboardingCompleteResult(ok: false, error: "invalid_persona_type")
         }
@@ -118,6 +115,7 @@ extension SwiftNativeOnboardingClient {
                     ("voice", docs.voice, nil),
                     ("user", docs.user, userBaseSHA256),
                     ("growth", docs.growth, nil),
+                    ("agents", docs.agents, nil),
                     ("profile", profilePlan.content, profilePlan.baseSHA256),
                     ("sentinel", sentinelBody, nil),
                 ]
@@ -176,7 +174,7 @@ extension SwiftNativeOnboardingClient {
             dataRoot: dataRoot
         )
         let intents = Dictionary(uniqueKeysWithValues: manifest.targets.map { ($0.role, $0) })
-        for role in ["soul", "voice", "user", "growth", "profile"] {
+        for role in ["soul", "voice", "user", "growth", "agents", "profile"] {
             guard let intent = intents[role], let target = targetURLs[role] else {
                 throw OnboardingError.ioFailure("onboarding transaction missing required target '\(role)'")
             }
@@ -239,7 +237,7 @@ extension SwiftNativeOnboardingClient {
         guard manifest.identityHash == expectedIdentity else {
             throw OnboardingError.ioFailure("onboarding transaction identity evidence does not match")
         }
-        let requiredRoles: Set<String> = ["soul", "voice", "user", "growth", "profile", "sentinel"]
+        let requiredRoles: Set<String> = ["soul", "voice", "user", "growth", "agents", "profile", "sentinel"]
         let roles = manifest.targets.map(\.role)
         guard manifest.targets.count == requiredRoles.count,
               Set(roles) == requiredRoles,

@@ -32,8 +32,7 @@ public enum InlineInteractionRegistry {
         case unavailable
     }
 
-    /// Canonical connector id → how it is set up. Aliases resolve to the
-    /// canonical id first.
+    /// Canonical connector id → how it is set up.
     public static func connectorSetup(for rawID: String) -> ConnectorSetup {
         switch canonicalConnectorID(rawID) {
         case "slack", "telegram":
@@ -43,14 +42,9 @@ public enum InlineInteractionRegistry {
         }
     }
 
-    /// Alias folding: a need raised with any spelling must reach the same
-    /// descriptor.
+    /// Current connector IDs are exact after whitespace/case normalization.
     public static func canonicalConnectorID(_ rawID: String) -> String {
-        switch rawID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "google_chrome", "chrome_extension": return "chrome"
-        case "ipad", "phone", "ios": return "iphone"
-        case let other: return other
-        }
+        rawID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     // MARK: - Descriptors
@@ -217,48 +211,16 @@ public enum InlineInteractionRegistry {
     /// A connector added there is named correctly here with no code change.
     public static func connectorDisplayName(_ id: String, dataRoot: URL) -> String {
         let canonical = canonicalConnectorID(id)
-        if let name = connectorRegistryNames(dataRoot: dataRoot)[canonical],
-           !name.isEmpty {
-            return name
+        do {
+            let rows = try ConnectorOAuthRegistry.readRegistry(at: ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot))
+            if let row = rows.first(where: { $0["id"]?.stringValue == canonical }),
+               let name = row["name"]?.stringValue, !name.isEmpty { return name }
+            // No registered display name is an optional fact, not a reason to
+            // manufacture a second name. The exact connector ID is usable.
+            return canonical
+        } catch {
+            return "\(canonical) (registry name unavailable: \(error.localizedDescription); repair connectors/registry.json)"
         }
-        // The registry on disk is written lazily and its rows often carry no
-        // `name` at all, so title-casing the id was the common path, not the
-        // rare one — and it renders "Connect Github", with a lowercase h, on a
-        // fresh install. These are proper nouns; they have one spelling. Same
-        // species as `macControlCategoryTitles` below: a display-name table,
-        // not a per-service branch.
-        if let known = connectorDisplayNames[canonical] { return known }
-        return titleCased(canonical)
-    }
-
-    /// How each connector spells its own name. Consulted only when the
-    /// registry on disk does not answer.
-    static let connectorDisplayNames: [String: String] = [
-        "slack": "Slack",
-        "telegram": "Telegram",
-        "chrome": "Chrome",
-        "iphone": "iPhone",
-    ]
-
-    private static func connectorRegistryNames(dataRoot: URL) -> [String: String] {
-        let path = ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot)
-        guard let data = try? Data(contentsOf: path),
-              var value = try? JSONValue.parse(data)
-        else { return [:] }
-        // Display-only wrappers do not change the authority parser's contract.
-        if case .object(let object) = value,
-           case .array(let rows)? = object["connectors"] ?? object["items"] {
-            value = .array(rows)
-        }
-        guard let rows = try? ConnectorOAuthRegistry.checkedConnectorRows(from: value) else { return [:] }
-        var names: [String: String] = [:]
-        for row in rows {
-            guard case .string(let id)? = row["id"],
-                  case .string(let name)? = row["name"]
-            else { continue }
-            names[canonicalConnectorID(id)] = name
-        }
-        return names
     }
 
     /// Mac Integration ids own their display names; the five Mac Control
@@ -317,18 +279,18 @@ public enum InlineInteractionRegistry {
     /// the card cannot disagree with the thing that will refuse the call. Under
     /// Safe or Workspace this is false, and no per-category switch would take
     /// effect even if one were written — so the card must not offer to write one.
-    public static func macControlPostureAllowsCategories(dataRoot: URL) -> Bool {
-        guard let policy = try? macControlPolicySnapshot(dataRoot: dataRoot),
-              let trust = policy.trustPolicy
+    public static func macControlPostureAllowsCategories(dataRoot: URL) throws -> Bool {
+        let policy = try macControlPolicySnapshot(dataRoot: dataRoot)
+        guard let trust = policy.trustPolicy
         else { return false }
         return MacControlGate.fullMacActive(trust)
     }
 
     /// Whether the saved policy already allows a category — the same question
     /// the dispatch gate asks, so a settled card and a working call agree.
-    public static func macControlCategoryAllowed(_ category: String, dataRoot: URL) -> Bool {
-        guard let policy = try? macControlPolicySnapshot(dataRoot: dataRoot),
-              let trust = policy.trustPolicy, MacControlGate.fullMacActive(trust) else {
+    public static func macControlCategoryAllowed(_ category: String, dataRoot: URL) throws -> Bool {
+        let policy = try macControlPolicySnapshot(dataRoot: dataRoot)
+        guard let trust = policy.trustPolicy, MacControlGate.fullMacActive(trust) else {
             return false
         }
         return MacControlGate.gate(policy, category: category).allowed
@@ -376,7 +338,7 @@ public enum InlineInteractionRegistry {
         switch rawID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "chatgpt", "openai_codex_oauth", "openai_oauth", "codex_oauth": return "openai_oauth_direct"
         case "claude", "anthropic_oauth", "claude_oauth": return "anthropic_oauth_direct"
-        case "xai", "grok", "xai_oauth", "xai-oauth", "grok-oauth": return "xai_oauth_direct"
+        case "xai", "grok", "xai_oauth": return "xai_oauth_direct"
         case let other: return other
         }
     }
@@ -538,20 +500,21 @@ public enum InlineInteractionRegistry {
     /// The models on this Mac that can make a picture, as options.
     ///
     /// Provider-blind by construction: the only per-provider thing consulted is
-    /// DATA — `FirstPartyModelCatalog`'s own image-route table and its model
-    /// tables, the same catalog the Providers page renders. `providerIDs` is
+    /// DATA — `FirstPartyModelCatalog`'s own image-route table and the exact
+    /// data root's checked provider catalog, the same owner Providers reads. `providerIDs` is
     /// whatever the routing snapshot says this person actually uses, so a
     /// catalog row for an account they do not have never appears. No branch
     /// anywhere names a provider.
     public static func imageCapableModelOptions(
-        providerIDs: [String]
-    ) -> [InlineInteraction.Option] {
+        providerIDs: [String], dataRoot: URL
+    ) throws -> [InlineInteraction.Option] {
         var seen: Set<String> = []
-        var rows: [(providerID: String, model: FirstPartyModelDescriptor, routeModel: String)] = []
+        var rows: [(providerID: String, model: ProviderModelInfo, routeModel: String)] = []
         for providerID in providerIDs {
             guard let route = FirstPartyModelCatalog.imageRoute(forProviderID: providerID)
             else { continue }
-            for model in FirstPartyModelCatalog.models(forProviderID: providerID) {
+            let catalog = try SwiftNativeProviderRouting(dataRoot: dataRoot).checkedCatalogModels(for: providerID)
+            for model in catalog {
                 // An option names the ACCOUNT and the model. Before this it
                 // named the model alone and the resolver inferred the account
                 // back from the id — which sends every bare `gpt-*` to the
@@ -583,11 +546,10 @@ public enum InlineInteractionRegistry {
     /// resolver reads the account straight off this instead of guessing it
     /// from the model id.
     public static func modelOptionID(providerID: String, modelID: String) -> String {
-        providerID.isEmpty ? modelID : "\(providerID)::\(modelID)"
+        "\(providerID)::\(modelID)"
     }
 
-    /// Split a provider-qualified option id. `nil` for a bare model id — every
-    /// card written before this existed — which the caller resolves the old way.
+    /// Split the current provider-qualified option ID; malformed IDs refuse.
     public static func splitModelOptionID(_ id: String) -> (providerID: String, modelID: String)? {
         guard let separator = id.range(of: "::") else { return nil }
         let providerID = String(id[id.startIndex..<separator.lowerBound])

@@ -8,14 +8,14 @@ import MacControl
 import NativeAgentCore
 import TrustCenter
 import TurnTrace
-// Blueprint: | `AppModel+MacChatTurnPort.swift` | `AppModel`: `resumeMacChatTurn` reconnects checkpoint progress to the core event stream and lifecycle; `captureMacWorkContinuation`, `chatHasConversationRows`, `cancelICloudChatTurnForControlHandoff` |
+// Blueprint: | `AppModel+MacChatTurnPort.swift` | `AppModel`: `resumeMacChatTurn` mounts checkpoint presentation through the core session delivery owner and lifecycle without forwarding a turn sink; `captureMacWorkContinuation`, `chatHasConversationRows`, `cancelICloudChatTurnForControlHandoff` |
 
 extension AppModel: MacChatTurnPresentationPort {
     var macChatTurns: MacChatTurnRuntime { engine.turns.runtime }
     var knownChatSessionIDs: Set<String> { Set(engine.transcripts.sessions.map(\.id)) }
 
     func resumeMacChatTurn(_ checkpoint: TurnCheckpoint,
-        operation: @escaping @Sendable (@escaping TurnEventSink) async throws -> Void) async throws {
+        operation: @escaping @Sendable () async throws -> Void) async throws {
         try await engine.resumeMacChatTurn(checkpoint, port: self, operation: operation)
     }
 
@@ -29,7 +29,7 @@ extension AppModel: MacChatTurnPresentationPort {
         guard let app, !app.isTerminated else {
             return .unsupported("previous_app_unavailable", taskReference: taskReference)
         }
-        return MacAccessibilityReader.captureContinuation(pid: app.processIdentifier, taskReference: taskReference)
+        return await MacAccessibilityReader.captureContinuation(pid: app.processIdentifier, taskReference: taskReference)
     }
 
     func chatHasConversationRows(sessionId: String) -> Bool {
@@ -75,7 +75,7 @@ extension AppModel: MacChatTurnPresentationPort {
         case .status(let message):
             statusText = message
         case .intakeClosed:
-            drainPendingResidentRefreshIfTurnsIdle()
+            break
         case .activity(let activity):
             // Preserve the existing notice/toast contract; tools add no chatter.
             guard case .notice(let kind) = activity.source,

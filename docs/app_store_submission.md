@@ -64,11 +64,14 @@ app's entitlements. Reconcile them with the signed archive:
 
 | Declaration | Purpose in the source |
 |---|---|
-| Microphone and speech recognition | Push-to-talk dictation |
-| Photo library | Selected images in chat |
+| Microphone and speech recognition | Dictation and voice notes |
+| Photo library | Selected images in chat; opt-in count of visible photos dated today, Limited Access sufficient, partial counts labelled, no image upload by the sense |
+| Media & Apple Music | Opt-in Music app playback state and available title/artist, no audio or history |
+| Motion & Fitness | Opt-in activity flags/confidence; no pedometer fitness totals or HealthKit |
+| Focus Status | Opt-in Boolean Focus status, never the Focus kind |
 | Camera | Photo capture for an accepted phone request |
-| Location when in use | Current location for an accepted phone request |
-| Location always/when in use | Arrival/departure for places the user enables |
+| Location when in use | Save a place locally; current location for an accepted phone request |
+| Location always/when in use | Arrival/departure for places the user enables; significant-change wakes for brief enabled sense readings, no coordinates exported by senses |
 | Remote notifications | APNS registration and background sync |
 | CloudKit, CloudDocuments and KVS | Companion sync and pairing |
 | Communication/time-sensitive notifications | Notification presentation |
@@ -76,6 +79,14 @@ app's entitlements. Reconcile them with the signed archive:
 
 The Share extension requests its App Group. Inspect the other embedded
 extensions' signed entitlements as part of the archive, too.
+
+Settings → Phone senses also offers opt-in battery percentage, app audio-route
+category and network type; these need no extra system permission. Every sense
+explains its data, paired iCloud destination and use by the Mac's selected AI
+provider. Setup state shares missing steps even when an observation switch is
+off. Background delivery relies on existing wakes and never keeps the app alive.
+No health/fitness totals, HealthKit or WeatherKit are offered in this transport;
+see [candidate exclusions](mobile_companion.md#where-the-person-is).
 
 ## App Privacy, age rating and export compliance
 

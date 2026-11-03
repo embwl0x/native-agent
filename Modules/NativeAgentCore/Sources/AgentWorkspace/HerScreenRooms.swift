@@ -9,7 +9,7 @@ import StandingBots
 import ChatSessionWork
 import Transcripts
 import ChatToolParsing
-// Blueprint: | `HerScreenRooms.swift` | HerScreen room rendering, names and screen interpretation; helper facts bind native identity, freshness and status; covered sessions retain lock uncertainty until wake evidence |
+// Blueprint: | `HerScreenRooms.swift` | HerScreen room rendering and tool/locator item identity with separate display titles; retained title-bearing keys preserve issued numbers; shared read evidence admits partial pages and named gaps; helper conversation classification requires recorded ask/entry identity; covered sessions retain lock uncertainty until wake evidence |
 
 /// Opening a name shows a text room in home's style, with stable verbs and a back link. Rooms project supplied owner reads or read their owners directly.
 extension HerScreen {
@@ -29,7 +29,7 @@ extension HerScreen {
             let label: String? = if case .string(let value)? = input["conversation"] { value } else { nil }
             return await personRoom(agent, label: label, dataRoot: dataRoot, person: person, scope: scope, issue: issue, now: now, observed: observed)
         case .record("desk_read", let input, _):
-            guard case .string(let handle)? = input["handle"], Set(input.keys).isSubset(of: ["handle", "structured"]) else { return nil }
+            guard case .string(let handle)? = input["handle"], Set(input.keys) == ["handle"] else { return nil }
             if let issue { return screen([handle, "unavailable"], [[issue]], verbs: []) }
             guard let value, let projection else { return nil }
             return deskItemRoom(value, projection: projection, dataRoot: dataRoot, scope: scope, now: now)
@@ -53,7 +53,8 @@ extension HerScreen {
         case .record(AgentWorkspaceKnowledge.webSearchTool, _, _):
             guard let value, let projection else { return nil }
             let failed = issue != nil || ChatToolOutcome.carriesFailureEvidence(value)
-            if failed { return screen(["RESEARCH", value.objectValue?["status"]?.stringValue ?? "failed"], [[failureFace(value)]], verbs: []) }
+            if failed { return screen(["RESEARCH", value.objectValue?["status"]?.stringValue ?? "failed"],
+                                      [[failureFace(value)], section("GAPS", pageGaps(projection.content))], verbs: []) }
             return textRoom("research", place: location, projection: projection,
                             status: .string(failed ? "failed" : "ok"), dataRoot: dataRoot, scope: scope, now: now)
         default: return nil
@@ -95,28 +96,25 @@ extension HerScreen {
 
     private static func helperRoom(_ id: UUID, dataRoot: URL, person: String, issue: String?, now: Date) -> String? {
         do {
-            guard let bot = try? BotDefinitionStore(dataRoot: dataRoot).get(id) else { return nil }
+            let bot = try BotDefinitionStore(dataRoot: dataRoot).get(id)
             let slug = try withNames(dataRoot) { $0.slug(id: "bot:" + id.uuidString, name: bot.name) }
             let shelf = ShelfStore(dataRoot: dataRoot)
-            let running = (try? BotRunQueue(dataRoot: dataRoot).activeOrQueuedIDs())?.contains(id) == true
-            let state = helperState(bot, entry: (try? shelf.latestEntries(botIDs: [id]))?.first, running: running, person: person, now: now)
+            let running = try BotRunQueue(dataRoot: dataRoot).activeOrQueuedIDs().contains(id)
+            let state = try helperState(bot, entry: shelf.latestEntries(botIDs: [id]).first, running: running, person: person, now: now)
             let cadence = StandingBotSchedule.words(bot.cadence)
-            // A message to the helper (its .say / bot_ask) settles as a shelf entry too. The entry says so (`asked`); older entries are known by the conversation owner's own record of the ask: its entry id, or the exchange whose send the
-            // entry started with.
-            let entries = ((try? shelf.entriesByBot())?[id] ?? []).sorted { $0.runAt > $1.runAt }
-            let records = ((try? AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)) ?? [])
+            // A conversation run is recorded by `asked` or its exact entry ID.
+            let entries = try (shelf.entriesByBot()[id] ?? []).sorted { $0.runAt > $1.runAt }
+            let records = try AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)
                 .filter { $0.agent.caseInsensitiveCompare("bot:" + id.uuidString) == .orderedSame }
-            var askedIDs: Set<String> = [], sent: [Date] = []
+            var askedIDs: Set<String> = []
             for record in records {
                 let receipt = record.sendEvidence
                 for value in [receipt["entry_id"], receipt["message_id"], record.readInput?["message_id"]] {
                     if case .string(let entry)? = value { askedIDs.insert(entry.uppercased()) }
                 }
-                sent += (record.exchanges ?? []).map(\.sentAt)
             }
             func asked(_ entry: ShelfEntry) -> Bool {
                 entry.asked == true || askedIDs.contains(entry.id.uuidString)
-                    || sent.contains { entry.runAt >= $0 && entry.runAt.timeIntervalSince($0) < 3 }
             }
             let marks: [ShelfRunHealth: String] = [.ok: "✓", .nothingNew: "○", .partial: "~", .failed: "✗"]
             func rows(_ list: [ShelfEntry], _ mark: (ShelfEntry) -> String, more: String) -> [String] {
@@ -140,12 +138,13 @@ extension HerScreen {
                                    observed: ((HerWorld, Date, Set<String>) -> Void)?) async -> String? {
         do {
             let world = await readWorld(dataRoot, now: now)
+            if let failure = world.sourceFailure("people", "contacts") { return screen([agent, "unavailable"], [[failure]], verbs: []) }
             let (records, chats) = (world.records, world.chats)
             // Identity merging is for list rows. A room retains its selected route.
             let everyone = world.routes
             let contact = everyone.first { $0.id.caseInsensitiveCompare(agent) == .orderedSame }
                 ?? Contact(id: agent, name: records.first { $0.agent == agent }?.name ?? agent, kind: nil)
-            let record = try? AgentWorkspacePorts.current.conversations.find(dataRoot: dataRoot, scopeSessionID: scope, agent: agent, label: label)
+            let record = try AgentWorkspacePorts.current.conversations.find(dataRoot: dataRoot, scopeSessionID: scope, agent: agent, label: label)
             // Read all verified doors for this mind; sends retain the selected route.
             let identity = world.identity
             let members = Set(identity.members(contact.id))
@@ -178,7 +177,7 @@ extension HerScreen {
             if let chat = theirs.first(where: { $0.id != scope }),
                chat.at > max(thread.last?.at ?? .distantPast, record?.exchanges?.last?.sentAt ?? .distantPast) {
                 // Its newest bridge chat other than the one she is in: that one is already in front of her, so quoting it back only sent her on to open the chat before it (chat.N) for what was actually going on.
-                let tail = chatTail(chat.id, dataRoot: dataRoot).suffix(6)
+                let tail = try chatTail(chat.id, dataRoot: dataRoot).suffix(6)
                 let projected = ContactThread.project(tail, person: person, own: "me",
                     names: identity.doors, contactPrefix: slug + " · ",
                     mark: { peer, _ in AgentWorkspacePorts.current.tools.markConsumed(peer: peer) })
@@ -187,7 +186,7 @@ extension HerScreen {
                 shown = []
                 // Their last message in each of the next few chats too, oldest first: one newer test chat must not hide the ask before it.
                 for older in theirs.filter({ $0.id != scope && $0.id != chat.id }).prefix(3) {
-                    if let last = chatTail(older.id, dataRoot: dataRoot, bytes: 16_384).last(where: { !$0.mine }) {
+                    if let last = try chatTail(older.id, dataRoot: dataRoot, bytes: 16_384).last(where: { !$0.mine }) {
                         let projected = ContactThread.project([last], person: person,
                             names: identity.doors, contactPrefix: slug + " · ",
                             mark: { peer, _ in AgentWorkspacePorts.current.tools.markConsumed(peer: peer) })[0]
@@ -197,18 +196,19 @@ extension HerScreen {
             }
             if talk.isEmpty, contact.kind == "routine" {
                 // Its answers come back as chat turns, not in its thread: her asks are in the thread (empty here), its replies in the chats that asked.
-                let replies = ContactThread.project(await routineReplies(dataRoot: dataRoot).suffix(6), names: labels, unattested: contact.name,
+                let replies = try await ContactThread.project(routineReplies(dataRoot: dataRoot).suffix(6), names: labels, unattested: contact.name,
                     mark: { peer, _ in AgentWorkspacePorts.current.tools.markConsumed(peer: peer) })
                 talk = replies.map { line($0.date, $0.speaker, $0.text, now: now) }
             }
-            if talk.isEmpty, let record, let reply = record.retainedReply?.text {
-                let replyLine = ContactThread.project((try? ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: identity)) ?? [],
-                    names: labels, answering: record.operationID, fallback: .init(text: reply, stamp: record.cachedReplyStamp),
+            if talk.isEmpty, let record, record.retainedReply != nil {
+                let replyLine = try ContactThread.project(ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: identity),
+                    names: labels, answering: record.operationID,
                     mark: { peer, _ in AgentWorkspacePorts.current.tools.markConsumed(peer: peer) })
-                // An older record kept only the answer; say so rather than show a reply to nothing.
-                talk.append(line(record.operationStartedAt, "me", "(my message isn't kept in this older record)", now: now, talk: false))
-                // Untimed like any exchange's reply: this record's updatedAt may be a later look.
-                talk.append(line(nil, replyLine[0].speaker, reply, now: now))
+                if let reply = replyLine.first {
+                    talk.append(line(reply.date, reply.speaker, reply.text, now: now))
+                } else {
+                    talk.append("A reply record exists, but its matching conversation line is unavailable; history is incomplete.")
+                }
             }
             if talk.isEmpty { talk = [record == nil ? "no messages yet" : "sent; no reply is recorded yet"] }
             for row in shown { ContactThread.consume(row, mark: { peer, _ in AgentWorkspacePorts.current.tools.markConsumed(peer: peer) }) }
@@ -242,7 +242,14 @@ extension HerScreen {
             if listed.contains(where: { $0.id != scope }) { verbs.append(("chat.N", "open one of those chats")) }
             let kind = contact.kind ?? "agent"
             observed?(world, now, [healthID])
-            if !previewing, !answers.isEmpty { AgentWorkspacePorts.current.conversations.shown(answers: answers, peer: contact.id, scope: scope, dataRoot: dataRoot) }
+            if !previewing, contact.kind == "routine", !answers.isEmpty {
+                do { try AgentWorkspacePorts.current.conversations.shown(answers: answers, peer: contact.id, scope: scope, dataRoot: dataRoot) }
+                catch {
+                    let repair = "Contact \(owner)'s reply handover evidence could not be read: \(error.localizedDescription). Repair the named contact or agents/grok-requests file while preserving its contents."
+                    return screen([contact.name, "Reply handover unavailable"], [[readFailure(error, reason: "contact_request_unavailable",
+                        remedy: Repair.remedy(owner: "Contact reply handover for " + owner, nextCall: nil, tap: repair, instruction: repair))]], verbs: [])
+                }
+            }
             return freshness(world) + "\n" + screen([contact.name.uppercased(), kind, state],
                 [section("TALK", talk), section("LAST SEND", outcome), section("CONVERSATIONS", chatLines), issue.map { section("READ", [$0]) } ?? []], verbs: verbs)
         } catch { return nameFailure(error) }
@@ -260,6 +267,7 @@ extension HerScreen {
             guard case .object(let result)? = value, result["conversation_session_id"] == .string(id),
                   case .array(let messages)? = result["messages"] else { return nil }
             let world = await readWorld(dataRoot, now: now)
+            if let failure = world.sourceFailure("people", "contacts") { return screen(["CONVERSATION", "unavailable"], [[failure]], verbs: []) }
             let chat = world.chats.first { $0.id == id }
             let who = try withNames(dataRoot) { book in
                 chat.flatMap { chat in world.contacts.first { $0.id == chat.who || $0.name.lowercased() == chat.who } }
@@ -287,30 +295,48 @@ extension HerScreen {
     }
 
     /// The last messages of a chat, from the final 96 KB of its log: who said it, when, and the words without the bridge's bracketed notes.
-    static func chatTail(_ id: String, dataRoot: URL, bytes: UInt64 = 98_304) -> [LogLine] {
-        guard NativeAgentChatSessionID.normalizedPathComponent(id) != nil else { return [] }
+    static func chatTail(_ id: String, dataRoot: URL, bytes: UInt64 = 98_304) throws -> [LogLine] {
+        guard NativeAgentChatSessionID.normalizedPathComponent(id) != nil else { throw CocoaError(.fileReadInvalidFileName) }
         let url = dataRoot.appendingPathComponent("chat/messages/\(id).jsonl")
         // Widen past tool results, up to 2 MiB, until the other side's message is included.
-        var size = bytes, tail = logTail(url, bytes: size)
-        let file = UInt64((try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0)
-        while !tail.contains(where: { !$0.mine }), size < 2_097_152, file > size {
+        var size = bytes, tail = try logTail(url, bytes: size)
+        let attributes: [FileAttributeKey: Any]
+        do { attributes = try FileManager.default.attributesOfItem(atPath: url.path) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return tail }
+        guard let file = attributes[.size] as? NSNumber else { throw CocoaError(.fileReadUnknown) }
+        while !tail.contains(where: { !$0.mine }), size < 2_097_152, file.uint64Value > size {
             size = min(size * 4, 2_097_152)
-            tail = logTail(url, bytes: size)
+            tail = try logTail(url, bytes: size)
         }
         return tail
     }
 
     package typealias LogLine = ContactThread.Line
 
-    static func logTail(_ url: URL, bytes: UInt64, humanOnly: Bool = false) -> [LogLine] {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+    static func logTail(_ url: URL, bytes: UInt64, humanOnly: Bool = false) throws -> [LogLine] {
+        let handle: FileHandle
+        do { handle = try FileHandle(forReadingFrom: url) }
+        catch let error as CocoaError where error.isFileAbsent { return [] }
         defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        guard let data = ContactThread.read(handle, from: size > bytes ? size - bytes : 0) else { return [] }
-        var lines = data.split(separator: UInt8(ascii: "\n"))
+        let size = try handle.seekToEnd()
+        guard let data = try ContactThread.read(handle, from: size > bytes ? size - bytes : 0) else {
+            if size == 0 { return [] }
+            throw CocoaError(.fileReadUnknown, userInfo: [NSFilePathErrorKey: url.path])
+        }
+        guard UInt64(data.count) >= min(size, bytes) else {
+            throw CocoaError(.fileReadUnknown, userInfo: [NSFilePathErrorKey: url.path])
+        }
+        let completeEnd = data.lastIndex(of: UInt8(ascii: "\n")).map { $0 + 1 } ?? data.startIndex
+        var lines = data[..<completeEnd].split(separator: UInt8(ascii: "\n"))
         if size > bytes, !lines.isEmpty { lines.removeFirst() }
-        let rows = lines.compactMap { line -> ContactThread.Line? in
-            guard let line = ContactThread.Line(jsonl: Data(line)), line.role == "user" || line.role == "assistant" else { return nil }
+        let rows = try lines.compactMap { line -> ContactThread.Line? in
+            guard case .object(let object) = try JSONValue.parse(Data(line)) else { throw CocoaError(.fileReadCorruptFile) }
+            let line = ContactThread.Line(object)
+            guard line.role == "user" || line.role == "assistant" else { return nil }
+            guard case .string? = object["id"], case .string? = object["content"], line.date != nil,
+                  line.provenanceFailure == nil else {
+                throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: url.path])
+            }
             return !humanOnly || line.human ? line : nil
         }
         return ContactThread.project(rows, style: .log)
@@ -318,29 +344,32 @@ extension HerScreen {
 
     /// A routine's answers (Grok Bot's): each arrives as its own turn in the chat that asked (the request's `conversationID`), carrying the request's run id. The newest five answered requests, found in bounded (256 KB) tails of that chat's
     /// log and its three newest compacted copies; kept until the request folder or those logs change. Newest last.
-    package static func routineReplies(dataRoot: URL) async -> [LogLine] {
+    package static func routineReplies(dataRoot: URL) async throws -> [LogLine] {
         let dir = dataRoot.appendingPathComponent("agents/grok-requests", isDirectory: true)
-        let requests = AgentWorkspacePorts.current.conversations.answeredRequests(dataRoot: dataRoot)
+        let requests = try AgentWorkspacePorts.current.conversations.answeredRequests(dataRoot: dataRoot)
             .compactMap { request -> (run: String, chat: String)? in
                 guard let run = request.run, let chat = request.chat, NativeAgentChatSessionID.normalizedPathComponent(chat) != nil else { return nil }
                 return (run, chat)
             }.prefix(5)
         let chats = Array(Set(requests.map { $0.chat })).sorted()
-        func logs(_ chat: String) -> [URL] {
+        func logs(_ chat: String) throws -> [URL] {
             let folder = dataRoot.appendingPathComponent("chat/sessions/\(chat)", isDirectory: true)
             // Compaction moves older turns into dated copies; the newest three cover the last few answers.
-            let compact = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
+            let names: [String]
+            do { names = try FileManager.default.contentsOfDirectory(atPath: folder.path) }
+            catch let error as CocoaError where error.code == .fileReadNoSuchFile { names = [] }
+            let compact = names
                 .filter { $0.hasPrefix("messages.compact.") && $0.hasSuffix(".jsonl") }.sorted().suffix(3)
             return [dataRoot.appendingPathComponent("chat/messages/\(chat).jsonl"),
                     ChatSessionAutocompactor.originalsPath(dataRoot: dataRoot, sessionId: chat)]
                 + compact.map { folder.appendingPathComponent($0) }
         }
-        let files = chats.flatMap(logs)
+        let files = try chats.flatMap(logs)
         let runs = Set(requests.map { $0.run.uppercased() })
-        return await HerMemo.shared.value(dataRoot.standardizedFileURL.path + "\u{0}routine",
+        return try await HerMemo.shared.value(dataRoot.standardizedFileURL.path + "\u{0}routine",
                 stamp: stamps(dir) + files.map(stamp)) {
             var seen: Set<String> = []
-            return files.flatMap { logTail($0, bytes: 262_144) }
+            return try files.flatMap { try logTail($0, bytes: 262_144) }
                 .filter { !$0.mine && $0.run.map { runs.contains($0.uppercased()) } == true && seen.insert($0.text).inserted }
                 .sorted { $0.at < $1.at }
         }
@@ -409,6 +438,7 @@ extension HerScreen {
     private static func helpersRoom(dataRoot: URL, person: String, now: Date) async -> String {
         do {
             let world = await readWorld(dataRoot, now: now)
+            if let failure = world.sourceFailure("bots", "running helpers") { return screen(["HELPERS", "unavailable"], [[failure]], verbs: []) }
             let botsState=world.unread.contains("bots") ? "unavailable" : world.pending.contains("bots") ? "stale" : "available"
             let runningState=world.unread.contains("running helpers") ? "unavailable" : world.pending.contains("running helpers") ? "stale" : "available"
             if botsState == "unavailable" {
@@ -479,6 +509,7 @@ extension HerScreen {
 
     private static func peopleRoom(dataRoot: URL, scope: String, now: Date, observed: ((HerWorld, Date, Set<String>) -> Void)?) async -> String {
         let world = await readWorld(dataRoot, now: now)
+        if let failure = world.sourceFailure("people", "contacts") { return screen(["PEOPLE", "unavailable"], [[failure]], verbs: []) }
         let (cells, needs, _, health) = peopleRows(world, dataRoot: dataRoot, now: now, scope: scope, limit: .max)
         let width = min(20, (cells.map(\.name.count).max() ?? 0) + 2)
         observed?(world, now, health)
@@ -493,6 +524,7 @@ extension HerScreen {
     private static func conversationsRoom(dataRoot: URL, person: String, scope: String, now: Date, page: Int = 0) async -> String {
         do {
             let world = await readWorld(dataRoot, now: now)
+            if let failure = world.sourceFailure("people", "contacts") { return screen(["CONVERSATIONS", "unavailable"], [[failure]], verbs: []) }
             func who(_ record: AgentConversationRecord) -> String {
                 let agent = record.agent
                 if agent.lowercased().hasPrefix("bot:"), let id = UUID(uuidString: String(agent.dropFirst(4))) { return "bot:" + id.uuidString }
@@ -585,7 +617,10 @@ extension HerScreen {
             row += (row.isEmpty ? "" : ", ") + name
         }
         if !row.isEmpty { rows.append(row + (names.count > 24 ? " +\(names.count - 24) more" : "")) }
-        let mine = touched(dataRoot: dataRoot, now: now).map { window in
+        let touchedRows: [Touched]
+        do { touchedRows = try touched(dataRoot: dataRoot, now: now) }
+        catch { return screen(["MAC", "recorded windows unavailable"], [[nameFailure(error)]], verbs: []) }
+        let mine = touchedRows.map { window in
             pad(clip(window.app, 24), 14) + ([window.kind, window.readout.map { "reads " + clip($0, 24) }].compactMap { $0 }
                 + ["\(age(now.timeIntervalSince1970 - window.at)) ago"]).joined(separator: " · ")
         }
@@ -601,7 +636,7 @@ extension HerScreen {
 
     static let touchedHours: Double = 4
 
-    package static func touch(dataRoot: URL, app: String, kind: String?, readouts: [String], before: [String] = [], now: Date = Date()) {
+    package static func touch(dataRoot: URL, app: String, kind: String?, readouts: [String], before: [String] = [], now: Date = Date()) throws {
         let name = clip(app, 40), at = now.timeIntervalSince1970
         let word = kind.map { $0.contains("AXSheet") ? "sheet" : $0.contains("Dialog") ? "dialog" : $0.contains("Floating") ? "panel" : "window" }
         // A display value only (digits, operators, a short unit: "42", "3:05", "12.5 kg", "80%"); words or codes could be someone's content. Invisible format marks (Calculator's display carries left-to-right marks) come off first. The
@@ -616,15 +651,15 @@ extension HerScreen {
         func result(_ text: String) -> Bool { text.dropFirst().range(of: #"[+\-−×÷=/]"#, options: .regularExpression) == nil }
         let changed = values.filter { !earlier.contains($0) }
         let short = changed.first(where: result) ?? changed.first ?? values.first(where: result) ?? values.first
-        HerTouched.shared.update(dataRoot) { rows in
+        try HerTouched.shared.update(dataRoot) { rows in
             rows.removeAll { ($0.app == name && $0.kind == word) || at - $0.at > touchedHours * 3600 }
             rows.insert(Touched(app: name, kind: word, readout: short, at: at), at: 0)
             if rows.count > 8 { rows.removeLast(rows.count - 8) }
         }
     }
 
-    package static func touched(dataRoot: URL, now: Date) -> [Touched] {
-        HerTouched.shared.rows(dataRoot).filter { now.timeIntervalSince1970 - $0.at <= touchedHours * 3600 }
+    package static func touched(dataRoot: URL, now: Date) throws -> [Touched] {
+        try HerTouched.shared.rows(dataRoot).filter { now.timeIntervalSince1970 - $0.at <= touchedHours * 3600 }
     }
 
     // MARK: Places and lists as text
@@ -650,17 +685,38 @@ extension HerScreen {
 
     /// A plain owner read's identity; also what names.json keeps for `mail.3`.
     static func key(_ place: AgentWorkspaceLocation) -> String? {
-        guard case .record(let tool, let input, let title) = place else { return nil }
+        guard case .record(let tool, let input, _) = place else { return nil }
         // A mail row's inbox position moves as mail arrives; its name must not.
-        let stable = input.filter { $0.key != "position" }
-        return try? JSONValue.object(["tool": .string(tool), "input": .object(stable), "title": .string(title)]).serialize(pretty: false)
+        let stable: [String: JSONValue]
+        if tool == "contacts_search", let id = input["identifier"]?.stringValue, !id.isEmpty {
+            // Exact-card reads use only the Contacts owner's identifier.
+            // A query (including retained display-name queries) is not identity.
+            stable = ["identifier": .string(id)]
+        } else {
+            stable = input.filter { $0.key != "position" }
+        }
+        return try? JSONValue.object(["tool": .string(tool), "input": .object(stable)]).serialize(pretty: false)
+    }
+
+    /// The current locator identity, including for the retained title-bearing
+    /// keys whose issued numbers still exist on this installation.
+    static func recordIdentity(_ key: String) -> String? {
+        guard case .object(let row)? = try? JSONValue.parse(Data(key.utf8)),
+              let tool = row["tool"]?.stringValue, let input = row["input"]?.objectValue else { return nil }
+        return self.key(.record(tool: tool, input: input, title: ""))
     }
 
     /// `mail.3` back to the reading it names.
     static func itemPlace(_ room: String, _ n: Int, dataRoot: URL) throws -> AgentWorkspaceLocation? {
-        guard let id = try withNames(dataRoot, { $0.id("item." + room, n) }),
+        let retained = try withNames(dataRoot) { book in
+            (book.id("item." + room, n), book.titles?["item." + room + ":" + String(n)])
+        }
+        guard let id = retained.0,
               case .object(let row)? = try? JSONValue.parse(Data(id.utf8)),
-              case .string(let tool)? = row["tool"], case .object(let input)? = row["input"], case .string(let title)? = row["title"] else { return nil }
+              case .string(let tool)? = row["tool"], case .object(let input)? = row["input"] else { return nil }
+        guard let title = retained.1 ?? row["title"]?.stringValue else {
+            throw NameFailure("The retained item has no display metadata: \(room).\(n)")
+        }
         return .record(tool: tool, input: input, title: title)
     }
 
@@ -702,7 +758,7 @@ extension HerScreen {
                 return parts.joined(separator: " · ")
             }
             let status = text(status) ?? "ok"
-            let fine = ["ok", "completed", "success", "succeeded"].contains(status)
+            let fine = ChatToolOutcome.hasReadEvidence(projection.content)
             let content: [String: JSONValue] = if case .object(let row) = projection.content { row } else { [:] }
             func fieldsOf(_ item: AgentWorkspaceItem) -> [String: JSONValue] { if case .object(let row) = item.content { row } else { [:] } }
 
@@ -724,7 +780,7 @@ extension HerScreen {
             let roomVerbs = projection.actions.map(\.label)
             var names: [String: AgentWorkspaceAction] = [:], pages: [String: String] = [:]
             var rowVerb: (String, String)?
-            let trouble = room != "connections" ? [:] : sendTrouble(agents: items.compactMap { entry -> String? in
+            let trouble = try room != "connections" ? [:] : sendTrouble(agents: items.compactMap { entry -> String? in
                 guard case .open(.record("agent_read", let input, _))? = entry.item.actions.first?.action, case .string(let agent)? = input["agent"] else { return nil }
                 return agent
             }, dataRoot: dataRoot, now: now)
@@ -737,7 +793,7 @@ extension HerScreen {
                     let opens = item.actions.first.map { opening($0.action) } ?? true
                     if let first = item.actions.first {
                         let number = room == "windows" ? projection.page * 8 + offset + 1
-                            : try book.number("item." + room, id: identity(first.action, label: first.label)) { present }
+                            : try book.number("item." + room, id: identity(first.action, label: first.label), title: item.title) { present }
                         name = room + ".\(number)"
                         if opens { names[name] = first.action }
                     }
@@ -756,6 +812,10 @@ extension HerScreen {
                        let warning = trouble[agent.lowercased()] { about = about.isEmpty ? warning : about + " · " + warning }
                     if !opens {
                         pages[name] = screen([name, clip(item.title, 60)], [about.isEmpty ? [] : [clip(about, 110)]], verbs: own, back: "Back: \(room).")
+                    }
+                    if room == "notes", fieldsOf(item)["status"] == .string("unavailable") {
+                        return (name, clip(item.title, 60) + "\n"
+                            + wrap(failureFace(item.content), width: 100).map { "      " + $0 }.joined(separator: "\n"))
                     }
                     // A non-ok Doctor check keeps its whole recovery detail, wrapped.
                     if room == "status", !item.title.hasSuffix(" · ok"), case .string(let detail)? = fieldsOf(item)["summary"], !detail.isEmpty {
@@ -808,11 +868,15 @@ extension HerScreen {
             let unread = projection.items.filter { fieldsOf($0)["unread"] == .bool(true) }.count
             // A launcher (create, research) lists nothing: it is its verbs.
             var header = [room.uppercased()] + roomCounts(content, fine: fine, status: status, listed: count, unreadRows: unread, page: projection.page)
+            if fine, content["status"] == .string("partial") { header.append("partial") }
             // Windows describe this work's retained places, not Mac apps.
             if room == "windows" { header += ["the work I'm on, drafts and pages I acted in", "a read doesn't stay open", "not Mac apps"] }
             // Numbers are per item, never by position (windows aside): a name kept from an older look still reaches the same one, and a gap is the price, said on every numbered list so it doesn't read as a bug.
             if room != "windows", lines.contains(where: { $0.0 != "·" }) { header.append(numbersNote) }
-            var about = fine ? ["message", "detail", "about", "note", "error"].compactMap { text(content[$0]) }.prefix(2).map { clip($0, 110) }
+            // Partial-page messages name coverage gaps; clipping can hide an account.
+            var about = fine ? ["message", "detail", "about", "note", "error"].compactMap { text(content[$0]) }.prefix(2).flatMap {
+                content["status"] == .string("partial") ? wrap($0, width: 100) : [clip($0, 110)]
+            }
                 : [failureFace(.object(content))]
             if notConnected(content) {
                 header = [room.uppercased(), "not connected"]
@@ -842,8 +906,17 @@ extension HerScreen {
                 }
             }
             return screen(header, [lines.isEmpty && about.isEmpty && arrivals.isEmpty ? ["nothing here"] : lines.map { pad(clip($0.0, 24), width) + $0.1 },
-                                   section(fine ? "ABOUT" : "READ", about)] + arrivals, verbs: verbs)
+                                   section(fine ? "ABOUT" : "READ", about),
+                                   section("GAPS", pageGaps(projection.content))] + arrivals, verbs: verbs)
         } catch { return nameFailure(error) }
+    }
+
+    /// Per-item and engine failures remain named beside the readable page.
+    static func pageGaps(_ content: JSONValue) -> [String] {
+        ["gaps", "unresponsive_engines"].flatMap { key -> [String] in
+            guard case .array(let gaps)? = content.objectValue?[key] else { return [] }
+            return gaps.compactMap(\.stringValue).flatMap { wrap($0) }
+        }
     }
 
     /// What an action is, stably across renders: the number behind `today.3`.
@@ -898,7 +971,7 @@ extension HerScreen {
             return script || page == "current" || page.hasPrefix("chat") ? WorkspaceMacCall.refusal : nil
         }
         guard ["screen", "go", "act"].contains(tool) else { return nil }
-        let value = tool == "go" ? input["name"] ?? input["target"] : input["app"]
+        let value = tool == "go" ? input["name"] : input["app"]
         let named: String? = if case .string(let text)? = value, !text.trimmingCharacters(in: .whitespaces).isEmpty { text } else { nil }
         var own = false
         if let named {

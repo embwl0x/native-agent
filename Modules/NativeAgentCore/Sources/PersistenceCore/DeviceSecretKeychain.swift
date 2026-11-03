@@ -1,9 +1,9 @@
 import Foundation
 import Security
-// Blueprint: | `DeviceSecretKeychain.swift` | Verified device-only Keychain secret bytes and a service's account list; callers own locked reference commits and migration |
+// Blueprint: | `DeviceSecretKeychain.swift` | Device-only Keychain bytes and account listing; accepted writes retain exact-item unverified evidence on readback failure, without restoration or deletion; callers own locked references |
 
-/// Device-only secret bytes. Callers own reference commits and serialize their
-/// lifecycle with the same lock as the legacy file they replace.
+/// Device-only secret bytes. Callers serialize the lifecycle and reference
+/// commits under their authority owner's lock.
 public enum DeviceSecretKeychain {
     private static func query(service: String, account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
@@ -42,25 +42,24 @@ public enum DeviceSecretKeychain {
         item[kSecValueData as String] = data
         item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else { throw Failure.unavailable }
-        do {
-            guard try read(service: service, account: account) == data else { throw Failure.unavailable }
-        } catch {
-            try? delete(service: service, account: account)
-            throw Failure.unavailable
-        }
+        try verifyAcceptedWrite(data, service: service, account: account)
     }
 
     public static func replace(_ data: Data, service: String, account: String) throws {
-        guard let previous = try read(service: service, account: account) else { throw Failure.unavailable }
         let status = SecItemUpdate(query(service: service, account: account) as CFDictionary,
                                    [kSecValueData as String: data] as CFDictionary)
         guard status == errSecSuccess else { throw Failure.unavailable }
-        do {
-            guard try read(service: service, account: account) == data else { throw Failure.unavailable }
-        } catch {
-            _ = SecItemUpdate(query(service: service, account: account) as CFDictionary,
-                              [kSecValueData as String: previous] as CFDictionary)
-            throw Failure.unavailable
+        try verifyAcceptedWrite(data, service: service, account: account)
+    }
+
+    /// Acceptance is real even when verification is unavailable. Never undo it;
+    /// the caller must reread this exact item before a deliberate forward repair.
+    private static func verifyAcceptedWrite(_ data: Data, service: String, account: String) throws {
+        let observed: Data?
+        do { observed = try read(service: service, account: account) }
+        catch { throw Failure.acceptedButUnverified(service: service, account: account) }
+        guard observed == data else {
+            throw Failure.acceptedButUnverified(service: service, account: account)
         }
     }
 
@@ -71,6 +70,13 @@ public enum DeviceSecretKeychain {
 
     public enum Failure: LocalizedError {
         case unavailable
-        public var errorDescription: String? { "Device Keychain secret is unavailable." }
+        case acceptedButUnverified(service: String, account: String)
+        public var errorDescription: String? {
+            switch self {
+            case .unavailable: return "Device Keychain secret is unavailable."
+            case .acceptedButUnverified(let service, let account):
+                return "Keychain accepted the write to \(service)/\(account), but its bytes could not be verified. No restoration or deletion ran. Reread this exact item before deliberately repairing it; do not assume the prior secret is active."
+            }
+        }
     }
 }

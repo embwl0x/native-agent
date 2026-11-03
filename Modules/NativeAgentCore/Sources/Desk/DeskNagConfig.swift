@@ -329,11 +329,6 @@ public struct DeskNagConfigStore: Sendable {
             .appendingPathComponent("nag_config.json")
     }
 
-    /// Unavailable settings keep reminders off without replacing the saved file.
-    public func load() async -> DeskNagConfig {
-        (try? await loadChecked()) ?? DeskNagConfig()
-    }
-
     public func loadChecked() async throws -> DeskNagConfig {
         let raw = try await SwiftNativePersistenceCore.readJSON(configPath, ifMissing: .null)
         if raw == .null, !FileManager.default.fileExists(atPath: configPath.path) {
@@ -472,8 +467,8 @@ public enum DeskNagPanelModel {
 
     public static func snoozeOptions(from now: Date, calendar: Calendar = .current) -> [SnoozeOption] {
         [
-            SnoozeOption(label: "Until tomorrow", until: DeskDeferPreset.tomorrow.day(from: now, calendar: calendar)),
-            SnoozeOption(label: "Until next week", until: DeskDeferPreset.nextWeek.day(from: now, calendar: calendar)),
+            SnoozeOption(label: "Through tomorrow", until: DeskDeferPreset.tomorrow.day(from: now, calendar: calendar)),
+            SnoozeOption(label: "Through " + DeskDeferPreset.nextWeek.day(from: now, calendar: calendar), until: DeskDeferPreset.nextWeek.day(from: now, calendar: calendar)),
             SnoozeOption(label: "Indefinitely", until: nil),
         ]
     }

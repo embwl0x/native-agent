@@ -29,7 +29,7 @@ extension SwiftNativeTriggerScheduler {
             "title": .string(built.title),
             "summary": .string(built.summary),
             "detail": built.detail,
-            "related_mission_id": .null,
+            "related_execution_id": .null,
             "related_approval_id": .null,
             "related_paths": .null,
             "related_groups": .null,

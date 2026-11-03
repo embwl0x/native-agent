@@ -14,9 +14,9 @@ package enum AgentWorkspaceScreenPreview {
     public static let didChange = Notification.Name("NativeAgent.herWorldDidChange")
     /// Home, then every place home's PLACES rows show, in order, then the
     /// rooms home's own sections and footer open.
-    public static func tabs(_ layout: SurfaceLayout, profile: String?) -> [String] {
+    public static func tabs(_ layout: SurfaceLayoutAvailability, profile: String?) -> [String] {
         var names = ["home"]
-        for name in (layout.shown("places", profile: profile).map(\.name) + ["people", "helpers", "mac", "conversations", "windows", "arrivals", "work"]).map(AppDoorNames.resolve)
+        for name in (layout.contentNames("places", profile: profile) + ["people", "helpers", "mac", "conversations", "windows", "arrivals", "work"]).map(AppDoorNames.resolve)
             where !names.contains(name) { names.append(name) }
         return names
     }
@@ -35,12 +35,13 @@ package enum AgentWorkspaceScreenPreview {
 
     /// The glance as a turn renders it, without a turn's pin or budget.
     public static func glance(dataRoot: URL, scope: String) async -> String? {
-        if SessionConversation.isHelper(scope, dataRoot: dataRoot) { return nil }
+        do { if try SessionConversation.checkedIsHelper(scope, dataRoot: dataRoot) { return nil } }
+        catch { return "Conversation ownership unavailable: \(error.localizedDescription). Repair the saved session index before reading this room." }
         return await HerScreen.$previewing.withValue(true) {
             let now = Date()
             async let parts = AgentWorkspacePorts.parts(for: "", dataRoot: dataRoot)
             let home = await HerScreen.renderGlance(dataRoot: dataRoot, scope: scope.isEmpty ? nil : scope, now: now)
-            return await [home, parts].compactMap { $0 }.joined(separator: "\n")
+            return await [home, parts.text].compactMap { $0 }.joined(separator: "\n")
         }
     }
 

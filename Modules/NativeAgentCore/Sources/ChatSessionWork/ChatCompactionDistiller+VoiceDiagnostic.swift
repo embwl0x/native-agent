@@ -1,4 +1,5 @@
 import Foundation
+import PersonaEngine
 import PersistenceCore
 import Experiences
 import NativeAgentCore
@@ -53,14 +54,16 @@ extension ChatCompactionDistiller {
 
     /// The configured agent name from the shared persona profile.
     package static func configuredAgentName(dataRoot: URL) -> String? {
-        let path = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("profile.json")
-        guard let data = try? Data(contentsOf: path),
-              let parsed = try? JSONValue.parse(data),
-              case .object(let object) = parsed,
-              case .string(let name)? = object["name"] else { return nil }
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        do { return try checkedAgentName(dataRoot: dataRoot) }
+        catch {
+            nativeLog("Conversation voice diagnostic unavailable: %@", error.localizedDescription)
+            return nil
+        }
+    }
+
+    static func checkedAgentName(dataRoot: URL) throws -> String? {
+        let profile = try PersonaCompiler.compileProfile(dataRoot: dataRoot)
+        let trimmed = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
 }

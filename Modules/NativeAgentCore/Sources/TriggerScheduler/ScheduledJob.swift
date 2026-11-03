@@ -2,10 +2,10 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `ScheduledJob.swift` | `ScheduledJob`: strict scheduler row decoding and projected civil next-run decoration while preserving claimed/retry instants |
+// Blueprint: | `ScheduledJob.swift` | `ScheduledJob`: strict scheduler row decoding and projected civil next-run decoration while preserving claimed instants |
 
 /// Scheduler list projection: unclaimed wall-clock nextRunAt follows the current
-/// zone; active occurrences and retry floors retain their saved instant.
+/// zone; active occurrences retain their saved instant.
 public struct ScheduledJob: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var name: String

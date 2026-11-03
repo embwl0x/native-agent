@@ -12,7 +12,8 @@ extension InboxItemRecord {
     /// producer cannot become a tappable iOS control until the signed Mac
     /// action router accepts it.
     var presentableActions: [InboxActionRecord] {
-        actions.filter { $0.id == "view" || InboxActionVocabulary.supports($0.id, itemID: id) }
+        InboxActionVocabulary.actions(declared: actions, approvalLinked: !(related_approval_id ?? "").isEmpty)
+            .filter { $0.id == "view" || InboxActionVocabulary.supports($0.id, itemID: id) }
     }
 
     /// The Mac's reading of where a card came from, in plain words.

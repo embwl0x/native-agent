@@ -108,7 +108,8 @@ extension ResponseOutcomeObservationV2 {
             if case .bool(false)? = object["verifyPassed"] { return .unverified }
             if case .bool(false)? = object["verified"] { return .unverified }
             if case .string(let raw)? = object["verification"] {
-                if raw == "verified" { return .verified } // legacy compatibility
+                // Chrome's current wire receipt uses "verified" (its protocol's value).
+                if raw == "verified" { return .verified }
                 if let canonical = MotorVerificationState(rawValue: raw) {
                     return outcomeEvidence(for: canonical)
                 }

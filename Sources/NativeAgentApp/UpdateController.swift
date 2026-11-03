@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import Sparkle
 import SystemOps
+import NativeAgentCore
 
 // Blueprint: | `UpdateController.swift` | `UpdateController`: configured Sparkle lifecycle, version probes and explicit unavailable/update presentation |
 
@@ -39,6 +40,7 @@ final class UpdateController: NSObject {
     final class Status {
         /// Display version of the update Sparkle found; nil when none known.
         var availableVersion: String? = nil
+        var noticeFailure: String? = nil
         var canCheckForUpdates = false
         var automaticChecksEnabled = false
     }
@@ -48,8 +50,12 @@ final class UpdateController: NSObject {
     let status = Status()
 
     private var updaterController: SPUStandardUpdaterController?
-    /// The agent's probe in flight; resumed with the failure, or nil.
-    private var probe: CheckedContinuation<String?, Never>?
+    private final class Probe {
+        let done = ScopedWaiter()
+        var failure: String?
+    }
+    /// The agent's probe in flight; the actor records its outcome before waking it.
+    private var probe: Probe?
     private var probeGeneration = 0
     private var canCheckObservation: NSKeyValueObservation?
     private var automaticChecksObservation: NSKeyValueObservation?
@@ -74,8 +80,8 @@ final class UpdateController: NSObject {
         self.preferences = preferences
         self.updaterController = nil
         super.init()
-        status.availableVersion = SoftwareUpdateState.restoreNotice(
-            info: info, preferences: preferences, isNewer: Self.isVersion)
+        applyNotice(SoftwareUpdateState.restoreNotice(
+            info: info, preferences: preferences, isNewer: Self.isVersion))
         // Created after super.init so the controller can carry `self` as the
         // updater delegate (found/not-found mirror into `status`).
         if unavailability == nil {
@@ -132,7 +138,9 @@ final class UpdateController: NSObject {
 
     /// Compact copy shared by the visible Settings row and its footer.
     var settingsDetail: String {
-        Self.settingsDetail(for: unavailability, automaticChecksEnabled: automaticChecksEnabled)
+        let detail = Self.settingsDetail(for: unavailability, automaticChecksEnabled: automaticChecksEnabled)
+        if let failure = status.noticeFailure { return failure + " " + detail }
+        return detail
     }
 
     /// Pure copy boundary for the Settings row. Keeping this separate from the
@@ -173,19 +181,25 @@ final class UpdateController: NSObject {
         }
         probeGeneration &+= 1
         let generation = probeGeneration
-        let failure = await withCheckedContinuation { continuation in
-            probe = continuation
-            updater.checkForUpdateInformation()
-            // A probe Sparkle never finishes must not hold `probe` forever.
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .seconds(45))
-                guard let self, self.probeGeneration == generation, let probe = self.probe else { return }
-                self.probe = nil
-                probe.resume(returning: "No answer from the update feed within 45 seconds.")
-            }
+        let response = Probe()
+        probe = response
+        updater.checkForUpdateInformation()
+        // A probe Sparkle never finishes must not hold `probe` forever.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(45))
+            guard let self, self.probeGeneration == generation, let probe = self.probe else { return }
+            self.probe = nil
+            probe.failure = "No answer from the update feed within 45 seconds."
+            probe.done.resume()
         }
+        let done = response.done
+        await Task { await done.park() }.value
+        let failure = response.failure
         if let failure {
             return ("", ("check_failed", "The update check failed: \(failure) Try again later."))
+        }
+        if let failure = status.noticeFailure {
+            return ("", ("notice_unreadable", failure))
         }
         guard let version = status.availableVersion else {
             let installed = info["CFBundleShortVersionString"] as? String ?? "this version"
@@ -221,13 +235,27 @@ final class UpdateController: NSObject {
     }
 
     func handleFoundUpdate(displayVersion: String) {
-        status.availableVersion = SoftwareUpdateState.storeNotice(
-            displayVersion, info: info, preferences: preferences, isNewer: Self.isVersion)
+        applyNotice(SoftwareUpdateState.storeNotice(
+            displayVersion, info: info, preferences: preferences, isNewer: Self.isVersion))
     }
 
     func handleNoUpdate() {
-        status.availableVersion = SoftwareUpdateState.storeNotice(
-            nil, info: info, preferences: preferences, isNewer: Self.isVersion)
+        applyNotice(SoftwareUpdateState.storeNotice(
+            nil, info: info, preferences: preferences, isNewer: Self.isVersion))
+    }
+
+    private func applyNotice(_ notice: SoftwareUpdateState.NoticeState) {
+        switch notice {
+        case .available(let version):
+            status.availableVersion = version
+            status.noticeFailure = nil
+        case .absent, .stale:
+            status.availableVersion = nil
+            status.noticeFailure = nil
+        case .unreadable(let failure):
+            status.availableVersion = nil
+            status.noticeFailure = failure
+        }
     }
 
 }
@@ -264,7 +292,8 @@ extension UpdateController: SPUUpdaterDelegate {
             self.probe = nil
             let failure = error as NSError?
             let noUpdate = failure?.domain == SUSparkleErrorDomain && failure?.code == Int(SUError.noUpdateError.rawValue)
-            probe.resume(returning: noUpdate ? nil : failure?.localizedDescription)
+            probe.failure = noUpdate ? nil : failure?.localizedDescription
+            probe.done.resume()
             return
         }
     }

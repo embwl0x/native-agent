@@ -1,4 +1,5 @@
 import SwiftUI
+import CryptoKit
 import UIKit
 import PhotosUI
 import NativeAgentShared
@@ -25,19 +26,21 @@ struct ChatRuntimeControls: Equatable, Sendable, Codable {
         )
     }
 
-    func metadata(transport: String) -> [String: String] {
+    func metadata(transport: String) throws -> [String: String] {
         let clean = normalized
         var out: [String: String] = [
             "clientSurface": "iphone",
             "source": "ios",
             "transport": transport,
-            "sourceKey": NativeAgentICloudBridgeConstants.mobileSourceKey,
+            "sourceKey": try NativeAgentICloudBridgeConstants.mobileSourceKey,
             "routeKey": Self.deviceSourceKey
         ]
         if !clean.model.isEmpty { out["model"] = clean.model }
         if !clean.reasoningEffort.isEmpty { out["reasoningEffort"] = clean.reasoningEffort }
         if !clean.serviceTier.isEmpty { out["serviceTier"] = clean.serviceTier }
-        if !clean.fileAccess.isEmpty { out["fileAccess"] = clean.fileAccess }
+        // This required control was supplied even when blank. Preserve it so
+        // Mac ingress refuses malformed input instead of inferring Auto.
+        out["fileAccess"] = clean.fileAccess
         if !clean.providerId.isEmpty { out["providerId"] = clean.providerId }
         return out
     }
@@ -183,17 +186,28 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         self.interactionSessionID = interactionSessionID
     }
 
-    nonisolated static func projectChatRecords(_ records: [ChatMessageRecord]) -> [ChatMessage] {
+    /// Same derivation as the Mac's NativeAgentEngine.phoneMessageID.
+    nonisolated static func derivedMessageID(_ id: String) -> UUID {
+        var bytes = Array(SHA256.hash(data: Data(("nativeagent.message:" + id).utf8)).prefix(16))
+        bytes[6] = (bytes[6] & 0x0F) | 0x50
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                           bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
+    }
+
+    nonisolated static func projectChatRecords(_ records: [ChatMessageRecord]) throws -> [ChatMessage] {
         // Project metadata.attachments into chat summaries so snapshot refresh preserves attachments.
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return records.compactMap { rec in
+        return try records.compactMap { rec in
             let roleStr = rec.role
-            let interaction = rec.interactionJSON.flatMap { try? decoder.decode(InlineInteraction.self, from: Data($0.utf8)) }
-            let descriptor = rec.interactionDescriptorJSON.flatMap { try? decoder.decode(InlineInteractionDescriptor.self, from: Data($0.utf8)) }
+            let interaction = try rec.interactionJSON.map { try decoder.decode(InlineInteraction.self, from: Data($0.utf8)) }
+            let descriptor = try rec.interactionDescriptorJSON.map { try decoder.decode(InlineInteractionDescriptor.self, from: Data($0.utf8)) }
             guard roleStr == "user" || roleStr == "assistant" || interaction != nil else { return nil }
             let role: ChatMessage.Role = roleStr == "user" ? .user : .assistant
-            let uuid = UUID(uuidString: rec.id) ?? UUID()
+            // Every row has one stable identity: a non-UUID row id (an older Mac's
+            // interaction mirror or approval card) maps to the same UUID the Mac derives.
+            let uuid = UUID(uuidString: rec.id) ?? Self.derivedMessageID(rec.id)
             let attachments: [ChatAttachmentSummary] = (rec.metadata?.attachments ?? []).map { a in
                 ChatAttachmentSummary(
                     id: a.id,

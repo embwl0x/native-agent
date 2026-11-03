@@ -28,16 +28,11 @@ public enum OrganismSemanticExpectation {
     public static let reactionField = "reaction"
     public static let sessionField = "session"
     public static let turnField = "turn"
-    /// He pushed back — the expectation was wrong. The only violating value; an
-    /// absent, empty, or unrecognised reaction reads as `neutral` (see below),
-    /// so a producer bug can never manufacture violations.
+    /// A grounded disagreement with the prior statement. Absent, empty or
+    /// unrecognised readings never settle an expectation.
     public static let pushbackReaction = "pushback"
-    /// He agreed / built on it. Satisfied, and worth more than silence.
+    /// Explicit confirmation of the prior claim, never inferred from good mood.
     public static let confirmedReaction = "confirmed"
-    /// He moved on without pushing back. Still satisfied — the expectation was
-    /// "this will hold", and it held — but with less evidence behind it.
-    public static let neutralReaction = "neutral"
-
     /// Per-session pending cap; a fourth row evicts the oldest without an outcome.
     public static let maximumPendingPerSession = 3
     /// Backstop only. The next user turn normally resolves an expectation long
@@ -47,13 +42,6 @@ public enum OrganismSemanticExpectation {
     /// Reserved id namespace, so a semantic row can never collide with the
     /// correlation-keyed `pending:` / `terminal:` ids.
     public static let idPrefix = "semantic"
-
-    /// Evidence strength of a reaction. `confirmed` is a real signal; `neutral`
-    /// is the absence of contradiction and moves her far less.
-    static func satisfiedIntensity(for reaction: String, signalIntensity: Double) -> Double {
-        let base = reaction == confirmedReaction ? 1.0 : 0.35
-        return OrganismBodyConfidence.clamp(base * max(0.2, signalIntensity))
-    }
 
     /// The scope inside the object at `key`. Both fields or neither: a
     /// half-scoped signal is a producer bug and must not mint or resolve.
@@ -162,7 +150,9 @@ extension OrganismPredictiveBody {
             OrganismSemanticExpectation.reactionField,
             in: signal.metadata,
             key: OrganismSemanticExpectation.reactionMetadataKey
-        ), let scope = OrganismSemanticExpectation.scope(
+        ), [OrganismSemanticExpectation.pushbackReaction,
+            OrganismSemanticExpectation.confirmedReaction].contains(reaction),
+        let scope = OrganismSemanticExpectation.scope(
             in: signal.metadata,
             key: OrganismSemanticExpectation.reactionMetadataKey
         ) else { return nil }
@@ -181,19 +171,9 @@ extension OrganismPredictiveBody {
         chemicalState: inout ChemicalState
     ) {
         guard let resolution = semanticPredictionsResolved(by: signal, in: ledger) else { return }
-        let clean = resolution.reaction.lowercased()
-        // Fail toward "he did not push back". An unrecognised label is an absent
-        // reading, and an absent reading must never mint the punishing outcome.
-        let reaction = [
-            OrganismSemanticExpectation.pushbackReaction,
-            OrganismSemanticExpectation.confirmedReaction,
-        ].contains(clean) ? clean : OrganismSemanticExpectation.neutralReaction
+        let reaction = resolution.reaction
         let violated = reaction == OrganismSemanticExpectation.pushbackReaction
-        let intensity = violated
-            ? OrganismBodyConfidence.clamp(max(0.2, signal.intensity))
-            : OrganismSemanticExpectation.satisfiedIntensity(
-                for: reaction, signalIntensity: signal.intensity
-            )
+        let intensity = OrganismBodyConfidence.clamp(max(0.2, signal.intensity))
         for id in resolution.ids {
             guard let prediction = ledger.predictions[id] else { continue }
             settlePrediction(

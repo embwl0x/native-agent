@@ -47,14 +47,19 @@ extension AgentA2AWire {
         return .object(part)
     }
 
-    public static func canonicalState(_ value: String, version: String) -> String {
+    public static func canonicalState(_ value: String, version: String) throws -> String {
         let states = ["submitted", "working", "input-required", "auth-required", "completed", "failed", "canceled", "rejected", "unknown"]
-        let candidate = version == "0.3" ? value : value.replacingOccurrences(of: "TASK_STATE_", with: "").lowercased().replacingOccurrences(of: "_", with: "-")
-        return states.contains(candidate) && (version == "0.3" || value.hasPrefix("TASK_STATE_")) ? candidate : "unknown"
+        if version == "1.0", value == "TASK_STATE_UNSPECIFIED" { return "unknown" }
+        let candidate = version == "0.3" ? value : String(value.dropFirst("TASK_STATE_".count)).lowercased().replacingOccurrences(of: "_", with: "-")
+        guard states.contains(candidate), value == wireState(candidate, version: version) else {
+            throw WireError.invalid("unrecognized task state \(value)")
+        }
+        return candidate
     }
 
     public static func wireState(_ state: String, version: String) -> String {
-        version == "0.3" ? state : "TASK_STATE_" + state.uppercased().replacingOccurrences(of: "-", with: "_")
+        version == "0.3" ? state : state == "unknown" ? "TASK_STATE_UNSPECIFIED"
+            : "TASK_STATE_" + state.uppercased().replacingOccurrences(of: "-", with: "_")
     }
 
     /// Project an existing 0.3 task/message/event without traversing user data

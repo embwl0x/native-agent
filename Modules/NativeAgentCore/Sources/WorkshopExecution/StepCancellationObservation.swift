@@ -18,7 +18,7 @@ extension WorkshopExecutorLoop {
     /// execution.json to "cancelled" while a step was in flight.
     internal struct WorkshopExecutionCancelledDuringStep: Error {}
 
-    /// A deadline-won step retains its joined outcome and maps to failure in dispatchStep.
+    /// A deadline-won step retains its joined outcome; dispatchStep fails effects and continues unavailable reads.
     internal struct WorkshopStepTimedOut: Error {
         let seconds: TimeInterval
         let returned: WorkshopStepOutcome?
@@ -74,9 +74,9 @@ extension WorkshopExecutorLoop {
                     return .observerFailed(error)
                 }
             }
-            // The deadline cancels the effect and selects failure, then joins
-            // the operation. Its returned outcome is settlement evidence, not
-            // permission to admit another step. Zero disables the deadline;
+            // The deadline cancels and joins the operation. dispatchStep retains
+            // the returned outcome, failing an effect or continuing an unavailable
+            // read. Zero disables the deadline;
             // no deadline promises a bound on noncooperative settlement.
             if deadlineNanos > 0 {
                 group.addTask {

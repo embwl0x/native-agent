@@ -1,70 +1,35 @@
 import Foundation
 import Darwin
 import NativeAgentCore
-// Blueprint: | `AgentACPProcess.swift` | `AgentACPProcess` approved spawn, process-group termination and reap |
+// Blueprint: | `AgentACPProcess.swift` | `AgentACPProcess` verifies approval then uses `OwnedProcessGroup` for before-exec containment, one group-only TERM/KILL settlement, checked termination and retained leader reap |
 
-/// ACP owns and reaps its children directly: Foundation's termination observer
-/// must not reap the group leader before descendants have been signaled.
 public enum AgentACPProcess {
     static func spawn(executable: String, arguments: [String], directory: URL,
                       environment: [String: String], input: Pipe, output: Pipe,
                       approvedExecutable: AgentACPExecutable? = nil, errorsToOutput: Bool = false) throws -> pid_t {
-        var actions: posix_spawn_file_actions_t?
-        var attributes: posix_spawnattr_t?
-        guard posix_spawn_file_actions_init(&actions) == 0 else { throw AgentACPClient.Failure.unavailable }
-        defer { posix_spawn_file_actions_destroy(&actions) }
-        guard posix_spawnattr_init(&attributes) == 0 else { throw AgentACPClient.Failure.unavailable }
-        defer { posix_spawnattr_destroy(&attributes) }
-        guard posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)) == 0,
-              posix_spawnattr_setpgroup(&attributes, 0) == 0,
-              posix_spawn_file_actions_addchdir_np(&actions, directory.path) == 0,
-              posix_spawn_file_actions_adddup2(&actions, input.fileHandleForReading.fileDescriptor, STDIN_FILENO) == 0,
-              posix_spawn_file_actions_adddup2(&actions, output.fileHandleForWriting.fileDescriptor, STDOUT_FILENO) == 0,
-              errorsToOutput ? posix_spawn_file_actions_adddup2(&actions, output.fileHandleForWriting.fileDescriptor, STDERR_FILENO) == 0
-                : posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) == 0 else {
-            throw AgentACPClient.Failure.unavailable
-        }
-        let argv = ([executable] + arguments).map { strdup($0) } + [nil]
-        let envp = environment.sorted { $0.key < $1.key }.map { strdup("\($0.key)=\($0.value)") } + [nil]
-        defer { argv.forEach { free($0) }; envp.forEach { free($0) } }
-        var pid: pid_t = 0
         if let approvedExecutable {
             do { try approvedExecutable.verify() }
             catch { throw AgentACPClient.Failure.executableChanged }
         }
-        let result = argv.withUnsafeBufferPointer { args in
-            envp.withUnsafeBufferPointer { env in
-                posix_spawn(&pid, executable, &actions, &attributes, args.baseAddress!, env.baseAddress!)
-            }
-        }
-        guard result == 0 else { throw AgentACPClient.Failure.unavailable }
-        return pid
+        do {
+            return try OwnedProcessGroup.spawn(executable: executable, arguments: arguments,
+                directory: directory, environment: environment, input: input, output: output,
+                errors: errorsToOutput ? output : FileHandle.nullDevice).pid
+        } catch { throw AgentACPClient.Failure.unavailable }
     }
 
-    static func finish(_ pid: pid_t, snapshot: ProcessTreeSnapshot? = nil,
-                       grace: Duration = .milliseconds(200)) async {
-        guard pid > 0 else { return }
+    @discardableResult static func finish(_ pid: pid_t, snapshot: ProcessTreeSnapshot? = nil,
+                       grace: Duration = .milliseconds(200)) async -> String? {
+        guard pid > 0 else { return nil } // No child was launched.
+        guard let owner = OwnedProcessGroup.owner(pid), owner.identity == snapshot?.groupOwnerID else {
+            return "ACP process group \(pid) has no retained child owner. Termination is unconfirmed; no process was signalled."
+        }
+        // Cancellation ends this optional grace, not the group's settlement.
         try? await Task.sleep(for: grace)
-        // Frozen first, then the tree as it is now: a child that forked into a
-        // group of its own since is in it and cannot fork again before its
-        // signal. A stopped process takes SIGTERM only once continued.
-        var snapshot = snapshot.map { ProcessTreeReaper.snapshot(rootPID: pid, retaining: $0) }
-        kill(-pid, SIGSTOP)
-        if let frozen = snapshot {
-            ProcessTreeReaper.signal(frozen, signal: SIGSTOP)
-            snapshot = ProcessTreeReaper.snapshot(rootPID: pid, retaining: frozen)
-        }
-        for sent in [SIGTERM, SIGCONT] {
-            kill(-pid, sent)
-            if let snapshot { ProcessTreeReaper.signal(snapshot, signal: sent) }
-        }
+        guard owner.send(SIGTERM) else { return owner.failure }
         try? await Task.sleep(for: .milliseconds(500))
-        kill(-pid, SIGSTOP)
-        if let snapshot {
-            ProcessTreeReaper.quiesceAndKill(ProcessTreeReaper.snapshot(rootPID: pid, retaining: snapshot))
-        }
-        kill(-pid, SIGKILL)
-        var status: Int32 = 0
-        while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
+        guard owner.closeExitedGroup() else { return owner.failure }
+        owner.reapExitedLeader()
+        return owner.failure
     }
 }

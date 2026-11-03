@@ -72,26 +72,28 @@ extension RuntimeReadouts {
     }
 
     public static func getBrowserStatus(dataRoot: URL) async throws -> BrowserRuntimeStatus {
-        // Read this root's browser feeds without write-back; absent feeds mean unmeasured.
+        // Read without write-back; absent feeds are unmeasured only after owner recovery succeeds.
         let root = dataRoot
         let browserRoot = root
             .appendingPathComponent("native_power", isDirectory: true)
             .appendingPathComponent("browser", isDirectory: true)
         let runsPath = browserRoot.appendingPathComponent("runs.json")
         let receiptsPath = browserRoot.appendingPathComponent("receipts.jsonl")
+        let client = SwiftNativeBrowserClient.defaultClient(dataRoot: root)
+        let recoveryIssue = client.recoveryIssue
         let availability = Self.statusFeedAvailability([runsPath, receiptsPath])
         guard availability == .measured else {
             return BrowserRuntimeStatus(
-                status: availability == .absent ? "unmeasured" : "unavailable",
+                status: availability == .absent && recoveryIssue == nil ? "unmeasured" : "unavailable",
                 sourcePath: nil,
                 screenshotPath: nil,
                 activeRuns: nil,
                 receiptCount: nil,
                 latestReceipt: nil,
-                createdAt: ISO8601DateFormatter().string(from: Date())
+                createdAt: ISO8601DateFormatter().string(from: Date()),
+                recoveryIssue: recoveryIssue
             )
         }
-        let client = SwiftNativeBrowserClient.defaultClient(dataRoot: root)
         do {
             let envelope = try await client.browserStatus()
             return try Self.decodeJSONValue(envelope, as: BrowserRuntimeStatus.self, context: "getBrowserStatus(swiftNative)")
@@ -100,7 +102,8 @@ extension RuntimeReadouts {
                 status: "unavailable", sourcePath: nil,
                 screenshotPath: nil,
                 activeRuns: nil, receiptCount: nil, latestReceipt: nil,
-                createdAt: ISO8601DateFormatter().string(from: Date())
+                createdAt: ISO8601DateFormatter().string(from: Date()),
+                recoveryIssue: recoveryIssue
             )
         }
     }
@@ -129,7 +132,7 @@ extension RuntimeReadouts {
         try InstalledSkillInventory.entries(dataRoot: dataRoot, includingSource: includingSource)
     }
 
-    /// `runs/runs.json`, newest first, at most 200; accepts a bare array or `{"runs": [...]}`.
+    /// `runs/runs.json`, newest first, at most 200; requires a bare array.
     /// `[]` means absent or empty; nil means unreadable, so publication preserves the last good rows.
     public static func runs(dataRoot: URL) async -> [RunRecord]? {
         let path = dataRoot

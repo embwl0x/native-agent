@@ -17,7 +17,7 @@ import os
 import CoreText
 import ScreenCaptureKit
 #endif
-// Blueprint: | `MacAXElementSource.swift` | Read-only element source contracts and defaults |
+// Blueprint: | `MacAXElementSource.swift` | Read-only source contracts; checked attributes/count/children preserve unavailable reads through the shared walker; focus binds to elements in the supplied observation |
 /// because a half-readable tree is still useful perception.
 public protocol MacAXElementSource: Sendable {
     /// `AXIsProcessTrusted()` in production.
@@ -53,10 +53,12 @@ public protocol MacAXElementSource: Sendable {
     /// These roots are never window-relative action addresses.
     func transientMenuRoots(pid: Int32) -> [MacAXElementRef]
     func attributes(of ref: MacAXElementRef) -> MacAXAttributes?
+    func checkedAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes
     /// Only what the desktop capture's secret mask reads: role, subrole,
     /// title, value, frame and actions, without the display-only reads.
     /// Default: the full attribute read.
     func maskingAttributes(of ref: MacAXElementRef) -> MacAXAttributes?
+    func checkedMaskingAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes
     /// Writable action attributes, queried only for selected screen marks.
     func settableAttributes(of ref: MacAXElementRef) -> [String]
     func children(of ref: MacAXElementRef) -> [MacAXElementRef]
@@ -66,11 +68,13 @@ public protocol MacAXElementSource: Sendable {
     /// counted at the depth cap. nil = the
     /// app did not answer: unknown, never an empty subtree.
     func childCount(of ref: MacAXElementRef) -> Int?
+    func checkedChildCount(of ref: MacAXElementRef) throws -> Int
     /// At most `limit` children. Default prefixes `children(of:)`; the live
     /// source uses `AXUIElementCopyAttributeValues` ranged fetch so the whole
     /// child array is never bridged when only a bounded slice can still fit
     /// under the node cap.
     func children(of ref: MacAXElementRef, limit: Int) -> [MacAXElementRef]
+    func checkedChildren(of ref: MacAXElementRef, limit: Int) throws -> [MacAXElementRef]
     /// The child-index path of the app's focused element, relative to the same
     /// window root `frontmostWindowRoot()` returns — or nil when this source
     /// CANNOT TELL. The default is nil for exactly that reason: a source that
@@ -84,6 +88,8 @@ public protocol MacAXElementSource: Sendable {
     /// between the walk and this call). Default defers to `focusedElementPath()`
     /// for sources with a single tree (synthetic/test sources).
     func focusedElementPath(relativeTo root: MacAXElementRef?) -> [Int]?
+    /// Focus is an element in this observation, using its actual child ordering.
+    func focusedElementPath(in snapshot: MacAXTreeSnapshot, relativeTo root: MacAXElementRef) -> [Int]?
     /// The underlying element's identity, so one walk
     /// never reads the same element twice through two parents. nil = cannot
     /// tell (synthetic sources), which dedupes nothing.
@@ -91,6 +97,25 @@ public protocol MacAXElementSource: Sendable {
     func sameElement(_ lhs: MacAXElementRef, _ rhs: MacAXElementRef) -> Bool
 }
 public extension MacAXElementSource {
+    func checkedMaskingAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes {
+        guard let value = maskingAttributes(of: ref) else {
+            throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility masking attributes are unavailable.")
+        }
+        return value
+    }
+    func checkedChildCount(of ref: MacAXElementRef) throws -> Int {
+        guard let count = childCount(of: ref) else {
+            throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility child count is unavailable.")
+        }
+        return count
+    }
+    func checkedChildren(of ref: MacAXElementRef, limit: Int) throws -> [MacAXElementRef] { children(of: ref, limit: limit) }
+    func checkedAttributes(of ref: MacAXElementRef) throws -> MacAXAttributes {
+        guard let value = attributes(of: ref) else {
+            throw MacAccessibilityReader.NativeReadFailure(detail: "Accessibility element attributes are unavailable.")
+        }
+        return value
+    }
     func maskingAttributes(of ref: MacAXElementRef) -> MacAXAttributes? { attributes(of: ref) }
     func settableAttributes(of ref: MacAXElementRef) -> [String] { [] }
     func elementHash(_ ref: MacAXElementRef) -> Int? { nil }
@@ -106,6 +131,10 @@ public extension MacAXElementSource {
     }
     func focusedElementPath() -> [Int]? { nil }
     func focusedElementPath(relativeTo root: MacAXElementRef?) -> [Int]? { focusedElementPath() }
+    func focusedElementPath(in snapshot: MacAXTreeSnapshot, relativeTo root: MacAXElementRef) -> [Int]? {
+        guard let path = focusedElementPath(relativeTo: root), snapshot.nodes.contains(where: { $0.path == path }) else { return nil }
+        return path
+    }
     func windowRoot(pid: Int32) -> MacAXElementRef? { frontmostWindowRoot() }
     func windowRoots(pid: Int32) -> [MacAXWindowHandle] {
         guard let root = windowRoot(pid: pid) else { return [] }
@@ -118,7 +147,8 @@ public extension MacAXElementSource {
                 role: attributes?.role ?? "AXWindow",
                 subrole: attributes?.subrole,
                 title: attributes?.title,
-                frame: attributes?.frame
+                frame: attributes?.frame,
+                attributeGaps: attributes?.attributeGaps ?? []
             )
         )]
     }

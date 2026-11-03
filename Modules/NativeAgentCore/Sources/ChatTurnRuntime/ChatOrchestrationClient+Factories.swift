@@ -17,7 +17,7 @@ import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
 import Context
-// Blueprint: | `ChatOrchestrationClient+Factories.swift` | `makeChatOrchestrationClient`, `makeGatedToolDispatchClient` (outermost node `ExpansionDispatcher`), the factory shares its injected clock with engine and chat client; uses ProviderRouting’s canonical provider assembly; stall-only calls share a transport without a resource wall; `SwiftNativeMemoryV2Recaller`: disclosure-aware recall and served-hit credit |
+// Blueprint: | `ChatOrchestrationClient+Factories.swift` | `makeChatOrchestrationClient`, `makeGatedToolDispatchClient`: ExpansionDispatcher → CanonicalToolNameDispatcher → optional ChatToolDispatchTracer → PeerDataTaintDispatcher → AutonomyGatedDispatcher → FileAccessGatedDispatcher → injected tools; factory shares its clock with engine and chat client and uses ProviderRouting's canonical provider assembly |
 
 // MARK: - Factory
 
@@ -142,8 +142,7 @@ public func makeGatedToolDispatchClient(
     dataRoot: URL = PersistenceCore.defaultDataRoot(),
     verifiedSessionId: String? = nil,
     approvedReplay: ApprovedChatToolReplay? = nil,
-    tracePeerTurn: Bool = false,
-    allowsFirstConversationExemption: Bool = false
+    tracePeerTurn: Bool = false
 ) -> any ToolDispatchClient {
     let gate = AutonomyGate(approvalFiler: approvalFiler)
     let fileAccessGated = FileAccessGatedDispatcher(inner: tools, fileAccess: fileAccess)
@@ -159,11 +158,6 @@ public func makeGatedToolDispatchClient(
         injectionApprovalVerifier: ApprovalInboxInjectionApprovalVerifier(dataRoot: dataRoot),
         // Non-injection replays require a matching inbox approval just spent by the executor, valid for one dispatch.
         approvedReplayVerifier: ApprovalInboxApprovedReplayVerifier(dataRoot: dataRoot, canonicalTool: CanonicalToolNameDispatcher.canonical),
-        // The ONLY chain offered the first-conversation exemption: this is
-        // the Mac chat turn the opener runs on. The token itself is bound
-        // to a session id and spent on first use, so later turns on this
-        // same chain match nothing. See FirstConversationPersonaProgression.
-        firstConversationDataRoot: allowsFirstConversationExemption ? dataRoot : nil,
         // The peer directory supplies display names only, never authority.
         peerDirectoryDataRoot: dataRoot,
         fileAccess: fileAccess

@@ -3,7 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import os
 import TurnTrace
-// Blueprint: | `LLMRequestShape.swift` | Request cache markers, conversation-prefix snapshots and task-local secondary-call isolation; `ToolContractWeight` measures schema material without retaining content |
+// Blueprint: | `LLMRequestShape.swift` | Request cache markers, conversation-prefix snapshots and task-local secondary-call isolation; pending prefix computation is joined by receipt readers, outside request encoding; `ToolContractWeight` measures schema material without retaining content |
 
 /// Cache marker positions and TTLs from the finished request body, never prompt bytes.
 /// Anthropic renders tools → system → messages; longer TTLs must precede shorter ones.
@@ -37,8 +37,7 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
     public let volatileDeltaBlockBytes: Int
     public let volatileKeyframe: Bool
     public let volatileDelivery: String
-    public let windowCursorAdvanceCount: Int
-    public let windowSlid: Bool
+    public let historyContextWindow: String
     /// Message count and bounded digests of role plus serialized content (first 12 SHA-256 hex).
     /// Digests expose head drift even when consecutive messages have equal sizes.
     public let messageCount: Int
@@ -63,8 +62,7 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
         volatileDeltaBlockBytes: Int = 0,
         volatileKeyframe: Bool = false,
         volatileDelivery: String,
-        windowCursorAdvanceCount: Int,
-        windowSlid: Bool,
+        historyContextWindow: String,
         messageCount: Int = 0,
         messageDigests: [String] = [],
         prefixMessageDigests: [String] = [],
@@ -82,8 +80,7 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
         self.volatileDeltaBlockBytes = volatileDeltaBlockBytes
         self.volatileKeyframe = volatileKeyframe
         self.volatileDelivery = volatileDelivery
-        self.windowCursorAdvanceCount = windowCursorAdvanceCount
-        self.windowSlid = windowSlid
+        self.historyContextWindow = historyContextWindow
         self.messageCount = messageCount
         self.messageDigests = messageDigests
         self.prefixMessageDigests = prefixMessageDigests
@@ -104,8 +101,7 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
             "volatileDeltaBlockBytes": .int(Int64(volatileDeltaBlockBytes)),
             "volatileKeyframe": .bool(volatileKeyframe),
             "volatileDelivery": .string(volatileDelivery),
-            "windowCursorAdvanceCount": .int(Int64(windowCursorAdvanceCount)),
-            "windowSlid": .bool(windowSlid),
+            "historyContextWindow": .string(historyContextWindow),
             "messageCount": .int(Int64(messageCount)),
             "messageDigests": .array(messageDigests.map { .string($0) }),
             "prefixMessageDigests": .array(prefixMessageDigests.map { .string($0) }),
@@ -128,6 +124,7 @@ public struct ConversationPrefixTelemetrySnapshot: Sendable, Equatable {
 public final class ConversationPrefixTelemetrySink: @unchecked Sendable {
     private let lock = NSLock()
     private var value: ConversationPrefixTelemetrySnapshot?
+    private var pending: Task<ConversationPrefixTelemetrySnapshot, Never>?
     private var weight: ToolContractWeight.Measurement?
 
     /// True when this binding exists to SHED an outer turn's receipts rather
@@ -146,7 +143,20 @@ public final class ConversationPrefixTelemetrySink: @unchecked Sendable {
     public func set(_ snapshot: ConversationPrefixTelemetrySnapshot) {
         // Secondary-call bindings remain permanently unmeasured.
         guard !marksRequestShapeUnmeasured else { return }
-        lock.lock(); value = snapshot; lock.unlock()
+        lock.lock(); value = snapshot; pending = nil; lock.unlock()
+    }
+
+    /// Diagnostics can prepare beside the request. Receipt writers join this
+    /// exact work before reading it; request construction never needs it.
+    public func setPending(_ task: Task<ConversationPrefixTelemetrySnapshot, Never>) {
+        guard !marksRequestShapeUnmeasured else { return }
+        lock.withLock { value = nil; pending = task }
+    }
+
+    public func resolved() async -> ConversationPrefixTelemetrySnapshot? {
+        let task = lock.withLock { pending }
+        if let task { return await task.value }
+        return current
     }
 
     public var current: ConversationPrefixTelemetrySnapshot? {

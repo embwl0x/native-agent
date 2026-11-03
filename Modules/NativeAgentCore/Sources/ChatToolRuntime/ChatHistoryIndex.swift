@@ -6,7 +6,7 @@ import NativeAgentCore
 import PersistenceCore
 import Transcripts
 import ToolRegistry
-// Blueprint: | `ChatHistoryIndex.swift` | SQLite-owned content-addressed history; on-demand rows and receipts, semantics-versioned cancellable absorption, transactional manifest reference reclamation |
+// Blueprint: | `ChatHistoryIndex.swift` | SQLite-owned content-addressed history; on-demand rows and receipts, semantics-versioned cancellable absorption, transactional manifest reference reclamation and read-only timestamp/door owner activity for rhythm using the Telegram owner's checked identity supplied through CognitionHost |
 
 /// One durable index per history. Every transcript line is projected for
 /// search once in its life and kept by the hash of its bytes, so a line that
@@ -24,7 +24,7 @@ import ToolRegistry
 public final class ChatHistoryIndex: @unchecked Sendable {
     /// Bump only when row, receipt redaction or provenance semantics change.
     /// Old build identities are upgraded once; unrelated builds keep valid rows.
-    static let projector = "history-projection-2"
+    static let projector = "history-projection-3"
 
     /// The stored table shapes; bump when the tables below change.
     static let schema = 3
@@ -88,6 +88,33 @@ public final class ChatHistoryIndex: @unchecked Sendable {
 
     // MARK: - Reading
 
+    /// Rhythm reads only timestamps and doors from the canonical index, never words.
+    /// Content-addressed copies and repeated message ids contribute one observation.
+    public func ownerActivity(since: Date, until: Date, telegramOwnerUserId: Int64?) throws -> [(at: Date, door: String)] {
+        let path = dataRoot.appendingPathComponent("chat/index/history.sqlite")
+        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
+        let owner = telegramOwnerUserId.map(String.init)
+        // Do not initialize, migrate, or absorb history for this read.
+        var configuration = Configuration()
+        configuration.readonly = true
+        let database = try DatabaseQueue(path: path.path, configuration: configuration)
+        return try database.read { db in
+            var seen: Set<String> = []
+            return try Row.fetchAll(db, sql: """
+                SELECT instant, route, COALESCE(message_id, identity, hex(hash)) AS id
+                FROM line WHERE valid = 1 AND shape = 2 AND role = 'user' AND mechanical = 0
+                    AND (author = 'owner' OR (author = ? AND route = 'telegram'))
+                    AND instant >= ? AND instant <= ? ORDER BY instant
+                """, arguments: [owner, since.timeIntervalSince1970, until.timeIntervalSince1970])
+                .compactMap { row in
+                    let instant: Double = row["instant"], door: String = row["route"] ?? "chat"
+                    let id: String = row["id"]
+                    guard seen.insert(door + ":" + id).inserted else { return nil }
+                    return (at: Date(timeIntervalSince1970: instant), door: door)
+                }
+        }
+    }
+
     /// One conversation line as history holds it: who said it, when, the
     /// stored words. For the one reader outside the tool lane, the reading of
     /// her recent life into cares.
@@ -135,7 +162,7 @@ public final class ChatHistoryIndex: @unchecked Sendable {
 
     /// The transcript's line hashes, absorbing whatever changed since last read;
     /// `current` also upgrades rows with older projection semantics.
-    private func lines(at file: URL, current: Bool = false) throws -> [Data] {
+    private func lines(at file: URL, current: Bool = true) throws -> [Data] {
         absorption.lock()
         defer { absorption.unlock() }
         let path = key(file)
@@ -292,7 +319,11 @@ public final class ChatHistoryIndex: @unchecked Sendable {
 
         func applied(to row: ChatHistorySearchRow) throws -> ChatHistorySearchRow {
             var row = row
-            row.content = String(decoding: try (content as NSData).decompressed(using: .lzfse) as Data, as: UTF8.self)
+            let bytes = try (content as NSData).decompressed(using: .lzfse) as Data
+            guard let text = String(data: bytes, encoding: .utf8) else {
+                throw CocoaError(.fileReadInapplicableStringEncoding)
+            }
+            row.content = text
             row.searchable = searchable ?? row.content
             row.folded = row.searchable.lowercased()
             row.instant = instant.map(Date.init(timeIntervalSince1970:))
@@ -437,12 +468,11 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         try database.write { db in
             let version = try Int.fetchOne(db, sql: "PRAGMA user_version") ?? 0
             guard version != Self.schema else { return }
-            // Version 2's rows and packed manifests survive the one-time reference migration.
-            // Older derived shapes are rebuilt, as before.
-            if version != 2 {
+            guard version == 0 else {
+                throw ToolFailureError("History index schema \(version) is not current (\(Self.schema)).", effects: .none,
+                    owner: url.path, instruction: "Rebuild this derived history index from the canonical transcripts.")
+            }
                 try db.execute(sql: """
-                    DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS held;
-                    DROP TABLE IF EXISTS line; DROP TABLE IF EXISTS receipt; DROP TABLE IF EXISTS file;
                     CREATE TABLE line (hash BLOB PRIMARY KEY, valid INTEGER NOT NULL, shape INTEGER NOT NULL, identity TEXT, role TEXT,
                         run_id TEXT, message_id TEXT, timestamp TEXT, raw_content TEXT, content TEXT,
                         searchable TEXT, instant REAL, author TEXT, route TEXT, peer TEXT, tool TEXT,
@@ -452,23 +482,11 @@ public final class ChatHistoryIndex: @unchecked Sendable {
                     CREATE TABLE file (path TEXT PRIMARY KEY, inode INTEGER NOT NULL, size INTEGER NOT NULL,
                         modified REAL NOT NULL, absorbed INTEGER NOT NULL, terminated INTEGER NOT NULL, lines BLOB NOT NULL);
                     """)
-            }
             try db.execute(sql: """
                 CREATE TABLE held (path TEXT NOT NULL, hash BLOB NOT NULL, PRIMARY KEY(path, hash));
                 CREATE INDEX held_hash ON held(hash);
                 """)
-            for file in try Row.fetchAll(db, sql: "SELECT * FROM file") {
-                guard let manifest = Self.manifest(file) else {
-                    try db.execute(sql: "DELETE FROM file WHERE path = ?", arguments: [file["path"] as String])
-                    continue
-                }
-                for hash in Set(manifest.lines) {
-                    try db.execute(sql: "INSERT INTO held(path, hash) VALUES (?, ?)", arguments: [file["path"] as String, hash])
-                }
-            }
             try db.execute(sql: """
-                DELETE FROM receipt WHERE NOT EXISTS (SELECT 1 FROM held WHERE held.hash = receipt.hash);
-                DELETE FROM line WHERE NOT EXISTS (SELECT 1 FROM held WHERE held.hash = line.hash);
                 PRAGMA user_version = \(Self.schema);
                 """)
         }

@@ -10,7 +10,7 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
-// Blueprint: | `ChatOrchestrationClient+RuntimeHelpers.swift` | `SwiftNativeChatOrchestrationClient`: `contextFingerprint`, `iso8601` |
+// Blueprint: | `ChatOrchestrationClient+RuntimeHelpers.swift` | `SwiftNativeChatOrchestrationClient`: `contextFingerprint` |
 
 extension SwiftNativeChatOrchestrationClient {
     nonisolated static func contextFingerprint(recalledIds: [String]) -> String? {

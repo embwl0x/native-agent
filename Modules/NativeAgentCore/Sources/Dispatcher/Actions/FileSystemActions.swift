@@ -141,14 +141,14 @@ package enum FileSystemActions {
 }
 func isNull(_ v: JSONValue) -> Bool { if case .null = v { return true }; return false }
 /// Raw strings, scalar text with True/False/None spellings, or serialized containers.
-func jsonToStr(_ v: JSONValue) -> String {
+func jsonToStr(_ v: JSONValue) throws -> String {
     switch v {
     case .string(let s): return s
     case .bool(let b): return b ? "True" : "False"
     case .int(let i): return String(i)
     case .double(let d): return String(d)
     case .null: return "None"
-    default: return (try? v.serialize(pretty: false)) ?? ""
+    default: return try v.serialize(pretty: false)
     }
 }
 /// repr-ish rendering for error messages (`got <x>`). Best-effort.
@@ -160,13 +160,11 @@ func jsonRepr(_ v: JSONValue?) -> String {
     case .bool(let b): return b ? "True" : "False"
     case .int(let i): return String(i)
     case .double(let d): return String(d)
-    default: return (try? v.serialize(pretty: false)) ?? ""
+    default:
+        do { return try v.serialize(pretty: false) }
+        catch { return "[JSON serialization unavailable: \(error.localizedDescription)]" }
     }
 }
 func rootsRepr(_ roots: [URL]) -> String {
     "[" + roots.map { "'\($0.path)'" }.joined(separator: ", ") + "]"
-}
-/// Decode UTF-8, replacing invalid sequences with U+FFFD.
-func decodeUTF8Replacing(_ data: Data) -> String {
-    String(decoding: data, as: UTF8.self)
 }

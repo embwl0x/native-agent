@@ -21,41 +21,14 @@ import MacControl
 import Darwin
 import ChatTurnContracts
 import ChatToolParsing
-// Blueprint: | `MountedTranscriptRefresh.swift` | Mounted and detached chat refresh/observation through the engine shared transcript owner |
+// Blueprint: | `MountedTranscriptRefresh.swift` | Mounted conversations read the store when it publishes; no turn refreshes a view |
 extension NativeAgentEngine {
-    /// Re-read a mounted transcript after a turn to replace optimistic rows
-    /// with persisted ones. Local turns already land their disk snapshot and
-    /// set `messagesAlreadyRefreshed`; remote turns keep the full refresh.
+    /// A mounted conversation reads the store when the store publishes (its file changed). No turn asks for this read:
+    /// the live turn is drawn over the saved rows, and settles into them as the store takes them.
     @MainActor
-    @discardableResult
-    public func refreshChatMessagesAfterTurn(
-        sessionId: String, messagesAlreadyRefreshed: Bool,
-        isMounted: () -> Bool, failure: (Error) -> Void
-    ) async -> Bool {
-        guard !sessionId.isEmpty, isMounted() else { return false }
-        if !messagesAlreadyRefreshed {
-            do {
-                guard try await transcripts.refreshMessages(sessionId: sessionId) else { return false }
-            } catch {
-                failure(error)
-                return false
-            }
-        }
-        return isMounted()
-    }
-    /// Refresh a visible detached transcript after a turn completed on another
-    /// surface, independently of the main selection.
-    @MainActor
-    public func refreshDetachedChatMessagesAfterTurn(
-        sessionId: String, messagesAlreadyRefreshed: Bool,
-        isDetached: () -> Bool, finished: ([String]) -> Void
-    ) async {
-        if await refreshChatMessagesAfterTurn(
-            sessionId: sessionId, messagesAlreadyRefreshed: messagesAlreadyRefreshed,
-            isMounted: isDetached, failure: { _ in finished(["messages"]) }
-        ) {
-            finished([])
-        }
+    public func readMountedTranscript(sessionId: String, failure: (Error) -> Void) async {
+        guard !sessionId.isEmpty else { return }
+        do { try await transcripts.refreshMessages(sessionId: sessionId) } catch { failure(error) }
     }
 }
 extension NativeAgentEngine {
@@ -66,8 +39,7 @@ extension NativeAgentEngine {
             for await _ in events.stream {
                 guard !Task.isCancelled else { break }
                 var failure: Error?
-                await refreshChatMessagesAfterTurn(sessionId: sessionID, messagesAlreadyRefreshed: false,
-                    isMounted: { true }, failure: { failure = $0 })
+                await readMountedTranscript(sessionId: sessionID, failure: { failure = $0 })
                 finished(failure)
             }
         } onCancel: { events.cancel() }

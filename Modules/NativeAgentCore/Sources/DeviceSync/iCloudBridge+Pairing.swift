@@ -11,7 +11,7 @@ import PersistenceCore
 import ProviderRouting
 import OSLog
 import Network
-// Blueprint: | `iCloudBridge+Pairing.swift` | Pairing claims and the Mac reading of phone connection facts |
+// Blueprint: | `iCloudBridge+Pairing.swift` | Pairing claims reconcile owed key changes from the exact existing Keychain item before reopening signing; the Mac reading of phone connection facts |
 
 extension iCloudBridge {
     /// Publish the exact bytes returned by the atomic rotation transaction.
@@ -38,6 +38,21 @@ extension iCloudBridge {
         refreshPhoneConnection()
     }
 
+    public var pairingPublicationOwed: Bool {
+        UserDefaults.standard.bool(forKey: pairingPublicationOwedKey)
+    }
+
+    private func pairingSecretForPublication() async throws -> Data {
+        // Callers exclude an in-flight write before entering this read.
+        let secret = try pairingPublicationOwed
+            ? PairingSecret.requireExistingSecret() : PairingSecret.loadOrGenerateSecret()
+        if sync.engine.pairingSecretRotation == .awaitingVerification {
+            await sync.engine.finishPairingSecretRotation(with: secret)
+            nativeLog("[PairingBootstrap] Reconciled pairing rotation from the exact existing Keychain item; pairing publication remains owed")
+        }
+        return secret
+    }
+
     /// The account's pairing record takes this Mac's key: the person's act or
     /// this Mac's own key change. Landing settles anything owed.
     private func publishPairing(_ secret: Data) async -> Bool {
@@ -53,13 +68,13 @@ extension iCloudBridge {
     /// record holds. Launch takes that record only when it is free or already
     /// this Mac's. Another Mac keeps the phone until the person moves it here
     /// (`usePhoneHere`), so launching a second Mac never takes the phone.
-    func claimPhonePairing() async {
-        guard let transport = deviceTransport else { return }
+    public func claimPhonePairing() async {
+        guard let transport = deviceTransport, sync.engine.pairingSecretRotation != .writing else { return }
         let generation = setupGeneration
         let accountGeneration = accountFailureGeneration
         let secret: Data
         do {
-            secret = try PairingSecret.loadOrGenerateSecret()
+            secret = try await pairingSecretForPublication()
         } catch {
             nativeLog("[PairingBootstrap] Pairing unavailable; refusing device claim: \(error.localizedDescription)")
             pairingKeyUnreadable = true
@@ -70,7 +85,7 @@ extension iCloudBridge {
         }
         pairingKeyUnreadable = false
         let held: Bool?
-        if UserDefaults.standard.bool(forKey: pairingPublicationOwedKey) {
+        if pairingPublicationOwed {
             held = await publishPairing(secret) ? true : nil
         } else {
             held = await transport.claimPairing(secret: secret)
@@ -94,9 +109,16 @@ extension iCloudBridge {
     /// The person's act: move the phone to this Mac.
     @discardableResult
     public func usePhoneHere() async -> Bool {
-        guard deviceTransport != nil,
-              let secret = try? PairingSecret.loadOrGenerateSecret() else { return false }
-        return await publishPairingSecret(secret)
+        guard deviceTransport != nil, sync.engine.pairingSecretRotation != .writing else { return false }
+        do {
+            let secret = try await pairingSecretForPublication()
+            pairingKeyUnreadable = false
+            return await publishPairingSecret(secret)
+        } catch {
+            pairingKeyUnreadable = true
+            nativeLog("[PairingBootstrap] Pairing unavailable; refusing move here: \(error.localizedDescription)")
+            return false
+        }
     }
 
     /// This Mac holds the pairing. Coming out of silence (launch, or another
@@ -128,8 +150,6 @@ extension iCloudBridge {
         syncStatus = Self.pairedElsewhereStatus
         doctorTransportHealth = .pairedElsewhere
         doctorSendFailures.removeAll()
-        deviceDrainTimerTask?.cancel()
-        deviceDrainTimerTask = nil
         recordTransportOrgansOff("the iPhone is paired with another Mac")
     }
 
@@ -137,6 +157,7 @@ extension iCloudBridge {
 
     func notePhoneContact(at peerTimestamp: Date) {
         let contact = min(peerTimestamp, Date())
+        phoneContactReadFailure = nil
         if contact > (lastPhoneContactAt ?? .distantPast) { lastPhoneContactAt = contact }
     }
 
@@ -150,7 +171,7 @@ extension iCloudBridge {
             return .init(.broken, "This Mac's pairing key can't be read.", owner: .personOnMac,
                          lever: "Open Connectors → iPhone → Regenerate the pairing key, confirm Regenerate, then pair the iPhone again.")
         }
-        if deviceTransport != nil, UserDefaults.standard.bool(forKey: pairingPublicationOwedKey) {
+        if deviceTransport != nil, pairingPublicationOwed {
             return .init(.waiting, "This Mac's new pairing key is waiting for iCloud to take it.", owner: .network,
                          lever: "Keep this Mac online with NativeAgent open; it publishes the key on its own.")
         }
@@ -175,11 +196,19 @@ extension iCloudBridge {
     }
 
     private var phoneTransportFact: NAPhoneConnection.Fact {
+        if let accountFailureReadError {
+            return .init(.broken, accountFailureReadError, owner: .builder,
+                         lever: "Restore access to icloud/account_failure.json, then check Connection.")
+        }
         if accountFailure != nil {
             return .init(.broken, "iCloud sign-in needs attention on this Mac.", owner: .iCloudAccount,
                          lever: "Open System Settings → Apple Account and finish signing in to iCloud.")
         }
         if deviceTransport == nil, let transportRefusal { return transportRefusal }
+        if cloudKitPushUnavailable {
+            return .init(.broken, "CloudKit cannot wake this Mac for phone messages.", owner: .builder,
+                         lever: "Repair APNs registration and CloudKit subscriptions. Open Connection to refresh explicitly meanwhile.")
+        }
         let carrier = deviceTransport != nil ? "CloudKit" : "iCloud Drive"
         switch doctorTransportHealth {
         case .available, .pairedElsewhere:
@@ -209,6 +238,10 @@ extension iCloudBridge {
     }
 
     private var phoneExchangeFact: NAPhoneConnection.Fact {
+        if let phoneContactReadFailure {
+            return .init(.waiting, "Saved phone contact evidence is unavailable: \(phoneContactReadFailure)",
+                         owner: .builder, lever: "Repair mobile/signed_peer_evidence.json while preserving its contents, then reconnect.")
+        }
         if let rejected = lastPhoneRejectedAt, rejected > (lastPhoneContactAt ?? .distantPast) {
             return .init(.broken,
                          "Turned away the iPhone's last message (\(rejected.formatted(date: .abbreviated, time: .shortened))): it was signed with a key this Mac does not hold.",
@@ -222,16 +255,4 @@ extension iCloudBridge {
         return .init(.holds, "Last message from your iPhone: \(contact.formatted(date: .abbreviated, time: .shortened)).")
     }
 
-    /// Why a build meant to use CloudKit got no transport for the phone.
-    nonisolated static func cloudKitRefusal(containerID: String) -> NAPhoneConnection.Fact? {
-        guard DeviceSyncTransportResolver.resolvedKind() == .cloudkit else { return nil }
-        guard DeviceCloudKitPreflight.hasCloudKitEntitlement() else {
-            return .init(.broken, "This build is not signed for CloudKit, so the iPhone cannot reach it.", owner: .builder,
-                         lever: "Install a NativeAgent build signed with CloudKit.")
-        }
-        return .init(.broken,
-                     "This build is configured for iCloud container \(containerID), but its signature grants another, so the iPhone cannot reach it.",
-                     owner: .builder,
-                     lever: "Install a NativeAgent build whose iCloud container matches its signature.")
-    }
 }

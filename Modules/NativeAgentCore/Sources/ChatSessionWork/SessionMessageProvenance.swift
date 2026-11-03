@@ -12,28 +12,25 @@ public enum SessionMessageProvenance: Sendable, Equatable {
         }
     }
 
-    public static func make(role: String, source: String?, hasOrigin: Bool, surface: String?, agent: String?) -> SessionMessageProvenance? {
+    /// `envelope` is the row's recorded turn envelope (`metadata.envelope`), which the
+    /// persistence seam writes on every message row from the transport that admitted it.
+    public static func make(role: String, source: String?, hasEnvelope: Bool, surface: String?, agent: String?) -> SessionMessageProvenance? {
         guard role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "user" else {
             return nil
         }
-        // The out-of-band origin record wins when present: it is written by the
-        // persistence seam and, unlike `source`, is not overloaded to also mean
-        // "tool authorization surface". The bridges legitimately run with
-        // source "app" precisely so they keep chat's tool permissions, so
-        // `source` alone cannot distinguish them.
+        // The recorded envelope is the provenance: the transport named itself
+        // and any bridge lane when it admitted the turn. `source` is overloaded
+        // to also mean "tool authorization surface" (the bridges run with
+        // source "app" to keep chat's tool permissions), so it never decides
+        // provenance for a recorded row.
         //
-        // The PRESENCE of the record is itself the signal, independent of what
-        // it says. `surface` is Optional, so `{"origin":{}}` and
-        // `{"origin":{"agent":"claude"}}` both decode cleanly with a nil
-        // surface. Falling back to `source` there would read "app" and render
-        // NO badge — a bridge row displayed as though User typed it, which is
-        // precisely the trust leak this file exists to close. An origin with no
-        // readable surface is UNATTRIBUTED, not human, so it resolves to the
-        // same "unreadable" sentinel the undecodable case uses in
-        // ChatMessageMetadata.init(from:) and lands on "Automated" below.
-        // Once an origin record exists, this function can never return nil.
+        // An envelope with no readable surface is UNATTRIBUTED, not human: it
+        // resolves to the same "unreadable" sentinel an undecodable envelope
+        // gets in ChatMessageMetadata(fields:) and lands on "Automated" below.
+        // Only an unsaved local bubble has no envelope; it is the person at
+        // this Mac until the canonical row replaces it.
         let recorded: String
-        if hasOrigin {
+        if hasEnvelope {
             recorded = normalized(surface) ?? "unreadable"
         } else {
             guard let fromSource = normalized(source) else { return nil }
@@ -42,31 +39,29 @@ public enum SessionMessageProvenance: Sendable, Equatable {
 
         switch recorded {
         case "app", "chat", "mac", "default":
-            // A local source is human only when there is NO explicit origin
-            // record. Once an origin object exists, even
-            // {"surface":"app"}, suppressing the badge would turn malformed
-            // provenance back into a human-looking row.
-            return !hasOrigin ? nil : .automated
+            // The local window is the person at this Mac unless the envelope
+            // names an agent lane (a bridge, her own native work).
+            return normalized(agent) == nil ? nil : .automated
         case "claude-bridge", "claude_bridge", "claude":
-            guard bridgeAgentMatches("claude", hasOrigin: hasOrigin, agent: agent) else {
+            guard bridgeAgentMatches("claude", hasEnvelope: hasEnvelope, agent: agent) else {
                 return .automated
             }
             return .claude
         case "codex-bridge", "codex_bridge", "codex":
-            guard bridgeAgentMatches("codex", hasOrigin: hasOrigin, agent: agent) else {
+            guard bridgeAgentMatches("codex", hasEnvelope: hasEnvelope, agent: agent) else {
                 return .automated
             }
             return .codex
         case "telegram":
-            guard humanTransportHasNoAgent(hasOrigin: hasOrigin, agent: agent) else { return .automated }
+            guard humanTransportHasNoAgent(hasEnvelope: hasEnvelope, agent: agent) else { return .automated }
             return .telegram
         case "slack":
-            guard humanTransportHasNoAgent(hasOrigin: hasOrigin, agent: agent) else { return .automated }
+            guard humanTransportHasNoAgent(hasEnvelope: hasEnvelope, agent: agent) else { return .automated }
             return .slack
-        case "ios", "mobile", "iphone", "icloud":
-            guard humanTransportHasNoAgent(hasOrigin: hasOrigin, agent: agent) else { return .automated }
+        case "ios":
+            guard humanTransportHasNoAgent(hasEnvelope: hasEnvelope, agent: agent) else { return .automated }
             return .iPhone
-        case "cron", "scheduler", "scheduled":
+        case "scheduler":
             return .scheduled
         default:
             // Unrecognized. Say that it is machine-authored and say NOTHING
@@ -80,23 +75,23 @@ public enum SessionMessageProvenance: Sendable, Equatable {
     /// still visibly automated, but it cannot borrow another route's label.
     private static func bridgeAgentMatches(
         _ expected: String,
-        hasOrigin: Bool, agent: String?
+        hasEnvelope: Bool, agent: String?
     ) -> Bool {
         // `source` alone is routing/display data. A named bridge badge requires
-        // the explicit server-written origin object and an agreeing pair. The
+        // the recorded envelope and an agreeing pair. The
         // bridge currently shares one bearer across routes, so this is route
         // provenance rather than independent caller-identity attestation.
-        guard hasOrigin else { return false }
+        guard hasEnvelope else { return false }
         return normalized(agent) == expected
     }
 
     /// Human transport labels describe the person-facing ingress, so an
-    /// explicit machine-agent claim contradicts them. Source-only legacy rows
-    /// and explicit origins without an agent remain valid human transports.
+    /// explicit machine-agent claim contradicts them. A remote-human label
+    /// requires the recorded envelope; source alone proves no human authorship.
     private static func humanTransportHasNoAgent(
-        hasOrigin: Bool, agent: String?
+        hasEnvelope: Bool, agent: String?
     ) -> Bool {
-        guard hasOrigin else { return true }
+        guard hasEnvelope else { return false }
         return normalized(agent) == nil
     }
 

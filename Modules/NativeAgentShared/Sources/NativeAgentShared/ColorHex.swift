@@ -54,18 +54,23 @@ public extension Color {
 /// by chat and nothing else (`settings.haze_color`).
 public enum HazeColor: String, CaseIterable, Identifiable, Sendable {
     case teal, blue, violet, rose, amber, forest, graphite
+    /// An unsupported saved value has no selected hue until the person repairs it.
+    case unavailable
+
+    public static let allCases: [Self] = [.teal, .blue, .violet, .rose, .amber, .forest, .graphite]
 
     public static let key = "nativeagent.hazeColor"
     public static let storageKey = key
     public static let defaultValue: HazeColor = .teal
 
-    public init(stored raw: String) { self = HazeColor(rawValue: raw) ?? .teal }
+    public init(stored raw: String) { self = HazeColor(rawValue: raw) ?? .unavailable }
 
     public var id: String { rawValue }
 
     /// The accessibility name, and the word the Settings swatch speaks.
     public var name: String {
         switch self {
+        case .unavailable: return "Unsupported saved color"
         case .forest: return "Forest green"
         default: return rawValue.capitalized
         }
@@ -73,6 +78,7 @@ public enum HazeColor: String, CaseIterable, Identifiable, Sendable {
 
     public var shades: [UInt] {
         switch self {
+        case .unavailable: return [0x000000, 0x000000, 0x000000]
         case .teal:     return [0x17A597, 0x0F7C78, 0x1CB8A6]
         case .blue:     return [0x2F6FD6, 0x1F4FA8, 0x3C86E8]
         case .violet:   return [0x7A52D6, 0x5A3AA8, 0x8D66EA]

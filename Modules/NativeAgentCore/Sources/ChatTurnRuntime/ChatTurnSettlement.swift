@@ -80,7 +80,7 @@ extension SwiftNativeChatOrchestrationClient {
         context: TurnContext?,
         result: TurnEngineResult
     ) -> TurnTraceEvent {
-        // Legacy failed-slot count includes neverRan refusals. Attempt counts and subsequent-round behavior use ToolLoopTraceObservation instead.
+        // Slot failures include neverRan refusals. Attempt counts use ToolLoopTraceObservation.
         let failed = result.toolDispatches.filter {
             !ChatToolOutcome.outputLooksSuccessful($0.result)
                 && !ChatToolOutcome.wasCancelled($0.result)
@@ -104,8 +104,6 @@ extension SwiftNativeChatOrchestrationClient {
             "recalledMemoryCount": .int(Int64(result.recalledIds.count)),
             "toolDispatchCount": .int(Int64(result.toolDispatches.count)),
             "discoveryToolDispatchCount": .int(Int64(discovery.count)),
-            // Retain the legacy slot counter; attempted failures exclude synthetic skips.
-            "failedToolDispatchCount": .int(Int64(failed)),
             "failedToolSlotCount": .int(Int64(failed)),
             "contextExpansionCount": .int(Int64(expansions)),
         ]
@@ -175,7 +173,7 @@ extension SwiftNativeChatOrchestrationClient {
     /// The accepted turn owns one settlement, after its effect has returned or thrown.
     func settleStructuredChatTurn(
         _ outcome: Result<ProducedChatTurn, any Error>, observation: ToolLoopTraceObservation, context: TurnContext?,
-        message: String, sessionId resolvedSession: String, runId: String, turnId boundTurnId: String,
+        message: String, sessionId resolvedSession: String, runId: String, turnId boundTurnId: String, replyRowID: String?,
         heardID: String, model: String, reasoningEffort: String, persona: String?, surface: String,
         suppressUserAppend: Bool, chosenPaths: [String], outputMilestoneGate: TurnLifecycleFirstOutputGate,
         noticeSink: @escaping @Sendable (String, String) async -> Void
@@ -200,7 +198,7 @@ extension SwiftNativeChatOrchestrationClient {
         case .success(let produced):
         let result = produced.result
         let providerCtx = produced.context
-        let reply = BotRunner.conditionReply(result.reply, sessionID: resolvedSession)
+        let reply = result.reply
         let transcriptRow = TurnSettle.transcriptRow(for: reply)
         let generatedAttachments = produced.attachments
         // The row the surface drew this reply in, when it drew one for this turn: the answer lands in place instead of replacing it.
@@ -293,14 +291,14 @@ extension SwiftNativeChatOrchestrationClient {
         execution = StructuredChatExecution(response: response, turn: .success(result))
         case .failure(let error):
             let cancelled = error is CancellationError
-            let partial = BotRunner.conditionReply(
-                ToolCallParser.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(observation.partialReply)),
-                sessionID: resolvedSession)
+            let partial = ToolCallParser.visiblePrefix(in: ToolCallParser.stripToolUseMarkers(observation.partialReply))
             let attachments = ChatGeneratedImageArtifacts.attachments(
                 from: observation.toolDispatches, chosen: chosenPaths, dataRoot: dataRoot)
             let saved = try await persistPartialIfNeeded(
                 sessionId: resolvedSession, runId: runId, text: partial, attachments: attachments,
-                cancelled: cancelled, failure: error, source: surface, outcomeContext: context, onNotice: noticeSink)
+                cancelled: cancelled, failure: error, source: surface, outcomeContext: context,
+                // The partial is the reply's own row: the id its live bubble was born with.
+                replyRowID: replyRowID, onNotice: noticeSink)
             if saved == nil, !cancelled, Self.shouldPersistFailureMessage(surface: surface) {
                 try await appendFailureMessageIfNeeded(sessionId: resolvedSession, runId: runId,
                     failure: error, persona: persona, surface: surface,

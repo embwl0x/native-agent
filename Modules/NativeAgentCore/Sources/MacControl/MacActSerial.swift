@@ -10,7 +10,7 @@ import NativeAgentShared
 import UserNotifications
 import Experiences
 import Senses
-// Blueprint: | `MacActSerial.swift` | `MacActSerial` serializes named/exact acts and watch hands, releasing held input on driver transfer |
+// Blueprint: | `MacActSerial.swift` | `MacActSerial` serializes named/exact acts and watch hands, releasing held input on driver transfer; expired queue parkers remove themselves or pass on a raced slot |
 
 /// One act at a time, in arrival order. Every act reads and moves a real
 /// window, and the pid it will touch is only known after its first look, so
@@ -18,7 +18,7 @@ import Senses
 actor MacActSerial {
     static let shared = MacActSerial()
     private var busy = false
-    private var waiters: [(UUID, CheckedContinuation<Bool, Never>)] = []
+    private var waiters: [(UUID, ScopedWaiter)] = []
     private weak var inputOwner: MacDriverBinding?
 
     /// A new driver cannot inherit another watch's held keys or buttons.
@@ -28,29 +28,23 @@ actor MacActSerial {
     }
 
     func acquire() async -> Bool {
-        guard !Task.isCancelled else { return false }
+        guard !Task.isCancelled, !TaskWaitDeadline.expired else { return false }
         guard busy else { busy = true; return true }
         let id = UUID()
-        let acquired = await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                guard !Task.isCancelled else { continuation.resume(returning: false); return }
-                waiters.append((id, continuation))
-            }
-        } onCancel: {
-            Task { await self.cancel(id) }
+        let done = ScopedWaiter()
+        waiters.append((id, done))
+        await done.park()
+        if let index = waiters.firstIndex(where: { $0.0 == id }) {
+            waiters.remove(at: index)
+            return false
         }
         // Cancellation may race the transfer of the slot; its new owner must
         // pass it on before returning, rather than abandoning a busy queue.
-        if acquired, Task.isCancelled { release(); return false }
-        return acquired
-    }
-
-    private func cancel(_ id: UUID) {
-        guard let index = waiters.firstIndex(where: { $0.0 == id }) else { return }
-        waiters.remove(at: index).1.resume(returning: false)
+        if Task.isCancelled || TaskWaitDeadline.expired { release(); return false }
+        return true
     }
 
     func release() {
-        if waiters.isEmpty { busy = false } else { waiters.removeFirst().1.resume(returning: true) }
+        if waiters.isEmpty { busy = false } else { waiters.removeFirst().1.resume() }
     }
 }

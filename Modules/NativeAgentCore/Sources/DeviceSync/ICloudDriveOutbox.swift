@@ -37,8 +37,8 @@ extension iCloudBridge {
         let scanGeneration = outboxScanGeneration
         let lifecycle = setupGeneration
         outboxScanTask = Task.detached(priority: .utility) { [docsURL, seenSnapshot, inFlightSnapshot, secret] in
-            let scan = await VolumeIO.run {
-                Self.scanIosOutboxFiles(docsURL: docsURL, seenMessageIDs: seenSnapshot,
+            let result = await VolumeIO.result {
+                try Self.scanIosOutboxFiles(docsURL: docsURL, seenMessageIDs: seenSnapshot,
                     inFlightMessageIDs: inFlightSnapshot, secret: secret)
             }
             await MainActor.run {
@@ -51,6 +51,13 @@ extension iCloudBridge {
                 }
                 guard !Task.isCancelled, self.isSetUp, self.outboxScanGeneration == scanGeneration,
                       lifecycle == self.setupGeneration else { return }
+                let scan: [PendingOutboxMessage]
+                switch result {
+                case .success(let messages): scan = messages
+                case .failure(let error):
+                    self.syncStatus = "Retained Drive messages could not be read: \(error.localizedDescription). Restore the Drive folder's access before resuming them."
+                    return
+                }
                 if !scan.isEmpty {
                     self.lastSyncAt = Date()
                     self.syncStatus = "Received message from iOS"
@@ -66,6 +73,7 @@ extension iCloudBridge {
                         guard self.isSetUp, lifecycle == self.setupGeneration else { return }
                         guard !self.seenMessageIDs.contains(pending.message.id),
                               !self.inFlightIncomingMessageIDs.contains(pending.message.id) else { continue }
+                        self.notePhoneContact(at: pending.message.timestamp)
                         do {
                             try await SignedPeerEvidenceStore.record(
                                 eventID: pending.message.id,
@@ -73,9 +81,6 @@ extension iCloudBridge {
                                 peerCreatedAt: pending.message.timestamp,
                                 dataRoot: PersistenceCore.defaultDataRoot()
                             )
-                            if self.isSetUp, lifecycle == self.setupGeneration {
-                                self.notePhoneContact(at: pending.message.timestamp)
-                            }
                         } catch {
                             nativeLog("[iCloudBridge] could not persist signed peer evidence for %@: %@",
                                   pending.message.id, error.localizedDescription)
@@ -83,13 +88,16 @@ extension iCloudBridge {
                         guard self.isSetUp, lifecycle == self.setupGeneration else { return }
                         let delivery = await self.deliverIncomingChat(pending.message)
                         if delivery != .deferred {
-                            if delivery == .delivered {
-                                await Self.appendInboundSuccessReceipt(
+                            if delivery == .delivered || delivery == .handled {
+                                guard await Self.appendInboundSuccessReceipt(
                                     pending.message,
                                     transport: "icloud_drive",
                                     secret: secret,
                                     dataRoot: PersistenceCore.defaultDataRoot()
-                                )
+                                ) else {
+                                    self.syncStatus = "iPhone request was handled; its required receipt remains owed. The original message remains pending."
+                                    continue
+                                }
                             }
                             await self.markIosMessageProcessed(pending, docsURL: docsURL, recordIdentity: delivery != .rejected)
                         } else if self.isSetUp, lifecycle == self.setupGeneration {
@@ -110,20 +118,16 @@ extension iCloudBridge {
             .appendingPathComponent("ios_chat_processed_ids.json")
     }
     // Persist the ordered message identities, oldest first.
-    nonisolated static func loadProcessedMessageIDs(docsURL: URL) -> [String] {
+    nonisolated static func loadProcessedMessageIDs(docsURL: URL) throws -> [String] {
         let url = processedMessageIDsURL(docsURL: docsURL)
-        guard let data = try? Data(contentsOf: url),
-              let ids = try? JSONDecoder().decode([String].self, from: data) else {
-            return []
-        }
-        return ids
+        do { return try JSONDecoder().decode([String].self, from: VolumeIO.contents(of: url)) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
     }
-    nonisolated static func saveProcessedMessageIDs(_ ids: [String], docsURL: URL) {
+    nonisolated static func saveProcessedMessageIDs(_ ids: [String], docsURL: URL) throws {
         let url = processedMessageIDsURL(docsURL: docsURL)
         let capped = Array(ids.suffix(seenMessageIDsCap))
-        guard let data = try? JSONEncoder().encode(capped) else { return }
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: url, options: .atomic)
+        let data = try JSONEncoder().encode(capped)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
     }
     private func markIosMessageProcessed(_ pending: PendingOutboxMessage, docsURL: URL, recordIdentity: Bool) async {
         let processedDir = docsURL.appendingPathComponent(DriveFolder.processed)
@@ -131,38 +135,47 @@ extension iCloudBridge {
         let dest = processedDir.appendingPathComponent(pending.fileURL.lastPathComponent)
         let idsSnapshot = seenMessageIDsOrdered
         let sourceURL = pending.fileURL
-        await VolumeIO.run { [idsSnapshot, docsURL, dest, sourceURL] in
-            Self.saveProcessedMessageIDs(idsSnapshot, docsURL: docsURL)
+        let result = await VolumeIO.result { [idsSnapshot, docsURL, dest, sourceURL] in
+            try Self.saveProcessedMessageIDs(idsSnapshot, docsURL: docsURL)
             if FileManager.default.fileExists(atPath: dest.path) {
-                try? FileManager.default.removeItem(at: dest)
+                guard try VolumeIO.contents(of: dest) == VolumeIO.contents(of: sourceURL) else {
+                    throw CocoaError(.fileWriteFileExists)
+                }
+                try FileManager.default.removeItem(at: sourceURL)
+            } else {
+                try FileManager.default.moveItem(at: sourceURL, to: dest)
             }
-            try? FileManager.default.moveItem(at: sourceURL, to: dest)
         }
-        lastSyncAt = Date()
-        syncStatus = "iPhone request processed"
+        switch result {
+        case .success:
+            lastSyncAt = Date()
+            syncStatus = "iPhone request processed"
+        case .failure(let error):
+            syncStatus = "The iPhone request ran, but its Drive completion could not be retained: \(error.localizedDescription). Repair the processed-message store; do not repeat the request."
+        }
     }
     nonisolated static func scanIosOutboxFiles(
         docsURL: URL,
         seenMessageIDs: Set<String>,
         inFlightMessageIDs: Set<String>,
         secret: Data
-    ) -> [PendingOutboxMessage] {
+    ) throws -> [PendingOutboxMessage] {
         let iosOutbox = docsURL.appendingPathComponent(DriveFolder.outboxIos)
         let processingDir = docsURL.appendingPathComponent(DriveFolder.processing)
         let processedDir = docsURL.appendingPathComponent(DriveFolder.processed)
         let fm = FileManager.default
         var messages: [PendingOutboxMessage] = []
         try? fm.startDownloadingUbiquitousItem(at: iosOutbox)
-        try? fm.createDirectory(at: processingDir, withIntermediateDirectories: true)
-        try? fm.createDirectory(at: processedDir, withIntermediateDirectories: true)
-        let outboxFiles = (try? fm.contentsOfDirectory(
+        try fm.createDirectory(at: processingDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: processedDir, withIntermediateDirectories: true)
+        let outboxFiles = try fm.contentsOfDirectory(
             at: iosOutbox, includingPropertiesForKeys: [.creationDateKey],
             options: .skipsHiddenFiles
-        )) ?? []
-        let processingFiles = (try? fm.contentsOfDirectory(
+        )
+        let processingFiles = try fm.contentsOfDirectory(
             at: processingDir, includingPropertiesForKeys: [.creationDateKey],
             options: .skipsHiddenFiles
-        )) ?? []
+        )
         let jsonFiles = (outboxFiles + processingFiles).filter { $0.pathExtension == "json" }
             .sorted { ($0.lastPathComponent) < ($1.lastPathComponent) }
         func quarantine(_ url: URL, data: Data, reason: String) {
@@ -170,7 +183,7 @@ extension iCloudBridge {
             let dest = processedDir.appendingPathComponent("\(reason)_\(digest).done")
             do {
                 if fm.fileExists(atPath: dest.path) {
-                    guard try Data(contentsOf: dest) == data else { throw CocoaError(.fileReadCorruptFile) }
+                    guard try VolumeIO.contents(of: dest) == data else { throw CocoaError(.fileReadCorruptFile) }
                     try fm.removeItem(at: url)
                 } else {
                     try fm.moveItem(at: url, to: dest)
@@ -182,7 +195,7 @@ extension iCloudBridge {
         }
         var admittedPaths = Set<URL>()
         for fileURL in jsonFiles {
-            guard let data = try? Data(contentsOf: fileURL) else { continue }
+            let data = try VolumeIO.contents(of: fileURL)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             guard let msg = try? decoder.decode(BridgeMessage.self, from: data) else {
@@ -199,7 +212,7 @@ extension iCloudBridge {
                 let claimed = processingDir.appendingPathComponent(fileURL.lastPathComponent)
                 if fm.fileExists(atPath: claimed.path) {
                     do {
-                        if try Data(contentsOf: claimed) == data {
+                        if try VolumeIO.contents(of: claimed) == data {
                             // The authenticated bytes are already claimed. Its
                             // handler (possibly queued) still owns that path.
                             try fm.removeItem(at: fileURL)

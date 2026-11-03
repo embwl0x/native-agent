@@ -8,16 +8,21 @@ import PersistenceCore
 
 extension MemoryStorage {
     static func validateTemporalEvidence(_ memory: StoredMemory) throws {
+        try validateTemporalEvidence(id: memory.id, validFrom: memory.validFrom,
+            validTo: memory.validTo, observedAt: memory.observedAt)
+    }
+
+    static func validateTemporalEvidence(id: String, validFrom: String?, validTo: String?, observedAt: String?) throws {
         func parsed(_ label: String, _ value: String?) throws -> Date? {
             guard let value else { return nil }
             guard let date = MemoryRecallScoring.parseTimestamp(value) else {
-                throw MemoryStorageError.invalidTemporalEvidence("\(label) is not ISO-8601")
+                throw MemoryStorageError.invalidTemporalEvidence("Memory \(id): \(label) is not ISO-8601")
             }
             return date
         }
-        let validFrom = try parsed("valid_from", memory.validFrom)
-        let validTo = try parsed("valid_to", memory.validTo)
-        _ = try parsed("observed_at", memory.observedAt)
+        let validFrom = try parsed("valid_from", validFrom)
+        let validTo = try parsed("valid_to", validTo)
+        _ = try parsed("observed_at", observedAt)
         if let validFrom, let validTo, validTo < validFrom {
             throw MemoryStorageError.invalidTemporalEvidence("valid_to precedes valid_from")
         }
@@ -39,16 +44,6 @@ extension MemoryStorage {
         NativeTimestampFormat.fractionalZulu(Date())
     }
 
-    static func metadataString(
-        _ object: [String: JSONValue],
-        _ key: String,
-        fallback: String
-    ) -> String? {
-        if case .string(let value)? = object[key] { return value }
-        if case .string(let value)? = object[fallback] { return value }
-        return nil
-    }
-
     static func encodeEmbedding(_ e: [Float]?) -> Data? {
         guard let e else { return nil }
         var out = Data(capacity: e.count * 4)
@@ -59,8 +54,11 @@ extension MemoryStorage {
         return out
     }
 
-    static func decodeEmbedding(_ data: Data?) -> [Float]? {
-        guard let data, data.count % 4 == 0 else { return nil }
+    static func decodeEmbedding(_ data: Data?) throws -> [Float]? {
+        guard let data else { return nil }
+        guard !data.isEmpty, data.count % 4 == 0 else {
+            throw MemoryStorageError.databaseUnavailable("Stored embedding has invalid byte length \(data.count); repair the canonical vector before semantic use.")
+        }
         let count = data.count / 4
         var out = [Float](); out.reserveCapacity(count)
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
@@ -69,14 +67,16 @@ extension MemoryStorage {
                 out.append(Float(bitPattern: UInt32(littleEndian: base[i])))
             }
         }
+        guard out.allSatisfy(\.isFinite) else {
+            throw MemoryStorageError.databaseUnavailable("Stored embedding contains a non-finite value; repair the canonical vector before semantic use.")
+        }
         return out
     }
 
-    static func encodeMetadata(_ m: JSONValue?) -> String? {
+    static func encodeMetadata(_ m: JSONValue?) throws -> String? {
         guard let m else { return nil }
         let enc = JSONEncoder()
-        guard let data = try? enc.encode(m), let s = String(data: data, encoding: .utf8) else { return nil }
-        return s
+        return String(decoding: try enc.encode(m), as: UTF8.self)
     }
 
     static func decodeMetadata(_ s: String?) throws -> JSONValue? {
@@ -85,7 +85,7 @@ extension MemoryStorage {
     }
 
     static func decodeMemory(_ row: Row) throws -> StoredMemory {
-        try StoredMemory(
+        let memory = try StoredMemory(
             id: row.decode(forColumn: "id"),
             content: row.decode(forColumn: "content"),
             personaId: row.decode(forColumn: "persona_id"),
@@ -105,6 +105,9 @@ extension MemoryStorage {
             useCount: row.decode(forColumn: "use_count") ?? 0,
             lastUsedAt: row.decode(forColumn: "last_used_at")
         )
+        do { try validateTemporalEvidence(memory) }
+        catch { throw MemoryStorageError.databaseUnavailable("Memory \(memory.id) has unreadable temporal evidence: \(error.localizedDescription). Repair the saved row before recall.") }
+        return memory
     }
 
     static func decodeProposal(_ row: Row) throws -> StoredProposal {

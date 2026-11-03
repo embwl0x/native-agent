@@ -4,7 +4,7 @@ import PersistenceCore
 import NativeAgentShared
 import ProviderRouting
 import TrustCenter
-// Blueprint: | `QuietSettingsHost.swift` | `QuietSettingsHost` protocol; `saveChatBrainDefaultsFailure`, `saveMacControlPolicy` |
+// Blueprint: | `QuietSettingsHost.swift` | Settings owner ports, mounted platform control declarations and asynchronous phone-owned control resolution |
 
 /// The settings page's observed values and existing UI write actions.
 @MainActor
@@ -12,6 +12,7 @@ public protocol QuietSettingsHost: AnyObject {
     var dataRootOverride: URL? { get }
     var trustPolicy: TrustPolicy? { get }
     var personality: PersonalityProfile? { get }
+    var personalityError: String? { get }
     var dreamError: String? { get }
     var makeShelfFault: String? { get }
     var chatModel: String { get set }
@@ -20,6 +21,12 @@ public protocol QuietSettingsHost: AnyObject {
     var chatFileAccess: String { get }
     var chatProvider: String { get }
     var searchServiceURL: String { get }
+    /// Controls owned by the mounted app (for example its shortcut manager).
+    /// Declared beside those owners, then used by every settings reader/writer.
+    var platformSettings: [QuietSetting] { get }
+    /// A phone owns its local controls. Resolve them through its signed request
+    /// channel; no Mac defaults or cached phone state stand in for its answer.
+    func phoneSetting(id: String) async throws -> QuietSetting?
 
     func saveChatBrainDefaultsFailure() async -> String?
     func saveMacControlPolicy(
@@ -42,7 +49,7 @@ public protocol QuietSettingsHost: AnyObject {
         field: String, enabled: Bool,
         guardedByLockedPolicy: @escaping @Sendable ([String: JSONValue]) throws -> Void
     ) async throws -> TrustPolicy
-    func dreamEnabled() async -> Bool
+    func dreamEnabled() async throws -> Bool
     func setDreamCycleEnabled(_ enabled: Bool) async -> Bool
     func setRemCycleEnabled(_ enabled: Bool) async -> Bool
     func savePersonalityChecked(_ profile: PersonalityProfile) async throws
@@ -57,7 +64,7 @@ public protocol QuietSettingsHost: AnyObject {
     func setCognitionLane(_ lane: QuietCognitionLane, enabled: Bool) async
     func setReflectionBudget(_ budget: Int) async
     /// The mode in effect after the write, which setup or safety can hold off.
-    func setContextFlowMode(_ mode: ContextFlowMode) async -> ContextFlowMode
+    func setContextFlowMode(_ mode: ContextFlowMode) async throws -> ContextFlowMode
     func setGlobalHotkeyEnabled(_ enabled: Bool)
     /// Nil when saved; otherwise what was wrong with it.
     func savePersonalityName(_ name: String) async -> String?
@@ -70,7 +77,7 @@ public protocol QuietSettingsHost: AnyObject {
     /// (Chrome, Pause everything, activity capture, Mac integration, Telegram,
     /// Slack, connected agents), built with `QuietSettings.lowerOnly` and
     /// `narrowOnly` so the direction rule stays here.
-    var lowerOnlyRows: [QuietSetting] { get }
+    var lowerOnlyRows: [QuietSetting] { get throws }
 }
 
 /// The inner-life lanes the Settings page and the Cognition page switch one
@@ -96,12 +103,14 @@ public struct QuietProviderModel: Sendable {
     public let defaultEffort: String
     public let efforts: [String]
     public let supportsFast: Bool
+    public let reasoningCapabilitiesKnown: Bool
 
-    public init(id: String, defaultEffort: String, efforts: [String], supportsFast: Bool) {
+    public init(id: String, defaultEffort: String, efforts: [String], supportsFast: Bool, reasoningCapabilitiesKnown: Bool = true) {
         self.id = id
         self.defaultEffort = defaultEffort
         self.efforts = efforts
         self.supportsFast = supportsFast
+        self.reasoningCapabilitiesKnown = reasoningCapabilitiesKnown
     }
 }
 

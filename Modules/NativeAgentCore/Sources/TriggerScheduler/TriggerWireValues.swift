@@ -128,7 +128,7 @@ public struct TriggerFireResult: Sendable, Equatable {
     public var error: String?
     /// The newly accepted card; nil when an existing card represents the fire.
     public var item: JSONValue?         // inbox only
-    /// Whether notification delivery handled this accepted card.
+    /// Whether the router projected transport acceptance or queueing for this card.
     public var notified: Bool?          // inbox only
 
     public init(

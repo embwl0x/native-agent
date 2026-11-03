@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id":"backup-cadence","kind":"tool","version":1,"reach":{"capabilities":[]},"face":{"page":"diagnostics"},"record":{"description":"Choose off-disk backup freshness and identity-change cadence from native timestamps. No files, scheduling or backup effects.","actions":[],"inputSchema":{"type":"object","readOnly":true,"properties":{},"additionalProperties":true}}}
+{"id":"backup-cadence","kind":"ability","version":1,"reach":{"capabilities":[]},"face":{"page":"diagnostics"},"record":{"description":"Choose off-disk backup freshness and identity-change cadence from native timestamps. No files, scheduling or backup effects.","actions":[],"inputSchema":{"type":"object","readOnly":true,"properties":{},"additionalProperties":true}}}
 */
 function run(input) {
     if (input.kind === "deadline") {

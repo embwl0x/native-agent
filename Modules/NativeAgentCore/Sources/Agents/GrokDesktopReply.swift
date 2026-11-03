@@ -5,16 +5,15 @@ import AgentConversations
 import MacControl
 import NativeAgentCore
 import PersistenceCore
-import ScreenCaptureKit
-import Vision
-// Blueprint: | `GrokDesktopReply.swift` | MacControl owns bounded native window/subtree reads and reply-text traversal; incomplete reads propagate to send and reply receipts; submission-owned shared desktop observation transfers once to its reply reader; a last non-answering reply must match across two idle AX reads at least 300ms apart, with one quiet-boundary read independent of notifications; the three-minute reporting deadline releases foreground ownership without claiming completion; no-notification interval observation ends at that deadline while supported events retain late-answer reach; reader settlement through `settle` saves the answer or partial with its actual read method/wake and releases observation and foreground once |
+import Experiences
+import Privacy
+// Blueprint: | `GrokDesktopReply.swift` | MacControl owns bounded native window/subtree reads and reply-text traversal; incomplete reads propagate to send and reply receipts; submission-owned shared desktop observation transfers once to its reply reader; a last non-answering reply must match across two idle AX reads at least 300ms apart, with one quiet-boundary read independent of notifications; the three-minute reply deadline ends every observation without claiming completion; reader settlement through `settle` saves the answer or partial with its actual read method/wake, owes failed storage with that terminal evidence under the operation ID, and releases observation and foreground once |
 
 /// Grok's answer to a desktop send, read back from the same chat it was pasted
 /// into, after the send has returned (the exchange waits; this settles it).
 ///
-/// Two reads, never an action: first its accessibility tree for exact text;
-/// when unavailable, a capture of Grok's window alone, cropped to the
-/// transcript, read with Vision. Pixels retain partial text, not completion.
+/// One reader: its accessibility tree provides exact text and completion.
+/// An unavailable tree retains the partial answer and names its blocker.
 /// Grok is never brought forward for this.
 ///
 /// The transcript's AXDocumentArticle rows contain message groups; the AXHeading names the chat.
@@ -22,15 +21,18 @@ import Vision
     typealias AX = GrokRoutineAccessibility
     struct Turn: Sendable { let user: Bool; let text: String }
     /// Taken at send time with Grok in front.
-    struct Layout { let baseline: Int; let transcript: CGRect; let window: CGSize; let windowID: CGWindowID; var watchID: String? }
+    struct Layout { let baseline: Int; var watchID: String? }
 
     // MARK: - Accessibility (Grok in front)
 
-    private struct Scan { let window: AXUIElement; let log: AXUIElement; let composer: AXUIElement?; let turns: [Turn]; let answering: Bool }
+    private struct Scan { let turns: [Turn]; let answering: Bool }
     private struct Read: Sendable { let turns: [Turn]; let answering: Bool }
 
     private static func passiveRead(chat: String) async throws -> Read? {
-        try await MacAccessibilityReader.read {
+        if let pid = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first?.processIdentifier {
+            try? await SystemMacAXElementSource.prepareRenderer(pid: pid)
+        }
+        return try await MacAccessibilityReader.read {
             try scan(chat: chat).map { Read(turns: $0.turns, answering: $0.answering) }
         }
     }
@@ -43,7 +45,7 @@ import Vision
             guard SystemMacAXElementSource().isTrusted(), let app = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first else { return nil }
             let windows = try SystemMacAXElementSource().nativeWindows(pid: app.processIdentifier)
             guard windows.count == 1, let window = windows.first else { return nil }
-            var log: AXUIElement?, composer: AXUIElement?, current = false, answering = false
+            var log: AXUIElement?, current = false, answering = false
             let tree = try MacAccessibilityReader.elements(in: window, searching: "Grok Bot's current chat and transcript") {
                 !["AXApplicationLog", "AXLandmarkComplementary"].contains(MacAXAttributeRead.text($0, kAXSubroleAttribute))
             }
@@ -51,7 +53,6 @@ import Vision
                 let role = try MacAXAttributeRead.checkedText(node, kAXRoleAttribute), subrole = try MacAXAttributeRead.checkedText(node, kAXSubroleAttribute)
                 if role == "AXHeading", try MacAXAttributeRead.checkedText(node, kAXDescriptionAttribute) == chat || MacAXAttributeRead.checkedText(node, kAXTitleAttribute) == chat { current = true }
                 if role == kAXButtonRole, try [kAXTitleAttribute, kAXDescriptionAttribute].contains(where: { try MacAXAttributeRead.checkedText(node, $0).hasPrefix("Stop") }) { answering = true }
-                if role == kAXTextAreaRole, try MacAXAttributeRead.checkedText(node, kAXDescriptionAttribute).lowercased() == "prompt" { composer = node }
                 if subrole == "AXApplicationLog" { log = node }
             }
             guard current, let log else { return nil }
@@ -66,7 +67,7 @@ import Vision
                     guard label == "Your message" || label.hasSuffix(" message") else { return Turn(user: false, text: "") }
                     return Turn(user: label == "Your message", text: try MacAccessibilityReader.nativeText(in: body))
                 }
-            return Scan(window: window, log: log, composer: composer, turns: turns, answering: answering)
+            return Scan(turns: turns, answering: answering)
         }
     }
 
@@ -74,25 +75,9 @@ import Vision
         guard let scan = try scan(chat: chat) else { return nil }
         func normalized(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
         let baseline = scan.turns.filter { $0.user && normalized($0.text) == normalized(message) }.count
-        guard let window = MacAXAttributeRead.frame(scan.window), var transcript = MacAXAttributeRead.frame(scan.log),
-              let pid = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first?.processIdentifier else { return (baseline, nil) }
-        // The window the message went into, by its id: the passive read looks at that one only.
-        let ids = ((CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]) ?? []).compactMap { info -> CGWindowID? in
-            guard info[kCGWindowOwnerPID as String] as? pid_t == pid, info[kCGWindowLayer as String] as? Int == 0,
-                  let bounds = (info[kCGWindowBounds as String] as? NSDictionary).flatMap({ CGRect(dictionaryRepresentation: $0) }),
-                  abs(bounds.minX - window.minX) < 1, abs(bounds.minY - window.minY) < 1,
-                  abs(bounds.width - window.width) < 1, abs(bounds.height - window.height) < 1 else { return nil }
-            return info[kCGWindowNumber as String] as? CGWindowID
-        }
-        guard ids.count == 1 else { return (baseline, nil) }
-        if let composer = scan.composer.flatMap(MacAXAttributeRead.frame), composer.minY > transcript.minY {
-            transcript.size.height = min(transcript.height, composer.minY - transcript.minY)
-        }
-        transcript = transcript.intersection(window)
-        guard !transcript.isNull, !transcript.isEmpty else { return (baseline, nil) }
-        return (baseline, Layout(baseline: scan.turns.filter { $0.user && same($0.text, message) }.count,
-                      transcript: transcript.offsetBy(dx: -window.minX, dy: -window.minY), window: window.size, windowID: ids[0]))
+        return (baseline, Layout(baseline: scan.turns.filter { $0.user && same($0.text, message) }.count, watchID: nil))
     }
+
 
     /// The answer by accessibility: Grok's turns after the user turn that is
     /// exactly this message and the first one past the baseline.
@@ -105,88 +90,13 @@ import Vision
                 scan.turns[(mine[baseline] + 1)...].allSatisfy { !$0.user })
     }
 
-    // MARK: - Screen text (Grok behind other windows)
-
-    private struct Line { var text: String; var rect: CGRect }
-    private enum ScreenRead { case lines([Line]), noPermission, windowGone, unreadable }
-
-    /// Grok's window alone (occluded is fine; minimized or on another Space is
-    /// not), cropped to the transcript and the header above it, as text lines
-    /// in transcript points; only the send's own window, and only while its
-    /// header names this chat.
-    private static func screenLines(_ layout: Layout, chat: String) async -> ScreenRead {
-        guard CGPreflightScreenCaptureAccess() else { return .noPermission }
-        guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) else { return .unreadable }
-        guard let window = content.windows.first(where: { $0.windowID == layout.windowID }),
-              window.owningApplication?.bundleIdentifier == GrokBotRoute.bundleID else { return .windowGone }
-        guard abs(window.frame.width - layout.window.width) < 2, abs(window.frame.height - layout.window.height) < 2 else { return .unreadable }
-        let filter = SCContentFilter(desktopIndependentWindow: window)
-        let configuration = SCStreamConfiguration()
-        let scale = max(1, min(Double(filter.pointPixelScale), 4))
-        let area = CGRect(x: layout.transcript.minX, y: 0, width: layout.transcript.width, height: layout.transcript.maxY)
-            .intersection(CGRect(origin: .zero, size: window.frame.size))
-        guard !area.isNull, !area.isEmpty,
-              let width = Int(exactly: (Double(area.width) * scale).rounded()), width > 0,
-              let height = Int(exactly: (Double(area.height) * scale).rounded()), height > 0 else { return .unreadable }
-        configuration.sourceRect = area
-        configuration.width = width
-        configuration.height = height
-        configuration.ignoreShadowsSingleWindow = true
-        configuration.showsCursor = false
-        guard let image = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) else { return .unreadable }
-        let size = area.size, top = layout.transcript.minY
-        let lines = await Task.detached(priority: .utility) { () -> [Line]? in
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = false
-            guard (try? VNImageRequestHandler(cgImage: image, options: [:]).perform([request])) != nil else { return nil }
-            return (request.results ?? []).compactMap { observation in
-                guard let text = observation.topCandidates(1).first?.string, !bare(text).isEmpty else { return nil }
-                let box = observation.boundingBox
-                return Line(text: text, rect: CGRect(x: box.minX * size.width, y: (1 - box.maxY) * size.height,
-                                                     width: box.width * size.width, height: box.height * size.height))
-            }
-        }.value
-        guard let lines, lines.contains(where: { $0.rect.maxY <= top && bare($0.text).lowercased() == bare(chat).lowercased() }) else { return .unreadable }
-        return .lines(lines.filter { $0.rect.minY >= top }.map { Line(text: $0.text, rect: $0.rect.offsetBy(dx: 0, dy: -top)) })
-    }
-
-    /// The answer on screen: Grok's lines below the person's bubble that reads
-    /// as this message, up to the next bubble of theirs. Which bubble: the one
-    /// followed by the answer already seen, else the newest; `last` when no
-    /// bubble of theirs follows it on screen.
-    private static func screenReply(_ lines: [Line], width: CGFloat, message: String, seen: String) -> (text: String, last: Bool)? {
-        struct Segment { let user: Bool; var text: String; var bottom: CGFloat }
-        var segments: [Segment] = []
-        var boundary = false
-        for line in lines.sorted(by: { $0.rect.minY < $1.rect.minY }) {
-            // A day/time separator is not text, but it does end the bubble above it.
-            if stamp(line.text) { boundary = true; continue }
-            let user = line.rect.minX > width * 0.15
-            defer { boundary = false }
-            if !boundary, var last = segments.last, last.user == user {
-                // A wrapped line joins its paragraph; a wider gap starts a new one.
-                last.text += (line.rect.minY - last.bottom > line.rect.height * 0.8 ? "\n" : " ") + line.text
-                last.bottom = line.rect.maxY
-                segments[segments.count - 1] = last
-            } else { segments.append(Segment(user: user, text: line.text, bottom: line.rect.maxY)) }
-        }
-        let answers = segments.indices.filter { segments[$0].user && resembles(segments[$0].text, message) }.map { index in
-            (index, segments[(index + 1)...].prefix { !$0.user }.map(\.text).joined(separator: "\n\n"))
-        }
-        let start = String(bare(seen).prefix(24))
-        let chosen = start.isEmpty ? answers.last : answers.last { bare($0.1).hasPrefix(start) } ?? answers.last
-        guard let chosen else { return nil }
-        return (chosen.1, !segments[(chosen.0 + 1)...].contains { $0.user })
-    }
 
     // MARK: - The watch
 
     enum Outcome: Sendable { case answered(String, at: Date, by: String), unanswered(partial: String, blocker: String?) }
     private static let replyTimeout: TimeInterval = 180
 
-    /// The reporting deadline shares evidence with the event reader; it never
-    /// cancels the subscription or turns a pause in text into an answer.
+    /// The reply deadline ends observation without treating a pause as an answer.
     @MainActor final class Observation {
         var outcome: Outcome = .unanswered(partial: "", blocker: nil)
         var firstActivity: Date?
@@ -234,8 +144,8 @@ import Vision
         }
     }
 
-    /// Read after registration and on shared desktop wakes. No-notification
-    /// apps are read only within the reply deadline. An idle AX answer arms
+    /// Read after registration and on shared desktop wakes, within the reply
+    /// deadline. An idle AX answer arms
     /// one 300ms quiet read, so a second notification is never required to
     /// verify the same text with the answering control absent on both reads.
     static func watch(message: String, chat: String, layout: Layout, live: AgentConversationLiveTarget?,
@@ -244,7 +154,6 @@ import Vision
         var text = ""
         var idleText: String?
         var idleSince: Date?
-        var awaited = layout.baseline == 0
         do {
             while true {
                 guard !Task.isCancelled else { return observation.outcome }
@@ -259,7 +168,6 @@ import Vision
                 do {
                     // A failed read is no evidence this tick (never completion); the deadline still ends the watch.
                     if let scan = try await passiveRead(chat: chat), let found = axReply(scan, message: message, baseline: layout.baseline) {
-                        if found.last { awaited = true }
                         reply = (found.text, found.active)
                         readBy = "accessibility"
                         if !found.last {
@@ -281,24 +189,6 @@ import Vision
                 } catch {
                     blocker = "Grok's Accessibility read failed: \(error.localizedDescription)."
                 }
-                if reply == nil {
-                    let axBlocker = blocker.map { $0 + " " } ?? ""
-                    switch await screenLines(layout, chat: chat) {
-                    case .lines(let lines):
-                        if let seen = screenReply(lines, width: layout.transcript.width, message: message, seen: text), seen.last {
-                            if seen.text.isEmpty { awaited = true }
-                            if awaited { reply = (seen.text, !seen.text.isEmpty); readBy = "screen_text" }
-                        }
-                        blocker = axBlocker + "Its visible text can be read on desktop wakes, but the window's pixels do not prove that the answer is finished. Open this chat in Grok to observe its completion signal."
-                    case .noPermission:
-                        blocker = axBlocker + "Screen Recording is off for NativeAgent, so Grok's window could not be read. Grant NativeAgent Screen Recording in System Settings (Privacy & Security), or bring Grok to the front so its text can be read."
-                    case .windowGone:
-                        observation.outcome = .unanswered(partial: text, blocker: windowGone)
-                        return observation.outcome
-                    case .unreadable:
-                        blocker = axBlocker + "Grok's window text could not be read on this desktop wake. Open this chat in a single Grok window to observe its reply."
-                    }
-                }
                 let changed = reply.map { $0.text != text } ?? false
                 let activity = reply?.active == true && observation.firstActivity == nil
                 if activity { observation.firstActivity = Date() }
@@ -313,14 +203,14 @@ import Vision
                     if let live, changed, !text.isEmpty { await hub.text(live, replace: text) }
                 }
                 if completed { return observation.outcome }
-                if events.pollingReason != nil, Date() >= observation.deadline {
-                    observation.outcome = .unanswered(partial: text, blocker: "Grok's reply was not confirmed within the three-minute observation deadline. The app supports no Accessibility change notifications; bounded interval reads have ended. Any answer stays in that chat; nothing was resent.")
+                if Date() >= observation.deadline {
+                    observation.outcome = .unanswered(partial: text, blocker: "Grok's reply was not confirmed within the three-minute observation deadline. Reply observation has ended. Any answer stays in that chat; nothing was resent.")
                     return observation.outcome
                 }
-                var boundary: Date? = Date() < observation.deadline ? observation.deadline : nil
+                var boundary = observation.deadline
                 if let idleSince, let idleText, !idleText.isEmpty {
                     let quiet = idleSince.addingTimeInterval(0.3)
-                    boundary = min(boundary ?? quiet, quiet)
+                    boundary = min(boundary, quiet)
                 }
                 try await events.next(until: boundary)
             }
@@ -330,7 +220,6 @@ import Vision
         return observation.outcome
     }
 
-    static let windowGone = "The Grok window this message went into was closed, minimized or moved to another Space, so its answer could not be read. Open that chat's window on this Space; any answer stays in that chat."
 
     /// A verified desktop send to Grok returns at once as waiting; a tracked
     /// watch then settles that exact exchange with the answer and its timing.
@@ -365,8 +254,8 @@ import Vision
         let events = pending.events
         let follower = Task { @MainActor in
             let observation = pending.observation
-            // One reporting deadline, never a read trigger. The same event
-            // subscription remains alive for an answer arriving after it.
+            // The same reply deadline releases foreground ownership even if
+            // the final read is still finishing. Settlement releases the watch.
             let deadline = Task { @MainActor in
                 do { try await Task.sleep(for: .seconds(max(0, observation.deadline.timeIntervalSinceNow))) } catch { return }
                 observation.timedOut = true
@@ -399,7 +288,7 @@ import Vision
             }
             terminal["terminal"] = .bool(true); terminal["completed"] = .bool(answer != nil)
             terminal["reply_observation_receipt"] = observation.readReceipt ?? events.receipt(readBy: "unavailable")
-            terminal["reply_observation"] = .string(answer != nil ? "done" : stop != nil ? "stopped" : "failed")
+            terminal["reply_observation"] = .string(answer != nil ? "done" : stop != nil ? "stopped" : Date() >= observation.deadline ? "timed_out" : "failed")
             let receipt = JSONValue.object(terminal), produced = answer, stopDetail = stop
             await settle { @MainActor in
                 await deadline.value
@@ -414,6 +303,14 @@ import Vision
                     await AgentConversationLiveHub.shared.settle(live, state: "finished")
                 } catch {
                     let failure = "Grok's reply result could not be saved: \(error.localizedDescription) Nothing was resent; any answer stays in that chat."
+                    let source = AgentConversationStore(dataRoot: dataRoot).fileURL.path
+                    await RepairOwed.owe(dataRoot, id: operation + ":reply-settlement", kind: .message,
+                        cause: [operation], evidence: [.init(source: source, id: row)],
+                        operation: "agent.reply.settlement:" + operation, owner: source,
+                        words: "Conversation \(row), operation \(operation), reply in \(place). " + failure
+                            + " Original reply outcome and observation evidence: "
+                            + NativeAgentSecretRedactor.redactText(String(describing: receipt)),
+                        lever: "Repair conversation storage, then save this exact reply outcome and its evidence; never resend the message.").value
                     nativeLog("%@", failure)
                     await AgentConversationLiveHub.shared.settle(live, state: "failed", note: failure)
                 }
@@ -427,31 +324,17 @@ import Vision
 
     // MARK: - Text
 
-    /// Letters and digits only: the composer, the transcript and the screen
-    /// differ in spacing, line breaks and markdown punctuation.
-    nonisolated static func bare(_ text: String) -> String { String(text.filter { $0.isLetter || $0.isNumber }) }
+    /// Composer and transcript differ in whitespace, never in meaningful
+    /// punctuation, symbols or emoji. Submission and reply use this same key.
+    nonisolated static func transcriptKey(_ text: String) -> String {
+        text.precomposedStringWithCanonicalMapping.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
 
     /// The whole turn is exactly this message.
     static func same(_ turn: String, _ message: String) -> Bool {
-        let key = bare(message)
-        return !key.isEmpty && bare(turn) == key
+        let key = transcriptKey(message)
+        return !key.isEmpty && transcriptKey(turn) == key
     }
 
-    /// A run of the person's lines read off the screen ends with this message,
-    /// within a few misread characters.
-    static func resembles(_ bubble: String, _ message: String) -> Bool {
-        // Its ending: the reply follows the end of our message, and a bubble
-        // whose top scrolled away still shows it; one followed by another
-        // message of theirs in the same run of lines does not end with ours.
-        let seen = Array(bare(bubble).lowercased()), sent = Array(bare(message).lowercased())
-        let n = min(60, seen.count, sent.count)
-        guard n >= min(8, sent.count), n > 0 else { return false }
-        return characterEditDistance(Array(seen.suffix(n)), Array(sent.suffix(n))) <= max(2, n / 10)
-    }
-
-    /// Day and time separators ("Today 11:09 PM", "10:56 AM", "Tue, Sep 22 5:17 PM").
-    static func stamp(_ text: String) -> Bool {
-        text.count <= 32 && text.range(of: #"\d{1,2}:\d{2}\s?(AM|PM|am|pm)?$"#, options: .regularExpression) != nil
-    }
 
 }

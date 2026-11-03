@@ -37,7 +37,7 @@ import MacControl
 import ChatToolParsing
 import UniformTypeIdentifiers
 import Desk
-// Blueprint: | `BotRunCard.swift` | Helper run receipts, quiet-run folds and artifact links; recorded outcomes and model remain run-owned |
+// Blueprint: | `BotRunCard.swift` | Helper run receipts, quiet-run folds and artifact links with async save-panel presentation; recorded outcomes and model remain run-owned |
 
 /// One settled run, summarized: the headline the reply opened with, when the
 /// run happened and how long it took, the outcome word, the model it ran on,
@@ -156,13 +156,9 @@ struct BotRunCard: View {
                 }.foregroundStyle(.blue)
                 if !entry.actualReply.isEmpty {
                     let reply = entry.actualReply.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if let attributed = ChatMarkdownCache.attributed(reply) {
-                        Text(attributed).font(ShellType.body).textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        Text(reply).font(ShellType.body).textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+                    Text(ChatMarkdownCache.inline(reply).presentation)
+                        .font(ShellType.body).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
@@ -226,7 +222,8 @@ private struct BotsShelfArtifactLink: View {
                 Button("Save \(artifact.name)", systemImage: "arrow.down.doc") {
                     let panel = NSSavePanel()
                     panel.nameFieldStringValue = artifact.name
-                    panel.begin { response in
+                    Task { @MainActor in
+                        let response = await panel.begin()
                         guard response == .OK, let url = panel.url else { return }
                         do { try data.write(to: url, options: .atomic) }
                         catch { self.error = UserFacingError.message(error, action: "save that file") }

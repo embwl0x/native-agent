@@ -18,13 +18,11 @@ public struct ModelCompensationsCheck: DoctorCheck {
     /// the deleted mechanisms are excluded; silence here means zero receipts.
     private static let censusIDs = [
         "P10", "P11",
-        "C02", "C04", "C06", "C07", "C09",
+        "C02", "C04", "C09",
         "L01", "L10", "L12", "L13",
-        "L22", "L23", "L24",
-        "T01", "T04", "T05", "T06",
-        "T11", "T12", "T16", "T17",
-        "T19", "T21",
-        "M10", "M13", "M20",
+        "L22", "L23",
+        "T01", "T05", "T16", "T17", "T21",
+        "M20",
     ]
 
     public init(root: URL = defaultDataRoot(), cacheTTL: TimeInterval = 60) {
@@ -41,7 +39,11 @@ public struct ModelCompensationsCheck: DoctorCheck {
     }
 
     private func measure(now: Date) async -> CheckResult {
-        let window = DoctorWindowFloor.resolve(root: root, now: now)
+        guard let window = DoctorWindowFloor.resolve(root: root, now: now) else {
+            return CheckResult(source: root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename).path,
+                id: id, title: title, status: "unmeasured",
+                detail: "This launch's build stamp is unavailable or invalid. Repair build_launch.json through the app launch owner before measuring this build.")
+        }
         var turns = Set<String>()
         var counts: [String: Int] = [:]
         let summary = await TurnTraceWindowReader.scan(

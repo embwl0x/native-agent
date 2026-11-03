@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 import Darwin
 #endif
 
-// Blueprint: | `FileSystemVerifiedPath.swift` | `VerifiedImageRead`: shared image delivery from verified file or owned Chrome capture bytes; source dimensions and bounded-thumbnail receipts remain intact |
+// Blueprint: | `FileSystemVerifiedPath.swift` | `VerifiedImageRead`: shared image delivery from verified file or owned Chrome capture bytes; text-only reads return verified dimensions, byte size and type without claiming pixel delivery; bounded-thumbnail receipts retain source dimensions |
 
 // MARK: - Image pixels decoded from the verified descriptor
 
@@ -28,14 +28,27 @@ public enum VerifiedImageRead {
     }
 
     public static func deliver(data: Data, name: String) -> JSONValue {
-        guard LocalToolImage.sink != nil else {
-            return failure("No image slot for this call: it is text-only. Read it in a model turn.")
-        }
         guard !data.isEmpty, data.count <= LocalToolImage.maximumBytes else {
             return failure("Image must be a nonempty regular file of at most 8 MiB.")
         }
         guard let thumbnail = LocalToolImage.thumbnail(data, maxPixelSize: 2048) else {
             return failure("Image is unreadable, unsupported, or exceeds the 40-megapixel limit.")
+        }
+        guard LocalToolImage.sink != nil else {
+            // Both pixels and metadata come from the admitted descriptor's bytes;
+            // a filename extension is not evidence of the encoded type.
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  let type = CGImageSourceGetType(source) else {
+                return failure("Could not read the image's encoded type.")
+            }
+            return .object([
+                "status": .string("ok"), "image_pixels": .bool(false), "read_only": .bool(true),
+                "name": .string(name), "bytes": .int(Int64(data.count)),
+                "type": .string(type as String),
+                "source_width": .int(Int64(thumbnail.sourceWidth)),
+                "source_height": .int(Int64(thumbnail.sourceHeight)),
+                "note": .string("Verified image metadata only; this call has no image slot. To see the pixels, use files.read on this file from a turn."),
+            ])
         }
         let encoded = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(

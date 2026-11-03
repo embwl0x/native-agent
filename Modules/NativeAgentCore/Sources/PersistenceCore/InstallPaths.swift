@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
-// Blueprint: | `InstallPaths.swift` | Install-owned paths, public release preparation and login-item location admission |
+// Blueprint: | `InstallPaths.swift` | Install-owned paths and explicit Chrome manifest bundle ownership, public release preparation and login-item location admission |
 
 /// Owns paths outside the data root, preserving shipped rendezvous names and namespacing other bundle ids.
 public struct InstallPaths: Sendable {
@@ -79,21 +79,8 @@ public struct InstallPaths: Sendable {
         bridgeConfigRoot(dataRoot: dataRoot, defaultRoot: defaultRoot, secondary: secondary)
             .appendingPathComponent("claude-bridge", isDirectory: true)
     }
-    public func ownsChromeManifest(_ manifest: [String: Any], relay: URL) -> Bool {
-        if let owner = manifest["nativeagent_bundle_id"] as? String { return owner == bundleIdentifier }
-        // Adopt a pre-ownership relay from an earlier location of this app.
-        guard let path = manifest["path"] as? String, path.hasPrefix("/") else { return false }
-        let oldRelay = URL(fileURLWithPath: path).standardizedFileURL
-        if oldRelay.resolvingSymlinksInPath() == relay.resolvingSymlinksInPath() { return true }
-        guard oldRelay.lastPathComponent == "NativeAgentChromeRelay",
-              oldRelay.deletingLastPathComponent().lastPathComponent == "MacOS",
-              oldRelay.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent == "Contents" else { return false }
-        let app = oldRelay.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        // Only when that app is gone or is this same bundle: another installed
-        // variant's manifest is not ours to replace or delete.
-        let other = Bundle(url: app)?.bundleIdentifier
-        return app.pathExtension == "app" && app.deletingPathExtension().lastPathComponent.hasPrefix("NativeAgent")
-            && (other == nil || other == bundleIdentifier)
+    public func ownsChromeManifest(_ manifest: [String: Any]) -> Bool {
+        manifest["nativeagent_bundle_id"] as? String == bundleIdentifier
     }
 
     public func bridgeEnvironment(configRoot: URL) -> [String: String] {
@@ -130,7 +117,7 @@ public struct InstallPaths: Sendable {
         guard (ProcessInfo.processInfo.environment["NATIVE_AGENT_DATA_ROOT"] ?? "").isEmpty else { return .notNeeded }
         guard isPublicReleaseBundle else { return .notNeeded }
 
-        let support = libraryAppSupportFallback().standardizedFileURL
+        let support = applicationSupportDataRoot().standardizedFileURL
         let root = defaultDataRoot().standardizedFileURL
         guard root.path == support.path else { return .notNeeded }
 

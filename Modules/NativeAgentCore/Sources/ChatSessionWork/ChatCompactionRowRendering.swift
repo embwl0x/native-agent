@@ -26,13 +26,12 @@ enum ChatCompactionRowRendering {
     }
     private static func contentValue(_ obj: [String: JSONValue]) -> JSONValue? {
         if case .string? = obj["content"] { return obj["content"] }
-        if case .string? = obj["text"] { return obj["text"] }
         return obj["content"]
     }
     /// Characters this row contributes to the transcript size estimate. When
     /// `content` is empty the payload lives in `metadata`, so the serialized
     /// metadata length stands in for it.
-    static func characterCount(_ obj: [String: JSONValue]) -> Int {
+    static func characterCount(_ obj: [String: JSONValue]) throws -> Int {
         // Delivery bytes count toward the model window, but summaryBody still
         // reads only what the person said. Context is never distilled as speech.
         if obj["role"] == .string("user"),
@@ -48,11 +47,11 @@ enum ChatCompactionRowRendering {
             if case .string(let text) = content {
                 if !text.isEmpty { return text.count }
             } else {
-                return ((try? content.serialize(pretty: false)) ?? "").count
+                return try content.serialize(pretty: false).count
             }
         }
         guard let metadata = obj["metadata"] else { return 0 }
-        return ((try? metadata.serialize(pretty: false)) ?? "").count
+        return try metadata.serialize(pretty: false).count
     }
     /// The transcript line body for a row, or nil when the row carries nothing
     /// worth preserving. A tool row (empty `content`, a `toolName` in metadata)
@@ -63,10 +62,10 @@ enum ChatCompactionRowRendering {
         _ obj: [String: JSONValue],
         collapseNewlines: Bool,
         toolSummaryCap: Int? = nil
-    ) -> String? {
-        let content: String = {
+    ) throws -> String? {
+        let content: String = try {
             if case .string(let text)? = contentValue(obj) { return text }
-            if let value = contentValue(obj) { return (try? value.serialize(pretty: false)) ?? "" }
+            if let value = contentValue(obj) { return try value.serialize(pretty: false) }
             return ""
         }()
         let normalized = normalize(content, collapseNewlines: collapseNewlines)

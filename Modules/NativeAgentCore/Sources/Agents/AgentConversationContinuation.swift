@@ -1,4 +1,5 @@
 import BackgroundLoops
+import AuthoredCapabilities
 import ChatTurnRuntime
 import ChatTurnContracts
 import ChatToolRuntime
@@ -6,6 +7,7 @@ import AgentWorkspace
 import AgentConversations
 import AgentLinkTransport
 import Cognition
+import CognitiveSubstrate
 import CryptoKit
 import Desk
 import Foundation
@@ -17,7 +19,7 @@ import StandingBots
 import Transcripts
 import os
 
-// Blueprint: | `AgentConversationContinuation.swift` | `AgentConversationContinuation`: durable reply reads, queued follow-ups and completion delivery through the existing delegation lifecycle; a collected answer is offered atomically to an inline send waiter before starting a delayed turn; requested helper outcomes return as one native receipt through the peer reply writer/router and arrival signal, without another model turn |
+// Blueprint: | `AgentConversationContinuation.swift` | Durable contact reply reads, queued follow-ups and completion delivery; inline waiters receive collected answers before delayed turns; requested helper outcomes return through the peer reply writer/router and arrival signal; own-page helper refusals publish one native transcript receipt before delivery settles; proven pre-run failures release the exact claim as not started with their checked cause; resident wakes and their deadlines belong to ResidentWakeRuntime |
 
 /// Delayed remote replies belong to the existing delegation runner's lifecycle.
 /// This is a reader, never a message retry queue. Callback-owned contacts do not
@@ -53,10 +55,16 @@ public struct AgentConversationContinuation: Sendable {
         // Once per launch: queued follow-ups a restart left without a sender.
         // (and Grok Bot answers saved but not yet handed to her as a turn).
         if !queuesResumed.withLock({ $0 }) { return now.addingTimeInterval(1) }
-        let dotAgents = Set(((try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []).filter { $0.ability == nil && ChatGPTDotIPCTransport.owns($0) }.map { "peer:" + $0.id })
+        let peers: [AgentPeerContact]
+        do { peers = try AgentPeerStore(dataRoot: dataRoot).list() }
+        catch {
+            nativeLog("Conversation continuation contact snapshot unavailable: %@", error.localizedDescription)
+            return now.addingTimeInterval(60)
+        }
+        let dotAgents = Set(peers.filter { $0.ability == nil && ChatGPTDotIPCTransport.owns($0) }.map { "peer:" + $0.id })
         let ordinary = rows.filter { !dotAgents.contains($0.agent) && ($0.notice != nil || $0.automaticRead && ($0.phase == "waiting" || $0.deliveryState == "delivering")) }
             .map { max($0.nextReadAt ?? now, now.addingTimeInterval(1)) }.min()
-        return [ordinary, AgentLocalHealth.nextRefresh(dataRoot, now: now), ResidentWake.shared.nextDeadline(dataRoot: dataRoot)]
+        return [ordinary, AgentLocalHealth.nextRefresh(dataRoot, now: now)]
             .compactMap { $0 }.min()
     }
 
@@ -86,9 +94,8 @@ public struct AgentConversationContinuation: Sendable {
         }
         try Task.checkCancellation()
         if !queuesResumed.withLock({ $0 }) {
-            // Push proof belongs to this process, not the saved deadline. Read
-            // waiting tasks once at startup after registering for pushes, so a
-            // terminal callback missed while closed cannot leave them suspended.
+            // Read retained waiting tasks once at startup after registering
+            // their invalidation source. The task owns current state.
             let now = Date()
             for row in try store.records() where row.agent.hasPrefix("peer:")
                 && row.automaticRead && row.phase == "waiting"
@@ -101,18 +108,16 @@ public struct AgentConversationContinuation: Sendable {
                 }
             }
         }
-        guard queuesResumed.withLock({ value in defer { value = true }; return !value }) else { return }
-        ResidentWake.shared.turnEnded(dataRoot: dataRoot)
+        guard !queuesResumed.withLock({ $0 }) else { return }
         // Every agent row below reads its recipe: seeded and loaded first.
         AgentRecipeStore.load(dataRoot: dataRoot)
-        grok.resumeHandOvers(dataRoot: dataRoot, continuation: self)
+        try grok.resumeHandOvers(dataRoot: dataRoot, continuation: self)
         // Dot's room is pushed to her from here on; nothing pulls it.
-        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
+        let peers = try AgentPeerStore(dataRoot: dataRoot).list()
         // A Dot contact moved to one of her abilities keeps its exchanges like any contact.
         let dotAgents = Set(peers.filter { $0.ability == nil && ChatGPTDotIPCTransport.owns($0) }.map { "peer:" + $0.id })
-        _ = try? store.dropUnsettleable(dot: dotAgents, saved: Set(peers.map { "peer:" + $0.id }))
-        Task { await importContactHistory(peers: peers) }
-        for row in AgentConversationSession.orphanedQueues(dataRoot: dataRoot) {
+        _ = try store.dropUnsettleable(dot: dotAgents, saved: Set(peers.map { "peer:" + $0.id }))
+        for row in try AgentConversationSession.orphanedQueues(dataRoot: dataRoot) {
             if dotAgents.contains(row.agent) { continue } // Retired queued Dot sends are never replayed.
             let session = row.scopeSessionID, surface = row.sourceSurface
             let tools = clients.toolDispatchClient(enforceAppAutonomy: false)
@@ -125,6 +130,7 @@ public struct AgentConversationContinuation: Sendable {
                 }
             }
         }
+        queuesResumed.withLock { $0 = true }
     }
 
     public func stop() async {
@@ -137,73 +143,6 @@ public struct AgentConversationContinuation: Sendable {
             await AgentDiscoverySession.shared.stop()
             await AgentConversationLiveHub.shared.shutdown()
         }
-    }
-
-    /// Once (10-01): what a contact's pane showed from its records and, for a
-    /// built-in lane, the live file, copied into the contact's own session so
-    /// reading the pane from there loses none of it, at its own time and with
-    /// its send id. Marked done once every session took it; the import never
-    /// adds a row twice. Dot's history is his session already.
-    private func importContactHistory(peers: [AgentPeerContact]) async {
-        let marker = dataRoot.appendingPathComponent("agents/contact-history-imported.json")
-        guard !FileManager.default.fileExists(atPath: marker.path), let records = try? store.records() else { return }
-        let lanes = ["codex", "claude", "omp"]
-        let dots = Set(peers.filter(ChatGPTDotIPCTransport.owns).map(\.id))
-        var rows: [String: [JSONValue]] = [:]
-        for owner in peers.map(\.id) + lanes { rows[owner] = [] }
-        // Words a record or live file kept, never a transport's turn: imported
-        // unattested (another agent's to every reader), never stamped with the
-        // owner's identity. The owner only places them in its conversation.
-        func reply(_ owner: String, name: String, text: String, id: String, key: String, at: Date) -> JSONValue {
-            let lane = lanes.contains(owner)
-            let surface = lane ? BridgeLane.bridgeSurfaceName(forSender: owner) : AgentBridgeSurface.id
-            return .object(["id": .string(id), "sessionId": .string(ContactThread.session(owner: owner)), "role": .string("user"),
-                "content": .string(AgentContacts.savedReply(owner: owner, name: name, text: text)),
-                "createdAt": .string(NativeTimestampFormat.fractionalZulu(at)), "source": .string(lane ? "app" : surface),
-                "metadata": .object(["origin": .object(["surface": .string(surface), "agent": .string(lane ? owner : "agent"),
-                                                        "replyTo": .string(key)]),
-                                     "envelope": .object(["surface": .string(surface)]), "unattested": .bool(true)])])
-        }
-        for record in records {
-            let owner = record.agent.hasPrefix("peer:") ? String(record.agent.dropFirst(5)) : record.agent
-            guard rows[owner] != nil, !dots.contains(owner) else { continue }
-            for exchange in record.exchanges ?? [] {
-                if let prompt = exchange.prompt, !prompt.isEmpty {
-                    var metadata: [String: JSONValue] = ["dotClientUserMessageID": .string(exchange.id)]
-                    if exchange.byPerson == true { metadata["byPerson"] = .bool(true) }
-                    rows[owner]?.append(.object(["id": .string(exchange.id + "-sent"),
-                        "sessionId": .string(ContactThread.session(owner: owner)), "role": .string("assistant"),
-                        "content": .string(prompt), "createdAt": .string(NativeTimestampFormat.fractionalZulu(exchange.sentAt)),
-                        "source": .string("agent-bridge"), "metadata": .object(metadata)]))
-                }
-                if let text = exchange.reply, !text.isEmpty {
-                    rows[owner]?.append(reply(owner, name: record.name, text: text, id: exchange.id + "-reply",
-                        key: "agent-conversation:" + exchange.id, at: exchange.settledAt ?? exchange.sentAt.addingTimeInterval(0.001)))
-                }
-            }
-        }
-        // A built-in lane's answers the records missed; the live copy is the
-        // newest part of a reply, so one a record kept is not taken twice.
-        for entry in AgentConversationLiveStore(dataRoot: dataRoot).all().values
-            where entry.recordID == nil && entry.state == "finished" && lanes.contains(entry.agent) {
-            guard let text = entry.partial?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { continue }
-            let kept = records.filter { $0.agent == entry.agent }.flatMap { $0.exchanges ?? [] }
-                .compactMap { $0.reply?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            if kept.contains(where: { $0.hasSuffix(text) || text.hasSuffix($0) }) { continue }
-            rows[entry.agent]?.append(reply(entry.agent, name: entry.agent, text: text, id: UUID().uuidString.lowercased(),
-                key: "agent-live:" + entry.key, at: entry.finishedAt ?? entry.lastActivityAt))
-        }
-        var complete = true
-        for (owner, list) in rows {
-            let session = ContactThread.session(owner: owner)
-            guard !list.isEmpty || FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent("chat/messages/\(session).jsonl").path) else { continue }
-            do { _ = try await clients.bridgeChatClient().importAgentConversationHistory(sessionID: session, rows: list) }
-            catch {
-                complete = false
-                nativeLog("AgentConversationContinuation: history for \(owner) not imported: \(error)")
-            }
-        }
-        if complete { try? await SwiftNativePersistenceCore.writeJSON(.string(NativeTimestampFormat.fractionalZulu(Date())), to: marker) }
     }
 
     public func reconcileReplies() async throws {
@@ -240,8 +179,6 @@ public struct AgentConversationContinuation: Sendable {
     public func tick() async throws {
         try await resumeQueues()
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
-        // Her wake is this tick's one full turn; the reads wait a second.
-        if try await wakeHer() { return }
         let now = Date()
         let dotAgents = Set(try AgentPeerStore(dataRoot: dataRoot).list().filter { $0.ability == nil && ChatGPTDotIPCTransport.owns($0) }.map { "peer:" + $0.id })
         let due = try store.records().filter {
@@ -265,11 +202,10 @@ public struct AgentConversationContinuation: Sendable {
                 }
                 return
             }
-            let pushDriven: Bool
-            if row.agent.hasPrefix("peer:"), let task = string(row.readInput?["task_id"] ?? row.receiptField("task_id")) {
-                pushDriven = await AgentA2APushReceiver.shared.hasReceived(peerID: String(row.agent.dropFirst(5)), taskID: task)
-                try Task.checkCancellation()
-            } else { pushDriven = false }
+            guard let operationStartedAt = row.operationStartedAt else {
+                try attention(row, "The accepted operation's start time is unavailable. Repair its saved operation evidence before continuing; no message was repeated.")
+                continue
+            }
             let readingUntil = Date().addingTimeInterval(30)
             do {
                 if row.agent.hasPrefix("bot-run:") {
@@ -316,7 +252,6 @@ public struct AgentConversationContinuation: Sendable {
                 }
                 let settled = fields["terminal"] == .bool(true) || fields["needs_input"] == .bool(true)
                 let cached = AgentConversationStore.cacheReceipt(receipt)
-                let taskSnapshot = fields["terminal"] == .bool(true) || fields["terminal"] == .bool(false)
                 _ = try store.update(id: row.id, operationID: row.operationID) {
                     $0.receipt = cached
                     if $0.conversationID == nil, let conversation = string(fields["conversation_id"]) {
@@ -326,13 +261,10 @@ public struct AgentConversationContinuation: Sendable {
                         $0.readInput?["task_id"] = task
                     }
                     if $0.nextReadAt == readingUntil {
-                        // A proven webhook replaces sampling only after a
-                        // validated task read. Unavailable or invalid reads keep
-                        // their short deadline; an ended stream without push
-                        // also keeps the existing task reads.
-                        $0.nextReadAt = pushDriven && taskSnapshot
-                            ? (row.operationStartedAt ?? row.updatedAt).addingTimeInterval(24 * 60 * 60)
-                            : Date().addingTimeInterval(Date().timeIntervalSince(row.operationStartedAt ?? row.updatedAt) > 300 ? 60 : 15)
+                        // The retained task is the one state reader. Pushes only
+                        // invalidate it sooner; delivery evidence never selects
+                        // a different receive mechanism.
+                        $0.nextReadAt = Date().addingTimeInterval(Date().timeIntervalSince(operationStartedAt) > 300 ? 60 : 15)
                     }
                 }
                 if settled, row.personInitiated == true {
@@ -344,14 +276,14 @@ public struct AgentConversationContinuation: Sendable {
                     try await deliver(row, receipt: cached, peer: peer)
                     return
                 }
-                if Date().timeIntervalSince(row.operationStartedAt ?? row.updatedAt) > 24 * 60 * 60 {
+                if Date().timeIntervalSince(operationStartedAt) > 24 * 60 * 60 {
                     try attention(row, "The contact has not supplied a finished reply. Its original message remains available; it was not sent again.", receipt: cached)
                 }
             } catch is CancellationError { throw CancellationError() }
             catch {
                 // Read failure is safe to retry; a delivery failure is not.
                 // The lifecycle below records ambiguity before this boundary.
-                if Date().timeIntervalSince(row.operationStartedAt ?? row.updatedAt) > 24 * 60 * 60 {
+                if Date().timeIntervalSince(operationStartedAt) > 24 * 60 * 60 {
                     try? attention(row, "The contact's reply could not be recovered within a day. The original message has not been repeated.")
                 } else {
                     _ = try? store.update(id: row.id, operationID: row.operationID) {
@@ -362,207 +294,6 @@ public struct AgentConversationContinuation: Sendable {
                 }
             }
         }
-    }
-
-    /// Her one wake for what resolved (ResidentWake): only while no turn of
-    /// hers runs, in her own conversation. A promise's reply returns to the
-    /// conversation it was made in. It quotes an agent's words only with
-    /// that agent's authority; otherwise it
-    /// is hers. At most once: a turn that fails is not rerun.
-    private func wakeHer() async throws -> Bool {
-        let now = Date()
-        guard ResidentWake.shared.arrivalsDue(dataRoot: dataRoot).map({ $0 <= now }) == true else { return false }
-        // The person's quiet hours hold what reaches him, not her work (User 10-12).
-        let nextFreeAt: @Sendable (Date, Date) -> Date? = { now, activity in
-            let due = activity.addingTimeInterval(StudioWanderLane.quietInterval)
-            return due > now ? due : nil
-        }
-        guard await ChatTurnSteering.shared.residentWakeIsFree(dataRoot: dataRoot, nextFreeAt: nextFreeAt) else { return false }
-        var items = ResidentWake.pendingItems(dataRoot: dataRoot, now: now)
-        let pending = items.filter { $0.key?.hasPrefix("carry.") == true }
-        var carriedItems: [String: DeskItem] = [:]
-        let deskRevision = SwiftNativeDeskStore.currentRevision
-        if !pending.isEmpty {
-            let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
-            let context = HerScreen.queueContext(dataRoot: dataRoot, now: now, ownTurn: true)
-            let ready = MyQueueReady.ready(items: state.items, context: context, dataRoot: dataRoot)
-            for arrival in pending {
-                guard let key = arrival.key else { continue }
-                let handle = String(key.dropFirst(6))
-                guard let item = ready.first(where: { $0.handle == handle }),
-                      item.step?.session == arrival.session,
-                      arrival.filedAt == nil || arrival.filedAt == (item.step?.filedAt ?? item.openedAt) else {
-                    ResidentWake.shared.withdraw(dataRoot: dataRoot, key: key)
-                    items.removeAll { $0.id == arrival.id }
-                    continue
-                }
-                carriedItems[handle] = item
-                if let index = items.firstIndex(where: { $0.id == arrival.id }) {
-                    // What this offer says is the item as it is now: that is what a later change is measured from.
-                    let offered = ResidentWake.carriedArrival(item, crossing: arrival.at)
-                    items[index].line = offered.line
-                    items[index].materialFingerprint = offered.materialFingerprint
-                    items[index].at = now
-                }
-            }
-        }
-        guard !items.isEmpty else { return false }
-        let session = ResidentWake.session
-        let carried = items.first { $0.key?.hasPrefix("carry.") == true }
-        // Carried work has one external slot; other arrivals may share its wake.
-        items.removeAll { $0.key?.hasPrefix("carry.") == true && $0.id != carried?.id }
-        var route: AgentBridgeCompletionRoute?
-        if let key = carried?.key, let item = carriedItems[String(key.dropFirst(6))], item.step?.owedToPerson(dataRoot: dataRoot) == true {
-            let revision = (try? ResidentWake.routeRevision(rows: HumanConversationIndex.rows(dataRoot: dataRoot), session: item.step?.session)) ?? .null
-            do {
-                guard let id = item.step?.session, NativeAgentChatSessionID.normalizedPathComponent(id) == id else {
-                    throw StandingBotsError.invalidValue("The promise has no recorded conversation to reply to.")
-                }
-                if item.step?.replyRoute == nil, let ref = item.refs.last(where: {
-                    if case .step = $0.kind { return true }; return false
-                }) {
-                    var originating: TurnEnvelope?
-                    // Creation predates condition refreshes; a later message cannot move the promise's door.
-                    if let before = DeskClock.parseISO(item.openedAt) {
-                        do { originating = try await HumanConversationReader.read(sessionID: id, dataRoot: dataRoot, replyBefore: before).route }
-                        catch is CancellationError { throw CancellationError() }
-                        catch { nativeLog("Legacy promise route could not be proven: %@", error.localizedDescription) }
-                    }
-                    let repaired = HumanConversationReader.routeAvailable(originating) ? originating! : TurnEnvelope(surface: "chat")
-                    try await SwiftNativeDeskStore(dataRoot: dataRoot).updateRef(item.handle, refId: ref.refId,
-                        cachedFields: ["replyRoute": repaired.persistedMetadata()])
-                    // The Desk write signals another admission with fresh readiness and provenance.
-                    return false
-                }
-                guard let envelope = TurnEnvelope.fromPersistedMetadata(item.step?.replyRoute),
-                      HumanConversationReader.routeAvailable(envelope) else {
-                    throw StandingBotsError.invalidValue("The promise's recorded reply route is unavailable. Restore that route before replying.")
-                }
-                let saved = envelope.replyRoute
-                route = AgentBridgeCompletionRoute(surface: saved.surface, sessionId: id,
-                    destinationId: saved.destinationId, threadId: saved.threadId, sourceKey: saved.sourceKey,
-                    replyTo: saved.replyTo, correlationId: saved.correlationId, turnSessionId: session,
-                    requesterUserId: saved.requesterUserId)
-            } catch is CancellationError { throw CancellationError() }
-            catch {
-                let reason: String
-                switch error {
-                case StandingBotsError.invalidValue(let detail): reason = detail
-                default: reason = error.localizedDescription
-                }
-                let marker = "Waiting to return this promise: "
-                try await SwiftNativeDeskStore(dataRoot: dataRoot).appendNoteIfAbsent(item.handle,
-                    marker: marker + reason, text: marker + reason)
-                try ResidentWake.shared.waitForRoute(dataRoot: dataRoot, key: key, revision: revision)
-                return false
-            }
-        }
-        do {
-            try await ResidentWake.openSession(dataRoot: dataRoot)
-            let (context, agents) = await Self.wakeMessage("",
-                agents: Array(Set(items.compactMap(\.agent))).sorted(), items: items, dataRoot: dataRoot)
-            let execution: (response: ChatResponse, items: [ResidentWake.Item], completion: CodexCompletionTranscriptBinding?)? = try await TurnAdmission.shared.run(sessionID: session) {
-                    guard let wake = await ChatTurnSteering.shared.claimResidentWake(dataRoot: dataRoot, items: items,
-                        deskRevision: deskRevision, nextFreeAt: nextFreeAt) else { return nil }
-                    let admitted = wake.items.first { $0.key?.hasPrefix("carry.") == true }
-                    let step = admitted?.key.flatMap { carriedItems[String($0.dropFirst(6))]?.step }
-                    let taint = PeerDataTaint(restoring: step?.peers ?? [], elevated: step?.elevated ?? [])
-                    if let step { taint.keep(line: step.words) }
-                    for agent in agents { taint.mark(peer: agent) }
-                    let reply = admitted == nil ? nil : route
-                    let completion = reply.flatMap { _ in admitted }.map { arrival in
-                        let id = "carried-reply:" + arrival.id
-                        let digest = SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined()
-                        return CodexCompletionTranscriptBinding(deliveryId: id, requestDigest: digest, model: "", reasoningEffort: nil)
-                    }
-                    let responseRunID = completion.map { CausalTransitionEvidence.opaqueIdentity($0.deliveryId) }
-                    if let completion, let responseRunID {
-                        guard try await lifecycle.claim(deliveryId: completion.deliveryId, requestDigest: completion.requestDigest,
-                            sessionId: session, responseRunId: responseRunID, route: reply, principal: "self", source: session) == .start else {
-                            throw StandingBotsError.invalidValue("This carried reply already has a recorded attempt; it was not sent again.")
-                        }
-                    }
-                    var text = wake.text + context
-                    if reply != nil { text += "\nYour reply will return to the conversation this promise was made in. Say what you did or why it waits." }
-                    let agent = "self"
-                    var origin = ChatMessageOrigin(surface: session, agent: agent, authored: .agent)
-                    origin.peerSources = taint.checkpointSources
-                    origin.elevatedPeerSources = taint.elevatedSources
-                    let request = TurnRequest(message: text, sessionID: session, surface: "chat",
-                        envelope: TurnEnvelope(surface: "chat", agent: agent, deliveryRoute: reply?.chatToolReplyRoute,
-                            declaredRemote: false, workIdentity: admitted?.key),
-                        verifiedSessionID: session, replyRoute: reply?.chatToolReplyRoute,
-                        origin: origin, pinnedRunID: responseRunID, codexCompletion: completion, threadKind: .builder)
-                    do {
-                        let response = try await PeerDataTaint.$current.withValue(taint) {
-                            try await request.chat(on: clients.bridgeChatClient())
-                        }
-                        if let completion {
-                            try await lifecycle.cacheResponse(response, deliveryId: completion.deliveryId, requestDigest: completion.requestDigest)
-                        }
-                        return (response, wake.items, completion)
-                    } catch {
-                        if let completion {
-                            try await lifecycle.markOutcomeUnknown(deliveryId: completion.deliveryId, requestDigest: completion.requestDigest,
-                                detail: "Resident continuation interrupted; never rerun automatically")
-                        }
-                        throw error
-                    }
-            }
-            guard let execution else { return false }
-            let response = execution.response
-            if let route, let completion = execution.completion {
-                let answer = ChatResponse.answerOnly(response.output, workingCommentaryCharacters: response.workingCommentaryCharacters)
-                let result = await AgentBridgeCompletionRouter.deliverAnswer(deliveryId: completion.deliveryId, requestDigest: completion.requestDigest,
-                    text: answer, attachments: response.attachments ?? [], route: route, client: clients.bridgeChatClient(),
-                    sender: completionSender, lifecycle: lifecycle)
-                if result.status != "completed" {
-                    throw StandingBotsError.invalidValue("Carried reply delivery is not confirmed: " + (result.reason ?? result.status))
-                }
-            }
-            // Phase 5 E1: a reach wakes alone; her answer is the message, or "pass".
-            if let reach = execution.items.first(where: \.isReach) {
-                await clients.deliverReach(
-                    reply: ChatResponse.answerOnly(response.output, workingCommentaryCharacters: response.workingCommentaryCharacters),
-                    itemID: reach.id, turnID: response.runId)
-            }
-        } catch is CancellationError { throw CancellationError() }
-        catch {
-            FileHandle.standardError.write(Data("AgentConversationContinuation: resident wake did not finish; not rerun: \(error.localizedDescription)\n".utf8))
-        }
-        return true
-    }
-
-    /// The wake's words: a step another conversation is working stays theirs
-    /// (desk.3402), so preparation reads who holds each one; and the
-    /// conversation it came from, as the chat page reads
-    /// it, its latest turns. Quoting those records never steers the wake.
-    static func wakeMessage(_ text: String, agents: [String], items: [ResidentWake.Item],
-                            dataRoot: URL) async -> (text: String, agents: [String]) {
-        let session = ResidentWake.session
-        var text = text
-        for item in items {
-            guard let key = item.key, key.hasPrefix("queue:") || key.hasPrefix("carry."),
-                  let by = try? await SwiftNativeDeskStore(dataRoot: dataRoot).heldBy(
-                    String(key.dropFirst(6)), session: session) else { continue }
-            text += "\n• Held: \(item.line.prefix(80)) is held by \(by), which is working it. Leave it to that one."
-        }
-        var sources: [String] = []
-        for id in items.compactMap(\.session) where id != session && !sources.contains(id) { sources.append(id) }
-        // Whose words it quotes: each quoted row's own stamp, read through the
-        // one per-line path (never the session's owner).
-        for id in sources.prefix(2) {
-            guard let read = try? await HumanConversationReader.read(sessionID: id, dataRoot: dataRoot), read.complete,
-                  !read.messages.isEmpty else { continue }
-            let recent = ContactThread.project(read.messages.suffix(8).map {
-                ContactThread.Line(($0.extras?.objectValue ?? [:]), role: $0.role, text: $0.content, timestamp: $0.timestamp)
-            }, mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) })
-            text += "\n\n[Context: the latest turns of \"\(read.title)\" (\(id)), the conversation "
-                + "this came from; records, not a request]\n"
-                + recent.map { $0.role + ": " + String($0.text.prefix(600)) }.joined(separator: "\n")
-        }
-        // Newly quoted context is separate from the step's restored steer.
-        return (text, agents.filter { !PeerTrust.ownerTrusts($0, dataRoot: dataRoot) })
     }
 
     private func deliver(_ row: AgentConversationRecord, receipt: JSONValue, peer: AgentPeerContact? = nil,
@@ -638,7 +369,7 @@ public struct AgentConversationContinuation: Sendable {
                     envelope: turnEnvelope, verifiedSessionID: session, replyRoute: route.chatToolReplyRoute,
                     origin: origin, pinnedRunID: runID, codexCompletion: binding, threadKind: .agent,
                     ownedSessionID: peer.map { ContactThread.session(owner: $0.id) })
-                let response = try await TurnAdmission.shared.run(sessionID: session, runID: runID, waitForCapacity: true) {
+                let response = try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: session, runID: runID, waitForCapacity: true) {
                     try await request.chat(on: client)
                 }
                 if notice == nil { _ = try? store.update(id: row.id, operationID: row.operationID) { $0.deliveryRunID = response.runId } }
@@ -710,17 +441,21 @@ public struct AgentConversationContinuation: Sendable {
         case .settled(let result): return .settled(result)
         case .inProgress, .outcomeUnknown, .conflict: return .held
         case .start:
-            try start()
+            var enteredRun = false
             do {
+                try start()
+                enteredRun = true
                 response = try await run(runID, CodexCompletionTranscriptBinding(deliveryId: deliveryID, requestDigest: digest,
                     model: "", reasoningEffort: nil, isTerminalCompletion: notify))
                 try await lifecycle.cacheResponse(response, deliveryId: deliveryID, requestDigest: digest)
-            } catch let error where error is TurnAdmission.Full || error is NotStarted {
-                try await lifecycle.markNotStarted(deliveryId: deliveryID, requestDigest: digest)
-                throw error
             } catch {
-                try? await lifecycle.markOutcomeUnknown(deliveryId: deliveryID, requestDigest: digest,
-                    detail: "Resident continuation interrupted; never rerun automatically")
+                if !enteredRun || error is TurnAdmission.Full || error is NotStarted {
+                    try await lifecycle.markNotStarted(deliveryId: deliveryID, requestDigest: digest,
+                        detail: "Continuation did not start: " + error.localizedDescription)
+                } else {
+                    try await lifecycle.markOutcomeUnknown(deliveryId: deliveryID, requestDigest: digest,
+                        detail: "Resident continuation interrupted; never rerun automatically: " + error.localizedDescription)
+                }
                 throw error
             }
         }
@@ -758,7 +493,7 @@ public struct AgentConversationContinuation: Sendable {
         // answered inside a helper's session and the helper then remembered it as its own).
         let askedByItself = row.scopeSessionID.lowercased() == "bot-" + botID.uuidString.lowercased()
         if row.deliveryState == "delivering", let receipt = row.receipt {
-            if askedByItself { try await finish(row, delivered: true, runID: nil, sessionID: row.scopeSessionID) }
+            if askedByItself { try await finishBotRunOnOwnPage(row, botID: botID, requestID: requestID, receipt: receipt) }
             else { try await deliver(row, receipt: receipt, bot: (botID, row.name)) }
             return true
         }
@@ -767,7 +502,7 @@ public struct AgentConversationContinuation: Sendable {
             do {
                 let found = try shelf.entry(requestID)
                 guard found.botId == botID else { throw StandingBotsError.corruptStore("bot result identity mismatch") }
-                return shelf.reconciling([found]).first ?? found
+                return found
             } catch StandingBotsError.notFound(let missing) where missing == requestID { return nil }
         }
         var entry = try exactEntry()
@@ -780,22 +515,19 @@ public struct AgentConversationContinuation: Sendable {
                 entry = try exactEntry()
             }
         }
-        // A request rejected before its turn (or lost on restart) still owes
-        // an exact saved outcome. Never repeat the helper to obtain one.
+        // Only the queue owner's positive refusal proves no turn executed.
+        // Missing queue/shelf evidence cannot manufacture an interrupted run.
         if entry == nil {
-            let bot = try BotDefinitionStore(dataRoot: dataRoot).get(botID)
-            let at = row.operationStartedAt ?? row.updatedAt
-            let detail = "This requested check is no longer queued or running and saved no result. It was interrupted or rejected; its effects are unknown. No run was repeated."
-            var interrupted = ShelfEntry(id: requestID, botId: botID, briefVersion: bot.briefVersion,
-                runAt: at, coverageStart: at, coverageEnd: at, headline: "Requested check interrupted",
-                findings: "", changedSinceLastGood: "", uncertainties: [detail], runHealth: .partial,
-                spend: ShelfSpend(tokens: nil, seconds: 0))
-            interrupted.status = .interrupted
-            interrupted.statusDetail = detail
-            interrupted.sessionID = bot.sessionID
-            do { try shelf.append(interrupted) }
-            catch StandingBotsError.alreadyExists { }
-            entry = try exactEntry()
+            if let detail = try BotRunQueue(dataRoot: dataRoot).refusal(bot: botID, requestID: requestID) {
+                let receipt: JSONValue = .object(["agent": .string(agent), "message_id": .string(requestID.uuidString),
+                    "status": .string("refused"), "effects": .string("none"), "completed": .bool(false), "detail": .string(detail)])
+                _ = try store.update(id: row.id, operationID: row.operationID) { $0.receipt = receipt }
+                if askedByItself { try await finishBotRunOnOwnPage(row, botID: botID, requestID: requestID, receipt: receipt) }
+                else { try await deliver(row, receipt: receipt, bot: (botID, row.name)) }
+                return true
+            }
+            try attention(row, "This requested check has no queue, claim, result or refusal evidence. Its outcome is unavailable; repair the exact request evidence before deciding what happened. No run was repeated.")
+            return true
         }
         var fields: [String: JSONValue] = ["agent": .string(agent), "message_id": .string(requestID.uuidString)]
         fields["read_with"] = .object(["action": .string("bot.reply"),
@@ -826,9 +558,26 @@ public struct AgentConversationContinuation: Sendable {
         }
         let receipt = AgentConversationStore.cacheReceipt(.object(fields))
         _ = try store.update(id: row.id, operationID: row.operationID) { $0.receipt = receipt }
-        if askedByItself { try await finish(row, delivered: true, runID: nil, sessionID: row.scopeSessionID) }
+        if askedByItself { try await finishBotRunOnOwnPage(row, botID: botID, requestID: requestID, receipt: receipt) }
         else { try await deliver(row, receipt: receipt, bot: (botID, row.name)) }
         return true
+    }
+
+    /// Execution already wrote its reply in the helper's session. A refusal
+    /// never entered that session, so publish its native receipt before delivery
+    /// is settled. The writer's operation identity deduplicates a resumed finish.
+    private func finishBotRunOnOwnPage(_ row: AgentConversationRecord, botID: UUID, requestID: UUID,
+                                     receipt: JSONValue) async throws {
+        if case .object(let fields) = receipt, fields["status"] == .string("refused") {
+            guard let detail = try BotRunQueue(dataRoot: dataRoot).refusal(bot: botID, requestID: requestID) else {
+                throw StandingBotsError.corruptStore("Exact helper refusal unavailable: \(requestID)")
+            }
+            let name = row.name.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            try await clients.bridgeChatClient().appendAnswerForAskingChat(sessionID: row.scopeSessionID,
+                text: name + ": refused · " + detail, attachments: [], surface: row.sourceSurface,
+                deliveryID: "requested-result:agent-conversation:" + row.operationID, mechanicalRow: .botReceipt)
+        }
+        try await finish(row, delivered: true, runID: nil, sessionID: row.scopeSessionID)
     }
 
     /// A saved helper outcome needs delivery, not a second model's judgment
@@ -840,15 +589,23 @@ public struct AgentConversationContinuation: Sendable {
               let request = string(fields["message_id"]), let requestID = UUID(uuidString: request) else {
             throw StandingBotsError.invalidValue("The requested result has no exact shelf entry.")
         }
-        let entry = try ShelfStore(dataRoot: dataRoot).entry(requestID)
-        guard entry.botId == bot.id else { throw StandingBotsError.corruptStore("bot result identity mismatch") }
-        let status = string(fields["status"]) ?? entry.runtimeStatus.rawValue
+        let status: String
+        let refusal = try BotRunQueue(dataRoot: dataRoot).refusal(bot: bot.id, requestID: requestID)
+        if refusal != nil { status = "refused" }
+        else {
+            let entry = try ShelfStore(dataRoot: dataRoot).entry(requestID)
+            guard entry.botId == bot.id else { throw StandingBotsError.corruptStore("bot result identity mismatch") }
+            status = entry.runtimeStatus.rawValue
+        }
         let name = bot.name.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
         let read: JSONValue = .object(["action": .string("bot.reply"), "args": .object([
             "id": .string(requestID.uuidString), "bot_id": .string(bot.id.uuidString)])])
         // This line is the app's receipt. Helper-authored prose remains on its
         // shelf, read under its own provenance rather than quoted as her words.
-        let line = name + ": " + status + " · " + (try read.serialize(pretty: false))
+        let detail: String
+        if let refusal { detail = refusal }
+        else { detail = try read.serialize(pretty: false) }
+        let line = name + ": " + status + " · " + detail
         let deliveryID = "agent-conversation:" + row.operationID
         let digest = try await lifecycle.cachedRequestDigest(deliveryId: deliveryID)
             ?? SHA256.hash(data: try JSONEncoder().encode(receipt)).map { String(format: "%02x", $0) }.joined()

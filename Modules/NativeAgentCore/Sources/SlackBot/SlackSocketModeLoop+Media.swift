@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import ChatTurnRuntime
 import PersistenceCore
 import NativeAgentShared
@@ -42,7 +43,19 @@ extension SlackSocketModeLoop {
         if inbound.text.isEmpty && inbound.attachments.isEmpty {
             return SlackSocketModeReply(text: hydration.notice ?? "No readable message was received.")
         }
-        var reply = try await generateReply(inbound, sessionId: sessionId, sink: noticeSink(for: original))
+        let preview = replyPreview(for: original, sessionId: sessionId)
+        guard let runID = ChatPersistenceContext.pinnedTurnRunID else { throw SlackInboundJournalError.malformed }
+        let lease = SessionTurnDelivery.mount(dataRoot: dataRoot, sessionID: sessionId, runID: runID,
+            recipient: .init(progress: noticeSink(for: original, preview: preview)))
+        defer { SessionTurnDelivery.unmount(dataRoot: dataRoot, sessionID: sessionId, runID: runID, lease: lease) }
+        var reply: SlackSocketModeReply
+        do {
+            reply = try await generateReply(inbound, sessionId: sessionId)
+        } catch {
+            await settle { await preview.finish() }
+            throw error
+        }
+        await settle { await preview.finish() }
         if let notice = hydration.notice { reply.text = notice + "\n\n" + reply.text }
         return reply
     }

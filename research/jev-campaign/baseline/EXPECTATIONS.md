@@ -72,7 +72,7 @@ the outcome of each predeclared check. Source: `results/first-run-corrected.md`.
 
 | predeclared check | outcome |
 |---|---|
-| 1. Foreman verification gap (J02/J03/J10) | caught on the development corpus (`contradicts` 0.38, `supports_specific_claim` 0.05). Illustration only, and restated as an **unresolved artifact association**, not a contradiction. |
+| 1. Foreman verification gap (J02/J03/J10) | caught on the development corpus (`contradicts` 0.38, `supports_specific_claim` 0.08). Illustration only, and restated as an **unresolved artifact association**, not a contradiction. |
 | 2. Cost contradiction (J04/J08) | pair not flagged by the contradiction channel; the point was reached by reading. Missed, as the medium confidence allowed. |
 | 3. Latency claims consistent, no false positive | held — no contradiction flagged among J01/J06/J08/J04. |
 | 4. Screen misses "six posts are one launch event" | held — missed by the screen, reached by the full-exposure arm. |

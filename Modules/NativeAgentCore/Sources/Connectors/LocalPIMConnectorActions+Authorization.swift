@@ -19,7 +19,7 @@ extension LocalPIMConnectorActions {
         switch intent {
         case .read:
             switch status {
-            case .authorized, .fullAccess:
+            case .fullAccess:
                 return .ready
             case .notDetermined, .writeOnly:
                 return .requestFull
@@ -30,7 +30,7 @@ extension LocalPIMConnectorActions {
             }
         case .write:
             switch status {
-            case .authorized, .fullAccess, .writeOnly:
+            case .fullAccess, .writeOnly:
                 return .ready
             case .notDetermined:
                 return .requestWriteOnly
@@ -44,7 +44,7 @@ extension LocalPIMConnectorActions {
 
     public static func authorizationAllowsRead(_ status: EKAuthorizationStatus) -> Bool {
         switch status {
-        case .authorized, .fullAccess:
+        case .fullAccess:
             return true
         default:
             return false
@@ -53,7 +53,7 @@ extension LocalPIMConnectorActions {
 
     public static func authorizationState(_ status: EKAuthorizationStatus) -> String {
         switch status {
-        case .authorized, .fullAccess:
+        case .fullAccess:
             return "ready"
         case .writeOnly:
             return "needs_permission"
@@ -85,24 +85,24 @@ extension LocalPIMConnectorActions {
     /// Triggers the Calendar TCC prompt if status is `.notDetermined`;
     /// otherwise returns current status without prompting. Returns the
     /// post-request status in the wizard vocabulary.
-    public static func requestCalendarAccess() async -> String {
+    public static func requestCalendarAccess() async throws -> String {
         let store = EKEventStore()
-        _ = try? await requestCalendarReadAccess(store: store)
+        _ = try await requestCalendarReadAccess(store: store)
         return currentCalendarAuthorizationStatus()
     }
 
     /// Triggers the Reminders TCC prompt if status is `.notDetermined`;
     /// otherwise returns current status without prompting. Returns the
     /// post-request status in the wizard vocabulary.
-    public static func requestReminderAccess() async -> String {
+    public static func requestReminderAccess() async throws -> String {
         let store = EKEventStore()
-        if EKEventStore.authorizationStatus(for: .reminder) == .notDetermined { _ = try? await store.requestFullAccessToReminders() }
+        if EKEventStore.authorizationStatus(for: .reminder) == .notDetermined { _ = try await store.requestFullAccessToReminders() }
         return currentReminderAuthorizationStatus()
     }
 
     private nonisolated static func ekStatusToWizardString(_ status: EKAuthorizationStatus) -> String {
         switch status {
-        case .authorized, .fullAccess:
+        case .fullAccess:
             return "granted"
         case .writeOnly:
             return "limited"

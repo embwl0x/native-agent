@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import Security
 
-// Blueprint: | `ChromeSocketIdentity.swift` | `ChromeSocketIdentity`: kernel audit-token peer validation against the running caller's designated signer; unsigned identity is refused |
+// Blueprint: | `ChromeSocketIdentity.swift` | `ChromeSocketIdentity`: throwing kernel audit-token peer validation against the running caller's designated signer; Security check/status and POSIX errno survive refusal, unsigned identity is refused |
 
 public enum ChromeSocketIdentity {
     // Peer identity inherits the running caller's signer, never a peer file's requirement.
@@ -41,11 +41,7 @@ public enum ChromeSocketIdentity {
     }
 
     // The kernel audit token binds validation to the socket peer and its PID generation.
-    public static func peerIsTrusted(descriptor: Int32, identifiers: [String]) -> Bool {
-        (try? checkTrustedPeer(descriptor: descriptor, identifiers: identifiers)) != nil
-    }
-
-    private static func checkTrustedPeer(descriptor: Int32, identifiers: [String]) throws {
+    public static func checkTrustedPeer(descriptor: Int32, identifiers: [String]) throws {
         var token = audit_token_t()
         var size = socklen_t(MemoryLayout<audit_token_t>.size)
         let result = getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERTOKEN, &token, &size)

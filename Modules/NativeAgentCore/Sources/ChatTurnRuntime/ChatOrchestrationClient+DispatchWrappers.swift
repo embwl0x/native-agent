@@ -1,4 +1,7 @@
 import AuthoredCapabilities
+import ChatToolRuntime
+import ChatToolParsing
+import ChatTurnContracts
 import NativeAgentShared
 import AgentWorkspace
 import Experiences
@@ -57,11 +60,11 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         case invalid
 
         init(_ fileAccess: String) {
-            switch fileAccess.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "workspace", "auto", "full": self = .allow
-            case "read_only", "readonly", "read-only": self = .readOnly
-            case "none": self = .none
-            default: self = .invalid
+            switch ICloudChatFileAccessPolicy.Mode(fileAccess) {
+            case .some(.workspace), .some(.auto), .some(.full): self = .allow
+            case .some(.readOnly): self = .readOnly
+            case .some(.none): self = .none
+            case nil: self = .invalid
             }
         }
     }
@@ -99,7 +102,7 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         let source = "effective request fileAccess=\(fileAccess); saved chatFileAccess=\(UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto")"
         if mode == .invalid {
             return ToolFailureError("\(source) is unrecognized; no file access was inferred.", argumentPath: "request.fileAccess",
-                accepted: "auto, workspace, full, read_only, readonly, read-only, none", effects: .none)
+                accepted: ICloudChatFileAccessPolicy.acceptedIDs.sorted().joined(separator: ", "), effects: .none)
         }
         if isPathfulReadUnderNoFileAccess(tool: tool, input: input) {
             return ToolFailureError("\(source) blocks \(tool) with an explicit path. The request issuer must resubmit with file access; changing the requested operation to a screen read would not repair this file read.", effects: .none)
@@ -139,13 +142,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
     private let injectionApprovalVerifier: ApprovalInboxInjectionApprovalVerifier
     /// Non-injection replays require a matching approved record just spent by the executor.
     private let approvedReplayVerifier: ApprovalInboxApprovedReplayVerifier
-    /// The data root whose persona documents a first-conversation write would
-    /// target — supplied ONLY by the Mac chat dispatcher, and nil on every
-    /// other chain (bridge, background, ephemeral, approval replay), which is
-    /// what keeps progression on one surface. Nil cannot advance a step;
-    /// the persona root is never inferred from a process-wide default.
-    /// See `FirstConversationPersonaProgression`.
-    private let firstConversationDataRoot: URL?
     /// The data root holding the peer address book (`agents/peers.json`), so a
     /// credential-verified peer id can be shown to the person as the NAME she
     /// gave it in Trust → Connected agents. DISPLAY ONLY — nothing here grants
@@ -186,12 +182,10 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
         approvedReplay: ApprovedChatToolReplay? = nil,
         injectionApprovalVerifier: ApprovalInboxInjectionApprovalVerifier,
         approvedReplayVerifier: ApprovalInboxApprovedReplayVerifier,
-        firstConversationDataRoot: URL? = nil,
         peerDirectoryDataRoot: URL? = nil,
         fileAccess: String? = nil
     ) {
         self.fileAccess = fileAccess
-        self.firstConversationDataRoot = firstConversationDataRoot
         self.peerDirectoryDataRoot = peerDirectoryDataRoot
         self.approvedReplayVerifier = approvedReplayVerifier
         self.inner = inner
@@ -229,7 +223,23 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
         if StandingBotContinuity.isHelperTurn, let pending = ChatTurnExecution.current?.pendingApproval { return pending }
         return try await inner.withToolArguments(tool: tool, input: input) { input in
             guard SkillRunContext.partID != nil, !SkillRunContext.handsBack else {
-                return try await dispatchNormalized(tool: tool, input: input, surface: surface)
+                let result = try await dispatchNormalized(tool: tool, input: input, surface: surface)
+                guard input["preview"] != .bool(true), let need = InlineInteractionNeed.interaction(in: result),
+                      let session = verifiedSessionId else { return result }
+                let arguments = try JSONValue.object(input).serialize(pretty: false)
+                let blocked = ToolNameAliases.ranTool(tool, input: input) != InlineInteractionWire.toolName
+                let retained = try await SwiftNativeChatOrchestrationClient.fileInlineInteraction(
+                    need, sessionID: session, toolName: blocked ? tool : nil,
+                    toolArgumentsJSON: blocked && SwiftNativeChatOrchestrationClient.redactedPersistedToolInput(tool: tool, json: arguments) == arguments ? arguments : nil,
+                    requestingTool: tool, origin: TurnEnvelope.current(surface: surface), dataRoot: securityCenter.dataRoot)
+                NotificationCenter.default.post(name: InlineInteractionWire.changedNotification, object: session)
+                guard case .object(var fields) = result,
+                      let encoded = InlineInteractionNeed.encode(retained) else {
+                    throw ToolFailureError("The retained card could not be returned.", effects: .none, code: "card_encoding_failed")
+                }
+                fields[InlineInteractionWire.needsKey] = encoded
+                fields["card_id"] = .string(retained.id)
+                return .object(fields)
             }
             let id = UUID()
             let call = AuthoredToolEffects.call, reach = AbilityStore.fileReach
@@ -364,12 +374,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
         } else {
             approvedReplayAuthorizes = false
         }
-        // The first conversation's one documented line still spends its token,
-        // which arms the voice step after it; posture alone authorizes the write.
-        if surface == "chat" {
-            _ = FirstConversationPersonaProgression.advanceIfMatching(
-                tool: tool, input: input, dataRoot: firstConversationDataRoot, sessionID: verifiedSessionId)
-        }
         // Injection replay requires a real, approved, unspent inbox record bound
         // to the exact tool, surface, body and verified origin, checked before
         // exemption and minting. Unverified replay is denied without another ask.
@@ -382,7 +386,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
             input: input,
             verifiedSessionID: verifiedSessionId
            ) {
-            let verdict = await injectionApprovalVerifier.verifyInjectionApproval(
+            let verdict = try await injectionApprovalVerifier.verifyInjectionApproval(
                 approvalID: replay.approvalID,
                 tool: tool,
                 surface: surface,
@@ -437,7 +441,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
         // replay answers the same card, and Full Mac preserves an allowed connect.
         let peerReasonMayReplace: Bool
         if case .deny = decision { peerReasonMayReplace = false } else { peerReasonMayReplace = true }
-        let protectedAction = PeerTurnEffectPolicy.requiresPeerApproval(tool, input: input)
+        let protectedAction = try PeerTurnEffectPolicy.requiresPeerApproval(tool, input: input)
         var decidedRequester = fullMacOn && protectedAction
             && ChatToolSessionContext.envelope?.workIdentity?.hasPrefix("carry.") == true ? "Full Mac" : nil
         if botDesktop, fullMacOn, case .allow = decision {
@@ -465,7 +469,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                     if source.hasPrefix("peer:") { return peerDisplayName(peerID: String(source.dropFirst(5))) ?? source }
                     return source.contains(" ") ? source : source.prefix(1).uppercased() + source.dropFirst()
                 }.joined(separator: ", ")
-                decision = .requireApproval(reason: PeerTurnEffectPolicy.floorReason(
+                decision = .requireApproval(reason: try PeerTurnEffectPolicy.floorReason(
                     tool: tool, input: input, requester: named.isEmpty ? requester ?? "" : named,
                     quote: Self.peerQuote(taint?.lastLine ?? "")))
             } else if let requester, protectedAction {
@@ -544,6 +548,9 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
             await audit(Self.securityEnvelope(envelope, decision: .block, reason: reason))
             throw AutonomyGateError.toolDenied(reason: reason, remedy: envelope.remedy)
         case .requireApproval(let gateReason):
+            if let refusal = try await MacAppActGate.requestRefusal(tool: tool, input: input, dataRoot: peerDirectoryDataRoot ?? defaultDataRoot()) {
+                return ChatToolOutcome.refusedBeforeRunning(.object(refusal.fields))
+            }
             // A switch User turned off refuses before any card, whatever the
             // posture: a card never asks for what the switch would refuse.
             if let gate = MacIntegrationGates.byTool[tool] {
@@ -676,7 +683,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                 // record and exact body before minting; its claimed ID alone grants no authority.
                 var mintApprovalID = resolved.approvalID
                 if MacInjectionToolNames.isInjectionTool(tool) {
-                    let verdict = await injectionApprovalVerifier.verifyInjectionApproval(
+                    let verdict = try await injectionApprovalVerifier.verifyInjectionApproval(
                         approvalID: resolved.approvalID ?? "",
                         tool: tool,
                         surface: surface,
@@ -795,8 +802,12 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
 
         let finalInput = effectiveInput
         let finalCapability = capability
+        // Inline-card replay binds its verified session around dispatch rather
+        // than at factory construction. Keep that owner's binding through the
+        // writer and capture it before detached settlement loses task locals.
+        let executionSessionID = verifiedSessionId ?? ChatToolSessionContext.verifiedSessionId
         try Task.checkCancellation()
-        return try await ChatToolSessionContext.$verifiedSessionId.withValue(verifiedSessionId) {
+        let result = try await ChatToolSessionContext.$verifiedSessionId.withValue(executionSessionID) {
             // Bound even when nil: a non-injection tool must never inherit a
             // capability left in scope by an enclosing task.
             try await MacInjectionCapabilityContext.$current.withValue(finalCapability) {
@@ -813,6 +824,30 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, Sendable {
                 }
             }
         }
+        if surface == "chat", tool == FirstConversationPersonaProgression.writeTool,
+           finalInput["preview"] != .bool(true), ChatToolOutcome.exactResultClass(result) == .succeeded {
+            let root = securityCenter.dataRoot, session = executionSessionID
+            // Stop does not cancel the bookkeeping for an already committed write.
+            // Every allowed path (including approved replay) settles here once.
+            let progressionFailure: String? = await settle {
+                do {
+                    _ = try await FirstConversationPersonaProgression.settleSuccessfulWrite(
+                        tool: tool, input: finalInput, dataRoot: root, sessionID: session)
+                    return nil
+                } catch {
+                    RepairOwed.owe(root, id: "first-conversation:" + UUID().uuidString, kind: .run,
+                        operation: "first_conversation.progression", owner: PersonaRootResolver.resolveIsolated(dataRoot: root).path,
+                        words: "The persona append succeeded, but its progression remains owed: \(error.localizedDescription). Inspect the retained token and persona bytes; repair progression without appending the same section again.")
+                    return error.localizedDescription
+                }
+            }
+            if let progressionFailure, case .object(var fields) = result {
+                fields["progression_status"] = .string("repair_owed")
+                fields["progression_detail"] = .string("The persona append succeeded. Repair its progression without repeating the append: " + progressionFailure)
+                return .object(fields)
+            }
+        }
+        return result
     }
 
     func listAvailableTools() async throws -> [String] {

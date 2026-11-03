@@ -1,4 +1,5 @@
 import AgentWorkspace
+import ChatToolParsing
 import NativeAgentShared
 import Darwin
 import Foundation
@@ -300,7 +301,7 @@ extension SwiftToolDispatcher {
         _ input: [String: JSONValue],
         tool: String
     ) -> (configuration: String?, failure: JSONValue?) {
-        let raw = builderResolveString(input, keys: ["configuration", "config"]) ?? "debug"
+        let raw = builderResolveString(input, keys: ["configuration"]) ?? "debug"
         let normalized = raw.lowercased()
         switch normalized {
         case "debug", "release":
@@ -321,7 +322,7 @@ extension SwiftToolDispatcher {
         _ input: [String: JSONValue],
         dataRoot: URL
     ) -> String {
-        builderResolveString(input, keys: ["package_path", "packagePath", "cwd"])
+        builderResolveString(input, keys: ["package_path"])
             ?? builderDefaultCwd(dataRoot: dataRoot)
     }
     static func impl_shell(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -341,9 +342,12 @@ extension SwiftToolDispatcher {
         // No command escapes the profile. xcodebuild physically cannot run
         // inside it, so it is refused with a reason instead of being lifted or
         // left to fail as exit 74 — see builderXcodebuildRefusalEnvelope.
-        if builderCommandInvokesXcodebuild(cmd),
-           await builderShellSandboxMode(dataRoot: dataRoot) != .off {
-            return builderXcodebuildRefusalEnvelope(tool: toolName, cmd: cmd)
+        if builderCommandInvokesXcodebuild(cmd) {
+            do {
+                if try await builderShellSandboxMode(dataRoot: dataRoot) != .off {
+                    return builderXcodebuildRefusalEnvelope(tool: toolName, cmd: cmd)
+                }
+            } catch { return ChatToolOutcome.failure(error: error, tool: toolName, effects: ToolFailureError.Effects.none) }
         }
         return await runShellLikeProcess(
             toolName: toolName,
@@ -368,23 +372,10 @@ extension SwiftToolDispatcher {
                         "status": .string("failed"),
                         "effects": .string("none"),
                         "tool": .string("git"),
-                        "reason": .string("args_must_be_string_array_or_shell_string"),
-                        "fix": .string("Pass args as [\"status\", \"--short\"] or as a shell-style string like \"status --short\"."),
+                        "reason": .string("args_must_be_string_array"),
+                        "fix": .string("Pass args as [\"status\", \"--short\"]."),
                     ])
                 }
-            }
-            parsedArgs = args
-        case .string(let raw)?:
-            let parsed = builderParseArgString(raw)
-            guard let args = parsed.args else {
-                return .object([
-                    "status": .string("failed"),
-                    "effects": .string("none"),
-                    "tool": .string("git"),
-                    "reason": .string("args_string_parse_failed"),
-                    "detail": .string(parsed.error ?? "invalid_args_string"),
-                    "fix": .string("Use an args array when quoting is complex, e.g. [\"log\", \"--oneline\", \"-5\"]."),
-                ])
             }
             parsedArgs = args
         default:
@@ -392,8 +383,8 @@ extension SwiftToolDispatcher {
                 "status": .string("failed"),
                 "effects": .string("none"),
                 "tool": .string("git"),
-                "reason": .string("missing_args"),
-                "fix": .string("Pass args as [\"status\", \"--short\"] or as a shell-style string like \"status --short\"."),
+                "reason": .string("args_must_be_string_array"),
+                "fix": .string("Pass args as [\"status\", \"--short\"]."),
             ])
         }
         if parsedArgs.isEmpty {
@@ -402,7 +393,7 @@ extension SwiftToolDispatcher {
                 "effects": .string("none"),
                 "tool": .string("git"),
                 "reason": .string("empty_args"),
-                "fix": .string("Pass at least one git subcommand, e.g. \"status --short\"."),
+                "fix": .string("Pass at least one git subcommand, e.g. [\"status\", \"--short\"]."),
             ])
         }
         let cwd = builderResolveCwd(input, dataRoot: dataRoot)
@@ -445,7 +436,7 @@ extension SwiftToolDispatcher {
             selectors += ["--filter", filter]
         }
         var args = ["swift", command]
-        if builderResolveBool(input, keys: ["disable_swiftpm_sandbox", "disableSwiftPMSandbox"], default: true) {
+        if builderResolveBool(input, keys: ["disable_swiftpm_sandbox"], default: true) {
             args.append("--disable-sandbox")
         }
         args += ["--package-path", packagePath, "--configuration", configuration]

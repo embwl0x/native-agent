@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 import NativeAgentCore
-// Blueprint: | `DataRootLife.swift` | `DataRootLife`; one root life-id, created once when absent as their first life (`first`) and replaced by the restore intent's UUID; `life(of:)` reads a missing stamp as the first life, so an upgrade never reads as a restore; resumable owners stamp at beginning and admit only that life, projecting work from another life stopped with reason restored; CodexCompletionReadout owns lifecycle disk projection and incremental transcript origins |
+// Blueprint: | `DataRootLife.swift` | `DataRootLife`; one root life-id, created once when absent as their first life (`first`) and replaced by the restore intent's UUID; `life(of:)` reads a missing stamp as the first life, so an upgrade never reads as a restore; resumable owners stamp at beginning and admit only that life, projecting work from another life stopped with reason restored; CodexCompletionReadout owns lifecycle disk projection and incremental transcript origins bounded to the initial stamp, accepting in-place append growth and leaving later bytes for the next read |
 
 /// A restore brings back what she had, never what she was doing.
 /// Resumable owners retain the life in which work began, never adopt it on read.
@@ -138,10 +138,17 @@ public struct CodexCompletionReadout: Decodable, Sendable {
   private static let transcriptOrigins = TranscriptOrigins()
 
   public static func directories(configRoot: URL, dataRoot: URL) -> [URL] {
-    [configRoot.appendingPathComponent("claude-bridge/codex-completion-lifecycle")]
-      + ["agent-conversations", "chat/human-reply-delivery", "chat/anchor-mirror"].map {
+    delegationDirectories(configRoot: configRoot, dataRoot: dataRoot)
+      + ["chat/human-reply-delivery", "chat/anchor-mirror"].map {
         dataRoot.appendingPathComponent($0 + "/codex-completion-lifecycle")
       }
+  }
+
+  /// Work handed to another agent. The person's own replies and their
+  /// Telegram mirror share the lifecycle but are not delegations.
+  public static func delegationDirectories(configRoot: URL, dataRoot: URL) -> [URL] {
+    [configRoot.appendingPathComponent("claude-bridge/codex-completion-lifecycle"),
+     dataRoot.appendingPathComponent("agent-conversations/codex-completion-lifecycle")]
   }
 
   public static func unsettledAnswerRuns(configRoot: URL, dataRoot: URL) throws -> Set<String> {
@@ -166,26 +173,70 @@ public struct CodexCompletionReadout: Decodable, Sendable {
 }
 
 /// Each transcript's run → origin agent (the last user row of the run that
-/// names an origin). A run's origin is written once and never changes, so the
-/// index only grows; a transcript that got shorter was rewritten and is reread.
+/// names an origin). Appends extend the index; the shared filesystem version
+/// invalidates it on replacement or a same-size/shrinking rewrite. Inspect the
+/// opened file before every cache hit, including hits for previously seen runs.
 private final class TranscriptOrigins: @unchecked Sendable {
-  private struct Indexed { var offset: UInt64 = 0; var agents: [String: String?] = [:] }
+  private struct Indexed {
+    var stamp: SnapshotTailOpLog.FileStamp = .absent
+    var offset: UInt64 = 0
+    var agents: [String: String?] = [:]
+  }
   private let lock = NSLock()
   private var transcripts: [String: Indexed] = [:]
 
   func agent(forRun run: String, in path: URL) throws -> String? {
     lock.lock()
     defer { lock.unlock() }
+    let handle: FileHandle
+    do { handle = try FileHandle(forReadingFrom: path) }
+    catch let error as CocoaError where error.isFileAbsent {
+      transcripts.removeValue(forKey: path.path)
+      return nil
+    }
+    defer { try? handle.close() }
+    var info = stat()
+    guard fstat(handle.fileDescriptor, &info) == 0 else {
+      throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+    }
+    guard (info.st_mode & S_IFMT) == S_IFREG, info.st_size >= 0 else {
+      throw PersistenceCoreError.ioFailure("The conversation transcript is not a regular file.")
+    }
+    let stamp = SnapshotTailOpLog.FileStamp(info)
+    let size = UInt64(info.st_size)
+    // The read owns the prefix at this stamp. Appends do not invalidate it;
+    // replacement, shrink or a same-size rewrite do.
+    func stillHasPrefix(_ current: SnapshotTailOpLog.FileStamp?) -> Bool {
+      if current == stamp { return true }
+      guard case .present(let device, let inode, let currentSize, _, _, _, _)? = current else { return false }
+      return device == info.st_dev && inode == info.st_ino && currentSize > info.st_size
+    }
     var indexed = transcripts[path.path] ?? Indexed()
-    if let known = indexed.agents[run] { return known }
-    guard let size = (try? FileManager.default.attributesOfItem(atPath: path.path))?[.size] as? UInt64
-    else { return nil }
-    if size < indexed.offset { indexed = Indexed() }
+    if indexed.stamp == stamp {
+      guard stillHasPrefix(SnapshotTailOpLog.fileStamp(path)) else {
+        throw PersistenceCoreError.ioFailure("The conversation transcript was replaced while its origins were being read. Read it again for current provenance.")
+      }
+      return indexed.agents[run] ?? nil
+    }
+    if case .present(let device, let inode, let previousSize, _, _, _, _) = indexed.stamp,
+       device == info.st_dev, inode == info.st_ino, size > UInt64(previousSize) {
+      // The transcript owner appends in place and replaces destructive writes.
+    } else {
+      indexed = Indexed()
+    }
     if size > indexed.offset {
-      let handle = try FileHandle(forReadingFrom: path)
-      defer { try? handle.close() }
       try handle.seek(toOffset: indexed.offset)
-      let data = try handle.readToEnd() ?? Data()
+      let remaining = size - indexed.offset
+      guard let count = Int(exactly: remaining) else {
+        throw PersistenceCoreError.ioFailure("The conversation transcript prefix is too large to read.")
+      }
+      var data = Data()
+      while data.count < count {
+        guard let chunk = try handle.read(upToCount: count - data.count), !chunk.isEmpty else {
+          throw PersistenceCoreError.ioFailure("The conversation transcript shrank while its origins were being read. Read it again for current provenance.")
+        }
+        data.append(chunk)
+      }
       // Whole lines only: a row still being appended is read next time.
       let end = data.lastIndex(of: UInt8(ascii: "\n")).map { $0 + 1 } ?? data.startIndex
       for line in data[data.startIndex..<end].split(separator: UInt8(ascii: "\n")) {
@@ -197,6 +248,14 @@ private final class TranscriptOrigins: @unchecked Sendable {
       }
       indexed.offset += UInt64(end - data.startIndex)
     }
+    var after = stat()
+    guard fstat(handle.fileDescriptor, &after) == 0 else {
+      throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+    }
+    guard stillHasPrefix(SnapshotTailOpLog.FileStamp(after)), stillHasPrefix(SnapshotTailOpLog.fileStamp(path)) else {
+      throw PersistenceCoreError.ioFailure("The conversation transcript changed while its origins were being read. Read it again for current provenance.")
+    }
+    indexed.stamp = stamp
     transcripts[path.path] = indexed
     return indexed.agents[run] ?? nil
   }

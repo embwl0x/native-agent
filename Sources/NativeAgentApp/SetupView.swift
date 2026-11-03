@@ -556,10 +556,10 @@ struct SetupStudioWanderPicker: View {
                         get: { activeProvider },
                         set: { newValue in
                             pendingProvider = newValue
-                            pendingModel = models(for: newValue).first?.id ?? ""
-                            Task { await save() }
+                            pendingModel = ""
                         }
                     )) {
+                        Text("Choose provider").tag("")
                         ForEach(providers) { provider in
                             let ready = provider.auth_status.eligible
                             Text(provider.display_name + (ready ? "" : " ⚠️"))
@@ -576,12 +576,13 @@ struct SetupStudioWanderPicker: View {
                             Task { await save() }
                         }
                     )) {
-                        if model.isEmpty { Text("No model selected").tag("") }
+                        Text("Choose model").tag("")
                         if !model.isEmpty, !models(for: activeProvider).contains(where: { $0.id == model }) {
                             Text(model + " — unavailable").tag(model)
                         }
                         ForEach(models(for: activeProvider)) { item in
                             Text(item.name).tag(item.id)
+                                .disabled(item.supported_reasoning_efforts == nil)
                         }
                     }
                     .pickerStyle(.menu)
@@ -604,7 +605,7 @@ struct SetupStudioWanderPicker: View {
     private func save() async {
         guard !activeProvider.isEmpty, !model.isEmpty else { return }
         saving = true
-        defer { saving = false; pendingProvider = nil; pendingModel = nil }
+        defer { saving = false }
         do {
             _ = try await appModel.engine.saveProviderGroupSelection(
                 group: ProviderSurfaceGroups.mind,
@@ -612,13 +613,17 @@ struct SetupStudioWanderPicker: View {
                 model: model,
                 reasoningEffort: ProvidersFacade.normalizedReasoningEffort(
                     from: appModel.engine.providers.catalog,
+                    providers: appModel.engine.providers.connections,
+                    providerID: activeProvider,
                     model: model,
-                    selected: preference?.reasoningEffort ?? "high"
+                    selected: preference?.reasoningEffort ?? ""
                 ),
                 serviceTier: preference?.serviceTier
             )
             errorMessage = nil
             appModel.statusText = "Memory and mind → \(model) saved"
+            pendingProvider = nil
+            pendingModel = nil
         } catch {
             errorMessage = UserFacingError.message(error, action: "save Memory and mind")
         }

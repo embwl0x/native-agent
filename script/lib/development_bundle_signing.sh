@@ -3,39 +3,73 @@
 # Development-bundle signing contract used by the dist builder.
 # Callers must source provisioning_profile_contract.sh first.
 #
-# Discover a usable local identity, reject a stale explicit override when another real identity exists,
-# use profile-derived entitlements when the complete development chain exists,
-# and fall back to ad-hoc only for missing prerequisites or explicit opt-in.
+# Select one signing mode and product before compilation; missing prerequisites
+# and failed signatures stop that mode. No identity or capability substitution.
 
 nativeagent_resolve_development_signing_identity() {
   local log_prefix="$1" signing_identities="$2"
   local discovered_identity env_identity
-
-  discovered_identity="$(awk -F '"' '/Apple Development/ {print $2; found=1; exit} /Developer ID Application/ && !developer {developer=$2} END {if (!found) print developer}' <<<"$signing_identities")"
-
-  env_identity="${NATIVE_AGENT_DEVELOPMENT_SIGN_IDENTITY:-${NATIVE_AGENT_DEVELOPER_ID:-}}"
+  discovered_identity="$(awk -F '"' '/Apple Development/ {print $2}' <<<"$signing_identities")"
+  env_identity="${NATIVEAGENT_DEVELOPMENT_SIGN_IDENTITY:-}"
   if [[ -z "$env_identity" ]]; then
+    if [[ -z "$discovered_identity" || "$discovered_identity" == *$'\n'* ]]; then
+      echo "$log_prefix Select one NATIVEAGENT_DEVELOPMENT_SIGN_IDENTITY (Apple Development certificate required)." >&2
+      return 1
+    fi
     printf '%s\n' "$discovered_identity"
     return 0
   fi
-  if grep -Fq -- "$env_identity" <<<"$signing_identities"; then
+  if awk -F '"' -v identity="$env_identity" '$2 == identity && /Apple Development/ {found=1} END {exit !found}' <<<"$signing_identities"; then
     printf '%s\n' "$env_identity"
     return 0
   fi
-  if [[ -z "$discovered_identity" ]]; then
-    # Preserve the missing-cert path: the membership gate in the owner below
-    # will select ad-hoc because this stale value is not in the keychain.
-    printf '%s\n' "$env_identity"
-    return 0
-  fi
-
-  echo "$log_prefix NATIVE_AGENT_DEVELOPMENT_SIGN_IDENTITY/NATIVE_AGENT_DEVELOPER_ID='$env_identity'" >&2
-  echo "$log_prefix is NOT present in the keychain, but a real signing identity IS:" >&2
-  echo "$log_prefix   '$discovered_identity'" >&2
-  echo "$log_prefix Refusing to silently ad-hoc-sign an iCloud app (macOS would kill it)." >&2
-  echo "$log_prefix Fix or unset the env var (the discovered identity will be used)," >&2
-  echo "$log_prefix or set NATIVE_AGENT_ADHOC=1 to explicitly opt into ad-hoc." >&2
+  echo "$log_prefix NATIVEAGENT_DEVELOPMENT_SIGN_IDENTITY is not an available Apple Development identity. Fix the selected certificate." >&2
   return 1
+}
+
+nativeagent_prepare_development_signing() {
+  local root="$1" bundle_id="$2" log_prefix="$3" identities profile widget_profile group
+  NATIVEAGENT_SIGNING_MODE="${NATIVEAGENT_SIGNING_MODE:-development}"
+  NATIVEAGENT_PRODUCT="${NATIVEAGENT_PRODUCT:-host}"
+  case "$NATIVEAGENT_PRODUCT" in host|host-with-widget) ;; *) echo "$log_prefix NATIVEAGENT_PRODUCT must be host or host-with-widget" >&2; return 1 ;; esac
+  case "$NATIVEAGENT_SIGNING_MODE" in
+    adhoc)
+      [[ -r "$root/NativeAgent.adhoc.entitlements" ]] || { echo "$log_prefix Missing ad-hoc entitlements" >&2; return 1; }
+      plutil -lint "$root/NativeAgent.adhoc.entitlements" >/dev/null || return 1
+      NATIVEAGENT_SELECTED_SIGN_IDENTITY=-
+      ;;
+    development)
+      identities="$(security find-identity -v -p codesigning)" || return 1
+      NATIVEAGENT_SELECTED_SIGN_IDENTITY="$(nativeagent_resolve_development_signing_identity "$log_prefix" "$identities")" || return 1
+      ;;
+    *) echo "$log_prefix NATIVEAGENT_SIGNING_MODE must be development or adhoc" >&2; return 1 ;;
+  esac
+  mkdir -p "$root/.runtime" || return 1
+  NATIVEAGENT_SIGNING_WORK="$(mktemp -d "$root/.runtime/signing.XXXXXX")" || return 1
+  [[ "$NATIVEAGENT_SIGNING_MODE" == development ]] || return 0
+  profile="${NATIVEAGENT_PROVISIONING_PROFILE:-$root/local/NativeAgent.provisionprofile}"
+  local source_entitlements="${NATIVEAGENT_ENTITLEMENTS:-$root/local/NativeAgent.entitlements}"
+  [[ -r "$source_entitlements" ]] || {
+    echo "$log_prefix Missing development entitlements; configure NATIVEAGENT_ENTITLEMENTS." >&2; return 1;
+  }
+  cp "$source_entitlements" "$NATIVEAGENT_SIGNING_WORK/host-source.entitlements" || return 1
+  plutil -lint "$NATIVEAGENT_SIGNING_WORK/host-source.entitlements" >/dev/null || return 1
+  decode_provisioning_profile "$profile" "$NATIVEAGENT_SIGNING_WORK/host.plist" "$NATIVEAGENT_SIGNING_WORK/host.plist.provisionprofile" || return 1
+  verify_profile_identity_contract "$NATIVEAGENT_SIGNING_WORK/host.plist" "$bundle_id" || return 1
+  _nativeagent_assert_profile_allows_current_mac "$NATIVEAGENT_SIGNING_WORK/host.plist" "$bundle_id" "$root" "$log_prefix" || return 1
+  if [[ "$NATIVEAGENT_PRODUCT" == host-with-widget ]]; then
+    widget_profile="${NATIVEAGENT_WIDGET_PROVISIONING_PROFILE:-$root/local/NativeAgentWidget.provisionprofile}"
+    group="${NATIVEAGENT_MAC_APP_GROUP_ID:-group.$bundle_id}"
+    decode_provisioning_profile "$widget_profile" "$NATIVEAGENT_SIGNING_WORK/widget.plist" "$NATIVEAGENT_SIGNING_WORK/widget.plist.provisionprofile" || return 1
+    verify_profile_identity_contract "$NATIVEAGENT_SIGNING_WORK/widget.plist" "${NATIVEAGENT_MAC_WIDGET_BUNDLE_ID:-$bundle_id.widget}" || return 1
+    [[ "$(provisioning_profile_value "$NATIVEAGENT_SIGNING_WORK/host.plist" TeamIdentifier:0)" == "$(provisioning_profile_value "$NATIVEAGENT_SIGNING_WORK/widget.plist" TeamIdentifier:0)" ]] || return 1
+    _nativeagent_assert_profile_allows_current_mac "$NATIVEAGENT_SIGNING_WORK/widget.plist" "$bundle_id.widget" "$root" "$log_prefix" || return 1
+    for profile in host widget; do
+      provisioning_profile_array_contains "$NATIVEAGENT_SIGNING_WORK/$profile.plist" 'Entitlements:com.apple.security.application-groups' "$group" || {
+        echo "$log_prefix Selected widget product requires App Group $group in both profiles." >&2; return 1;
+      }
+    done
+  fi
 }
 
 _nativeagent_sign_nested_plain() {
@@ -63,20 +97,13 @@ _nativeagent_sign_nested_plain() {
   fi
 }
 
-# Widget provisioning is optional; the app's existing signing contract is not.
+# Apply the selected product, never infer it from provisioning failures.
 _nativeagent_gate_widget() {
-  local bundle="$1" root="$2" profile="$3" profile_plist="$4" widget_profile group provisioned=0
-  widget_profile="${NATIVEAGENT_WIDGET_PROVISIONING_PROFILE:-$root/local/NativeAgentWidget.provisionprofile}"
-  group="$(/usr/libexec/PlistBuddy -c 'Print :NativeAgentMacAppGroupID' "$bundle/Contents/Info.plist")" || return 1
-  if [[ -f "$widget_profile" && -f "$profile" ]]; then
-    decode_provisioning_profile "$profile" "$profile_plist" "$profile_plist.provisionprofile" || return 1
-    if provisioning_profile_array_contains "$profile_plist" 'Entitlements:com.apple.security.application-groups' "$group"; then
-      provisioned=1
-    fi
-  fi
-  if [[ "$provisioned" == "0" ]]; then
+  local bundle="$1"
+  if [[ "$NATIVEAGENT_PRODUCT" == host ]]; then
     rm -rf "$bundle/Contents/PlugIns/NativeAgentWidget.appex" || return 1
-    echo 'widget not embedded: register io.github.embwl0x.nativeagent.mac.widget + group.io.github.embwl0x.nativeagent.mac in the developer portal' >&2
+    /usr/libexec/PlistBuddy -c 'Delete :NativeAgentMacAppGroupID' "$bundle/Contents/Info.plist" || return 1
+    echo '[sign] selected host product (no widget)'
   elif [[ ! -d "$bundle/Contents/PlugIns/NativeAgentWidget.appex" ]]; then
     echo '[sign] Missing embedded NativeAgentWidget.appex in provisioned build' >&2
     return 1
@@ -104,7 +131,7 @@ _nativeagent_set_widget_group() {
 }
 
 _nativeagent_sign_widget() {
-  local bundle="$1" identity="$2" root="$3" profile_plist="${4:-}" widget profile entitlements widget_id
+  local bundle="$1" identity="$2" root="$3" profile_plist="${4:-}" widget entitlements widget_id
   widget="$bundle/Contents/PlugIns/NativeAgentWidget.appex"
   [[ -d "$widget" ]] || return 0
   entitlements="$bundle/../widget-sign.$$.entitlements"
@@ -116,14 +143,8 @@ _nativeagent_sign_widget() {
   if [[ "$identity" == "-" ]]; then
     codesign --force --sign - --options runtime --entitlements "$entitlements" "$widget"
   else
-    profile="${NATIVEAGENT_WIDGET_PROVISIONING_PROFILE:-$root/local/NativeAgentWidget.provisionprofile}"
-    if [[ ! -f "$profile" ]]; then
-      echo "[sign] Missing widget profile: $profile. Register the widget ID and shared App Group first." >&2
-      rm -f "$entitlements"
-      return 1
-    fi
     widget_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$widget/Contents/Info.plist")"
-    _nativeagent_sign_with_development_identity "$widget" "$identity" "$profile" "$entitlements" "$widget_id" '[sign widget]' "$profile_plist"
+    _nativeagent_sign_with_development_identity "$widget" "$identity" "$entitlements" "$widget_id" '[sign widget]' "$profile_plist"
   fi
   local result=$?
   rm -f "$entitlements"
@@ -161,10 +182,12 @@ _nativeagent_assert_profile_allows_current_mac() {
   local profile_plist="$1" bundle_id="$2" root="$3" log_prefix="$4"
   local ids devices_xml id matched
 
-  ids="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Hardware UUID|Provisioning UDID/ {print $2}')"
-  [[ -z "$ids" ]] && return 0
+  ids="$(system_profiler SPHardwareDataType | awk -F': ' '/Hardware UUID|Provisioning UDID/ {print $2}')" || return 1
+  [[ -n "$ids" ]] || { echo "$log_prefix Could not establish this Mac's provisioning identity." >&2; return 1; }
   if ! devices_xml="$(/usr/bin/plutil -extract ProvisionedDevices xml1 -o - "$profile_plist" 2>/dev/null)"; then
-    return 0
+    [[ "$(provisioning_profile_value "$profile_plist" ProvisionsAllDevices)" == true ]] && return 0
+    echo "$log_prefix Profile has neither readable ProvisionedDevices nor an all-devices grant." >&2
+    return 1
   fi
   matched=0
   while IFS= read -r id; do
@@ -185,18 +208,17 @@ _nativeagent_assert_profile_allows_current_mac() {
   printf '%s\n' "$devices_xml" | awk -F'[<>]' -v prefix="$log_prefix" '/<string>/ {print prefix "   - " $3}' >&2
   echo "$log_prefix Regenerate/download the Mac Development profile for $bundle_id with this Mac selected," >&2
   echo "$log_prefix replace $root/local/NativeAgent.provisionprofile, then rerun ./script/install_app.sh." >&2
-  echo "$log_prefix Temporary local-only launch: NATIVE_AGENT_ADHOC=1 ./script/install_app.sh (iCloud disabled)." >&2
   return 1
 }
 
-# Only final codesign failure returns 11 for NATIVE_AGENT_ADHOC_FALLBACK; integrity failures return 10.
+# All signing and identity failures stop the selected mode.
 _nativeagent_sign_with_development_identity() {
-  local bundle="$1" identity="$2" profile="$3" source_entitlements="$4"
-  local bundle_id="$5" log_prefix="$6"
-  local entitlement_template entitlement_sign profile_plist="$7"
-  if [[ ! -f "$profile_plist" ]]; then
-    decode_provisioning_profile "$profile" "$profile_plist" "$profile_plist.provisionprofile" || return 10
-  fi
+  local bundle="$1" identity="$2" source_entitlements="$3"
+  local bundle_id="$4" log_prefix="$5"
+  local entitlement_template entitlement_sign profile_plist="$6"
+  [[ -r "$profile_plist" && -r "$profile_plist.provisionprofile" ]] || {
+    echo "$log_prefix Preflight profile snapshot is unavailable; refusing to select new signing input." >&2; return 10;
+  }
   cp "$profile_plist.provisionprofile" "$bundle/Contents/embedded.provisionprofile" || return 10
 
   entitlement_template="${TMPDIR:-/tmp}/na_ent_template.$$.entitlements"
@@ -232,20 +254,16 @@ _nativeagent_sign_with_development_identity() {
 _nativeagent_sign_adhoc_bundle() {
   local bundle="$1" adhoc_entitlements="$2"
   _nativeagent_sign_nested_plain "$bundle" "-" || return 1
-  if [[ -f "$adhoc_entitlements" ]]; then
-    local expanded="$bundle/../app-sign.$$.entitlements"
-    cp "$adhoc_entitlements" "$expanded" || return 1
-    if ! _nativeagent_set_widget_group "$bundle" "$expanded"; then
-      rm -f "$expanded"
-      return 1
-    fi
-    codesign --force --sign - --entitlements "$expanded" "$bundle"
-    local result=$?
+  local expanded="$bundle/../app-sign.$$.entitlements"
+  cp "$adhoc_entitlements" "$expanded" || return 1
+  if ! _nativeagent_set_widget_group "$bundle" "$expanded"; then
     rm -f "$expanded"
-    return "$result"
-  else
-    codesign --force --sign - "$bundle"
+    return 1
   fi
+  codesign --force --sign - --entitlements "$expanded" "$bundle"
+  local result=$?
+  rm -f "$expanded"
+  return "$result"
 }
 
 _nativeagent_verify_signed_bundle() {
@@ -261,58 +279,25 @@ _nativeagent_verify_signed_bundle() {
 
 nativeagent_sign_development_bundle() (
   local bundle="$1" root="$2" bundle_id="$3" log_prefix="$4"
-  local profile source_entitlements adhoc_entitlements sign_identity sign_status signing_identities snapshot_dir profile_plist
-  snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-sign.XXXXXX")" || return 1
-  trap 'rm -rf "$snapshot_dir"' EXIT
+  local source_entitlements adhoc_entitlements sign_identity snapshot_dir profile_plist
+  snapshot_dir="$NATIVEAGENT_SIGNING_WORK"
   profile_plist="$snapshot_dir/host.plist"
 
-  profile="${NATIVEAGENT_PROVISIONING_PROFILE:-$root/local/NativeAgent.provisionprofile}"
-  source_entitlements="${NATIVEAGENT_ENTITLEMENTS:-$root/local/NativeAgent.entitlements}"
+  source_entitlements="$snapshot_dir/host-source.entitlements"
   adhoc_entitlements="$root/NativeAgent.adhoc.entitlements"
-  signing_identities="$(security find-identity -v -p codesigning 2>/dev/null)" || return 1
-  sign_identity="$(nativeagent_resolve_development_signing_identity "$log_prefix" "$signing_identities")" || return 1
-  _nativeagent_gate_widget "$bundle" "$root" "$profile" "$profile_plist" || return 1
+  sign_identity="$NATIVEAGENT_SELECTED_SIGN_IDENTITY"
+  _nativeagent_gate_widget "$bundle" || return 1
 
-  if [[ "${NATIVE_AGENT_ADHOC:-0}" == "1" ]]; then
-    echo "$log_prefix NATIVE_AGENT_ADHOC=1 — using ad-hoc signature (iCloud disabled)"
+  if [[ "$NATIVEAGENT_SIGNING_MODE" == adhoc ]]; then
+    echo "$log_prefix selected ad-hoc signature (iCloud disabled)"
     _nativeagent_sign_widget "$bundle" "-" "$root" || return 1
     _nativeagent_sign_adhoc_bundle "$bundle" "$adhoc_entitlements" || return 1
-  elif [[ -f "$profile" && -f "$source_entitlements" ]] \
-    && [[ -n "$sign_identity" ]] \
-    && grep -Fq -- "$sign_identity" <<<"$signing_identities"; then
+  else
     echo "$log_prefix Apple Development cert + provisioning profile + iCloud entitlements"
-    if [[ ! -f "$profile_plist" ]]; then
-      decode_provisioning_profile "$profile" "$profile_plist" "$profile_plist.provisionprofile" || return 1
-    fi
-    _nativeagent_assert_profile_allows_current_mac "$profile_plist" "$bundle_id" "$root" "$log_prefix" || return 1
     _nativeagent_sign_widget "$bundle" "$sign_identity" "$root" "$snapshot_dir/widget.plist" || return 1
     _nativeagent_sign_nested_plain "$bundle" "$sign_identity" || return 1
-    if _nativeagent_sign_with_development_identity \
-      "$bundle" "$sign_identity" "$profile" "$source_entitlements" "$bundle_id" "$log_prefix" "$profile_plist"; then
-      :
-    else
-      sign_status=$?
-      if [[ "$sign_status" != "11" ]]; then
-        return 1
-      fi
-      echo "$log_prefix dev-cert signing FAILED (see codesign error above)." >&2
-      if [[ "${NATIVE_AGENT_ADHOC_FALLBACK:-0}" == "1" ]]; then
-        echo "$log_prefix NATIVE_AGENT_ADHOC_FALLBACK=1 — falling back to ad-hoc" >&2
-        echo "$log_prefix iCloud entitlements will NOT be honored and macOS may kill the app." >&2
-        _nativeagent_sign_widget "$bundle" "-" "$root" || return 1
-        _nativeagent_sign_adhoc_bundle "$bundle" "$adhoc_entitlements" || return 1
-      else
-        echo "$log_prefix cert+profile are present, so this is NOT a missing-identity case —" >&2
-        echo "$log_prefix refusing to silently ship an unlaunchable ad-hoc iCloud app." >&2
-        echo "$log_prefix Fix the codesign cause and re-run, or set NATIVE_AGENT_ADHOC_FALLBACK=1" >&2
-        echo "$log_prefix (or NATIVE_AGENT_ADHOC=1) to explicitly opt into ad-hoc." >&2
-        return 1
-      fi
-    fi
-  else
-    echo "$log_prefix no local provisioning profile / cert — ad-hoc (iCloud disabled)"
-    _nativeagent_sign_widget "$bundle" "-" "$root" || return 1
-    _nativeagent_sign_adhoc_bundle "$bundle" "$adhoc_entitlements" || return 1
+    _nativeagent_sign_with_development_identity \
+      "$bundle" "$sign_identity" "$source_entitlements" "$bundle_id" "$log_prefix" "$profile_plist" || return 1
   fi
 
   _nativeagent_verify_signed_bundle "$bundle" "$log_prefix"

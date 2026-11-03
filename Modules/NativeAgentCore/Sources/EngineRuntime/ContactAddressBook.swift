@@ -42,8 +42,8 @@ public final class ContactListFacade {
                     let records = Result { try AgentConversationStore(dataRoot: root).records() }
                     let peers = try AgentPeerStore(dataRoot: root).list()
                     let lasts = AgentConversationStore.lastExchanges(peers: peers,
-                        records: (try? records.get()) ?? [], dataRoot: root).mapValues(\.summary)
-                    let doors = AgentContactRow.rows(peers: peers, candidates: discovery, dataRoot: root, everyDoor: true).map { row in
+                        records: try records.get(), dataRoot: root).mapValues(\.summary)
+                    let doors = try AgentContactRow.rows(peers: peers, candidates: discovery, dataRoot: root, everyDoor: true).map { row in
                         var row = row
                         row.lastExchange = row.contact.flatMap { lasts[$0.id] }
                         return row

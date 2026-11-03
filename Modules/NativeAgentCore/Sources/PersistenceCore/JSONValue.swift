@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 import Darwin
-// Blueprint: | `JSONValue.swift` | `JSONValue` ADT and wire codec; nonfinite-token parsing, Python-compatible ordered/sorted serialization, Codable conversion; `decodeCompletion`, `fromEncodable`, `mapStrings`, `decodedExactly` (strict stored-document shape), `digest`, `differences` |
+// Blueprint: | `JSONValue.swift` | `JSONValue` ADT and wire codec; strict JSON parsing, Python-compatible ordered/sorted serialization, Codable conversion; `decodeCompletion`, `fromEncodable`, `mapStrings`, `decodedExactly` (strict stored-document shape), checked throwing `digest`, `differences` |
 
 // MARK: - JSONValue
 
@@ -154,19 +154,12 @@ extension JSONValue {
 
     /// Parse JSON bytes into a JSONValue. Distinguishes Int vs Double by
     /// inspecting the underlying CFNumber type (NSNumber from JSONSerialization).
-    ///
-    /// LOSSY: Python's `json.dumps` with default `allow_nan=True` emits the bare
-    /// tokens `NaN`, `Infinity`, `-Infinity` (non-standard). Swift's
-    /// JSONSerialization rejects those tokens. To stay readable across the wire
-    /// we strip those tokens (when they appear as JSON values, not inside string
-    /// literals) and replace them with `null` before parsing. So
-    /// `Python NaN → Swift JSONValue.null` on read.
+    /// Invalid numeric tokens are rejected without changing the supplied bytes.
     public static func parse(_ data: Data) throws -> JSONValue {
         // Release JSONSerialization's autoreleased tree after each parse.
         try autoreleasepool {
-            let sanitized = stripNonFiniteTokens(data)
             let raw = try JSONSerialization.jsonObject(
-                with: sanitized, options: [.fragmentsAllowed]
+                with: data, options: [.fragmentsAllowed]
             )
             return convert(raw)
         }
@@ -195,64 +188,6 @@ extension JSONValue {
         case .array(let values): return values.map { $0.foundationObject }
         case .object(let values): return values.mapValues { $0.foundationObject }
         }
-    }
-
-    /// Walk JSON bytes with a tiny string-aware lexer and replace bare
-    /// `NaN` / `Infinity` / `-Infinity` value tokens with `null`. Tokens
-    /// inside double-quoted strings (respecting `\"` escapes) are untouched.
-    static func stripNonFiniteTokens(_ data: Data) -> Data {
-        data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
-            var out = Data()
-            let nullBytes: [UInt8] = [0x6E, 0x75, 0x6C, 0x6C] // "null"
-            var inString = false
-            var escape = false
-            var i = 0, start = 0
-            while i < bytes.count {
-                let b = bytes[i]
-                if inString {
-                    if escape {
-                        escape = false
-                    } else if b == 0x5C { // backslash
-                        escape = true
-                    } else if b == 0x22 { // quote
-                        inString = false
-                    }
-                    i += 1
-                    continue
-                }
-                if b == 0x22 { // entering string
-                    inString = true
-                    i += 1
-                    continue
-                }
-                let tokenLength: Int
-                if b == 0x4E && matchesAscii(bytes, i, "NaN") {
-                    tokenLength = 3
-                } else if b == 0x49 && matchesAscii(bytes, i, "Infinity") {
-                    tokenLength = 8
-                } else if b == 0x2D && i + 1 < bytes.count && bytes[i + 1] == 0x49
-                    && matchesAscii(bytes, i + 1, "Infinity") {
-                    tokenLength = 9
-                } else {
-                    i += 1
-                    continue
-                }
-                out.append(contentsOf: bytes[start..<i])
-                out.append(contentsOf: nullBytes)
-                i += tokenLength
-                start = i
-            }
-            guard start > 0 else { return data }
-            out.append(contentsOf: bytes[start..<bytes.count])
-            return out
-        }
-    }
-
-    private static func matchesAscii(_ bytes: UnsafeRawBufferPointer, _ i: Int, _ token: String) -> Bool {
-        let t = Array(token.utf8)
-        if i + t.count > bytes.count { return false }
-        for j in 0..<t.count where bytes[i + j] != t[j] { return false }
-        return true
     }
 
     private static func convert(_ any: Any) -> JSONValue {
@@ -299,23 +234,6 @@ extension JSONValue {
     /// UTF-8 byte form of `serialize`.
     public func serializedData(pretty: Bool) throws -> Data {
         try Data(serialize(pretty: pretty).utf8)
-    }
-
-    /// Emit top-level keys in the supplied order, matching Python's default
-    /// `json.dumps(d)` (`sort_keys=False`, `ensure_ascii=True`, separators
-    /// `(', ', ': ')`), including `mac_control_audit.jsonl` receipt order.
-    /// String escaping matches `serialize`; nested objects still sort keys.
-    public static func serializeOrderedObjectPython(_ pairs: [(String, JSONValue)]) throws -> String {
-        if pairs.isEmpty { return "{}" }
-        var out = "{"
-        for (idx, pair) in pairs.enumerated() {
-            if idx > 0 { out += ", " }
-            JSONValue.encodeString(pair.0, into: &out)
-            out += ": "
-            try pair.1.encode(into: &out, pretty: false, indentLevel: 0, path: pair.0)
-        }
-        out += "}"
-        return out
     }
 
     private func encode(into out: inout String, pretty: Bool, indentLevel: Int, path: String) throws {
@@ -531,7 +449,9 @@ extension JSONValue {
 
     /// The first 8 bytes of the compact form's SHA-256, as hex.
     public var digest: String {
-        SHA256.hash(data: (try? serializedData(pretty: false)) ?? Data()).prefix(8).map { String(format: "%02x", $0) }.joined()
+        get throws {
+            SHA256.hash(data: try serializedData(pretty: false)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        }
     }
 
     /// The dotted fields whose values differ, for a write's receipt.

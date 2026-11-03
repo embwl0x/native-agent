@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import GRDB
 import PersistenceCore
-// Blueprint: | `CognitiveSQLiteStore.swift` | `CognitiveSQLiteStore` actor; `backupForDoctor`, `commitMaintenance` |
+// Blueprint: | `CognitiveSQLiteStore.swift` | `CognitiveSQLiteStore` actor; checked current-schema adoption or fresh initialization, `backupForDoctor`, `commitMaintenance`; historical schema repair chains and retired mirror drains are removed |
 
 struct CognitiveArtifactWrite: Sendable, Equatable {
     var kind: String
@@ -26,11 +26,13 @@ struct CognitiveReceiptWrite: Sendable, Equatable {
 /// BOUNDED WORST CASE — protection is an eviction ORDERING, never a veto.
 /// pruneArtifacts always deletes exactly `count - cap` rows (protected rows sort
 /// last, but they are still spent once the unprotected supply runs out), so the
-/// table is bounded at `cap` no matter how many families are listed here or how
+/// eligible history is bounded at `cap` no matter how many families are listed here or how
 /// lopsidedly they fill. A full protected family may spend its floor when
 /// the rest of the table has no unprotected rows left.
 /// Kinds the generic cap never counts or evicts. Cares have no count cap:
 /// lane 3's night fades the unused ones, and the four seeds never go.
+/// Reflection rows with status `owed` are unfinished work, also excluded until
+/// their effects and the dream journal's acknowledgment have landed.
 private let cognitiveUnprunedArtifactKinds: Set<String> = [
     "care", "care_migration", "care_retired_migration", "standing_view", "thought_seed",
 ]
@@ -46,9 +48,6 @@ private let cognitiveProtectedArtifactMinimums: [String: Int] = [
     "emotional_consolidation": 32,
     "episode": 64,
     "schema_proposal": 64,
-    // Retired from resident cognition, but old rows remain byte-preserved for
-    // backup/migration readers rather than being silently deleted at store open.
-    "identity_proposal": 32,
     "developmental_timeline": 128,
     "reflection_receipt": 32,
 ]
@@ -116,6 +115,11 @@ public actor CognitiveSQLiteStore {
         let dir = dataRoot.appendingPathComponent("cognition", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.databaseURL = dir.appendingPathComponent("cognition.sqlite")
+        let newStore: Bool
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: databaseURL.path)
+            newStore = false
+        } catch CocoaError.fileReadNoSuchFile { newStore = true }
         var config = Configuration()
         // Without a busy timeout GRDB fails a write instantly with SQLITE_BUSY
         // when any second connection (probe CLI, second process) holds the
@@ -126,8 +130,7 @@ public actor CognitiveSQLiteStore {
             try db.execute(sql: "PRAGMA foreign_keys = ON")
         }
         self.dbQueue = try DatabaseQueue(path: databaseURL.path, configuration: config)
-        try Self.migrator.migrate(dbQueue)
-        try Self.drainRetiredCognitionArtifacts(dbQueue)
+        try Self.migrator(newStore: newStore).migrate(dbQueue)
     }
 
     /// Consistent online snapshot through the mounted writer before Doctor restores.
@@ -140,44 +143,6 @@ public actor CognitiveSQLiteStore {
         guard result == "ok" else { throw CognitivePersistenceError.storeUnavailable }
         try backup.close()
         return destination
-    }
-
-    /// Drain retired cognition rows at open, including rows a downgraded
-    /// pre-retirement binary may have written after newer migrations ran.
-    private static func drainRetiredCognitionArtifacts(_ dbQueue: DatabaseQueue) throws {
-        try dbQueue.write { db in
-            // Artifact rows: the persisted `prediction`/`commitment` records plus the
-            // mirror `receipt.prediction_resolution` rows appendReceipt writes.
-            try db.execute(sql: """
-                DELETE FROM cognitive_artifacts
-                WHERE kind LIKE 'prediction%'
-                   OR kind LIKE 'commitment%'
-                   OR kind LIKE 'receipt.%'
-                   OR kind LIKE 'cue_authoring%'
-                """)
-            // Receipt rows carry the bare kind (e.g. 'prediction_resolution').
-            try db.execute(sql: """
-                DELETE FROM cognitive_receipts
-                WHERE kind LIKE 'prediction%'
-                   OR kind LIKE 'commitment%'
-                   OR kind LIKE 'cue_authoring%'
-                """)
-            // R8a cue authoring had already lost its capsule consumer before
-            // the lane was retired. Remove its inert node decorations so they
-            // cannot spend bounded metadata slots forever.
-            try db.execute(sql: """
-                UPDATE cognitive_nodes
-                SET metadata_json = json_remove(
-                    metadata_json,
-                    '$.authored_cue',
-                    '$.authored_cue_hash',
-                    '$.authored_cue_at'
-                )
-                WHERE json_type(metadata_json, '$.authored_cue') IS NOT NULL
-                   OR json_type(metadata_json, '$.authored_cue_hash') IS NOT NULL
-                   OR json_type(metadata_json, '$.authored_cue_at') IS NOT NULL
-                """)
-        }
     }
 
     /// Durable, payload-free replay guard for canonical motor projections.
@@ -336,14 +301,11 @@ public actor CognitiveSQLiteStore {
                 arguments: [nodeCap]
             )
             let deletedNodes = db.changesCount
-            // Remove legacy receipt mirrors even if restored after store open.
-            try db.execute(sql: "DELETE FROM cognitive_artifacts WHERE kind LIKE 'receipt.%'")
-            let deletedMirrors = db.changesCount
             let deletedArtifacts = try Self.pruneArtifacts(
                 db,
                 maxArtifacts: maxArtifacts,
                 protectedMinimums: cognitiveProtectedArtifactMinimums
-            ).count + deletedMirrors
+            ).count
             for receipt in receipts {
                 var payload = receipt.payload
                 if let startedAt = receipt.startedAt, case .object(var fields) = payload {
@@ -457,14 +419,14 @@ public actor CognitiveSQLiteStore {
         let exemptMarks = Array(repeating: "?", count: exempt.count).joined(separator: ",")
         let count = try Int.fetchOne(
             db,
-            sql: "SELECT COUNT(*) FROM cognitive_artifacts WHERE kind NOT IN (\(exemptMarks))",
+            sql: "SELECT COUNT(*) FROM cognitive_artifacts WHERE kind NOT IN (\(exemptMarks)) AND NOT (kind = 'reflection_receipt' AND status = 'owed')",
             arguments: StatementArguments(Array(exempt))
         ) ?? 0
         let overflow = count - boundedCap
         guard overflow > 0 else { return [] }
         let rows = try Row.fetchAll(
             db,
-            sql: "SELECT id, kind, status, updated_at FROM cognitive_artifacts WHERE kind NOT IN (\(exemptMarks))",
+            sql: "SELECT id, kind, status, updated_at FROM cognitive_artifacts WHERE kind NOT IN (\(exemptMarks)) AND NOT (kind = 'reflection_receipt' AND status = 'owed')",
             arguments: StatementArguments(Array(exempt))
         ).compactMap { row -> ArtifactPruneRow? in
             guard let id: String = try row.decode(forColumn: "id"),
@@ -657,9 +619,22 @@ public actor CognitiveSQLiteStore {
         )
     }
 
-    private static var migrator: DatabaseMigrator {
+    private static func migrator(newStore: Bool) -> DatabaseMigrator {
         var migrator = DatabaseMigrator()
-        migrator.registerMigration("v1_cognitive_substrate") { db in
+        migrator.registerMigration("current_cognitive_schema") { db in
+            let tables = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('cognitive_nodes','cognitive_artifacts','cognitive_receipts','cognitive_motor_consequence_admission','cognitive_epochs','lived_moments')") ?? 0
+            if tables > 0 {
+                guard tables == 6 else { throw CognitivePersistenceError.storeUnavailable }
+                // Existing current stores adopt the baseline without rewriting continuity.
+                _ = try Row.fetchAll(db, sql: "SELECT id, kind, subject_type, subject_id, subject_label, activation, salience, confidence, source_class, created_at, last_activated_at, decay_half_life, summary, metadata_json, updated_at, emotional_valence, emotional_arousal, emotional_warmth, lived_seq FROM cognitive_nodes LIMIT 0")
+                _ = try Row.fetchAll(db, sql: "SELECT id, kind, status, score, payload_json, created_at, updated_at FROM cognitive_artifacts LIMIT 0")
+                _ = try Row.fetchAll(db, sql: "SELECT id, kind, payload_json, created_at FROM cognitive_receipts LIMIT 0")
+                _ = try Row.fetchAll(db, sql: "SELECT action_key, semantic_fingerprint, owner_updated_at, admitted_at FROM cognitive_motor_consequence_admission LIMIT 0")
+                _ = try Row.fetchAll(db, sql: "SELECT domain, epoch FROM cognitive_epochs LIMIT 0")
+                _ = try Row.fetchAll(db, sql: "SELECT id, life, kind, lived_at, accepted_at, state, fold_seq, mind_epoch, body_epoch, input_json, meaning_json, parts_json, reason, updated_at FROM lived_moments LIMIT 0")
+                return
+            }
+            guard newStore else { throw CognitivePersistenceError.storeUnavailable }
             try db.execute(sql: """
                 CREATE TABLE cognitive_nodes (
                     id TEXT PRIMARY KEY NOT NULL,
@@ -676,7 +651,11 @@ public actor CognitiveSQLiteStore {
                     decay_half_life REAL NOT NULL,
                     summary TEXT NOT NULL,
                     metadata_json TEXT NOT NULL,
-                    updated_at REAL NOT NULL
+                    updated_at REAL NOT NULL,
+                    emotional_valence REAL NOT NULL DEFAULT 0,
+                    emotional_arousal REAL NOT NULL DEFAULT 0,
+                    emotional_warmth REAL NOT NULL DEFAULT 0,
+                    lived_seq INTEGER
                 );
                 CREATE INDEX idx_cognitive_nodes_kind ON cognitive_nodes(kind);
                 CREATE INDEX idx_cognitive_nodes_subject ON cognitive_nodes(subject_type, subject_id);
@@ -693,10 +672,8 @@ public actor CognitiveSQLiteStore {
                 );
                 CREATE INDEX idx_cognitive_artifacts_kind ON cognitive_artifacts(kind, status);
                 CREATE INDEX idx_cognitive_artifacts_updated ON cognitive_artifacts(updated_at);
-                """)
-        }
-        migrator.registerMigration("v2_cognitive_receipts_and_schema_markers") { db in
-            try db.execute(sql: """
+
+
                 CREATE TABLE cognitive_receipts (
                     id TEXT PRIMARY KEY NOT NULL,
                     kind TEXT NOT NULL,
@@ -704,18 +681,8 @@ public actor CognitiveSQLiteStore {
                     created_at REAL NOT NULL
                 );
                 CREATE INDEX idx_cognitive_receipts_kind ON cognitive_receipts(kind, created_at);
-                """)
-        }
-        // New emotional-tag columns default to neutral without changing existing values.
-        migrator.registerMigration("v3_cognitive_node_emotional_tags") { db in
-            try db.execute(sql: """
-                ALTER TABLE cognitive_nodes ADD COLUMN emotional_valence REAL NOT NULL DEFAULT 0;
-                ALTER TABLE cognitive_nodes ADD COLUMN emotional_arousal REAL NOT NULL DEFAULT 0;
-                ALTER TABLE cognitive_nodes ADD COLUMN emotional_warmth REAL NOT NULL DEFAULT 0;
-                """)
-        }
-        migrator.registerMigration("v4_motor_consequence_replay_guard") { db in
-            try db.execute(sql: """
+
+
                 CREATE TABLE cognitive_motor_consequence_admission (
                     action_key TEXT PRIMARY KEY NOT NULL,
                     semantic_fingerprint TEXT NOT NULL,
@@ -724,41 +691,16 @@ public actor CognitiveSQLiteStore {
                 );
                 CREATE INDEX idx_cognitive_motor_consequence_admitted
                     ON cognitive_motor_consequence_admission(admitted_at);
-                """)
-        }
-        migrator.registerMigration("v5_care_folded_movement_days") { db in
-            // Old folds kept no distinct-day evidence. Preserve their summary
-            // and start an explicit empty witness list; the retained story still
-            // counts, and future folds keep its days. Never invent lost evidence.
-            for row in try Row.fetchAll(db, sql: "SELECT id, payload_json FROM cognitive_artifacts WHERE kind = 'care'") {
-                let id: String = try row.decode(forColumn: "id")
-                let payload: String = try row.decode(forColumn: "payload_json")
-                guard case .object(var object) = try JSONValue.parse(Data(payload.utf8)),
-                      case .object(var folded)? = object["folded"], folded["movedDays"] == nil else { continue }
-                folded["movedDays"] = .array([])
-                object["folded"] = .object(folded)
-                try db.execute(sql: "UPDATE cognitive_artifacts SET payload_json = ? WHERE id = ?",
-                               arguments: [try JSONValue.object(object).serialize(pretty: false), id])
-            }
-        }
-        migrator.registerMigration("v6_retire_cognitive_experiments") { db in
-            // These count-based ratings never measured a cognitive outcome.
-            // Retire only their artifacts; living state and receipts keep their format.
-            try db.execute(sql: "DELETE FROM cognitive_artifacts WHERE kind = 'experiment'")
-        }
-        migrator.registerMigration("v7_forgetting_epochs") { db in
-            // One durable forgetting boundary per domain, kept OUTSIDE what
-            // `clear()` deletes: a moment admitted under an older epoch of a
-            // domain is refused by that domain's parts. An older binary ignores
-            // this table (GRDB skips unknown applied migrations).
-            try db.execute(sql: """
+
+
                 CREATE TABLE IF NOT EXISTS cognitive_epochs (
                     domain TEXT PRIMARY KEY NOT NULL,
                     epoch INTEGER NOT NULL
                 )
+
                 """)
+            try createLivedMomentsSchema(db)
         }
-        registerLivedMomentsMigration(&migrator)
         return migrator
     }
 

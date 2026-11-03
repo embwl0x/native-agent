@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import CryptoKit
-// Blueprint: | `StudioConsult.swift` | Studio errors and immutable consult envelopes |
+// Blueprint: | `StudioConsult.swift` | Studio errors and immutable consult envelopes; saved envelopes require the current writer's refs and description-only flag, rejecting malformed optional content |
 
 // MARK: - Errors
 
@@ -152,32 +152,17 @@ public struct StudioConsult: Sendable, Equatable {
 
     public static func fromJSON(_ value: JSONValue) -> StudioConsult? {
         guard case .object(let obj) = value,
-              case .string(let id)? = obj["id"],
-              case .string(let filedAt)? = obj["filed_at"],
-              case .string(let question)? = obj["question"] else { return nil }
-        // A missing description_only flag decodes as FALSE only when refs are present. An envelope with no refs is description-only by definition, whatever the bytes say — the honest reading is the restrictive one.
-        var refs: [String] = []
-        if case .array(let arr)? = obj["artifact_refs"] {
-            refs = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
-        }
-        var descriptionOnly = refs.isEmpty
-        if case .bool(let flag)? = obj["description_only"], flag { descriptionOnly = true }
-        func str(_ key: String) -> String? {
-            if case .string(let s)? = obj[key], !s.isEmpty { return s }
-            return nil
-        }
-        return StudioConsult(
-            id: id,
-            filedAt: filedAt,
-            artifactRefs: refs,
-            description: str("description"),
-            portionAvailable: str("portion_available"),
-            question: question,
-            projectContext: str("project_context"),
-            stage: str("stage"),
-            constraints: str("constraints"),
-            priorDiscussion: str("prior_discussion"),
-            descriptionOnly: descriptionOnly
-        )
+              case .bool(let descriptionOnly)? = obj["description_only"] else { return nil }
+        do {
+            let row = try StudioSavedRow(value)
+            let refs = try row.strings("artifact_refs", required: true)
+            let description = try row.optionalString("description")
+            guard (!refs.isEmpty || descriptionOnly), (!refs.isEmpty || description != nil) else { return nil }
+            return try StudioConsult(id: row.string("id"), filedAt: row.string("filed_at"), artifactRefs: refs,
+                description: description, portionAvailable: row.optionalString("portion_available"),
+                question: row.string("question"), projectContext: row.optionalString("project_context"),
+                stage: row.optionalString("stage"), constraints: row.optionalString("constraints"),
+                priorDiscussion: row.optionalString("prior_discussion"), descriptionOnly: descriptionOnly)
+        } catch { return nil }
     }
 }

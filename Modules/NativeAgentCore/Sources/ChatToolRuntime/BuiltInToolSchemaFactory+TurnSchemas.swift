@@ -110,11 +110,11 @@ extension BuiltInToolSchemaFactory {
                 )
             ),
             requestedSchema(name: "context_lookup", toolClass: .read, capabilities: ["tool_call"],
-                description: "Find NativeAgent capabilities and where to use them. Supports type='lookup_feature_surface' / 'feature_surface' / 'features'.",
+                description: "Find NativeAgent capabilities and where to use them.",
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("query", ToolSchema.strSchema("Capability or feature text to search for. Empty returns the first bounded feature-surface records.")),
-                        ("type", ToolSchema.strSchema("Optional lookup type. Supported: lookup_feature_surface, feature_surface, features.")),
+                        ("type", ToolSchema.strSchema("Optional operation: lookup_feature_surface.")),
                     ],
                     required: []
                 )
@@ -150,7 +150,6 @@ extension BuiltInToolSchemaFactory {
                         ("name", ToolSchema.strSchema("Optional exact tool or app action filter, e.g. mac.clipboard_read or mac.clipboard_read. For returned values use turn_id or completed_turns with fields:[name,args,result,receipt].")),
                         ("status", ToolSchema.strSchema("Optional exact status filter.")),
                         ("session_id", ToolSchema.strSchema("Optional exact conversation filter. Includes sibling events from turns belonging to that conversation.")),
-                        ("sessionId", ToolSchema.strSchema("Compatibility alias for session_id.")),
                         ("turn_id", ToolSchema.strSchema("Optional exact turn id filter.")),
                         ("receipt_id", ToolSchema.strSchema("Exact dispatch receipt id, including from an expired result handle; reads retained evidence without repeating the operation.")),
                         ("fields", stringArraySchema("Optional payload keys; requires turn_id or completed_turns. Up to 16 keys, 80 characters each; values share an 8 KiB cap.", minItems: 1, maxItems: 16, maxItemLength: 80)),
@@ -163,13 +162,10 @@ extension BuiltInToolSchemaFactory {
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("objective", ToolSchema.strSchema("Required. The task/question every worker should analyze.")),
-                        ("agents", looseObjectArraySchema("Optional worker configs. Each object may include name, role, prompt/lens_brief, reasoning_effort, access ('read_only' or 'inherit'), contextSlice, findingsCap.")),
+                        ("agents", looseObjectArraySchema("Optional worker configs. Each object may include name, role, prompt (the complete worker mission), reasoning_effort, access ('read_only' or 'inherit'), contextSlice, findingsCap.")),
                         ("reasoning_effort", ToolSchema.strSchema("Optional Think level for workers and synthesis: low, medium, high, xhigh, or another level the selected Work model's catalog supports. Defaults to Work's Think level. Each worker may override it with reasoning_effort.")),
-                        ("workers", looseObjectArraySchema("Compatibility alias for agents.")),
-                        ("roles", looseObjectArraySchema("Compatibility alias for agents.")),
                         ("agentCount", ToolSchema.intSchema("Optional worker count when no agents array is supplied. Default 4, hard cap 20.")),
                         ("access", ToolSchema.enumStringSchema(["read_only", "inherit"], "Worker capability mode. read_only (default) performs prompt-only reasoning. inherit exposes the ordinary NativeAgent tool loop under the same live TrustCenter and workspace gates as the parent; nested delegation and app install/restart remain parent-only.")),
-                        ("readOnly", ToolSchema.boolSchema("Compatibility alias: true maps to access=read_only; false maps to access=inherit.")),
                         ("mode", ToolSchema.strSchema("Optional label such as parallel, council, review, or bughunt.")),
                         ("maxParallel", ToolSchema.intSchema("Maximum concurrent workers. Clamped by trust policy.")),
                         ("timeoutSeconds", ToolSchema.intSchema("Per-worker timeout, default 240, capped 900.")),

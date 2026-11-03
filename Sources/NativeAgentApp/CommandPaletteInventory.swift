@@ -38,7 +38,13 @@ import AppKit
 import MacControl
 import ChatToolParsing
 import UniformTypeIdentifiers
-// Blueprint: | `CommandPaletteInventory.swift` | Palette item inventory, saved-owner projections and deterministic search ranking |
+// Blueprint: | `CommandPaletteInventory.swift` | Palette item inventory, exact saved destinations (helper and reply, diary date, memory id), saved-owner projections and deterministic search ranking |
+
+enum PaletteSavedDestination: Hashable, Sendable {
+    case botReply(botID: UUID, entryID: UUID)
+    case dream(String)
+    case memory(String)
+}
 
 /// A single match row in the command palette.
 struct PaletteItem: Identifiable, Hashable, Sendable {
@@ -73,9 +79,7 @@ struct PaletteItem: Identifiable, Hashable, Sendable {
         case chatSession(String)         // chat session id
         case recentAction(String)        // recent-action id
         case deskItem(String)            // desk handle — active OR done
-        case bot(String)                 // bot id, found by what a run said
-        case dream(String)               // diary date key
-        case memory(String)              // memory id
+        case saved(PaletteSavedDestination)
     }
 }
 
@@ -195,13 +199,13 @@ enum CommandPalettePresentation {
     }
 
     /// The rail top to bottom, in its own words — the Navigate menu's order.
-    @MainActor static func railItems(_ layout: SurfaceLayout) -> [SidebarItem] {
+    @MainActor static func railItems(_ layout: SurfaceLayoutAvailability) -> [SidebarItem] {
         SidebarItem.rail(layout).compactMap { $0 }
     }
 
     @MainActor
     static func itemPool(
-        layout: SurfaceLayout,
+        layout: SurfaceLayoutAvailability,
         sessions: [ChatSession],
         settings: [PaletteItem] = [],
         saved: [PaletteItem] = []
@@ -261,8 +265,8 @@ enum CommandPalettePresentation {
     /// Every control in the settings registry, by its label, opening the
     /// page it is on. Read once per opening.
     @MainActor
-    static func settingItems(appModel: AppModel) -> [PaletteItem] {
-        QuietSettings.all(host: AppQuietSettingsHost(appModel)).map { row in
+    static func settingItems(appModel: AppModel) throws -> [PaletteItem] {
+        try QuietSettings.all(host: AppQuietSettingsHost(appModel)).map { row in
             PaletteItem(id: "setting.\(row.id)", title: row.label,
                         subtitle: QuietPages.page(named: row.page)?.title ?? row.page,
                         systemImage: "slider.horizontal.3", kind: .setting(row.page, tab: row.tab))
@@ -311,7 +315,7 @@ enum CommandPaletteSavedThings {
                 title: said,
                 subtitle: "\(record.definition.name) · \(BotsShelfRecord.shortDate(entry.runAt))",
                 systemImage: "bubble.left.and.exclamationmark.bubble.right",
-                kind: .bot(record.id.uuidString)
+                kind: .saved(.botReply(botID: record.id, entryID: entry.id))
             )
         }
     }
@@ -324,7 +328,7 @@ enum CommandPaletteSavedThings {
                 title: excerpt.isEmpty ? "Dream · \(entry.date)" : excerpt,
                 subtitle: "Dream · \(entry.date)",
                 systemImage: "moon.stars",
-                kind: .dream(entry.date)
+                kind: .saved(.dream(entry.date))
             )
         }
     }
@@ -338,7 +342,7 @@ enum CommandPaletteSavedThings {
                     title: firstLine(record.text),
                     subtitle: "Memory · \(record.layer ?? "")",
                     systemImage: "brain",
-                    kind: .memory(record.id),
+                    kind: .saved(.memory(record.id)),
                     searchText: record.text
                 )
             }

@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceDesktopNavigation.swift` | `AgentWorkspaceNavigation`: `restoredSession`, `canEvict`, `draftAttemptIsDurable` |
+// Blueprint: | `AgentWorkspaceDesktopNavigation.swift` | `AgentWorkspaceNavigation`: `restoredSession` preserves the validated saved Back path; only an empty path uses the saved current place. `canEvict` and `draftAttemptIsDurable` guard persisted drafts and navigation. |
 
 extension AgentWorkspaceNavigation {
     package func currentPlace(dataRoot: URL, scope: String) -> String? {
@@ -53,9 +53,10 @@ extension AgentWorkspaceNavigation {
         do {
             if let saved = try store.load() {
                 session.arrangement = saved
-                // Restored windows sit beside each other: Home, then the one that was open.
-                session.arrangement.path = saved.path.last.map { $0 == .home ? [.home] : [.home, $0] }
-                    ?? (saved.current == .home ? [.home] : [.home, saved.current])
+                // An empty path is a supported desktop with only a current place.
+                if saved.path.isEmpty {
+                    session.arrangement.path = saved.current == .home ? [.home] : [.home, saved.current]
+                }
                 session.lastPersisted = saved
             }
         } catch {
@@ -67,24 +68,24 @@ extension AgentWorkspaceNavigation {
             guard case .record("agent_read", let input, _) = place, case .string(let agent)? = input["agent"] else { return nil }
             return agent
         })
-        session.watched = Self.conversationWindows(dataRoot: dataRoot).filter {
+        do { session.watched = try Self.conversationWindows(dataRoot: dataRoot).filter {
             guard case .record(_, let input, _) = $0, case .string(let agent)? = input["agent"] else { return false }
             return !present.contains(agent)
-        }
+        } } catch { session.persistenceIssue = "Conversation watching is unavailable: " + error.localizedDescription + ". Repair conversation storage, then reopen this workspace." }
         return session
     }
 
     /// Newest conversation per contact, ordered oldest first for arrival watching.
-    private static func conversationWindows(dataRoot: URL) -> [AgentWorkspaceLocation] {
-        let rows = (try? AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)) ?? []
+    private static func conversationWindows(dataRoot: URL) throws -> [AgentWorkspaceLocation] {
+        let rows = try AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)
         var windows: [(at: Date, agent: String, location: AgentWorkspaceLocation)] = rows.filter { $0.phase != "sending" }.map { row in
             var input: [String: JSONValue] = ["agent": .string(row.agent)]
             if !row.agent.hasPrefix("bot:") { input["conversation"] = .string(row.label) }
             return (row.updatedAt, row.agent, .record(tool: "agent_read", input: input, title: row.name))
         }
         // Verified incoming bridge chats join the watched conversations.
-        let people = AgentWorkSession.people(dataRoot: dataRoot)
-        for session in AgentWorkSession.verified(dataRoot: dataRoot) {
+        let people = try AgentWorkSession.people(dataRoot: dataRoot)
+        for session in try AgentWorkSession.verified(dataRoot: dataRoot) {
             guard let person = AgentWorkSession.owner(session.sender, people: people),
                   let updated = session.row["updatedAt"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }),
                   let at = NativeTimestampFormat.parseISO8601FractionalFirst(updated) else { continue }

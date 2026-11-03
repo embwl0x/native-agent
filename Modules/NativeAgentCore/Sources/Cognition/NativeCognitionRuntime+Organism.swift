@@ -13,7 +13,7 @@ import PersistenceCore
 import ProviderRouting
 import TurnTrace
 
-// Blueprint: | `NativeCognitionRuntime+Organism.swift` | `NativeCognitionRuntime` live organism integration: approval lifecycle expectations, somatic ingestion, felt resolutions and live body projections |
+// Blueprint: | `NativeCognitionRuntime+Organism.swift` | `NativeCognitionRuntime` live organism integration: approval lifecycle expectations, somatic ingestion, replay followed by caller-owed or scheduled reflection, felt resolutions and live body projections |
 
 extension NativeCognitionRuntime {
     func startApprovalLifecycleObservationIfNeeded() async {
@@ -177,6 +177,55 @@ extension NativeCognitionRuntime {
         }
     }
 
+    /// A dormant body owes no effect. An awake body acknowledges only its
+    /// durable identity claim, so retry cannot put it to sleep twice.
+    public func completeDreamSignal(id: UUID, occurredAt: Date, metadata: [String: JSONValue]) async throws -> Bool {
+        await bootstrap()
+        guard !isFlushedForTermination else {
+            throw PersistenceCoreError.ioFailure("dream completion awaits the running mind")
+        }
+        if let bootstrapFailure { throw PersistenceCoreError.ioFailure(bootstrapFailure) }
+        // Completion belongs to the dream, not to the optional body effects.
+        // The journal's landed checkpoint is the witness for this no-effect path.
+        if !(await organismKernel.snapshot().enabled) {
+            sourceWakes.reachDirty = true
+            _ = await runEventDrivenReplayWithDeadline(
+                reason: "replay_event:\(SomaticSignalKind.dreamCompleted.rawValue)", material: nil)
+            return false
+        }
+        guard !isFlushedForTermination, !organismRestoreFailedHard, organismContinuityReadable else {
+            throw PersistenceCoreError.ioFailure("dream completion awaits available body continuity")
+        }
+        if !(await organismKernel.hasCompletedDream(id)) {
+            try Task.checkCancellation()
+            let signal = SomaticSignal(id: id, kind: .dreamCompleted, sourceOrgan: "dream",
+                occurredAt: occurredAt, intensity: 0.62, valence: 0.35, arousal: 0.12, metadata: metadata)
+            // Once admitted, Stop cannot abandon the body mutation's save.
+            let saved = await settle { [self] in await self.settleDreamSignal(signal) }
+            try saved.get()
+        } else {
+            guard await persistOrganismContinuity(reason: "dream:\(id.uuidString)") else {
+                throw PersistenceCoreError.ioFailure("dream completion body claim is not durable")
+            }
+        }
+        await rescheduleResidualRepairDeadline()
+        publishRuntimeChange(reason: "somatic:dreamCompleted")
+        _ = await runEventDrivenReplayWithDeadline(reason: "replay_event:dreamCompleted", material: nil)
+        return true
+    }
+
+    private func settleDreamSignal(_ signal: SomaticSignal) async -> Result<Void, PersistenceCoreError> {
+        await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(.dreamCompleted))
+        sourceWakes.reachDirty = true
+        await drainFeltResolutionsIntoSubstrate()
+        cachedBodyRead = nil
+        guard await organismKernel.hasCompletedDream(signal.id),
+              await persistOrganismContinuity(reason: "dream:\(signal.id.uuidString)") else {
+            return .failure(.ioFailure("dream completion remains owed; body did not persist it"))
+        }
+        return .success(())
+    }
+
     public func ingestOrganismSignal(
         kind: SomaticSignalKind,
         sourceOrgan: String,
@@ -185,7 +234,8 @@ extension NativeCognitionRuntime {
         arousal: Double? = nil,
         metadata: [String: JSONValue] = [:],
         reflectionMaterial: [String: CognitiveReflectionCause] = [:],
-        persistSynchronously: Bool = true
+        persistSynchronously: Bool = true,
+        reflectAfterReplay: Bool = true
     ) async {
         let signal = SomaticSignal(
             id: UUID(),
@@ -200,7 +250,8 @@ extension NativeCognitionRuntime {
         await ingestPreparedOrganismSignal(
             signal,
             reflectionMaterial: reflectionMaterial,
-            persistSynchronously: persistSynchronously
+            persistSynchronously: persistSynchronously,
+            reflectAfterReplay: reflectAfterReplay
         )
     }
 
@@ -212,20 +263,23 @@ extension NativeCognitionRuntime {
     func ingestPreparedOrganismSignal(
         _ signal: SomaticSignal,
         reflectionMaterial: [String: CognitiveReflectionCause] = [:],
-        persistSynchronously: Bool = true
+        persistSynchronously: Bool = true,
+        reflectAfterReplay: Bool = true
     ) async {
         await bootstrap()
         await ingestPreparedOrganismSignalAfterBootstrap(
             signal,
             reflectionMaterial: reflectionMaterial,
-            persistSynchronously: persistSynchronously
+            persistSynchronously: persistSynchronously,
+            reflectAfterReplay: reflectAfterReplay
         )
     }
 
     private func ingestPreparedOrganismSignalAfterBootstrap(
         _ signal: SomaticSignal,
         reflectionMaterial: [String: CognitiveReflectionCause] = [:],
-        persistSynchronously: Bool
+        persistSynchronously: Bool,
+        reflectAfterReplay: Bool = true
     ) async {
         let kind = signal.kind
         await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(kind))
@@ -248,13 +302,10 @@ extension NativeCognitionRuntime {
         // crash-window event loss.
         if kind == .dreamCompleted || kind == .remIntegrated {
             let reason = "replay_event:\(kind.rawValue)"
-            let outcome = await runEventDrivenReplayWithDeadline(reason: reason)
-            await handleEventDrivenReplayOutcome(outcome, reason: reason, allowRetry: true)
-            await reportLoopOutcome(loopId: "cognition_replay", outcome: outcome)
-            // Reflection follows the same commit signal, AFTER the replay
-            // await above so it reflects on post-replay substrate state. Fire-
-            // and-forget after the previous flight; budget gates stay inside.
-            await scheduleEventDrivenReflection(reason: "reflection_event:\(kind.rawValue)", material: reflectionMaterial)
+            // Replay owns its retained flight and terminal accounting. Dream
+            // reflection is acknowledged by the journal, never scheduled twice.
+            _ = await runEventDrivenReplayWithDeadline(reason: reason,
+                material: reflectAfterReplay ? reflectionMaterial : nil)
         }
     }
 
@@ -296,7 +347,7 @@ extension NativeCognitionRuntime {
         let phoneDelivery = await organismKernel.latestPrediction(ofKind: .phoneDelivery)
         let liveRead = await Self.makeOrganismBodyRead(
             dataRoot: dataRoot,
-            mobileConfigured: (try? await host.phoneNotificationTargetCount(dataRoot: dataRoot)).map { $0 > 0 } == true,
+            mobileConfigured: await checkedPhoneNotificationConfiguration(),
             phoneDeliveryPrediction: phoneDelivery
         )
         await organismKernel.refreshBodySchema(liveRead, integratesChemistry: false)
@@ -387,16 +438,20 @@ extension NativeCognitionRuntime {
     }
 
     /// Preference/clock invalidation pushes the turn engine's quiet-hours window
-    /// into the body clock; a missing window retains the default 4 AM trough.
+    /// into the body clock; a missing window supplies no diurnal input.
     private func refreshOrganismDiurnalClockIfInvalidated(at fixedAt: Date) async {
         guard !isFlushedForTermination, sourceWakes.clockDirty else { return }
         sourceWakes.clockDirty = false
-        let window = TurnQuietHoursWindow.read(dataRoot: dataRoot)
+        let window: TurnQuietHoursWindow?
+        do { window = try TurnQuietHoursWindow.checkedRead(dataRoot: dataRoot) }
+        catch {
+            // Withhold the diurnal projection while its preference is unavailable.
+            // nil disables this input.
+            await organismKernel.configureDiurnalClock(nil)
+            return
+        }
         await organismKernel.configureDiurnalClock(
-            OrganismDiurnalClock(
-                quietStartHour: window?.startHour,
-                quietEndHour: window?.endHour
-            )
+            window.flatMap { OrganismDiurnalClock(quietStartHour: $0.startHour, quietEndHour: $0.endHour) }
         )
     }
 
@@ -426,7 +481,7 @@ extension NativeCognitionRuntime {
             let phoneDelivery = await organismKernel.latestPrediction(ofKind: .phoneDelivery)
             liveRead = await Self.makeOrganismBodyRead(
                 dataRoot: dataRoot,
-                mobileConfigured: (try? await host.phoneNotificationTargetCount(dataRoot: dataRoot)).map { $0 > 0 } == true,
+                mobileConfigured: await checkedPhoneNotificationConfiguration(),
                 now: fixedAt,
                 phoneDeliveryPrediction: phoneDelivery
             )
@@ -434,14 +489,7 @@ extension NativeCognitionRuntime {
         }
         if liveRead.providersAvailable == true {
             let providerEvidence = providerPathEvidence(at: fixedAt)
-            liveRead.providerPathBelief = if providerEvidence.isEmpty {
-                Self.providerCapabilityFallbackProjection(
-                    await organismKernel.capabilityBelief(ofKind: .providerCompletion),
-                    now: fixedAt
-                ) ?? ProviderPathBeliefProjector.project(evidence: [], now: fixedAt)
-            } else {
-                ProviderPathBeliefProjector.project(evidence: providerEvidence, now: fixedAt)
-            }
+            liveRead.providerPathBelief = ProviderPathBeliefProjector.project(evidence: providerEvidence, now: fixedAt)
         } else {
             liveRead.providerPathBelief = nil
         }

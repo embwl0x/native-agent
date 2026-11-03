@@ -62,8 +62,8 @@ public struct WorkshopStepLLMCompletion: Sendable, Equatable {
 public typealias WorkshopStepMeasuredLLM = @Sendable (_ prompt: String) async throws -> WorkshopStepLLMCompletion
 
 /// Tool dispatch for non-LLM steps. `args` is the step's flat JSON object.
-/// A read failure supplies no evidence: required reads fail, optional reads
-/// record unavailability and continue. Effect failures fail the step; unknown
+/// A read failure records absence or unavailability and continues, regardless
+/// of the optional hint. Effect failures fail the step; unknown
 /// tools MUST throw, never return a fabricated success.
 public typealias WorkshopStepToolDispatch = @Sendable (_ tool: String, _ args: JSONValue) async throws -> JSONValue
 public typealias WorkshopStepApprovedToolDispatch = @Sendable (_ tool: String, _ args: JSONValue, _ approvalId: String) async throws -> JSONValue

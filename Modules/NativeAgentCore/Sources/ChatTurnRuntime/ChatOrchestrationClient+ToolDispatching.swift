@@ -15,10 +15,10 @@ import MacIntegration
 extension SwiftNativeChatOrchestrationClient {
     /// CHOKE POINT for chat tool dispatch. Every chat turn must build its
     /// per-turn dispatcher here, so the
-    /// ChatToolDispatchTracer wrapper sees EVERY dispatch exactly once.
-    /// The tracer sits OUTERMOST because gate denials throw above the inner
-    /// dispatcher; a trace hook inside SwiftToolDispatcher would never see
-    /// them. The bridge /claude/tool path uses the shared factory without
+    /// ChatToolDispatchTracer sees dispatches and refusals from the inner
+    /// provenance, autonomy and file gates. Expansion and canonical naming
+    /// wrap the tracer; undispatched offered-contract refusals are recorded
+    /// by the loop. The bridge /claude/tool path uses the shared factory without
     /// tracing and does not traverse this — chat rows
     /// only, no double-logging.
     func makeTracedGatedDispatcher(
@@ -32,8 +32,7 @@ extension SwiftNativeChatOrchestrationClient {
             approvalTimeoutSeconds: approvalTimeoutSeconds,
             dataRoot: dataRoot,
             verifiedSessionId: verifiedSessionId,
-            tracePeerTurn: true,
-            allowsFirstConversationExemption: true
+            tracePeerTurn: true
         )
     }
 }

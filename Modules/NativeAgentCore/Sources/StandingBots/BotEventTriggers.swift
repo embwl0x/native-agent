@@ -1,4 +1,5 @@
 import Foundation
+import Experiences
 
 // Blueprint: | `BotEventTriggers.swift` | `BotEventRouter` and `BotEventStore`: Slack event matching/admission and durable wake records from already received events |
 
@@ -55,6 +56,7 @@ public struct BotEventTrigger: Codable, Equatable, Sendable {
 /// What an arriving event is: where it came from, one line for the card, and the
 /// text the run reads.
 public struct BotIncomingEvent: Sendable, Equatable {
+    public let id: String
     public let source: BotEventSource
     /// The Slack channel id the runner received.
     public let target: String
@@ -62,8 +64,9 @@ public struct BotIncomingEvent: Sendable, Equatable {
     public let detail: String
     public let provenance: BotEventProvenance
 
-    public init(source: BotEventSource, target: String, summary: String, detail: String,
+    public init(id: String, source: BotEventSource, target: String, summary: String, detail: String,
                 verifiedUserID: String? = nil) {
+        self.id = id
         self.source = source
         self.target = target
         self.summary = summary
@@ -103,16 +106,8 @@ public struct BotEventStore: Sendable {
     public init(dataRoot: URL) { disk = StandingBotsDisk(dataRoot: dataRoot) }
     private var path: URL { disk.root.appendingPathComponent("last-events.json") }
 
-    /// Discard records for retired GitHub triggers on read.
     private func records() throws -> [String: BotEventRecord] {
-        struct Saved: Decodable {
-            let record: BotEventRecord?
-            init(from decoder: Decoder) throws {
-                struct Source: Decodable { let source: String }
-                record = try Source(from: decoder).source == "github" ? nil : BotEventRecord(from: decoder)
-            }
-        }
-        return try disk.read([String: Saved].self, at: path)?.compactMapValues(\.record) ?? [:]
+        try disk.read([String: BotEventRecord].self, at: path) ?? [:]
     }
 
     public func lastEvents() throws -> [UUID: BotEventRecord] {
@@ -160,8 +155,21 @@ public struct BotEventRouter: Sendable {
     /// Returns the bots this event woke. A bot with no trigger, a paused bot, or
     /// a trigger that does not want the event is untouched.
     @discardableResult
-    public func deliver(_ event: BotIncomingEvent) async -> [UUID] {
-        let definitions = (try? BotDefinitionStore(dataRoot: dataRoot).list()) ?? []
+    public func deliver(_ event: BotIncomingEvent) async throws -> [UUID] {
+        do { return try await deliverChecked(event) }
+        catch {
+            RepairOwed.owe(dataRoot, id: "bot-event-admission:" + event.id, kind: .run,
+                evidence: [.init(source: "slack/inbound_delivery_journal.json", id: event.id)],
+                operation: "bots.event.admission:" + event.id,
+                owner: "bots/definitions, run-queue.json and last-events.json",
+                words: "Helper event \(event.id) from \(event.source.label) in \(event.target) was not fully recorded: \(error). Its accepted input remains in slack/inbound_delivery_journal.json. Inspect accepted run-queue requests before repairing the wake record; do not admit the event again to replace missing evidence.",
+                lever: "Repair the named helper storage and reconcile its retained queue receipt.")
+            throw error
+        }
+    }
+
+    private func deliverChecked(_ event: BotIncomingEvent) async throws -> [UUID] {
+        let definitions = try BotDefinitionStore(dataRoot: dataRoot).list()
         let matched = definitions.filter { bot in
             guard !bot.paused, let trigger = bot.eventTrigger else { return false }
             return trigger.wants(event)
@@ -175,24 +183,35 @@ public struct BotEventRouter: Sendable {
         var woken: [UUID] = []
         for bot in matched {
             guard allowed else {
-                try? store.record(BotEventRecord(source: event.source, target: event.target,
+                try store.record(BotEventRecord(source: event.source, target: event.target,
                     summary: event.summary, outcome: .held,
                     detail: "Autonomy is off"), bot: bot.id)
                 continue
             }
             let context = Self.context(event)
+            let receipt: BotRunReceipt
             do {
-                let receipt = try queue.enqueue(bot: bot.id, context: context, origin: .event,
-                                                provenance: event.provenance)
-                try? store.record(BotEventRecord(source: event.source, target: event.target,
+                receipt = try queue.enqueue(bot: bot.id, context: context, origin: .event,
+                                            provenance: event.provenance)
+            } catch {
+                let admissionError = error
+                do {
+                    try store.record(BotEventRecord(source: event.source, target: event.target,
+                        summary: event.summary, outcome: .notRun,
+                        detail: "Helper admission failed: \(admissionError)"), bot: bot.id)
+                } catch {
+                    throw StandingBotsError.corruptStore("Helper admission failed for \(bot.id): \(admissionError). Its wake record also failed: \(error). Inspect the queue and repair the named storage before reconciling this event.")
+                }
+                throw admissionError
+            }
+            do {
+                try store.record(BotEventRecord(source: event.source, target: event.target,
                     summary: event.summary, outcome: receipt.accepted ? .queued : .notRun,
                     detail: receipt.accepted ? nil : receipt.reason), bot: bot.id)
-                if receipt.accepted { woken.append(bot.id) }
             } catch {
-                try? store.record(BotEventRecord(source: event.source, target: event.target,
-                    summary: event.summary, outcome: .notRun,
-                    detail: String(describing: error)), bot: bot.id)
+                throw StandingBotsError.corruptStore("Helper wake record unavailable for \(bot.id), request \(receipt.runID): \(error). The queue retains any accepted request; repair last-events.json without repeating admission.")
             }
+            if receipt.accepted { woken.append(bot.id) }
         }
         return woken
     }

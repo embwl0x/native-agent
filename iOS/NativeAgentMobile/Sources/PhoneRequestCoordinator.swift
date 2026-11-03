@@ -15,6 +15,13 @@ import AVFoundation
 final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
     static let shared = PhoneRequests()
     @Published private(set) var active: PhoneRequest?
+    /// Automatic settings reads/writes have no consent sheet. The retained
+    /// executing record, also used for recovery, is the sole execution truth.
+    var presented: PhoneRequest? {
+        guard let active else { return nil }
+        if active.kind.isSettings, records.first(where: { $0.request.id == active.id })?.executing == true { return nil }
+        return active
+    }
     @Published var errorMessage: String?
     private struct Record: Codable, Sendable {
         var request: PhoneRequest
@@ -24,7 +31,6 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         var attachments: [MultimodalAttachment] = []
         var envelope: BridgeMessage?
         var recoveryAttempts: Int?
-        var sent = false
     }
     private var records: [Record] = [] { didSet { stateRevision += 1 } }
     private struct Replay: Codable, Sendable {
@@ -68,20 +74,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         if loadTask == nil {
             loadTask = Task.detached(priority: .utility) {
                 guard FileManager.default.fileExists(atPath: file.path) else { return History(pending: [], replay: []) }
-                let data = try Data(contentsOf: file)
-                let decoder = JSONDecoder()
-                guard data.first(where: { ![9, 10, 13, 32].contains($0) }) == 91 else {
-                    return try decoder.decode(History.self, from: data)
-                }
-                let rows = try decoder.decode([Record].self, from: data)
-                let now = Date()
-                let replay = rows.filter { $0.sent && $0.request.expiresAt > now.addingTimeInterval(-86_400) }.map {
-                    Replay(id: $0.request.id, kind: $0.request.kind, state: $0.result?.status ?? .completed,
-                        expiresAt: $0.request.expiresAt, finishedAt: now)
-                }
-                let history = History(pending: rows.filter { !$0.sent }, replay: Array(replay.suffix(128)))
-                try JSONEncoder().encode(history).write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-                return history
+                return try JSONDecoder().decode(History.self, from: Data(contentsOf: file))
             }
         }
         guard let loadTask else { return }
@@ -121,7 +114,7 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         var validRequest = false
         do {
             let request = try JSONDecoder().decode(PhoneRequest.self, from: Data(message.text.utf8))
-            guard request.id == message.id, request.params.isEmpty,
+            guard request.id == message.id, PhoneLocalSettings.validate(request),
                   request.expiresAt.timeIntervalSince(message.timestamp) <= 125,
                   request.expiresAt > message.timestamp,
                   let pairing = AgentNameCache.fingerprint(secret) else {
@@ -180,12 +173,23 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
             if let active, records.first(where: { $0.request.id == active.id })?.result != nil { clearActive() }
             if active == nil, UIApplication.shared.applicationState == .active,
                let record = records.first(where: { $0.result == nil && $0.pairing == pairing }) {
+                let approval: Bool
+                do { approval = try await PhoneLocalSettings.needsApproval(record.request) }
+                catch {
+                    await complete(record.request.id, status: .failed, message: error.localizedDescription)
+                    return
+                }
+                guard active == nil, records.contains(where: { $0.request.id == record.request.id && $0.result == nil }) else { return }
                 active = record.request
                 deadline = Task { [weak self, request = record.request] in
                     do { try await Task.sleep(for: .seconds(max(0, request.expiresAt.timeIntervalSinceNow))) }
                     catch { return }
                     self?.deadline = nil
                     await self?.complete(request.id, status: .expired)
+                }
+                if record.request.kind.isSettings, !approval {
+                    await applySetting(record.request)
+                    return
                 }
             }
             await publishResults(pairing: pairing, retrying: retrying)
@@ -247,12 +251,9 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         records[index].result = PhoneRequestResult(requestID: id, status: expired ? .expired : status,
             values: expired ? [:] : values, message: message)
         records[index].attachments = expired ? [] : attachments
-        let revision = stateRevision
         do { try await save() } catch {
-            if stateRevision == revision, let index = records.firstIndex(where: { $0.request.id == id }) {
-                records[index].result = nil
-                records[index].attachments = []
-            }
+            // Keep the terminal outcome with its owner for owed settlement.
+            // A failed checkpoint cannot turn Cancel back into runnable work.
             errorMessage = "Could not save phone result: \(error.localizedDescription)"
             return
         }
@@ -281,7 +282,8 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         do {
             try await save()
             return active?.id == request.id && request.expiresAt > Date()
-                && records.contains { $0.request.id == request.id && $0.result == nil && $0.executing }
+                && records.contains { $0.request.id == request.id && $0.result == nil && $0.executing
+                    && $0.pairing == AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) }
         } catch {
             if stateRevision == revision, let index = records.firstIndex(where: { $0.request.id == request.id }) {
                 records[index].executing = false
@@ -302,6 +304,32 @@ final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocatio
         case .notDetermined: manager.requestWhenInUseAuthorization()
         default: locationManagerDidChangeAuthorization(manager)
         }
+    }
+
+    func applySetting(_ request: PhoneRequest, approved: Bool = false) async {
+        guard request.kind.isSettings,
+              let accepted = records.first(where: { $0.request.id == request.id }),
+              await begin(request) else { return }
+        do {
+            let acceptedPairing = accepted.pairing
+            let values = try await PhoneLocalSettings.perform(request, approved: approved, pairing: acceptedPairing) { [weak self] in
+                self?.settingAuthorization(requestID: request.id, pairing: acceptedPairing) == true
+            }
+            await complete(request.id, status: .completed, values: values)
+        } catch {
+            await complete(request.id, status: .failed, message: error.localizedDescription)
+        }
+    }
+
+    /// Read the request journal itself: Cancel/expiry revokes future effects,
+    /// while a completed preference may finish its already-approved OS prompt.
+    private func settingAuthorization(requestID: String, pairing: String) -> Bool {
+        if let record = records.first(where: { $0.request.id == requestID }) {
+            guard record.pairing == pairing else { return false }
+            if let result = record.result { return result.status == .completed }
+            return record.executing
+        }
+        return replay.contains { $0.id == requestID && $0.state == .completed }
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
@@ -424,13 +452,18 @@ struct PhoneRequestSheet: View {
     @State private var photo: PhotosPickerItem?
     @State private var working = false
     @State private var camera = false
+    @State private var settingQuestion = "Change this iPhone setting?"
 
     var body: some View {
         VStack(spacing: 24) {
             Text(iCloudSyncEngine.shared.agentDisplayName).font(.title2)
-            Text(request.kind == .currentLocation ? "Share your current location?"
+            Text(request.kind.isSettings ? settingQuestion
+                 : request.kind == .currentLocation ? "Share your current location?"
                  : request.kind == .capturePhoto ? "Take a photo to share." : "Choose a photo to share.")
-            if request.kind == .currentLocation {
+            if request.kind.isSettings {
+                Text("This changes the setting on this iPhone. Any iOS permission prompt is still yours to answer.")
+                Button("Allow change") { working = true; Task { await coordinator.applySetting(request, approved: true) } }.disabled(working)
+            } else if request.kind == .currentLocation {
                 Button("Share location") { working = true; Task { await coordinator.locate(request) } }.disabled(working)
             } else if request.kind == .capturePhoto {
                 Button("Open camera") {
@@ -459,5 +492,11 @@ struct PhoneRequestSheet: View {
         }
         .padding(32)
         .interactiveDismissDisabled()
+        .task {
+            if request.kind.isSettings, let id = request.params["id"],
+               let control = await PhoneLocalSettings.controls().first(where: { $0.id == id }) {
+                settingQuestion = "Turn on \(control.label)?"
+            }
+        }
     }
 }

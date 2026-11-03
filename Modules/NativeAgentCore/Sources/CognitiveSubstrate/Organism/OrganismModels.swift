@@ -21,7 +21,6 @@ public enum SomaticSignalKind: String, Codable, Sendable, Equatable, CaseIterabl
     case deskItemCancelled
     case memoryCommitted
     case memoryCorrected
-    case memoryHygieneCompleted
     case dreamCompleted
     case remIntegrated
     case iPhoneReachable
@@ -163,19 +162,8 @@ public enum OrganismResourcePressure: String, Codable, Sendable, Equatable, Case
     case critical
 
     static func from(metadata: [String: JSONValue]) -> Self? {
-        let candidates = ["resourcePressure", "resource_pressure", "pressure", "level"]
-        for key in candidates {
-            guard case .string(let raw)? = metadata[key] else { continue }
-            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            switch normalized {
-            case "nominal", "normal", "low": return .nominal
-            case "elevated", "medium": return .elevated
-            case "high": return .high
-            case "critical", "thermal": return .critical
-            default: continue
-            }
-        }
-        return nil
+        guard case .string(let raw)? = metadata["resourcePressure"] else { return nil }
+        return Self(rawValue: raw)
     }
 }
 
@@ -203,7 +191,8 @@ public struct BodySchema: Codable, Sendable, Equatable {
     public var dreamHealthy: Bool
     public var toolHandsAvailable: Bool
     public var approvalChannelsOpen: Bool
-    public var notificationPathHealthy: Bool
+    /// Delivery evidence only; nil means no current delivery verdict.
+    public var notificationPathHealthy: Bool?
     public var resourcePressure: OrganismResourcePressure
 
     public init(
@@ -223,7 +212,7 @@ public struct BodySchema: Codable, Sendable, Equatable {
         dreamHealthy: Bool = true,
         toolHandsAvailable: Bool = true,
         approvalChannelsOpen: Bool = true,
-        notificationPathHealthy: Bool = true,
+        notificationPathHealthy: Bool? = nil,
         resourcePressure: OrganismResourcePressure = .nominal
     ) {
         self.macAwake = macAwake
@@ -260,7 +249,7 @@ public struct BodySchema: Codable, Sendable, Equatable {
             && dreamHealthy
             && toolHandsAvailable
             && approvalChannelsOpen
-            && notificationPathHealthy
+            && notificationPathHealthy != false
             && resourcePressure == .nominal
     }
 
@@ -277,11 +266,10 @@ public struct BodySchema: Codable, Sendable, Equatable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.init(
-            macAwake: try container.decodeIfPresent(Bool.self, forKey: .macAwake) ?? true,
-            iPhoneReachable: try container.decodeIfPresent(Bool.self, forKey: .iPhoneReachable) ?? false,
-            providersHealthy: try container.decodeIfPresent(Bool.self, forKey: .providersHealthy) ?? true,
-            providersAvailable: try container.decodeIfPresent(Bool.self, forKey: .providersAvailable)
-                ?? (try container.decodeIfPresent(Bool.self, forKey: .providersHealthy) ?? true),
+            macAwake: try container.decode(Bool.self, forKey: .macAwake),
+            iPhoneReachable: try container.decode(Bool.self, forKey: .iPhoneReachable),
+            providersHealthy: try container.decode(Bool.self, forKey: .providersHealthy),
+            providersAvailable: try container.decode(Bool.self, forKey: .providersAvailable),
             providerPathBelief: nil,
             peerPresenceBelief: nil,
             notificationDeliveryBelief: nil,
@@ -290,12 +278,12 @@ public struct BodySchema: Codable, Sendable, Equatable {
             toolCapabilityReading: nil,
             approvalPathReading: nil,
             resourcePressureReading: nil,
-            memoryHealthy: try container.decodeIfPresent(Bool.self, forKey: .memoryHealthy) ?? true,
-            dreamHealthy: try container.decodeIfPresent(Bool.self, forKey: .dreamHealthy) ?? true,
-            toolHandsAvailable: try container.decodeIfPresent(Bool.self, forKey: .toolHandsAvailable) ?? true,
-            approvalChannelsOpen: try container.decodeIfPresent(Bool.self, forKey: .approvalChannelsOpen) ?? true,
-            notificationPathHealthy: try container.decodeIfPresent(Bool.self, forKey: .notificationPathHealthy) ?? true,
-            resourcePressure: try container.decodeIfPresent(OrganismResourcePressure.self, forKey: .resourcePressure) ?? .nominal
+            memoryHealthy: try container.decode(Bool.self, forKey: .memoryHealthy),
+            dreamHealthy: try container.decode(Bool.self, forKey: .dreamHealthy),
+            toolHandsAvailable: try container.decode(Bool.self, forKey: .toolHandsAvailable),
+            approvalChannelsOpen: try container.decode(Bool.self, forKey: .approvalChannelsOpen),
+            notificationPathHealthy: try container.decodeIfPresent(Bool.self, forKey: .notificationPathHealthy),
+            resourcePressure: try container.decode(OrganismResourcePressure.self, forKey: .resourcePressure)
         )
     }
 }
@@ -418,29 +406,25 @@ public struct OrganismConfiguration: Sendable, Equatable {
 }
 
 // MARK: - The body's clock
-// The clock shares user_prefs.json quiet_hours with the turn engine, using the default trough when absent.
+// The clock shares user_prefs.json quiet_hours with the turn engine; no window means no clock.
 // OrganismDiurnalRead carries the phase and bounded offsets through the existing body readout.
 
 /// The user's day, as the body knows it: two integers, read on the Mac's
 /// local clock wherever it is (User 10-21) — no zone is held.
-public struct OrganismDiurnalClock: Sendable, Equatable, Codable {
+public struct OrganismDiurnalClock: Sendable, Equatable {
     /// The declared quiet window in LOCAL wall-clock hours; `start > end` wraps
-    /// midnight. Both nil → the shipped default trough (see
-    /// `OrganismCircadian.defaultTroughHour`).
-    public var quietStartHour: Int?
-    public var quietEndHour: Int?
+    /// midnight. Only a complete, nondegenerate window supplies a clock.
+    public let quietStartHour: Int
+    public let quietEndHour: Int
 
-    public init(
-        quietStartHour: Int? = nil,
-        quietEndHour: Int? = nil
+    public init?(
+        quietStartHour: Int,
+        quietEndHour: Int
     ) {
-        self.quietStartHour = quietStartHour.flatMap { (0...23).contains($0) ? $0 : nil }
-        self.quietEndHour = quietEndHour.flatMap { (0...23).contains($0) ? $0 : nil }
-        // A degenerate window (start == end) is not a window.
-        if self.quietStartHour == self.quietEndHour {
-            self.quietStartHour = nil
-            self.quietEndHour = nil
-        }
+        guard (0...23).contains(quietStartHour), (0...23).contains(quietEndHour),
+              quietStartHour != quietEndHour else { return nil }
+        self.quietStartHour = quietStartHour
+        self.quietEndHour = quietEndHour
     }
 
 }
@@ -451,7 +435,7 @@ public struct OrganismDiurnalClock: Sendable, Equatable, Codable {
 /// another fence — this side only publishes):
 ///   • `timeOfDayPhase` — 0…1 through the user's local day. 0 = local midnight,
 ///     0.25 = 6 AM, 0.5 = local noon, 0.75 = 6 PM. Nil-free and always present
-///     when the organism is enabled, so "is it late" needs no second clock.
+///     when a configured quiet window supplies a clock.
 ///   • `nightliness` — 0…1, how deep into the night the trough says we are
 ///     (1 at the trough itself, 0 twelve hours later). This is the "it's late
 ///     and it shows" gate.

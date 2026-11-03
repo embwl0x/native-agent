@@ -8,16 +8,14 @@ public protocol ToolDispatchClient: Sendable {
     func listAvailableTools() async throws -> [String]
     /// Tool-schema variant. Returns full JSON-Schema descriptors for the same
     /// tools `listAvailableTools()` exposes by name. Threaded through the
-    /// LLMClient so the model can emit tool calls. Default implementation
-    /// returns `[]` so dispatchers that only know names compile unchanged
-    /// (the LLM then sees no tools — pre-tools behavior).
+    /// LLMClient so the model can emit tool calls. Every dispatcher supplies
+    /// its actual descriptors, including an explicitly empty contract.
     func listAvailableToolSchemas() async throws -> [LLMToolSchema]
     /// Select the offered contract without collecting unused internal schemas.
     func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema]
 }
 
 extension ToolDispatchClient {
-    public func listAvailableToolSchemas() async throws -> [LLMToolSchema] { [] }
     public func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
         try await listAvailableToolSchemas().filter { names.contains($0.name) }
     }

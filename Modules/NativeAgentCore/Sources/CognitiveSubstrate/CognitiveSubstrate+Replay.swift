@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+Replay.swift` | `CognitiveSubstrate`: `integrateReplayChecked`; schema status and dated REM resolutions share the inbox's decision snapshot by proposal identity; adoption requires its application claim; unmatched retained history stays explicitly unavailable; retired view/opinion/interest events never enter timeline or growth-week readouts |
+// Blueprint: | `CognitiveSubstrate+Replay.swift` | `CognitiveSubstrate`: `integrateReplayChecked`; schema status and dated REM resolutions share the inbox's checked decision snapshot by proposal identity and read displaced content from the proposal owner; adoption requires its application claim; unmatched or unreadable history stays explicitly unavailable |
 
 extension CognitiveSubstrate {
     /// Scheduled replay's checked boundary. All replay artifacts, lineage, and
@@ -29,11 +29,16 @@ extension CognitiveSubstrate {
         var stagedSchemas: [UUID: CognitiveSchemaProposal] = [:]
         var stagedTimeline: [UUID: CognitiveDevelopmentalTimelineEvent] = [:]
         var insertedReplayEvidence: Set<String> = []
+        var unavailableEvidence = input.unavailableEvidence
 
         do {
 
         for dream in input.dreamEntries.prefix(8) {
             let evidenceId = dreamReplayEvidenceID(dream)
+            guard let occurredAt = dateFromFullDate(dream.date) else {
+                unavailableEvidence.append("\(evidenceId): invalid dream date \(dream.date)")
+                continue
+            }
             guard replayEvidenceIds.insert(evidenceId).inserted,
                   episodes.values.contains(where: { $0.externalEvidenceIds.contains(evidenceId) }) == false else {
                 skippedEvidenceIds.append(evidenceId)
@@ -43,7 +48,7 @@ extension CognitiveSubstrate {
                 id: stableArtifactID("episode|\(evidenceId)"),
                 title: bounded("Dream replay \(dream.date)", maxCharacters: 120),
                 summary: dreamSummary(dream.content),
-                occurredAt: dateFromFullDate(dream.date) ?? now,
+                occurredAt: occurredAt,
                 externalEvidenceIds: [evidenceId],
                 lineageId: bounded("dream:\(dream.date)", maxCharacters: 120)
             )
@@ -74,6 +79,10 @@ extension CognitiveSubstrate {
 
         for proposal in input.remProposals.prefix(8) {
             let evidenceId = remReplayEvidenceID(proposal)
+            guard let createdAt = dateFromInternetDate(proposal.createdAt) else {
+                unavailableEvidence.append("\(evidenceId): invalid REM createdAt \(proposal.createdAt)")
+                continue
+            }
             if schemaProposals.values.contains(where: { $0.externalEvidenceIds.contains(evidenceId) }) {
                 skippedEvidenceIds.append(evidenceId)
                 continue
@@ -85,7 +94,7 @@ extension CognitiveSubstrate {
                 body: bounded(proposal.text.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 500),
                 target: bounded(proposal.target.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 120),
                 confidence: proposal.confidence,
-                createdAt: dateFromInternetDate(proposal.createdAt) ?? now,
+                createdAt: createdAt,
                 externalEvidenceIds: [evidenceId] + proposal.evidenceDates.map { bounded("dream:\($0)", maxCharacters: 120) },
                 lineageId: bounded("rem:\(proposal.id)", maxCharacters: 120)
             )
@@ -104,10 +113,10 @@ extension CognitiveSubstrate {
         }
 
         let receiptPayload: JSONValue? =
-            !writes.isEmpty || !input.unavailableEvidence.isEmpty
+            !writes.isEmpty || !unavailableEvidence.isEmpty
             ? .object([
                     "reason": .string(bounded(input.reason, maxCharacters: 120)),
-                    "unavailableEvidence": .array(input.unavailableEvidence.prefix(16).map {
+                    "unavailableEvidence": .array(unavailableEvidence.prefix(16).map {
                         .string(bounded($0, maxCharacters: 240))
                     }),
                     "episodeCount": .int(Int64(episodeIds.count)),
@@ -177,13 +186,26 @@ extension CognitiveSubstrate {
     // Cognition owns feelings and continuity; the Desk owns explicit task tracking.
 
     public func schemaProposalSnapshot() async -> [CognitiveSchemaProposal] {
+        await schemaProposalSnapshot(from: Array(schemaProposals.values))
+    }
+
+    func schemaProposalSnapshot(from proposals: [CognitiveSchemaProposal]) async -> [CognitiveSchemaProposal] {
         let decisions = await dependencies.decisions()
-        return schemaProposals.values.sorted { lhs, rhs in
+        let replacements = await dependencies.remReplacements()
+        return proposals.sorted { lhs, rhs in
             if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
             return lhs.id.uuidString < rhs.id.uuidString
         }.map { proposal in
             var proposal = proposal
-            proposal.decision = decisions[String(proposal.lineageId.dropFirst(4))]
+            let id = String(proposal.lineageId.dropFirst(4))
+            proposal.decision = decisions.value[id]
+            proposal.replacementDescription = replacements.value[id]
+                ?? (replacements.unreadable.isEmpty
+                    ? "Replaced content: proposal record unavailable"
+                    : "Replaced content unavailable: " + replacements.unreadable.joined(separator: "; "))
+            if !decisions.unreadable.isEmpty {
+                proposal.replacementDescription += "\nDecision history unavailable: " + decisions.unreadable.joined(separator: "; ")
+            }
             return proposal
         }
     }
@@ -195,7 +217,6 @@ extension CognitiveSubstrate {
         let lower = title.lowercased()
         let namesTheActNotTheThing =
             lower.hasPrefix("schema proposal")
-            || lower.hasPrefix("identity proposal")
             || lower.hasSuffix("rem proposal")
         guard namesTheActNotTheThing else { return title }
         // THE FIRST SENTENCE, not the whole lesson. A title is a name; a
@@ -215,25 +236,19 @@ extension CognitiveSubstrate {
         return sentence.count >= 16 ? sentence : lesson
     }
 
-    /// These immutable titles identify history from the retired view family,
-    /// including its opinion and interest statuses. Her story now lives in cares.
-    static func isRetiredViewTimelineEvent(_ event: CognitiveDevelopmentalTimelineEvent) -> Bool {
-        let title = event.title.lowercased()
-        return ["standing view", "opinion formed", "opinion reconsidered", "opinion revised",
-                "interest from her hour", "returned to an interest", "out of the current set"]
-            .contains(where: title.hasPrefix)
-    }
-
     public func developmentalTimelineSnapshot(limit: Int = 40) async -> [CognitiveDevelopmentalTimelineEvent] {
         developmentalTimelineSnapshot(proposals: await schemaProposalSnapshot(), limit: limit)
     }
 
     public func developmentalTimelineSnapshot(proposals: [CognitiveSchemaProposal], limit: Int) -> [CognitiveDevelopmentalTimelineEvent] {
+        developmentalTimelineSnapshot(proposals: proposals, events: Array(developmentalTimeline.values), limit: limit)
+    }
+
+    func developmentalTimelineSnapshot(proposals: [CognitiveSchemaProposal], events: [CognitiveDevelopmentalTimelineEvent], limit: Int) -> [CognitiveDevelopmentalTimelineEvent] {
         let regenerated = Set(proposals.map(\.lineageId))
-        var result = developmentalTimeline.values.compactMap { event -> CognitiveDevelopmentalTimelineEvent? in
+        var result = events.compactMap { event -> CognitiveDevelopmentalTimelineEvent? in
             let isProposal = event.kind == .schemaProposal || event.kind == .proposalResolution
-            guard !(isProposal && regenerated.contains(event.lineageId)),
-                  !Self.isRetiredViewTimelineEvent(event) else { return nil }
+            guard !(isProposal && regenerated.contains(event.lineageId)) else { return nil }
             var event = event
             if isProposal && event.lineageId.hasPrefix("rem:") {
                 event.externalEvidenceIds.removeAll { $0.hasPrefix("outcome:") }
@@ -247,7 +262,7 @@ extension CognitiveSubstrate {
         for proposal in proposals {
             var event = CognitiveDevelopmentalTimelineEvent(
                 id: stableArtifactID("proposal|\(proposal.id)"), kind: .schemaProposal,
-                title: proposal.title, summary: proposal.body, occurredAt: proposal.createdAt,
+                title: proposal.title, summary: proposal.body + "\n\n" + proposal.replacementDescription, occurredAt: proposal.createdAt,
                 artifactId: proposal.id, lineageId: proposal.lineageId,
                 externalEvidenceIds: proposal.externalEvidenceIds)
             let decision = proposal.decision
@@ -257,7 +272,7 @@ extension CognitiveSubstrate {
                 resolution.kind = .proposalResolution
                 resolution.occurredAt = at
                 resolution.title = Self.growthRowTitle(for: event)
-                resolution.summary = decision.face?.words ?? ""
+                resolution.summary = (decision.face?.words ?? "") + "\n\n" + proposal.replacementDescription
                 resolution.externalEvidenceIds += growthOutcomeTagIds(for: decision)
                 result.append(resolution)
             } else {
@@ -324,7 +339,10 @@ extension CognitiveSubstrate {
     }
 
     private func dateFromFullDate(_ raw: String) -> Date? {
-        let parts = raw.split(separator: "-").compactMap { Int($0) }
+        let fields = raw.split(separator: "-", omittingEmptySubsequences: false)
+        guard fields.count == 3, fields[0].count == 4, fields[1].count == 2, fields[2].count == 2,
+              fields.allSatisfy({ $0.allSatisfy(\.isNumber) }) else { return nil }
+        let parts = fields.compactMap { Int($0) }
         guard parts.count == 3 else { return nil }
         var components = DateComponents()
         components.calendar = Calendar(identifier: .gregorian)
@@ -333,7 +351,10 @@ extension CognitiveSubstrate {
         components.year = parts[0]
         components.month = parts[1]
         components.day = parts[2]
-        return components.date
+        guard let date = components.date else { return nil }
+        let actual = components.calendar!.dateComponents(in: .current, from: date)
+        guard actual.year == parts[0], actual.month == parts[1], actual.day == parts[2] else { return nil }
+        return date
     }
 
     private func dateFromInternetDate(_ raw: String) -> Date? {

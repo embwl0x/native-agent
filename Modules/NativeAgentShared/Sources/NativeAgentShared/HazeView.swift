@@ -220,7 +220,7 @@ public final class HazeView: HazeNativeView {
             }
             CATransaction.commit()
         }
-        let changed = mood != self.mood || dark != self.dark || still != self.still || self.color == nil
+        let changed = mood != self.mood || dark != self.dark || still != self.still || color != self.color
         self.color = color
         self.mood = mood
         self.dark = dark
@@ -238,7 +238,7 @@ public final class HazeView: HazeNativeView {
     }
 
     private func retarget() {
-        let targetOpacity = mood.opacity * (dark ? 1 : Self.lightWeight)
+        let targetOpacity = color == .unavailable ? 0 : mood.opacity * (dark ? 1 : Self.lightWeight)
         let from = weight.presentation()?.opacity ?? weight.opacity
         if from != targetOpacity {
             let fade = CABasicAnimation(keyPath: "opacity")

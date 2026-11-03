@@ -16,7 +16,7 @@ import ToolRegistry
 import Desk
 import TrustCenter
 import TurnTrace
-// Blueprint: | `ChatOrchestration+ToolLoop.swift` | `TurnContext`: `withToolSchemas`; `finishReplyTurn` settles reply.end, including incomplete work; ContextFlow's `.completed` records this loop exit; tool rounds distinguish Stop, control return and failed observation; failed handback waits end the turn without resuming, and the return nudge requires current driver permission |
+// Blueprint: | `ChatOrchestration+ToolLoop.swift` | `TurnContext`: `withToolSchemas`; `finishReplyTurn` settles reply.end, including incomplete work; ContextFlow's `.completed` records this loop exit; takeover receipts reach the next model round as ordinary refusals without parking for handback |
 
 // MARK: - Tool-dispatch loops
 
@@ -215,55 +215,8 @@ extension SwiftNativeTurnEngine {
         }
         LocalToolImage.boundConversation(&conversation)
         ChatTurnExecution.current?.keepPixels(LocalToolImage.imageNames(conversation))
-        // An app chrome.* call is the Chrome tool it ran, with its args as input.
-        if iterationRecords.contains(where: {
-            let ran = $0.ranCall.tool
-            return Self.driverTakeoverReceipt($0.result) != nil
-                || (!MacAttentionSessionStore.shared.currentDriverAllowed
-                    && ["act", "go"].contains(ran)
-                    && ChatToolOutcome.wasCancelled($0.result))
-        }) {
-            await progress?(.notice(kind: "mac_handback", text:
-                "You took control of the Mac; waiting for you to return control."))
-            // Keep the conversation and its delivery route alive while the
-            // existing handback event or this run's Stop releases the wait.
-            // Observation failure ends the turn; it cannot stand in for either.
-            let changes = await MacAttentionSessionStore.shared.driverChanges(waitingForReturn: true)
-            let outcome = await withTaskGroup(of: MacControlWaitOutcome.self) { group in
-                group.addTask {
-                    for await _ in changes {
-                        if Self.dispatchCancelSignalled(cancelFlagPath) { return .stopped }
-                        if MacAttentionSessionStore.shared.currentDriverAllowed { return .returned }
-                    }
-                    return Self.dispatchCancelSignalled(cancelFlagPath)
-                        ? .stopped : .unavailable("The control-return observation ended.")
-                }
-                if let flag = cancelFlagPath {
-                    group.addTask {
-                        let stop = FileChangeEvents(paths: [URL(fileURLWithPath: flag.path)])
-                        defer { stop.cancel() }
-                        for await _ in stop.stream {
-                            if Self.dispatchCancelSignalled(flag) { return .stopped }
-                        }
-                        return Self.dispatchCancelSignalled(flag)
-                            ? .stopped : .unavailable("The Stop-file observation failed.")
-                    }
-                }
-                let result = await group.next() ?? .unavailable("The control-return wait ended without an outcome.")
-                group.cancelAll()
-                return result
-            }
-            if Self.dispatchCancelSignalled(cancelFlagPath) { return }
-            switch outcome {
-            case .stopped: throw CancellationError()
-            case .unavailable(let why): throw TurnEngineError.macControlWaitUnavailable(why)
-            case .returned: break
-            }
-            if !MacAttentionSessionStore.shared.currentDriverAllowed {
-                throw TurnEngineError.macControlWaitUnavailable("Mac control is still with you.")
-            }
-            Self.appendStructuredUserNudge("Mac control has returned; continue from the recorded results.", to: &conversation)
-        }
+        // A takeover answers this call. The recorded refusal reaches her next
+        // model round immediately; whether to wait, answer or stop is hers.
         if StandingBotContinuity.isHelperTurn, iterationRecords.contains(where: { ChatToolOutcome.isWaitingApproval($0.result) }) {
             ChatTurnExecution.current?.waitForApproval()
         }
@@ -274,26 +227,6 @@ extension SwiftNativeTurnEngine {
             .first(where: InlineInteractionNeed.blocksTurn) {
             ChatTurnExecution.current?.waitForInteraction(waiting)
         }
-    }
-
-    private enum MacControlWaitOutcome: Sendable {
-        case returned
-        case stopped
-        case unavailable(String)
-    }
-
-    private static func driverTakeoverReceipt(_ value: JSONValue, depth: Int = 0) -> [String: JSONValue]? {
-        guard depth < 5, case .object(let object) = value else { return nil }
-        if object["status"] == .string("yielded_to_user")
-            || { if case .string(let error)? = object["error"] { error.hasPrefix("human_takeover:") } else { false } }() {
-            return object
-        }
-        for key in ["detail", "output", "result"] {
-            if let child = object[key], let receipt = driverTakeoverReceipt(child, depth: depth + 1) {
-                return receipt.merging(object.filter { $0.key != key }) { current, _ in current }
-            }
-        }
-        return nil
     }
 
 }

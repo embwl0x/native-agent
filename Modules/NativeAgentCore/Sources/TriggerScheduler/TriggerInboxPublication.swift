@@ -24,17 +24,17 @@ extension SwiftNativeTriggerScheduler {
         case refused(TriggerFireResult)
     }
 
-    /// JavaScript and its model run before taking any publication/state lock.
+    /// JavaScript and its model run with no publication/state lock held.
     internal func prepareInboxTrigger(name: String) async throws -> InboxPreparation {
+        try Task.checkCancellation()
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { throw TriggerSchedulerError.invalidRequest("empty name") }
-        guard inboxMasterOn else {
+        guard try inboxMasterOn else {
             return .refused(TriggerFireResult(
                 status: "disabled", name: name, stub: true,
                 error: "Raising things unasked is off (Notifications), so no trigger fires."
             ))
         }
-        try await migrateLegacyInboxTriggerFilesIfNeeded()
 
         // Look up the trigger row.
         let configs: [TriggerConfig]
@@ -43,7 +43,7 @@ extension SwiftNativeTriggerScheduler {
             seed = try await defaults()
             configs = try await Self._readList(
                 path: inboxPath,
-                defaultValue: seed.inbox, inbox: true
+                defaultValue: seed.inbox
             )
         } catch {
             return .refused(TriggerFireResult(status: "error", name: name, stub: true,
@@ -52,8 +52,15 @@ extension SwiftNativeTriggerScheduler {
         guard let row = configs.first(where: { ExecutionEventVocabulary.matches($0.name, name) }) else {
             return .refused(TriggerFireResult(status: "not_found", name: name, stub: true))
         }
+        guard row.enabled else {
+            return .refused(TriggerFireResult(status: "disabled", name: name, stub: true,
+                error: "The current trigger definition is disabled; no brief was prepared."))
+        }
 
-        do { return .ready(row: row, notify: seed.notify, item: try await _buildMorningBriefItem()) }
+        do {
+            try Task.checkCancellation()
+            return .ready(row: row, notify: seed.notify, item: try await _buildMorningBriefItem())
+        }
         catch { return .refused(TriggerFireResult(status: "error", name: name, stub: true, error: String(describing: error))) }
     }
 
@@ -72,7 +79,7 @@ extension SwiftNativeTriggerScheduler {
                 fields["trigger_occurrence"] = .string(occurrence)
                 item = .object(fields)
             }
-            guard inboxMasterOn else {
+            guard try inboxMasterOn else {
                 return TriggerFireResult(
                     status: "disabled", name: name, stub: true,
                     error: "Raising things unasked is off (Notifications), so no trigger fires."
@@ -94,7 +101,7 @@ extension SwiftNativeTriggerScheduler {
             } else {
                 if let notifier {
                     delivery = await notifier(note, shouldNotify)
-                    notified = shouldNotify && delivery != .null
+                    notified = shouldNotify && delivery.objectValue?["delivered"] == .bool(true)
                     if delivery == .null {
                         // The sender reported failure. Say so on the record
                         // rather than logging "ok".

@@ -1,16 +1,16 @@
 import NativeAgentShared
 import Foundation
 import PersistenceCore
-// Blueprint: | `DeskOperations.swift` | `DeskOpBody` enum; `updateTitle` optionally replaces refs with the same replayable summary update |
+// Blueprint: | `DeskOperations.swift` | `DeskOpBody` enum and exact current-form operation decoder; explicit clears and complete collections; typed release conditions; `updateTitle` optionally replaces refs with the same replayable summary update |
 
 // MARK: - Ops (DeskOp) — one event each; compact() folds into DeskState
 
 /// The mutation payload. Every op also carries a `handle` (the item it targets,
-/// or — for create — the newly assigned handle). Tolerant decode: an unknown
-/// `op` token yields nil and is skipped by the rebuild.
+/// or — for create — the newly assigned handle). Every persisted operation
+/// must decode completely before the feed can be replayed.
 public enum DeskOpBody: Sendable, Equatable {
     case createItem(alias: String, kind: DeskKind, project: String, title: String, parent: String?, summary: String?, assignee: String?, laneOf: String?, origin: DeskOrigin, pursuit: Pursuit?, findingKey: String? = nil)
-    /// A dedicated token keeps older writers from treating pursuits as ordinary projects.
+    /// A dedicated token identifies dossier-gated self-authored pursuits.
     /// Origin is implicitly .agent, kind implicitly .project.
     case openPursuit(alias: String, project: String, title: String, summary: String?, pursuit: Pursuit, notify: NotifyPolicy)
     case setStatus(
@@ -24,7 +24,7 @@ public enum DeskOpBody: Sendable, Equatable {
     case updateTitle(title: String?, summary: String?, refs: [DeskRef]? = nil)
     case addRef(ref: DeskRef)
     case updateRef(refId: String, cachedFields: [String: JSONValue])
-    case appendNote(text: String, author: String? = "system")
+    case appendNote(text: String, author: String? = "system", releaseCondition: String? = nil)
     /// One atomic user veto: the pursuit becomes canceled and carries the
     /// durable rationale in the same replayable event.
     case vetoPursuit(note: String)
@@ -105,8 +105,7 @@ public struct DeskOp: Sendable, Equatable {
             put("assignee", assignee)
             put("laneOf", laneOf)
             put("findingKey", findingKey)
-            // Origin is omitted when .owner so a pre-origin create op re-serializes
-            // BYTE-IDENTICAL; pursuit emitted only for an origin=agent create.
+            // The current writer omits the default owner origin.
             if origin != .owner { obj["origin"] = .string(origin.rawValue) }
             if let pursuit { obj["pursuit"] = pursuit.toJSON() }
         case let .openPursuit(alias, project, title, summary, pursuit, notify):
@@ -132,9 +131,10 @@ public struct DeskOp: Sendable, Equatable {
         case let .updateRef(refId, cachedFields):
             obj["refId"] = .string(refId)
             obj["cachedFields"] = .object(cachedFields)
-        case let .appendNote(text, author):
+        case let .appendNote(text, author, releaseCondition):
             obj["text"] = .string(text)
             put("author", author)
+            if let releaseCondition { obj["releaseCondition"] = .string(releaseCondition) }
         case let .vetoPursuit(note):
             obj["note"] = .string(note)
         case let .setCadence(cadence):
@@ -143,9 +143,7 @@ public struct DeskOp: Sendable, Equatable {
             obj["policy"] = policy.toJSON()
         case let .closeItem(outcomeSummary, status):
             obj["outcomeSummary"] = .string(outcomeSummary)
-            // close_item is terminal by definition — clamp on encode too so a
-            // directly-constructed op can never persist a non-terminal status.
-            obj["status"] = .string((status.isTerminal ? status : .done).rawValue)
+            obj["status"] = .string(status.rawValue)
         case let .markNotified(at):
             obj["at"] = .string(at)
         case .archiveItem:
@@ -186,11 +184,13 @@ public struct DeskOp: Sendable, Equatable {
               let token = obj["op"]?.stringValue,
               let handle = obj["handle"]?.stringValue else { return nil }
         let body: DeskOpBody
-        if token == "set_continuation" {
-            guard let value = obj["continuation"], let record = DeskContinuation.fromJSON(value) else { return nil }
-            return DeskOp(opId: opId, ts: ts, handle: handle, body: .setContinuation(record: record))
-        }
+        guard !opId.isEmpty, !handle.isEmpty, DeskClock.parseISO(ts) != nil,
+              DeskJSON.optionalStringsAreValid(obj, keys: ["parent", "summary", "assignee", "laneOf", "origin", "findingKey", "blockedReason", "waitingOn", "title", "author", "disposition"])
+        else { return nil }
         let pursuit = obj["pursuit"].flatMap(Pursuit.fromJSON)
+        if obj["pursuit"] != nil && pursuit == nil { return nil }
+        let progress = obj["progress"].flatMap(DeskProgress.fromJSON)
+        if obj["progress"] != nil && progress == nil { return nil }
         switch token {
         case "create_item":
             if obj["pursuit"] != nil && pursuit == nil { return nil }
@@ -198,24 +198,33 @@ public struct DeskOp: Sendable, Equatable {
                   let kindRaw = obj["kind"]?.stringValue, let kind = DeskKind(rawValue: kindRaw),
                   let project = obj["project"]?.stringValue,
                   let title = obj["title"]?.stringValue else { return nil }
-            // Origin defaults to .owner; pursuit is optional.
+            let origin: DeskOrigin
+            if let raw = obj["origin"]?.stringValue {
+                guard let value = DeskOrigin(rawValue: raw) else { return nil }
+                origin = value
+            } else { origin = .owner } // omitted by the current owner-origin writer
             body = .createItem(alias: alias, kind: kind, project: project, title: title,
                                parent: obj["parent"]?.stringValue, summary: obj["summary"]?.stringValue,
                                assignee: obj["assignee"]?.stringValue, laneOf: obj["laneOf"]?.stringValue,
-                               origin: obj["origin"]?.stringValue.flatMap(DeskOrigin.decodePersisted) ?? .owner,
+                               origin: origin,
                                pursuit: pursuit, findingKey: obj["findingKey"]?.stringValue)
         case "open_pursuit":
             guard let alias = obj["alias"]?.stringValue,
                   let project = obj["project"]?.stringValue,
                   let title = obj["title"]?.stringValue,
                   let pursuit else { return nil }
+            let notify: NotifyPolicy
+            if let raw = obj["notify"] {
+                guard let policy = NotifyPolicy.fromJSON(raw) else { return nil }
+                notify = policy
+            } else { notify = NotifyPolicy() } // current writer omits the default policy
             body = .openPursuit(
                 alias: alias,
                 project: project,
                 title: title,
                 summary: obj["summary"]?.stringValue,
                 pursuit: pursuit,
-                notify: obj["notify"].map { NotifyPolicy.fromJSON($0) } ?? NotifyPolicy()
+                notify: notify
             )
         case "set_status":
             guard let statusRaw = obj["status"]?.stringValue, let status = DeskStatus(rawValue: statusRaw) else { return nil }
@@ -223,7 +232,7 @@ public struct DeskOp: Sendable, Equatable {
                 status: status,
                 blockedReason: obj["blockedReason"]?.stringValue,
                 waitingOn: obj["waitingOn"]?.stringValue,
-                progress: obj["progress"].flatMap { DeskProgress.fromJSON($0) },
+                progress: progress,
                 assignee: obj["assignee"]?.stringValue,
                 laneOf: obj["laneOf"]?.stringValue
             )
@@ -241,43 +250,29 @@ public struct DeskOp: Sendable, Equatable {
             body = .addRef(ref: ref)
         case "update_ref":
             guard let refId = obj["refId"]?.stringValue else { return nil }
-            var fields: [String: JSONValue] = [:]
-            if case .object(let f)? = obj["cachedFields"] { fields = f }
+            guard case .object(let fields)? = obj["cachedFields"] else { return nil }
             body = .updateRef(refId: refId, cachedFields: fields)
         case "append_note":
-            guard let text = obj["text"]?.stringValue else { return nil }
-            body = .appendNote(text: text, author: obj["author"]?.stringValue)
+            guard let text = obj["text"]?.stringValue, DeskNote.fromJSON(value) != nil else { return nil }
+            body = .appendNote(text: text, author: obj["author"]?.stringValue, releaseCondition: obj["releaseCondition"]?.stringValue)
         case "veto_pursuit":
             guard let note = obj["note"]?.stringValue, !note.isEmpty else { return nil }
             body = .vetoPursuit(note: note)
         case "set_cadence":
-            guard let c = obj["cadence"] else { return nil }
-            body = .setCadence(cadence: Cadence.fromJSON(c))
+            guard let c = obj["cadence"], let cadence = Cadence.fromJSON(c) else { return nil }
+            body = .setCadence(cadence: cadence)
         case "set_notify":
-            guard let p = obj["policy"] else { return nil }
-            body = .setNotify(policy: NotifyPolicy.fromJSON(p))
+            guard let p = obj["policy"], let policy = NotifyPolicy.fromJSON(p) else { return nil }
+            body = .setNotify(policy: policy)
         case "close_item":
-            guard let outcome = obj["outcomeSummary"]?.stringValue else { return nil }
-            let decoded = obj["status"]?.stringValue.flatMap { DeskStatus(rawValue: $0) } ?? .done
-            // close_item is terminal by definition — a non-terminal token clamps
-            // to .done rather than materializing a half-closed lifecycle row.
-            body = .closeItem(outcomeSummary: outcome, status: decoded.isTerminal ? decoded : .done)
+            guard let outcome = obj["outcomeSummary"]?.stringValue,
+                  let raw = obj["status"]?.stringValue, let status = DeskStatus(rawValue: raw), status.isTerminal else { return nil }
+            body = .closeItem(outcomeSummary: outcome, status: status)
         case "mark_notified":
             guard let at = obj["at"]?.stringValue else { return nil }
             body = .markNotified(at: at)
         case "archive_item":
             body = .archiveItem
-        case "reserve_work_session":
-            guard let reservationId = obj["reservationId"]?.stringValue,
-                  let day = obj["day"]?.stringValue,
-                  let slot = obj["slot"]?.stringValue else { return nil }
-            body = .reserveWorkAttempt(attemptId: reservationId, lane: .pursuit, day: day, slot: slot)
-        case "complete_work_session":
-            guard let reservationId = obj["reservationId"]?.stringValue,
-                  let receipt = obj["receipt"]?.stringValue else { return nil }
-            body = .completeWorkAttempt(attemptId: reservationId, receipt: receipt,
-                disposition: obj["disposition"]?.stringValue.flatMap(DeskWorkDisposition.init(rawValue:)),
-                artifactRefs: (obj["artifactRefs"]?.arrayValue?.compactMap(\.stringValue) ?? []))
         case "reserve_work_attempt":
             guard let attemptId = obj["attemptId"]?.stringValue,
                   let laneRaw = obj["lane"]?.stringValue,
@@ -288,9 +283,10 @@ public struct DeskOp: Sendable, Equatable {
         case "complete_work_attempt":
             guard let attemptId = obj["attemptId"]?.stringValue,
                   let receipt = obj["receipt"]?.stringValue else { return nil }
-            body = .completeWorkAttempt(attemptId: attemptId, receipt: receipt,
-                                        disposition: obj["disposition"]?.stringValue.flatMap(DeskWorkDisposition.init(rawValue:)),
-                                        artifactRefs: (obj["artifactRefs"]?.arrayValue?.compactMap(\.stringValue) ?? []))
+            let disposition = obj["disposition"]?.stringValue.flatMap(DeskWorkDisposition.init(rawValue:))
+            guard obj["disposition"] == nil || disposition != nil,
+                  let artifacts = DeskJSON.strings(obj["artifactRefs"]) else { return nil }
+            body = .completeWorkAttempt(attemptId: attemptId, receipt: receipt, disposition: disposition, artifactRefs: artifacts)
         case "work_log":
             guard let receipt = obj["receipt"]?.stringValue else { return nil }
             body = .workLog(receipt: receipt)
@@ -298,20 +294,24 @@ public struct DeskOp: Sendable, Equatable {
             guard let reservationId = obj["reservationId"]?.stringValue else { return nil }
             body = .handOffWorkReceipt(reservationId: reservationId)
         case "set_blocked_on":
-            // Absent / wrong-typed → [] , which is the CLEAR. The op is a
-            // whole-set replace, so there is nothing to preserve on a partial read.
-            body = .setBlockedOn(handles: (obj["blockedOn"]?.arrayValue?.compactMap(\.stringValue) ?? []))
+            guard let handles = DeskJSON.strings(obj["blockedOn"], defaultWhenAbsent: false) else { return nil }
+            body = .setBlockedOn(handles: handles)
         case "set_defer_until":
-            let raw = obj["until"]?.stringValue ?? ""
+            guard let raw = obj["until"]?.stringValue,
+                  raw.isEmpty || DeskSequencing.parseDeferStamp(raw) != nil else { return nil }
             body = .setDeferUntil(until: raw.isEmpty ? nil : raw)
+        case "set_continuation":
+            guard let value = obj["continuation"], let record = DeskContinuation.fromJSON(value) else { return nil }
+            body = .setContinuation(record: record)
         default:
-            return nil // tolerant: unknown op tokens skipped
+            return nil
         }
         guard let attempts = DeskWorkAttempt.readAttempts(obj) else { return nil }
         if let pursuit,
            pursuit.retiredSessions.addingReportingOverflow(attempts.count).overflow { return nil }
         var op = DeskOp(opId: opId, ts: ts, handle: handle, body: body)
         op.workAttempts = attempts
+        guard op.toJSON() == value else { return nil }
         return op
     }
 }

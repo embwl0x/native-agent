@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `ContextProjectionSources.swift` | `ContextCompiledProjectionProvider`: incremental rebuildable source projections, generation-bound exclusions and delivery/publication hooks |
+// Blueprint: | `ContextProjectionSources.swift` | `ContextCompiledProjectionProvider`: incremental rebuildable source projections, generation-bound exclusions and delivery/publication hooks; compiled projections carry unavailable-source reasons and opt-in checked unchanged sources for health recovery |
 
 /// The chosen atoms a provider drops, and the degraded-source receipts for
 /// what it could not verify (dropped too).
@@ -19,27 +19,38 @@ public struct ContextTurnExclusion: Sendable {
 public struct ContextCompiledProjectionResult: Sendable, Equatable {
     public let changedSources: [ContextCompiledSource]
     public let removedSourceIDs: Set<ContextSourceID>
+    /// Checked reads, including unchanged sources, and failures beside retained inputs.
+    public let verifiedSources: [ContextCompiledSource]
+    public let sourceFailures: [ContextSourceID: String]
     public init(
         changedSources: [ContextCompiledSource],
-        removedSourceIDs: Set<ContextSourceID> = []
+        removedSourceIDs: Set<ContextSourceID> = [],
+        sourceFailures: [ContextSourceID: String] = [:],
+        verifiedSources: [ContextCompiledSource] = []
     ) {
         self.changedSources = changedSources
         self.removedSourceIDs = removedSourceIDs
+        self.verifiedSources = verifiedSources.filter { sourceFailures[$0.descriptor.id] == nil }
+        self.sourceFailures = sourceFailures
     }
 
     public init(owner: String, currentSources: [ContextCompiledSource],
-                previousSources: [ContextSourceID: ContextCompiledSource]) {
+                previousSources: [ContextSourceID: ContextCompiledSource],
+                sourceFailures: [ContextSourceID: String] = [:],
+                verifiedSources: [ContextCompiledSource] = []) {
+        self.verifiedSources = verifiedSources.filter { sourceFailures[$0.descriptor.id] == nil }
+        self.sourceFailures = sourceFailures
         changedSources = currentSources.filter {
             previousSources[$0.descriptor.id]?.sourceHash != $0.sourceHash
         }
         let currentIDs = Set(currentSources.map(\.descriptor.id))
         removedSourceIDs = Set(previousSources.values.lazy
             .filter { $0.descriptor.owner == owner }
-            .map(\.descriptor.id)).subtracting(currentIDs)
+            .map(\.descriptor.id)).subtracting(currentIDs).subtracting(sourceFailures.keys)
     }
 
     public var isEmpty: Bool {
-        changedSources.isEmpty && removedSourceIDs.isEmpty
+        changedSources.isEmpty && removedSourceIDs.isEmpty && sourceFailures.isEmpty
     }
 }
 
@@ -53,12 +64,12 @@ public protocol ContextCompiledProjectionProvider: Sendable {
     var projectionIdentifier: String { get }
 
     /// Canonical invalidation namespaces that require this projection to be
-    /// rebuilt. Empty keeps legacy/test providers launch-only.
+    /// rebuilt. Each provider declares its current contract explicitly.
     var invalidationNamespaces: Set<String> { get }
 
     /// Exact canonical file whose changes this projection consumes. A staged
     /// candidate under another root is not a mutation of the live source.
-    /// Nil preserves namespace-only consumers and unlocated legacy events.
+    /// Nil explicitly declares a namespace-wide, non-file source.
     var invalidationSourceURL: URL? { get }
 
     /// Point-of-use policy exclusions, including sources in retained generations.
@@ -84,8 +95,6 @@ public protocol ContextCompiledProjectionProvider: Sendable {
 
 public extension ContextCompiledProjectionProvider {
     var projectionIdentifier: String { String(reflecting: Self.self) }
-    var invalidationNamespaces: Set<String> { [] }
-    var invalidationSourceURL: URL? { nil }
     var excludedSourceOwners: Set<String> { [] }
     func verify(_ chosen: [ContextStoredAtom], in generation: ContextStoredGeneration,
                 surface: ContextSurface) async -> ContextTurnExclusion { ContextTurnExclusion() }

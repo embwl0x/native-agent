@@ -50,8 +50,8 @@ public enum REMLessonOrigin {
         let ranked: [(MemoryRecord, Int)] = moments.compactMap { record in
             guard (record.status ?? "active") == "active", MemoryMoments.isMoment(record.extras),
                   let session = record.extras?.objectValue?["session_id"]?.stringValue,
-                  let at = MemoryMoments.parseTimestamp(record.observedAt ?? record.createdAt),
-                  days.contains("\(session)|\(MemoryMoments.dayKey(at))"),
+                  let at = MemoryDataProvenance.parseTimestamp(record.observedAt ?? record.createdAt),
+                  days.contains("\(session)|\(MemoryDataProvenance.dayKey(at))"),
                   ownExchange(record, session: session, peerSessionTrusted: peerSessionTrusted, dataRoot: dataRoot) else { return nil }
             let shared = words(record.text).intersection(about).count
             return shared > 0 ? (record, shared) : nil
@@ -74,19 +74,19 @@ public enum REMLessonOrigin {
 
     /// What recall surfaces in place of the slogan (GROWTH already carries
     /// that): the moment, in his words, and what changed; with no qualifying
-    /// moment, what changed alone. It closes on the day it was lived, which
-    /// also keeps the memory gate from reading a sentence that ends "…than I
-    /// was" as a clipped capture. nil without a "what changed".
+    /// moment, what changed alone. A lived day is included only when the
+    /// source moment or proposal records one. nil without a "what changed".
     public static func originText(for row: REMProposalRow, moment: MemoryRecord?) -> String? {
         guard let changed = row.whatChanged?.trimmingCharacters(in: .whitespacesAndNewlines),
               !changed.isEmpty else { return nil }
-        let lived = moment.flatMap { MemoryMoments.parseTimestamp($0.observedAt ?? $0.createdAt) }.map { MemoryMoments.dayKey($0) }
-            ?? row.livedDates?.last ?? String(row.createdAt.prefix(10))
+        let lived = moment.flatMap { MemoryDataProvenance.parseTimestamp($0.observedAt ?? $0.createdAt) }.map { MemoryDataProvenance.dayKey($0) }
+            ?? row.livedDates?.last
+        let livedClause = lived.map { " (lived \($0))" } ?? ""
         guard let said = moment.flatMap({ $0.extras?.objectValue?["quote"]?.stringValue })?
             .trimmingCharacters(in: .whitespacesAndNewlines), !said.isEmpty else {
-            return "What changed: \(changed) (lived \(lived))"
+            return "What changed: \(changed)\(livedClause)"
         }
-        return "\"\(String(said.prefix(quoteCap)))\" — what changed: \(changed) (lived \(lived))"
+        return "\"\(String(said.prefix(quoteCap)))\" — what changed: \(changed)\(livedClause)"
     }
 
     /// Keep the origin of an approved lesson, once: a replay returns the row

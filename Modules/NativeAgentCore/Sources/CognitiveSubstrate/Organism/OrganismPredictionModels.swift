@@ -140,15 +140,15 @@ public struct OrganismPredictionOutcomeCounts: Codable, Sendable, Equatable {
     public var expired: Int
     public var lastEvidenceAt: Date?
     /// Lifetime counts stay monotone; weights forget on the organism clock.
-    /// An absent wire key seeds weights from the lifetime tally.
-    public var weights: OrganismPredictionOutcomeWeights?
+    /// Persisted weights are the sole current evidence mass.
+    public var weights: OrganismPredictionOutcomeWeights
 
     public init(
         satisfied: Int = 0,
         violated: Int = 0,
         expired: Int = 0,
         lastEvidenceAt: Date? = nil,
-        weights: OrganismPredictionOutcomeWeights? = nil
+        weights: OrganismPredictionOutcomeWeights = .init()
     ) {
         self.satisfied = max(0, satisfied)
         self.violated = max(0, violated)
@@ -157,27 +157,6 @@ public struct OrganismPredictionOutcomeCounts: Codable, Sendable, Equatable {
         self.weights = weights
     }
 
-    /// Recorded weights, or the lifetime tally seeded for a state written
-    /// before forgetting existed. The seed is discounted by the age of
-    /// `lastEvidenceAt`, because decay only ever runs forward from the upgrade:
-    /// an undiscounted seed would let months-old evidence read as if all of it
-    /// had landed at restore, contradicting the staleness the same record
-    /// reports. Full strength only when the state carries no evidence date to
-    /// age it against.
-    public func effectiveWeights(at date: Date) -> OrganismPredictionOutcomeWeights {
-        if let weights { return weights }
-        var factor: Double = 1
-        if let lastEvidenceAt {
-            let elapsed: Double = max(0, date.timeIntervalSince(lastEvidenceAt))
-            let halfLife: Double = OrganismCapabilitySelfModel.evidenceHalfLife
-            factor = pow(0.5, elapsed / halfLife)
-        }
-        return OrganismPredictionOutcomeWeights(
-            satisfied: Double(satisfied) * factor,
-            violated: Double(violated) * factor,
-            expired: Double(expired) * factor
-        )
-    }
 }
 
 public struct OrganismPredictionSummary: Codable, Sendable, Equatable {
@@ -233,7 +212,7 @@ public struct OrganismPredictionLedger: Codable, Sendable, Equatable {
     /// still update the operational violation clock above.
     public var lastFeltViolationAt: Date?
     /// Nil means per-kind totals are unavailable; the bounded reservoir is no outcome sample.
-    public var outcomeCountsByKind: [String: OrganismPredictionOutcomeCounts]?
+    public var outcomeCountsByKind: [String: OrganismPredictionOutcomeCounts]
     /// At most one felt resolution per prediction kind per hour, keyed by
     /// `OrganismPredictionKind` raw value. An absent wire key decodes as nil.
     public var lastResolutionFeltAt: [String: Date]?
@@ -249,7 +228,7 @@ public struct OrganismPredictionLedger: Codable, Sendable, Equatable {
         lastUpdatedAt: Date? = nil,
         lastViolationAt: Date? = nil,
         lastFeltViolationAt: Date? = nil,
-        outcomeCountsByKind: [String: OrganismPredictionOutcomeCounts]? = nil
+        outcomeCountsByKind: [String: OrganismPredictionOutcomeCounts] = [:]
     ) {
         self.predictions = predictions
         self.satisfiedCount = max(0, satisfiedCount)

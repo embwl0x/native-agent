@@ -33,7 +33,7 @@ public enum AppDoorReentry {
     @TaskLocal public static var waitForInteraction: (@Sendable (InlineInteraction, String, [String: JSONValue]) async -> JSONValue)?
 }
 
-/// ToolNameAliases canonicalizes names before every gate so policy judges the name that executes.
+/// Trims current executor names before every gate so policy judges the name that executes.
 public final class CanonicalToolNameDispatcher: ToolDispatchClient {
     private let inner: any ToolDispatchClient
     private let peerDataRoot: URL?
@@ -51,24 +51,23 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
         try AgentConversationRouting.namingSavedContact(tool, input, dataRoot: peerDataRoot)
     }
 
-    /// The one alias table (`ToolNameAliases`) over the built-in catalog —
-    /// the same resolution `SwiftToolDispatcher.dispatch` applies downstream.
-    /// Unknown names stay unknown.
+    /// The same whitespace-only name admission the native dispatcher uses.
+    /// Unknown and retired names stay unknown; no alias resolves them.
     public static func canonical(_ name: String) -> String {
-        ToolNameAliases.canonical(name) { SwiftToolDispatcher.nativeCanonicalToolNames.contains($0) }
+        ToolNameAliases.canonical(name)
     }
 
     /// The door action an ingress call is: a dotted action name as itself, a
     /// part's bare id as `authored.<id>`; nil for a native tool or an unknown name.
-    static func doorAction(_ tool: String) -> String? {
+    static func doorAction(_ tool: String) throws -> String? {
         let trimmed = tool.trimmingCharacters(in: .whitespacesAndNewlines)
         let action = trimmed.lowercased()
         if action.contains(".") {
-            return AppActionBinding.action(input: ["action": .string(action)]) != nil ? action : nil
+            return try AppActionBinding.action(input: ["action": .string(action)]) != nil ? action : nil
         }
         guard !action.isEmpty, !SwiftToolDispatcher.nativeCanonicalToolNames.contains(action) else { return nil }
         let authored = ToolNameAliases.authoredAction(trimmed)
-        return AppActionBinding.action(input: ["action": .string(authored)]) != nil ? authored : nil
+        return try AppActionBinding.action(input: ["action": .string(authored)]) != nil ? authored : nil
     }
 
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -79,7 +78,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
         // card's replay, a bridge's direct call — is the door call that runs it
         // (`authored.<id>`), so its script has the chain to come back through
         // and the card's exact call is what re-enters under the part's name.
-        if AppDoorReentry.perform == nil, AuthoredToolEffects.call?.tool != tool, let door = Self.doorAction(tool) {
+        if AppDoorReentry.perform == nil, AuthoredToolEffects.call?.tool != tool, let door = try Self.doorAction(tool) {
             var call = input.filter { $0.key.hasPrefix("__") }
             call["action"] = .string(door)
             call["args"] = .object(input.filter { !$0.key.hasPrefix("__") })
@@ -91,16 +90,13 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
     }
 
     private func dispatchWithWorkspacePorts(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        if Self.canonical(tool) != tool {
-            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T04"), "site": .string("CanonicalToolNameDispatcher.swift:dispatch")]))
-        }
         let result = try await inner.withToolArguments(tool: Self.canonical(tool), input: input) { input in
             let result = try await AgentRecipeStore.$dryRun.withValue(Self.canonical(tool) == "agent_message" && input["dry_run"] == .bool(true)) {
                 try await dispatchNormalized(tool: tool, input: input, surface: surface)
             }
             if !AgentConversationContext.isInternalRead, Self.canonical(tool) == "agent_read",
                case .object(var fields) = result,
-               case .string(let agent)? = fields["agent_id"] ?? fields["agent"], let root = peerDataRoot, AgentConversationDelivery.door(for: agent, dataRoot: root)?.liveReader == true {
+               case .string(let agent)? = fields["agent_id"] ?? fields["agent"], let root = peerDataRoot, try AgentConversationDelivery.door(for: agent, dataRoot: root)?.liveReader == true {
                 fields["worklog"] = AgentConversationView.claudeWorklog()
                 return .object(fields)
             }
@@ -184,15 +180,19 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
         // Dotted facade aliases are deliberately unsupported: this context has
         // two policy identities, not three.
         var input = try namingSavedContact(tool, input)
+        if tool == "agent_message" {
+            try AgentMessageFiles.requireSupported(input, dataRoot: peerDataRoot)
+            if try AgentMessageFiles.paths(input["files"]).isEmpty { input.removeValue(forKey: "files") }
+        }
         if ["read_page", "browser.chrome_navigate", "browser_chrome_navigate"].contains(Self.canonical(tool)),
            case .string(let url)? = input["url"] { input["url"] = .string(SwiftToolDispatcher.withWebScheme(url)) }
         // Known hosts connect through agent_connect's gates and card before messaging.
         if tool == "agent_message", !HelperContact.matches(input), PersonInitiatedSend.current == nil, !AgentRecipeStore.dryRun,
            case .string(let name)? = input["agent"], !name.contains(":"),
            let row = AgentHostDirectory.row(named: name), let root = peerDataRoot,
-           AgentConversationDelivery.door(for: name, dataRoot: root) == nil,
+           try AgentConversationDelivery.door(for: name, dataRoot: root) == nil,
            // "Grok" while "Grok Bot" is saved means that contact, not a second route.
-           !((try? AgentPeerStore(dataRoot: root).list()) ?? []).contains(where: { $0.name.localizedCaseInsensitiveContains(name) }) {
+           !(try AgentPeerStore(dataRoot: root).list()).contains(where: { $0.name.localizedCaseInsensitiveContains(name) }) {
             return try await connectThenMessage(row: row, input: input, surface: surface)
         }
         if Self.canonical(tool) == "bot_run_once", let root = peerDataRoot,
@@ -224,7 +224,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
         }
         if (Self.canonical(tool) == "wait" && input["agent"] != nil) || waitsOnRead {
             guard let root = peerDataRoot,
-                  let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope
+                  let scope = try ChatToolSessionContext.verifiedSessionId ?? conversationScope
                     ?? (waitsOnRead ? Self.contactSession(input, dataRoot: root) : nil), !scope.isEmpty else {
                 if waitsOnRead { throw AgentConversationStore.Failure(message: "wait_seconds needs this chat's conversation, which this call does not have. Nothing was read.") }
                 return try await dispatchExact(tool: tool, input: input, surface: surface)
@@ -240,7 +240,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
         // contact's own session, where her side of that conversation lives.
         if !AgentConversationContext.isInternalRead, !AgentRecipeStore.dryRun,
            ["agent_message", "agent_read", "agent_cancel"].contains(tool), let root = peerDataRoot,
-           let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope ?? Self.contactSession(input, dataRoot: root),
+           let scope = try ChatToolSessionContext.verifiedSessionId ?? conversationScope ?? Self.contactSession(input, dataRoot: root),
            !scope.isEmpty {
             return try await AgentConversationSession.dispatch(tool: tool, input: input, surface: surface,
                 scope: scope, dataRoot: root) { tool, input in
@@ -253,9 +253,9 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
     }
 
     /// The saved contact's own session (`ContactThread.session`); nil for anything else.
-    private static func contactSession(_ input: [String: JSONValue], dataRoot: URL) -> String? {
+    private static func contactSession(_ input: [String: JSONValue], dataRoot: URL) throws -> String? {
         guard case .string(let named)? = input["agent"] else { return nil }
-        let agent = AgentConversationDelivery.door(for: named, dataRoot: dataRoot)?.agent ?? named
+        let agent = try AgentConversationDelivery.door(for: named, dataRoot: dataRoot)?.agent ?? named
         return agent.hasPrefix("peer:") ? ContactThread.session(owner: String(agent.dropFirst(5))) : nil
     }
 
@@ -277,7 +277,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient {
         if case .string(let status)? = connect["status"], ["configured", "connected", "already_configured", "set up"].contains(status) {
             if case .object(let contact)? = connect["contact"], case .string(let agent)? = contact["agent"] { handle = agent }
             else if status == "set up", let root = peerDataRoot,
-                    let peer = ((try? AgentPeerStore(dataRoot: root).list()) ?? []).first(where: {
+                    let peer = (try AgentPeerStore(dataRoot: root).list()).first(where: {
                         $0.transport == .grokBot && $0.name.caseInsensitiveCompare(row.displayName) == .orderedSame }) {
                 handle = "peer:" + peer.id
             }

@@ -28,7 +28,7 @@ extension SwiftToolDispatcher {
         func answer(_ status: String, _ detail: String = "") -> JSONValue {
             .object(["status": .string(status), "agent": .string(agent), "detail": .string(detail)])
         }
-        if let door = AgentConversationDelivery.door(for: agent, dataRoot: dataRoot, bridgeConfigRoot: agentBridgeConfigRoot), !door.liveReader {
+        if let door = try AgentConversationDelivery.door(for: agent, dataRoot: dataRoot, bridgeConfigRoot: agentBridgeConfigRoot), !door.liveReader {
             guard let message = try Self.peerString(args, "message_id", max: 160, required: false) else {
                 return answer("cannot_stop", "No accepted message is recorded for this reply, so there is nothing exact to stop.")
             }
@@ -142,20 +142,13 @@ extension SwiftToolDispatcher {
               case .string(let recorded)? = job["runnerIdentity"], !recorded.isEmpty else {
             return answer("cannot_stop", "\(name)'s run did not record its process identity, so it is not safe to interrupt from here.")
         }
-        guard AgentBridgeRuntime.processStartIdentity(pid) == recorded else {
-            return answer("cannot_stop", "\(name)'s run is no longer live on this Mac, so there is nothing to interrupt.")
+        guard let currentIdentity = AgentBridgeRuntime.processStartIdentity(pid) else {
+            return answer("cannot_stop", "\(name)'s runner identity could not be verified. No process was signalled; reconcile its original job before deciding whether more work is needed.")
         }
-        // Only the run's own children (the agent CLI), never the runner: it
-        // records the interrupted exit and settles the job like any other end.
-        let tree = ProcessTreeReaper.snapshot(rootPID: pid)
-        let children = ProcessTreeSnapshot(rootPID: pid, rootIdentity: nil, descendants: tree.descendants)
-        guard !children.descendants.isEmpty else {
-            return answer("cannot_stop", "\(name)'s run has no agent process to interrupt right now.")
+        guard currentIdentity == recorded else {
+            return answer("cannot_stop", "The process at \(name)'s recorded PID does not match that run's identity. No process was signalled; reconcile the original job.")
         }
-        return await settle {
-            ProcessTreeReaper.quiesceAndKill(children)
-            return answer("stopped", "Stopped \(name)'s agent process. Its runner retains any output and records the run's end.")
-        }
+        return answer("cannot_stop", "This run is owned by an external runner whose exact process-group authority is unavailable here. No process was signalled; its original job and any answer remain available for reconciliation.")
     }
     /// A MESSAGE GOES OUT AND A MESSAGE COMES BACK, IN THE SAME CALL.
     ///

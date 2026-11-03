@@ -43,28 +43,28 @@ public enum PermissionLaw {
     public static func posture(permissionLevel: String, outsideWorkspaceDefault: String) -> PermissionPosture {
         if MacControlGate.fullMacActive(MacControlTrustPolicy(outsideWorkspaceDefault: outsideWorkspaceDefault,
                                                               permissionLevel: permissionLevel)) { return .fullMac }
-        return ["strict", "locked_down"].contains(permissionLevel) ? .readOnly : .work
+        return permissionLevel == "strict" ? .readOnly : .work
     }
 
     /// The one effective answer for a call, with the reason and the lever
     /// that would change it. SecurityCenter (with the facts it already
     /// resolved) and Trust's by-name and Workshop answers both use it.
     public static func answer(tool: String, input: [String: JSONValue]?, policy: [String: JSONValue],
-                              dataRoot: URL) -> (toolClass: ToolClass, level: String, reason: String, remedy: JSONValue?) {
+                              dataRoot: URL) throws -> (toolClass: ToolClass, level: String, reason: String, remedy: JSONValue?) {
         let roots = SwiftNativeSecurityCenter.trustedWorkspaceRoots(
-            policy: policy, filePolicy: SwiftNativeSecurityCenter.object(policy["filePolicy"]), dataRoot: dataRoot)
-        let capabilities = input.map { SwiftNativeSecurityCenter.profile(tool: SwiftNativeSecurityCenter.policyToolName(tool),
+            filePolicy: SwiftNativeSecurityCenter.object(policy["filePolicy"]), dataRoot: dataRoot)
+        let capabilities = try input.map { try SwiftNativeSecurityCenter.profile(tool: SwiftNativeSecurityCenter.policyToolName(tool),
                                                                          input: $0, dataRoot: dataRoot, trustedWorkspaceRoots: roots).capabilities }
-        return answer(tool: tool, input: input, policy: policy, capabilities: capabilities)
+        return try answer(tool: tool, input: input, policy: policy, capabilities: capabilities)
     }
 
     static func answer(tool: String, input: [String: JSONValue]?, policy: [String: JSONValue],
-                       capabilities: Set<String>?) -> (toolClass: ToolClass, level: String, reason: String, remedy: JSONValue?) {
+                       capabilities: Set<String>?) throws -> (toolClass: ToolClass, level: String, reason: String, remedy: JSONValue?) {
         // Steering caps the posture: a turn an untrusted peer steered is judged as Work at most.
         let peer = CapabilityLifecycle.turnWriteCheck()()
         let capped = peer != nil && posture(policy) == .fullMac
         let posture = capped ? .work : posture(policy)
-        let (toolClass, level) = judge(tool: tool, input: input, posture: posture, capabilities: capabilities)
+        let (toolClass, level) = try judge(tool: tool, input: input, posture: posture, capabilities: capabilities)
         let mode = posture == .fullMac ? "Full Mac" : posture == .readOnly ? "Safe" : "Work mode"
         var reason = "trust/policy.json: \(mode) judges \(tool) as \(toolClass), autonomy=\(level)."
         if capped, let peer {
@@ -87,9 +87,9 @@ public enum PermissionLaw {
     /// The call's class, reach and posture decide act, ask or refuse.
     /// With no input, only its declaration counts.
     static func judge(tool: String, input: [String: JSONValue]?, posture: PermissionPosture,
-                      capabilities: Set<String>?) -> (toolClass: ToolClass, level: String) {
-        let toolClass = toolClass(tool, input: input ?? [:])
-        let users = toolClass >= .send || reachesUser(tool, input: input, capabilities: capabilities ?? [])
+                      capabilities: Set<String>?) throws -> (toolClass: ToolClass, level: String) {
+        let toolClass = try toolClass(tool, input: input ?? [:])
+        let users = try toolClass >= .send || reachesUser(tool, input: input, capabilities: capabilities ?? [])
         let level: String = switch (toolClass, posture) {
         case (.read, _): "auto"
         case _ where !users: "auto"
@@ -106,7 +106,7 @@ public enum PermissionLaw {
     /// row, a part's reach, a host primitive's effect). Shell commands certified
     /// by the shell owner read; every other command retains its declared class.
     /// The one class resolution: authorization and scheduling read the same answer for the same call.
-    public static func toolClass(_ tool: String, input: [String: JSONValue]) -> ToolClass {
+    public static func toolClass(_ tool: String, input: [String: JSONValue]) throws -> ToolClass {
         let name = ToolNameAliases.canonical(tool)
         if AuthoredToolEffects.shellReadOnly(name, input: input) { return .read }
         if name == "app" {
@@ -118,14 +118,14 @@ public enum PermissionLaw {
             // Home, a page read, find and a preview change nothing; a folded
             // action re-enters under its tool's name and is judged there.
             guard named, input["preview"] != .bool(true) else { return .read }
-            guard let action = AppActionBinding.action(input: input) else { return .write }
+            guard let action = try AppActionBinding.action(input: input) else { return .write }
             return declaredRead(action) || action.folded ? .read : action.toolClass
         }
-        if AuthoredToolEffects.primitiveCapabilities[name] != nil || name.hasPrefix("fetch.") {
+        if AuthoredToolEffects.isPrimitiveEffect(name) {
             return effectClass(AuthoredToolEffects.primitiveEffect(name, arguments: .object(input)).capabilities)
         }
         // A part's declaration is the app action that folds it.
-        let action = AppActionBinding.action(tool: name, input: input) ?? AppActionBinding.binding(ToolNameAliases.authoredAction(name))
+        let action = try AppActionBinding.action(tool: name, input: input) ?? AppActionBinding.binding(ToolNameAliases.authoredAction(name))
         if let action, declaredRead(action) { return .read }
         let declared = AppActionBinding.declaredClass(name) ?? action?.toolClass ?? .write
         // A send's dry run reaches no one.
@@ -139,11 +139,11 @@ public enum PermissionLaw {
 
     /// What a door action does as it runs: a folded action is judged as the
     /// tool it hands the call to. Nil when the door has no such action.
-    public static func doorClass(action: String, args: [String: JSONValue]) -> ToolClass? {
+    public static func doorClass(action: String, args: [String: JSONValue]) throws -> ToolClass? {
         let call: [String: JSONValue] = ["action": .string(action), "args": .object(args)]
-        guard AppActionBinding.action(input: call) != nil else { return nil }
+        guard try AppActionBinding.action(input: call) != nil else { return nil }
         let ran = ToolNameAliases.ranCall("app", input: call)
-        return toolClass(ran.tool, input: ran.input)
+        return try toolClass(ran.tool, input: ran.input)
     }
 
     /// Whether a write lands on User's side of the line: a command line (nobody
@@ -154,7 +154,7 @@ public enum PermissionLaw {
     /// declaration does not say where it reaches. Her app's own door actions
     /// are hers, and so are her Chrome extension's tabs; a folded door action
     /// re-enters under its tool's name.
-    static func reachesUser(_ tool: String, input: [String: JSONValue]?, capabilities: Set<String>) -> Bool {
+    static func reachesUser(_ tool: String, input: [String: JSONValue]?, capabilities: Set<String>) throws -> Bool {
         let name = ToolNameAliases.canonical(tool)
         if input != nil, !capabilities.isDisjoint(with: [
             "outside_app_data_write", "other_app_settings_write", "system_control", "system_permission_reset",
@@ -162,7 +162,7 @@ public enum PermissionLaw {
         ]) { return true }
         if name == "app" { return false }
         if let schema = AppActionBinding.declaredSchema(name) { return schema.reach == .his }
-        return AppActionBinding.binding(ToolNameAliases.authoredAction(name))?.reach != .hers
+        return try AppActionBinding.binding(ToolNameAliases.authoredAction(name))?.reach != .hers
     }
 
     /// Whether a card is a person's even under Full Mac: the call it carries
@@ -170,14 +170,14 @@ public enum PermissionLaw {
     /// own approve never stands in for his). A chat tool's card carries the
     /// tool as its action and the call's `input`; a Workshop step's carries
     /// the step's `tool` and `args`.
-    public static func humanDecides(action: String, payload: JSONValue) -> Bool {
+    public static func humanDecides(action: String, payload: JSONValue) throws -> Bool {
         guard case .object(let payload) = payload else { return false }
         let step = ExecutionEventVocabulary.matches(action, WorkshopStepApprovalAction.canonical)
         var tool = action
         if step, case .string(let name)? = payload["tool"] { tool = name }
         var input: [String: JSONValue] = [:]
         if case .object(let fields)? = payload[step ? "args" : "input"] { input = fields }
-        return toolClass(tool, input: input) == .destructive
+        return try toolClass(tool, input: input) == .destructive
     }
 
     /// A part's declared permission, as the primitive it names reaches.
@@ -191,7 +191,7 @@ public enum PermissionLaw {
         // These grants can only read: app_read is enforced per Apple Event,
         // and app_data_read admits only file readers in the owning root.
         if permission == "app_data_read" || permission.hasPrefix("app_read:") { return .read }
-        guard AuthoredToolEffects.primitiveCapabilities[permission] != nil || permission.hasPrefix("fetch") else { return .write }
+        guard AuthoredToolEffects.isPrimitiveEffect(permission) else { return .write }
         return effectClass(AuthoredToolEffects.primitiveEffect(permission, arguments: nil).capabilities)
     }
 
@@ -205,7 +205,7 @@ public enum PermissionLaw {
 extension SwiftNativeTrustCenter {
     /// Input-aware judgment through the same `PermissionLaw.answer` SecurityCenter uses.
     public func autonomyLevel(forTool toolName: String, input: [String: JSONValue]?) async throws -> String {
-        PermissionLaw.answer(tool: toolName, input: input, policy: try await loadTrustPolicyChecked(), dataRoot: dataRoot).level
+        try PermissionLaw.answer(tool: toolName, input: input, policy: try await loadTrustPolicyChecked(), dataRoot: dataRoot).level
     }
 
     /// Format a Date with the shared TrustCenter timestamp helper.

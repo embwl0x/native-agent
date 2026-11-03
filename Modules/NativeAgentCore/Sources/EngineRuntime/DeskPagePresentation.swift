@@ -26,9 +26,12 @@ public struct DeskPageSnapshot: Sendable {
     public var now = Date.distantPast
     public var jobs: [ScheduledJob] = []
     public var nagConfig = DeskNagConfig()
+    public var nagConfigError: String?
+    public var botScheduleError: String?
     public var herHour: DeskHerHourPresentation.State = .absent
     public var missedBots: [DeskMissedBot] = []
     public var timedBots: [DeskTimedBot] = []
+    public var botsUnavailable: String?
     public var rows: DeskPageContent.Content = ([], [], [], [], [], [], [], [], .quiet, nil)
 
     public static let empty = DeskPageSnapshot()

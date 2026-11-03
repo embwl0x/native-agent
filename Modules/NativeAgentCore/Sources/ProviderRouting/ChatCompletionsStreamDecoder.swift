@@ -1,9 +1,9 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `ChatCompletionsStreamDecoder.swift` | `ChatCompletionsStreamDecoder`: shared buffered terminal decoding/receipts and SSE content/reasoning/tool fragments, usage and root errors; terminal/tool alignment validation preserves provider failures |
+// Blueprint: | `ChatCompletionsStreamDecoder.swift` | `ChatCompletionsStreamDecoder`: shared terminal decoding/receipts and SSE content/reasoning/tool fragments, usage and root errors; nonempty malformed JSON always fails; terminal/tool alignment validation preserves provider failures |
 
-/// Shared decoder for buffered and streamed OpenAI-compatible Chat Completions.
+/// Shared decoder for OpenAI-compatible Chat Completions streams.
 ///
 /// Consumes `choices[0].delta` content, reasoning, and indexed tool fragments;
 /// captures root-level usage wherever it appears; and surfaces root error
@@ -21,23 +21,6 @@ public struct ChatCompletionsStreamDecoder {
     private struct Accum { var id = ""; var name = ""; var arguments = "" }
     private var toolAccum: [Int: Accum] = [:]
     private var toolOrder: [Int] = []
-    /// Slot most recently written to. Fallback anchor for an `index`-less
-    /// fragment whose frame position has no counterpart in `previousFrameSlots`
-    /// — see `slot(for:position:)`.
-    private var currentToolIndex: Int?
-    /// Slots touched by the PREVIOUS `tool_calls` frame, in that frame's array
-    /// order. An id-less fragment at array position `p` of the current frame
-    /// belongs to `previousFrameSlots[p]`: providers that omit `index` keep the
-    /// per-frame array order stable across continuation frames. Reset (rebuilt)
-    /// on every `tool_calls` frame, so it is a per-frame cursor and never a
-    /// decoder-global one.
-    private var previousFrameSlots: [Int] = []
-    /// True while the CURRENT frame's array still lines up with
-    /// `previousFrameSlots`. Cleared the moment an entry lands off-position (a
-    /// new call opening mid-array, a frame that grew), after which id-less
-    /// entries in that frame chain from the open call instead. Reset to true at
-    /// the top of every `tool_calls` frame.
-    private var frameAligned = true
 
     /// True once a `[DONE]` sentinel has been consumed. When the byte stream
     /// ends with this still false, the adapter throws `streamTruncated`.
@@ -48,8 +31,6 @@ public struct ChatCompletionsStreamDecoder {
     /// telemetry shape. `nil` when the stream sent no usage frame — the recorder
     /// omits nil keys, so the row simply carries no token fields.
     public private(set) var usage: LLMUsage?
-    /// Any text, reasoning or tool fragment activates the malformed-frame failure rule in consume.
-    private var sawSemanticOutput = false
     public private(set) var reachedLengthLimit = false
     private var terminalBoundaryReason: LLMToolBoundaryReason?
     private var streamError: Error?
@@ -60,9 +41,10 @@ public struct ChatCompletionsStreamDecoder {
         reachedLengthLimit ? .outputLimit : terminalBoundaryReason ?? runaway.toolBoundaryReason
     }
 
-    public init(providerLabel: String, retainReasoning: Bool = false) {
+    public init(providerLabel: String, retainReasoning: Bool = false, diagnosticDataRoot: URL? = nil) {
         self.providerLabel = providerLabel
         self.retainReasoning = retainReasoning
+        self.runaway = RunawayOutputDetector(diagnosticDataRoot: diagnosticDataRoot)
     }
 
 
@@ -110,6 +92,9 @@ public struct ChatCompletionsStreamDecoder {
         let terminal = Result {
             try finalizedToolCalls(idPrefix: idPrefix, providerID: providerID, sawContent: sawContent)
         }
+        if reachedLengthLimit {
+            RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit", dataRoot: telemetry.diagnosticDataRoot)
+        }
         await telemetry.record(
             requestBody: request.httpBody, provider: providerID, model: model, streaming: true,
             usage: usage, ttftMs: ttftMs,
@@ -125,7 +110,7 @@ public struct ChatCompletionsStreamDecoder {
 
     /// One decoded frame's surface-relevant content. Every field is
     /// empty/nil/zero for a frame the adapter should ignore (role-only delta,
-    /// usage-only empty-choices frame, malformed JSON, keep-alive comment).
+    /// usage-only empty-choices frame, empty keep-alive).
     public struct DecodedFrame: Sendable, Equatable {
         /// This frame was the `[DONE]` sentinel — the adapter breaks its loop.
         public var isDone = false
@@ -161,10 +146,8 @@ public struct ChatCompletionsStreamDecoder {
         }
         guard let data = payload.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            // Unreadable frames are skipped before output starts and fail the stream transiently afterward.
-            guard sawSemanticOutput else { return frame }
-            throw LLMError.transient(
-                message: "\(providerLabel): malformed stream frame after content")
+            throw ProviderFailure.Diagnostic(cause: .malformedResponse,
+                detail: "\(providerLabel): malformed Chat Completions stream frame")
         }
         // Root error frames carry no choices; surface them before reading deltas.
         try throwIfChatCompletionsProviderError(root)
@@ -187,107 +170,66 @@ public struct ChatCompletionsStreamDecoder {
         if let thought = delta["reasoning_content"] as? String, !thought.isEmpty {
             if retainReasoning { reasoning += thought }
             frame.reasoning = thought
-            sawSemanticOutput = true
         }
         if let content = delta["content"] as? String, !content.isEmpty {
             _ = runaway.feed(content)
             let kept = runaway.takeCommittedText()
             frame.content = kept.isEmpty ? nil : kept
-            sawSemanticOutput = true
         }
         if let refusal = delta["refusal"] as? String, !refusal.isEmpty {
             refusalText += refusal
             frame.content = (frame.content ?? "") + refusal
-            sawSemanticOutput = true
         }
         if frame.finishReason != nil, !refusalText.isEmpty { terminalBoundaryReason = .refusal }
         if let calls = delta["tool_calls"] as? [[String: Any]] {
             frame.toolCallDeltaCount = calls.count
-            sawSemanticOutput = true
-            var touched: [Int] = []
-            frameAligned = true
-            for (position, raw) in calls.enumerated() {
-                let index = try slot(for: raw, position: position)
+            for raw in calls {
+                let index = try slot(for: raw)
                 if toolAccum[index] == nil {
                     toolAccum[index] = Accum()
                     toolOrder.append(index)
                 }
-                currentToolIndex = index
-                touched.append(index)
                 // Mutate in place so each fragment does not copy the growing arguments.
-                if let id = raw["id"] as? String, !id.isEmpty { toolAccum[index, default: Accum()].id = id }
+                if let id = raw["id"] as? String, !id.isEmpty {
+                    guard toolAccum[index]?.id.isEmpty != false || toolAccum[index]?.id == id else {
+                        throw LLMError.providerError(message: "\(providerLabel): tool index changed call identity")
+                    }
+                    toolAccum[index, default: Accum()].id = id
+                }
                 if let function = raw["function"] as? [String: Any] {
-                    if let name = function["name"] as? String, !name.isEmpty { toolAccum[index, default: Accum()].name = name }
+                    if let name = function["name"] as? String, !name.isEmpty {
+                        guard toolAccum[index]?.name.isEmpty != false || toolAccum[index]?.name == name else {
+                            throw LLMError.providerError(message: "\(providerLabel): tool call changed function name")
+                        }
+                        toolAccum[index, default: Accum()].name = name
+                    }
                     if let args = function["arguments"] as? String { toolAccum[index, default: Accum()].arguments += args }
                 }
             }
-            previousFrameSlots = touched
         }
         return frame
     }
 
-    /// Resolve a tool fragment by explicit index, then by an already-seen ID.
-    /// Index-less fragments at position p continue the slot at position p in
-    /// the previous tool frame, while those arrays still align. A global
-    /// last-written slot cannot pair interleaved multi-call fragments.
-    ///
-    /// Once frame alignment breaks, an unnamed fragment continues the current
-    /// slot. A new ID or a conflicting function name opens a new slot rather
-    /// than corrupting an existing call. Explicit indexes remain authoritative.
-    private mutating func slot(for raw: [String: Any], position: Int) throws -> Int {
+    /// A wire index or call ID establishes association; array position never does.
+    private mutating func slot(for raw: [String: Any]) throws -> Int {
         if let value = raw["index"] {
             guard let explicit = value as? Int, explicit >= 0 else {
                 throw LLMError.providerError(message: "\(providerLabel): invalid tool index")
             }
-            noteAlignment(of: explicit, at: position)
             return explicit
         }
         let id = (raw["id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         if let id, let known = toolOrder.first(where: { toolAccum[$0]?.id == id }) {
-            noteAlignment(of: known, at: position)
             return known
         }
-        if id == nil, frameAligned, position < previousFrameSlots.count {
-            let candidate = previousFrameSlots[position]
-            if continues(candidate, raw) { return candidate }
-        } else if id == nil, let open = currentToolIndex, continues(open, raw) {
-            // This frame's array no longer lines up with the previous one (an
-            // entry addressed by id/index landed off-position, or the frame
-            // grew): chain from the call this frame most recently opened or
-            // touched rather than trusting a stale position.
-            return open
+        guard id != nil else {
+            throw LLMError.providerError(message: "\(providerLabel): tool fragment has neither an index nor a call ID; repair the provider stream")
         }
-        // New id, a name that disagrees with the resolved slot, or the very
-        // first fragment of the stream: allocate a slot that cannot collide
-        // with an explicit index seen so far.
-        frameAligned = false
         let (next, overflow) = (toolAccum.keys.max() ?? -1).addingReportingOverflow(1)
         guard !overflow else {
             throw LLMError.providerError(message: "\(providerLabel): tool index space exhausted")
         }
         return next
-    }
-
-    /// An id- or index-addressed entry that does NOT land where the previous
-    /// frame's same position landed means this frame's array layout shifted, so
-    /// every LATER id-less entry in it must chain from the open call instead of
-    /// reading a stale position.
-    private mutating func noteAlignment(of slot: Int, at position: Int) {
-        guard position < previousFrameSlots.count, previousFrameSlots[position] == slot else {
-            frameAligned = false
-            return
-        }
-    }
-
-    /// True when `raw` can be a continuation of the call already in `slot`. Only
-    /// a fragment that names a DIFFERENT function is rejected — continuation
-    /// fragments carry no `name` at all, and providers that repeat the name on
-    /// every fragment repeat the same one.
-    private func continues(_ slot: Int, _ raw: [String: Any]) -> Bool {
-        guard let existing = toolAccum[slot]?.name, !existing.isEmpty else { return true }
-        guard let name = (raw["function"] as? [String: Any])?["name"] as? String,
-              !name.isEmpty else { return true }
-        return name == existing
     }
 
     /// Return committed calls with their boundary, or retain the read failure
@@ -305,9 +247,6 @@ public struct ChatCompletionsStreamDecoder {
             }
             return []
         }
-        if reachedLengthLimit {
-            RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
-        }
         if !sawDone && toolBoundaryReason == nil {
             terminalBoundaryReason = .interrupted
             streamError = LLMError.streamTruncated(message: "\(providerID) stream ended without [DONE]")
@@ -316,11 +255,13 @@ public struct ChatCompletionsStreamDecoder {
         for index in toolOrder {
             guard let call = toolAccum[index] else { continue }
             let name = call.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            let id = call.id.isEmpty ? "\(idPrefix)_\(index)_\(call.name)" : call.id
-            let arguments = call.arguments.isEmpty && toolBoundaryReason == nil ? "{}" : call.arguments
-            guard !name.isEmpty,
+            let id = call.id
+            let arguments = call.arguments
+            guard !id.isEmpty, !name.isEmpty,
                   (try? JSONSerialization.jsonObject(with: Data(arguments.utf8))) is [String: Any] else {
-                if toolBoundaryReason == nil { terminalBoundaryReason = .incompleteCall }
+                if toolBoundaryReason == nil {
+                    throw LLMError.providerError(message: "\(providerLabel): incomplete tool call (call ID, name and object arguments are required); repair the provider stream")
+                }
                 continue
             }
             completed.append(LLMStreamToolCall(id: id, name: call.name, inputJSON: Data(arguments.utf8)))

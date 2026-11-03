@@ -3,7 +3,7 @@ import NativeAgentShared
 import ApprovalInbox
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TelegramPollLoop+Approvals.swift` | `TelegramPollLoop`; approval commands/callbacks carry decisions; shared approval transactions own reporting turns; the transport recovers only already-produced legacy answers |
+// Blueprint: | `TelegramPollLoop+Approvals.swift` | `TelegramPollLoop`; approval commands/callbacks carry decisions and terminalize keyboards; shared approval transactions own reporting turns, whose replies use the session's update-delivery journal |
 
 extension TelegramPollLoop {
     func handleApprovalSlashCommand(
@@ -209,79 +209,4 @@ extension TelegramPollLoop {
     }
 
 
-    /// Delivery settlement completes before returning.
-    func finishApprovalContinuation(approvalId: String) async {
-        do {
-            _ = try await approvalInbox.annotateChatContinuation(approvalId, done: true)
-        } catch {
-            await recordError(context: "approval_continuation_forget", error: String(describing: error))
-        }
-    }
-
-    func recoverApprovalAnswer(approvalId: String, destination: TelegramDestination,
-                               resendUnknown: Bool = false) async throws -> (TelegramAssistantDeliveryOutcome, String)? {
-        let key = Data(approvalId.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
-        return try await SwiftNativePersistenceCore.withFileLock(dataRoot.appendingPathComponent("telegram/\(key).delivery")) {
-            let current = try await approvalInbox.get(approvalId)
-            guard case .object(let state)? = current.chatContinuation,
-                  state["done"] != .bool(true), let raw = state["assistantDelivery"] else { return nil }
-            let saved = try JSONDecoder().decode(TelegramAssistantDeliveryState.self, from: raw.serializedData(pretty: false))
-            let delivery = makeAssistantDelivery(destination: destination, turnId: UUID(), errorContext: "recover_approval_answer",
-                update: nil, message: nil, text: nil, approvalId: approvalId)
-            let outcome = await delivery.finalize(reply: saved.reply, savedDelivery: saved, resendUnknown: resendUnknown)
-            if case .delivered = outcome { await finishApprovalContinuation(approvalId: approvalId) }
-            return (outcome, saved.reply)
-        }
-    }
-
-    func retryApprovalAnswer(args: [String], update: TelegramUpdate, message: TelegramMessage, text: String) async throws -> Bool {
-        for approval in try await approvalInbox.list(filter: .resolved) {
-            guard case .object(let state)? = approval.chatContinuation,
-                  state["done"] != .bool(true), let raw = state["assistantDelivery"],
-                  let queued = state["delivery"] else { continue }
-            let continuation = try JSONDecoder().decode(TelegramPendingApprovalContinuation.self, from: queued.serializedData(pretty: false))
-            guard continuation.destination == message.destination else { continue }
-            let retained = try JSONDecoder().decode(TelegramAssistantDeliveryState.self, from: raw.serializedData(pretty: false))
-            if retained.isDelivered { continue }
-            if await turnCoordinator.snapshot(destination: message.destination).isRunning {
-                await sendCommandReply("I'm still delivering that answer.", kind: "retry_busy", update: update, message: message, text: text)
-                return true
-            }
-            if let (outcome, reply) = try await recoverApprovalAnswer(approvalId: approval.id, destination: message.destination,
-                                                                    resendUnknown: args == ["resend"]) {
-                switch outcome {
-                case .held: break
-                case .delivered:
-                    await recordReceipt(kind: "retry_reply", update: update, message: message, text: text, reply: reply)
-                case .failed(let reason), .outcomeUnknown(let reason):
-                    await sendCommandReply(reason, kind: "retry_delivery_pending", update: update, message: message, text: text)
-                }
-            }
-            return true
-        }
-        return false
-    }
-
-    /// Transport recovery carries already-produced words; the shared owner
-    /// alone decides and runs any reporting turn still owed.
-    func recoverApprovalRepliesIfNeeded() async {
-        guard await turnCoordinator.claimApprovalRecovery() else { return }
-        do { try await reconcileSavedReplies() }
-        catch { await recordError(context: "approval_answer_recovery", error: String(describing: error)) }
-    }
-
-}
-/// The approval's retained Telegram delivery payload; its owner holds the life stamp.
-struct TelegramPendingApprovalContinuation: Sendable, Decodable {
-    let approvalId: String
-    let prompt: String
-    let acknowledgement: String
-    let chatId: Int
-    let threadId: Int?
-    let fromUserId: Int?
-    let sessionId: String?
-
-    var destination: TelegramDestination {
-        TelegramDestination(chatId: chatId, threadId: threadId)
-    }
 }

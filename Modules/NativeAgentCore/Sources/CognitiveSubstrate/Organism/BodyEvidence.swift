@@ -58,7 +58,11 @@ public struct BodyEvidenceReference: Codable, Sendable, Equatable, Identifiable 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let rawID = try container.decode(String.self, forKey: .id)
-        self.id = ProviderPathEvidence.isCanonicalDigest(rawID) ? rawID : Self.digest(rawID)
+        guard ProviderPathEvidence.isCanonicalDigest(rawID) else {
+            throw DecodingError.dataCorruptedError(forKey: .id, in: container,
+                debugDescription: "Body evidence requires its canonical SHA-256 identity")
+        }
+        self.id = rawID
         self.evidenceClass = try container.decode(BodyEvidenceClass.self, forKey: .evidenceClass)
         self.observedAt = try container.decode(Date.self, forKey: .observedAt)
         self.receivedAt = try container.decode(Date.self, forKey: .receivedAt)

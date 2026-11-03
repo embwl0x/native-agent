@@ -596,7 +596,7 @@ public struct TelegramUpdate: Sendable, Codable, Equatable {
             throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Invalid Telegram update ID"))
         }
         self.updateId = id
-        self.message = try? c.decodeIfPresent(TelegramMessage.self, forKey: JSONKey("message"))
+        self.message = try c.decodeIfPresent(TelegramMessage.self, forKey: JSONKey("message"))
         self.callbackQuery = c.jsonValue(for: "callback_query") ?? c.jsonValue(for: "callbackQuery")
 
         self.extras = c.extras(excluding: Self.knownKeys)
@@ -651,6 +651,27 @@ struct TelegramCallbackPayload<Command> {
             self.fromUserId = (from["id"]?.integerValue.flatMap(Int.init(exactly:)) ?? from["id"]?.stringValue.flatMap(Int.init))
         } else {
             self.fromUserId = nil
+        }
+    }
+}
+
+extension TelegramAPIFailure {
+    /// Nothing reached Telegram: it answered with a refusal, or the request never left this
+    /// Mac (offline, no route, name lookup failed). A later send may try again. A timeout,
+    /// a dropped connection, an unreadable answer or a server error leaves the outcome unknown.
+    public static func isKnownNotDelivered(_ error: Error) -> Bool {
+        if let failure = error as? TelegramAPIFailure { return failure.isKnownNotDelivered }
+        guard let url = error as? URLError else { return false }
+        return [.notConnectedToInternet, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+                .internationalRoamingOff, .dataNotAllowed].contains(url.code)
+    }
+
+    /// Telegram answered and refused it, so nothing went out.
+    public var isKnownNotDelivered: Bool {
+        switch kind {
+        case .rejected, .invalidDuration: return true
+        case .httpStatus: return httpStatus.map { (400..<500).contains($0) } ?? false
+        case .malformedResponse, .malformedResult: return false
         }
     }
 }

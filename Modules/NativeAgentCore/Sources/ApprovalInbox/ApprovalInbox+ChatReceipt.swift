@@ -14,14 +14,14 @@ extension SwiftNativeApprovalInbox {
         summary: String, resultClass: String, resultStatus: String?, ok: Bool?, resultPreview: String?,
         returnedID: String? = nil, effects: String? = nil,
         recoveredAt: String? = nil
-    ) async throws -> String? {
+    ) async throws {
         guard !sessionID.isEmpty, sessionID != ".", sessionID != "..",
               !sessionID.contains("/"), !sessionID.contains("\\") else {
             throw ApprovalInboxError.malformedResponse("invalid receipt session")
         }
         let path = root.appendingPathComponent("chat/messages")
             .appendingPathComponent("\(sessionID).jsonl")
-        return try await SwiftNativePersistenceCore.withFileLock(path) {
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             let rows = try await SwiftNativePersistenceCore.readJSONL(path)
             let existingIndex = rows.firstIndex { row in
                 guard case .object(let object) = row,
@@ -46,15 +46,6 @@ extension SwiftNativeApprovalInbox {
                 "approvalId": .string(approvalID),
                 "postApproval": .bool(true),
             ]
-            let priorMetadata: [String: JSONValue] = {
-                guard case .object(let value)? = priorObject["metadata"] else { return [:] }
-                return value
-            }()
-            // Preserve the old claim until it has migrated to the approval.
-            let legacyStarted = priorMetadata["approvalContinuationStarted"] == .bool(true)
-            if legacyStarted {
-                metadata["approvalContinuationStarted"] = .bool(true)
-            }
             if let ok { metadata["ok"] = .bool(ok) }
             metadata["resultClass"] = .string(resultClass)
             // The same exact word any tool row keeps beside its class.
@@ -108,9 +99,6 @@ extension SwiftNativeApprovalInbox {
             } else {
                 try await ContactThread.append(row, to: path)
             }
-            guard legacyStarted else { return nil }
-            if case .string(let date)? = priorObject["createdAt"] { return date }
-            return now
         }
     }
 }

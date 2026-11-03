@@ -5,13 +5,13 @@ import Foundation
 package enum ProviderFamilyIdentity {
     package static func normalize(_ raw: String) -> String {
         switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "anthropic", "anthropic_oauth_direct", "anthropic_mcp":
+        case "anthropic", "anthropic_oauth_direct":
             return "anthropic"
         case "openai", "openai_oauth_direct":
             return "openai"
-        case "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth":
+        case "xai_oauth_direct":
             return "xai"
-        case "moonshot", "kimi":
+        case "moonshot":
             return "moonshot"
         case "openrouter":
             return "openrouter"

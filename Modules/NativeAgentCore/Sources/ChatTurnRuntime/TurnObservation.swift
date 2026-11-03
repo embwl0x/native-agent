@@ -18,8 +18,6 @@ enum TurnObservation {
         case restarted(stepsDone: Int, unknownStep: Int?, started: [String] = [])
         /// Her turn part failed and the stem swapped it back; never model-visible.
         case healed(from: String, to: String, why: String)
-        /// No helper could start to run her turn part; the stem retries. Never model-visible.
-        case helperUnavailable(why: String, retryIn: Int)
     }
 
     static func text(_ kind: Kind) -> String {
@@ -62,8 +60,6 @@ enum TurnObservation {
                 + " Calls without receipts may have taken effect; inspect their affected state before repeating them."
         case .healed(let from, let to, let why):
             happened = "Her turn part \(from) failed (\(line(why))); the stem swapped in \(to) and replayed this turn's log through it."
-        case .helperUnavailable(let why, let seconds):
-            happened = "No helper could start to run her turn part (\(line(why))); the stem tries again in \(seconds) seconds."
         }
         return "[turn.observation reason=\(code(kind))] " + happened + " Do not repeat completed work or delivered prose."
     }
@@ -88,7 +84,6 @@ enum TurnObservation {
         case .notesUnwritten: "working_notes_unwritten"
         case .restarted: "turn_restarted"
         case .healed: "turn_part_healed"
-        case .helperUnavailable: "turn_helper_unavailable"
         }
     }
 

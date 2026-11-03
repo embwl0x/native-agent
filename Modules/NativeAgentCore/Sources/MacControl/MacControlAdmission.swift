@@ -14,27 +14,33 @@ extension SwiftNativeMacControl {
     /// A refusal returns its shaped result; proceed continues native dispatch.
     enum GatePreflightOutcome {
         case refuse(MacControlResult)
-        case proceed
+        case proceed(fullMacAdmitted: Bool)
     }
 
     /// Check master, remote, and category gates before the file-policy layer. Execution, approval, and operation receipts remain with their owners.
     func gatePreflightOutcome(
         action: String,
         body: [String: JSONValue]
-    ) async -> GatePreflightOutcome {
+    ) async throws -> GatePreflightOutcome {
         // The entry point validates explicit replay capabilities. Every call reaches this policy preflight, with or without a replay capability.  No provider configured: tests and direct library callers can exercise handlers in isolation.
         // Production wires a Swift TrustCenter provider.
-        guard let provider = policyProvider else { return .proceed }
-        guard let category = macControlGateCategory(forAction: action) else {
-            // self_test / unmapped: no single category to pre-gate. Unsupported actions fail closed after this pre-flight.
-            return .proceed
-        }
-        guard let policy = await provider.currentPolicy() else {
+        let checkedPolicy: MacControlPolicy?
+        do { checkedPolicy = try await policyProvider?.currentPolicy() }
+        catch {
             return .refuse(Self.refusalResult(
                 action: action,
-                reason: "mac_control_policy_unavailable: Swift trust policy could not be resolved",
-                now: now
+                reason: "mac_control_policy_unavailable: \(error.localizedDescription)",
+                now: now,
+                remedy: Repair.why(owner: "trust/policy.json", tap: "Trust", instruction: "Preserve the saved policy bytes and repair the authority before continuing.")
             ))
+        }
+        let fullMacAdmitted = checkedPolicy?.fullMacAdmitted == true || MacAppActGate.fullMacAdmitted
+        if let refusal = try await MacAppActGate.$fullMacAdmitted.withValue(fullMacAdmitted, operation: {
+            try await MacAppActGate.requestRefusal(tool: action, input: body, dataRoot: permissionDataRoot)
+        }) { return .refuse(refusal.result(action: action)) }
+        guard let provider = policyProvider, let policy = checkedPolicy,
+              let category = macControlGateCategory(forAction: action) else {
+            return .proceed(fullMacAdmitted: fullMacAdmitted)
         }
         let trigger = body["trigger"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 } ?? "user"
 
@@ -79,7 +85,7 @@ extension SwiftNativeMacControl {
                 return .refuse(result)
             }
         }
-        return .proceed
+        return .proceed(fullMacAdmitted: fullMacAdmitted)
     }
 
     /// Preserve `httpStatus:403` and the verbatim gate reason for callers rendering a refusal.
@@ -145,6 +151,7 @@ extension SwiftNativeMacControl {
                 "status": .string("not_trusted"),
                 "error": .string(error),
                 "note": .string(MacAccessibilityReader.notTrustedNote),
+                "remedy": MacFourVerbsReply.privacyRemedy(error) ?? .null,
             ]),
             error: error,
             durationMs: 0
@@ -199,7 +206,14 @@ extension SwiftNativeMacControl {
         body: [String: JSONValue]
     ) async -> MacControlResult {
         let result = Self.refusalResult(action: action, reason: reason, now: now)
-        if let provider = policyProvider, let policy = await provider.currentPolicy() {
+        if let provider = policyProvider {
+            let policy: MacControlPolicy
+            do { policy = try await provider.currentPolicy() }
+            catch {
+                return Self.refusalResult(action: action,
+                    reason: "mac_control_policy_unavailable: \(error.localizedDescription)", now: now,
+                    remedy: Repair.why(owner: "trust/policy.json", tap: "Trust", instruction: "Preserve the saved policy bytes and repair the authority before continuing."))
+            }
             await emitBlockedAudit(
                 action: action,
                 category: macControlGateCategory(forAction: action) ?? "accessibility",
@@ -212,15 +226,15 @@ extension SwiftNativeMacControl {
         return result
     }
 
-    static func handWaitMilliseconds(seconds: Double?) -> Int {
-        let finiteSeconds = seconds.flatMap { $0.isFinite ? $0 : nil } ?? 0.6
-        // Clamp while still floating point, before multiplication or Int conversion can overflow. The existing hand range stays 0...10s.
-        return Int(max(0, min(finiteSeconds, 10)) * 1000)
-    }
-
-    static func handDragMilliseconds(seconds: Double?) -> Int {
-        guard let seconds, seconds.isFinite, seconds > 0 else { return 240 }
-        return Int(max(0.08, min(seconds, 2)) * 1000)
+    /// Defaults apply to absent values only; explicit invalid durations emit nothing.
+    static func handDurationMilliseconds(_ value: JSONValue?, field: String, defaultMilliseconds: Int,
+                                         range: ClosedRange<Double>) throws -> Int {
+        guard let value else { return defaultMilliseconds }
+        guard let seconds = value.numberValue(coercingStrings: false, finiteOnly: true), range.contains(seconds) else {
+            throw NSError(domain: "MacControlArguments", code: 400,
+                userInfo: [NSLocalizedDescriptionKey: "invalid_duration: \(field) must be a finite number in \(range.lowerBound)...\(range.upperBound) seconds"])
+        }
+        return Int(seconds * 1000)
     }
 
     /// Effect-time human-takeover check shared by every motor sibling.
@@ -228,9 +242,9 @@ extension SwiftNativeMacControl {
         action: String,
         body: [String: JSONValue]
     ) async -> MacControlResult? {
-        if let refusal = MacWorkContinuation.current?.refusal() {
+        if let continuation = MacWorkContinuation.current, let refusal = continuation.refusal() {
             return MacControlResult(ok: false, action: action,
-                output: .object(["message": .string(refusal)]), error: "continuation_unavailable",
+                output: .object(continuation.refusalOutput(refusal)), error: "continuation_unavailable",
                 durationMs: 0)
         }
         let sessionId = body["attention_session"]?.stringValue

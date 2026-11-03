@@ -1,7 +1,7 @@
 /* NativeAgent ability
 {
   "id": "desk-notify",
-  "kind": "tool",
+  "kind": "ability",
   "version": 1,
   "reach": {"capabilities": [], "readPaths": [], "hosts": [], "apps": []},
   "face": {"page": "desk"},

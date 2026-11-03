@@ -74,7 +74,7 @@ extension ChatGPTTransport {
                     if !hasImage { flushContent() }
                 case .toolUse(let id, let name, let inputJSON):
                     flushContent()
-                    let argsStr = String(data: inputJSON, encoding: .utf8) ?? "{}"
+                    let argsStr = try checkedProviderJSONText(inputJSON, owner: "Recorded tool call \(name) (\(id))")
                     inputItems.append([
                         "type": "function_call",
                         "name": name,
@@ -113,7 +113,7 @@ extension ChatGPTTransport {
         if let system, !system.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             body["instructions"] = system
         }
-        OpenAIExecutionControls.applyResponsesControls(
+        try OpenAIExecutionControls.applyResponsesControls(
             to: &body,
             model: model,
             transport: transport,
@@ -133,12 +133,7 @@ extension ChatGPTTransport {
                     "description": t.description,
                 ]
                 if transport == .publicAPI { entry["strict"] = false }
-                do {
-                    entry["parameters"] = try JSONSerialization.jsonObject(with: t.parametersJSON)
-                } catch {
-                    if transport == .publicAPI { throw error }
-                    entry["parameters"] = ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
-                }
+                entry["parameters"] = try t.checkedParameters().foundationObject
                 toolList.append(entry)
             }
             body["tools"] = toolList

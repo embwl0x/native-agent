@@ -5,7 +5,7 @@ import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SenseNewsBoard.swift` | Durable bounded unread/recent news, deduplication, acknowledgement, storage failures and care crossing |
+// Blueprint: | `SenseNewsBoard.swift` | Durable bounded unread/recent news, deduplication, acknowledgement, storage failures and care crossing; post/keep accept only after checked persistence, preserving prior news on failure |
 /// The latest news from live senses. The runner posts; her context and the
 /// surfaces read. Bounded: older news falls off.
 public actor SenseNewsBoard {
@@ -42,8 +42,9 @@ public actor SenseNewsBoard {
     public private(set) var storageFailure: String?
     /// Bind before live readers start. Only a missing file means an empty
     /// board; damaged bytes are preserved and the failure remains visible.
-    public func configure(dataRoot: URL) {
-        guard storageURL == nil else { return }
+    @discardableResult
+    public func configure(dataRoot: URL) -> Bool {
+        guard storageURL == nil || storageBlocked else { return true }
         defer { NotificationCenter.default.post(name: Self.presentationDidChange, object: nil) }
         let directory = dataRoot.appendingPathComponent("senses/news", isDirectory: true)
         storageURL = directory.appendingPathComponent("unread.json")
@@ -97,10 +98,15 @@ public actor SenseNewsBoard {
                 throw storageError("Private news store is unreadable.")
             }
             prune(save: false)
+            // Only this checked reopen may release a blocked binding. A
+            // later failed write is refused and leaves the store blocked.
+            storageBlocked = false
             try persist()
+            return true
         } catch {
             storageBlocked = true
             fail(error)
+            return false
         }
     }
     public func present(_ view: SenseInteractiveView?) {
@@ -136,13 +142,20 @@ public actor SenseNewsBoard {
     }
     /// A part's line already weighed against her cares that woke nothing: it
     /// waits here for her next turn.
-    public func keep(_ news: SenseNews) async {
-        guard !Task.isCancelled else { return }
+    @discardableResult
+    public func keep(_ news: SenseNews) async -> Bool {
+        guard !Task.isCancelled else { return false }
         let before = (items, recent, histories)
-        do { try postCurrent(news) }
-        catch { (items, recent, histories) = before; fail(error); return }
-        saveVisible()
+        do { try postCurrent(news); try persist() }
+        catch {
+            (items, recent, histories) = before
+            fail(error)
+            NotificationCenter.default.post(name: Self.presentationDidChange, object: nil)
+            return false
+        }
+        NotificationCenter.default.post(name: Self.presentationDidChange, object: nil)
         await published(news)
+        return true
     }
     private func published(_ news: SenseNews) async {
         await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
@@ -251,7 +264,7 @@ public actor SenseNewsBoard {
         bounded(text.split(whereSeparator: \.isNewline).joined(separator: " · "), bytes: maximumUpdateBytes)
     }
     private func persist() throws {
-        guard let storageURL else { return }
+        guard let storageURL else { throw storageError("Private news storage is not bound.") }
         guard !storageBlocked else { throw storageError(storageFailure ?? "Private news storage is unavailable.") }
         let bytes = try JSONEncoder().encode(Saved(items: items, recent: recent, histories: histories))
         guard bytes.count <= Self.maximumStorageBytes else { throw storageError("Private news storage exceeded its byte bound.") }

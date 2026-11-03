@@ -8,25 +8,26 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
-// Blueprint: | `ConversationPrefixSeeding.swift` | One provider-independent user-leading context delivery; ordered paragraph replacements from the preceding replayed complete state, keyframes, sent-row metadata and full/delta byte telemetry |
+import Synchronization
+// Blueprint: | `ConversationPrefixSeeding.swift` | One provider-independent user-leading context delivery; ordered paragraph replacements from the preceding replayed complete state, keyframes, sent-row metadata and full/delta byte telemetry; bounded exact-input diagnostic preview reuse keeps unchanged history redaction off subsequent dispatches |
 
 /// historyMessages ‖ [user: sent context block, current words].
 /// Every provider gets the same layout. Earlier blocks remain exactly as sent
 /// on their user rows; changes replace paragraphs of the preceding state. A route/window
 /// change or loss of the last full block starts a new keyframe.
 enum ConversationPrefixSeeding {
+    private struct PreviewKey: Hashable, Sendable {
+        let bytes: Data
+        let limit: Int
+    }
+    private static let previews = Mutex<(rows: [PreviewKey: String], bytes: Int)>(([:], 0))
+    private static let previewMaximumBytes = 8 * 1024 * 1024
     enum VolatileDelivery: String, Sendable, Equatable {
         case userLeadingBlock
         case none
     }
 
-    static func currentUserMessage(_ ctx: TurnContext) -> LLMMessage {
-        ctx.imageBlocks.isEmpty
-            ? .user(ctx.userMessage)
-            : .userWithImages(ctx.userMessage, images: ctx.imageBlocks)
-    }
-
-    struct Seed {
+    struct Seed: Sendable {
         let context: TurnContext
         let messages: [LLMMessage]
         let delivery: VolatileDelivery
@@ -42,30 +43,65 @@ enum ConversationPrefixSeeding {
     static func seed(_ ctx: TurnContext, textToolCatalogAppendix: String? = nil) -> Seed {
         var split = ctx.splittingVolatileBlock(appending: textToolCatalogAppendix ?? "")
         let full = split.turnVolatileBlock ?? ""
-        let sent = SentTurnContext.delivery(full: full, replayed: split.replayedTurnContexts,
-            model: split.modelId, provider: split.providerId, window: split.historyContextWindow,
-            userText: split.userMessage)
+        let request = SessionRequestMessages.seed(history: split.historyMessages,
+            replayed: split.replayedTurnContexts, fullBlock: full, model: split.modelId,
+            provider: split.providerId, window: split.historyContextWindow, userText: split.userMessage,
+            images: split.imageBlocks)
+        let sent = request.sent
         split.turnVolatileBlock = sent.block
-        var messages = split.historyMessages
-        var current = currentUserMessage(split)
-        if !sent.block.isEmpty {
-            current = LLMMessage(role: .user, content: [.text(sent.block)] + current.content)
-        }
-        // Failed turns can leave a trailing user message. Preserve its blocks
-        // and append this turn's blocks to avoid a rejected same-role pair.
-        let currentUserIndex: Int
-        if let last = messages.last, last.role == .user {
-            messages[messages.count - 1] = LLMMessage(role: .user, content: last.content + current.content)
-            currentUserIndex = messages.count - 1
-        } else {
-            currentUserIndex = messages.count
-            messages.append(current)
-        }
-        return Seed(context: split, messages: messages,
+        return Seed(context: split, messages: request.messages,
             delivery: sent.block.isEmpty ? .none : .userLeadingBlock,
-            currentUserIndex: currentUserIndex,
+            currentUserIndex: request.currentUserIndex,
             textToolCatalogRidesVolatileBlock: textToolCatalogAppendix != nil,
             sentContext: sent, fullBlockBytes: full.utf8.count)
+    }
+
+    struct Request: Sendable {
+        let seed: Seed
+        let system: String?
+        let segments: SystemPromptSegments?
+        let tools: [LLMToolSchema]?
+        var additionalMessages: [LLMMessage] = []
+        var messages: [LLMMessage] {
+            var result = seed.messages
+            for message in additionalMessages {
+                if let last = result.last, last.role == message.role {
+                    result[result.count - 1] = LLMMessage(role: last.role, content: last.content + message.content)
+                } else { result.append(message) }
+            }
+            return result
+        }
+        func appending(_ messages: [LLMMessage]) -> Self {
+            var result = self
+            result.additionalMessages = messages
+            return result
+        }
+        func plan(runID: String, userMessageID: String?, additionalCharacters: Int = 0) throws -> SessionContextPlan {
+            guard let replay = seed.context.historyReplaySpec else {
+                throw ProviderRoutingError.configurationFailed("This conversation's request has no replay builder.")
+            }
+            return SessionContextPlan(replay: replay, currentRunID: runID, currentUserMessageID: userMessageID,
+                systemAndToolsCharacters: LLMMessage.inputCharacters([], system: system, tools: tools ?? []),
+                additionalCharacters: additionalCharacters, model: seed.context.modelId, provider: seed.context.providerId)
+        }
+        var measurement: SessionContextRequest {
+            get throws { try SessionContextRequest(messages: messages, system: system, tools: tools ?? [],
+                historyCharacters: LLMMessage.inputCharacters(seed.context.historyMessages, system: nil, tools: []),
+                rowCharacters: seed.context.historyRowCharacters) }
+        }
+    }
+
+    /// The request and its count leave the same builder, after codec layout.
+    static func request(_ context: TurnContext, codec: ToolCallCodec) throws -> Request {
+        let seed = seed(context, textToolCatalogAppendix: codec == .textMarkers
+            ? try TextMarkerCodec.volatileCatalogAppendix(for: context) : nil)
+        let layout = codec == .textMarkers
+            ? try TextMarkerCodec.systemLayout(baseSystem: seed.context.systemPrompt,
+                segments: seed.context.systemSegments, context: seed.context)
+            : (system: seed.context.systemPrompt ?? "", segments: seed.context.systemSegments)
+        let names = ProviderToolNameMap(seed.context.toolSchemas)
+        return Request(seed: seed, system: layout.system, segments: layout.segments,
+            tools: codec.requestTools(names.schemas))
     }
 
     /// Nudges append to the trailing user message without changing prior blocks.
@@ -135,19 +171,28 @@ enum ConversationPrefixSeeding {
 
     /// Redact the whole string before capping its single-line trace preview so partial secrets cannot survive.
     static func tracePreview(_ text: String, limit: Int) -> String {
-        String(
+        let key = PreviewKey(bytes: Data(text.utf8), limit: limit)
+        if let kept = previews.withLock({ $0.rows[key] }) { return kept }
+        let preview = String(
             NativeAgentSecretRedactor.redactText(text)
                 .replacingOccurrences(of: "\n", with: " ")
                 .prefix(limit)
         )
+        if key.bytes.count <= previewMaximumBytes {
+            previews.withLock { memo in
+                guard memo.rows[key] == nil else { return }
+                if memo.rows.count >= 64 || memo.bytes + key.bytes.count > previewMaximumBytes {
+                    memo = ([:], 0)
+                }
+                memo.rows[key] = preview
+                memo.bytes += key.bytes.count
+            }
+        }
+        return preview
     }
 
     /// Fingerprint + size receipts for one seeded turn, published to the turn
     /// trace and the `llm.call` row. Payload-free.
-    /// The window facts come off the CONTEXT, not from the caller: the cursor
-    /// ran ONCE, inside the context build, and every seeding site has to report
-    /// that same decision rather than re-reading it from disk or passing a
-    /// placeholder that quietly disagrees with it.
     static func telemetry(
         _ seed: Seed,
         toolSchemaFingerprint: String
@@ -190,8 +235,7 @@ enum ConversationPrefixSeeding {
             volatileDeltaBlockBytes: seed.sentContext.block.utf8.count,
             volatileKeyframe: seed.sentContext.isKeyframe,
             volatileDelivery: seed.delivery.rawValue,
-            windowCursorAdvanceCount: seed.context.historyWindowReceipt?.advanceCount ?? 0,
-            windowSlid: seed.context.historyWindowReceipt?.slid ?? false,
+            historyContextWindow: seed.context.historyContextWindow,
             messageCount: seed.messages.count,
             messageDigests: Array(digests.prefix(messageDigestCount)),
             prefixMessageDigests: Array(digests.prefix(before.count)),

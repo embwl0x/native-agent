@@ -2,17 +2,18 @@ import Foundation
 import Experiences
 import NativeAgentCore
 import PersistenceCore
+import MemoryV2
+import PersonaEngine
 import Transcripts
 
-// Blueprint: | `REMProposalStore.swift` | `REMProposalStore`: canonical proposal JSONL, checked reads, legacy import, approval transitions and bounded compaction |
+// Blueprint: | `REMProposalStore.swift` | `REMProposalStore`: sole canonical proposal JSONL including source-bound displaced content, checked reads, approval transitions and bounded compaction |
 
 // Canonical REM proposal store — `<dataRoot>/rem_proposals.jsonl`, one
 // camelCase row per line. This is THE store: REMConsolidator (full weekly
-// pipeline), REMCycleLoop (legacy tick path), and the Mac app's
+// pipeline) and the Mac app's
 // approval-resolve executor all read and write through it; the pins emitter
 // (`REMConsolidator.emitREMPinsIndex`) derives `rem_pins.json` from it. The
-// snake_case file at `<dataRoot>/harness/rem_proposals.jsonl` is import-only
-// (see `importLegacyHarnessFileIfNeeded`) — no production writer remains.
+// No alternate proposal store participates in reads or writes.
 //
 // Mutations hold the sibling `<path>.lock` flock; lock-free reads see appends or atomic rewrites.
 
@@ -32,8 +33,7 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
     public var status: String
     public var approvalId: String?
     /// The passages the proposal rests on, verbatim, with the sources behind
-    /// each. Optional on the wire: rows written before this shape decode
-    /// unchanged, and a proposal with nothing verifiable carries none.
+    /// each. A proposal with nothing verifiable carries none.
     public var supportingPassages: [REMSupportingPassage]?
     /// The distinct dates the material actually HAPPENED on — what recurrence
     /// is counted in, as opposed to `evidenceDates`, which are dream dates.
@@ -44,6 +44,9 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
     public var support: REMSupportKind?
     /// The circumstance behind the lesson, never written to GROWTH.
     public var whatChanged: String?
+    /// Exact displaced words and their source at proposal creation. Absent in
+    /// a record when no alternative was recorded; never means none.
+    public var replaced: REMReplacement?
 
     public init(
         id: String,
@@ -57,8 +60,10 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
         supportingPassages: [REMSupportingPassage]? = nil,
         livedDates: [String]? = nil,
         support: REMSupportKind? = nil,
-        whatChanged: String? = nil
+        whatChanged: String? = nil,
+        replaced: REMReplacement? = nil
     ) {
+        self.replaced = replaced
         self.whatChanged = whatChanged
         self.id = id
         self.targetDoc = targetDoc
@@ -79,8 +84,7 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
         // Recollection row IDs change on folding; only canonical exchanges and
         // messages count, each once by its identity.
         return passages.flatMap(\.sourceRefs).filter {
-            $0.hasPrefix("exchange:") || $0.hasPrefix("message:") || UUID(uuidString: $0) != nil
-                || $0.hasPrefix("chat.user_turn:") || $0.hasPrefix("chat.assistant_turn:")
+            $0.hasPrefix("exchange:") || $0.hasPrefix("message:")
         }
     }
 
@@ -150,19 +154,9 @@ public struct REMProposalStore: Sendable {
         dataRoot.appendingPathComponent("rem_proposals_base.json")
     }
 
-    /// Retired snake_case side-store. Import-only; renamed to
-    /// `rem_proposals.jsonl.migrated` after the one-time import.
-    public var legacyHarnessURL: URL {
-        dataRoot
-            .appendingPathComponent("harness", isDirectory: true)
-            .appendingPathComponent("rem_proposals.jsonl")
-    }
-
     // MARK: Read
 
     /// Display reads retain partial evidence and name every unreadable part.
-    public func loadAll() -> [REMProposalRow] { loadAllChecked().rows }
-
     public func loadAllChecked() -> (rows: [REMProposalRow], unreadable: [String]) {
         let read = readChecked()
         return (Self.fold(feedRows: read.feed, baseRows: read.base), read.unreadable)
@@ -328,81 +322,6 @@ public struct REMProposalStore: Sendable {
         }
     }
 
-    // MARK: One-time legacy import
-
-    /// Import the legacy `<dataRoot>/harness/rem_proposals.jsonl` snake_case
-    /// rows into the canonical store: map to camelCase, force status
-    /// "pending" (nothing legacy ever flipped one), dedupe by id, then
-    /// rename the source to `.migrated`. Idempotent — skips silently when
-    /// the legacy file is absent or `.migrated` already exists. Callers run
-    /// this lazily at the pipeline's first store open, NOT at app boot.
-    @discardableResult
-    public func importLegacyHarnessFileIfNeeded() async throws -> Int {
-        let legacy = legacyHarnessURL
-        let migrated = legacy.appendingPathExtension("migrated")
-        let fm = FileManager.default
-        // Cheap pre-check outside the lock; re-checked inside because another
-        // process may complete the import while we wait on the flock.
-        guard fm.fileExists(atPath: legacy.path),
-              !fm.fileExists(atPath: migrated.path) else { return 0 }
-        return try await SwiftNativePersistenceCore.withFileLock(proposalsURL) {
-            let fm = FileManager.default
-            guard fm.fileExists(atPath: legacy.path),
-                  !fm.fileExists(atPath: migrated.path) else { return 0 }
-            // Legacy wire schema (REMCycleLoop pre-cutover): snake_case
-            // except `createdAt` — that inconsistency was on-disk, mirror it.
-            struct LegacyWire: Decodable {
-                let id: String
-                let target_doc: String
-                let proposed_text: String
-                let evidence_dates: [String]?
-                let createdAt: String?
-                let status: String?
-            }
-            // The legacy file is an append-only EVENT LOG: one id can appear
-            // repeatedly as its status progressed (pending → applying →
-            // applied). Collapse to the LAST row per id — the final status is
-            // the truth — before deciding what imports.
-            var order: [String] = []
-            var finals: [String: LegacyWire] = [:]
-            for line in Self.readLines(legacy) {
-                guard let wire = try? JSONDecoder().decode(LegacyWire.self, from: line),
-                      !wire.id.isEmpty else { continue }
-                if finals[wire.id] == nil { order.append(wire.id) }
-                finals[wire.id] = wire
-            }
-            let seen = Set(try self.loadAllStrictly().map(\.id))
-            var buffer = Data()
-            var imported = 0
-            for id in order {
-                guard let wire = finals[id], !seen.contains(id) else { continue }
-                guard Self.supportsProposalTarget(wire.target_doc) else { continue }
-                // Imported lessons obey the same passage bound as fresh proposals.
-                guard Self.growthPassageRefusal(wire.proposed_text) == nil else { continue }
-                // Applied rows stay in migrated history; unfinished rows import as pending for human approval.
-                if wire.status == "applied" { continue }
-                let row = REMProposalRow(
-                    id: wire.id,
-                    targetDoc: Self.normalizedTargetDoc(wire.target_doc),
-                    proposalText: wire.proposed_text,
-                    evidenceDates: wire.evidence_dates ?? [],
-                    confidence: 0, // legacy wire carried no confidence
-                    createdAt: wire.createdAt ?? "",
-                    status: "pending"
-                )
-                buffer.append(Data((try Self.encodeRow(row) + "\n").utf8))
-                imported += 1
-            }
-            if !buffer.isEmpty {
-                try SwiftNativePersistenceCore.appendLines(buffer, to: self.proposalsURL)
-            }
-            // Rename even when 0 rows survived the dedupe — the rename is
-            // the one-time marker.
-            try fm.moveItem(at: legacy, to: migrated)
-            return imported
-        }
-    }
-
     // MARK: Approval staging
 
     /// Stage every pending, unstamped row through `stage`, stamping rows
@@ -473,6 +392,70 @@ public struct REMProposalStore: Sendable {
     }
 
     // MARK: Decision application
+
+    public struct LessonApplication: Sendable {
+        public let row: REMProposalRow
+        public let growthAppended: Bool
+        public let stale: Bool
+    }
+
+    /// Apply the canonical proposal, including recovery after GROWTH or a
+    /// graduation landed but the proposal/approval receipt did not. Eligibility
+    /// is a pre-effect condition; matching completed effects are evidence of
+    /// this application's progress, not an externally stale correction.
+    public func applyApprovedLesson(proposalId: String, expectedProposalText: String) async throws -> LessonApplication {
+        try await SwiftNativePersistenceCore.withFileLock(proposalsURL.appendingPathExtension("application")) {
+            guard let row = try self.loadAllStrictly().first(where: { $0.id == proposalId }) else {
+                throw REMProposalStoreError.notFound(proposalId)
+            }
+            guard row.status == "pending" || row.status == "approved" else {
+                throw REMProposalStoreError.conflict(id: proposalId, status: row.status)
+            }
+            guard !expectedProposalText.isEmpty, row.proposalText == expectedProposalText else {
+                throw NSError(domain: "REMProposalApprove", code: 409, userInfo: [
+                    NSLocalizedDescriptionKey: "The canonical lesson no longer matches the text reviewed on this approval. Review the changed proposal before applying it."
+                ])
+            }
+            let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: self.dataRoot)
+            let growth = try SwiftNativePersonaEngine.readPersonaDocument(at: personaRoot.appendingPathComponent("GROWTH.md"))
+            let landed = REMGrowthWriter.containsEntryParagraph(growth, row.proposalText.trimmingCharacters(in: .whitespacesAndNewlines))
+            let graduating = (row.support == .standing ? row.supportingPassages ?? [] : []).flatMap { passage in
+                passage.sourceRefs.filter { $0.hasPrefix("memory:") }
+                    .map { (id: String($0.dropFirst("memory:".count)), quote: passage.quote) }
+            }
+            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: self.dataRoot)
+            for item in graduating {
+                let memory = try await storage.memory(id: item.id)
+                let eligible = memory.map { $0.status == "active" && MemoryLifecycle.isRecallEligible($0.lifecycle) } == true
+                let graduated = landed && memory?.lifecycle == MemoryLifecycle.graduated
+                guard let memory, memory.content == item.quote, eligible || graduated else {
+                    // A landed lesson must never be denied as stale by recovery.
+                    // A changed source after landing is an owed owner repair.
+                    if landed || row.status == "approved" {
+                        throw NSError(domain: "REMProposalApprove", code: 409, userInfo: [
+                            NSLocalizedDescriptionKey: "Lesson \(proposalId) has application evidence but source memory \(item.id) no longer matches. Preserve the lesson and repair its graduation before settling."
+                        ])
+                    }
+                    let denied = try await self.applyDenial(proposalId: proposalId, reason: "stale", tombstone: false)
+                    return LessonApplication(row: denied, growthAppended: false, stale: true)
+                }
+            }
+            guard row.status != "approved" || landed else {
+                throw NSError(domain: "REMProposalApprove", code: 409, userInfo: [
+                    NSLocalizedDescriptionKey: "Approved lesson \(proposalId) is absent from GROWTH; review its canonical document before receipt repair."
+                ])
+            }
+            let appended = try await REMGrowthWriter.appendApprovedLesson(personaRoot: personaRoot, proposalText: row.proposalText)
+            for item in graduating {
+                if try await storage.memory(id: item.id)?.lifecycle != MemoryLifecycle.graduated {
+                    _ = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: self.dataRoot).updateMemory(
+                        id: item.id, update: .object(["lifecycle": .string(MemoryLifecycle.graduated)]))
+                }
+            }
+            let approved = try await self.applyApproval(proposalId: proposalId)
+            return LessonApplication(row: approved, growthAppended: appended, stale: false)
+        }
+    }
 
     /// Approve: flip pending→approved under one flock'd R-M-W, then rebuild
     /// rem_pins.json so the chat-turn injector sees the pin next turn.
@@ -623,13 +606,6 @@ public struct REMProposalStore: Sendable {
             return "over \(growthPassageScalarCap) characters"
         }
         return nil
-    }
-
-    private static func readLines(_ url: URL) -> [Data] {
-        guard let body = try? Data(contentsOf: url) else { return [] }
-        // Decode each physical row independently: a torn UTF-8 scalar must
-        // neither hide later rows nor be replaced when another row changes.
-        return body.split(separator: 0x0A).map { Data($0) }
     }
 
     private static func decodeRow(_ line: Data) -> REMProposalRow? {

@@ -20,8 +20,9 @@ public enum Keyring {
         public var clientSecret: String?
         public var clientAuth: String?
         public var refreshToken: String
-        public var expires: Date
-        public init(token: String, clientID: String, clientSecret: String?, clientAuth: String?, refreshToken: String, expires: Date) {
+        /// Nil means the service supplied no expiry; renew before the next use.
+        public var expires: Date?
+        public init(token: String, clientID: String, clientSecret: String?, clientAuth: String?, refreshToken: String, expires: Date?) {
             self.token = token; self.clientID = clientID; self.clientSecret = clientSecret; self.clientAuth = clientAuth
             self.refreshToken = refreshToken; self.expires = expires
         }
@@ -94,10 +95,15 @@ public enum Keyring {
 
     public static func save(_ name: String, _ entry: Entry) throws {
         let data = try JSONEncoder().encode(entry)
-        try lock.withLock {
-            if try DeviceSecretKeychain.read(service: service, account: name) == nil {
-                try DeviceSecretKeychain.insert(data, service: service, account: name)
-            } else { try DeviceSecretKeychain.replace(data, service: service, account: name) }
+        do {
+            try lock.withLock {
+                if try DeviceSecretKeychain.read(service: service, account: name) == nil {
+                    try DeviceSecretKeychain.insert(data, service: service, account: name)
+                } else { try DeviceSecretKeychain.replace(data, service: service, account: name) }
+            }
+        } catch let error as DeviceSecretKeychain.Failure {
+            if case .acceptedButUnverified = error { changed() }
+            throw error
         }
         changed()
     }

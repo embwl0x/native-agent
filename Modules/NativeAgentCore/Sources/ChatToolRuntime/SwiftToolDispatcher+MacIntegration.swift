@@ -233,6 +233,11 @@ extension SwiftToolDispatcher {
         surface: String,
         input: [String: JSONValue]
     ) async throws -> JSONValue {
+        if MacAppActGate.dataRoot != dataRoot {
+            return try await MacAppActGate.$dataRoot.withValue(dataRoot) {
+                try await dispatchMacIntegrationTool(tool: tool, surface: surface, input: input)
+            }
+        }
         // Bind observed Mail identities before admission, without executing a backend.
         let input = ["mail_save_attachment", "mail_read_batch", "mail_triage_batch"].contains(tool)
             ? AgentWorkspace.bindMail(input, dataRoot: dataRoot) : input
@@ -240,7 +245,7 @@ extension SwiftToolDispatcher {
             throw ToolFailureError("Mac integration tool has no permission declaration: \(tool)", effects: .none)
         }
         let admitted = await fullMacYoloAdmitted(surface: surface)
-        let allowed = await macIntegrationPermissionStore.allows(integration, mode: mode, fullMacAdmitted: admitted)
+        let allowed = try await macIntegrationPermissionStore.allows(integration, mode: mode)
         guard allowed else {
             return try await Self.macIntegrationDeniedEnvelope(integration: integration, mode: mode, store: macIntegrationPermissionStore)
         }
@@ -286,7 +291,7 @@ extension SwiftToolDispatcher {
             let attachment = try await bridge.mailAttachment(input: input)
             var fileInput = input
             fileInput["path"] = input["destination"] ?? .string("~/Downloads")
-            if await fullMacToolAccess(surface: surface).fileOpsAllowed {
+            if try await fullMacToolAccess(surface: surface).fileOpsAllowed {
                 return try await impl_local_connector_tool(tool: tool, input: fileInput, surface: surface, attachment: attachment)
             }
             return try await impl_trusted_file_mutation(tool: tool, input: fileInput, attachment: attachment)

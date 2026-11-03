@@ -73,14 +73,15 @@ extension MacSyncEngine {
     }
 
     /// The ledger response owns replay; a response file never overrides it.
+    /// Without a retained result, report uncertainty rather than confirmed failure.
     private func replayInboxResponse(
         _ action: InboxAction, record: ICloudTransactionRecord?, refusal: (code: String, message: String)?
     ) throws -> [String: String] {
         if refusal == nil, let response = record?.response { return response }
-        var body = ["status": "error", "ok": "false",
+        let body = ["status": "error", "ok": "false",
+                    "code": refusal?.code ?? "unknown_outcome",
                     "message": refusal?.message ?? "Mac could not confirm whether this command completed, so it was not retried automatically.",
                     "msgId": action.msgId, "transactionId": action.transactionId ?? action.msgId, "action": action.action]
-        body["code"] = refusal?.code
         return try signedResponse(body)
     }
 
@@ -292,12 +293,16 @@ extension MacSyncEngine {
         guard isActive, generation == snapshotLifecycleGeneration else { return }
 
         // Directory listing — can block on iCloud-resident directories; do it off main.
-        guard let files = await Task.detached(priority: .utility, operation: { [inboxDir] in
-            try? FileManager.default.contentsOfDirectory(
-                at: inboxDir, includingPropertiesForKeys: [.creationDateKey],
-                options: .skipsHiddenFiles
-            )
-        }).value else { return }
+        let files: [URL]
+        do {
+            files = try await Task.detached(priority: .utility, operation: { [inboxDir] in
+                try FileManager.default.contentsOfDirectory(at: inboxDir,
+                    includingPropertiesForKeys: [.creationDateKey], options: .skipsHiddenFiles)
+            }).value
+        } catch {
+            syncError = "The iPhone action inbox could not be listed: \(error.localizedDescription). Restore the inbox folder's access and reconnect; no new command was admitted."
+            return
+        }
 
         guard isActive, generation == snapshotLifecycleGeneration else { return }
 
@@ -345,21 +350,36 @@ extension MacSyncEngine {
                         retainedResponse = await retainedInboxResponse(staleAction, record: record, digest: actionDigest)
                     }
                 }
-                guard let response = retainedResponse ?? (try? signedResponse([
-                    "status": "error",
-                    "message": "Mac could not confirm whether this command completed, so it was not retried automatically.",
-                    "msgId": staleAction.msgId,
-                    "transactionId": txId,
-                    "action": staleAction.action,
-                ])) else {
-                    syncError = "Pairing secret unavailable; stale command \(staleAction.msgId) remains pending."
-                    continue
+                let response: [String: String]
+                if let retainedResponse {
+                    response = retainedResponse
+                } else {
+                    do {
+                        response = try replayInboxResponse(staleAction, record: nil, refusal: nil)
+                    } catch {
+                        syncError = "Pairing secret unavailable; stale command \(staleAction.msgId) remains pending."
+                        continue
+                    }
                 }
-                // Consume the pending file only after its response passes durable readback.
+                // Consume only after response readback and both required receipts.
                 let responseWritten = await writeInboxResponse(response, to: responseURL)
                 guard responseWritten else {
                     syncError = "Could not write iCloud response for stale command \(staleAction.msgId); left pending for retry."
                     nativeLog("MacSyncEngine.processInboxFiles: %@", syncError ?? "")
+                    continue
+                }
+                guard await iCloudBridge.appendActionResponseDeliveryReceipt(
+                    response: response, correlationID: staleAction.msgId, transport: "icloud_drive",
+                    status: .queuedForICloudSync, dataRoot: sync.dataRoot
+                ) else {
+                    syncError = "Stale action response receipt remains owed for \(staleAction.msgId); left pending."
+                    continue
+                }
+                guard await iCloudBridge.appendInboundActionSuccessReceipt(
+                    messageID: staleAction.msgId, action: staleAction.action,
+                    transport: "icloud_drive", dataRoot: sync.dataRoot
+                ) else {
+                    syncError = "Stale action inbound receipt remains owed for \(staleAction.msgId); left pending."
                     continue
                 }
                 let msgId = staleAction.msgId
@@ -388,12 +408,16 @@ extension MacSyncEngine {
         }
 
         // Second directory listing (after stale-pending sweep) — off main.
-        guard let refreshedFiles = await Task.detached(priority: .utility, operation: { [inboxDir] in
-            try? FileManager.default.contentsOfDirectory(
-                at: inboxDir, includingPropertiesForKeys: [.creationDateKey],
-                options: .skipsHiddenFiles
-            )
-        }).value else { return }
+        let refreshedFiles: [URL]
+        do {
+            refreshedFiles = try await Task.detached(priority: .utility, operation: { [inboxDir] in
+                try FileManager.default.contentsOfDirectory(at: inboxDir,
+                    includingPropertiesForKeys: [.creationDateKey], options: .skipsHiddenFiles)
+            }).value
+        } catch {
+            syncError = "The iPhone action inbox could not be listed: \(error.localizedDescription). Restore the inbox folder's access and reconnect; no new command was admitted."
+            return
+        }
 
         let jsonFiles = refreshedFiles.filter {
             let name = $0.lastPathComponent
@@ -485,6 +509,19 @@ extension MacSyncEngine {
                     syncError = "Could not write iCloud response for redelivered command \(action.msgId); left in place for retry."
                     continue
                 }
+                guard await iCloudBridge.appendActionResponseDeliveryReceipt(response: response,
+                    correlationID: action.msgId, transport: "icloud_drive", status: .queuedForICloudSync,
+                    dataRoot: sync.dataRoot) else {
+                    syncError = "Retained action response receipt remains owed for \(action.msgId)."
+                    continue
+                }
+                if ledgerRefusal == nil {
+                    guard await iCloudBridge.appendInboundActionSuccessReceipt(messageID: action.msgId,
+                        action: action.action, transport: "icloud_drive", dataRoot: sync.dataRoot) else {
+                        syncError = "Retained action inbound receipt remains owed for \(action.msgId)."
+                        continue
+                    }
+                }
                 if ledgerRefusal == nil, priorTransaction?.response == nil {
                     await writeTransaction(
                         id: transactionId,
@@ -531,6 +568,7 @@ extension MacSyncEngine {
             // action's HMAC and timestamp have passed validation. Token and
             // pairing-file timestamps prove configuration, not contact.
             if let peerCreatedAt = ISO8601DateFormatter().date(from: action.createdAt) {
+                sync.bridge.notePhoneContact(at: peerCreatedAt)
                 do {
                     try await SignedPeerEvidenceStore.record(
                         eventID: action.msgId,
@@ -539,7 +577,6 @@ extension MacSyncEngine {
                         dataRoot: PersistenceCore.defaultDataRoot()
                     )
                     guard isActive, generation == snapshotLifecycleGeneration else { return }
-                    sync.bridge.notePhoneContact(at: peerCreatedAt)
                 } catch {
                     nativeLog("[MacSyncEngine] could not persist signed peer evidence for %@: %@",
                           action.msgId, error.localizedDescription)
@@ -605,20 +642,26 @@ extension MacSyncEngine {
                 }.value
                 continue
             }
-            await iCloudBridge.appendActionResponseDeliveryReceipt(
+            guard await iCloudBridge.appendActionResponseDeliveryReceipt(
                 response: response,
                 correlationID: action.msgId,
                 transport: "icloud_drive",
                 status: .queuedForICloudSync,
                 dataRoot: PersistenceCore.defaultDataRoot()
-            )
+            ) else {
+                syncError = "Action response is retained; its delivery receipt remains owed for \(action.msgId)."
+                continue
+            }
             if inboundActionVerified {
-                await iCloudBridge.appendInboundActionSuccessReceipt(
+                guard await iCloudBridge.appendInboundActionSuccessReceipt(
                     messageID: action.msgId,
                     action: action.action,
                     transport: "icloud_drive",
                     dataRoot: PersistenceCore.defaultDataRoot()
-                )
+                ) else {
+                    syncError = "Action result is retained; its inbound receipt remains owed for \(action.msgId)."
+                    continue
+                }
             }
 
             await settleInboxAction(action, transactionId: transactionId, response: response, directory: transactionDir)
@@ -756,6 +799,11 @@ extension MacSyncEngine {
         // projection still own replay; no response file can override them.
         if processedMsgIds.contains(action.msgId), alreadyExecuted {
             guard let response = try? replayInboxResponse(action, record: priorTransaction, refusal: nil) else { return false }
+            guard await iCloudBridge.appendInboundActionSuccessReceipt(messageID: action.msgId,
+                action: action.action, transport: "cloudkit", dataRoot: actionStateRoot) else {
+                syncError = "Retained action inbound receipt remains owed for \(action.msgId)."
+                return false
+            }
             do {
                 try await sync.bridge.sendCloudKitActionResponse(response, correlationID: action.msgId)
                 return true
@@ -796,7 +844,7 @@ extension MacSyncEngine {
         let response: [String: String]
         let inboundActionVerified: Bool
         if alreadyExecuted, let priorTransaction {
-            inboundActionVerified = false
+            inboundActionVerified = true
             guard let retained = try? replayInboxResponse(action, record: priorTransaction, refusal: nil) else {
                 syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."
                 return false
@@ -832,6 +880,7 @@ extension MacSyncEngine {
         } else {
             inboundActionVerified = true
             if let peerCreatedAt = ISO8601DateFormatter().date(from: action.createdAt) {
+                sync.bridge.notePhoneContact(at: peerCreatedAt)
                 do {
                     try await SignedPeerEvidenceStore.record(
                         eventID: action.msgId,
@@ -840,7 +889,6 @@ extension MacSyncEngine {
                         dataRoot: actionStateRoot
                     )
                     guard isActive, generation == snapshotLifecycleGeneration else { return false }
-                    sync.bridge.notePhoneContact(at: peerCreatedAt)
                 } catch {
                     nativeLog("[MacSyncEngine] could not persist CloudKit action peer evidence for %@: %@",
                           action.msgId, error.localizedDescription)
@@ -871,12 +919,15 @@ extension MacSyncEngine {
             return false
         }
         if inboundActionVerified {
-            await iCloudBridge.appendInboundActionSuccessReceipt(
+            guard await iCloudBridge.appendInboundActionSuccessReceipt(
                 messageID: action.msgId,
                 action: action.action,
                 transport: "cloudkit",
                 dataRoot: actionStateRoot
-            )
+            ) else {
+                syncError = "Action result is retained; its inbound receipt remains owed for \(action.msgId)."
+                return false
+            }
         }
         recordProcessed(action.msgId)
         let processedSaved = await saveProcessedIds()

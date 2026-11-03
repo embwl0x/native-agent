@@ -56,29 +56,26 @@ extension TelegramUpdateClaim {
         phase = try values.decode(TelegramUpdateClaimPhase.self, forKey: .phase)
         claimedAt = try values.decode(String.self, forKey: .claimedAt)
         updatedAt = try values.decode(String.self, forKey: .updatedAt)
-        let string: (CodingKeys) -> String? = { key in
-            guard let raw = try? values.decode(String.self, forKey: key), !raw.isEmpty else { return nil }
+        let string: (CodingKeys) throws -> String? = { key in
+            guard let raw = try values.decodeIfPresent(String.self, forKey: key) else { return nil }
+            guard key == .resolvedRetryText || !raw.isEmpty else {
+                throw DecodingError.dataCorruptedError(forKey: key, in: values, debugDescription: "Empty claim metadata")
+            }
             return raw
         }
-        lifeID = string(.lifeID)
-        assistantRunId = string(.assistantRunId)
-        assistantSessionId = string(.assistantSessionId)
-        assistantOriginRunId = string(.assistantOriginRunId)
-        quarantineReason = string(.quarantineReason)
-        resolvedRetryText = string(.resolvedRetryText)
-        resolvedSessionId = string(.resolvedSessionId)
-        switch try? values.decode(JSONValue.self, forKey: .queueAcknowledgementMessageId) {
-        case .int(let raw)?: queueAcknowledgementMessageId = Int(exactly: raw)
-        case .double(let raw)?: queueAcknowledgementMessageId = Int(exactly: raw)
-        case .string(let raw)?: queueAcknowledgementMessageId = Int(raw)
-        default: queueAcknowledgementMessageId = nil
-        }
+        lifeID = try string(.lifeID)
+        assistantRunId = try string(.assistantRunId)
+        assistantSessionId = try string(.assistantSessionId)
+        assistantOriginRunId = try string(.assistantOriginRunId)
+        quarantineReason = try string(.quarantineReason)
+        resolvedRetryText = try string(.resolvedRetryText)
+        resolvedSessionId = try string(.resolvedSessionId)
+        queueAcknowledgementMessageId = try values.decodeIfPresent(Int.self, forKey: .queueAcknowledgementMessageId)
         resolvedRetryMessage = try values.decodeIfPresent(TelegramMessage.self, forKey: .resolvedRetryMessage)
         assistantDelivery = try values.decodeIfPresent(TelegramAssistantDeliveryState.self, forKey: .assistantDelivery)
-        settledAssistantRuns = values.contains(.settledAssistantRuns)
-            ? try values.decode([String: String].self, forKey: .settledAssistantRuns) : [:]
-        noRecoverableAnswer = (try? values.decode(JSONValue.self, forKey: .noRecoverableAnswer)) == .bool(true)
-        failedBeforeAnswer = (try? values.decode(JSONValue.self, forKey: .failedBeforeAnswer)) == .bool(true)
+        settledAssistantRuns = try values.decode([String: String].self, forKey: .settledAssistantRuns)
+        noRecoverableAnswer = try values.decode(Bool.self, forKey: .noRecoverableAnswer)
+        failedBeforeAnswer = try values.decode(Bool.self, forKey: .failedBeforeAnswer)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -237,10 +234,14 @@ public struct TelegramUpdateInbox: Sendable {
         return claims.sorted { $0.updatedAt < $1.updatedAt }
     }
 
+    static func replyUpdateID(runId: String) -> Int {
+        -1 - SHA256.hash(data: Data(runId.utf8)).prefix(7).reduce(0) { ($0 << 8) | Int($1) }
+    }
+
     func reserveReply(runId: String, sessionId: String, destination: TelegramDestination,
                       delivery: TelegramAssistantDeliveryState, priorVerdict: String?, fromUserId: Int?) async throws -> TelegramUpdateClaim {
         // Upstream update ids are nonnegative; outbound answers share the same journal in its negative namespace.
-        let updateId = -1 - SHA256.hash(data: Data(runId.utf8)).prefix(7).reduce(0) { ($0 << 8) | Int($1) }
+        let updateId = Self.replyUpdateID(runId: runId)
         let path = claimPath(updateId: updateId)
         return try await withClaimMutationLock(path) {
             if FileManager.default.fileExists(atPath: path.path) {
@@ -374,6 +375,10 @@ public struct TelegramUpdateInbox: Sendable {
             let previous = current
             if failedBeforeAnswer { current.failedBeforeAnswer = true }
             if recovering, var retained = current.assistantDelivery {
+                if retained.previewPending == true, delivery?.previewPending == false {
+                    retained.reply = delivery?.reply ?? retained.reply
+                    retained.previewPending = false
+                }
                 if retained.imagePaths == nil { retained.imagePaths = delivery?.imagePaths }
                 current.assistantDelivery = retained
             } else {
@@ -410,14 +415,19 @@ public struct TelegramUpdateInbox: Sendable {
             guard claim.settledAssistantRuns[runId] == nil,
                   let priorRun = claim.assistantRunId, let prior = claim.assistantDelivery,
                   prior.isDelivered || prior.outcomeUnknown else { throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent) }
-            claim.settledAssistantRuns[priorRun] = prior.isDelivered ? "completed" : "sent_unconfirmed"
+            claim.settledAssistantRuns[priorRun] = prior.isDelivered
+                ? (claim.failedBeforeAnswer ? "failed_before_answer" : "completed") : "sent_unconfirmed"
             claim.assistantOriginRunId = claim.assistantOriginRunId ?? claim.assistantRunId
             claim.assistantRunId = runId
             claim.assistantSessionId = sessionId
             claim.assistantDelivery = delivery
             claim.noRecoverableAnswer = false
             claim.failedBeforeAnswer = false
+            claim.phase = .outcomeUnknown
             claim.updatedAt = _tgNowString()
+            // Publish recovery eligibility first. If the claim write fails,
+            // recovery reads the prior settled claim and repairs this index.
+            try await upsertIndex(claim)
             try await write(claim, to: path)
         }
     }
@@ -503,7 +513,8 @@ public struct TelegramUpdateInbox: Sendable {
         _ body: @Sendable () async throws -> T
     ) async throws -> T {
         try await SwiftNativePersistenceCore.withFileLock(indexPath) {
-            try await SwiftNativePersistenceCore.withFileLock(path, body)
+            _ = try await loadIndex()
+            return try await SwiftNativePersistenceCore.withFileLock(path, body)
         }
     }
 
@@ -516,14 +527,16 @@ public struct TelegramUpdateInbox: Sendable {
         }
         guard claim.update.hasValidInboxID, !claim.claimedAt.isEmpty, !claim.updatedAt.isEmpty,
               claim.phase != .quarantined || claim.quarantineReason != nil,
-              claim.settledAssistantRuns.allSatisfy({ !$0.key.isEmpty && ["completed", "sent_unconfirmed"].contains($0.value) }) else {
+              claim.settledAssistantRuns.allSatisfy({ !$0.key.isEmpty && ["completed", "sent_unconfirmed", "failed_before_answer"].contains($0.value) }) else {
             throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent)
         }
         guard claim.update.updateId == claim.updateId else {
             throw TelegramUpdateInboxError.mismatchedUpdateId(expected: claim.updateId, actual: claim.update.updateId)
         }
         if let delivery = claim.assistantDelivery {
-            guard !delivery.reply.isEmpty || !(delivery.imagePaths ?? []).isEmpty,
+            // A reply reservation (previewPending, written by the session stream before any text)
+            // is a current claim shape: it waits for the canonical transcript.
+            guard !delivery.reply.isEmpty || !(delivery.imagePaths ?? []).isEmpty || delivery.previewPending == true,
                   delivery.confirmedMessageIds.count <= TelegramRichMessageRenderer.render(delivery.reply).count,
                   (0...(delivery.imagePaths?.count ?? 0)).contains(delivery.confirmedImageCount ?? 0) else {
                 throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent)
@@ -545,11 +558,14 @@ public struct TelegramUpdateInbox: Sendable {
 
     private func loadIndex() async throws -> InboxClaimIndex {
         guard FileManager.default.fileExists(atPath: indexPath.path) else {
-            // One-time migration for pre-index installs. This may scan retained
-            // claims once, but every later tick reads this bounded index first.
-            let migrated = InboxClaimIndex(claims: try await snapshots())
-            try await writeIndex(migrated)
-            return migrated
+            // Only an empty store may bootstrap. Existing claims without an
+            // index need the explicit checked repair, never silent recovery.
+            guard try await snapshots().isEmpty else {
+                throw TelegramUpdateInboxError.malformedClaim(indexPath.lastPathComponent)
+            }
+            let initial = InboxClaimIndex()
+            try await writeIndex(initial)
+            return initial
         }
         let data: Data
         do {

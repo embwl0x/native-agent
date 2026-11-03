@@ -3,6 +3,7 @@ import Cognition
 import ContextFlow
 import Onboarding
 import PersonaEngine
+import ChatTurnRuntime
 
 // Blueprint: | `NativeAgentResidentRefresh.swift` | `NativeAgentEngine` onboarding/resident refresh: profile transitions defer mind/context reload until admitted turns drain |
 
@@ -56,7 +57,7 @@ public extension NativeAgentEngine {
     @MainActor
     func repairOnboardingProfile(
         payload: OnboardingCompletePayload,
-        publishProfile: @MainActor () async -> Void, resident: NativeAgentEngine
+        publishProfile: @escaping @MainActor @Sendable () async -> Void, resident: NativeAgentEngine
     ) async throws -> OnboardingCompleteResult {
         let response = try await onboarding.repairProfile(payload: payload)
         if response.ok {
@@ -76,36 +77,17 @@ public extension NativeAgentEngine {
     }
 
     /// A profile repair cannot reload cognition or Context Flow underneath an
-    /// admitted turn. Its intake close drains the same deferred request.
+    /// admitted turn. Shared admission retains a busy root's request and
+    /// rechecks the actual in-flight owner before publication and reload.
     @MainActor
     func refreshResidentMindAfterProfileRepair(
-        publishProfile: @MainActor () async -> Void, refreshMind: @MainActor () async -> Void
+        publishProfile: @escaping @MainActor @Sendable () async -> Void,
+        refreshMind: @escaping @MainActor @Sendable () async -> Void
     ) async {
-        guard turns.activeTurnIDsBySession.isEmpty else {
-            turns.runtime.residentRefreshPendingAfterActiveTurns = true
-            return
+        await TurnAdmission.shared.refreshResidentWhenIdle(dataRoot: dataRoot) {
+            await publishProfile()
+            await refreshMind()
         }
-        turns.runtime.residentRefreshPendingAfterActiveTurns = false
-        await applyProfileRepairToResidentMind(publishProfile: publishProfile, refreshMind: refreshMind)
-    }
-
-    @MainActor
-    func drainPendingResidentRefreshIfTurnsIdle(
-        publishProfile: @escaping @MainActor () async -> Void,
-        refreshMind: @escaping @MainActor () async -> Void
-    ) {
-        guard turns.runtime.residentRefreshPendingAfterActiveTurns,
-              turns.activeTurnIDsBySession.isEmpty else { return }
-        turns.runtime.residentRefreshPendingAfterActiveTurns = false
-        Task { await applyProfileRepairToResidentMind(publishProfile: publishProfile, refreshMind: refreshMind) }
-    }
-
-    @MainActor
-    private func applyProfileRepairToResidentMind(
-        publishProfile: @MainActor () async -> Void, refreshMind: @MainActor () async -> Void
-    ) async {
-        await publishProfile()
-        await refreshMind()
     }
 
     @MainActor

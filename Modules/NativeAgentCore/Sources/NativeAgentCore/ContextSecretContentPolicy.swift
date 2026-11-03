@@ -1,13 +1,20 @@
 import Foundation
 import NativeAgentShared
-// Blueprint: | `ContextSecretContentPolicy.swift` | Shared derived-context secret policy; linear nested percent decoding and ordered URL extraction with authoritative whole-text and query-assignment redaction before and after news composition; Context compiler, native news and JavaScript helper use this same owner |
+// Blueprint: | `ContextSecretContentPolicy.swift` | Shared secret policy; literal credential inspection for binary attachments; linear nested percent decoding and ordered URL extraction with authoritative whole-text and query-assignment redaction for derived context, text attachments, native news and JavaScript helpers |
 
-/// One fail-closed secret-shape policy for material entering derived context.
+/// One shared secret-shape policy for derived context and attachment admission.
 public enum ContextSecretContentPolicy {
     public static func containsSecretLikeContent(_ source: String) -> Bool {
         secretPatterns.contains { pattern in
             source.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
         }
+    }
+
+    /// Inspect literal credential shapes without interpreting arbitrary binary
+    /// bytes as URL escapes. Includes the shared token and assignment redactor.
+    /// Callers may supply a lossy UTF-8 view, but must send the original bytes.
+    public static func containsLiteralSecretLikeContent(_ source: String) -> Bool {
+        redactedText(source) != source
     }
 
     /// Inspect decoded source fragments before prefixing, flattening, clipping

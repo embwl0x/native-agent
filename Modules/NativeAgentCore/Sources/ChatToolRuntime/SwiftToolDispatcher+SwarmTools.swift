@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import MemoryV2
 import PersonaEngine
@@ -11,7 +12,7 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
-// Blueprint: | `SwiftToolDispatcher+SwarmTools.swift` | `SwiftToolDispatcher`: `impl_agent_swarm` |
+// Blueprint: | `SwiftToolDispatcher+SwarmTools.swift` | `impl_agent_swarm` checks Trust authority, binds one authenticated requestedBy origin and the checked Work route, and reads OpenRouter efforts from its own catalog before fan-out |
 
 // MARK: - Agent swarm tools
 
@@ -19,47 +20,28 @@ extension SwiftToolDispatcher {
     func impl_agent_swarm(input: [String: JSONValue], surface: String) async throws -> JSONValue {
         var body = input
         // The dispatcher supplies the authenticated origin. A model-provided
-        // `surface` must never reclassify Telegram/Slack/iOS work as local Mac.
-        body["surface"] = .string(surface)
-        // The request parser also accepts these legacy aliases, with
-        // requestedBy taking precedence over surface. Bind that canonical
-        // field too: it is the inherited worker's authorization origin.
+        // origin must never reclassify Telegram/Slack/iOS work as local Mac.
+        // requestedBy is the sole origin consumed by the request owner.
         body["requestedBy"] = .string(surface)
-        body.removeValue(forKey: "requested_by")
         let trust = SwiftNativeTrustCenter(dataRoot: dataRoot)
-        let policyJSON = await trust.loadTrustPolicy()
+        let policyJSON = try await trust.loadTrustPolicyChecked()
         var policy = AgentSwarmPolicy.fromTrustPolicy(.object(policyJSON))
         let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
-        let routingSnapshot = try await router.checkedRoutingSnapshot()
-        if let preference = routingSnapshot.preferences["swarms"] {
-            // Provider Settings is the one owner of cognitive selection.
-            // TrustCenter still owns enablement and concurrency caps, but it
-            // no longer carries a stale second swarm-model default.
-            policy.defaultModel = preference.model
-            policy.defaultReasoningEffort = preference.reasoningEffort
+        let providerSnapshot = try await router.checkedProviderSnapshot()
+        let routingSnapshot = providerSnapshot.routing
+        let routing = try routingSnapshot.routeAdmission(for: "swarms", choice: nil)
+        policy.defaultModel = routing.modelId
+        policy.defaultReasoningEffort = routing.reasoningEffort
+        guard let providerID = routing.providerId else { throw ProviderRoutingError.providerNotFound }
+        guard let provider = providerSnapshot.providers.first(where: { $0.id == providerID }), provider.configured == true else {
+            throw ProviderRoutingError.configurationFailed("Work's account is unavailable. Repair it in Providers before starting helpers.")
         }
-        if let providerID = routingSnapshot.activeProviders["swarms"] {
-            if CodexAccountModelCatalog.isAccountBackedProvider(providerID) {
-                policy.supportedReasoningEfforts = CodexAccountModelCatalog.load(
-                    providerID: providerID,
-                    cacheURL: CodexAccountModelCatalog.chatGPTOAuthCacheCandidate(dataRoot: dataRoot),
-                    useDefaultCacheWhenNil: false
-                ).first { $0.id.caseInsensitiveCompare(policy.defaultModel) == .orderedSame }?.supportedReasoningEfforts ?? []
-            } else {
-                policy.supportedReasoningEfforts = FirstPartyModelCatalog.models(forProviderID: providerID)
-                    .first { $0.id.caseInsensitiveCompare(policy.defaultModel) == .orderedSame }?.supportedReasoningEfforts ?? []
-            }
-        }
+        policy.supportedReasoningEfforts = try SwiftNativeProviderRouting.modelReasoningEfforts(
+            provider: provider, modelID: policy.defaultModel)
         // The checked provider/account belongs to the fan-out; requested models cannot redirect it.
         let executor = makeAgentSwarmExecutor(
             router: router,
-            routing: TurnRouteAdmission(
-                routingSurface: "swarms",
-                modelId: policy.defaultModel,
-                reasoningEffort: policy.defaultReasoningEffort,
-                providerId: routingSnapshot.activeProviders["swarms"],
-                serviceTier: routingSnapshot.preferences["swarms"]?.serviceTier ?? "default"
-            ),
+            routing: routing,
             providerLifecycleObserver: providerLifecycleObserver
         )
         // Child effort is filled by the parsed worker/run, never an ambient

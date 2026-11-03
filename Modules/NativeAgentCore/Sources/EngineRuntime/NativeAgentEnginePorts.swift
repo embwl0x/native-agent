@@ -22,6 +22,7 @@ import TrustCenter
 import ToolExecution
 import Senses
 import NativeAgentShared
+import TelegramBot
 // Blueprint: | `NativeAgentEnginePorts.swift` | Once-installed native host factories, body effects and shared EngineCognitionHost defaults; pure readout faces bind the selected Parts version through the no-effect authored host; read-part calls bind the existing ToolsFacade originating door and narrow the pinned candidate to native-permitted read actions/capabilities |
 
 /// Platform hosts supplied once to Core's composition root. The factories
@@ -32,7 +33,7 @@ public struct NativeAgentEnginePorts: Sendable {
     public let cognitionHost: any CognitionHost
     public let deviceSyncHost: any DeviceSyncHost
     public let macIntegration: any MacIntegrationToolBridge
-    public let a2aPushConfiguration: @Sendable (AgentPeerContact) async -> JSONValue?
+    public let a2aPushConfiguration: @Sendable (AgentPeerContact) async throws -> JSONValue
     public let completionSender: @Sendable (URL) -> any AgentBridgeCompletionSending
     public let standingBotQueue: BotRunQueue
     public let appTools: @Sendable (SwiftNativeSecurityCenter, Bool) -> AppToolExecutor
@@ -44,7 +45,7 @@ public struct NativeAgentEnginePorts: Sendable {
         cognitionHost: any CognitionHost,
         deviceSyncHost: any DeviceSyncHost,
         macIntegration: any MacIntegrationToolBridge,
-        a2aPushConfiguration: @escaping @Sendable (AgentPeerContact) async -> JSONValue?,
+        a2aPushConfiguration: @escaping @Sendable (AgentPeerContact) async throws -> JSONValue,
         completionSender: @escaping @Sendable (URL) -> any AgentBridgeCompletionSending,
         standingBotQueue: BotRunQueue,
         appTools: @escaping @Sendable (SwiftNativeSecurityCenter, Bool) -> AppToolExecutor,
@@ -64,6 +65,10 @@ public struct NativeAgentEnginePorts: Sendable {
 }
 
 extension CognitionHost {
+    public func telegramOwnerUserId(dataRoot: URL) throws -> Int64? {
+        try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: false)?.ownerUserId
+    }
+
     public func phoneNotificationTargetCount(dataRoot: URL) async throws -> Int {
         try await SwiftNativeAPNSSender().deliverableTargetCount(dataRoot: dataRoot)
     }
@@ -126,9 +131,9 @@ extension AttentionRouter {
         // it goes to the phone, never to a Telegram chat that lacks it.
         let outcome = try await route(
             eventId: eventId, importance: .informational, title: title, body: body,
-            reason: reason, userInfo: userInfo, pinnedTo: .phone, at: date
+            reason: reason, userInfo: userInfo, at: date
         )
-        guard outcome.delivery != .none, !outcome.suppressed else { return nil }
+        guard outcome.transportOutcome == .delivered else { return nil }
         return outcome.delivery.rawValue
     }
 }
@@ -156,6 +161,10 @@ public struct EngineCognitionHost: CognitionHost {
     private let attention: AttentionRouter
 
     public init(attention: AttentionRouter) { self.attention = attention }
+
+    public func runCarriedAction(_ step: DeskStep, handle: String, dataRoot: URL) async -> JSONValue {
+        await EnginePartWake.runCarried(step, handle: handle, dataRoot: dataRoot)
+    }
 
     public func callReadPart(id: String, input: JSONValue, actions: Set<String>, dataRoot: URL, origin: String) async throws -> JSONValue {
         try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(envelope: .native(origin)) {

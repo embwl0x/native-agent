@@ -4,8 +4,16 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `SwiftNativeAPNSSender.swift` | One APNs sender actor owns credential state, JWT reuse/expiry, rejection holds and signing |
+// Blueprint: | `SwiftNativeAPNSSender.swift` | One APNs sender actor owns bounded transport, credential state, JWT reuse/expiry, rejection holds and signing |
 public actor SwiftNativeAPNSSender {
+    /// A transport limit, never a race that cancels a write to stop observing it.
+    let deliverySession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 5
+        configuration.timeoutIntervalForResource = 30
+        return URLSession(configuration: configuration)
+    }()
+
     /// Reuse provider JWTs for 50 minutes to avoid `TooManyProviderTokenUpdates` and Apple's 60-minute expiry.
     static let providerTokenTTL: TimeInterval = 50 * 60
 
@@ -47,10 +55,15 @@ public actor SwiftNativeAPNSSender {
         let current = Date()
         let storeURL = URL(fileURLWithPath: keyPath).deletingLastPathComponent()
             .appendingPathComponent("apns_provider_token.json")
-        if cachedProviderToken == nil, !providerTokenRejected,
-           let data = try? Data(contentsOf: storeURL) {
-            cachedProviderToken = try? JSONDecoder().decode(CachedProviderToken.self, from: data)
-            providerTokenStoreURL = storeURL
+        if cachedProviderToken == nil, !providerTokenRejected {
+            do {
+                let data = try Data(contentsOf: storeURL)
+                cachedProviderToken = try JSONDecoder().decode(CachedProviderToken.self, from: data)
+                providerTokenStoreURL = storeURL
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                // Only a missing cache admits the first mint. Other read and
+                // decode failures retain their cause at the APNs owner.
+            }
         }
         if let cached = cachedProviderToken,
            cached.keyId == keyId,

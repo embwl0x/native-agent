@@ -78,11 +78,12 @@ extension MacFourVerbs {
             }
             var details = control?.states ?? []
             details += row?.detail.compactMap(\.display) ?? []
-            if !target.enabled, !details.contains("disabled") { details.append("disabled") }
+            if target.enabled == false, !details.contains("disabled") { details.append("disabled") }
+            if target.enabled == nil { details.append("enabled state unavailable") }
             if target.secret { details.append("secure") }
             if let abstain = control?.abstain ?? row?.abstain { details.append(abstain) }
             let name = target.label ?? (candidate.label?.withheld == true ? "⟨redacted⟩" : selector ?? target.kind)
-            let verbs = target.enabled && control?.abstain == nil && row?.abstain == nil
+            let verbs = target.enabled == true && control?.abstain == nil && row?.abstain == nil
                 ? Self.nativeAXVerbs(target) : []
             let detail = details.isEmpty ? nil : details.joined(separator: "; ")
             let thing = NativeThing(name: name, kind: target.kind, address: address, detail: detail, verbs: verbs)
@@ -116,10 +117,10 @@ extension MacFourVerbs {
     static func nativeAXVerbs(_ target: ActTarget) -> [String] {
         let scrollable = target.frame != nil && (target.regionOnly || Self.physicalScrollKinds.contains(target.kind))
             || (!target.isSupplemental && target.actions.contains("AXScrollToVisible"))
-        if target.regionOnly { return scrollable ? ["scroll"] : [] }
+        if target.regionOnly { return Self.offeredVerbs(scrollable ? ["scroll"] : []) }
         var verbs: [String] = []
         if target.actions.contains("AXPress") { verbs.append("press") }
-        if target.physicalOnly { return verbs + (scrollable ? ["scroll"] : []) }
+        if target.physicalOnly { return Self.offeredVerbs(verbs + (scrollable ? ["scroll"] : [])) }
         if !target.secret, Self.keystrokeEditableKinds.contains(target.kind),
            target.settableAttributes.contains("AXValue")
             || (!target.isSupplemental && target.settableAttributes.contains("AXFocused")) { verbs.append("type") }
@@ -128,7 +129,7 @@ extension MacFourVerbs {
             if target.settableAttributes.contains("AXFocused") { verbs.append("focus") }
         }
         if scrollable { verbs.append("scroll") }
-        return verbs
+        return Self.offeredVerbs(verbs)
     }
 
     /// Scope the native page from capture-local AX paths, retaining the
@@ -244,6 +245,9 @@ extension MacFourVerbs {
 
     static func pastTense(_ verb: MacActVerb, direction: ScrollDirection) -> String {
         switch verb {
+        case .doubleClick: return "Double-clicked"
+        case .rightClick: return "Right-clicked"
+        case .hover: return "Hovered over"
         case .click: return "Clicked"
         case .open: return "Opened"
         case .type: return "Typed into"
@@ -277,8 +281,8 @@ extension MacFourVerbs {
     static func effectWords(output: [String: JSONValue]) -> EffectWords {
         let status = string(output["status"]) ?? "acted_unobserved"
         return EffectWords(
-            sentence: string(output["status_note"]) ?? string(output["guidance"])
-                ?? "The input went out, but the declared effect could not be read back.",
+            sentence: (string(output["status_note"]) ?? string(output["guidance"])
+                ?? "The input went out, but the declared effect could not be read back."),
             status: status)
     }
 
@@ -292,8 +296,10 @@ extension MacFourVerbs {
             return "the screen moved while I was reaching for it — nothing was touched."
         case "frame_window_gone", "frame_app_gone":
             return "what I was looking at isn't there any more — nothing was touched."
-        case "verb_not_supported_on_element":
+        case "verb_not_supported_on_element", "unsupported_explicit_ax_action":
             return "that control does not support this action. Use mac.look for this app to inspect its controls and supported actions."
+        case "enabled_state_unavailable", "ax_evidence_unavailable", "window_evidence_unavailable":
+            return "the required Accessibility evidence could not be read. Read this app again before acting."
         case "observer_unavailable":
             return "I couldn't watch that app for the effect, so I didn't press anything blind."
         default:
@@ -334,7 +340,7 @@ extension MacFourVerbs {
     static func lookRefusalWords(_ code: String) -> String {
         switch code {
         case "no_frontmost_window": return "There's no window up to look at."
-        case "accessibility_not_trusted", "ax_untrusted", "accessibility_untrusted":
+        case "accessibility_not_trusted":
             return "Accessibility isn't granted to NativeAgent. System Settings > Privacy & Security > Accessibility > NativeAgent switch on."
         default: return "The read came back \(code)."
         }
@@ -388,7 +394,8 @@ extension MacFourVerbs {
             // Emission counts ride every receipt: whether input went out is
             // what tells a refusal from an act that was not observed.
             for key in ["reason", "detail", "effects", "note", "guidance", "message", "remedy", "blocked_by", "block_reason", "matched_name", "bundle_identifier", "process_identifier",
-                        "requested_events_emitted", "recovery_events_emitted", "effects_may_have_occurred"] { detail[key] = output[key] }
+                        "requested_events_emitted", "recovery_events_emitted", "effects_may_have_occurred",
+                        "ax_outcome", "ax_emission_attempted", "ax_cause", "ax_native_code", "ax_outcomes", "ax_readback"] { detail[key] = output[key] }
         }
         if let error = result.error { detail["error"] = .string(error) }
         if result.error?.hasPrefix("human_takeover:") == true, case .object(let receipt) = result.output {
@@ -401,7 +408,7 @@ extension MacFourVerbs {
         detail["verification"] = .string(SwiftNativeMacControl.verificationState(action: result.action, result: result).rawValue)
         detail["duration_ms"] = .int(Int64(result.durationMs))
         let output = object(result.output)
-        for key in ["status", "verified", "status_reason", "status_note", "verification_evidence", "verification_scope",
+        for key in ["status", "verified", "status_reason", "status_note", "verification_evidence", "verification_scope", "method", "requested_action",
                     "hand_neutral", "text_value_verified"] {
             detail[key] = output[key]
         }

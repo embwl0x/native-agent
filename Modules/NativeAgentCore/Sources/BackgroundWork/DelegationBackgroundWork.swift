@@ -13,7 +13,8 @@ import DeviceSync
 import TelegramBot
 import SlackBot
 import NativeAgentShared
-// Blueprint: | `DelegationBackgroundWork.swift` | `DelegationBackgroundWork` struct; `makeDelegationOutcomeLoop`; one owed-answer notice per peer, retires the duplicate Codex backlog card; one failed-before-answer finding per peer or human route, dated counts and bounded newest-first file refs; per-peer findings persist and refresh every covered delivery ID as a trace ref; closed peer findings settle only those IDs before reply reconciliation; Telegram's index and exact iOS events retain settlement ownership |
+import ProviderRouting
+// Blueprint: | `DelegationBackgroundWork.swift` | `DelegationBackgroundWork` struct; `makeDelegationOutcomeLoop`; one owed-answer notice per peer, retires the duplicate Codex backlog card; one failed-before-answer finding per peer or human route, dated counts and bounded newest-first file refs; per-peer findings persist and refresh every covered delivery ID as a trace ref; closed peer findings settle only those IDs before reply reconciliation; Telegram's index and exact iOS events retain settlement ownership; shared NetworkSense returns re-tick held resident arrivals; tick budget derives from the provider stream wall plus 60 s |
 
 // MARK: - DelegationOutcomeLoop registration
 //
@@ -59,9 +60,9 @@ public struct DelegationBackgroundWork: Sendable {
 
     private func fileFailedHumanReplies(dataRoot: URL) async throws {
         try await fileFailedReplies(TelegramUpdateInbox.failedReplyClaims(dataRoot: dataRoot),
-            route: "telegram", destination: "on Telegram", legacyPrefixes: ["delivery-before-answer|telegram/"], dataRoot: dataRoot)
+            route: "telegram", destination: "on Telegram", dataRoot: dataRoot)
         try await fileFailedReplies(SlackInboundDeliveryJournal.failedReplyClaims(dataRoot: dataRoot), route: "slack", destination: "on Slack",
-            legacyPrefixes: ["delivery-before-answer|slack/inbound_delivery_journal.json|"], dataRoot: dataRoot)
+            dataRoot: dataRoot)
     }
 
     fileprivate func fileFailedIOSReplies(dataRoot: URL, deferral: DelegationDeferralState, changedPath: URL? = nil) async throws {
@@ -70,35 +71,39 @@ public struct DelegationBackgroundWork: Sendable {
         let claims = try iCloudBridge.failedReplyClaims(dataRoot: dataRoot, changedPath: changedPath)
         let failed = try await deferral.updateIOSFailures(claims, changedPath: changedPath)
         try await fileFailedReplies(failed, route: "ios", destination: "on iOS",
-            legacyPrefixes: ["delivery-before-answer|icloud/chat_transactions/"], dataRoot: dataRoot)
+            dataRoot: dataRoot)
     }
 
-    private func fileFailedReplies(_ records: [(path: URL, at: String)], deliveryRefs: [DeskRef] = [], route: String, destination: String,
-                                   legacyPrefixes: [String], dataRoot: URL) async throws {
+    private func fileFailedReplies(_ records: [(path: URL, at: String?)], deliveryRefs: [DeskRef] = [], route: String, destination: String,
+                                   dataRoot: URL) async throws {
         let key = "delivery-failed-before-answer|" + route
         guard !records.isEmpty else {
             let note = "No replies \(destination) remain failed before an answer."
             try await HarnessQueue.resolve(key: key, note: note, dataRoot: dataRoot)
-            try await HarnessQueue.resolve(keyPrefixes: Dictionary(uniqueKeysWithValues: legacyPrefixes.map { ($0, note) }), dataRoot: dataRoot)
             return
         }
-        var ordered: [(path: URL, date: Date)] = try records.map { record in
-            guard let date = DeskClock.parseISO(record.at) else { throw CocoaError(.fileReadCorruptFile) }
-            return (path: record.path, date: date)
+        var ordered: [(path: URL, date: Date?)] = records.map { record in
+            (path: record.path, date: record.at.flatMap(DeskClock.parseISO))
         }
         ordered.sort { lhs, rhs in
             if lhs.date == rhs.date { return lhs.path.path < rhs.path.path }
-            return lhs.date > rhs.date
+            if let left = lhs.date, let right = rhs.date { return left > right }
+            return lhs.date != nil
         }
+        let dated = ordered.compactMap(\.date)
+        let undated = ordered.count - dated.count
+        let span = dated.first.flatMap { newest in dated.last.map { oldest in
+            " (\(DeskClock.dayStamp(oldest)) – \(DeskClock.dayStamp(newest)))"
+        } } ?? ""
+        let missingDates = undated == 0 ? "" : "; \(undated) delivery timestamps unavailable — inspect their records"
         var seen = Set<URL>()
         let refs = deliveryRefs + ordered.filter { seen.insert($0.path).inserted }.prefix(12).map {
             DeskRef(refId: $0.path.path, kind: .file(path: $0.path.path, line: nil, label: nil))
         }
         let title = "Replies \(destination) failed before an answer"
         _ = try await HarnessQueue.file(HarnessFinding(key: key, title: title,
-            summary: "\(records.count) replies \(destination) failed before an answer (\(DeskClock.dayStamp(ordered.last!.date)) – \(DeskClock.dayStamp(ordered.first!.date))) — inspect or let go",
+            summary: "\(records.count) replies \(destination) failed before an answer\(span)\(missingDates) — inspect or let go",
             owner: .agent, refs: refs, source: .loop), dataRoot: dataRoot, refreshRefs: true)
-        try await HarnessQueue.fold(keyPrefixes: legacyPrefixes, into: title, dataRoot: dataRoot)
     }
 
 
@@ -144,6 +149,12 @@ public struct DelegationBackgroundWork: Sendable {
                     job.contactName = contacts.first { $0.id == id }?.name
                     return job
                 }
+                let rows: [AgentConversationRecord]
+                do { rows = try AgentConversationStore(dataRoot: dataRoot).records() }
+                catch {
+                    return DelegationJobsRead(jobs: jobs, allStoresReadable: false,
+                        availabilityError: "Delegation conversation routing is unavailable: \(error.localizedDescription). Repair the conversation records, then retry outcome reconciliation.")
+                }
                 if read.allStoresReadable {
                     do {
                         _ = try await LiveNotificationInbox.live(dataRoot: dataRoot)
@@ -169,12 +180,12 @@ public struct DelegationBackgroundWork: Sendable {
                         do {
                             let failedJobs = read.jobs.filter { $0.agent == peer && $0.deliveryOutcome == "failed_before_answer" }
                             let failed = try failedJobs.map { job in
-                                guard let path = job.recoveryNote, let at = job.completedAt else { throw CocoaError(.fileReadCorruptFile) }
-                                return (path: URL(fileURLWithPath: path), at: at)
+                                guard let path = job.recoveryNote else { throw CocoaError(.fileReadCorruptFile) }
+                                return (path: URL(fileURLWithPath: path), at: job.deliveryUpdatedAt)
                             }
                             try await fileFailedReplies(failed, deliveryRefs: Self.replyRefs(failedJobs), route: peer,
                                 destination: "to " + DelegationOutcomeCard.displayName(source: peer, agent: peer),
-                                legacyPrefixes: ["delivery-before-answer|\(peer)|"], dataRoot: dataRoot)
+                                dataRoot: dataRoot)
                         } catch { nativeLog("Reply failure filing failed: %@", error.localizedDescription) }
                     }
                 }
@@ -190,8 +201,8 @@ public struct DelegationBackgroundWork: Sendable {
                 }
                 // Her notice lands only on a matching open row she started
                 // (AgentConversationStore.noteDelegationEvent); anything else
-                // keeps the person's push. Unreadable rows count as none.
-                let rows = (try? AgentConversationStore(dataRoot: dataRoot).records()) ?? []
+                // keeps the person's push. An unreadable conversation source
+                // cannot choose a different audience; reconciliation stays owed.
                 return DelegationJobsRead(
                     jobs: jobs.map { snapshot in
                         var job = snapshot
@@ -544,15 +555,13 @@ public struct DelegationBackgroundWork: Sendable {
     private static func adverseDelegationRollup(source: String, jobs: [DelegationReadout]) -> (entries: [String], counts: String) {
         let entries = jobs.compactMap { job -> String? in
             guard job.source == source,
-                  !["owed", "sent_unconfirmed", "failed_before_answer", "legacy_before_receipts"].contains(job.deliveryOutcome ?? ""),
+                  !["owed", "sent_unconfirmed", "failed_before_answer"].contains(job.deliveryOutcome ?? ""),
                   let outcome = job.terminalOutcome, outcome == .failed || outcome == .unknown else { return nil }
             return "\(outcome.rawValue)|\(job.source):\(job.id)"
         }.sorted()
         let unconfirmed = entries.filter { $0.hasPrefix("\(DelegationOutcome.unknown.rawValue)|") }.count
         let failed = entries.count - unconfirmed
-        let legacy = jobs.filter { $0.source == source && $0.deliveryOutcome == "legacy_before_receipts" }.count
-        let counts = [failed > 0 ? "\(failed) failed" : nil, unconfirmed > 0 ? "\(unconfirmed) unconfirmed" : nil,
-                      legacy > 0 ? "\(legacy) legacy jobs before receipts; nothing to settle" : nil]
+        let counts = [failed > 0 ? "\(failed) failed" : nil, unconfirmed > 0 ? "\(unconfirmed) unconfirmed" : nil]
             .compactMap { $0 }.joined(separator: ", ")
         return (entries, counts)
     }
@@ -614,35 +623,6 @@ public struct DelegationBackgroundWork: Sendable {
         )
     }
 
-    /// Retires the unread per-job success cards written before successful
-    /// delegations moved to one bounded rollup per bridge source. Exact adverse
-    /// outcomes, current rollups, and already-handled history do
-    /// not match this migration.
-    public func reconcileLegacySuccessfulDelegationNotices(
-        dataRoot: URL,
-        now: Date = Date()
-    ) async throws -> Int {
-        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
-        let prefix = "delegation-outcome:"
-        let legacyIDs = try await inbox.rows().compactMap { row -> String? in
-            guard case .object(let object) = row,
-                  case .string("delegation_outcome")? = object["source"],
-                  case .string("info")? = object["severity"],
-                  case .string("unread")? = object["status"],
-                  object["informational_rollup_key"] == nil,
-                  case .string(let id)? = object["id"], id.hasPrefix(prefix),
-                  case .string(let title)? = object["title"], title.hasSuffix(" finished"),
-                  case .string(let signature)? = object["error_signature"]
-            else { return nil }
-            let jobKey = String(id.dropFirst(prefix.count))
-            guard signature == jobKey || signature == "\(jobKey):succeeded" else { return nil }
-            return id
-        }
-        return try await inbox.archiveUnreadInformational(
-            ids: legacyIDs,
-            readAt: DelegationOutcomeCursor.formatISO(now)
-        )
-    }
 }
 
 /// Event-fed reply reconciliation and the exact iOS failure projection.
@@ -678,11 +658,19 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
     var interval: TimeInterval { underlying.interval }
     // One delayed peer continuation may include a full resident chat turn.
     // The manager still owns single-flight execution and cancellation.
-    var tickTimeoutOverride: TimeInterval? { 600 }
+    var tickTimeoutOverride: TimeInterval? {
+        let config = ProviderStreamGuardConfig.fromEnvironment()
+        do { try config.validate(); return config.wallTimeout + 60 }
+        // No provider tick is admitted below; the scheduler retains its own
+        // envelope for reporting this configuration failure.
+        catch { return nil }
+    }
 
     func shutdown() async { await port.stopAgentConversations() }
 
     func tickOutcome() async -> LoopTickOutcome {
+        do { try ProviderStreamGuardConfig.fromEnvironment().validate() }
+        catch { return .failed(error: error.localizedDescription) }
         do { try await work.reconcileClosedReplyFindings(dataRoot: dataRoot, configRoot: configRoot) }
         catch { return .failed(error: "Reply let-go settlement failed: \(error.localizedDescription). Repair the reply or Desk records before reconciliation.") }
         if await deferral.takeReplyReconciliation() {
@@ -693,12 +681,10 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
             }
         }
         do {
-            let archived = try await work
-                .reconcileLegacySuccessfulDelegationNotices(dataRoot: dataRoot)
-                + work.reconcileStaleAdverseDelegationNotices(dataRoot: dataRoot)
+            let archived = try await work.reconcileStaleAdverseDelegationNotices(dataRoot: dataRoot)
             if archived > 0 {
                 FileHandle.standardError.write(Data(
-                    "DelegationOutcomeLoop: archived \(archived) legacy delegation cards\n".utf8
+                    "DelegationOutcomeLoop: archived \(archived) stale adverse delegation cards\n".utf8
                 ))
             }
         } catch {
@@ -706,7 +692,7 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
             // fails; the idempotent reconciliation retries on the next event or
             // six-hour integrity tick.
             FileHandle.standardError.write(Data(
-                "DelegationOutcomeLoop: legacy success reconciliation failed: \(error)\n".utf8
+                "DelegationOutcomeLoop: stale adverse notice reconciliation failed: \(error)\n".utf8
             ))
         }
         let outcome = await underlying.tickOutcome()
@@ -737,8 +723,16 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
                     DelegationOutcomeLoop.workRemaining])
             let deliveryEvents = EventDeadlinePhysiology.storeAndFileEvents(paths: deliveryPaths, loopId: nil)
             let ordinaryEvents = EventDeadlinePhysiology.storeAndFileEvents(paths: ordinaryPaths, loopId: nil)
+            let networkChanges = NetworkSense.changes
             let task = Task {
                 await withTaskGroup(of: String.self) { group in
+                    group.addTask {
+                        for await up in networkChanges {
+                            guard !Task.isCancelled else { break }
+                            if up { continuation.yield(()) }
+                        }
+                        return "network path"
+                    }
                     group.addTask {
                         guard !Task.isCancelled else { return "reply-delivery journal" }
                         do { try await work.fileFailedIOSReplies(dataRoot: dataRoot, deferral: deferral) }
@@ -807,11 +801,16 @@ private struct DelegationOutcomeEventRunner: EventDeadlineLoopRunner {
         // or the six-hour missed-event integrity sweep.
         let conversation = port.nextConversationDeadline(after: now)
         var quietEnd: Date?
-        if let window = TurnQuietHoursWindow.read(dataRoot: dataRoot),
-           window.contains(hour: Calendar.current.component(.hour, from: now)) {
-            quietEnd = window.end(after: now)
-            // The existing saved-delivery pass runs at this exact crossing.
-            await deferral.requestReplyReconciliation()
+        do {
+            if let window = try TurnQuietHoursWindow.checkedRead(dataRoot: dataRoot),
+               window.contains(hour: Calendar.current.component(.hour, from: now)) {
+                quietEnd = window.end(after: now)
+                // The existing saved-delivery pass runs at this exact crossing.
+                await deferral.requestReplyReconciliation()
+            }
+        } catch {
+            // Preference repair/source events rearm this deadline. The failed
+            // read records repair owed and cannot authorize reply release.
         }
         return [stall, conversation, quietEnd].compactMap { $0 }.min()
     }

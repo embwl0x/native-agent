@@ -160,7 +160,7 @@ public actor DesktopAgentConversationRoute {
 
 /// Request-scoped evidence fence over the transport's own verbs (screen, go,
 /// read, its result pages and act); every call still enters the app's file,
-/// Trust and Mac Control gates, and any other tool is hers here as anywhere.
+/// Trust and Mac Control gates. No other execution door is offered or dispatched.
 package actor DesktopConversationTools: ToolDispatchClient {
     let inner: any ToolDispatchClient
     let bundle: String
@@ -188,12 +188,16 @@ package actor DesktopConversationTools: ToolDispatchClient {
         self.frontmostBundle = frontmostBundle
     }
     package func listAvailableTools() async throws -> [String] {
-        try await inner.listAvailableTools()
+        try await listAvailableToolSchemas().map(\.name)
     }
+    private static let offered: Set<String> = ["screen", "go", "read", "tool_result_page", "act"]
     package func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-        try await inner.listAvailableToolSchemas()
+        try await inner.listAvailableToolSchemas(named: Self.offered).filter { Self.offered.contains($0.name) }
     }
     package func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        guard Self.offered.contains(tool) else {
+            throw refusal("This courier only offers its scoped screen, go, read, result paging and act operations. That call did not run.")
+        }
         calls += 1
         guard calls <= 24 else { throw refusal("Desktop conversation tool budget exceeded.") }
         var args = input.filter { $0.value != .null }
@@ -279,8 +283,6 @@ package actor DesktopConversationTools: ToolDispatchClient {
                 default: throw refusal("This operation is outside desktop conversation scope.")
                 }
             }
-        } else {
-            return try await inner.dispatch(tool: tool, input: input, surface: surface)
         }
         // Only a read taken after the submission counts as evidence of it.
         if submitting { observed = "" }
@@ -307,6 +309,9 @@ package actor DesktopConversationTools: ToolDispatchClient {
     }
 
     @MainActor private static func verifiedComposerTarget(bundle: String, label: String, content: String) throws -> String? {
+        try MacAccessibilityReader.withReadBudget { try verifiedComposerTargetRead(bundle: bundle, label: label, content: content) }
+    }
+    @MainActor private static func verifiedComposerTargetRead(bundle: String, label: String, content: String) throws -> String? {
         let source = SystemMacAXElementSource()
         guard source.isTrusted(), let app = NSWorkspace.shared.frontmostApplication,
               app.bundleIdentifier == bundle else { return nil }
@@ -328,9 +333,11 @@ package actor DesktopConversationTools: ToolDispatchClient {
         let boxes = tree.filter {
             [kAXTextAreaRole, kAXTextFieldRole].contains(MacAXAttributeRead.text($0, kAXRoleAttribute))
                 && MacAXAttributeRead.text($0, kAXSubroleAttribute) != kAXSearchFieldSubrole
-                && MacAXAttributeRead.copyRaw($0, kAXEnabledAttribute) as? Bool != false
+                && MacAXAttributeRead.copyRaw($0, kAXEnabledAttribute) as? Bool == true
         }
-        guard boxes.count == 1, let value = MacAXAttributeRead.copyRaw(boxes[0], kAXValueAttribute) as? String,
+        guard boxes.count == 1 else { return nil }
+        let value = try GrokRoutineAccessibility.composerValue(boxes[0])
+        guard
               value.trimmingCharacters(in: .whitespacesAndNewlines) == content.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
         return MacAXAttributeRead.text(boxes[0], kAXRoleAttribute) == kAXTextAreaRole ? "text area" : "text"
     }

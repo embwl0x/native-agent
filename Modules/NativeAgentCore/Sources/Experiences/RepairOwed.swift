@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `RepairOwed.swift` | `RepairOwed`: experience-backed repair claims and settlement; `isOwed` omits effect-free agent probes and explicit pre-effect refusals without rewriting history; retries, restarts and unrelated successes cannot settle another operation's debt |
+// Blueprint: | `RepairOwed.swift` | `RepairOwed`: experience-backed repair claims and settlement; `attempt` is the one form that owes on throw and settles on return; `isOwed` omits effect-free agent probes and explicit pre-effect refusals without rewriting history; retries, restarts and unrelated successes cannot settle another operation's debt |
 
 /// Repair owed (User 10-18: "No fallbacks: it works and it works right, and
 /// never can the agent say I can't fix it"). A no whose cause lies outside the
@@ -78,6 +78,41 @@ public enum RepairOwed {
             try await store.append([.evidence(.init(source: "repeat", id: met.id))], to: open.id)
         } else {
             try await store.begin(met)
+        }
+    }
+
+    /// THE ONE FORM for work that can owe repair: it runs `body`. A throw owes
+    /// repair for `operation` (folding into the open debt) and rethrows; a
+    /// return settles every repair owed for it. A debt never exists without
+    /// the success that ends it.
+    @discardableResult
+    public static func attempt<T>(_ dataRoot: URL, operation: String, owner: String, lever: String? = nil,
+                                  nextCall: String? = nil, tap: String? = nil,
+                                  words: (any Error) -> String, _ body: () throws -> T) rethrows -> T {
+        do {
+            let value = try body()
+            settle(dataRoot, operation: operation, evidence: .init(source: "attempt", id: UUID().uuidString.lowercased()))
+            return value
+        } catch {
+            owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .act, operation: operation, owner: owner,
+                words: words(error), lever: lever, nextCall: nextCall, tap: tap)
+            throw error
+        }
+    }
+
+    /// `attempt` for asynchronous work.
+    @discardableResult
+    public static func attempt<T>(_ dataRoot: URL, operation: String, owner: String, lever: String? = nil,
+                                  nextCall: String? = nil, tap: String? = nil,
+                                  words: (any Error) -> String, _ body: () async throws -> T) async rethrows -> T {
+        do {
+            let value = try await body()
+            settle(dataRoot, operation: operation, evidence: .init(source: "attempt", id: UUID().uuidString.lowercased()))
+            return value
+        } catch {
+            owe(dataRoot, id: UUID().uuidString.lowercased(), kind: .act, operation: operation, owner: owner,
+                words: words(error), lever: lever, nextCall: nextCall, tap: tap)
+            throw error
         }
     }
 

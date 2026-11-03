@@ -152,8 +152,11 @@ extension ChatView {
     }
 
     @ViewBuilder
-    var shellConversationsColumn: some View {
+    func shellConversationsColumn(_ layout: SurfaceLayoutAvailability) -> some View {
         VStack(alignment: .leading, spacing: 4) {
+            if let failure = layout.failure {
+                Text(failure.localizedDescription).font(.caption).textSelection(.enabled)
+            }
             HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
                 Text(ChatShellCopy.conversationsTitle)
                     .font(ShellType.columnTitle)
@@ -226,14 +229,14 @@ extension ChatView {
                 }
                 // The column's blocks in the layout's order (ui/layout.json,
                 // chat); whether a fold is open is saved there too.
-                ForEach(shellColumnBlocks, id: \.self) { block in
+                ForEach(layout.contentNames("chat", profile: layoutProfile), id: \.self) { block in
                     switch block {
                     case "rows":
                         ForEach(sections.rows) { session in
                             shellSessionRow(session).tag(session.id)
                         }
                     case "briefs" where !sections.briefs.isEmpty:
-                        Section(isExpanded: shellFold("briefs")) {
+                        Section(isExpanded: shellFold("briefs", layout: layout)) {
                             ForEach(sections.briefs) { session in
                                 shellSessionRow(session).tag(session.id)
                             }
@@ -243,7 +246,7 @@ extension ChatView {
                         }
                     case "working" where !sections.working.isEmpty:
                         // The conversation on screen is never folded out of sight.
-                        Section(isExpanded: shellFold("working",
+                        Section(isExpanded: shellFold("working", layout: layout,
                             openWhile: sections.working.contains { $0.id == appModel.activeChatSessionId })) {
                             ForEach(sections.working) { session in
                                 shellSessionRow(session).tag(session.id)
@@ -269,15 +272,11 @@ extension ChatView {
         // The list stays transparent over ShellFrame's sheet; only its gutter separates it from the room.
     }
 
-    /// The conversations column's blocks as this chat's view shows them;
-    /// none shown, no column (Simple's profile, as seeded).
-    var shellColumnBlocks: [String] {
-        appModel.engine.layout.layout.shown("chat", profile: layoutProfile).map(\.name)
-    }
-
     /// A fold the person opens or closes: the layout's, written as theirs.
-    func shellFold(_ block: String, openWhile forced: Bool = false) -> Binding<Bool> {
-        Binding(get: { forced || appModel.engine.layout.layout.expanded("chat", block) },
+    func shellFold(_ block: String, layout: SurfaceLayoutAvailability, openWhile forced: Bool = false) -> Binding<Bool> {
+        // Without a layout there is no fold state to edit; expose its rows.
+        guard case .available(let document) = layout else { return .constant(true) }
+        return Binding(get: { forced || document.expanded("chat", block) },
                 set: { open in Task { await appModel.engine.setSurfaceExpanded(open, surface: "chat", block: block) } })
     }
 
@@ -407,7 +406,6 @@ extension ChatView {
         ChatMessageListView(
             messages: appModel.chatMessages,
             sessionId: appModel.activeChatSessionId,
-            isStreaming: appModel.isBusy && appModel.isChatStreaming,
             highlightedMessageID: showTranscriptSearch ? transcriptSearch.selectedMessageID : nil,
             animatesArrival: animatesMessageArrival,
             latestRequest: transcriptLatestRequest,

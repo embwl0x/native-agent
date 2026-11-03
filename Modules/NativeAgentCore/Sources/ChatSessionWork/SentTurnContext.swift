@@ -88,6 +88,12 @@ package struct SentTurnContext: Sendable {
         }
     }
 
+    package static func matches(_ row: [String: JSONValue], runID: String, userMessageID: String?) -> Bool {
+        guard row["role"] == .string("user") else { return false }
+        if let userMessageID { return row["id"] == .string(userMessageID) }
+        return row["runId"] == .string(runID)
+    }
+
     private func persistMetadata(sessionID: String, runID: String, userMessageID: String?, dataRoot: URL?) async throws {
         guard let safe = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else {
             throw NSError(domain: "SentTurnContext", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid context transcript session."])
@@ -96,9 +102,7 @@ package struct SentTurnContext: Sendable {
         try await SwiftNativePersistenceCore.withFileLock(path) {
             let bytes = try Data(contentsOf: path)
             guard let updated = try ContactThread.editingRow(in: bytes, last: true, matching: { row in
-                guard row["role"] == .string("user") else { return false }
-                if let userMessageID { return row["id"] == .string(userMessageID) }
-                return row["runId"] == .string(runID)
+                Self.matches(row, runID: runID, userMessageID: userMessageID)
             }, replacement: { original in
                 var row = original
                 var metadata: [String: JSONValue]

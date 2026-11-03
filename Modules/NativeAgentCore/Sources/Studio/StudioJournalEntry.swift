@@ -3,7 +3,44 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import CryptoKit
-// Blueprint: | `StudioJournalEntry.swift` | Encounter, journal and amendment vocabulary; corrections project without rewriting journal bytes |
+// Blueprint: | `StudioJournalEntry.swift` | Encounter, journal and amendment vocabulary; strict current saved-row decoding rejects malformed present fields and elements; corrections project without rewriting journal bytes |
+
+/// Shared field checks for current saved Studio records. Missing optional fields
+/// are legitimate; a present malformed field rejects the entire owning row.
+struct StudioSavedRow {
+    let fields: [String: JSONValue]
+    init(_ value: JSONValue) throws {
+        guard case .object(let fields) = value else { throw CocoaError(.fileReadCorruptFile) }
+        self.fields = fields
+    }
+    func string(_ key: String) throws -> String {
+        guard case .string(let value)? = fields[key], !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return value
+    }
+    func optionalString(_ key: String) throws -> String? {
+        guard fields[key] != nil else { return nil }
+        return try string(key)
+    }
+    func strings(_ key: String, required: Bool = false) throws -> [String] {
+        try rows(key, required: required) { value in
+            guard case .string(let text) = value, !text.isEmpty else { return nil }
+            return text
+        }
+    }
+    func rows<T>(_ key: String, required: Bool = false, decode: (JSONValue) -> T?) throws -> [T] {
+        guard let value = fields[key] else {
+            if required { throw CocoaError(.fileReadCorruptFile) }
+            return []
+        }
+        guard case .array(let values) = value else { throw CocoaError(.fileReadCorruptFile) }
+        return try values.map {
+            guard let row = decode($0) else { throw CocoaError(.fileReadCorruptFile) }
+            return row
+        }
+    }
+}
 
 public enum StudioOriginKind: String, Sendable, CaseIterable, Equatable {
     case wandering, consult, project
@@ -56,15 +93,12 @@ public struct StudioWork: Sendable, Equatable {
     }
 
     public static func fromJSON(_ value: JSONValue) -> StudioWork? {
-        guard case .object(let obj) = value, case .string(let title)? = obj["title"] else { return nil }
-        func str(_ key: String) -> String? {
-            if case .string(let s)? = obj[key], !s.isEmpty { return s }
-            return nil
-        }
-        return StudioWork(
-            title: title, creator: str("creator"), medium: str("medium"),
-            date: str("date"), version: str("version"), edition: str("edition")
-        )
+        do {
+            let row = try StudioSavedRow(value)
+            return try StudioWork(title: row.string("title"), creator: row.optionalString("creator"),
+                medium: row.optionalString("medium"), date: row.optionalString("date"),
+                version: row.optionalString("version"), edition: row.optionalString("edition"))
+        } catch { return nil }
     }
 }
 
@@ -88,13 +122,11 @@ public struct StudioReception: Sendable, Equatable {
         return .object(obj)
     }
 
-    public static func fromJSON(_ value: JSONValue) -> StudioReception {
-        guard case .object(let obj) = value else { return StudioReception() }
-        func str(_ key: String) -> String? {
-            if case .string(let s)? = obj[key], !s.isEmpty { return s }
-            return nil
-        }
-        return StudioReception(how: str("how"), wholeOrPart: str("whole_or_part"))
+    public static func fromJSON(_ value: JSONValue) -> StudioReception? {
+        do {
+            let row = try StudioSavedRow(value)
+            return try StudioReception(how: row.optionalString("how"), wholeOrPart: row.optionalString("whole_or_part"))
+        } catch { return nil }
     }
 }
 
@@ -117,9 +149,11 @@ public struct StudioOrigin: Sendable, Equatable {
         guard case .object(let obj) = value,
               case .string(let kindRaw)? = obj["kind"],
               let kind = StudioOriginKind(rawValue: kindRaw) else { return nil }
-        var ref: String?
-        if case .string(let r)? = obj["ref"], !r.isEmpty { ref = r }
-        return StudioOrigin(kind: kind, ref: ref)
+        do {
+            let ref = try StudioSavedRow(value).optionalString("ref")
+            guard kind != .consult || ref != nil else { return nil }
+            return StudioOrigin(kind: kind, ref: ref)
+        } catch { return nil }
     }
 }
 
@@ -143,9 +177,8 @@ public struct StudioStanceValue: Sendable, Equatable {
         guard case .object(let obj) = value,
               case .string(let kindRaw)? = obj["kind"],
               let kind = StudioStance(rawValue: kindRaw) else { return nil }
-        var reason: String?
-        if case .string(let r)? = obj["reason"], !r.isEmpty { reason = r }
-        return StudioStanceValue(kind: kind, reason: reason)
+        do { return try StudioStanceValue(kind: kind, reason: StudioSavedRow(value).optionalString("reason")) }
+        catch { return nil }
     }
 }
 
@@ -290,38 +323,24 @@ public struct StudioJournalEntry: Sendable, Equatable {
 
     public static func fromJSON(_ value: JSONValue) -> StudioJournalEntry? {
         guard case .object(let obj) = value,
-              case .string(let id)? = obj["id"],
-              case .string(let recordedAt)? = obj["recorded_at"],
               let work = obj["work"].flatMap(StudioWork.fromJSON),
               let origin = obj["origin"].flatMap(StudioOrigin.fromJSON),
               let stance = obj["stance"].flatMap(StudioStanceValue.fromJSON) else { return nil }
-        var encounteredAt = recordedAt
-        if case .string(let e)? = obj["encountered_at"], !e.isEmpty { encounteredAt = e }
-        let reception = obj["reception"].map(StudioReception.fromJSON) ?? StudioReception()
-        var refs: [String] = []
-        if case .array(let arr)? = obj["artifact_refs"] {
-            refs = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
-        }
-        var response: String?
-        if case .string(let r)? = obj["response"], !r.isEmpty { response = r }
-        var relations: [StudioRelation] = []
-        if case .array(let arr)? = obj["relations"] {
-            relations = arr.compactMap { StudioRelation.fromJSON($0) }
-        }
-        var tags: [String] = []
-        if case .array(let arr)? = obj["tags"] {
-            tags = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
-        }
-        var amendments: [StudioAmendment] = []
-        if case .array(let arr)? = obj["amendments"] {
-            amendments = arr.compactMap { StudioAmendment.fromJSON($0) }
-        }
-        return StudioJournalEntry(
-            id: id, encounteredAt: encounteredAt, recordedAt: recordedAt,
-            work: work, reception: reception, artifactRefs: refs, origin: origin,
-            response: response, stance: stance, relations: relations, tags: tags,
-            amendments: amendments
-        )
+        do {
+            let row = try StudioSavedRow(value)
+            let reception: StudioReception
+            if let value = obj["reception"] {
+                guard let decoded = StudioReception.fromJSON(value) else { return nil }
+                reception = decoded
+            } else { reception = StudioReception() }
+            let response = try row.optionalString("response")
+            guard stance.kind == .abstained || response != nil else { return nil }
+            return try StudioJournalEntry(
+                id: row.string("id"), encounteredAt: row.string("encountered_at"), recordedAt: row.string("recorded_at"),
+                work: work, reception: reception, artifactRefs: row.strings("artifact_refs"), origin: origin,
+                response: response, stance: stance, relations: row.rows("relations", decode: StudioRelation.fromJSON),
+                tags: row.strings("tags"), amendments: row.rows("amendments", decode: StudioAmendment.fromJSON))
+        } catch { return nil }
     }
 }
 
@@ -371,18 +390,11 @@ public struct StudioAmendment: Sendable, Equatable {
     }
 
     public static func fromJSON(_ value: JSONValue) -> StudioAmendment? {
-        guard case .object(let obj) = value,
-              case .string(let id)? = obj["id"],
-              case .string(let entryId)? = obj["entry_id"],
-              case .string(let amendedAt)? = obj["amended_at"],
-              case .string(let reason)? = obj["reason"],
-              case .string(let correction)? = obj["correction"],
-              !correction.isEmpty else { return nil }
-        var supersedes: String?
-        if case .string(let s)? = obj["supersedes"], !s.isEmpty { supersedes = s }
-        return StudioAmendment(
-            id: id, entryId: entryId, amendedAt: amendedAt,
-            reason: reason, supersedes: supersedes, correction: correction
-        )
+        do {
+            let row = try StudioSavedRow(value)
+            return try StudioAmendment(id: row.string("id"), entryId: row.string("entry_id"),
+                amendedAt: row.string("amended_at"), reason: row.string("reason"),
+                supersedes: row.optionalString("supersedes"), correction: row.string("correction"))
+        } catch { return nil }
     }
 }

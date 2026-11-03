@@ -1,5 +1,6 @@
 import Foundation
 import os
+import Darwin
 
 // Blueprint: | `ModuleLogging.swift` | `ModuleLog`: shared public diagnostic formatting and credential scrubbing; `nativeLog` retains the Shared category |
 
@@ -34,17 +35,26 @@ private enum ModuleLogTrail {
     private static let lock = NSLock()
     static func append(_ line: String, to url: URL) {
         lock.lock(); defer { lock.unlock() }
-        let fm = FileManager.default
-        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if let size = (try? fm.attributesOfItem(atPath: url.path)[.size] as? Int) ?? nil, size > 512 * 1024 {
-            try? fm.removeItem(at: url)
-        }
-        let stamped = ISO8601DateFormatter().string(from: Date()) + " " + line + "\n"
-        if let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd(); try? handle.write(contentsOf: Data(stamped.utf8))
-        } else {
-            try? Data(stamped.utf8).write(to: url)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            // Create-or-append is one filesystem operation. An unreadable or
+            // unwritable existing log never selects a whole-file replacement.
+            let descriptor = open(url.path, O_WRONLY | O_CREAT | O_APPEND, mode_t(0o600))
+            guard descriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+            let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+            defer {
+                do { try handle.close() }
+                catch { ModuleLog(category: "ModuleLogTrail")("Diagnostic trail close failed: %@", error.localizedDescription, level: .error) }
+            }
+            var info = stat()
+            guard fstat(descriptor, &info) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+            if info.st_size > 512 * 1024 {
+                try handle.truncate(atOffset: 0)
+            }
+            let stamped = ISO8601DateFormatter().string(from: Date()) + " " + line + "\n"
+            try handle.write(contentsOf: Data(stamped.utf8))
+        } catch {
+            ModuleLog(category: "ModuleLogTrail")("Diagnostic trail append failed: %@. Repair the diagnostics directory's access; the existing log was not replaced.", error.localizedDescription, level: .error)
         }
     }
 }

@@ -1,9 +1,92 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `MemoryV2Contracts.swift` | Recall candidate offsets and counted/capped continuations, proposal contracts; `MemoryPatchContract` preserves untrusted sources through rewrites and duplicate collapse |
+// Blueprint: | `MemoryV2Contracts.swift` | Recall candidate offsets and continuations; `MemoryCommitArguments` owns explicit scope bounds; `MemoryProposalEvidence` reads checked recorded recurrence and sessions; proposal contracts and `MemoryPatchContract` provenance |
 
 // MARK: - Request / response types
+
+/// The explicit save's scope contract, shared with its advertised bounds.
+public enum MemoryCommitArguments {
+    public static let topicLimit = 8
+    public static let topicCharacterLimit = 120
+
+    public static func contextTopics(_ value: JSONValue, kind: String?) throws -> [JSONValue]? {
+        guard case .array(let values) = value, values.count <= topicLimit else {
+            throw MemoryV2Error.underlying("'context_topics' must be an array of at most \(topicLimit) scope phrases")
+        }
+        var topics: [JSONValue] = []
+        for value in values {
+            guard case .string(let raw) = value else {
+                throw MemoryV2Error.underlying("every context_topics entry must be a string")
+            }
+            let topic = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !topic.isEmpty, topic.count <= topicCharacterLimit else {
+                throw MemoryV2Error.underlying("every context_topics entry must contain 1...\(topicCharacterLimit) characters")
+            }
+            topics.append(.string(topic))
+        }
+        if !topics.isEmpty, let kind,
+           !["correction", "instruction", "preference", MemoryKindStamp.genericCommitKind].contains(kind) {
+            throw MemoryV2Error.underlying("context_topics is not supported for kind \(kind)")
+        }
+        return topics.isEmpty ? nil : topics
+    }
+}
+
+/// Evidence is recorded by `propose`, never inferred from a source label.
+public struct MemoryProposalEvidence: Sendable {
+    public let sessionIDs: [String]
+    public let recurrenceCount: Int?
+    public let error: String?
+
+    public static func confidence(in metadata: JSONValue?) throws -> Double {
+        guard case .object(let fields)? = metadata,
+              let value = fields["confidence"]?.numberValue(coercingStrings: false, finiteOnly: true),
+              (0...1).contains(value) else {
+            throw MemoryV2Error.underlying("Proposal confidence is missing or invalid; expected a finite number in 0...1. Its saved evidence is unchanged.")
+        }
+        return value
+    }
+
+    public static func recurrence(in metadata: [String: JSONValue]) throws -> Int? {
+        guard let value = metadata["recurrence_count"] else { return nil }
+        guard case .int(let raw) = value, let count = Int(exactly: raw), count > 0 else {
+            throw MemoryV2Error.underlying("recurrence_count must be a positive integer")
+        }
+        return count
+    }
+
+    public init(metadata: JSONValue?) {
+        var sessions: [String] = []
+        var count: Int?
+        var failures: [String] = []
+        if let metadata {
+            if case .object(let fields) = metadata {
+                do { count = try Self.recurrence(in: fields) }
+                catch { failures.append(String(describing: error)) }
+                if let value = fields["supporting_session_ids"] {
+                    if case .array(let values) = value,
+                       values.allSatisfy({ if case .string(let id) = $0 { return !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }; return false }) {
+                        sessions = Array(Set(values.compactMap(\.stringValue))).sorted()
+                    } else { failures.append("supporting_session_ids must contain only nonempty session ids") }
+                }
+            } else { failures.append("proposal evidence metadata is not an object") }
+        }
+        sessionIDs = sessions
+        recurrenceCount = count
+        error = failures.isEmpty ? nil : failures.joined(separator: "; ")
+    }
+}
+
+extension ProposalRecord {
+    public var evidence: MemoryProposalEvidence { MemoryProposalEvidence(metadata: metadata) }
+    public var evidenceSummary: String {
+        let recorded = evidence
+        return MemoryProposalRecord.evidenceDescription(sessionCount: recorded.sessionIDs.count,
+            recurrenceCount: recorded.recurrenceCount, error: recorded.error)
+    }
+}
 
 public struct MemoryV2RecallRequest: Sendable, Codable, Equatable {
     public var text: String
@@ -123,13 +206,12 @@ public enum MemoryPatchContract {
     /// `tags` / `importance` — surfaced back into typed slots by `toMemoryRecord`.
     /// `recall_count` — `store()`'s duplicate guard bumps it.
     /// `source_history` / `duplicate_occurrences` — byte-identical collapse provenance.
-    /// `owner_restored` — stamped when the agent restores an archived row.
     ///
     /// `kind` is deliberately ABSENT: it is semantics-owned (kind-scoped decay)
     /// and the approval-gated kind backfill uses its dedicated typed writer.
     public static let untypedPassthroughKeys: Set<String> = [
         "pinned", "tags", "importance", "recall_count",
-        "source_history", "duplicate_occurrences", "owner_restored", "untrusted_sources", "peer_data_sources", "peer_sources",
+        "source_history", "duplicate_occurrences", "untrusted_sources", "peer_data_sources", "peer_sources",
     ]
 
 }

@@ -5,7 +5,9 @@ import DoctorChecks
 import BackgroundWork
 import Synchronization
 import NativeAgentShared
-// Blueprint: | `EngineDoctorRuntime.swift` | EngineDoctorRuntime and EngineDoctorPlatformPort retain live check orchestration, frozen repair admission, cancellation, rechecks and repair-obligation publication |
+import Browser
+import MacControl
+// Blueprint: | `EngineDoctorRuntime.swift` | Live Doctor orchestration, owner-scoped Mac/browser recovery readings, frozen repair admission, cancellation, rechecks and repair-obligation publication |
 
 /// Platform observations and callbacks; Doctor owns interpretation and repair admission.
 public protocol EngineDoctorPlatformPort: Sendable {
@@ -153,6 +155,8 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
             return await self.doctorCognitionChecks().first { $0.id == id }
         }
         switch id {
+        case "live.mac_operation_recovery", "live.browser_operation_recovery":
+            return await operationRecoveryChecks().first { $0.id == id }
         case "live.providers": return await providerDoctorCoverageCheck()
         case "live.search": return await searchDoctorCoverageCheck(probe: true)
         case "live.telegram": return await telegramDoctorCoverageCheck()
@@ -176,7 +180,7 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
             let row = checks[index]
             let available = await self.doctorLiveRepair(for: row, scope: .button)?.checkID == row.id
             checks[index].repair = available ? "Press Repair in Diagnostics → Health checks to retry this live service." : nil
-            checks[index].human_action = row.recoveryAction(repairAvailable: available)
+            checks[index].human_action = row.recoveryAction()
             checks[index].repair_available = available
             checks[index].owner = DoctorOwner.of(row, repairAvailable: available)
         }
@@ -199,7 +203,29 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: Sendable {
         async let inspector = self.doctorInspectorCheck()
         async let embedding = self.doctorEmbeddingDownloadCheck()
         async let pulses = self.doctorOrganPulsesCheck()
-        let common = await [providers, telegram, search, tools, autonomy, loops, memory, bridges, agents, inspector, embedding, pulses] + (await loopDetails) + [self.doctorDataRootCheck()]
-        return includeCognition ? common + (await self.doctorCognitionChecks()) : common
+        let common = await [providers, telegram, search, tools, autonomy, loops, memory, bridges, agents, inspector, embedding, pulses]
+        let ownerChecks = await operationRecoveryChecks()
+        let readings = common + (await loopDetails) + [self.doctorDataRootCheck()] + ownerChecks
+        return includeCognition ? readings + (await self.doctorCognitionChecks()) : readings
+    }
+
+    private func operationRecoveryChecks() async -> [CheckResult] {
+        let macIssue = MacControlOperationStore(dataRoot: dataRoot).recoveryIssue
+        let mac = CheckResult(source: "mac_control/operations.json",
+            id: "live.mac_operation_recovery", title: "Mac action recovery",
+            status: macIssue == nil ? "ok" : "fail",
+            detail: macIssue ?? "Mac operation recovery completed; new effects still pass ordinary Trust and domain checks.",
+            human_action: macIssue == nil ? nil : "Preserve and repair mac_control/operations.json, inspect affected apps with mac.look to reconcile unknown effects, then restart NativeAgent. Looking and other surfaces remain available.")
+        let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
+        var issues = [browser.recoveryIssue].compactMap { $0 }
+        do { issues += try await browser.canonicalRunIssues() }
+        catch { issues.append(error.localizedDescription) }
+        return [mac, CheckResult(source: "native_power/browser/runs.json",
+            id: "live.browser_operation_recovery", title: "Browser action recovery",
+            status: issues.isEmpty ? "ok" : "fail",
+            detail: issues.isEmpty
+                ? "Browser operation recovery completed; new effects still pass ordinary Trust and domain checks."
+                : issues.joined(separator: "\n"),
+            human_action: issues.isEmpty ? nil : "Preserve and repair the named browser run or projection feed, reconcile unknown effects by observing the existing page without reopening its URL, then restart NativeAgent. Other surfaces remain available.")]
     }
 }

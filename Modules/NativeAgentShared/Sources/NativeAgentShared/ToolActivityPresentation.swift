@@ -43,9 +43,6 @@ public enum ToolActivityPresentation {
         case "agent_message": return plainName(args["agent"]).map { "Messaging \($0)" } ?? "Messaging an agent"
         case "agent_read": return plainName(args["agent"]).map { "Reading \($0)'s reply" } ?? "Reading a reply"
         case "time_now": return "Checking the time"
-        case "tool_catalog", "tool_load", "list_tools": return "Looking up tools"
-        case "read_skill": return "Loading skill"
-        case "list_skills": return "Checking skills"
         case "git_log": return "Checking recent commits"
         case "git_status": return "Checking repo status"
         case "git_diff": return "Checking repo diff"
@@ -53,7 +50,7 @@ public enum ToolActivityPresentation {
         case "read_file", "file_excerpt": return "Reading file"
         case "list_dir": return "Listing folder"
         case "recall_memory", "recall_search": return "Searching memory"
-        case "claude_message", "invoke_claude", "codex_message", "invoke_codex", "omp_message", "agent_swarm":
+        case "claude_message", "codex_message", "invoke_codex", "omp_message", "agent_swarm":
             return "Starting background work"
         case "search_kg": return "Searching knowledge graph"
         default:
@@ -131,10 +128,7 @@ public enum ToolActivityPresentation {
             }
             return "\(label): \(title(name))" + (detail.flatMap { $0.isEmpty ? nil : " · \($0)" } ?? "")
         }
-        switch name.lowercased() {
-        case "tool_catalog", "tool_load", "list_tools": return "Looking up tools"
-        default: return "Finished: \(title(name))"
-        }
+        return "Finished: \(title(name))"
     }
 
     /// Translate generated approval labels, preserving requesters and literal evidence.
@@ -163,11 +157,10 @@ public enum ToolActivityPresentation {
         "codex_message": "Send a coding request", "restart_app": "Restart the app",
         "write_file": "Write a file", "git": "Work with version history", "install_app": "Install the app",
         "shell": "Run a command", "list_dir": "List files", "image_generate": "Create an image",
-        "tool_load": "Looking up tools", "bash": "Run a command", "claude_message": "Send a helper request",
-        "studio_journal": "Write a working note", "tool_catalog": "Looking up tools",
-        "list_tools": "Looking up tools", "omp_message": "Send a helper request",
-        "invoke_codex": "Ask a coding helper", "invoke_claude": "Ask a helper",
-        "agent_swarm": "Start background work", "read_skill": "Read a skill", "list_skills": "Check skills",
+        "bash": "Run a command", "claude_message": "Send a helper request",
+        "studio_journal": "Write a working note", "omp_message": "Send a helper request",
+        "invoke_codex": "Ask a coding helper",
+        "agent_swarm": "Start background work",
         "desk_breakdown": "Break down a task",
         "mac_calendar_delete_event": "Delete a calendar event",
         "mac_calendar_create_event": "Create a calendar event",
@@ -175,12 +168,4 @@ public enum ToolActivityPresentation {
         "mac_calendar_list_upcoming": "Read upcoming calendar events",
     ]
 
-    public static let skillReaderToolNames: Set<String> = [
-        "list_skills",
-        "read_skill",
-    ]
-
-    public static func isSkillReaderTool(named name: String) -> Bool {
-        skillReaderToolNames.contains(name)
-    }
 }

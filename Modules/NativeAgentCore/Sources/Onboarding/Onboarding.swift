@@ -7,7 +7,7 @@ import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 // Blueprint: | `Onboarding.swift` | Onboarding client roots, start verdict and ability catalog |
-/// Completion/reset controls are excluded from local backup/export and phone sync in PrivacyMap.
+/// Pending completion/reset controls stay local; completion evidence travels in backup/export, never raw phone sync.
 /// PersonaEngine commits profiles; UserMDGenerator commits USER.md.
 public struct SwiftNativeOnboardingClient: Sendable {
     let personaRoot: URL
@@ -40,7 +40,7 @@ public struct SwiftNativeOnboardingClient: Sendable {
             let soulPath = targets["soul"]!
             let voicePath = targets["voice"]!
             let growthPath = targets["growth"]!
-            let personaPaths = [soulPath, voicePath, growthPath]
+            let personaPaths = [soulPath, voicePath, growthPath, targets["agents"]!]
             let onboardedSentinel = targets["sentinel"]!
             let pending = try Self.loadTransactionIfPresent(
                 at: transactionManifestPath,
@@ -50,18 +50,11 @@ public struct SwiftNativeOnboardingClient: Sendable {
             let hasExisting = pending != nil
                 || personaPaths.contains { fm.fileExists(atPath: $0.path) }
                 || fm.fileExists(atPath: onboardedSentinel.path)
-            // Completion is the sentinel or the complete, nonempty legacy
-            // SOUL/VOICE/USER/GROWTH bundle. No single document proves it.
-            let hasCompletionAnchor = Self.hasCompletionAnchor(
-                personaTargets: targets,
-                fileManager: fm
-            )
+            let hasCompletionAnchor = NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot)
             // Persona bytes with no proof of completion: partial state, which
             // takes the reset lane. A generator-only USER.md remains fresh state.
             let hasPartialPersonaState = !hasCompletionAnchor
-                && (fm.fileExists(atPath: soulPath.path)
-                    || fm.fileExists(atPath: voicePath.path)
-                    || fm.fileExists(atPath: growthPath.path))
+                && personaPaths.contains { fm.fileExists(atPath: $0.path) }
             // `hasPartialPersonaState` (and therefore `resetRequired`) requires
             // NO completion anchor, so the two states can never both be true.
             let profileRepairRequired = pending == nil
@@ -69,10 +62,12 @@ public struct SwiftNativeOnboardingClient: Sendable {
                 && !fm.fileExists(atPath: profileJSONPath.path)
             var currentName: String?
             var profileUnreadable: String?
-            if hasExisting {
-                do { currentName = try pending?.agentName ?? Self.readPersonaName(at: profileJSONPath) }
-                catch OnboardingError.ioFailure(let why) where pending == nil && hasCompletionAnchor {
-                    profileUnreadable = "Setup could not read the saved names: \(why). The persona documents are intact. Move \(profileJSONPath.path) aside on the Mac, then reopen setup to enter the two names again."
+            if let pending {
+                currentName = pending.agentName
+            } else if hasExisting && !profileRepairRequired && !hasPartialPersonaState {
+                do { currentName = try PersonaCompiler.compileProfile(dataRoot: dataRoot).name }
+                catch {
+                    profileUnreadable = "Setup could not read the saved profile: \(error.localizedDescription). The persona documents are intact. Repair \(profileJSONPath.path) on the Mac, then check again."
                 }
             }
             return OnboardingStartResult(

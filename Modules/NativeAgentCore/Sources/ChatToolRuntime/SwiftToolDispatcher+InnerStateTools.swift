@@ -206,6 +206,10 @@ extension SwiftToolDispatcher {
                     "valence_sign": .int(Int64(expectation.valenceSign)),
                 ])
             }),
+            "his_day": .object([
+                "title": reading.personDayTitle.map { .string(innerStateSafeText($0, limit: 160)) } ?? .null,
+                "claims": .array(reading.personDay.map { .string(innerStateSafeText($0, limit: 400)) }),
+            ]),
             // `toward` — the forward-facing register (#4). A label, a sign, a
             // date. Absent when she is facing nothing, which renders as null
             // rather than as a flat "nothing planned".
@@ -240,9 +244,29 @@ extension SwiftToolDispatcher {
                 ? ["No changes recorded in the last 7 days."]
                 : reading.growthWeek
             out["growth_week"] = .array(lines.map(JSONValue.string))
-            // Her story: how her cares changed depth and what her nights settled.
-            out["story"] = .array(reading.story.map { .string(innerStateSafeText($0, limit: 400)) })
+            // The raw care history stays distinct from her own telling of it.
+            out["care_history"] = .array(reading.story.map { .string(innerStateSafeText($0, limit: 400)) })
         }
+        let knowledge = reading.selfKnowledge
+        out["self_night"] = knowledge.map { .string($0.night) } ?? .null
+        out["self_unavailable"] = reading.selfKnowledgeIssue.map { .string(innerStateSafeText($0, limit: 320)) } ?? .null
+        out["people_unavailable"] = reading.carePeopleIssue.map { .string(innerStateSafeText($0, limit: 320)) } ?? .null
+        out["traits"] = .array((knowledge?.traits ?? []).map { trait in
+            .object([
+                "when": .string(innerStateSafeText(trait.when, limit: 120)),
+                "i_tend_to": .string(innerStateSafeText(trait.iTendTo, limit: 160)),
+                "shown_by": .array(trait.shownBy.map(JSONValue.string)),
+            ])
+        })
+        out["story"] = .array((knowledge?.story ?? []).map { entry in
+            .object(["line": .string(innerStateSafeText(entry.line, limit: 400)),
+                     "shown_by": .array(entry.shownBy.map(JSONValue.string))])
+        })
+        let people = knowledge?.people ?? []
+        out["people"] = .array(people.prefix(reading.detail == .full ? CognitiveSelfKnowledge.maximumPeople : 2).map { person in
+            .object(["person": .string(innerStateSafeText(person.person, limit: 120)),
+                     "line": .string(innerStateSafeText(person.line, limit: 280))])
+        })
         out["last_night"] = reading.dream.map { dream in
             .object([
                 "mood": .string(dream.moodWord),

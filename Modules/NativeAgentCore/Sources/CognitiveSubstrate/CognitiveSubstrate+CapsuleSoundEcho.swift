@@ -61,13 +61,15 @@ extension CognitiveSubstrate {
         roomWarmth: Double,
         mode: FeltMode?,
         dynamics: PersonalityDynamicsConfiguration
-    ) -> Double {
+    ) -> Double? {
         guard let mode else { return roomWarmth }
         // Bound the mode's influence so room warmth stays the anchor.
         let maximumNudge = 0.20
         let nudge: Double
         switch mode {
-        case .play:      nudge = maximumNudge * (0.5 + dynamics.playModeWeight * 0.5)
+        case .play:
+            guard let humor = dynamics.playModeWeight else { return nil }
+            nudge = maximumNudge * (0.5 + humor * 0.5)
         case .care:      nudge = maximumNudge * 0.5
         case .repair:    nudge = -maximumNudge * 0.75
         case .bracing:   nudge = -maximumNudge
@@ -103,6 +105,7 @@ extension CognitiveSubstrate {
         guard read.configuration.enabled else { return .silent }
         let now = read.fixedAt
         let dyn = read.personalityDynamics
+        guard dyn.playModeWeight != nil else { return .silent }
         let fieldNodes = read.snapshot.nodes
         // Her OWN live conversation turns only — never User's words as her voice,
         // never tool/system summaries (the feltDaySummary injection-safety rule).
@@ -188,10 +191,10 @@ extension CognitiveSubstrate {
             return quiet()
         }
         // Mirror the register that fits the room now.
-        let targetWarmth = Self.soundEchoRegisterTarget(
+        guard let targetWarmth = Self.soundEchoRegisterTarget(
             roomWarmth: read.affect.socialWarmth,
             mode: mode,
-            dynamics: dyn)
+            dynamics: dyn) else { return quiet() }
         let targetValence = roomValence.clampedSigned()
         func score(_ node: CognitiveNode) -> Double {
             let fit = Self.soundEchoRegisterScore(
@@ -214,7 +217,7 @@ extension CognitiveSubstrate {
             return lhs.node.id.uuidString < rhs.node.id.uuidString
         }.map(\.node)
         // Never quote a named rut phrase or share distinctive words across chosen fragments.
-        // Prefer unworn words; allow worn words only when no fragment survives that preference.
+        // Exhausting admitted fragments means silence.
         var dampedFragments = false
         defer {
             if emitReceipts, dampedFragments {
@@ -241,10 +244,10 @@ extension CognitiveSubstrate {
         var fragments: [String] = []
         var seen = Set<String>()
         var usedTokens = Set<String>()
-        func pick(allowWorn: Bool) {
+        func pick() {
             for entry in fragged {
                 guard fragments.count < dyn.soundEchoCount else { return }
-                if !allowWorn, !entry.tokens.isDisjoint(with: wornFragmentTokens) {
+                if !entry.tokens.isDisjoint(with: wornFragmentTokens) {
                     dampedFragments = true
                     continue
                 }
@@ -258,8 +261,7 @@ extension CognitiveSubstrate {
                 }
             }
         }
-        pick(allowWorn: false)
-        if fragments.isEmpty { pick(allowWorn: true) }
+        pick()
         guard !fragments.isEmpty else {
             return quiet()
         }

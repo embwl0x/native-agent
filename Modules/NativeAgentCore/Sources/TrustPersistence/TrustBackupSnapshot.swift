@@ -9,7 +9,8 @@ import AuthoredCapabilities
 import MemoryV2
 import Privacy
 import SystemOps
-// Blueprint: | `TrustBackupSnapshot.swift` | TrustBackupPersistence sealed snapshot evidence; bounded integrity manifests, link containment, authority validation and legacy sealing |
+import os
+// Blueprint: | `TrustBackupSnapshot.swift` | TrustBackupPersistence current sealed snapshot evidence; checked complete enumeration, explicit canonical persona destination, link containment and pre-staging restorable validation |
 
 struct NativeBackupIntegrityFile: Codable, Equatable, Sendable {
     let path: String
@@ -27,7 +28,7 @@ struct NativeBackupLink: Equatable {
 struct NativeValidatedBackupSnapshot {
     let id: String
     let dataDirectory: URL
-    let restorePaths: [String]
+    /// Validated captured scopes: the only paths restore may replace.
     let copied: [String]
     let files: [NativeBackupIntegrityFile]
     let links: [NativeBackupLink]
@@ -66,31 +67,28 @@ extension TrustBackupPersistence {
               object["kind"] == .string("backup"),
               object["id"] == .string(id),
               object["integrityVersion"] == .int(2),
+              object["scopeVersion"] == .int(3),
+              case .string(let personaPath)? = object["personaRoot"],
+              case .string(let lifeID)? = object["lifeID"],
+              UUID(uuidString: lifeID)?.uuidString.lowercased() == lifeID,
               case .string(let reason)? = object["reason"],
               case .string(let createdAt)? = object["createdAt"],
               case .array(let copiedValues)? = object["copied"],
-              case .array(let fileValues)? = object["files"] else {
+              case .array(let fileValues)? = object["files"],
+              case .array(let linkValues)? = object["links"], linkValues.count <= 10_000 else {
             throw Self.backupError(
                 code: 422,
-                "Backup manifest is missing its v2 identity or integrity contract. Older unsealed backups are not safe to restore."
+                "Backup manifest is missing its current identity, persona destination or integrity contract. Create a complete current NativeAgent backup."
             )
         }
         guard reason.utf8.count <= 1_000, createdAt.utf8.count <= 128 else {
             throw Self.backupError(code: 422, "Backup manifest metadata exceeds its bound.")
         }
-        let scopeVersion = object["scopeVersion"] ?? .int(1)
-        guard scopeVersion == .int(1) || scopeVersion == .int(2) else {
-            throw Self.backupError(code: 422, "Backup scope version is unsupported. Update NativeAgent before restoring it.")
+        let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: root).standardizedFileURL
+        guard personaPath == personaRoot.path else {
+            throw Self.backupError(code: 422, "Backup persona destination differs from the live persona owner: \(personaRoot.path)")
         }
 
-        // Older manifests have no `links`: they recorded none.
-        var linkValues: [JSONValue] = []
-        if let value = object["links"] {
-            guard case .array(let values) = value, values.count <= 10_000 else {
-                throw Self.backupError(code: 422, "Backup manifest has an invalid link list.")
-            }
-            linkValues = values
-        }
         var links: [NativeBackupLink] = []
         for value in linkValues {
             guard case .object(let link) = value,
@@ -109,8 +107,7 @@ extension TrustBackupPersistence {
             links.append(NativeBackupLink(path: path, target: target))
         }
 
-        let restorePaths = scopeVersion == .int(2) ? Self.backupRelativePaths : Self.legacyBackupRelativePaths
-        let allowed = Set(restorePaths)
+        let allowed = Set(Self.backupRelativePaths)
         var copied: [String] = []
         var copiedSet: Set<String> = []
         for value in copiedValues {
@@ -164,19 +161,6 @@ extension TrustBackupPersistence {
                   filePaths.insert(path).inserted else {
                 throw Self.backupError(code: 422, "Backup manifest has an invalid file member.")
             }
-            // Older local snapshots sealed coordination sidecars. Only their absence is harmless; any listed sidecar still
-            // present must retain its sealed bytes and regular-file type.
-            if path.hasSuffix(".lock") {
-                let sidecar = dataDir.appendingNativeRelativePath(path)
-                do {
-                    try Self.requireRegularFile(sidecar, maximumBytes: nil)
-                } catch CocoaError.fileReadNoSuchFile { continue }
-                let digest = try Self.fileDigest(sidecar)
-                guard digest.sizeBytes == sizeBytes, digest.sha256 == sha256 else {
-                    throw Self.backupError(code: 422, "Backup file membership or SHA-256 integrity does not match its manifest.")
-                }
-                continue
-            }
             files.append(NativeBackupIntegrityFile(
                 path: path,
                 sizeBytes: sizeBytes,
@@ -192,18 +176,24 @@ extension TrustBackupPersistence {
             )
         }
 
+        guard copied.contains("persona") else {
+            throw Self.backupError(code: 422, "Backup does not contain the live persona scope.")
+        }
+        try Self.requireRegularDirectory(dataDir.appendingPathComponent("persona"))
+        try Self.requireRegularFile(dataDir.appendingPathComponent("persona/SOUL.md"), maximumBytes: nil)
         if requireRestorableAuthority {
+            guard copied.contains("abilities"), copied.contains("chat/sessions.json") else {
+                throw Self.backupError(code: 422, "Restore requires captured current abilities and session index scopes; no restore was staged or current data replaced.")
+            }
+            try Self.requireRegularDirectory(dataDir.appendingPathComponent("abilities"))
             try Self.validateBackupChatSessionIndex(dataDir: dataDir)
+            _ = try Self.requiredTranscriptGenerationFloor(in: dataDir)
             try Self.validateBackupTrustPolicy(dataDir: dataDir)
             try Self.validateBackupCapabilityAuthority(dataDir: dataDir)
         }
         return NativeValidatedBackupSnapshot(
             id: id,
             dataDirectory: dataDir,
-            restorePaths: restorePaths.filter {
-                if ["chat/attachments", "chat/mac_turn_lifecycle.json"].contains($0) { return copiedSet.contains($0) }
-                return scopeVersion == .int(2) || $0 != "chat/archive" || copiedSet.contains($0)
-            },
             copied: copied,
             files: actualFiles,
             links: links,
@@ -213,106 +203,11 @@ extension TrustBackupPersistence {
         )
     }
 
-    /// Existing Swift backups predate file digests. On an explicit restore, migrate only the exact old NativeAgent manifest
-    /// shape at its canonical UUID directory. The source is fully enumerated, symlink-free, bounded, authority-validated, and
-    /// sealed before the restart intent can refer to it. A v2 manifest that fails validation is never resealed over tampering.
-    static func sealLegacyV1BackupForRestore(
-        id rawID: String,
-        dataRoot root: URL
-    ) throws -> Bool {
-        guard let uuid = UUID(uuidString: rawID) else { return false }
-        let id = uuid.uuidString.lowercased()
-        guard rawID.lowercased() == id else { return false }
-        let backupRoot = root.appendingPathComponent("backups", isDirectory: true)
-        let backupDir = backupRoot.appendingPathComponent(id, isDirectory: true)
-        let dataDir = backupDir.appendingPathComponent("data", isDirectory: true)
-        let manifestPath = backupDir.appendingPathComponent("manifest.json")
-        try Self.requireRegularDirectory(backupRoot)
-        try Self.requireRegularDirectory(backupDir)
-        try Self.requireRegularDirectory(dataDir)
-        try Self.requireRegularFile(manifestPath, maximumBytes: 16 * 1024 * 1024)
-        let legacyData = try Data(contentsOf: manifestPath, options: [.mappedIfSafe])
-        let legacy = try JSONValue.parse(legacyData)
-        guard case .object(let object) = legacy,
-              object["app"] == .string("NativeAgent"),
-              object["kind"] == .string("backup"),
-              object["id"] == .string(id),
-              object["integrityVersion"] == nil,
-              case .string(let createdAt)? = object["createdAt"],
-              case .array(let copiedValues)? = object["copied"] else {
-            return false
-        }
-        guard createdAt.utf8.count <= 128 else { return false }
-
-        let allowed = Set(Self.legacyBackupRelativePaths)
-        var copied: [String] = []
-        var copiedSet: Set<String> = []
-        for value in copiedValues {
-            guard case .string(let path) = value,
-                  allowed.contains(path),
-                  copiedSet.insert(path).inserted else { return false }
-            let source = dataDir.appendingNativeRelativePath(path)
-            guard Self.pathEntryExists(source) else { return false }
-            let values = try source.resourceValues(forKeys: [
-                .isDirectoryKey,
-                .isRegularFileKey,
-                .isSymbolicLinkKey,
-            ])
-            guard values.isSymbolicLink != true,
-                  values.isDirectory == true || values.isRegularFile == true else {
-                return false
-            }
-            copied.append(path)
-        }
-        let files = try Self.backupIntegrityFiles(in: dataDir)
-        guard files.allSatisfy({ file in
-            copied.contains(where: { NativeAgentWorkspaceRoot.relativePath(file.path, under: $0) != nil })
-        }) else { return false }
-        try Self.validateBackupChatSessionIndex(dataDir: dataDir)
-        try Self.validateBackupTrustPolicy(dataDir: dataDir)
-        try Self.validateBackupCapabilityAuthority(dataDir: dataDir)
-
-        let record = try Self.readBackupRecords(root: root).first { $0.id == id }
-        let reasonCandidate = record?.reason.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let reason = reasonCandidate.isEmpty
-            ? "legacy NativeAgent backup"
-            : String(reasonCandidate.prefix(1_000))
-        let scope = Self.scopeNames(for: copied)
-        let sealed: JSONValue = .object([
-            "app": .string("NativeAgent"),
-            "createdAt": .string(createdAt),
-            "id": .string(id),
-            "integrityVersion": .int(2),
-            "kind": .string("backup"),
-            "reason": .string(reason),
-            "scope": .array(scope.map { .string($0) }),
-            "copied": .array(copied.map { .string($0) }),
-            "files": .array(files.map(Self.backupIntegrityFileJSON)),
-            "version": object["version"] ?? .string("legacy"),
-        ])
-        let preserved = backupDir.appendingPathComponent("manifest.v1.json")
-        if Self.pathEntryExists(preserved) {
-            try Self.requireRegularFile(preserved, maximumBytes: 16 * 1024 * 1024)
-            guard try Data(contentsOf: preserved) == legacyData else { return false }
-        } else {
-            try legacyData.write(to: preserved, options: [.atomic])
-        }
-        try Self.writeJSONValue(sealed, to: manifestPath)
-        return true
-    }
-
     static func backupIntegrityFiles(in root: URL) throws -> [NativeBackupIntegrityFile] {
         try Self.requireRegularDirectory(root)
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
-            options: [],
-            errorHandler: { _, _ in false }
-        ) else {
-            throw Self.backupError(code: 422, "Backup contents could not be enumerated.")
-        }
+        let entries = try Self.backupEntries(in: root)
         var files: [NativeBackupIntegrityFile] = []
-        for case let item as URL in enumerator {
+        for item in entries {
             let values = try item.resourceValues(forKeys: [
                 .isDirectoryKey,
                 .isRegularFileKey,
@@ -343,7 +238,29 @@ extension TrustBackupPersistence {
         return files.sorted { $0.path < $1.path }
     }
 
+    /// No caller can mistake a stopped enumeration for a complete inventory.
+    static func backupEntries(in root: URL) throws -> [URL] {
+        try Self.requireRegularDirectory(root)
+        let failure = OSAllocatedUnfairLock<Error?>(initialState: nil)
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
+            options: [],
+            errorHandler: { _, error in
+                failure.withLock { $0 = error }
+                return false
+            }
+        ) else {
+            throw Self.backupError(code: 422, "Backup contents could not be enumerated: \(root.path)")
+        }
+        var entries: [URL] = []
+        for case let item as URL in enumerator { entries.append(item) }
+        if let error = failure.withLock({ $0 }) { throw error }
+        return entries
+    }
+
     static func fileDigest(_ path: URL) throws -> (sizeBytes: Int64, sha256: String) {
+        try VolumeIO.requireReadyForReading(path)
         let handle = try FileHandle(forReadingFrom: path)
         defer { try? handle.close() }
         var hasher = SHA256()
@@ -388,14 +305,10 @@ extension TrustBackupPersistence {
     /// files only.
     static func takeBackupLinks(in dataDir: URL) throws -> [NativeBackupLink] {
         let fm = FileManager.default
-        guard let enumerator = fm.enumerator(
-            at: dataDir, includingPropertiesForKeys: [.isSymbolicLinkKey], options: [], errorHandler: { _, _ in false }
-        ) else {
-            throw Self.backupError(code: 422, "Backup contents could not be enumerated.")
-        }
+        let entries = try Self.backupEntries(in: dataDir)
         let rootPath = dataDir.standardizedFileURL.path
         var links: [NativeBackupLink] = []
-        for case let item as URL in enumerator
+        for item in entries
         where try item.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == true {
             guard let relative = NativeAgentWorkspaceRoot.relativePath(item.standardizedFileURL.path, under: rootPath), !relative.isEmpty else {
                 throw Self.backupError(code: 422, "Backup link escapes its data directory.")
@@ -501,9 +414,7 @@ extension TrustBackupPersistence {
         guard FileManager.default.fileExists(atPath: dataDir.path) else { return }
         let sources = dataDir.appendingNativeRelativePath("catalog/sources/sources.json")
         let roots = dataDir.appendingNativeRelativePath("catalog/trust/roots.json")
-        let installs = dataDir.appendingNativeRelativePath("catalog/installs.json")
         _ = try CapabilityCatalogStoreReader.loadCatalogSourcesChecked(at: sources)
         _ = try CapabilityCatalogStoreReader.loadCapabilityTrustRootsChecked(at: roots)
-        _ = try CapabilityCatalogStoreReader.loadCapabilityPackInstallsChecked(at: installs)
     }
 }

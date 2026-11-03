@@ -5,13 +5,12 @@ import AgentConversations
 import CryptoKit
 import Foundation
 import NativeAgentShared
-import Network
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import ProviderRouting
 import Transcripts
-// Blueprint: | `ChatGPTDotConversation.swift` | `ChatGPTDotConversation` actor; `refresh`, `conversation`; saved arrivals wait on `TurnAdmission` capacity signals; only a retained typed network cause admits link recovery, and legacy untyped failed admissions migrate once to terminal; cached network-failed peer IDs gate recovery before peer/file reads; room cleanup keeps the first revised message per ID; successful recovery owns network/provider subscriptions until retirement, which releases recovery admission on failure, cancellation and stop; the delegation runner stops subscriptions with discovery and Dot socket observation; old lifecycle callbacks cannot retry admissions |
+// Blueprint: | `ChatGPTDotConversation.swift` | `ChatGPTDotConversation` actor; `refresh`, `conversation`; saved arrivals wait on `TurnAdmission` capacity signals; failed turns retain their actual cause and never create a second turn on link changes; launch resumes only arrivals whose turn has not started; the delegation runner stops subscriptions with discovery and Dot socket observation; old lifecycle callbacks cannot retry admissions |
 
 /// Dot's room is an ingress into his ordinary contact session, not an outbound reply tracker.
 actor ChatGPTDotConversation {
@@ -24,27 +23,14 @@ actor ChatGPTDotConversation {
         var lifeID: String?
         let message: JSONValue
         var started = false
-        /// The terminal reason is separate from evidence that a link recovery can help.
+        /// The actual terminal reason and supplied provider cause, never replay authority.
         var failed: String?
         var retryCause: ProviderFailure?
     }
     private struct AdmissionWork { var task: Task<Void, Never>? }
     private var admissionTasks: [String: AdmissionWork] = [:]
-    private var link: NWPathMonitor?
-    private var linkChanges: Task<Void, Never>?
-    private var providerChanges: Task<Void, Never>?
     private var generation = UUID()
     private var recoveryAttempted = false
-    /// The link is back: the network path came up (when), or her newest
-    /// provider call anywhere succeeded.
-    private var pathUp: Date?
-    private var providerFine = false
-    /// Retried at once after failing (below); again only after a fresh link event.
-    private var retriedAtOnce: Set<String> = []
-    /// Seeded at launch, then maintained with admission reads and durable writes.
-    /// Provider successes app-wide must not scan peers or files when none failed.
-    private var failedAdmissionPeers: Set<String> = []
-    private var retryingAdmissions = false
 
     init(dataRoot: URL, clients: any AgentContactClients) {
         self.dataRoot = dataRoot
@@ -57,8 +43,6 @@ actor ChatGPTDotConversation {
         recoveryAttempted = true
         let generation = generation
         // Reserve this lifecycle before the recovery pass suspends.
-        let link = NWPathMonitor()
-        self.link = link
         do {
             for peer in try AgentPeerStore(dataRoot: dataRoot).list() where ChatGPTDotIPCTransport.owns(peer) {
                 for (id, admission) in try admissions(peer: peer.id)
@@ -81,48 +65,15 @@ actor ChatGPTDotConversation {
         }
         guard self.generation == generation else { return }
         if Task.isCancelled { retireSubscriptions(); return }
-        // The link is back when the network path comes up (its state now
-        // counts), or when a call to her model provider succeeds: a provider
-        // timeout recovers with the path unchanged.
-        let paths = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
-        link.pathUpdateHandler = { path in
-            if path.status == .satisfied { paths.continuation.yield(()) }
-        }
-        linkChanges = Task { [weak self] in
-            defer { paths.continuation.finish() }
-            for await _ in paths.stream {
-                guard let self, await self.isCurrent(generation), !Task.isCancelled else { return }
-                await self.linkBack(path: true, generation: generation)
-            }
-        }
-        link.start(queue: DispatchQueue(label: "ChatGPTDotConversation.link"))
-        self.link = link
-        let clients = clients
-        providerChanges = Task { [weak self] in await self?.followProvider(clients, generation: generation) }
-    }
-
-    private func followProvider(_ clients: any AgentContactClients, generation: UUID) async {
-        defer { if self.generation == generation { providerChanges = nil } }
-        guard let changes = await clients.cognitionChanges(), isCurrent(generation), !Task.isCancelled else { return }
-        for await change in changes {
-            guard isCurrent(generation), !Task.isCancelled else { return }
-            switch change.reason {
-            case "provider_lifecycle:succeeded": await linkBack(path: false, generation: generation)
-            case "provider_lifecycle:failed": providerFailed(generation: generation)
-            default: break
-            }
-        }
     }
 
     func stopSubscriptions() async {
         retired = true
-        let pull = pull, linkChanges = linkChanges, providerChanges = providerChanges
+        let pull = pull
         let admissions = admissionTasks.values.compactMap(\.task)
         retireSubscriptions()
         pull?.cancel()
         for task in admissions { task.cancel() }
-        await linkChanges?.value
-        await providerChanges?.value
         _ = try? await pull?.value
         for task in admissions { await task.value }
     }
@@ -130,42 +81,10 @@ actor ChatGPTDotConversation {
     private func retireSubscriptions() {
         recoveryAttempted = false
         generation = UUID()
-        link?.pathUpdateHandler = nil
-        link?.cancel(); link = nil
-        linkChanges?.cancel(); linkChanges = nil
-        providerChanges?.cancel(); providerChanges = nil
-        providerFine = false; pathUp = nil
     }
 
-    private func isCurrent(_ generation: UUID) -> Bool { self.generation == generation && link != nil }
-
-    private func providerFailed(generation: UUID) {
-        guard isCurrent(generation), !Task.isCancelled else { return }
-        providerFine = false
-    }
-
-    private func linkBack(path: Bool, generation: UUID) async {
-        guard isCurrent(generation), !Task.isCancelled else { return }
-        if path { pathUp = Date() } else { providerFine = true }
-        retriedAtOnce.removeAll()
-        guard !failedAdmissionPeers.isEmpty else { return }
-        do { try await retryAdmissions() }
-        catch { nativeLog("Dot admission retry failed: %@", error.localizedDescription) }
-    }
-
-    private func retryAdmissions() async throws {
-        guard link != nil, !Task.isCancelled, !failedAdmissionPeers.isEmpty, !retryingAdmissions else { return }
-        let generation = generation
-        retryingAdmissions = true
-        defer { retryingAdmissions = false }
-        let peers = try AgentPeerStore(dataRoot: dataRoot).list().filter { ChatGPTDotIPCTransport.owns($0) }
-        failedAdmissionPeers.formIntersection(peers.map(\.id))
-        for peer in peers where failedAdmissionPeers.contains(peer.id) {
-            guard isCurrent(generation), !Task.isCancelled else { return }
-            if try admissions(peer: peer.id).values.contains(where: { !$0.started && $0.retryCause == .network }) {
-                _ = try await append([], peer: peer, retry: true, recovery: generation)
-            }
-        }
+    private func isCurrent(_ generation: UUID) -> Bool {
+        self.generation == generation && recoveryAttempted && !retired
     }
 
     private func admissionFile(peer: String) -> URL {
@@ -175,32 +94,14 @@ actor ChatGPTDotConversation {
     private func admissions(peer: String) throws -> [String: Admission] {
         let file = admissionFile(peer: peer)
         guard FileManager.default.fileExists(atPath: file.path) else {
-            failedAdmissionPeers.remove(peer)
             return [:]
         }
         var saved = try JSONDecoder().decode([String: Admission].self, from: Data(contentsOf: file))
-        // One-time migration: older rows called every failed turn recoverable.
-        // Preserve those reasons as terminal; they carry no network evidence.
-        var migrated = false
-        for id in Array(saved.keys) where saved[id]?.started == false && saved[id]?.failed != nil && saved[id]?.retryCause == nil {
-            saved[id]?.started = true
-            migrated = true
-        }
-        if migrated { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(saved), to: file) }
         for id in Array(saved.keys) where try !DataRootLife.isCurrent(saved[id]?.lifeID, in: dataRoot) {
             saved[id]?.started = true
             saved[id]?.failed = DataRootLife.stoppedReason
         }
-        cacheFailedAdmissions(saved, peer: peer)
         return saved
-    }
-
-    private func cacheFailedAdmissions(_ saved: [String: Admission], peer: String) {
-        if saved.values.contains(where: { !$0.started && $0.retryCause == .network }) {
-            failedAdmissionPeers.insert(peer)
-        } else {
-            failedAdmissionPeers.remove(peer)
-        }
     }
 
     private func updateAdmissions(peer: String, _ mutate: (inout [String: Admission]) throws -> Void) throws {
@@ -209,7 +110,6 @@ actor ChatGPTDotConversation {
         let file = admissionFile(peer: peer)
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(saved), to: file)
-        cacheFailedAdmissions(saved, peer: peer)
     }
 
     private func startAdmission(id: String, peer: String) throws {
@@ -224,7 +124,9 @@ actor ChatGPTDotConversation {
             ChatGPTDotIPCTransport.owns($0) && principal($0).storedConversation("mcp-" + $0.id) == sessionID
         }) else { return false }
         let tools = clients.bridgeToolDispatchClient(fileAccess: "read_only", verifiedSessionId: sessionID)
-        _ = try await tools.dispatch(tool: "agent_read", input: ["agent": .string("peer:" + peer.id)], surface: "chat")
+        _ = try await ChatToolSessionContext.$envelope.withValue(ChatToolSessionContext.envelope ?? .native("contact.refresh:" + peer.id)) {
+            try await tools.dispatch(tool: "agent_read", input: ["agent": .string("peer:" + peer.id)], surface: "chat")
+        }
         return true
     }
 
@@ -350,8 +252,7 @@ actor ChatGPTDotConversation {
         .init(id: peer.id, peerID: peer.id, elevated: peer.elevationAllowed, displayName: peer.name)
     }
 
-    /// `retry`: the link is back, so messages whose turn failed on it run again.
-    private func append(_ messages: [JSONValue], peer: AgentPeerContact, retry: Bool = false,
+    private func append(_ messages: [JSONValue], peer: AgentPeerContact,
                         recovery: UUID? = nil) async throws -> JSONValue {
         func checkRecovery() throws {
             guard !retired else { throw CancellationError() }
@@ -367,28 +268,9 @@ actor ChatGPTDotConversation {
         let principal = principal(peer), context = "mcp-" + peer.id
         let session = principal.storedConversation(context)
         let transcript = dataRoot.appendingPathComponent("chat/messages/\(session).jsonl")
-        let seenFile = dataRoot.appendingPathComponent("agent-conversations/dot-seen-\(peer.id).json")
-        let seen: [String]
-        if FileManager.default.fileExists(atPath: seenFile.path) {
-            seen = try JSONDecoder().decode([String].self, from: Data(contentsOf: seenFile))
-        } else { seen = [] }
         var rows = try await SwiftNativePersistenceCore.readJSONL(transcript)
         try checkRecovery()
         let replies = try replies(messages, rows: rows)
-        let cleanupFile = dataRoot.appendingPathComponent("agent-conversations/dot-reply-cleanup-\(peer.id).json")
-        if !FileManager.default.fileExists(atPath: cleanupFile.path) {
-            let erroneous = Set(messages.compactMap { message -> String? in
-                guard case .object(let fields) = message, fields["kind"] == .string("user"),
-                      case .string(let id)? = fields["id"] else { return nil }
-                return "dot-room:" + id
-            })
-            try await cleanup(transcript: transcript, seen: Set(seen), replies: replies, erroneous: erroneous)
-            try checkRecovery()
-            try await SwiftNativePersistenceCore.writeJSON(.bool(true), to: cleanupFile)
-            try checkRecovery()
-            rows = try await SwiftNativePersistenceCore.readJSONL(transcript)
-            try checkRecovery()
-        }
         var replyRows: [String: [JSONValue]] = [:], startedRuns: Set<String> = []
         for value in rows {
             if let id = Self.replyID(value) { replyRows[id, default: []].append(value) }
@@ -399,7 +281,7 @@ actor ChatGPTDotConversation {
         let client = clients.bridgeChatClient()
         var appended = false
         let pending = try admissions(peer: peer.id)
-        let recovered = try pending.values.filter { !$0.started && ($0.failed == nil || retry && $0.retryCause == .network) }.map { admission -> (JSONValue, Date) in
+        let recovered = try pending.values.filter { !$0.started && $0.failed == nil }.map { admission -> (JSONValue, Date) in
             guard case .object(let fields) = admission.message, case .string(let at)? = fields["at"],
                   let date = roomDate(at) else {
                 throw AgentConversationStore.Failure(message: "Dot returned an unreadable room message.")
@@ -419,14 +301,12 @@ actor ChatGPTDotConversation {
             if pending[id]?.started == true { continue }
             if durableIDs.contains(id), pending[id] == nil { continue }
             let failed = pending[id]?.failed
-            if failed != nil, !retry || pending[id]?.retryCause != .network { continue }
+            if failed != nil { continue }
             let lifeID = try DataRootLife.current(in: dataRoot)
             // His reply is a message in her Dot session that wakes her, like any
             // contact's; she answers him with agent_message when she wants to.
-            // A retry is a new turn: the one before it ended, and may have done things.
-            let again = failed.map { "\n\n(This reached you before, but that turn did not finish: \($0) Some steps may already have run; check before repeating them.)" } ?? ""
             let turn = AgentContactTurn(taskID: UUID().uuidString, context: context, requestID: id, principal: principal,
-                parts: [.text(text + "\n\n(Dot sees your answer only if you send it to him with agent_message.)" + again)],
+                parts: [.text(text + "\n\n(Dot sees your answer only if you send it to him with agent_message.)")],
                 bindRun: { _, _ in try await self.startAdmission(id: id, peer: peer.id) })
             let plain = turn.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
             let request = principal.turnRequest(context: context, plain: plain,
@@ -461,7 +341,6 @@ actor ChatGPTDotConversation {
             admissionTasks[key] = AdmissionWork(task: Task {
                 defer { admissionTasks.removeValue(forKey: key) }
                 guard !retired, !Task.isCancelled else { return }
-                let began = Date()
                 // Admission owns capacity waiting for this exact saved row.
                 var failed: String?
                 var retryCause: ProviderFailure?
@@ -470,27 +349,18 @@ actor ChatGPTDotConversation {
                                                                    enqueued: accepted, emit: { _ in })
                     if outcome.state == .failed {
                         failed = outcome.detail ?? "The turn did not finish."
-                        if outcome.failure?.cause == .network { retryCause = .network }
+                        retryCause = outcome.failure?.cause
                     }
                 } catch is CancellationError { return } catch {
                     failed = error.localizedDescription
-                    if ProviderFailure.classify(error) == .network { retryCause = .network }
-                    else { nativeLog("Dot admission failed: %@", error.localizedDescription) }
+                    retryCause = ProviderFailure.classify(error)
+                    nativeLog("Dot admission failed: %@", error.localizedDescription)
                 }
                 do { try updateAdmissions(peer: peer.id) { $0[id] = failed.map { Admission(lifeID: lifeID,
-                    message: message, started: retryCause != .network, failed: $0, retryCause: retryCause) } } }
+                    message: message, started: true, failed: $0, retryCause: retryCause) } } }
                 catch { nativeLog("Dot admission could not be saved: %@", error.localizedDescription); return }
-                // The link may have come back while this turn was failing: that
-                // event found nothing saved yet. Retry after this task lets go.
-                if retryCause == .network, providerFine || (pathUp ?? .distantPast) > began,
-                   retriedAtOnce.insert(key).inserted {
-                    Task { try? await self.retryAdmissions() }
-                }
             })
             appended = true
-        }
-        if !seen.isEmpty {
-            try await SwiftNativePersistenceCore.writeJSON(.array([]), to: seenFile)
         }
         if appended {
             AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peer.id, inbound: true)
@@ -523,15 +393,12 @@ actor ChatGPTDotConversation {
     }
 
     private func replies(_ messages: [JSONValue], rows: [JSONValue]) throws -> [JSONValue] {
-        var sentIDs = Set<String>(), legacySends = Set<String>()
+        var sentIDs = Set<String>()
         for row in rows {
             guard case .object(let row) = row, row["role"] == .string("assistant"),
-                  row["source"] == .string("agent-bridge"), case .string(let text)? = row["content"] else { continue }
+                  row["source"] == .string("agent-bridge") else { continue }
             if case .object(let metadata)? = row["metadata"], case .string(let id)? = metadata["dotClientUserMessageID"] {
                 sentIDs.insert(id)
-            } else {
-                // Sends made before this fix recorded their text, but not their room client ID.
-                legacySends.insert(text)
             }
         }
         let timeline = try messages.map { message -> (JSONValue, [String: JSONValue], Date) in
@@ -550,8 +417,6 @@ actor ChatGPTDotConversation {
                 let ownSend: Bool
                 if case .string(let id)? = fields["client_id"], sentIDs.contains(id) {
                     ownSend = true
-                } else if case .string(let text)? = fields["text"] {
-                    ownSend = legacySends.contains(text)
                 } else { ownSend = false }
                 afterSend = ownSend ? date : nil
             } else if fields["kind"] == .string("dot") {
@@ -568,37 +433,4 @@ actor ChatGPTDotConversation {
         return replies
     }
 
-    private func cleanup(transcript: URL, seen: Set<String>, replies: [JSONValue], erroneous: Set<String>) async throws {
-        let timestamps = Dictionary(replies.compactMap { message -> (String, String)? in
-            guard case .object(let fields) = message, case .string(let id)? = fields["id"],
-                  case .string(let at)? = fields["at"] else { return nil }
-            return ("dot-room:" + id, at)
-        }, uniquingKeysWith: { first, _ in first })
-        guard FileManager.default.fileExists(atPath: transcript.path) else { return }
-        let changed = try await SwiftNativePersistenceCore.withFileLock(transcript) {
-            let text = try String(contentsOf: transcript, encoding: .utf8)
-            var output = "", changed = false
-            let lines = text.components(separatedBy: "\n")
-            for (index, line) in lines.enumerated() {
-                let ending = index < lines.count - 1 ? "\n" : ""
-                guard !line.isEmpty, case .object(var row) = try JSONValue.parse(Data(line.utf8)),
-                      row["role"] == .string("user"), case .object(let metadata)? = row["metadata"],
-                      case .object(let origin)? = metadata["origin"], origin["surface"] == .string("agent-bridge"),
-                      case .string(let id)? = origin["replyTo"], id.hasPrefix("dot-room:"), seen.contains(id) else {
-                    output += line + ending
-                    continue
-                }
-                if erroneous.contains(id) { changed = true; continue }
-                guard let at = timestamps[id] else { output += line + ending; continue }
-                if row["createdAt"] != .string(at) {
-                    row["createdAt"] = .string(at)
-                    output += try JSONValue.object(row).serialize(pretty: false) + ending
-                    changed = true
-                } else { output += line + ending }
-            }
-            if changed { try ContactThread.replace(Data(output.utf8), to: transcript) }
-            return changed
-        }
-        if changed { NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: transcript.deletingPathExtension().lastPathComponent) }
-    }
 }

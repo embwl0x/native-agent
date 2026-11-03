@@ -3,7 +3,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `SecurityCenter+ToolProfiles.swift` | AuthoredToolEffects.shellReadOnlyWords certifies literal shell reads for gates, receipts and fixed-argv read confinement; canonicalToolRisk and declared effect projection; app-call read treatment delegates to PermissionLaw.toolClass, with argument policy and display severity |
+// Blueprint: | `SecurityCenter+ToolProfiles.swift` | AuthoredToolEffects owns current primitive-effect identity for redaction and classification; shellReadOnlyWords certifies literal shell reads for gates, receipts and fixed-argv read confinement; canonicalToolRisk and declared effect projection; app-call read treatment delegates to PermissionLaw.toolClass, with argument policy and display severity |
 
 /// Primitive effects retain the authored envelope and the turn's ordinary gates.
 public enum AuthoredToolEffects {
@@ -66,6 +66,13 @@ public enum AuthoredToolEffects {
         "program.receive": ["safe_read"], "program.close": ["process_spawn"],
     ].merging(handOperations.map { ($0, ["mac_control", "ax_injection"]) }) { $1 }
 
+    /// Fetch is one broker operation with keyless/secret effect identities at
+    /// admission. These and primitiveCapabilities are the current contracts.
+    private static let fetchOperations: Set<String> = ["fetch", "fetch.keyless", "fetch.secret"]
+    public static func isPrimitiveEffect(_ operation: String) -> Bool {
+        primitiveCapabilities[operation] != nil || fetchOperations.contains(operation)
+    }
+
     public static func appReadOnly(_ args: [String: JSONValue]) -> Bool {
         // Read-only script declarations are enforced per event by MacControl's
         // send callback before the event reaches the app.
@@ -79,7 +86,7 @@ public enum AuthoredToolEffects {
         if operation == "apps.call", case .object(let args)? = arguments, appReadOnly(args) {
             return (operation, ["safe_read", "applescript"])
         }
-        if operation == "fetch" || operation.hasPrefix("fetch.") {
+        if fetchOperations.contains(operation) {
             let read = args["method"] == nil || arguments?.stringFields["method"]?.uppercased() == "GET"
             // A call carrying the person's secret acts as the person at that
             // service: one that only reads (GET or HEAD, no body) is a read; any
@@ -103,6 +110,8 @@ public enum CanonicalToolRisk: String, Sendable, Codable, Comparable {
     case medium
     case high
     case critical
+    /// The source needed to classify the action could not be read.
+    case unavailable
 
     private var rank: Int {
         switch self {
@@ -110,6 +119,7 @@ public enum CanonicalToolRisk: String, Sendable, Codable, Comparable {
         case .medium: 1
         case .high: 2
         case .critical: 3
+        case .unavailable: 4
         }
     }
 
@@ -133,12 +143,14 @@ extension SwiftNativeSecurityCenter {
         dataRoot: URL,
         trustedWorkspaceRoots: [URL] = []
     ) -> CanonicalToolRisk {
-        profile(
-            tool: policyToolName(tool),
-            input: input,
-            dataRoot: dataRoot,
-            trustedWorkspaceRoots: trustedWorkspaceRoots
-        ).risk
+        do {
+            return try profile(tool: policyToolName(tool), input: input, dataRoot: dataRoot,
+                               trustedWorkspaceRoots: trustedWorkspaceRoots).risk
+        } catch {
+            // Advisory projections retain unknown classification. Admission
+            // below uses the throwing profile and reports the concrete cause.
+            return .unavailable
+        }
     }
 
     /// Project the declaration; argument policy only narrows the declared effects.
@@ -147,16 +159,16 @@ extension SwiftNativeSecurityCenter {
         input: [String: JSONValue],
         dataRoot: URL,
         trustedWorkspaceRoots: [URL] = []
-    ) -> ToolProfile {
-        if AuthoredToolEffects.primitiveCapabilities[tool] != nil || tool.hasPrefix("fetch.") {
+    ) throws -> ToolProfile {
+        if AuthoredToolEffects.isPrimitiveEffect(tool) {
             let effects = AuthoredToolEffects.primitiveEffect(tool, arguments: .object(input)).capabilities.union(["tool_call"])
             return ToolProfile(capabilities: effects, risk: displayRisk(toolClass: PermissionLaw.effectClass(effects), capabilities: effects))
         }
         let name = ToolNameAliases.canonical(tool)
         let schema = AppActionBinding.declaredSchema(name)
             ?? connectorActionIDs.first(where: { $0.value == tool }).flatMap { AppActionBinding.declaredSchema($0.key) }
-        let binding: AppActionBinding? = if tool == "app" { AppActionBinding.action(input: input) }
-            else if schema == nil { AppActionBinding.action(tool: name, input: input)
+        let binding: AppActionBinding? = if tool == "app" { try AppActionBinding.action(input: input) }
+            else if schema == nil { try AppActionBinding.action(tool: name, input: input)
                 ?? AppActionBinding.binding(ToolNameAliases.authoredAction(name)) }
             else { nil }
         var capabilities = schema?.capabilities ?? binding?.descriptor?.schema.capabilities ?? binding?.capabilities ?? ["tool_call"]
@@ -164,7 +176,7 @@ extension SwiftNativeSecurityCenter {
             capabilities = ["tool_call", "safe_read"]
         }
         if tool == "app" {
-            if PermissionLaw.toolClass(name, input: input) == .read {
+            if try PermissionLaw.toolClass(name, input: input) == .read {
                 capabilities = ["tool_call", "safe_read"]
             } else {
                 capabilities = binding?.capabilities ?? capabilities.subtracting(["safe_read"])
@@ -179,11 +191,11 @@ extension SwiftNativeSecurityCenter {
             }
         case .agentMessage:
             capabilities.subtract(input["dry_run"] == .bool(true) ? ["external_send", "network_write"] : ["network_read", "app_data_write"])
-            if !messagesAnAgentHostByCommand(input["agent"], dataRoot: dataRoot) {
+            if try !messagesAnAgentHostByCommand(input["agent"], dataRoot: dataRoot) {
                 capabilities.subtract(["shell", "process_spawn"])
             }
         }
-        if !capabilityWritesOutsideAppData(tool: name, input: input, dataRoot: dataRoot, trustedWorkspaceRoots: trustedWorkspaceRoots) {
+        if try !capabilityWritesOutsideAppData(tool: name, input: input, dataRoot: dataRoot, trustedWorkspaceRoots: trustedWorkspaceRoots) {
             capabilities.remove("outside_app_data_write")
         }
         return ToolProfile(capabilities: capabilities, risk: displayRisk(
@@ -208,28 +220,20 @@ extension SwiftNativeSecurityCenter {
     }
 
 
-    /// Whether an `agent_message` handle names an agent-host contact whose host
-    /// actually HAS a command line — the only kind that runs anything. The
-    /// contact's endpoint is `mcp://<host row id>`, and its recipe, as the
-    /// store validated it (`AgentHostLaunches`), is the one the adapter reads.
-    /// Contacts with no command line run no command and keep the ordinary
-    /// send risk. The contact is read straight off its file rather than
-    /// through the chat module, which depends on this one.
-    /// Anything unreadable is not shell-class: the run itself is gated again at
-    /// dispatch, and a guess here would only misprice the card.
-    static func messagesAnAgentHostByCommand(_ handle: JSONValue?, dataRoot: URL) -> Bool {
-        guard let raw = handle?.scalarText, raw.hasPrefix("peer:") else { return false }
-        let id = String(raw.dropFirst("peer:".count)).lowercased()
-        guard UUID(uuidString: id)?.uuidString.lowercased() == id,
-              let data = try? Data(contentsOf: dataRoot.appendingPathComponent("agents/peers.json")),
-              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-              let contact = rows.first(where: { ($0["id"] as? String)?.lowercased() == id }),
-              let transport = contact["transport"] as? String,
-              ["mcpHost", "acp"].contains(transport),
-              let endpoint = contact["endpoint"] as? String,
-              endpoint.hasPrefix(transport == "acp" ? "acp://" : "mcp://") else { return false }
-        let launch = AgentHostLaunches.launch(host: String(endpoint.dropFirst("mcp://".count)))
-        return transport == "acp" ? launch.acp != nil : launch.commandLine != nil
+    /// The checked contact owner resolves IDs, names and handles, then reads
+    /// the exact host recipe. Missing assembly/contact/recipe is unavailable.
+    static func messagesAnAgentHostByCommand(_ handle: JSONValue?, dataRoot: URL) throws -> Bool {
+        guard case .string(let agent)? = handle, !agent.isEmpty else {
+            throw ToolFailureError("Name the contact before classifying the message's effects.", effects: .none,
+                owner: "Agent contacts", code: "agent_profile_unavailable",
+                instruction: "Choose the contact from People and send again with its exact identity.")
+        }
+        do { return try AgentHostLaunches.messagesByCommand(agent: agent, dataRoot: dataRoot) }
+        catch {
+            throw ToolFailureError("The contact's effect profile is unavailable: \(error.localizedDescription)", effects: .none,
+                owner: "Agent contacts and host recipes", code: "agent_profile_unavailable",
+                instruction: "Repair the named contact or recipe before sending; no message was dispatched.")
+        }
     }
 
     /// The name a policy entry, profile and receipt are keyed on. Spellings

@@ -85,11 +85,10 @@ struct AgentWorkspaceForm: Sendable, Equatable {
 
     private static let harnessFields: Set<String> = ["__session_id", "current_session_id", "sender", "surface"]
 
-    // Existing legacy drafts containing `fields` keep their original shape.
-    // Newly opened exact-helper settings present ordinary editable fields; the
+    // Exact-helper settings present ordinary editable fields; the
     // form packs the owner's object only at submission, under the same schema.
     private var helperFields: [String: JSONValue]? {
-        guard tool == "bot_update", bound["id"] != nil, draftValues["fields"] == nil,
+        guard tool == "bot_update", bound["id"] != nil,
               case .object(let root) = parameters, case .object(let properties)? = root["properties"],
               case .object(let fields)? = properties["fields"],
               case .object(let nested)? = fields["properties"], !nested.isEmpty else { return nil }

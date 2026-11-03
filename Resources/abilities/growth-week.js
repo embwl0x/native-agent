@@ -1,6 +1,6 @@
 /* NativeAgent ability
 {
-  "id": "growth-week", "kind": "tool", "version": 1,
+  "id": "growth-week", "kind": "ability", "version": 1,
   "reach": {"capabilities": [], "readPaths": [], "hosts": [], "apps": []},
   "face": {"projection": true},
   "record": {"description": "My seven-day growth readout, from frozen native REM timeline evidence.", "actions": [], "inputSchema": {"type": "object", "required": ["events","transitions","clusters"]}}
@@ -90,6 +90,7 @@ function face(input) {
         if (reason) text += " — " + reason;
         if (["held","letGo"].includes(a.outcome)) text += " (her own)";
         return {id:a.id, title:text,
+            detail:a.lineage.startsWith("rem:") ? a.body : undefined,
             value:a.count > 1 ? (a.count-1) + " earlier step(s) collapsed · " + a.lineage : ""};
     });
     const transitions = input.transitions;

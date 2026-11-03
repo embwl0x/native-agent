@@ -61,10 +61,15 @@ public struct TranscriptRowStamp: Sendable, Equatable {
 
     public init?(json: JSONValue?) {
         guard case .object(let fields)? = json, case .bool(let contact)? = fields["contact"] else { return nil }
-        let source: String? = if case .string(let text)? = fields["source"] { text } else { nil }
-        let steering: [String] = if case .array(let values)? = fields["steered_by"] {
-            values.compactMap { if case .string(let peer) = $0 { peer } else { nil } }
-        } else { [] }
+        let source: String?
+        switch fields["source"] {
+        case .string(let text)?: source = text
+        case .null?: source = nil
+        default: return nil
+        }
+        guard case .array(let values)? = fields["steered_by"] else { return nil }
+        let steering = values.compactMap { if case .string(let peer) = $0 { peer } else { nil } }
+        guard steering.count == values.count else { return nil }
         self.init(source: source, steeredBy: steering, contact: contact)
     }
 

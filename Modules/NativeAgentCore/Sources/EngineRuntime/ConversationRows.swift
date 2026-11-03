@@ -307,15 +307,17 @@ public final class ChatShellOpeningLine {
         return OpeningLine()
     }
 
-    nonisolated static func read(sessionID: String, dataRoot: URL) -> OpeningLine {
+    nonisolated static func read(sessionID: String, dataRoot: URL) throws -> OpeningLine {
         guard let safeID = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else {
-            return OpeningLine()
+            throw CocoaError(.fileReadInvalidFileName)
         }
         let url = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeID).jsonl")
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return OpeningLine() }
+        let handle: FileHandle
+        do { handle = try FileHandle(forReadingFrom: url) }
+        catch let error as CocoaError where error.isFileAbsent { return OpeningLine() }
         defer { try? handle.close() }
 
         var firstBridge: String? = nil
@@ -326,7 +328,7 @@ public final class ChatShellOpeningLine {
         let newline = UInt8(ascii: "\n")
 
         while rows < rowBudget, read < byteCeiling {
-            guard let chunk = try? handle.read(upToCount: chunkSize), !chunk.isEmpty else { break }
+            guard let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty else { break }
             read += chunk.count
             buffer.append(chunk)
             // Everything up to the last newline is whole rows; the remainder
@@ -337,7 +339,9 @@ public final class ChatShellOpeningLine {
             for line in whole.split(separator: newline) {
                 rows += 1
                 if rows > rowBudget { break }
-                guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+                guard let object = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
                 guard let spoken = spokenLine(object) else { continue }
                 if !ChatShellConversationRow.hasBridgePrefix(spoken) {
                     projection.line = spoken
@@ -371,20 +375,24 @@ public final class ChatShellOpeningLine {
         }
         return trimmed
     }
-    nonisolated static func readLastTurn(sessionID: String, dataRoot: URL) -> String? {
-        guard let safeID = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else { return nil }
+    nonisolated static func readLastTurn(sessionID: String, dataRoot: URL) throws -> String? {
+        guard let safeID = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else { throw CocoaError(.fileReadInvalidFileName) }
         let url = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeID).jsonl")
-        guard let read = try? SwiftNativePersistenceCore.tailPhysicalLines(url, limit: .max, maxBytes: tailBytes)
+        guard let read = try SwiftNativePersistenceCore.tailPhysicalLines(url, limit: .max, maxBytes: tailBytes)
         else { return nil }
-        // Include the leading fragment: the newest row that parses supplies the timestamp.
-        for line in read.lines.reversed() {
-            guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
-            if let stamp = (object["timestamp"] ?? object["createdAt"] ?? object["created_at"]) as? String, !stamp.isEmpty {
+        // A completed newest row cannot be stepped over to certify older speech.
+        for line in read.lines.dropFirst(read.leadingFragment ? 1 : 0).reversed() {
+            if line.isEmpty { continue }
+            guard let object = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            if let stamp = object["createdAt"] as? String, !stamp.isEmpty {
                 return stamp
             }
+            throw CocoaError(.fileReadCorruptFile)
         }
         return nil
     }

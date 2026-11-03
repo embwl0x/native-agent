@@ -4,16 +4,16 @@ import PersistenceCore
 
 extension AgentWorkspace {
     package static func readReferences(_ reads: [(tool: String, input: [String: JSONValue], title: String)], dataRoot: URL) throws -> [JSONValue] {
-        let keys = reads.map { read -> (String, String)? in
+        let keys = reads.map { read -> (String, String, String)? in
             guard let room = read.tool == "recent_trace_summary" ? "trace" : HerScreen.commsFamily[read.tool],
                   let key = HerScreen.key(.record(tool: read.tool, input: read.input, title: read.title)) else { return nil }
-            return (room, key)
+            return (room, key, read.title)
         }
         return try HerScreen.withNames(dataRoot) { book in
             try keys.map { entry in
-                guard let (room, key) = entry else { return .null }
+                guard let (room, key, title) = entry else { return .null }
                 let present = Set(keys.compactMap { $0?.0 == room ? $0?.1 : nil })
-                return .string(room + ".\(try book.number("item." + room, id: key) { present })")
+                return .string(room + ".\(try book.number("item." + room, id: key, title: title) { present })")
             }
         }
     }

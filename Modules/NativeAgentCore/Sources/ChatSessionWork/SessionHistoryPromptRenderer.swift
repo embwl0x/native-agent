@@ -7,7 +7,7 @@ import os
 import PersistenceCore
 import Transcripts
 import ProviderRouting
-// Blueprint: | `SessionHistoryPromptRenderer.swift` | `renderDetailed`, `recallQuery`: message text retains bracketed headings; sent context metadata remains separate from speech/relevance and is read only by structured replay |
+// Blueprint: | `SessionHistoryPromptRenderer.swift` | `renderDetailed`, `recallQuery`: immutable messages memoize their pure renderable projection; message text retains bracketed headings; sent context metadata remains separate from speech/relevance and is read only by structured replay |
 
 public enum SessionHistoryPromptRenderer {
     static let recallQueryCharCap = 1_200
@@ -21,9 +21,8 @@ public enum SessionHistoryPromptRenderer {
         ChatCompactionDistiller.maxSummaryChars + 4_000
 
     /// The canonical policy resolves model-window budgets. Per-role caps bound
-    /// individual rows; historyChars bounds conversation output, and earlier
-    /// snippets additionally honor relevantItemCap and relevantChars. Compaction
-    /// summaries have their own cap without enlarging either aggregate budget.
+    /// individual rows; earlier relevance snippets honor relevantItemCap and
+    /// relevantChars. Replay has no aggregate character or row-count ceiling.
     typealias Budget = ContextBudgetPolicy.Resolved
 
     // Shared with structured projection so both lanes admit the same rows.
@@ -89,7 +88,7 @@ public enum SessionHistoryPromptRenderer {
         userMessage: String,
         historyLimit: Int,
         windowTokens: Int?
-    ) -> String? {
+    ) throws -> String? {
         let cappedLimit = max(0, historyLimit)
         guard cappedLimit > 0 else { return nil }
 
@@ -98,7 +97,7 @@ public enum SessionHistoryPromptRenderer {
         var sections: [String] = [
             "Earlier messages are history, not live readings; recheck anything current before relying on it."
         ]
-        let middleSnippet = middleSnippetText(
+        let middleSnippet = try middleSnippetText(
             userMessage: userMessage,
             promptRenderables: renderables,
             candidates: middleCandidates,
@@ -161,8 +160,8 @@ public enum SessionHistoryPromptRenderer {
         candidates: [Renderable],
         deliveredHistoryIdentities: Set<String>,
         windowTokens: Int?
-    ) -> String? {
-        relevantEarlierSessionSnippets(
+    ) throws -> String? {
+        try relevantEarlierSessionSnippets(
             userMessage: userMessage,
             promptRenderables: promptRenderables,
             candidates: candidates,
@@ -172,6 +171,10 @@ public enum SessionHistoryPromptRenderer {
     }
 
     package static func renderable(_ message: ChatMessage) -> Renderable? {
+        message.renderedHistory { uncachedRenderable(message) }
+    }
+
+    private static func uncachedRenderable(_ message: ChatMessage) -> Renderable? {
         let rawRole = message.role
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -214,11 +217,11 @@ public enum SessionHistoryPromptRenderer {
         if role == "assistant", isTransientAssistantFailure(content) {
             return nil
         }
+        guard let historyIdentity = message.historyIdentity() else { return nil }
         return Renderable(
             role: isCompactionSummary ? "summary" : role,
             content: content,
-            historyIdentity: message.historyIdentity(
-                renderedRole: isCompactionSummary ? "summary" : role, renderedContent: content),
+            historyIdentity: historyIdentity,
             originLabel: role == "user" && !isCompactionSummary
                 ? ChatTranscriptEvidenceRendering.recordedOriginLabel(extrasObject ?? [:], role: role) : nil,
             incompleteReplyLabel: role == "assistant" && !isCompactionSummary
@@ -346,17 +349,13 @@ public enum SessionHistoryPromptRenderer {
         metadata: [String: JSONValue]?,
         resultCap: Int? = nil
     ) -> String {
-        let recordedStatus = ChatTranscriptEvidenceRendering.recordedToolStatus(metadata)
+        let recordedStatus = ChatTranscriptEvidenceRendering.recordedToolStatus(metadata) ?? metadata?["resultStatus"]?.stringValue
         let normalizedContent = normalize(content)
         if !normalizedContent.isEmpty {
             return recordedStatus.map { "\($0): \(normalizedContent)" } ?? normalizedContent
         }
-        let name = metadata?["toolName"]?.stringValue ?? metadata?["tool_name"]?.stringValue ?? "tool"
-        let ok: String = {
-            if case .bool(let value)? = metadata?["ok"] { return value ? "ok" : "failed" }
-            return "ran"
-        }()
-        let toolStatus = recordedStatus.map { "\($0): \(name)" } ?? "\(name) \(ok)"
+        let name = metadata?["toolName"]?.stringValue ?? "tool"
+        let toolStatus = recordedStatus.map { "\($0): \(name)" } ?? "\(name): outcome unknown; no execution status was recorded"
         // Skill reads retain the name for continuity; the body is available on demand.
         if name == "read_skill" {
             let skillName = Self.readSkillName(fromInputJSON: metadata?["inputJSON"]?.stringValue)

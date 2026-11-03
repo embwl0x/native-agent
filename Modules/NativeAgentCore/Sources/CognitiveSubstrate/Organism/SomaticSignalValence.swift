@@ -8,7 +8,7 @@ extension SomaticSignalKind {
     var canonicalValence: Double {
         switch self {
         case .toolSucceeded, .deskItemClosed, .providerSucceeded, .providerRecovered,
-             .phoneDeliveryReceived, .memoryCommitted, .memoryHygieneCompleted,
+             .phoneDeliveryReceived, .memoryCommitted,
              .dreamCompleted, .remIntegrated:
             return 0.45
         case .toolFailed, .providerFailed, .phoneDeliveryFailed, .deskItemBlocked,

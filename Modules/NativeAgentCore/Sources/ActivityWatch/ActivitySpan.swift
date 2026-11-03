@@ -4,10 +4,10 @@ import Foundation
 
 /// Why an activity span stopped.
 ///
-/// v0 keeps the full v1 vocabulary (docs/build_plans/ambient-activity-watcher.md
-/// W3) even though `windowChange` is unreachable while titles are not captured —
-/// the enum is the persisted wire vocabulary and churning it later is worse than
-/// carrying one dormant case.
+/// `ActivitySpanEngine` emits `windowChange` for a changed, successfully read
+/// opt-in title or a policy change that removes a captured title. The initial
+/// title settles in place. Lost required AX observation ends at the last known
+/// observation with `observationUnavailable`, without inventing an app quit.
 public enum ActivityCloseReason: String, Sendable, Codable, CaseIterable {
     case appChange
     case windowChange
@@ -16,6 +16,7 @@ public enum ActivityCloseReason: String, Sendable, Codable, CaseIterable {
     case sleep
     case quit
     case abandoned
+    case observationUnavailable
 }
 
 /// One contiguous stretch of time the machine's frontmost app + window title
@@ -51,7 +52,7 @@ public struct ActivitySpan: Sendable, Equatable, Identifiable {
         titleRedacted: String? = nil,
         eventCount: Int = 0,
         closeReason: ActivityCloseReason? = nil,
-        tzOffsetMin: Int = ActivitySpan.currentTZOffsetMinutes()
+        tzOffsetMin: Int
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -71,10 +72,10 @@ public struct ActivitySpan: Sendable, Equatable, Identifiable {
     /// "now" — an open row must not grow while nothing is being observed.
     public var duration: Double { max(0, (endedAt ?? lastSeenAt) - startedAt) }
 
-    /// UTC offset in minutes in force *at write time* (W4 timezone correctness:
+    /// UTC offset in minutes at the new span's `startedAt` (W4 timezone correctness:
     /// buckets are computed at read time in the asking timezone, so the row only
-    /// has to remember the offset it was written under).
-    public static func currentTZOffsetMinutes(_ date: Date = Date()) -> Int {
-        TimeZone.current.secondsFromGMT(for: date) / 60
+    /// has to remember the offset at its start).
+    public static func tzOffsetMinutes(at date: Date) -> Int {
+        TimeZone.autoupdatingCurrent.secondsFromGMT(for: date) / 60
     }
 }

@@ -369,8 +369,10 @@ public enum ChatToolOutcome {
         if let status, ["timeout", "timed_out"].contains(status) { return .timeout }
         if !completed, let exitCode = numericExitCode(object["exit_code"]), exitCode != 0 { return .failed }
         if saysOutcomeOpen(output) { return .unknown }
+        // The door stamps execution "executed" only on a call it classed succeeded
+        // (AppDoorActions.actionResult); a wrapped plain value has no other status.
         if completed || object["ok"] == .bool(true) || object["success"] == .bool(true)
-            || object["outcome"] == .string("succeeded") { return .succeeded }
+            || object["outcome"] == .string("succeeded") || object["execution"] == .string("executed") { return .succeeded }
         if numericExitCode(object["exit_code"]) == 0 { return .succeeded }
         return .unknown
     }

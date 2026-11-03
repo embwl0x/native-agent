@@ -14,12 +14,7 @@ extension SwiftNativeOnboardingClient {
         let agentName = payload.agentName.trimmingCharacters(in: .whitespacesAndNewlines)
         let userName = payload.userName.trimmingCharacters(in: .whitespacesAndNewlines)
         let personaType = payload.personaType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if agentName.isEmpty {
-            return OnboardingCompleteResult(ok: false, error: "missing_agent_name")
-        }
-        if userName.isEmpty {
-            return OnboardingCompleteResult(ok: false, error: "missing_user_name")
-        }
+        if let refusal = Self.nameRefusal(agent: agentName, user: userName) { return refusal }
         if !PersonaTemplates.validTypes.contains(personaType) {
             return OnboardingCompleteResult(ok: false, error: "invalid_persona_type")
         }
@@ -86,7 +81,7 @@ extension SwiftNativeOnboardingClient {
             )
         }
         let fm = FileManager.default
-        guard Self.hasCompletionAnchor(personaTargets: targets, fileManager: fm) else {
+        guard NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot) else {
             return OnboardingCompleteResult(
                 ok: false,
                 error: "profile_repair_not_required",

@@ -6,8 +6,6 @@ import Foundation
 /// `# Dream — <date>`, then every later run of the same night as a
 /// `## Dreamt again — <yyyy-MM-dd HH:mm>` section. Each dream opens with
 /// `**<title>**`, then its summary, then `_Mood: <mood>_`.
-/// Other second-level headings also start a section in historical entries.
-///
 /// Readers and scheduler receipts name the latest dream through here.
 public struct DreamNight: Sendable, Equatable {
     public struct Dream: Sendable, Equatable {
@@ -35,10 +33,9 @@ public struct DreamNight: Sendable, Equatable {
         var current: Dream?
         for rawLine in content.split(whereSeparator: \.isNewline) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("## ") {
+            if line.hasPrefix(Self.againHeading) {
                 if let current { dreams.append(current) }
-                let stamp = line.hasPrefix(Self.againHeading)
-                    ? line.dropFirst(Self.againHeading.count).trimmingCharacters(in: .whitespaces) : ""
+                let stamp = line.dropFirst(Self.againHeading.count).trimmingCharacters(in: .whitespaces)
                 current = Dream(dreamtAgainAt: stamp.isEmpty ? nil : stamp, firstLine: "")
                 continue
             }

@@ -12,7 +12,7 @@ import NativeAgentCore
 import StandingBots
 import AppKit
 import AppToolRuntime
-// Blueprint: | `ProviderActivityChoices.swift` | Grouped activity model choices and pending-write lifecycle use ProvidersFacade routing transactions and inline receipts |
+// Blueprint: | `ProviderActivityChoices.swift` | Grouped activity model choices use the selected account's exact descriptor; missing thinking capabilities remain unavailable with repair guidance and retain saved values, account menus offer explicit model/Think/Fast-off tuples, while pending writes use ProvidersFacade routing transactions and inline receipts |
 
 /// Keep related choices together, stacking individual fields in narrow panes.
 struct ModelChoiceRow<Provider: View, Model: View, Think: View, Fast: View>: View {
@@ -158,9 +158,6 @@ extension ProviderSettingsView {
         guard !differing.isEmpty else { return all }
         return "Showing \(leadName)'s choice; \(names) \(verb). \(reach)"
     }
-    private static let fallbackReasoningEfforts = ["low", "medium", "high", "xhigh"]
-
-    private var catalogModels: [ModelCatalogItem] { appModel.engine.providers.catalog?.models ?? [] }
     var rowSet: ProviderSurfaceRowSet {
         appModel.engine.providers.settings?.rowSet ?? ProviderSurfaceRowSet(surfacePreferenceKeys: [], activeProviderKeys: [])
     }
@@ -172,7 +169,7 @@ extension ProviderSettingsView {
     private func modelsForSurface(_ surface: String) -> [ProvidersFacade.SurfaceModelChoice] {
         let selected = selection(of: surface)
         let pid = selected.provider
-        var choices = ProvidersFacade.modelsForProvider(pid, providers: providers, catalogModels: catalogModels)
+        var choices = ProvidersFacade.modelsForProvider(pid, providers: providers)
         let current = selected.model
         // Retain saved models; only a live catalog proves one unavailable.
         if !current.isEmpty, !choices.contains(where: { $0.id == current }) {
@@ -180,10 +177,11 @@ extension ProviderSettingsView {
             choices.insert(ProvidersFacade.SurfaceModelChoice(
                 id: current,
                 name: unavailable ? "\(current) — Unavailable" : current,
-                defaultReasoningEffort: selected.reasoningEffort.isEmpty ? "high" : selected.reasoningEffort,
-                supportedReasoningEfforts: [selected.reasoningEffort.isEmpty ? "high" : selected.reasoningEffort],
+                defaultReasoningEffort: "",
+                supportedReasoningEfforts: [],
                 supportsFast: false,
-                isUnavailable: unavailable
+                isUnavailable: unavailable,
+                reasoningCapabilitiesKnown: false
             ), at: 0)
         }
         return choices
@@ -192,7 +190,7 @@ extension ProviderSettingsView {
     private func selectedModelChoice(for surface: String) -> ProvidersFacade.SurfaceModelChoice? {
         let choices = modelsForSurface(surface)
         let model = selection(of: surface).model
-        return choices.first(where: { $0.id == model }) ?? choices.first
+        return choices.first(where: { $0.id == model })
     }
 
     private func reasoningLabel(_ effort: String) -> String {
@@ -273,8 +271,10 @@ extension ProviderSettingsView {
         let saving = savingGroups.contains(group.id)
         let surfModels = modelsForSurface(lead)
         let selectedChoice = selectedModelChoice(for: lead)
-        let supportedEfforts = selectedChoice?.supportedReasoningEfforts
-            ?? Self.fallbackReasoningEfforts
+        let supportedEfforts = selectedChoice?.supportedReasoningEfforts ?? []
+        let reasoningKnown = selectedChoice?.reasoningCapabilitiesKnown == true
+        let currentEffort = selected.reasoningEffort.isEmpty
+            ? (selectedChoice?.defaultReasoningEffort ?? "") : selected.reasoningEffort
         let clearable = ProvidersFacade.groupHasOverride(group, explicitSurfaces: explicitSurfaces)
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -314,11 +314,7 @@ extension ProviderSettingsView {
             ModelChoiceRow {
             Menu {
                 ForEach(pickerProviders.filter { $0.auth_status.eligible }) { provider in
-                    // One name per account, page-wide: the Accounts list's own
-                    // display name, never a second alias for the same row.
-                    Button(provider.display_name) {
-                        requestSetGroupProvider(group: group, lead: lead, providerId: provider.provider_id)
-                    }
+                    accountChoiceMenu(provider, group: group, lead: lead)
                 }
             } label: {
                 let id = selected.provider
@@ -365,16 +361,18 @@ extension ProviderSettingsView {
             } think: {
                 Picker("Think", selection: Binding(
                     get: {
-                        let current = selected.reasoningEffort.isEmpty
-                            ? (selectedChoice?.defaultReasoningEffort ?? "high") : selected.reasoningEffort
-                        return supportedEfforts.contains(current)
-                            ? current
-                            : (supportedEfforts.first ?? "high")
+                        currentEffort
                     },
                     set: { newVal in
                         requestSetGroupReasoning(group: group, lead: lead, effort: newVal)
                     }
                 )) {
+                    if !supportedEfforts.contains(currentEffort) {
+                        Text(reasoningKnown && supportedEfforts.isEmpty ? "Not configurable"
+                             : currentEffort.isEmpty ? "Unavailable" : reasoningLabel(currentEffort) + " — unavailable")
+                            .tag(currentEffort)
+                            .disabled(true)
+                    }
                     ForEach(supportedEfforts, id: \.self) { effort in
                         Text(reasoningLabel(effort)).tag(effort)
                     }
@@ -406,6 +404,17 @@ extension ProviderSettingsView {
                     : "This account and model do not offer a priority tier.")
                 }
             }
+            if !reasoningKnown {
+                Text("Thinking choices are unavailable for this model. "
+                     + (providerLoadError ?? appModel.engine.providers.settings?.catalogError
+                        ?? providers.first(where: { $0.provider_id == selected.provider })?.models_note
+                        ?? "Reload Providers to read its capabilities."))
+                    .font(ShellType.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if supportedEfforts.isEmpty {
+                Text("This model has no configurable thinking levels.")
+                    .font(ShellType.caption).foregroundStyle(secondaryInk)
+            }
             // Below the controls, not inside the Provider field: a caption in
             // the field would push Model, Think and Fast off the baseline.
             if let caption = ProviderToolCapability.caption(providerID: selected.provider) {
@@ -428,6 +437,36 @@ extension ProviderSettingsView {
 
     /// Restore inheritance from Chat for every surface in the group. `chat`
     /// itself is the root the others inherit from, so it is never cleared.
+    private func accountChoiceMenu(_ provider: ProviderInfo, group: ProviderSurfaceGroup, lead: String) -> some View {
+        Menu(provider.display_name) {
+            Button("Keep current model and controls") {
+                requestSetGroupProvider(group: group, lead: lead, providerId: provider.provider_id)
+            }
+            Divider()
+            ForEach(provider.models) { model in
+                Menu(model.name) {
+                    if let efforts = model.supported_reasoning_efforts {
+                        if efforts.isEmpty, provider.provider_id == "openrouter" {
+                            Button("Provider default · Fast off") {
+                                requestSetGroupSelection(group: group, providerID: provider.provider_id,
+                                    model: model.id, reasoningEffort: "default", serviceTier: "default")
+                            }
+                        } else {
+                            ForEach(efforts, id: \.self) { effort in
+                                Button("Think \(reasoningLabel(effort)) · Fast off") {
+                                    requestSetGroupSelection(group: group, providerID: provider.provider_id,
+                                        model: model.id, reasoningEffort: effort, serviceTier: "default")
+                                }
+                            }
+                        }
+                    } else {
+                        Text(model.controls_note ?? "Capabilities unavailable — refresh models")
+                    }
+                }
+            }
+        }
+    }
+
     private func clearGroupOverride(_ group: ProviderSurfaceGroup) async {
         guard !isLoading, !savingGroups.contains(group.id) else { return }
         savingGroups.insert(group.id)
@@ -455,7 +494,7 @@ extension ProviderSettingsView {
         let brain = ProvidersFacade.reconciledBrainForProvider(
             providerId: providerId, model: selected.model,
             reasoningEffort: selected.reasoningEffort.isEmpty ? nil : selected.reasoningEffort, fastMode: selected.fast,
-            providers: providers, catalogModels: catalogModels
+            providers: providers
         )
         requestSetGroupSelection(
             group: group, providerID: providerId, model: brain?.model,
@@ -471,12 +510,16 @@ extension ProviderSettingsView {
         let selected = selection(of: lead)
         guard !model.isEmpty, selected.model != model || ProvidersFacade.groupIsMixed(group, selections: surfaceSelections, explicitSurfaces: explicitSurfaces) else { return }
         guard let choice = modelsForSurface(lead).first(where: { $0.id == model }) else { return }
+        guard choice.reasoningCapabilitiesKnown else {
+            status = ("The model's thinking capabilities are unavailable. Reload Providers before choosing it.", .error)
+            return
+        }
         let nextEffort = normalizedReasoningEffort(
-            options: choice.supportedReasoningEfforts, preferred: choice.defaultReasoningEffort,
+            preferred: choice.defaultReasoningEffort,
             selected: selected.reasoningEffort.isEmpty ? choice.defaultReasoningEffort : selected.reasoningEffort
         )
         requestSetGroupSelection(group: group, providerID: selected.provider, model: model,
-            reasoningEffort: nextEffort, serviceTier: choice.supportsFast && selected.fast ? "priority" : "default")
+            reasoningEffort: nextEffort, serviceTier: selected.fast ? "priority" : "default")
     }
 
     private func requestSetGroupReasoning(

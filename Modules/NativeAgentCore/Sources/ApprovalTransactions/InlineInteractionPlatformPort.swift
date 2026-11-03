@@ -3,23 +3,24 @@ import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import ChatToolRuntime
-// Blueprint: | `InlineInteractionPlatformPort.swift` | `InlineInteractionPlatformPort` protocol; platform probes/acquisition and activation/System Settings quit events for non-polling card settlement; GrantWatch consumes them in BackgroundLoops' resident body, coalescing taps and retiring each card's refresher |
+// Blueprint: | `InlineInteractionPlatformPort.swift` | `InlineInteractionPlatformPort` protocol; Mail readiness reads the integration-status owner; platform probes/acquisition and activation/System Settings quit events for non-polling card settlement; GrantWatch consumes them in BackgroundLoops' resident body, coalescing taps and retiring each card's refresher |
 
 /// App/platform facts and effects; card authority stays with the resolver.
 @MainActor
 public protocol InlineInteractionPlatformPort {
-    func probeAppleEventApp(_ name: String) async -> String
-    func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue
+    /// The integration-status owner's permission AND checked read evidence.
+    /// A projection reads it; explicit verification asks the owner to check.
+    func mailReadiness(root: URL, check: Bool) async -> (status: String, word: String, next: String?)
     func chromeConnectionStatus() async -> (enabled: Bool, connected: Bool)
     var chromeSteps: String { get }
-    func pairedPhoneCount() async -> Int
+    func pairedPhoneCount() async -> Int?
     func connectorRecords(root: URL) async throws -> [InlineInteractionConnectorStatus]
     func providers() async throws -> [InlineInteractionProviderStatus]
     func cardBlockReason(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> String?
     func permissionChanges() -> AsyncStream<Void>
     /// Every card still open in the inbox, with the session it belongs to.
-    func openInteractionCards() async -> [(id: String, sessionID: String)]
-    func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> Bool
+    func openInteractionCards() async throws -> [(id: String, sessionID: String)]
+    func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async throws -> Bool
     func writeInteractionSnapshots() async
     func refreshInteractionInbox() async
     func postInteractionBanner(title: String, body: String, sessionID: String) async

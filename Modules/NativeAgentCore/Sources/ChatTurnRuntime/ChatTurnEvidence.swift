@@ -35,7 +35,7 @@ struct ProducedChatTurn: Sendable {
 
 /// Verified owner turns advance the current/previous stamp once per turn under its file lock.
 public enum UserTurnStamp {
-    struct Stamp: Codable { var at: Double; var previous: Double?; var key: String }
+    struct Stamp: Codable { var at: Double; var previous: Double?; var key: String; var door: String? }
 
     static func url(_ dataRoot: URL) -> URL { dataRoot.appendingPathComponent("cognition/user_turn.json") }
 
@@ -69,7 +69,7 @@ public enum UserTurnStamp {
         catch { unavailable(dataRoot, error); return nil }
     }
 
-    public static func record(dataRoot: URL, key: String, at date: Date = Date()) {
+    public static func record(dataRoot: URL, key: String, door: String? = nil, at date: Date = Date()) {
         let url = url(dataRoot)
         do {
             let keptKey = try CredentialFileLock.withLock(url) {
@@ -84,7 +84,7 @@ public enum UserTurnStamp {
                     }
                     return old.key
                 }
-                let stamp = Stamp(at: date.timeIntervalSince1970, previous: old?.at, key: key)
+                let stamp = Stamp(at: date.timeIntervalSince1970, previous: old?.at, key: key, door: door)
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(stamp), to: url)
                 return stamp.key

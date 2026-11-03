@@ -8,7 +8,7 @@ import ImageIO
 import Desk
 import Experiences
 import ToolExecution
-// Blueprint: | `SwiftOpenAIImageGenerationClient.swift` | OpenAI image request/result values and HTTP transport; default-deny admission, API credentials and named response failures |
+// Blueprint: | `SwiftOpenAIImageGenerationClient.swift` | OpenAI image request/result values and HTTP transport; default-deny admission, API credentials and per-item response decoding failures |
 
 struct OpenAIImageGenerationRequest: Sendable, Equatable {
     var prompt: String
@@ -28,6 +28,7 @@ struct OpenAIImageGenerationResult: Sendable, Equatable {
 
     var model: String
     var images: [Image]
+    var failures: [JSONValue]
     var usage: JSONValue?
 }
 
@@ -49,7 +50,7 @@ final class SwiftOpenAIImageGenerationClient: Sendable {
         let trimmedPrompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPrompt.isEmpty else { throw ImageGenerationToolError.missingPrompt }
 
-        guard let key = LLMCredentialResolver.resolveAPIKey(
+        guard let key = try LLMCredentialResolver.checkedAPIKey(
             providerConfigFile: "openai.json",
             dataRoot: dataRoot),
               !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -108,11 +109,16 @@ final class SwiftOpenAIImageGenerationClient: Sendable {
         }
 
         var images: [OpenAIImageGenerationResult.Image] = []
+        var failures: [JSONValue] = []
         for (idx, row) in rows.enumerated() {
             guard case let .object(obj) = row,
                   case let .string(b64)? = obj["b64_json"],
                   let bytes = Data(base64Encoded: b64) else {
-                throw ImageGenerationToolError.invalidImageData
+                failures.append(.object([
+                    "index": .int(Int64(idx)), "stage": .string("decode"),
+                    "error": .string(ImageGenerationToolError.invalidImageData.localizedDescription),
+                ]))
+                continue
             }
             let revised: String? = {
                 if case let .string(value)? = obj["revised_prompt"] { return value }
@@ -120,11 +126,12 @@ final class SwiftOpenAIImageGenerationClient: Sendable {
             }()
             images.append(.init(index: idx, data: bytes, revisedPrompt: revised))
         }
-        guard !images.isEmpty else { throw ImageGenerationToolError.invalidImageData }
+        guard !rows.isEmpty else { throw ImageGenerationToolError.invalidResponse("empty data array") }
 
         return OpenAIImageGenerationResult(
             model: request.model,
             images: images,
+            failures: failures,
             usage: root["usage"]
         )
     }

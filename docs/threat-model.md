@@ -122,6 +122,9 @@ Slack xox/xapp recognition uses that scanner; socket evidence strips URL queries
 Receipts and displays share its case-insensitive credential patterns, including
 JWTs, Slack xox/xapp tokens and Bearer values of 20 or more characters.
 `NativeAgentSecretRedactor.swift` retains digest replacements for receipts.
+Calendar and Reminder note previews inspect the complete notes with
+`NativeAppSecretRedactor` before taking 300 characters; Mac and phone
+notification receipts likewise redact the complete message before taking 200.
 Security audit strings use the canonical credential recognizer before clipping,
 as well as the audit boundary's additional token and JWT checks. A match
 withholds the whole string, including credentials under ordinary field names.

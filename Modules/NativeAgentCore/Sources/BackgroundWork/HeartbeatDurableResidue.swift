@@ -11,23 +11,28 @@ import AgentWorkspace
 import NotificationInbox
 import Privacy
 import Cognition
-// Blueprint: | `HeartbeatDurableResidue.swift` | HeartbeatBackgroundWork durable-residue summary and idempotent review-card reconciliation |
+// Blueprint: | `HeartbeatDurableResidue.swift` | HeartbeatBackgroundWork availability-bearing durable-residue summary and idempotent review-card reconciliation; an incomplete source cannot clear the card |
 extension HeartbeatBackgroundWork {
     public struct DurableResidueSummary: Sendable, Equatable {
-        let staleWorkflowRunCount: Int
+        let staleWorkflowRunCount: Int?
         let staleWorkflowRunIDs: [String]
         let preservedCodexReplyCount: Int?
         var codexReplyCountText: String { preservedCodexReplyCount.map(String.init) ?? "unavailable" }
-        let terminalBridgeMessageCount: Int
+        let terminalBridgeMessageCount: Int?
         let terminalBridgeMessages: [String]
-        let staleBridgeMessageCount: Int
+        let staleBridgeMessageCount: Int?
         let staleBridgeMessages: [String]
-        let veryOldDeskItemCount: Int
+        let veryOldDeskItemCount: Int?
         let veryOldDeskItems: [String]
         let membershipDigest: String
+        let unavailable: [String]
+        var workflowCountText: String { staleWorkflowRunCount.map(String.init) ?? "unavailable" }
+        var terminalCountText: String { terminalBridgeMessageCount.map(String.init) ?? "unavailable" }
+        var staleBridgeCountText: String { staleBridgeMessageCount.map(String.init) ?? "unavailable" }
+        var deskCountText: String { veryOldDeskItemCount.map(String.init) ?? "unavailable" }
 
         var isEmpty: Bool {
-            staleWorkflowRunCount == 0
+            unavailable.isEmpty && staleWorkflowRunCount == 0
                 && preservedCodexReplyCount == 0
                 && terminalBridgeMessageCount == 0
                 && staleBridgeMessageCount == 0
@@ -35,20 +40,21 @@ extension HeartbeatBackgroundWork {
         }
         var signature: String {
             [
-                String(staleWorkflowRunCount),
+                workflowCountText,
                 codexReplyCountText,
-                String(terminalBridgeMessageCount),
-                String(staleBridgeMessageCount),
-                String(veryOldDeskItemCount),
+                terminalCountText,
+                staleBridgeCountText,
+                deskCountText,
                 membershipDigest,
+                unavailable.joined(separator: "; "),
             ].joined(separator: "|")
         }
         var signalLine: String {
-            "Durable review residue: \(staleWorkflowRunCount) old non-terminal workflow run(s), "
+            "Durable review residue: \(workflowCountText) old non-terminal workflow run(s), "
                 + "saved replies to Codex owed or sent unconfirmed: \(codexReplyCountText), "
-                + "\(terminalBridgeMessageCount) terminal bridge delivery failure(s), "
-                + "\(staleBridgeMessageCount) bridge message(s) unconsumed over 24h, "
-                + "\(veryOldDeskItemCount) open Desk item(s) older than 30d."
+                + "\(terminalCountText) terminal bridge delivery failure(s), "
+                + "\(staleBridgeCountText) bridge message(s) unconsumed over 24h, "
+                + "\(deskCountText) open Desk item(s) older than 30d."
         }
     }
     public func heartbeatDurableResidueSummary(
@@ -57,6 +63,18 @@ extension HeartbeatBackgroundWork {
         now: Date = Date(),
         deadline: (Date) -> Void = { _ in }
     ) async -> DurableResidueSummary {
+        var unavailable: [String] = []
+        func rows(_ path: URL) throws -> [[String: Any]] {
+            let data: Data
+            do { data = try Data(contentsOf: path) }
+            catch CocoaError.fileReadNoSuchFile { return [] }
+            return try data.split(separator: 0x0A).map { line in
+                guard let row = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else {
+                    throw PersistenceCoreError.ioFailure("Non-object row at \(path.path)")
+                }
+                return row
+            }
+        }
         let workflowCutoff = now.addingTimeInterval(-heartbeatWorkflowStaleAge)
         let workflowDir = dataRoot
             .appendingPathComponent("workflows", isDirectory: true)
@@ -66,25 +84,35 @@ extension HeartbeatBackgroundWork {
             "blocked", "recovery_required",
         ]
         var workflowIDs: [String] = []
-        if let files = try? FileManager.default.contentsOfDirectory(
+        var workflowsReadable = true
+        do {
+            let files: [URL]
+            do { files = try FileManager.default.contentsOfDirectory(
             at: workflowDir,
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
-        ) {
+            ) } catch CocoaError.fileReadNoSuchFile { files = [] }
             for file in files where file.pathExtension.lowercased() == "json" {
-                guard let data = try? Data(contentsOf: file),
-                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let status = (object["status"] as? String)?.lowercased(),
-                      activeWorkflowStatuses.contains(status),
-                      let rawStamp = object["updatedAt"] as? String
+                let data = try Data(contentsOf: file)
+                guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let status = (object["status"] as? String)?.lowercased() else {
+                    throw PersistenceCoreError.ioFailure("Workflow status unavailable at \(file.path)")
+                }
+                guard activeWorkflowStatuses.contains(status) else { continue }
+                guard let rawStamp = object["updatedAt"] as? String
                         ?? object["updated_at"] as? String
                         ?? object["createdAt"] as? String
                         ?? object["created_at"] as? String,
-                      let stamp = NativeTimestampFormat.parseISO8601(rawStamp) else { continue }
+                      let stamp = NativeTimestampFormat.parseISO8601(rawStamp) else {
+                    throw PersistenceCoreError.ioFailure("Workflow timestamp unavailable at \(file.path)")
+                }
                 deadline(stamp.addingTimeInterval(heartbeatWorkflowStaleAge + 0.001))
                 guard stamp < workflowCutoff else { continue }
                 workflowIDs.append((object["id"] as? String) ?? file.deletingPathExtension().lastPathComponent)
             }
+        } catch {
+            workflowsReadable = false
+            unavailable.append("Workflow residue: \(error.localizedDescription)")
         }
         // Scoped to THIS install: only the owner of the machine-wide rendezvous
         // reads `~/.config`, so a fresh root does not report another install's
@@ -101,16 +129,16 @@ extension HeartbeatBackgroundWork {
         // remain compatibility proof for rows written before consumedAt/readAt.
         let codexBridge = configRoot
             .appendingPathComponent("codex-nativeagent-bridge", isDirectory: true)
+        var bridgeReadable = true
         let deliveredMessageIDs: Set<String> = {
             let path = codexBridge.appendingPathComponent("reply-deliveries.jsonl")
-            guard let text = try? String(contentsOf: path, encoding: .utf8) else { return [] }
             var ids = Set<String>()
-            for line in text.split(whereSeparator: \Character.isNewline) {
-                guard let data = String(line).data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let messageIDs = object["messageIds"] as? [String] else { continue }
+            do { for object in try rows(path) {
+                guard let messageIDs = object["messageIds"] as? [String] else {
+                    throw PersistenceCoreError.ioFailure("Reply delivery messageIds unavailable at \(path.path)")
+                }
                 ids.formUnion(messageIDs)
-            }
+            } } catch { bridgeReadable = false; unavailable.append("Bridge delivery evidence: \(error.localizedDescription)") }
             return ids
         }()
         let bridgeCutoff = now.addingTimeInterval(-heartbeatClaimStaleAge)
@@ -118,12 +146,11 @@ extension HeartbeatBackgroundWork {
         var terminalBridgeMessages: [String] = []
         var staleBridgeMessages: [String] = []
         let codexInbox = codexBridge.appendingPathComponent("codex-inbox.jsonl")
-        if let text = try? String(contentsOf: codexInbox, encoding: .utf8) {
-            for line in text.split(whereSeparator: \Character.isNewline) {
-                guard let data = String(line).data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else { continue }
-                let id = (object["messageId"] as? String) ?? (object["id"] as? String) ?? "unknown"
+        do {
+            for object in try rows(codexInbox) {
+                guard let id = (object["messageId"] as? String) ?? (object["id"] as? String), !id.isEmpty else {
+                    throw PersistenceCoreError.ioFailure("Bridge message identity unavailable at \(codexInbox.path)")
+                }
                 let topic = (object["topic"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
                 let label = (topic?.isEmpty == false ? topic! : id)
                 let read = (object["read"] as? Bool) == true
@@ -136,26 +163,34 @@ extension HeartbeatBackgroundWork {
                     terminalBridgeMessages.append("\(label) (\(reason))")
                     continue
                 }
-                guard !consumed,
-                      !deliveredMessageIDs.contains(id),
-                      let created = NativeTimestampFormat.parseISO8601(
+                guard !consumed, !deliveredMessageIDs.contains(id) else { continue }
+                guard let created = NativeTimestampFormat.parseISO8601(
                         (object["createdAt"] as? String) ?? (object["created_at"] as? String) ?? ""
-                      ),
-                      acknowledgedBefore.map({ created >= $0 }) ?? true else { continue }
+                      ) else { throw PersistenceCoreError.ioFailure("Bridge message timestamp unavailable at \(codexInbox.path) for \(id)") }
+                guard acknowledgedBefore.map({ created >= $0 }) ?? true else { continue }
                 deadline(created.addingTimeInterval(heartbeatClaimStaleAge + 0.001))
                 guard created < bridgeCutoff else { continue }
                 staleBridgeMessages.append(label)
             }
+        } catch {
+            bridgeReadable = false
+            unavailable.append("Bridge inbox evidence: \(error.localizedDescription)")
         }
         let deskCutoff = now.addingTimeInterval(-heartbeatDeskStaleAge)
-        let deskItems = (try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items) ?? []
-        let veryOldDeskItems = deskItems.compactMap { item -> String? in
-            guard !item.status.isTerminal,
-                  let stamp = NativeTimestampFormat.parseISO8601(item.updatedAt) else { return nil }
+        var deskReadable = true
+        var veryOldDeskItems: [String] = []
+        do {
+        let deskItems = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items
+        veryOldDeskItems = try deskItems.compactMap { item -> String? in
+            guard !item.status.isTerminal else { return nil }
+            guard let stamp = NativeTimestampFormat.parseISO8601(item.updatedAt) else {
+                throw PersistenceCoreError.ioFailure("Desk item timestamp unavailable for \(item.handle)")
+            }
             deadline(stamp.addingTimeInterval(heartbeatDeskStaleAge + 0.001))
             guard stamp < deskCutoff else { return nil }
             return "\(item.alias): \(item.title)"
         }
+        } catch { deskReadable = false; unavailable.append("Desk residue: \(error.localizedDescription)") }
         let sortedWorkflowIDs = workflowIDs.sorted()
         let sortedDeskItems = veryOldDeskItems.sorted()
         let membership = [
@@ -166,16 +201,16 @@ extension HeartbeatBackgroundWork {
             sortedDeskItems.joined(separator: "\n"),
         ].joined(separator: "\n---\n")
         return DurableResidueSummary(
-            staleWorkflowRunCount: sortedWorkflowIDs.count,
+            staleWorkflowRunCount: workflowsReadable ? sortedWorkflowIDs.count : nil,
             staleWorkflowRunIDs: Array(sortedWorkflowIDs.prefix(8)),
             preservedCodexReplyCount: replyRead.allStoresReadable ? preservedReplies.count : nil,
-            terminalBridgeMessageCount: terminalBridgeMessages.count,
+            terminalBridgeMessageCount: bridgeReadable ? terminalBridgeMessages.count : nil,
             terminalBridgeMessages: Array(terminalBridgeMessages.sorted().prefix(8)),
-            staleBridgeMessageCount: staleBridgeMessages.count,
+            staleBridgeMessageCount: bridgeReadable ? staleBridgeMessages.count : nil,
             staleBridgeMessages: Array(staleBridgeMessages.sorted().prefix(8)),
-            veryOldDeskItemCount: sortedDeskItems.count,
+            veryOldDeskItemCount: deskReadable ? sortedDeskItems.count : nil,
             veryOldDeskItems: Array(sortedDeskItems.prefix(8)),
-            membershipDigest: heartbeatStableDigest(membership)
+            membershipDigest: heartbeatStableDigest(membership), unavailable: unavailable
         )
     }
     /// Maintains one sticky informational review card. An unchanged summary
@@ -213,12 +248,15 @@ extension HeartbeatBackgroundWork {
             }
             var detail: [String] = [
                 "Review snapshot at \(NativeTimestampFormat.fractionalZulu(now)). Current reply outcomes are on Delegations and Desk. NativeAgent did not replay, resume, archive, or delete any underlying state.",
-                "Old non-terminal workflow runs: \(summary.staleWorkflowRunCount).",
+                "Old non-terminal workflow runs: \(summary.workflowCountText).",
                 "Saved replies to Codex owed or sent unconfirmed: \(summary.codexReplyCountText).",
-                "Terminal Codex bridge deliveries: \(summary.terminalBridgeMessageCount). These briefs remain retained and are never treated as consumed.",
-                "Codex bridge messages unconsumed over 24h: \(summary.staleBridgeMessageCount). Historical reply receipts count as compatibility proof.",
-                "Open Desk items older than 30 days: \(summary.veryOldDeskItemCount).",
+                "Terminal Codex bridge deliveries: \(summary.terminalCountText). These briefs remain retained and are never treated as consumed.",
+                "Codex bridge messages unconsumed over 24h: \(summary.staleBridgeCountText). Historical reply receipts count as compatibility proof.",
+                "Open Desk items older than 30 days: \(summary.deskCountText).",
             ]
+            if !summary.unavailable.isEmpty {
+                detail.append("Residue inventory is incomplete; no clear verdict is available. Repair these sources, then refresh: " + summary.unavailable.joined(separator: "; "))
+            }
             if !summary.staleWorkflowRunIDs.isEmpty {
                 detail.append("Workflow ids: " + summary.staleWorkflowRunIDs.prefix(8).joined(separator: ", "))
             }
@@ -241,7 +279,7 @@ extension HeartbeatBackgroundWork {
                 "summary": .string(summary.signalLine),
                 "detail": .string(detail.joined(separator: "\n")),
                 "residue_signature": .string(summary.signature),
-                "related_mission_id": .null,
+                "related_execution_id": .null,
                 "related_approval_id": .null,
                 "related_paths": .array([]),
                 "related_groups": .array([]),

@@ -90,11 +90,14 @@ extension NativeCognitionRuntime {
         if organismPersistenceCompletedGeneration >= generation {
             return organismPersistenceLastResult
         }
-        return await withCheckedContinuation { continuation in
-            organismPersistenceWaiters[generation, default: []].append(continuation)
-            // An awaited save never waits out the debounce.
-            organismPersistenceDebounceTask?.cancel()
-        }
+        let id = UUID(), done = ScopedWaiter()
+        organismPersistenceWaiters[generation, default: [:]][id] = OrganismPersistenceWait(done: done)
+        // An awaited save never waits out the debounce, even when cancelled.
+        organismPersistenceDebounceTask?.cancel()
+        await Task { await done.park() }.value
+        let result = organismPersistenceWaiters[generation]!.removeValue(forKey: id)!.result!
+        if organismPersistenceWaiters[generation]?.isEmpty == true { organismPersistenceWaiters[generation] = nil }
+        return result
     }
 
     /// Serial latest-state drain coalesces arrivals during a write into one subsequent snapshot.
@@ -105,7 +108,7 @@ extension NativeCognitionRuntime {
                 return
             }
             // Un-awaited saves coalesce for 30 seconds; a waiter flushes immediately.
-            if organismPersistenceWaiters.isEmpty,
+            if !organismPersistenceWaiters.values.contains(where: { $0.values.contains(where: { $0.result == nil }) }),
                let last = organismPersistenceLastWriteAt,
                ContinuousClock.now < last + .seconds(30) {
                 let due = last + .seconds(30)
@@ -135,9 +138,11 @@ extension NativeCognitionRuntime {
     private func resumeOrganismPersistenceWaiters(through generation: UInt64, result: Bool) {
         let completed = organismPersistenceWaiters.keys.filter { $0 <= generation }
         for key in completed {
-            let continuations = organismPersistenceWaiters.removeValue(forKey: key) ?? []
-            for continuation in continuations {
-                continuation.resume(returning: result)
+            guard let waiting = organismPersistenceWaiters[key] else { continue }
+            for id in waiting.keys {
+                guard organismPersistenceWaiters[key]?[id]?.result == nil else { continue }
+                organismPersistenceWaiters[key]?[id]?.result = result
+                organismPersistenceWaiters[key]?[id]?.done.resume()
             }
         }
     }

@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import ChatToolParsing
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
@@ -18,7 +19,7 @@ import CryptoKit
 import MemoryV2
 import SwarmRuns
 import MacIntegration
-// Blueprint: | `BuilderProcess.swift` | Process launch, environment and confinement |
+// Blueprint: | `BuilderProcess.swift` | Checked workspace and required SwiftPM shim admission before process launch; environment and confinement |
 extension SwiftToolDispatcher {
     // Escape SBPL literals so paths cannot alter confinement or credential/Trust denials.
     static func sbplEscapeLiteral(_ s: String) -> String {
@@ -55,21 +56,19 @@ extension SwiftToolDispatcher {
     /// Absolute path of the real `swift` driver, resolved without consulting the
     /// shim directory. `/usr/bin/swift` is the system xcrun stub and is what an
     /// unsandboxed spawn would have hit anyway.
-    static func builderRealSwiftPath() -> String? {
-        let candidates = [
-            "/usr/bin/swift",
-            "/usr/local/bin/swift",
-            "/opt/homebrew/bin/swift",
-        ]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    static func builderRealSwiftPath() throws -> String {
+        let path = "/usr/bin/swift"
+        guard FileManager.default.isExecutableFile(atPath: path) else {
+            throw ToolFailureError("The required Swift driver is not executable.", effects: .none,
+                owner: path, code: "builder_swift_unavailable", instruction: "Repair the selected Xcode command-line toolchain before launching the sandboxed command.")
+        }
+        return path
     }
-    /// Create (idempotently) the shim directory and return it, or nil if it could
-    /// not be built. Failing to nil is fail-SAFE: the spawn keeps its sandbox and
-    /// a SwiftPM command fails loudly, rather than silently running unconfined.
+    /// Required launch preparation: errors refuse the launch at their cause.
     /// Executable shim/staging files live in OS temp, outside backup/export/
     /// phone sync and the data-root PrivacyMap, like this owner's patch text.
-    static func builderSwiftPMShimDirectory(baseDirectory: URL? = nil) -> URL? {
-        guard let realSwift = builderRealSwiftPath() else { return nil }
+    static func builderSwiftPMShimDirectory(baseDirectory: URL? = nil) throws -> URL {
+        let realSwift = try builderRealSwiftPath()
         let fm = FileManager.default
         // Per-user private temp (/var/folders/<hash>/T, mode 700) — not the
         // world-writable /tmp, so the shim cannot be pre-planted by another user.
@@ -77,49 +76,27 @@ extension SwiftToolDispatcher {
             .appendingPathComponent(InstallPaths.current.name("nativeagent-swiftpm-shim"), isDirectory: true)
         let shim = dir.appendingPathComponent("swift", isDirectory: false)
         let script = builderSwiftPMShimScript(realSwiftPath: realSwift)
-        do {
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true,
-                                   attributes: [.posixPermissions: 0o700])
-            // createDirectory leaves an existing directory's permissions
-            // unchanged. Reassert the private boundary on every call, including
-            // the idempotent fast path.
-            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
-        } catch {
-            return nil
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true,
+                               attributes: [.posixPermissions: 0o700])
+        // createDirectory leaves existing permissions unchanged.
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+        if fm.fileExists(atPath: shim.path) {
+            let existing = try String(contentsOf: shim, encoding: .utf8)
+            if existing == script, fm.isExecutableFile(atPath: shim.path) { return dir }
         }
-        if let existing = try? String(contentsOf: shim, encoding: .utf8),
-           existing == script,
-           fm.isExecutableFile(atPath: shim.path) {
-            return dir
+        // Publish only the complete executable body.
+        let staged = dir.appendingPathComponent("swift.staged-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: staged) }
+        try script.write(to: staged, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: staged.path)
+        if fm.fileExists(atPath: shim.path) {
+            _ = try fm.replaceItemAt(shim, withItemAt: staged)
+        } else {
+            try fm.moveItem(at: staged, to: shim)
         }
-        do {
-            // Stage under a unique name, mark executable, then atomically swap in.
-            // A concurrent spawn therefore sees either the old shim or the new
-            // one — never a half-written or not-yet-executable file.
-            let staged = dir.appendingPathComponent("swift.staged-\(UUID().uuidString)")
-            try script.write(to: staged, atomically: true, encoding: .utf8)
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: staged.path)
-            if fm.fileExists(atPath: shim.path) {
-                _ = try fm.replaceItemAt(shim, withItemAt: staged)
-            } else {
-                try fm.moveItem(at: staged, to: shim)
-            }
-            // replaceItemAt may preserve the destination inode's mode (for
-            // example a stale 0644 shim). Reassert the executable contract on
-            // the final path, not only on the staging file.
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shim.path)
-            return dir
-        } catch {
-            // Lost a race with a sibling writer? Accept only the exact expected
-            // script with the full private/executable permission contract.
-            if let landed = try? String(contentsOf: shim, encoding: .utf8),
-               landed == script,
-               fm.isExecutableFile(atPath: shim.path),
-               (try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)) != nil {
-                return dir
-            }
-            return nil
-        }
+        // Replacement may preserve the destination inode's stale mode.
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shim.path)
+        return dir
     }
     static func builderSandboxProfile(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -206,16 +183,16 @@ extension SwiftToolDispatcher {
     /// The trust modes User means by "yolo": the operator has explicitly taken
     /// the wrapper off, so the harness must not second-guess it with one.
     static let builderYoloPermissionLevels: Set<String> = [
-        "full_mac_os", "wide_open_receipts",
+        "full_mac_os",
     ]
     /// Trust selects confinement; locked-down mode overrides all environment and policy escape hatches.
     static func builderShellSandboxMode(
         dataRoot: URL,
         environment: [String: String] = ProcessInfo.processInfo.environment
-    ) async -> BuilderShellSandboxMode {
-        let policy = await SwiftNativeTrustCenter(
+    ) async throws -> BuilderShellSandboxMode {
+        let policy = try await SwiftNativeTrustCenter(
             dataRoot: dataRoot
-        ).loadTrustPolicy()
+        ).loadTrustPolicyChecked()
         var permissionLevel = "balanced"
         if case .string(let raw)? = policy["permissionLevel"] {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -223,7 +200,7 @@ extension SwiftToolDispatcher {
         }
         // Tier 3 first: a locked-down posture outranks every off-ramp below,
         // including the env break-glass. Checked before the env var on purpose.
-        if permissionLevel == "strict" || permissionLevel == "locked_down" {
+        if permissionLevel == "strict" {
             return .lockedDown
         }
         // Tier 1: yolo. Explicit permission level AND a live Full Mac window.
@@ -257,15 +234,15 @@ extension SwiftToolDispatcher {
         let pathPrefix: String?
         let environment: [String: String]?
     }
-    static func builderLaunch(executable: String, args: [String], cwd: String, dataRoot: URL, readWords: [String]? = nil) async -> BuilderLaunch? {
+    static func builderLaunch(executable: String, args: [String], cwd: String, dataRoot: URL, readWords: [String]? = nil) async throws -> BuilderLaunch? {
         // The workspace is infrastructure, not a model-created side effect.
         // Launch prepares it for every entry surface.
-        _ = try? NativeAgentWorkspaceRoot.prepare(dataRoot: dataRoot)
+        _ = try NativeAgentWorkspaceRoot.prepare(dataRoot: dataRoot)
         // Resolve the effective confinement posture before cwd validation.
         // Full Mac YOLO deliberately removes the workspace wrapper, so it must
         // also be able to start in a user-selected external project. Ordinary
         // modes retain the canonical workspace/source-checkout boundary.
-        let mode = await builderShellSandboxMode(dataRoot: dataRoot)
+        let mode = try await builderShellSandboxMode(dataRoot: dataRoot)
         let directory = builderNormalizeCwd(cwd, dataRoot: dataRoot, allowOutsideWorkspace: mode == .off)
         guard directory.rejection == nil else { return nil }
         let resolvedCwd = directory.path
@@ -279,8 +256,9 @@ extension SwiftToolDispatcher {
             return BuilderLaunch(mode: mode, executable: executable, arguments: args, cwd: resolvedCwd, pathPrefix: nil, environment: nil)
         }
         let profile = mode == .developerFullMac ? builderDeveloperSandboxProfile(dataRoot: dataRoot) : builderSandboxProfile(dataRoot: dataRoot)
+        let shim = try builderSwiftPMShimDirectory()
         return BuilderLaunch(mode: mode, executable: "/usr/bin/sandbox-exec", arguments: ["-p", profile, executable] + args,
-                             cwd: resolvedCwd, pathPrefix: builderSwiftPMShimDirectory()?.path, environment: nil)
+                             cwd: resolvedCwd, pathPrefix: shim.path, environment: nil)
     }
     static func runShellLikeProcess(
         toolName: String,
@@ -319,7 +297,10 @@ extension SwiftToolDispatcher {
         // Normalize and bound-check cwd. On failure: write a pre-spawn
         // audit envelope, then return a clean denied envelope (carry the
         // audit_error if the write itself failed so it's visible).
-        guard let launch = await builderLaunch(executable: executable, args: args, cwd: cwd, dataRoot: dataRoot, readWords: readWords) else {
+        let checkedLaunch: BuilderLaunch?
+        do { checkedLaunch = try await builderLaunch(executable: executable, args: args, cwd: cwd, dataRoot: dataRoot, readWords: readWords) }
+        catch { return ChatToolOutcome.failure(error: error, tool: toolName, effects: ToolFailureError.Effects.none) }
+        guard let launch = checkedLaunch else {
             let auditEntry: [String: Any] = [
                 "toolName": toolName,
                 "runId": runId,
@@ -355,7 +336,7 @@ extension SwiftToolDispatcher {
         let clampedTimeout = builderEffectiveTimeoutSeconds(timeoutSeconds)
         let sandboxMode = launch.mode, resolvedCwd = launch.cwd
         let sandboxed = sandboxMode != .off
-        let process = Process()
+        let process = ManagedProcess()
         process.executableURL = URL(fileURLWithPath: launch.executable)
         process.arguments = launch.arguments
         // Environment. SwiftPM nesting shim, only relevant when we DID wrap: `sandbox_apply` refuses to nest, and SwiftPM
@@ -440,7 +421,7 @@ extension SwiftToolDispatcher {
             let durationMs = Int(Date().timeIntervalSince(started) * 1000)
             // A launched shell timeout is command data; an explicit Stop is cancellation.
             let timeoutIsAnswer = exitIsAnswer && exit.launched && exit.timedOut
-            let status = exit.stopped && !timeoutIsAnswer ? "stopped" : exitIsAnswer || exitCode == 0 ? "completed" : "failed"
+            let status = exit.terminationError != nil ? "failed" : exit.stopped && !timeoutIsAnswer ? "stopped" : exitIsAnswer || exitCode == 0 ? "completed" : "failed"
             var auditEntry: [String: Any] = [
                 "toolName": toolName,
                 "runId": runId,
@@ -464,6 +445,7 @@ extension SwiftToolDispatcher {
                 "sandbox_mode": sandboxMode.rawValue,
                 "outer_sandbox_policy": "policy",
             ]
+            if let error = exit.terminationError { auditEntry["terminationError"] = error }
             if let sourcePayloadForAudit { auditEntry["sourcePayload"] = sourcePayloadForAudit }
             if exit.stopped { auditEntry["reason"] = exit.timedOut ? "watchdog_timeout" : "stopped" }
             if !resolvedCompatRewrites.isEmpty {
@@ -505,13 +487,19 @@ extension SwiftToolDispatcher {
                     ? "Ran · exit \(exitCode)" + (exit.timedOut ? " · timed out after \(clampedTimeout) s" : "")
                     : "Stopped before launch")
             }
-            if exit.timedOut {
+            if let error = exit.terminationError {
+                envelope["reason"] = .string("process_termination_incomplete")
+                envelope["effects"] = .string("unknown")
+                envelope["detail"] = .string(error)
+                envelope["remedy"] = Repair.reconcile(instruction: "Inspect the command's existing effects and repair its process group before repeating work.",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["find": .string("shell")])]))
+            } else if exit.timedOut {
                 if !exitIsAnswer { envelope["reason"] = .string("watchdog_timeout") }
-                envelope["detail"] = .string("The process exceeded the effective \(clampedTimeout)-second builder timeout and its process tree was terminated.")
+                envelope["detail"] = .string("The process exceeded the effective \(clampedTimeout)-second builder timeout and its owned process group was terminated.")
             } else if exit.stopped {
                 envelope["reason"] = .string("stopped")
                 envelope["detail"] = .string(exit.launched
-                    ? "Stopped the process tree. Captured output is saved in the audit; any changes already made remain."
+                    ? "Stopped the owned process group. Captured output is saved in the audit; any changes already made remain."
                     : "Stopped before launch. Nothing ran.")
             }
             if !resolvedCompatRewrites.isEmpty {

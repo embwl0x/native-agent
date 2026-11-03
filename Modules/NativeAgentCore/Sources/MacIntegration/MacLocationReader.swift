@@ -15,14 +15,15 @@ import PersistenceCore
 import Photos
 import MacControl
 import UserNotifications
-// Blueprint: | `MacLocationReader.swift` | One retained CoreLocation manager, cached authorization and bounded fresh-fix requests |
+// Blueprint: | `MacLocationReader.swift` | One retained CoreLocation manager, cached authorization and bounded shared fresh-fix requests; caller-owned cancellation-aware waits retire only their own registration |
 
 /// One retained manager answers with its held fix and age; only reads with no fix wait for the bounded fresh request.
 @MainActor
 public final class MacLocationReader: NSObject, @preconcurrency CLLocationManagerDelegate {
     private static let shared = MacLocationReader()
     private let manager = CLLocationManager()
-    private var waiters: [CheckedContinuation<JSONValue, Never>] = []
+    private var waiters: [UUID: ScopedWaiter] = [:]
+    private var results: [UUID: JSONValue] = [:]
     private var deadline: Task<Void, Never>?
     /// The retained manager's authorization is protected by statusLock.
     nonisolated private static let statusLock = NSLock()
@@ -50,7 +51,7 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
         }
     }
 
-    public static func read() async -> JSONValue { await shared.read() }
+    public static func read() async throws -> JSONValue { try await shared.read() }
 
     /// The newest fix CoreLocation gave this Mac.
     private var held: CLLocation? {
@@ -58,16 +59,25 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
         return fix
     }
 
-    private func read() async -> JSONValue {
+    private func read() async throws -> JSONValue {
+        guard !Task.isCancelled, !TaskWaitDeadline.expired else { throw TaskWaitDeadline.cancellationError }
         if let held {
             if -held.timestamp.timeIntervalSinceNow >= Self.freshness, deadline == nil { request() }
             return Self.fix(held)
         }
-        guard !Task.isCancelled else { return Self.failure("cancelled", "The location read was cancelled.") }
-        return await withCheckedContinuation { continuation in
-            waiters.append(continuation)
-            if waiters.count == 1 { request() }
+        let id = UUID(), done = ScopedWaiter()
+        waiters[id] = done
+        defer {
+            waiters.removeValue(forKey: id)
+            results.removeValue(forKey: id)
         }
+        if deadline == nil { request() }
+        await done.park()
+        guard !Task.isCancelled, !TaskWaitDeadline.expired else { throw TaskWaitDeadline.cancellationError }
+        guard let result = results[id] else {
+            return Self.failure("location_unavailable", "The location wait ended without a result from its owner.")
+        }
+        return result
     }
 
     /// Not yet asked: macOS's own prompt asks, and its answer fetches the first fix.
@@ -122,7 +132,10 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
         deadline = nil
         let result = held.map(Self.fix) ?? none
         let waiting = waiters
-        waiters = []
-        for continuation in waiting { continuation.resume(returning: result) }
+        waiters = [:]
+        for (id, done) in waiting {
+            results[id] = result
+            done.resume()
+        }
     }
 }

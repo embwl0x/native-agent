@@ -158,8 +158,8 @@ struct InboxItemDetailSheet: View {
             case .succeeded:
                 // Dismiss only after the action's durable write succeeds.
                 if closesOnSuccess { onClose() }
-            case .failed:
-                actionError = InboxActionWords.failure(actionID)
+            case .failed(let detail):
+                actionError = detail
             case .dropped:
                 break
             }
@@ -168,24 +168,12 @@ struct InboxItemDetailSheet: View {
 
 }
 
-/// Action labels and useful failure wording keep the writer's error text in the log.
+/// Action labels and useful failure wording.
 enum InboxActionWords {
     static func isPrimary(_ actionID: String) -> Bool {
         actionID == "act" || actionID == "approve" || actionID == "open_approvals" || actionID == "repair"
     }
 
-    static func failure(_ actionID: String) -> String {
-        let what: String
-        switch actionID {
-        case "read": what = "mark this note read"
-        case "archive": what = "archive this note"
-        case "dismiss": what = "dismiss this note"
-        case "approve": what = "approve this"
-        case "reject", "deny": what = "decline this"
-        default: what = "do that"
-        }
-        return "Couldn't \(what). Try again in a moment."
-    }
 }
 
 /// One action flight prevents double submission and distinguishes failed writes from success.
@@ -194,7 +182,7 @@ final class InboxRowActionFlight {
     enum Outcome: Equatable {
         case dropped
         case succeeded
-        case failed
+        case failed(String)
     }
 
     private(set) var isInFlight = false
@@ -208,9 +196,9 @@ final class InboxRowActionFlight {
             try await operation()
             return .succeeded
         } catch {
-            // The writer's text goes to the log; the page says what to do.
-            ModuleLog.app("%@", "[inbox] action failed: \(error.localizedDescription)")
-            return .failed
+            let detail = String(TurnSecretRedactor.redactText(error.localizedDescription).prefix(1_000))
+            ModuleLog.app("%@", "[inbox] action failed: \(detail)")
+            return .failed(detail)
         }
     }
 }

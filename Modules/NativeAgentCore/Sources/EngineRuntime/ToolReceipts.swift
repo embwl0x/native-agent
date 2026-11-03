@@ -106,7 +106,7 @@ public enum ChatShellToolSummary {
                 .trimmingCharacters(in: .whitespacesAndNewlines),
               !title.isEmpty, !content.isEmpty
         else { return nil }
-        // Match the first conversation's own write on its exact exempted title.
+        // Match the first conversation's own write on its exact progression title.
         guard title == requiredTitle else { return nil }
         // Quote the written content's first line verbatim.
         let line = content.split(separator: "\n", omittingEmptySubsequences: true)

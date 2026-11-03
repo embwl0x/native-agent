@@ -134,7 +134,7 @@ extension ContextSQLiteStore {
             let keptRows = kept.isEmpty ? "SELECT NULL WHERE 0" : "VALUES " + kept.map { _ in "(?)" }.joined(separator: ",")
             let arguments = StatementArguments(kept)
             let deletedVersions = try [
-                "context_atom_versions", "context_source_versions", "context_relationship_versions"
+                "context_atom_versions", "context_source_versions"
             ].map { table in
                 try db.execute(
                     sql: """
@@ -173,8 +173,7 @@ extension ContextSQLiteStore {
             return ContextStorePruneResult(
                 deletedGenerations: deletedGenerations,
                 deletedAtomVersions: deletedVersions[0],
-                deletedSourceVersions: deletedVersions[1],
-                deletedRelationshipVersions: deletedVersions[2]
+                deletedSourceVersions: deletedVersions[1]
             )
         }
     }

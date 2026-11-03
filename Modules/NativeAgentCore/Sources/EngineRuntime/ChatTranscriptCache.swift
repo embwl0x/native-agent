@@ -71,7 +71,7 @@ import AppKit
 import Dispatcher
 import SystemOps
 import CoreGraphics
-// Blueprint: | `ChatTranscriptCache.swift` | `ChatTranscriptCache`: file-identity disk revisions feed transcript messages, recollections, context statistics and search; bounded shell opening/last-turn scans share the cache owner |
+// Blueprint: | `ChatTranscriptCache.swift` | `ChatTranscriptCache`: file-identity disk revisions feed transcript messages, recollections and search; bounded shell opening/last-turn scans share the cache owner; context sizing belongs to SessionContextMeasurement |
 
 /// One decoded disk revision feeds messages, recollections, raw context counts
 /// and search; optimistic rows and rendering stay outside this cache.
@@ -98,9 +98,9 @@ public actor ChatTranscriptCache {
             if let hit = cached[session.id], hit.revision == revision {
                 projections[session.id] = hit
             } else {
-                var projection = ChatShellOpeningLine.read(sessionID: session.id, dataRoot: dataRoot)
+                var projection = try ChatShellOpeningLine.read(sessionID: session.id, dataRoot: dataRoot)
                 projection.revision = revision
-                projection.lastTurn = ChatShellOpeningLine.readLastTurn(sessionID: session.id, dataRoot: dataRoot)
+                projection.lastTurn = try ChatShellOpeningLine.readLastTurn(sessionID: session.id, dataRoot: dataRoot)
                 projections[session.id] = projection
             }
         }
@@ -127,10 +127,6 @@ public actor ChatTranscriptCache {
             store(Entry(identity: before, history: history), for: key)
         }
         return history
-    }
-
-    func contextStatistics(at path: URL) async -> (totalChars: Int, messageCount: Int) {
-        (try? await history(at: path).contextStatistics) ?? (0, 0)
     }
 
     private func store(_ entry: Entry, for key: String) {

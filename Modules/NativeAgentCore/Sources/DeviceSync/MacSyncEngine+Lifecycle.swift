@@ -49,6 +49,7 @@ extension MacSyncEngine {
     /// the phone, and unchanged files would otherwise never go out again.
     func republishPhonePages() async {
         guard isActive, let snapshotDir else { return }
+        sync.bridge.invalidateMobileSnapshotPublication()
         let generation = snapshotLifecycleGeneration
         sync.bridge.notePublication(await sync.bridge.publishMobileSnapshotStatus(
             groups: Set(NAMobileSnapshotGroup.allCases),
@@ -80,14 +81,20 @@ extension MacSyncEngine {
         activeDocsURL = docsURL
         inboxDir = driveDocsURL?.appendingPathComponent(Folder.inbox)
         // Replay state must be restored before either inbox admits work.
-        guard await restoreState(generation: generation) else { return nil }
+        guard await restoreState(generation: generation) else {
+            return generation == snapshotLifecycleGeneration && !Task.isCancelled ? syncError : nil
+        }
         snapshotDir = docsURL.appendingPathComponent(Folder.snapshots, isDirectory: true)
         if driveDocsURL != nil {
             let secret: Data
             do {
                 if pairingSecretRotationInProgress { _ = try pairingSecret() }
                 let cached = _pairingSecret
-                let loaded = try await sync.storage.perform { try cached ?? PairingSecret.loadOrGenerateSecret() }
+                let publicationOwed = sync.bridge.pairingPublicationOwed
+                let loaded = try await sync.storage.perform {
+                    if let cached { return cached }
+                    return try publicationOwed ? PairingSecret.requireExistingSecret() : PairingSecret.loadOrGenerateSecret()
+                }
                 guard generation == snapshotLifecycleGeneration else { return nil }
                 if pairingSecretRotationInProgress { _ = try pairingSecret() }
                 secret = _pairingSecret ?? loaded
@@ -134,10 +141,8 @@ extension MacSyncEngine {
             reconcileArchiveRetention(pruneFirst: true)
         }
 
-        // Normal writes are mutation-driven. Retain one deliberately slow
-        // integrity path for an out-of-process change or crash-window event the
-        // app could not observe; unchanged passes write nothing and call no LLM.
-        await startSnapshotIntegrityFallback()
+        // Exact file observation owns reconciliation, armed before first read.
+        await startSnapshotIntegrityObservation()
         guard generation == snapshotLifecycleGeneration, isActive else { return nil }
         startPresenceBeat()
         startCognitionSnapshotObservation()
@@ -201,8 +206,6 @@ extension MacSyncEngine {
         // The snapshot writer keeps admission until its physical write ends.
         workActivities.removeAll()
         activeDocsURL = nil
-        snapshotIntegrityTask?.cancel()
-        snapshotIntegrityTask = nil
         snapshotIntegrityWatcher?.cancel()
         snapshotIntegrityWatcher = nil
         snapshotIntegrityReconcileTask?.cancel()
@@ -253,18 +256,14 @@ extension MacSyncEngine {
         NotificationCenter.default.removeObserver(self)
     }
 
-    private static let snapshotIntegrityCadence: TimeInterval = 15 * 60
-
-    private func startSnapshotIntegrityFallback() async {
-        snapshotIntegrityTask?.cancel()
+    private func startSnapshotIntegrityObservation() async {
         snapshotIntegrityWatcher?.cancel()
         guard let snapshotDir else { return }
         let generation = snapshotLifecycleGeneration
         let paths = NAMobileSnapshotGroup.allCases.flatMap(\.filenames).map {
             snapshotDir.appendingPathComponent($0)
         } + [ICloudSyncStatePaths.snapshotSkips(dataRoot: PersistenceCore.defaultDataRoot())]
-        // Arm before the launch reconciliation. Exact file events own normal
-        // integrity work; the slow clock remains a missed-event backstop.
+        // Arm before the launch reconciliation, including failed publication state.
         let watcher = await FileChangeWatcher.armed(paths: paths) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
@@ -273,14 +272,7 @@ extension MacSyncEngine {
         }
         guard isActive, generation == snapshotLifecycleGeneration else { watcher.cancel(); return }
         snapshotIntegrityWatcher = watcher
-        OrganPulse.recordStarting("snapshot_integrity", cadence: Self.snapshotIntegrityCadence)
-        snapshotIntegrityTask = Task { [weak self] in
-            while let self, !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(Self.snapshotIntegrityCadence))
-                guard !Task.isCancelled, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
-                self.requestSnapshotIntegrityPass(retrySkipped: true)
-            }
-        }
+        OrganPulse.record("snapshot_integrity", .skipped, note: "observing snapshot files")
     }
 
     /// One coalesced reconciliation, including its writes. The snapshot writer
@@ -380,12 +372,12 @@ extension MacSyncEngine {
         let lifecycleGeneration = snapshotLifecycleGeneration
         let digests = snapshotFileDigests
         let dataRoot = PersistenceCore.defaultDataRoot()
-        let (report, skippedGroups) = await VolumeIO.run {
+        let result = await VolumeIO.result {
             let report = MacSyncSnapshotIntegrity.reconcile(digests: digests, in: snapshotDir)
             let skipsURL = ICloudSyncStatePaths.snapshotSkips(dataRoot: dataRoot)
             let skippedGroups: [String: String]?
             if FileManager.default.fileExists(atPath: skipsURL.path) {
-                if let data = try? Data(contentsOf: skipsURL),
+                if let data = try? VolumeIO.contents(of: skipsURL),
                    let skips = try? JSONDecoder().decode([String: String].self, from: data) {
                     let groups = skips.filter { !$0.key.hasPrefix("_") }
                     skippedGroups = groups.isEmpty ? nil : groups
@@ -396,6 +388,14 @@ extension MacSyncEngine {
                 skippedGroups = nil
             }
             return (report, skippedGroups)
+        }
+        let report: MacSyncSnapshotIntegrity.Report
+        let skippedGroups: [String: String]?
+        switch result {
+        case .success(let value): (report, skippedGroups) = value
+        case .failure(let error):
+            syncError = "Snapshot integrity read did not finish: \(error.localizedDescription)"
+            return
         }
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive, !Task.isCancelled else { return }
         guard !snapshotWriteInFlight, digests == snapshotFileDigests else {
@@ -413,7 +413,7 @@ extension MacSyncEngine {
         }
         let found = report.integrityFailures + (hasSkippedGroups ? ["skipped groups to republish"] : [])
         OrganPulse.record("snapshot_integrity", found: found.count, note: found.joined(separator: "; "),
-                          cadence: Self.snapshotIntegrityCadence)
+                          cadence: nil)
         if report.requiresRepair {
             syncError = "iPhone snapshot integrity check found \(report.integrityFailures.joined(separator: "; ")). Rebuilding the affected mobile snapshot groups."
             // A mismatch can belong to a heavyweight group (catalog, graph,

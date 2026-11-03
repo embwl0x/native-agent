@@ -38,8 +38,8 @@ extension SwiftNativeChatOrchestrationClient {
         _ key: String,
         default fallback: Bool,
         dataRoot: URL
-    ) -> Bool {
-        SavedTrustPolicyAuthority.flag(
+    ) throws -> Bool {
+        try SavedTrustPolicyAuthority.flag(
             block: "multimodalPolicy",
             key: key,
             default: fallback,
@@ -92,7 +92,7 @@ extension SwiftNativeChatOrchestrationClient {
         // the model is told so in the same shape LLMClient+Real uses when a
         // non-vision adapter drops them: honest, and explicitly not licence to
         // describe what it did not see.
-        let visionAllowed = multimodalPolicyAllows("vision_api_calls", default: true, dataRoot: dataRoot)
+        let visionAllowed = try multimodalPolicyAllows("vision_api_calls", default: true, dataRoot: dataRoot)
         let imageBlocks = visionAllowed ? imageBlocksFromAttachments(attachments) : []
         if !visionAllowed {
             let skipped = imageBlocksFromAttachments(attachments).count
@@ -107,7 +107,7 @@ extension SwiftNativeChatOrchestrationClient {
         }
 
         // Plain text requires no Trust switch and shares one ingestion pass and per-turn budget with PDFs.
-        notes.append(contentsOf: documentAttachmentNotes(
+        notes.append(contentsOf: try documentAttachmentNotes(
             attachments, dataRoot: dataRoot, query: queryMessage))
 
         guard !notes.isEmpty else {
@@ -124,15 +124,16 @@ extension SwiftNativeChatOrchestrationClient {
 
     /// Read documents in attachment order with the read organ's extractors; only PDFs require the ingestion switch.
     /// Each document respects its cap and the remaining turn budget; skipped, cut and unreadable inputs are named to the model.
-    /// The user query selects overlong passages only; fitting documents stay whole, and an empty query selects the prefix.
+    /// The query selects overlong passages only; fitting documents stay whole.
+    /// An unusable query or passage budget stays explicitly unavailable.
     nonisolated static func documentAttachmentNotes(
         _ attachments: [MultimodalAttachment],
         dataRoot: URL,
         query: String = ""
-    ) -> [String] {
+    ) throws -> [String] {
         let pdfCount = attachments.filter { isPDFAttachment($0) }.count
         var notes: [String] = []
-        let pdfAllowed = pdfCount == 0
+        let pdfAllowed = try pdfCount == 0
             || multimodalPolicyAllows("file_ingestion_pdf", default: true, dataRoot: dataRoot)
         if pdfCount > 0, !pdfAllowed {
             notes.append(
@@ -181,20 +182,16 @@ extension SwiftNativeChatOrchestrationClient {
                 let fullCount = text.count
                 var selected = false
                 if text.count > allowance {
-                    // Third pass, item 4: an over-long document used to hand
-                    // over its first N characters — for three contracts, three
-                    // introductions and none of the clauses asked about. Take
-                    // the passages that answer THIS turn instead, each marked
-                    // with its line range so the rest can be asked for by
-                    // location. No query (or nothing matched) keeps the old
-                    // prefix exactly.
-                    if let excerpt = DocumentExcerpt.selected(
-                        text: text, query: query, allowance: allowance
-                    ) {
+                    switch DocumentExcerpt.selected(text: text, query: query, allowance: allowance) {
+                    case .passages(let excerpt):
                         text = excerpt
                         selected = true
-                    } else {
-                        text = String(text.prefix(allowance))
+                    case .noMatch:
+                        notes.append("[The attached \(label) \"\(name)\" exceeds this turn's allowance. No passages matched the request in the extracted text. No document text was supplied. Ask for a specific section or a location to read; do not infer its contents.]")
+                        continue
+                    case .unavailable(let reason):
+                        notes.append("[Passage selection for the attached \(label) \"\(name)\" is unavailable: \(reason) No document text was supplied. Ask for a specific section or a location to read; do not infer its contents.]")
+                        continue
                     }
                     cut = true
                 }
@@ -231,9 +228,8 @@ extension SwiftNativeChatOrchestrationClient {
         return mime == "application/pdf" || name.hasSuffix(".pdf")
     }
 
-    /// UTF-8, or UTF-16 announced by a BOM. Deliberately narrower than
-    /// `MacDocumentRead.decodeText`, whose ISO-8859-1 fallback never fails and
-    /// so cannot tell a text file from a renamed binary.
+    /// UTF-8, or UTF-16 announced by a BOM. This admission probe precedes
+    /// document extraction, whose decoder also rejects decoded NUL characters.
     nonisolated static func attachmentBytesAreText(_ data: Data) -> Bool {
         if String(data: data, encoding: .utf8) != nil { return true }
         let bom = [UInt8](data.prefix(2))
@@ -259,7 +255,7 @@ extension SwiftNativeChatOrchestrationClient {
     nonisolated static func textSkipReason(_ failure: MacDocumentRead.ExtractionFailure) -> String {
         switch failure {
         case .fileTooLarge: return "it is too large to read in one go"
-        case .unreadableDocument: return "its bytes are not readable text"
+        case .unreadableDocument, .unreadableTextEncoding: return "its bytes are not readable text"
         case .noTextInDocument: return "it is empty"
         default: return "its text could not be extracted"
         }

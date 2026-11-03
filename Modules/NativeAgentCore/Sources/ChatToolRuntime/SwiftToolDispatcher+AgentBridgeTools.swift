@@ -17,32 +17,31 @@ import ToolRegistry
 // Blueprint: | `SwiftToolDispatcher+AgentBridgeTools.swift` | `SwiftToolDispatcher`: driven-agent launch admission, executable rebinding, cwd authority and wake-helper execution |
 
 /// SecurityCenter's launch decision for the real origin and re-verified approved program.
-struct DrivenAgentLaunch: Sendable {
-    var permission: DrivenAgentLaunchPermission
-    /// The verified file to run; absent only when the launch is refused.
-    var executable: String? = nil
-    var arguments: [String] = []
-    /// Why the requested launch cannot proceed.
-    var note: String? = nil
-    var remedy: JSONValue? = nil
+enum DrivenAgentLaunch: Sendable {
+    struct Program: Sendable {
+        let permission: DrivenAgentLaunchPermission
+        let executable: String
+        let arguments: [String]
+        var receipt: JSONValue {
+            .object(["permission": .string(permission == .fullMac ? "full_mac" : "restricted")])
+        }
+    }
+    case admitted(Program)
+    case refused(JSONValue)
 
-    /// The answer for a launch that must not happen at all.
-    var deniedResult: JSONValue? {
-        let reason: String
-        if let note { reason = note }
-        else if case .denied(let denied) = permission { reason = denied }
-        else { return nil }
+    static func refusal(_ reason: String, remedy: JSONValue? = nil) -> Self {
         var result: [String: JSONValue] = ["status": .string("failed"), "reason": .string("launch_blocked"),
             "sent": .bool(false), "ran": .bool(false), "completed": .bool(false),
             "detail": .string("Nothing was launched: \(reason).")]
         if let remedy { result["remedy"] = remedy }
-        return .object(result)
+        return .refused(.object(result))
     }
 
     var receipt: JSONValue {
-        var value: [String: JSONValue] = ["permission": .string(permission == .fullMac ? "full_mac" : "restricted")]
-        if let note { value["note"] = .string(note) }
-        return .object(value)
+        switch self {
+        case .admitted(let program): return program.receipt
+        case .refused(let result): return result
+        }
     }
 }
 
@@ -56,7 +55,7 @@ extension SwiftToolDispatcher {
             verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface)
         let permission = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
             .drivenAgentLaunchPermission(origin: origin)
-        if case .denied = permission { return DrivenAgentLaunch(permission: permission) }
+        if case .denied(let reason) = permission { return .refusal(reason) }
         // Rebinding follows the installation without changing the launch's authority.
         let store = AgentPeerStore(dataRoot: dataRoot)
         var problem = "\(name)'s installed executable could not be bound to its contact"
@@ -70,14 +69,14 @@ extension SwiftToolDispatcher {
                     }
                 }
                 if let path = try store.list().first(where: { $0.id == current.id })?.verifiedExecutablePath {
-                    return DrivenAgentLaunch(permission: permission, executable: path,
-                        arguments: line.permissionFlags.map(permission.arguments) ?? [])
+                    return .admitted(.init(permission: permission, executable: path,
+                        arguments: line.permissionFlags.map(permission.arguments) ?? []))
                 }
             }
         } catch {
             problem = "\(name)'s executable binding could not be reconciled: \(error.localizedDescription)"
         }
-        return DrivenAgentLaunch(permission: permission, note: problem,
+        return .refusal(problem,
             remedy: Repair.remedy(owner: "agents/peers.json peer:" + (contact?.id ?? name),
                 nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("agent.connect"),
                     "args": .object(["name": .string(contact.map { "peer:" + $0.id } ?? name)])])]), tap: nil))
@@ -139,6 +138,7 @@ extension SwiftToolDispatcher {
             options: [.skipsHiddenFiles]
         )) ?? []).filter { file in
             file.pathExtension == "json"
+                && SubprocessWork.retained(at: file.path) == nil
                 && (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
         }.sorted { left, right in
             let leftDate = (try? left.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
@@ -217,44 +217,6 @@ extension SwiftToolDispatcher {
         return true
     }
 
-    /// Request slugs retain confidence order and require checkout-remote validation.
-    static func repositorySlugCandidates(inRequestText text: String) -> [String] {
-        var urlSlugs: [String] = []
-        var bareSlugs: [String] = []
-        // Prefer GitHub URLs; consult bare owner/name tokens only without a URL.
-        for rawToken in text.split(whereSeparator: { $0.isWhitespace }) {
-            var token = String(rawToken).trimmingCharacters(
-                in: CharacterSet(charactersIn: "`\"'<>(),;:[]{}!?*")
-            )
-            if token.isEmpty { continue }
-            // Both the https path form and the SSH form git@github.com:owner/name.
-            let hostRange = token.range(of: "github.com/") ?? token.range(of: "github.com:")
-            if let range = hostRange {
-                var slug = String(token[range.upperBound...])
-                for suffix in [".git", "/pull", "/issues", "/tree", "/blob", "/commit", "/compare"] {
-                    if let cut = slug.range(of: suffix) { slug = String(slug[slug.startIndex..<cut.lowerBound]) }
-                }
-                let parts = slug.split(separator: "/").prefix(2).map(String.init)
-                if parts.count == 2 {
-                    let candidate = "\(parts[0])/\(parts[1])"
-                    if isWellFormedRepositorySlug(candidate), !urlSlugs.contains(candidate) {
-                        urlSlugs.append(candidate)
-                    }
-                }
-                continue
-            }
-            // A bare token must be exactly owner/name, never a path fragment.
-            if token.hasPrefix("/") || token.hasSuffix("/") { continue }
-            if token.hasSuffix(".git") { token = String(token.dropLast(4)) }
-            guard isWellFormedRepositorySlug(token) else { continue }
-            let parts = token.split(separator: "/").map(String.init)
-            guard parts.count == 2, parts[0].count >= 2, parts[1].count >= 2 else { continue }
-            if !bareSlugs.contains(token) { bareSlugs.append(token) }
-        }
-        // Bound directory walks and git invocations to eight candidates.
-        return Array((urlSlugs.isEmpty ? bareSlugs : urlSlugs).prefix(8))
-    }
-
     /// Working-directory admission supplies an optional path or an explicit refusal.
     enum AgentBridgeWorkingDirectoryResolution {
         case success(String?)
@@ -267,8 +229,13 @@ extension SwiftToolDispatcher {
         input: [String: JSONValue],
         surface: String
     ) async -> AgentBridgeWorkingDirectoryResolution {
-        guard case .string(let raw)? = input["working_directory"] else {
+        guard let value = input["working_directory"], value != .null else {
             return .success(nil)
+        }
+        guard case .string(let raw) = value else {
+            return .failure(.object(["status": .string("failed"), "effects": .string("none"),
+                "reason": .string("invalid_working_directory"),
+                "detail": .string("working_directory must be an existing absolute project directory.")]))
         }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         // An empty cwd requests no path; a non-empty invalid path still fails closed.
@@ -280,7 +247,9 @@ extension SwiftToolDispatcher {
             "workingDirectory": .string(directory.path), "detail": .string(directory.detail!),
         ]
         if rejection == "working_directory_outside_workspace_denied" {
-            let access = await fullMacToolAccess(surface: surface)
+            let access: FullMacToolAccess
+            do { access = try await fullMacToolAccess(surface: surface) }
+            catch { return .failure(ChatToolOutcome.failure(error: error)) }
             if access.fullMacActive, access.fileOpsAllowed,
                Self.builderYoloPermissionLevels.contains(access.permissionLevel),
                access.outsideWorkspaceDefault == "allow" { return .success(directory.path) }
@@ -357,9 +326,12 @@ extension SwiftToolDispatcher {
         if cli == "codex" {
             let decision = await Self.drivenAgentLaunch(surface: surface,
                 contact: Self.drivenAgentContact(host: "codex", dataRoot: dataRoot), name: "Codex", dataRoot: dataRoot)
-            if let denied = decision.deniedResult { return denied }
-            launch = decision
-            arguments = ["--sandbox", decision.permission.codexSandbox, "--approval-policy", decision.permission.codexApprovalPolicy]
+            switch decision {
+            case .refused(let refusal): return refusal
+            case .admitted(let program):
+                launch = decision
+                arguments = ["--sandbox", program.permission.codexSandbox, "--approval-policy", program.permission.codexApprovalPolicy]
+            }
         }
         let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot) ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
         return await runAgentWakeupHelper(helper: helper, inputData: inputData, cwd: cwd,
@@ -385,7 +357,7 @@ extension SwiftToolDispatcher {
             return .object(failure)
         }
         environment.merge(launchEnvironment) { _, finished in finished }
-        if let executable = launch?.executable { environment[variable] = executable }
+        if case .admitted(let program)? = launch { environment[variable] = program.executable }
         if environment[variable] == nil {
             environment[variable] = AgentBridgeRuntime.executableURL(named: cli, environment: environment)?.path
         }

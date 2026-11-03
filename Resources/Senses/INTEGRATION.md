@@ -51,9 +51,12 @@ owner; filesystem access is deliberately absent in the kit.
   rows/cells. Nested tables and other legacy code pages fail explicitly.
   RTFD reads TXT.rtf from ZIP material and names attachments without rendering
   their bytes.
-- Figma canvas: named AX nodes/targets only; no pixel interpretation or
-  mutation verbs. Identifiers win over AX paths. Paths are explicitly
-  described as dependent on tree layout. Thin/empty AX is a visible failure.
+- Figma canvas: named AX nodes/targets plus retained on-device window text,
+  labelled with its recognition provenance and position. The helper receives
+  redacted AX and recognized text, never raw pixels; no mutation verbs or
+  visual-layout understanding. Identifiers win over AX paths. Paths are
+  explicitly described as dependent on tree layout. The read fails visibly
+  when neither AX nor recognized text yields readable rows.
 - ZIP64, encryption, unknown compression, oversized entries, invalid
   checksums and ambiguous identities fail explicitly. ZIP member limit:
   8,000; captured source/ZIP input: 16 MiB; decoded member: 32 MiB;

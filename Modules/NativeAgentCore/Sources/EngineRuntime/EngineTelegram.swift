@@ -7,7 +7,7 @@ import TelegramBot
 import AppToolRuntime
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `EngineTelegram.swift` | Telegram facade and tool status envelope; `TelegramFacade` class; `loadStatus`, `load`; status uses TelegramPollLoop's checked state read, reporting unavailable state in lastError; `refresh` alone publishes status through `LatestRead`, including diagnostic-clear readback; credential badges read TelegramPresentationSnapshot.tokenConfigured directly |
+// Blueprint: | `EngineTelegram.swift` | `TelegramFacade.loadStatus` consumes one checked configuration/credential result and checked routing with distinct unavailable causes; `load` adds checked diagnostic feeds; `refresh` alone publishes through `LatestRead`, including diagnostic-clear readback; credential badges read TelegramPresentationSnapshot.tokenConfigured directly |
 
 /// Mounted Telegram management state. The core owns configuration and transport
 /// status; the facade adds bounded diagnostic feeds and the app's routing pick.
@@ -19,8 +19,8 @@ public final class TelegramFacade {
     @ObservationIgnored private let statusRead = LatestRead()
 
     @discardableResult
-    public func refresh(manager: BackgroundLoopLifetimes = .shared, credentialUnavailable: Bool = false) async throws -> TelegramPresentationSnapshot {
-        try await statusRead.read({ try await load(manager: manager, credentialUnavailable: credentialUnavailable) }, publish: { status = $0 })
+    public func refresh(manager: BackgroundLoopLifetimes = .shared) async throws -> TelegramPresentationSnapshot {
+        try await statusRead.read({ try await load(manager: manager) }, publish: { status = $0 })
     }
 
     public nonisolated init(dataRoot: URL) { self.dataRoot = dataRoot }
@@ -30,9 +30,9 @@ public final class TelegramFacade {
         return status.toolStatusEnvelope(now: Date())
     }
 
-    public nonisolated func load(manager: BackgroundLoopLifetimes = .shared, credentialUnavailable: Bool = false,
+    public nonisolated func load(manager: BackgroundLoopLifetimes = .shared,
                                  routingSnapshot: ProviderRoutingSnapshot? = nil) async throws -> TelegramPresentationSnapshot {
-        var snapshot = try await loadStatus(manager: manager, credentialUnavailable: credentialUnavailable,
+        var snapshot = try await loadStatus(manager: manager,
                                             routingSnapshot: routingSnapshot)
         let telegramDir = dataRoot.appendingPathComponent("telegram", isDirectory: true)
         let receiptsRead: TelegramDiagnosticFeedRead<TelegramReceipt> = await telegramDiagnosticFeed(
@@ -56,32 +56,47 @@ public final class TelegramFacade {
         return snapshot
     }
 
-    public nonisolated func loadStatus(manager: BackgroundLoopLifetimes = .shared, credentialUnavailable: Bool = false,
+    public nonisolated func loadStatus(manager: BackgroundLoopLifetimes = .shared,
                                        routingSnapshot: ProviderRoutingSnapshot? = nil) async throws -> TelegramPresentationSnapshot {
         let read = await SwiftNativeTelegramBot.readTransportStatus(
-            dataRoot: dataRoot, manager: manager, resolveCredential: !credentialUnavailable)
+            dataRoot: dataRoot, manager: manager)
         let cfg = try read.configuration.get()
         let telegramBrain: SurfacePreference?
-        if let routingSnapshot {
-            telegramBrain = routingSnapshot.preferences["telegram"]
-        } else {
-            telegramBrain = try? await SwiftNativeProviderRouting(dataRoot: dataRoot)
-                .computeModelPreferences()["telegram"]
+        var routingIssue: String?
+        do {
+            let routing: ProviderRoutingSnapshot
+            if let routingSnapshot {
+                routing = routingSnapshot
+            } else {
+                routing = try await SwiftNativeProviderRouting(dataRoot: dataRoot)
+                    .checkedRoutingSnapshot()
+            }
+            // Ask the owner to validate the saved route, including a named
+            // group failure when Telegram inherits an unusable Chat pick.
+            _ = try routing.routeAdmission(for: "telegram", choice: nil, inheritChat: false)
+            telegramBrain = routing.preferences["telegram"]
+        } catch LLMError.providerError(let issue) {
+            telegramBrain = nil
+            routingIssue = issue
+        } catch {
+            telegramBrain = nil
+            routingIssue = error.localizedDescription
         }
-        var transport = read.status
-        if credentialUnavailable { transport.lastError = DeviceSecretKeychain.Failure.unavailable.localizedDescription }
-        return TelegramPresentationSnapshot(
-            transport: transport,
+        var snapshot = TelegramPresentationSnapshot(
+            transport: read.status,
             configuration: TelegramConfigurationSummary(
                 config: cfg, model: telegramBrain?.model,
                 reasoningEffort: telegramBrain?.reasoningEffort
             ),
             pollBackoffFailures: read.pollBackoffFailures,
-            lastPollAt: transport.extras?.stringFields["lastPollAt"],
+            lastPollAt: read.status.extras?.stringFields["lastPollAt"],
             lastDiagnosticsClearedAt: read.lastDiagnosticsClearedAt,
             voiceTranscription: read.voiceTranscription,
             receipts: [], blocked: [], errors: []
         )
+        snapshot.credentialIssue = read.credentialError?.localizedDescription
+        snapshot.routingIssue = routingIssue
+        return snapshot
     }
 
     nonisolated private func telegramDiagnosticFeed<Row: Decodable>(

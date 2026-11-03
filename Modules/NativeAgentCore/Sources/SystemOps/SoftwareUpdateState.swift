@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `SoftwareUpdateState.swift` | `SoftwareUpdateState` |
+// Blueprint: | `SoftwareUpdateState.swift` | checked update-notice persistence: absent, available, stale or byte-preserved unreadable evidence |
 
 /// Persisted updater evidence; the host supplies Sparkle's version comparison.
 @MainActor
@@ -39,7 +39,14 @@ public enum SoftwareUpdateState {
 
     public static let persistedNoticeKey = "NativeAgent.updateNotice.v1"
 
-    /// Pure configuration boundary used by the app and release-contract tests.
+    public enum NoticeState: Equatable {
+        case absent
+        case available(String)
+        case stale
+        case unreadable(String)
+    }
+
+    /// Configuration boundary used by the app.
     /// `nil` means Sparkle has a complete, published, non-placeholder feed.
     public static func resolveUnavailability(info: [String: Any]) -> Unavailability? {
         let feedURL = (info["SUFeedURL"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -68,42 +75,26 @@ public enum SoftwareUpdateState {
         return nil
     }
 
-    /// Pure persistence boundary used by launch and tests. A notice survives
+    /// Persistence boundary used by launch. A notice survives
     /// only for the exact published HTTPS feed/key and only while the offered
     /// version is newer than the currently installed build.
     private static func persistedNoticeData(
         availableVersion: String,
         info: [String: Any],
         isNewer: @MainActor (String, String) -> Bool
-    ) -> Data? {
+    ) throws -> Data? {
         let offered = availableVersion.trimmingCharacters(in: .whitespacesAndNewlines)
         guard resolveUnavailability(info: info) == nil,
               let context = updateContext(info: info),
               !offered.isEmpty,
               isNewer(offered, context.installedVersion)
         else { return nil }
-        return try? JSONEncoder().encode(PersistedNotice(
+        return try JSONEncoder().encode(PersistedNotice(
             schemaVersion: PersistedNotice.schemaVersion,
             availableVersion: offered,
             feedURL: context.feedURL,
             publicKey: context.publicKey
         ))
-    }
-
-    private static func restoredNoticeVersion(
-        data: Data,
-        info: [String: Any],
-        isNewer: @MainActor (String, String) -> Bool
-    ) -> String? {
-        guard resolveUnavailability(info: info) == nil,
-              let context = updateContext(info: info),
-              let notice = try? JSONDecoder().decode(PersistedNotice.self, from: data),
-              notice.schemaVersion == PersistedNotice.schemaVersion,
-              notice.feedURL == context.feedURL,
-              notice.publicKey == context.publicKey,
-              isNewer(notice.availableVersion, context.installedVersion)
-        else { return nil }
-        return notice.availableVersion
     }
 
     private static func updateContext(
@@ -122,28 +113,52 @@ public enum SoftwareUpdateState {
     public static func restoreNotice(
         info: [String: Any], preferences: UserDefaults,
         isNewer: @MainActor (String, String) -> Bool
-    ) -> String? {
-        guard let data = preferences.data(forKey: persistedNoticeKey),
-              let version = restoredNoticeVersion(data: data, info: info, isNewer: isNewer) else {
-            // Corrupt, stale, installed, or feed-mismatched display state has
-            // no authority and must not linger indefinitely.
-            preferences.removeObject(forKey: persistedNoticeKey)
-            return nil
+    ) -> NoticeState {
+        guard let value = preferences.object(forKey: persistedNoticeKey) else { return .absent }
+        guard let data = value as? Data else {
+            return .unreadable("Saved update notice has the wrong preference type; preserved unchanged. Run Check for Updates to obtain fresh evidence.")
         }
-        return version
+        let notice: PersistedNotice
+        do { notice = try JSONDecoder().decode(PersistedNotice.self, from: data) }
+        catch {
+            return .unreadable("Saved update notice could not be read: \(error.localizedDescription) Preserved unchanged. Run Check for Updates to obtain fresh evidence.")
+        }
+        guard notice.schemaVersion == PersistedNotice.schemaVersion,
+              !notice.availableVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let url = URL(string: notice.feedURL), url.scheme?.lowercased() == "https",
+              let host = url.host, !host.isEmpty,
+              let key = Data(base64Encoded: notice.publicKey), key.count == 32 else {
+            return .unreadable("Saved update notice has an unsupported or incomplete shape; preserved unchanged. Run Check for Updates to obtain fresh evidence.")
+        }
+        guard resolveUnavailability(info: info) == nil,
+              let context = updateContext(info: info),
+              notice.feedURL == context.feedURL,
+              notice.publicKey == context.publicKey,
+              isNewer(notice.availableVersion, context.installedVersion) else {
+            preferences.removeObject(forKey: persistedNoticeKey)
+            return .stale
+        }
+        return .available(notice.availableVersion)
     }
 
     public static func storeNotice(
         _ version: String?, info: [String: Any], preferences: UserDefaults,
         isNewer: @MainActor (String, String) -> Bool
-    ) -> String? {
-        guard let version,
-              let data = persistedNoticeData(availableVersion: version, info: info, isNewer: isNewer) else {
+    ) -> NoticeState {
+        guard let version else {
             preferences.removeObject(forKey: persistedNoticeKey)
-            return nil
+            return .absent
         }
-        preferences.set(data, forKey: persistedNoticeKey)
-        return version
+        do {
+            guard let data = try persistedNoticeData(availableVersion: version, info: info, isNewer: isNewer) else {
+                preferences.removeObject(forKey: persistedNoticeKey)
+                return .stale
+            }
+            preferences.set(data, forKey: persistedNoticeKey)
+            return .available(version)
+        } catch {
+            return .unreadable("Update notice could not be encoded: \(error.localizedDescription) Previous evidence preserved.")
+        }
     }
 
     /// Hosts that only ever appear in placeholder/dry-run configuration. A build

@@ -90,17 +90,21 @@ extension SwiftNativeMacControl {
                 now: now()
             )
             if Task.isCancelled {
+                let actual = await attentionStore.status(now: now())
                 return result(
                     ok: false,
-                    output: ["active": .bool(true), "status": .string("cancelled")],
+                    output: ["active": .bool(actual != nil), "status": .string("cancelled"),
+                             "attention": actual?.toJSON() ?? .null],
                     error: "attention_wait_cancelled",
                     status: 499
                 )
             }
             guard let pending else {
+                let actual = await attentionStore.status(now: now())
                 return result(
                     ok: false,
-                    output: ["active": .bool(false), "status": .string("not_active")],
+                    output: ["active": .bool(actual != nil), "status": .string(actual == nil ? "not_active" : "session_replaced"),
+                             "attention": actual?.toJSON() ?? .null],
                     error: "attention_session_not_active",
                     status: 409
                 )
@@ -127,11 +131,12 @@ extension SwiftNativeMacControl {
                 "attention": current.toJSON(),
             ])
         case "stop":
-            let wasActive = await attentionStore.stopAttentionSession()
-            await screenViewStore.invalidate()
+            let wasActive = await attentionStore.stopAttentionSession(sessionId: body["session"]?.stringValue)
+            let current = await attentionStore.status(now: now())
             return result(ok: true, output: [
-                "active": .bool(false),
-                "status": .string(wasActive ? "stopped" : "already_idle"),
+                "active": .bool(current != nil),
+                "status": .string(wasActive ? "stopped" : current == nil ? "already_idle" : "session_replaced"),
+                "attention": current?.toJSON() ?? .null,
             ])
         default:
             return result(
@@ -151,22 +156,36 @@ extension SwiftNativeMacControl {
         let view = await handleView(body)
         guard case .object(var output) = view.output,
               case .string(let viewId)? = output["view"] else {
+            var failure = view.output.objectValue ?? [:]
+            failure["requested_session"] = .string(pending.sessionId)
             return MacControlResult(
                 ok: false,
                 action: "attention",
-                output: view.output,
+                output: .object(failure),
                 error: view.error ?? "attention_view_unavailable",
                 durationMs: Int(now().timeIntervalSince(started) * 1000),
                 httpStatus: view.httpStatus
             )
         }
-        let current = await attentionStore.observed(
+        output["requested_session"] = .string(pending.sessionId)
+        guard let current = await attentionStore.observed(
             sessionId: pending.sessionId,
             viewId: viewId,
             sequence: pending.sequence,
             userSequence: pending.userSequence,
             now: now()
-        ) ?? pending
+        ) else {
+            // Capture may outlive Stop, expiry, or replacement. The store owns
+            // continuity; this old capture cannot reactivate it or its marks.
+            await screenViewStore.invalidate()
+            let actual = await attentionStore.status(now: now())
+            output["active"] = .bool(actual != nil)
+            output["status"] = .string(actual == nil ? "not_active" : "session_replaced")
+            output["attention"] = actual?.toJSON() ?? .null
+            output["how_to_continue"] = .string("This observation's attention session ended or was replaced. Read the current attention status before acting.")
+            return MacControlResult(ok: false, action: "attention", output: .object(output),
+                error: "attention_session_not_active", durationMs: Int(now().timeIntervalSince(started) * 1000), httpStatus: 409)
+        }
         if current.refreshRequired {
             // Input raced the capture. Never leave its marks usable while the
             // result truthfully says the agent must yield and look again.
@@ -177,6 +196,7 @@ extension SwiftNativeMacControl {
                 : (current.refreshRequired ? "refresh_required" : status)
         )
         output["attention"] = current.toJSON()
+        output["active"] = .bool(true)
         output["how_to_continue"] = .string(
             "While this attention session is active, pass attention_session and "
             + "attention_user_sequence from this result to every Mac action. If yield_required "

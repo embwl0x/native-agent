@@ -124,30 +124,39 @@ struct ResearchView: View {
                     title: "Search failed",
                     detail: message
                 )
-            case .loaded(let results) where results.isEmpty:
+            case .loaded(let response) where response.results.isEmpty && response.gaps.isEmpty && response.unresponsiveEngines.isEmpty:
                 NativeEmptyState(
                     title: "No results",
                     detail: "No matches found for \"\(submittedQuery)\"."
                 )
-            case .loaded(let results):
-                List(results) { result in
-                    VStack(alignment: .leading, spacing: 4) {
-                        if let url = URL(string: result.url),
-                           let scheme = url.scheme?.lowercased(),
-                           ["https", "http"].contains(scheme),
-                           url.host != nil {
-                            Link(result.title, destination: url)
-                                .font(.headline)
-                                .help(result.url)
-                        } else {
-                            Text(result.title).font(.headline)
+            case .loaded(let response):
+                List {
+                    if !response.gaps.isEmpty || !response.unresponsiveEngines.isEmpty {
+                        Section("Search gaps — repair the reported SearXNG reads") {
+                            ForEach(response.gaps + response.unresponsiveEngines, id: \.self) { gap in
+                                Text(gap).textSelection(.enabled)
+                            }
                         }
-                        Text(result.url).font(.caption).foregroundStyle(.secondary)
-                        Text(result.snippet).lineLimit(3)
-                            .help(result.snippet)
                     }
-                    .textSelection(.enabled)
-                    .padding(.vertical, 4)
+                    ForEach(response.results) { result in
+                        VStack(alignment: .leading, spacing: 4) {
+                            if let url = URL(string: result.url),
+                               let scheme = url.scheme?.lowercased(),
+                               ["https", "http"].contains(scheme),
+                               url.host != nil {
+                                Link(result.title, destination: url)
+                                    .font(.headline)
+                                    .help(result.url)
+                            } else {
+                                Text(result.title).font(.headline)
+                            }
+                            Text(result.url).font(.caption).foregroundStyle(.secondary)
+                            Text(result.snippet).lineLimit(3)
+                                .help(result.snippet)
+                        }
+                        .textSelection(.enabled)
+                        .padding(.vertical, 4)
+                    }
                 }
             }
         }
@@ -240,8 +249,8 @@ enum ResearchSearchServicePresentation {
                 : "Search service configured."
         case .detecting:
             return "Looking for a local SearXNG service…"
-        case .autodetect(.found(let baseURL)):
-            return "SearXNG found: \(baseURL)"
+        case .autodetect(.found(let baseURL, let gaps)):
+            return "SearXNG found: \(baseURL)" + (gaps.isEmpty ? "" : "\nOther addresses could not be checked: " + gaps.joined(separator: "; "))
         case .autodetect(.notFound(let detail)):
             return "SearXNG not found: \(detail)"
         case .autodetect(.failed(let detail)):
@@ -292,5 +301,5 @@ private enum ResearchViewState {
     case idle
     case loading
     case failed(String)
-    case loaded([ResearchSearchResult])
+    case loaded(ResearchSearchResponse)
 }

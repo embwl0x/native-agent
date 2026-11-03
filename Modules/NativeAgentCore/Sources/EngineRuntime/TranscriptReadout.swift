@@ -27,15 +27,21 @@ extension InlineCards {
     public static func cardsByRow(
         _ pairs: [(rowID: String, interaction: InlineInteraction)], messages: [ChatMessage],
         sessionID: String, dataRoot: URL
-    ) async -> (cardsByRow: [String: [TranscriptReadout.Card]], heading: String) {
+    ) async throws -> (cardsByRow: [String: [TranscriptReadout.Card]], heading: String) {
         var built: [String: [TranscriptReadout.Card]] = [:]
         var collapsed = InlineInteractionResolver.collapsedCards(pairs)
         var origins = collapsed.pairs.map { (rowID: $0.rowID, interaction: $0.interaction, sessionID: sessionID) }
         for message in messages {
-            if let mirror = message.metadata?.interactionMirror,
-               let interaction = await InlineInteractionResolver.interaction(
-                id: mirror.interactionID, sessionID: mirror.sessionID, dataRoot: dataRoot) {
-                origins.append((message.id, interaction, mirror.sessionID))
+            if let mirror = message.metadata?.interactionMirror {
+                do {
+                    if let interaction = try await InlineInteractionResolver.interaction(
+                        id: mirror.interactionID, sessionID: mirror.sessionID, dataRoot: dataRoot) {
+                        origins.append((message.id, interaction, mirror.sessionID))
+                    }
+                } catch {
+                    origins.append((message.id,
+                        InlineInteractionResolver.unavailableInteraction(rowID: message.id, error: error), mirror.sessionID))
+                }
             }
         }
         for pair in origins {

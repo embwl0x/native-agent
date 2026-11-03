@@ -172,10 +172,23 @@ extension ContextPreparation {
         guard started, mode != .off else {
             throw ContextTurnPreparationError.coordinatorNotStarted
         }
+        if request.memoryRecallEnabled, !request.userMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard let embedding = request.queryEmbedding, embedding.isUsable else {
+                throw NativeSemanticQueryError(detail: "The requested semantic readings are unavailable or still pending; no lexical substitution was selected.")
+            }
+        }
+        if feedbackRestoreFailure != nil { await restoreFeedbackEvents() }
+        if let reconciliationFailure {
+            reconcileInBackground(reason: "turn_generation_repair")
+            throw ContextFlowStoreError.malformedStoredValue("Context preparation is unavailable: \(reconciliationFailure). Repair its source and republish before another turn.")
+        }
         // The turn reads the published generation; it never joins a compile.
         guard let generation = activeStoredGeneration else {
             reconcileInBackground(reason: "turn_generation_recovery")
             throw ContextTurnPreparationError.generationUnavailable
+        }
+        let readFailures = sourceReadFailures.values.flatMap { failures in
+            failures.map { ContextDegradedSourceNotice(sourceID: $0.key, reason: $0.value) }
         }
         let lease = try arena.acquireSnapshot()
         do {
@@ -240,13 +253,11 @@ extension ContextPreparation {
                     activeTask: request.activeTask,
                     unresolvedQuestion: request.unresolvedQuestion,
                     goal: request.goal,
-                    predictedToolGroups: request.predictedToolGroups,
-                    contextualTerms: request.contextualTerms,
                     cognitiveActivation: activation,
                     feedbackUtilityOverrides: feedbackByAtom.mapValues(\.utility),
                     feedbackDecayOverrides: feedbackByAtom.mapValues(\.decay),
                     memoryReachability: feedbackByAtom.mapValues(\.reachability),
-                    servedTurnsAgo: self.servedTurnsAgo(sessionID: request.sessionID, recentTurns: request.recentTurns),
+                    servedTurnsAgo: self.servedTurnsAgo(sessionID: request.sessionID, recentExchanges: request.recentExchanges),
                     precoveredSourceIDs: generationDerived.precoveredSourceIDs,
                     mandatoryAtomIDs: Set(generation.atoms.lazy.filter {
                         generationDerived.protectedCorrectionAtomIDs.contains($0.draft.id)
@@ -275,7 +286,8 @@ extension ContextPreparation {
                 packet = try selector.select(
                     need,
                     from: generation,
-                    pinnedTo: lease.snapshot
+                    pinnedTo: lease.snapshot,
+                    sourceReadFailures: readFailures
                 )
             } catch ContextSelectionError.mandatoryBudgetExceeded(let required, _)
                 where request.maximumCharacterBudget > request.characterBudget
@@ -304,7 +316,8 @@ extension ContextPreparation {
                 packet = try selector.select(
                     need,
                     from: generation,
-                    pinnedTo: lease.snapshot
+                    pinnedTo: lease.snapshot,
+                    sourceReadFailures: readFailures
                 )
             }
             let verifier = Self.verifier(compiledProjectionProviders, generation: generation, surface: request.surface)
@@ -382,7 +395,7 @@ extension ContextPreparation {
             generationID: packet.generationID, sourceFingerprint: packet.sourceFingerprint,
             selectedItems: packet.selectedItems.filter { !check.atomIDs.contains($0.pointer.atomID) },
             expandablePointers: packet.expandablePointers.filter { !check.atomIDs.contains($0.atomID) },
-            conflictSets: packet.conflictSets, degradedSources: packet.degradedSources + check.unverified,
+            degradedSources: packet.degradedSources + check.unverified,
             budget: packet.budget, receipt: packet.receipt)
     }
 

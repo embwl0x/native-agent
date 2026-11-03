@@ -4,7 +4,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `ProviderRouteDerivation.swift` | Route and catalog derivation from one checked provider snapshot; unknown context windows remain unknown |
+// Blueprint: | `ProviderRouteDerivation.swift` | Route and catalog derivation from one checked provider snapshot; catalog/control failures leave only dependent surfaces unavailable; unknown context windows remain unknown |
 
 extension SwiftNativeProviderRouting {
     func routingSnapshot(
@@ -13,16 +13,41 @@ extension SwiftNativeProviderRouting {
         soleConnectedRoute: String?,
         configCache: ProviderConfigCache?,
         revision: Double = 0
-    ) -> ProviderRoutingSnapshot {
+    ) throws -> ProviderRoutingSnapshot {
         let surfacesFile = JSONValue.object(surfaces)
         let (parsedSurfaceModels, parsedSurfaceEfforts, parsedSurfaceServiceTiers) = Self.parseSurfacesFile(surfacesFile)
+        // Catalog failures belong to their routes, not the whole picker snapshot.
+        var catalogFaults: [String: String] = [:]
+        for route in Set(activeProviders.values).union(soleConnectedRoute.map { [$0] } ?? []) {
+            if CodexAccountModelCatalog.isAccountBackedProvider(route),
+               let fault = CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot) {
+                catalogFaults[route] = fault
+            }
+            if Self.normalizeProviderId(route) == "moonshot", let fault = MoonshotModelCatalog.cacheFault(dataRoot: dataRoot) {
+                catalogFaults[route] = fault
+            }
+            if Self.normalizeProviderId(route) == "openrouter", let fault = OpenRouterModelCatalog.cacheFault(dataRoot: dataRoot) {
+                catalogFaults[route] = fault
+            }
+        }
         // Interpret saved picks against route catalogs without rewriting disk state.
         let accountCatalogs = CodexAccountModelCatalog.chatGPTOAuthCatalogs(dataRoot: dataRoot)
+        let openRouterCatalog = OpenRouterModelCatalog.readCache(dataRoot: dataRoot)
+        func supportedEfforts(model: String, route: String?) -> [String]? {
+            if Self.normalizeProviderId(route ?? "") == "openrouter" {
+                return openRouterCatalog?.first { $0.id == model }?.supported_reasoning_efforts
+            }
+            if Self.normalizeProviderId(route ?? "") == "moonshot" {
+                return MoonshotModelCatalog.supportedReasoningEfforts(for: model)
+            }
+            return accountCatalogs[route ?? ""]?.first { $0.id == model }?.supportedReasoningEfforts
+                ?? FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: route ?? "")
+        }
         var cachedModelIDs = accountCatalogs.mapValues { Set($0.map { $0.id.lowercased() }) }
         if let moonshotModels = MoonshotModelCatalog.readCache(dataRoot: dataRoot) {
             cachedModelIDs["moonshot"] = Set(moonshotModels.map { $0.id.lowercased() })
         }
-        let retiredPickSurfaces = Self.surfacesWithRetiredPicks(
+        let retiredCandidates = Self.surfacesWithRetiredPicks(
             parsedSurfaceModels, accountModels: cachedModelIDs
         ) {
             [weak self] surface, model in
@@ -30,6 +55,11 @@ extension SwiftNativeProviderRouting {
                 ?? activeProviders["chat"]
                 ?? self?.inferProviderForModel(model)
         }
+        // Unavailable coverage cannot establish that a saved model was removed.
+        let retiredPickSurfaces = Set(retiredCandidates.filter {
+            let route = activeProviders[$0] ?? activeProviders["chat"] ?? soleConnectedRoute
+            return route.flatMap { catalogFaults[$0] } == nil
+        })
         // Retain unusable saved IDs for picker notices and execution refusals.
         var unusablePicks: [String: String] = [:]
         if case .object(let parsed) = parsedSurfaceModels {
@@ -62,7 +92,7 @@ extension SwiftNativeProviderRouting {
         )
         let offeredModels = Dictionary(uniqueKeysWithValues:
             Set(routesBeforeRetirement.values).union(chatRoute.map { [$0] } ?? []).map { route in
-                (route, modelsForProvider(route).compactMap { $0["id"]?.stringValue })
+                (route, modelsForProvider(route, openRouterModels: openRouterCatalog?.map { $0.providerJSON() }).compactMap { $0["id"]?.stringValue })
             })
         for (surface, route) in activeProviders.merging(chatRoute.map { ["chat": $0] } ?? [:], uniquingKeysWith: { first, _ in first }) {
             guard Self.stringFrom(parsedSurfaceModels, key: surface) == nil,
@@ -79,20 +109,20 @@ extension SwiftNativeProviderRouting {
                 : chatRoute.flatMap { defaultModelForProvider($0, offered: offeredModels[$0] ?? [], savedDefaults: savedDefaults) })
             ?? ""
         let chatModel = Self.normalizeModelIdStatic(chatModelRaw, fallback: "")
-        let chatEffortRaw = Self.stringFrom(surfaceEfforts, key: "chat") ?? DEFAULT_REASONING_EFFORT
-        let chatEffort = Self.normalizeReasoningEffortStatic(
-            chatEffortRaw,
-            fallback: DEFAULT_REASONING_EFFORT,
-            model: chatModel,
-            providerID: activeProviders["chat"],
-            supportedReasoningEfforts: accountCatalogs[chatRoute ?? ""]?
-                .first { $0.id == chatModel }?.supportedReasoningEfforts
-        )
+        let chatEffortRaw = Self.stringFrom(surfaceEfforts, key: "chat")
+            ?? (chatRoute == "openrouter" ? openRouterCatalog?.first { $0.id == chatModel }?.default_reasoning_effort : nil)
+            ?? accountCatalogs[chatRoute ?? ""]?.first { $0.id == chatModel }?.defaultReasoningEffort
+            ?? chatRoute.flatMap { FirstPartyModelCatalog.descriptor(for: chatModel, providerID: $0)?.defaultReasoningEffort }
+            ?? ""
+        // Validate after group inheritance, so a failed Chat route cannot
+        // prevent an independent Work or Memory route from being resolved.
+        let chatEffort = chatEffortRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let chatServiceTier = Self.normalizeServiceTierStatic(
             Self.stringFrom(surfaceServiceTiers, key: "chat") ?? "default"
         )
-        // ProviderSurfaceGroups owns membership. Every member resolves to its group's unanimous tuple, otherwise Chat's. Effort is independent: an effort-only group keeps Chat's current model and account. A stray per-surface pin is shown
-        // by the page, never splits group routing.
+        // ProviderSurfaceGroups owns membership. Only a group with no saved
+        // override inherits Chat; partial or conflicting tuples are unavailable.
+        // Independent effort/tier controls keep Chat's current model/account.
         struct CanonicalTuple: Equatable {
             let model: String
             let effort: String
@@ -114,24 +144,18 @@ extension SwiftNativeProviderRouting {
         ) -> CanonicalTuple? {
             let saved = Self.stringFrom(models, key: surface)
             guard saved != nil || routes[surface] != nil
-                || Self.stringFrom(efforts, key: surface) != nil else { return nil }
+                || Self.stringFrom(efforts, key: surface) != nil
+                || Self.stringFrom(tiers, key: surface) != nil else { return nil }
             let provider = routes[surface] ?? chatRoute
             let model = Self.normalizeModelIdStatic(
                 saved ?? (routes[surface] == nil ? chatModel : provider.flatMap { defaultModelForProvider($0, offered: offeredModels[$0] ?? [], savedDefaults: savedDefaults) } ?? ""),
                 fallback: ""
             )
             // Keep a provider-only assignment even without a default: it needs a model selection, rather than silently inheriting Chat's account.
-            guard !model.isEmpty || routes[surface] != nil else { return nil }
             return CanonicalTuple(
                 model: model,
-                effort: Self.normalizeReasoningEffortStatic(
-                    Self.stringFrom(efforts, key: surface) ?? chatEffort,
-                    fallback: chatEffort,
-                    model: model,
-                    providerID: provider,
-                    supportedReasoningEfforts: accountCatalogs[provider ?? ""]?
-                        .first { $0.id == model }?.supportedReasoningEfforts
-                ),
+                effort: (Self.stringFrom(efforts, key: surface) ?? chatEffort)
+                    .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
                 serviceTier: Self.normalizeServiceTierStatic(
                     Self.stringFrom(tiers, key: surface) ?? chatServiceTier
                 ),
@@ -139,45 +163,39 @@ extension SwiftNativeProviderRouting {
             )
         }
         func savedTuple(for surface: String) -> CanonicalTuple? {
-            tuple(for: surface, models: surfaceModels, efforts: surfaceEfforts,
-                  tiers: surfaceServiceTiers, routes: activeProviders)
+            tuple(for: surface, models: parsedSurfaceModels, efforts: parsedSurfaceEfforts,
+                  tiers: parsedSurfaceServiceTiers, routes: routesBeforeRetirement)
         }
-        // Retired overrides refuse only where the saved group tuple was unanimous. A stray key keeps its picker notice without blocking its inheriting group.
         var retiredOverrideSurfaces: Set<String> = []
-        for group in ProviderSurfaceGroups.all where group.id != ProviderSurfaceGroups.chat.id {
-            guard group.surfaces.allSatisfy(retiredPickSurfaces.contains) else { continue }
-            let saved = group.surfaces.map {
-                tuple(for: $0, models: parsedSurfaceModels, efforts: parsedSurfaceEfforts,
-                      tiers: parsedSurfaceServiceTiers, routes: routesBeforeRetirement)
-            }
-            if let first = saved.first ?? nil, saved.allSatisfy({ $0 == first }) {
-                retiredOverrideSurfaces.formUnion(group.surfaces)
-            }
-        }
         var canonicalByGroup: [String: CanonicalTuple] = [:]
+        var inconsistentGroups: [String: String] = [:]
         for group in ProviderSurfaceGroups.all {
             if group.id == ProviderSurfaceGroups.chat.id {
                 canonicalByGroup[group.id] = chatTuple
                 continue
             }
-            // A group overrides Chat only when every member has the same complete model/provider/effort/tier tuple; otherwise the group inherits Chat.
             let members = group.surfaces.map(savedTuple)
-            let first = members.first ?? nil
-            let unanimous = !members.contains(where: { $0 == nil })
-                && members.allSatisfy {
-                    $0?.model == first?.model
-                        && $0?.provider == first?.provider
-                        && $0?.effort == first?.effort
-                        && $0?.serviceTier == first?.serviceTier
+            if members.allSatisfy({ $0 == nil }) {
+                canonicalByGroup[group.id] = chatTuple
+            } else if let first = members.first ?? nil, members.allSatisfy({ $0 == first }) {
+                canonicalByGroup[group.id] = first
+                if group.surfaces.contains(where: retiredPickSurfaces.contains) {
+                    retiredOverrideSurfaces.formUnion(group.surfaces)
                 }
-            canonicalByGroup[group.id] = unanimous
-                ? (members.first ?? chatTuple) ?? chatTuple
-                : chatTuple
+            } else {
+                let savedKeys = zip(group.surfaces, members).filter { $0.1 != nil }.map { $0.0 }
+                inconsistentGroups[group.id] = "\(group.title) has partial or conflicting saved choices at \(savedKeys.joined(separator: ", ")). Choose one complete group choice or Use Chat's choice in Providers."
+            }
         }
         var out: [String: SurfacePreference] = [:]
         var resolvedProviders: [String: String] = [:]
         var mismatchedPicks: [String: String] = [:]
         for surface in MODEL_SURFACES {
+            if let group = ProviderSurfaceGroups.group(for: surface), let fault = inconsistentGroups[group.id] {
+                unusablePicks[surface] = fault
+                out[surface] = SurfacePreference(surface: surface, model: "", reasoningEffort: "")
+                continue
+            }
             // Resolve each surface through its group; stray saved keys cannot split it.
             let canonical = ProviderSurfaceGroups.group(for: surface)
                 .flatMap { canonicalByGroup[$0.id] } ?? chatTuple
@@ -185,7 +203,7 @@ extension SwiftNativeProviderRouting {
             let route = canonical.provider ?? activeProviders[surface]
             // Provider-only choices may use saved sheet picks; unusable Chat picks and retired effective group overrides must stay unset instead.
             let unusableBlocksFallback = retiredOverrideSurfaces.contains(surface)
-                || unusablePicks["chat"] != nil
+                || (canonical.provider == chatRoute && unusablePicks["chat"] != nil)
             let model = canonical.model.isEmpty
                 ? (unusableBlocksFallback
                     ? ""
@@ -202,21 +220,37 @@ extension SwiftNativeProviderRouting {
                 mismatchedPicks[surface] = "\(model) isn't available on \(route). Choose one."
                 effectiveModel = ""
             }
-            let effort = Self.normalizeReasoningEffortStatic(
-                canonical.effort,
-                fallback: DEFAULT_REASONING_EFFORT,
-                model: effectiveModel,
-                providerID: route,
-                supportedReasoningEfforts: accountCatalogs[route ?? ""]?
-                    .first { $0.id == effectiveModel }?.supportedReasoningEfforts
-            )
+            var effort = canonical.effort
+            do {
+                if let route, let fault = catalogFaults[route] {
+                    throw ProviderRoutingError.configurationFailed(fault)
+                }
+                effort = try Self.normalizeReasoningEffortStatic(
+                    canonical.effort, model: effectiveModel, providerID: route,
+                    supportedReasoningEfforts: supportedEfforts(model: effectiveModel, route: route)
+                )
+                guard SERVICE_TIER_OPTIONS.contains(canonical.serviceTier) else {
+                    throw ProviderRoutingError.configurationFailed("Saved service tier '\(canonical.serviceTier)' is invalid. Choose Default or Fast in Providers.")
+                }
+                if canonical.serviceTier == "priority", !effectiveModel.isEmpty, let route {
+                    let supportsFast = accountCatalogs[route]?.first { $0.id == effectiveModel }?.supportsFast
+                        ?? FirstPartyModelCatalog.descriptor(for: effectiveModel, providerID: route)?.supportsFast
+                    guard supportsFast == true else {
+                        throw ProviderRoutingError.configurationFailed("Fast is unsupported or unknown for \(effectiveModel) on \(route). Choose a supported tier in Providers.")
+                    }
+                }
+            } catch {
+                // The saved choice remains on disk. This surface cannot run
+                // until its own catalog/controls are repaired; no route changes.
+                unusablePicks[surface] = error.localizedDescription
+                effectiveModel = ""
+            }
             if let route, !route.isEmpty { resolvedProviders[surface] = route }
             out[surface] = SurfacePreference(
                 surface: surface,
                 model: effectiveModel,
                 reasoningEffort: effort,
-                serviceTier: canonical.serviceTier,
-                modelKnown: nil
+                serviceTier: canonical.serviceTier
             )
         }
         var pinnedModels: [String: String] = [:]
@@ -248,8 +282,8 @@ extension SwiftNativeProviderRouting {
         return preference
     }
     /// Chat's chosen route, for sizing a window on the selected model; nil when routing cannot be read, and the window then stays unknown.
-    public func chatRouteProvider() async -> String? {
-        (try? await checkedRoutingSnapshot()).flatMap { ProviderRoutingSurfaceLookup.value($0.activeProviders, "chat") }
+    public func chatRouteProvider() async throws -> String? {
+        ProviderRoutingSurfaceLookup.value(try await checkedRoutingSnapshot().activeProviders, "chat")
     }
     /// The provider a model id names, or nil when its spelling names none (the caller then keeps the explicit route). Routing, the picker and dispatch all read this one answer.
     public nonisolated func inferProviderForModel(_ modelId: String) -> String? {
@@ -263,7 +297,7 @@ extension SwiftNativeProviderRouting {
             ? await OpenRouterModelCatalog.modelsWithFreshness(dataRoot: dataRoot) : nil
         let catalog = catalogRows(providerID, openRouterModels: openRouter?.models)
         let length = Self.contextLength(of: modelID, in: catalog.rows)
-        return (length, length == nil ? catalog.fault ?? openRouter?.failure : nil)
+        return (length, catalog.fault ?? openRouter?.failure)
     }
     /// A route's catalog rows as its picker shows them: the account or provider cache under this root, else the rows this build ships when none is saved. A saved list that cannot be read gives no rows and its fault.
     nonisolated func catalogRows(_ providerID: String, openRouterModels: [ProviderModelInfo]? = nil)
@@ -280,6 +314,39 @@ extension SwiftNativeProviderRouting {
         let moonshot = providerID == "moonshot" ? MoonshotModelCatalog.readCache(dataRoot: dataRoot) : nil
         return (modelsForProvider(providerID, openRouterModels: openRouter?.map { $0.providerJSON() },
                                   moonshotModels: moonshot?.map { $0.providerJSON() }), nil)
+    }
+    /// Synchronous consumers use this exact-root catalog boundary instead of
+    /// borrowing shipped account rows or turning a read failure into no choices.
+    public nonisolated func checkedCatalogModels(for providerID: String) throws -> [ProviderModelInfo] {
+        let catalog = catalogRows(providerID)
+        if let fault = catalog.fault { throw ProviderRoutingError.configurationFailed(fault) }
+        guard !catalog.rows.isEmpty else {
+            throw ProviderRoutingError.configurationFailed("\(providerID)'s model catalog is unavailable. Refresh its models in Providers.")
+        }
+        return try catalog.rows.map { row in
+            do {
+                return try JSONDecoder().decode(ProviderModelInfo.self, from: JSONEncoder().encode(JSONValue.object(row)))
+            } catch {
+                throw ProviderRoutingError.configurationFailed("\(providerID)'s model catalog could not be decoded: \(error.localizedDescription). Refresh its models in Providers.")
+            }
+        }
+    }
+
+
+    /// The same route-specific descriptor supplies every effort consumer.
+    public nonisolated static func modelReasoningEfforts(provider: Provider, modelID: String) throws -> [String] {
+        let providerID = provider.id
+        guard case .array(let models)? = provider.modelCatalog,
+              let selected = models.first(where: {
+                  guard case .object(let row) = $0 else { return false }
+                  return row["id"] == .string(modelID)
+              }),
+              case .object(let row) = selected,
+              case .array(let values)? = row["supported_reasoning_efforts"],
+              values.allSatisfy({ $0.stringValue != nil }) else {
+            throw ProviderRoutingError.configurationFailed("\(providerID)'s thinking capabilities for \(modelID) are unavailable. Reload Providers.")
+        }
+        return values.compactMap(\.stringValue)
     }
     /// The window a catalog row states for `modelID`; nil when no row states one.
     nonisolated static func contextLength(of modelID: String, in rows: [[String: JSONValue]]) -> Int? {
@@ -353,7 +420,7 @@ extension SwiftNativeProviderRouting {
         let read = cache?.reads[trimmedId] ?? readProviderConfig(trimmedId)
         if let reason = read.unreadable { return .unreadable(reason) }
         guard let object = read.object else { return .absent }
-        for key in ["default_model", "defaultModel"] {
+        for key in ["default_model"] {
             if let value = object[key] as? String {
                 let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty { return .model(trimmed) }
@@ -384,7 +451,7 @@ extension SwiftNativeProviderRouting {
 }
 
 /// The one context window for an admitted provider/model tuple: the row that route's catalog states (its account or provider cache under `dataRoot`, else the rows this build ships), the same row its picker shows. Nil when no row states
-/// one: callers keep unknown as unknown. Without a provider, the smallest window this build ships for the id.
+/// one: callers keep unknown as unknown. Without the admitted provider, the window is unknown.
 public func verifiedContextLength(
     forModel modelId: String,
     providerID: String?,
@@ -393,12 +460,10 @@ public func verifiedContextLength(
     let model = modelId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     guard !model.isEmpty else { return nil }
     guard let provider = providerID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-          !provider.isEmpty else {
-        return FirstPartyModelCatalog.descriptor(for: model)?.contextLength
-    }
+          !provider.isEmpty else { return nil }
     // A route with neither a shipped nor a fetched catalog carries no evidence.
-    guard provider == "openrouter" || !FirstPartyModelCatalog.models(forProviderID: provider).isEmpty else { return nil }
-    let rows = dataRoot.map { SwiftNativeProviderRouting(dataRoot: $0).catalogRows(provider).rows }
-        ?? FirstPartyModelCatalog.models(forProviderID: provider).map { $0.providerJSON() }
+    guard provider == "openrouter" || CodexAccountModelCatalog.isAccountBackedProvider(provider)
+        || !FirstPartyModelCatalog.models(forProviderID: provider).isEmpty else { return nil }
+    let rows = SwiftNativeProviderRouting(dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()).catalogRows(provider).rows
     return SwiftNativeProviderRouting.contextLength(of: model, in: rows)
 }

@@ -1,11 +1,12 @@
 import Foundation
+import Experiences
 import CryptoKit
 import NativeAgentCore
 
 // Blueprint: | `AfterTurnMemorySurprise.swift` | `AfterTurnMemorySurprise`: the agent's own learned prediction that a turn's interpretation would be a COMPLETE no-op: language-independent, fully covered warm-vector precedents from its labelled record, keyed by agent, memory model and detector version, with the cost law's standing |
 
 /// A prediction about ALL interpretation channels (memories, affect, caring,
-/// cares), never permission to forget a turn: a deferred turn stays owed in
+/// cares, promises), never permission to forget a turn: a deferred turn stays owed in
 /// the lived-moment journal and is judged later (docs/COGNITION_WIRING.md,
 /// "Deferral").
 public struct AfterTurnMemorySurprise: Codable, Sendable, Equatable {
@@ -21,7 +22,7 @@ public struct AfterTurnMemorySurprise: Codable, Sendable, Equatable {
         public let detector: Int
     }
     public let verdict: Verdict
-    public let reason: String
+    public private(set) var reason: String
     public let epoch: String?
     public private(set) var scope: Scope?
     /// The frozen claim this prediction belongs to (precedent + its contrast
@@ -39,6 +40,14 @@ public struct AfterTurnMemorySurprise: Codable, Sendable, Equatable {
     static func unsure(_ reason: String) -> Self {
         Self(verdict: .unsure, reason: reason, epoch: nil, scope: nil, rule: nil,
              at: nil, vectors: nil, standing: false, lowerBound: nil, costBar: nil, tries: nil, hits: nil)
+    }
+
+    /// A turn left owed for another reason keeps the prediction as it was:
+    /// only an actual no-op verdict can become a no-op prediction trial.
+    func deferringBecause(_ reason: String) -> Self {
+        var deferred = self
+        deferred.reason = reason
+        return deferred
     }
 
     /// This prediction scored under the model that judged it (unchanged when
@@ -64,10 +73,15 @@ public struct AfterTurnMemorySurprise: Codable, Sendable, Equatable {
     /// Full traversal, no language: split on Unicode scalar boundaries, then
     /// bisect until the resident embedder certifies every piece fits. The
     /// bounds cap optional CPU work, never natural language. Anything not
-    /// fully covered is `unsure`, and an unsure turn is interpreted now.
+    /// fully covered is `unsure`; that cannot grant prediction-based deferral.
     static func check(texts: [String], scope: Scope, memory: SwiftNativeMemoryV2,
                       dataRoot: URL, excluding turn: String) async -> Self {
-        guard let epoch = await memory.warmEmbeddingEpoch() else { return .unsure("embedder_cold") }
+        guard let epoch = await memory.warmEmbeddingEpoch() else {
+            if let failure = await memory.embeddingRuntimeSnapshot()?.lastLoadError {
+                return .unsure("embedding_unavailable: " + failure)
+            }
+            return .unsure("embedder_cold")
+        }
         var pieces: [String] = []
         for text in texts where !text.isEmpty {
             let scalars = Array(text.unicodeScalars)
@@ -102,7 +116,15 @@ public struct AfterTurnMemorySurprise: Codable, Sendable, Equatable {
                 return .unsure("embedding_epoch_changed")
             }
             let inputs = Array(pieces[start..<min(start + 16, pieces.count)])
-            guard let batch = await memory.embedIfWarm(inputs, requireFullText: true),
+            let embedded: [[Float]]?
+            do { embedded = try await memory.embedIfWarm(inputs, requireFullText: true) }
+            catch {
+                await RepairOwed.owe(dataRoot, id: "noop-prediction:" + UUID().uuidString,
+                    kind: .act, operation: "memory.noop_embedding", owner: "AfterTurnMemorySurprise",
+                    words: "The resident memory model failed while weighing this turn: \(error.localizedDescription). Repair the model before using no-op predictions.").value
+                return .unsure("embedding_failed: " + error.localizedDescription)
+            }
+            guard let batch = embedded,
                   batch.count == inputs.count,
                   batch.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isFinite) && $0.contains(where: { $0 != 0 }) }) else {
                 return .unsure("embedding_coverage_unavailable")
@@ -112,6 +134,8 @@ public struct AfterTurnMemorySurprise: Codable, Sendable, Equatable {
         guard !Task.isCancelled, await memory.warmEmbeddingEpoch() == epoch,
               let dimension = vectors.first?.count,
               vectors.allSatisfy({ $0.count == dimension }) else { return .unsure("embedding_epoch_changed") }
+        await RepairOwed.settle(dataRoot, operation: "memory.noop_embedding",
+            evidence: .init(source: "turn", id: turn)).value
         return await AfterTurnSurpriseLedger.shared.predict(dataRoot: dataRoot, scope: scope,
             epoch: epoch, vectors: vectors, excluding: turn)
     }

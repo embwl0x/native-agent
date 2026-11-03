@@ -5,12 +5,27 @@ import PersistenceCore
 import Desk
 import Experiences
 import ToolExecution
-// Blueprint: | `SwiftToolDispatcher+DeskTools.swift` | `SwiftToolDispatcher`: ordinary Desk mutations, shared store and handle/argument methods; person waits use existing status fields, dependency waits retain their conditions, and close resolves holds once while retaining closed children on conflict |
+// Blueprint: | `SwiftToolDispatcher+DeskTools.swift` | `SwiftToolDispatcher`: ordinary Desk mutations, exact raw clear/set admission and checked pursuit evidence; person waits use existing status fields, dependency waits retain their conditions, and close resolves holds once while retaining closed children on conflict |
 
 // Desk actions use this dispatcher’s data root and the single event-sourced personal store.
 // DeskOp has no actor field; mutations use ledger_write authority.
 
 extension SwiftToolDispatcher {
+    /// A clear must be stated, and its raw type must survive protocol admission.
+    /// Called before normalization and again at the mutation owner.
+    static func validateDeskMutationArguments(_ tool: String, input: [String: JSONValue]) throws {
+        let key: String
+        switch tool {
+        case "desk_blocked_on": key = "blocked_on"
+        case "desk_defer": key = "until"
+        default: return
+        }
+        guard case .string? = input[key] else {
+            throw ToolFailureError("\(key) is required as a string; use an explicit empty string to clear it. Nothing was changed.",
+                argumentPath: "$." + key, effects: .none, code: "invalid_input")
+        }
+    }
+
     func deskInvalid(_ field: String, reason: String) -> ToolFailureError {
         ToolFailureError(reason, argumentPath: "$." + field, effects: .none, code: "invalid_input")
     }
@@ -26,9 +41,17 @@ extension SwiftToolDispatcher {
         SwiftNativeDeskStore(dataRoot: dataRoot)
     }
 
-    /// A mutation's fresh snapshot supplies its confirmation, or its bare handle if archived.
-    func deskConfirm(_ state: DeskState?, handle: String, prefix: String) -> JSONValue {
-        let item = state?.items.first { $0.handle == handle }
+    /// A committed effect remains committed when its confirmation cannot be read.
+    func deskConfirm(_ store: SwiftNativeDeskStore, handle: String, prefix: String) async -> JSONValue {
+        let state: DeskState
+        do { state = try await store.liveState() }
+        catch {
+            return ChatToolOutcome.failure(error: ToolFailureError(
+                "\(prefix) committed for \(handle), but its current Desk state could not be read: \(error.localizedDescription)",
+                effects: .occurred, owner: "Desk", code: "desk_confirmation_unavailable",
+                instruction: "Repair the reported Desk read failure, then read this handle before repeating the mutation."), tool: "desk")
+        }
+        let item = state.items.first { $0.handle == handle }
         let label: String
         if let item {
             label = "\(item.alias) \(item.kind.rawValue) (status: \(item.statusDescription)) \(item.title)"
@@ -105,7 +128,7 @@ extension SwiftToolDispatcher {
 
     /// Resolve the mutation's target against its operation snapshot.
     func resolveDeskHandle(_ input: [String: JSONValue], in state: DeskState) throws -> String {
-        guard case .string(let raw)? = input["handle"] ?? input["id"] else {
+        guard case .string(let raw)? = input["handle"] else {
             throw ToolFailureError("Supply the item's handle from desk.read.", argumentPath: "$.handle", effects: .none, code: "invalid_input")
         }
         return try resolveDeskRef(raw, in: state)
@@ -248,13 +271,20 @@ extension SwiftToolDispatcher {
         let doneLooksLike = (optionalString(input, "done_looks_like") ?? "")
         let abandonCondition = (optionalString(input, "abandon_condition") ?? "")
         let privateName = optionalString(input, "private_name")
-        let dossier = deskParseDossier(input)
+        let dossier = try deskParseDossier(input)
+        func bound(_ key: String, defaultValue value: Int) throws -> Int {
+            guard let raw = input[key] else { return value }
+            guard case .int(let number) = raw, let checked = Int(exactly: number) else {
+                throw deskInvalid(key, reason: "\(key) must be an integer. Nothing was opened.")
+            }
+            return checked
+        }
         let pursuit = Pursuit(
             why: why,
             evidence: dossier,
             doneLooksLike: doneLooksLike,
-            maxSessions: Self.jsonInt(input["max_sessions"]) ?? Pursuit.defaultMaxSessions,
-            maxDays: Self.jsonInt(input["max_days"]) ?? Pursuit.defaultMaxDays,
+            maxSessions: try bound("max_sessions", defaultValue: Pursuit.defaultMaxSessions),
+            maxDays: try bound("max_days", defaultValue: Pursuit.defaultMaxDays),
             abandonCondition: abandonCondition,
             privateName: (privateName?.isEmpty == false) ? privateName : nil
         )
@@ -280,10 +310,13 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// Drop malformed citations; the store refuses any resulting under-cited pursuit.
-    private func deskParseDossier(_ input: [String: JSONValue]) -> PromotionDossier {
-        guard case .array(let arr)? = input["evidence"] else { return PromotionDossier(citations: []) }
-        return PromotionDossier(citations: arr.compactMap { DossierSource.fromJSON($0) })
+    /// Every supplied citation must decode; the store owns the source-mix gate.
+    private func deskParseDossier(_ input: [String: JSONValue]) throws -> PromotionDossier {
+        guard let evidence = input["evidence"],
+              let dossier = PromotionDossier.fromJSON(.object(["citations": evidence])) else {
+            throw deskInvalid("evidence", reason: "evidence must be an array of complete current citation records. Nothing was opened.")
+        }
+        return dossier
     }
 
     // MARK: - desk_work_log
@@ -298,9 +331,7 @@ extension SwiftToolDispatcher {
         let store = deskStore()
         do {
             _ = try await store.appendWorkReceipt(handle, receipt: receipt)
-            return deskConfirm(try? await store.liveState(), handle: handle, prefix: "work logged")
-        } catch DeskError.notAPursuit {
-            return try await impl_desk_note(input: ["handle": .string(handle), "text": .string(receipt)])
+            return await deskConfirm(store, handle: handle, prefix: "work logged")
         } catch let e as DeskError {
             return .object([
                 "status": .string("refused"),
@@ -394,7 +425,7 @@ extension SwiftToolDispatcher {
             laneOf: laneOf
         )
         if let waitNote { _ = try await store.appendNote(handle, text: waitNote) }
-        return deskConfirm(try? await store.liveState(), handle: handle, prefix: inlineWaitingOn.map { "waiting on " + $0 } ?? "status set")
+        return await deskConfirm(store, handle: handle, prefix: inlineWaitingOn.map { "waiting on " + $0 } ?? "status set")
     }
 
     func impl_desk_wait(input: [String: JSONValue], state: DeskState) async throws -> JSONValue {
@@ -406,14 +437,14 @@ extension SwiftToolDispatcher {
             guard case .string(let id) = value, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return id.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        let correction = "desk.wait takes on: a person's name (for example User or owner), a Desk handle/number, an experience id (card, message, delivery or repair), or a list of those dependency ids. note is optional."
+        let correction = "desk.wait takes on: a person's or agent's name (for example User, owner or Claude Desktop), a conversation id (its next message), a Desk handle/number, an experience id (card, message, delivery or repair), or a list of those dependency ids. note is optional."
         guard !ids.isEmpty, ids.count == values.count else { throw ToolFailureError(correction, argumentPath: "$.on", effects: .none, code: "invalid_input") }
         let store = deskStore()
         // An id an owner just handed out may still be on its way into the store.
         let experiences = ExperienceStore.at(dataRoot)
         await experiences.drained()
         var blockers: [String] = [], settled: [String] = []
-        let note = try deskMetadataString(input, "note") ?? deskMetadataString(input, "why")
+        let note = try deskMetadataString(input, "note")
         for id in ids {
             if let item = try Self.deskMatches(id, in: state, field: "on").first { blockers.append(item.handle); continue }
             // A card answers to its bare id too (its experience is `interaction:<id>`).
@@ -425,7 +456,11 @@ extension SwiftToolDispatcher {
                 let personName = id.contains(where: { $0.isLetter }) && id.allSatisfy {
                     $0.isLetter || $0.isWhitespace || "-'.".contains($0)
                 } && !id.lowercased().hasPrefix("desk.")
-                if ids.count == 1, personName, case .string? = input["on"] {
+                // A conversation she is in is waited on like its person: its next message.
+                let conversation = NativeAgentChatSessionID.normalizedPathComponent(id).map {
+                    FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent("chat/messages/\($0).jsonl").path)
+                } ?? false
+                if ids.count == 1, personName || conversation, case .string? = input["on"] {
                     var statusInput = input
                     statusInput.removeValue(forKey: "wait")
                     statusInput["handle"] = .string(handle)
@@ -438,8 +473,8 @@ extension SwiftToolDispatcher {
             if experience.isOpen { blockers.append("exp:" + experience.id) } else { settled.append(id) }
         }
         _ = try await store.setBlockedOn(handle, blockers: blockers, waiting: true, note: note)
-        if blockers.isEmpty { return deskConfirm(try? await store.liveState(), handle: handle, prefix: "already settled: nothing to wait for; go on now") }
-        return deskConfirm(try? await store.liveState(), handle: handle, prefix: "waiting on " + blockers.map { $0.hasPrefix("exp:") ? String($0.dropFirst(4)) : $0 }.joined(separator: ", ")
+        if blockers.isEmpty { return await deskConfirm(store, handle: handle, prefix: "already settled: nothing to wait for; go on now") }
+        return await deskConfirm(store, handle: handle, prefix: "waiting on " + blockers.map { $0.hasPrefix("exp:") ? String($0.dropFirst(4)) : $0 }.joined(separator: ", ")
             + (settled.isEmpty ? "" : "; already settled: " + settled.joined(separator: ", ")))
     }
 
@@ -454,7 +489,7 @@ extension SwiftToolDispatcher {
         }
         let store = deskStore()
         _ = try await store.updateTitle(handle, title: title, summary: summary)
-        return deskConfirm(try? await store.liveState(), handle: handle, prefix: "updated")
+        return await deskConfirm(store, handle: handle, prefix: "updated")
     }
 
     // MARK: - desk_note
@@ -467,7 +502,7 @@ extension SwiftToolDispatcher {
         }
         let store = deskStore()
         _ = try await store.appendNote(handle, text: text, author: "agent")
-        return deskConfirm(try? await store.liveState(), handle: handle, prefix: "noted")
+        return await deskConfirm(store, handle: handle, prefix: "noted")
     }
 
     // MARK: - desk_add_ref
@@ -477,7 +512,7 @@ extension SwiftToolDispatcher {
         let ref = try deskBuildRef(input)
         let store = deskStore()
         _ = try await store.addRef(handle, ref: ref)
-        return deskConfirm(try? await store.liveState(), handle: handle, prefix: "ref added (\(ref.kind.token))")
+        return await deskConfirm(store, handle: handle, prefix: "ref added (\(ref.kind.token))")
     }
 
     // MARK: - desk_set_cadence
@@ -498,13 +533,13 @@ extension SwiftToolDispatcher {
         )
         let store = deskStore()
         _ = try await store.setCadence(handle, cadence: cadence)
-        return deskConfirm(try? await store.liveState(), handle: handle, prefix: "cadence \(mode.rawValue)")
+        return await deskConfirm(store, handle: handle, prefix: "cadence \(mode.rawValue)")
     }
 
     // MARK: - desk_close
 
     static func validateDeskClose(_ input: [String: JSONValue]) throws {
-        let fields = ["handle", "id", "summary", "outcome_summary", "canceled", "subtree", "expected_updated_at"]
+        let fields = ["handle", "summary", "canceled", "subtree", "expected_updated_at"]
         for key in input.keys.sorted() where !key.hasPrefix("__") {
             guard fields.contains(key) else {
                 throw ToolFailureError("desk.close takes no \(key). Nothing was closed.", argumentPath: "$.\(key)", effects: .none, code: "invalid_input")
@@ -522,10 +557,7 @@ extension SwiftToolDispatcher {
     func impl_desk_close(input: [String: JSONValue]) async throws -> JSONValue {
         try Self.validateDeskClose(input)
         let handle = try deskString(input, "handle")
-        guard input["summary"] == nil || input["outcome_summary"] == nil || input["summary"] == input["outcome_summary"] else {
-            throw ToolFailureError("summary and its alias must agree.", argumentPath: "$.summary", effects: .none, code: "invalid_input")
-        }
-        guard case .string(let rawSummary)? = input["summary"] ?? input["outcome_summary"] else {
+        guard case .string(let rawSummary)? = input["summary"] else {
             throw ToolFailureError("summary is required.", argumentPath: "$.summary", effects: .none, code: "invalid_input")
         }
         let outcome = rawSummary.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -612,7 +644,7 @@ extension SwiftToolDispatcher {
                 ])
             }
         }
-        return deskConfirm(try? await store.liveState(), handle: handle, prefix: canceled ? "canceled" : "closed")
+        return await deskConfirm(store, handle: handle, prefix: canceled ? "canceled" : "closed")
     }
 
     // MARK: - desk_blocked_on
@@ -622,9 +654,8 @@ extension SwiftToolDispatcher {
     /// set; an EMPTY string clears it.
 
     func impl_desk_blocked_on(input: [String: JSONValue], state: DeskState) async throws -> JSONValue {
+        try Self.validateDeskMutationArguments("desk_blocked_on", input: input)
         let handle = try deskString(input, "handle")
-        // Absent `blocked_on` is the same as an explicit clear: the op replaces
-        // the whole set, so there is no "leave it alone" reading of a missing arg.
         let refs = deskCSV(input, "blocked_on")
         let blockers = try refs.map { try resolveDeskRef($0, in: state, field: "blocked_on") }
         let store = deskStore()
@@ -637,12 +668,11 @@ extension SwiftToolDispatcher {
             ])
         }
         // Name the resolved blockers by the ALIASES the operator sees.
-        let state = try? await store.liveState()
-        let aliases = blockers.compactMap { h in state?.items.first { $0.handle == h }?.alias }
-        let prefix = aliases.isEmpty
+        let aliases = blockers.map { h in state.items.first { $0.handle == h }?.alias ?? h }
+        let prefix = blockers.isEmpty
             ? "blockers cleared"
             : "blocked-on \(aliases.joined(separator: ","))"
-        return deskConfirm(state, handle: handle, prefix: prefix)
+        return await deskConfirm(store, handle: handle, prefix: prefix)
     }
 
     // MARK: - desk_defer
@@ -651,6 +681,7 @@ extension SwiftToolDispatcher {
     /// empty `until` clears the park. A deferred item is not "next up" and is
     /// never flagged stale.
     func impl_desk_defer(input: [String: JSONValue]) async throws -> JSONValue {
+        try Self.validateDeskMutationArguments("desk_defer", input: input)
         let handle = try deskString(input, "handle")
         let raw = optionalString(input, "until")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let until: String? = (raw?.isEmpty == false) ? raw : nil
@@ -666,8 +697,8 @@ extension SwiftToolDispatcher {
                 "reason": .string(e.errorDescription ?? "\(e)"),
             ])
         }
-        return deskConfirm(
-            try? await store.liveState(), handle: handle,
+        return await deskConfirm(
+            store, handle: handle,
             prefix: until.map { "deferred until \($0)" } ?? "defer cleared"
         )
     }
@@ -697,26 +728,75 @@ extension SwiftToolDispatcher {
         return kind
     }
 
-    /// Normalize tool spelling and coercions before DeskRef decodes the fields.
+    /// Author one current stored reference from the selected tool shape.
+    /// Transport arguments never enter its persisted tagged union.
     private func deskBuildRef(_ input: [String: JSONValue]) throws -> DeskRef {
         let refKind = try deskString(input, "ref_kind").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard ["file", "commit", "gh_issue", "gh_pr", "url", "agent", "approval", "trace", "note"].contains(refKind) else {
+        var fields: [String: JSONValue] = [
+            "kind": .string(refKind), "refId": .string(DeskClock.newRefId()),
+        ]
+        func string(_ tool: String, stored: String? = nil, required: Bool = false) throws {
+            if required {
+                fields[stored ?? tool] = .string(try deskString(input, tool))
+                return
+            }
+            guard let raw = input[tool] else { return }
+            guard case .string(let value) = raw else {
+                throw deskInvalid(tool, reason: "desk_add_ref: \(tool) must be a string")
+            }
+            if !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                fields[stored ?? tool] = .string(value)
+            }
+        }
+        func integer(_ key: String, required: Bool = false) throws {
+            guard let raw = input[key] else {
+                if required { throw deskInvalid(key, reason: "desk_add_ref: \(key) is required") }
+                return
+            }
+            guard case .int(let value) = raw, Int(exactly: value) != nil else {
+                throw deskInvalid(key, reason: "desk_add_ref: \(key) must be an integer")
+            }
+            fields[key] = .int(value)
+        }
+        switch refKind {
+        case "file":
+            try string("path", required: true)
+            try integer("line")
+            try string("label")
+        case "commit":
+            try string("sha", required: true)
+            try string("repo")
+            try string("label")
+            try string("status")
+        case "gh_issue", "gh_pr":
+            try string("repo", required: true)
+            try integer("number", required: true)
+            try string("title")
+            try string("status")
+            if refKind == "gh_pr" { try string("checks") }
+        case "url":
+            try string("url", required: true)
+            try string("title")
+        case "agent":
+            try string("name", required: true)
+            try string("handoff_id", stored: "handoffId")
+            try string("session_id", stored: "sessionId")
+        case "approval":
+            try string("id", required: true)
+            try string("status")
+        case "trace":
+            try string("id", required: true)
+            try string("trace_kind", stored: "traceKind")
+        case "note":
+            try string("text", required: true)
+        default:
             throw deskInvalid("ref_kind",
-                reason: "desk_add_ref: unknown ref_kind '\(refKind)' (expected file|commit|gh_issue|gh_pr|url|agent|approval|trace|note)"
-            )
-        }
-        var fields = input.filter { $0.value.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }
-        fields["kind"] = .string(refKind)
-        for key in ["line", "number"] {
-            fields[key] = Self.jsonInt(input[key]).map { .int(Int64($0)) }
-        }
-        for (tool, stored) in [("handoff_id", "handoffId"), ("session_id", "sessionId"), ("trace_kind", "traceKind")] {
-            fields[stored] = optionalString(input, tool).map(JSONValue.string)
+                reason: "desk_add_ref: unknown ref_kind '\(refKind)' (expected file|commit|gh_issue|gh_pr|url|agent|approval|trace|note)")
         }
         guard let ref = DeskRef.fromJSON(.object(fields)) else {
             throw deskInvalid("ref_kind", reason: "desk_add_ref: ref_kind '\(refKind)' has missing or malformed required fields")
         }
-        return DeskRef(kind: ref.kind)
+        return ref
     }
 
 }

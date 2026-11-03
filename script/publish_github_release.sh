@@ -27,14 +27,49 @@ DOWNLOAD_URL="${NATIVEAGENT_DMG_DOWNLOAD_URL:-}"
 TARGET="${NATIVEAGENT_GITHUB_TARGET_COMMIT:-}"
 MODEL_ASSET="${NATIVEAGENT_PUBLISH_MODEL_ASSET:-}"
 DRY_RUN=false
+PREFLIGHT_SOURCE=false
 case "${1:-}" in
   --dry-run) [[ $# == 1 ]] || fail "usage: publish_github_release.sh [--dry-run]"; DRY_RUN=true ;;
+  --preflight-source) [[ $# == 1 ]] || fail 'usage: publish_github_release.sh --preflight-source'; PREFLIGHT_SOURCE=true ;;
   '') ;;
   *) fail "usage: publish_github_release.sh [--dry-run]" ;;
 esac
 
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
   || fail "NATIVEAGENT_GITHUB_REPOSITORY must be owner/repository."
+
+# One source/publication owner, callable before a release spends its compile.
+publication_source_preflight() {
+  "$ROOT/script/check_public_release_source.sh" "$ROOT" || return 1
+  local source_status
+  source_status="$(git -C "$ROOT" status --porcelain --untracked-files=normal)" || return 1
+  [[ -z "$source_status" ]] || fail 'publication source is dirty'
+  HEAD="$(git -C "$ROOT" rev-parse HEAD)" || return 1
+  [[ "$HEAD" =~ ^[0-9a-f]{40}$ ]] || fail 'publication requires one exact source commit'
+  TARGET="${TARGET:-$HEAD}"
+  [[ "$TARGET" == "$HEAD" ]] || fail 'publication target must equal the reviewed source HEAD'
+  GIT_REMOTE=""
+  local name url
+  for name in $(git -C "$ROOT" remote); do
+    url="$(git -C "$ROOT" remote get-url --push "$name")" || return 1
+    case "$url" in
+      "https://github.com/$REPOSITORY"|"https://github.com/$REPOSITORY.git"|"git@github.com:$REPOSITORY"|"git@github.com:$REPOSITORY.git"|"ssh://git@github.com/$REPOSITORY.git") GIT_REMOTE="$name"; break ;;
+    esac
+  done
+  [[ -n "$GIT_REMOTE" ]] || fail 'add a GitHub push remote for the selected public repository before building'
+  command -v gh >/dev/null || fail 'install GitHub CLI and run gh auth login'
+  gh auth status >/dev/null || return 1
+  local visibility remote_target
+  visibility="$(gh api "repos/$REPOSITORY" --jq '.visibility')" || return 1
+  [[ "$visibility" == public ]] || fail 'the publication repository must be public'
+  remote_target="$(gh api "repos/$REPOSITORY/commits/$TARGET" --jq '.sha')" || return 1
+  [[ "$remote_target" == "$TARGET" ]] || fail 'publish the reviewed source commit before building its release'
+}
+if [[ "$PREFLIGHT_SOURCE" == true ]]; then
+  publication_source_preflight
+  echo "==> Publication source ready: $TARGET"
+  exit 0
+fi
 command -v xmllint >/dev/null 2>&1 || fail "xmllint is required."
 command -v jq >/dev/null 2>&1 || fail "jq is required."
 command -v shasum >/dev/null 2>&1 || fail "shasum is required."
@@ -80,10 +115,13 @@ DMG_SHA256="$(shasum -a 256 "$DMG" | awk '{print $1}')"
 TEST_RECEIPT_SHA256="$(shasum -a 256 "$TEST_RECEIPT" | awk '{print $1}')"
 DMG_BYTES="$(wc -c < "$DMG" | tr -d '[:space:]')"
 jq -e --arg target "$TARGET" \
+  --arg name "$DMG_NAME" --arg sha256 "$DMG_SHA256" --argjson bytes "$DMG_BYTES" \
   '.schema_version == 1
    and .source_revision == $target
    and .source_dirty == false
-   and (.canonical_gate == "script/release.sh --artifact-only" and .ios_required == false and .ios_result == "not_run")' \
+   and (.canonical_gate == "script/release.sh --artifact-only" and .ios_required == false and .ios_result == "not_run")
+   and (.completed_at | type == "string" and length > 0)
+   and .artifact.name == $name and .artifact.sha256 == $sha256 and .artifact.byte_length == $bytes' \
   "$TEST_RECEIPT" >/dev/null \
   || fail "release receipt does not prove the exact clean source and artifact gate."
 jq -e \
@@ -95,8 +133,8 @@ jq -e \
   --argjson dmg_bytes "$DMG_BYTES" \
   '.schema_version == 1
    and .version == $version
-   and ((.short_version // $version) == $version)
-   and (.internal_build != true)
+   and .short_version == $version
+   and .internal_build == false
    and .source_revision == $target
    and .test_receipt.source_dirty == false
    and (.test_receipt.canonical_gate == "script/release.sh --artifact-only" and .test_receipt.ios_required == false and .test_receipt.ios_result == "not_run")
@@ -140,7 +178,7 @@ if [[ "$EMBEDDING_DISTRIBUTION" == separate-download ]]; then
   RELEASE_ASSETS+=( "$MODEL_ASSET" )
 fi
 sparkle_validate_deltas "$APPCAST" "${EXPECTED_DOWNLOAD_URL%/*}/" \
-  "${NATIVEAGENT_SPARKLE_ED_PRIV_KEY:-${NATIVE_AGENT_SPARKLE_ED_PRIV_KEY:-}}" \
+  "${NATIVEAGENT_SPARKLE_ED_PRIV_KEY:-}" \
   || fail 'Sparkle delta validation failed'
 [[ "$EMBEDDING_DISTRIBUTION" != bundled || "$SPARKLE_DELTA_COUNT" == 0 ]] \
   || fail "bundled releases publish only the full DMG, appcast, attestation and test receipt"
@@ -150,13 +188,7 @@ if [[ "$DRY_RUN" == true ]]; then
   printf '    asset: %s\n' "${RELEASE_ASSETS[@]}"
   exit 0
 fi
-command -v gh >/dev/null 2>&1 || fail "GitHub CLI (gh) is required."
-gh auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated; run: gh auth login"
-VISIBILITY="$(gh api "repos/$REPOSITORY" --jq '.visibility' 2>/dev/null || true)"
-[[ "$VISIBILITY" == public ]] || fail "$REPOSITORY is not public. Sparkle clients cannot authenticate to a private release feed."
-REMOTE_TARGET="$(gh api "repos/$REPOSITORY/commits/$TARGET" --jq '.sha' 2>/dev/null || true)"
-[[ "$REMOTE_TARGET" == "$TARGET" ]] \
-  || fail "source commit $TARGET is not present in $REPOSITORY. Publish the reviewed source first."
+publication_source_preflight
 
 # ---------------------------------------------------------------------------
 # Git tag (sweep R4 C1). `gh release create --target` creates the tag on the
@@ -172,16 +204,6 @@ REMOTE_TARGET="$(gh api "repos/$REPOSITORY/commits/$TARGET" --jq '.sha' 2>/dev/n
 # ---------------------------------------------------------------------------
 [[ "${NATIVEAGENT_APPCAST_REHEARSAL:-false}" != "true" ]] \
   || fail "refusing to tag or publish: this is a rehearsal run."
-
-GIT_REMOTE=""
-while read -r name url _; do
-  case "$url" in
-    *"$REPOSITORY"*) GIT_REMOTE="$name"; break ;;
-  esac
-done < <(git -C "$ROOT" remote -v 2>/dev/null || true)
-[[ -n "$GIT_REMOTE" ]] \
-  || fail "no git remote points at $REPOSITORY, so the release tag $TAG cannot be pushed.
-       Add the remote (git remote add origin https://github.com/$REPOSITORY.git) and retry."
 
 if EXISTING_TAG_COMMIT="$(git -C "$ROOT" rev-list -n 1 "$TAG" 2>/dev/null)"; then
   [[ "$EXISTING_TAG_COMMIT" == "$TARGET" ]] \

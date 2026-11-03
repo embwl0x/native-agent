@@ -59,7 +59,7 @@ public actor ContextSQLiteStore {
         }
         // The WAL pool lets turn-path reads run beside publication, pruning and vacuum.
         self.dbPool = try DatabasePool(path: databaseURL.path, configuration: configuration)
-        try Self.migrator.migrate(dbPool)
+        try Self.openCurrentSchema(dbPool)
     }
 
     @discardableResult
@@ -90,20 +90,6 @@ public actor ContextSQLiteStore {
 
             let affected = Set(draft.changedSources.map(\.descriptor.id)).union(draft.removedSourceIDs)
             for sourceID in affected.sorted() {
-                try db.execute(
-                    sql: """
-                    UPDATE context_relationship_versions
-                    SET valid_to_generation = ?
-                    WHERE valid_to_generation IS NULL
-                      AND EXISTS (
-                        SELECT 1 FROM context_atom_versions AS atom
-                        WHERE atom.source_id = ? AND atom.valid_to_generation IS NULL
-                          AND (atom.atom_id = context_relationship_versions.source_atom_id
-                            OR atom.atom_id = context_relationship_versions.target_atom_id)
-                      )
-                    """,
-                    arguments: [generationID - 1, sourceID.rawValue]
-                )
                 try db.execute(
                     sql: """
                     UPDATE context_atom_versions
@@ -224,41 +210,6 @@ public actor ContextSQLiteStore {
                 }
             }
 
-            for source in draft.changedSources.sorted(by: { $0.descriptor.id < $1.descriptor.id }) {
-                for relationship in source.relationships.sorted(by: { $0.id < $1.id }) {
-                    guard try Self.activeAtomExists(relationship.sourceAtomID, db: db) else {
-                        throw ContextFlowStoreError.relationshipSourceMissing(
-                            relationship.sourceAtomID.rawValue
-                        )
-                    }
-                    guard try Self.activeAtomExists(relationship.targetAtomID, db: db) else {
-                        throw ContextFlowStoreError.relationshipTargetMissing(
-                            relationship.targetAtomID.rawValue
-                        )
-                    }
-                    let versionKey = Self.versionKey(
-                        stableID: relationship.id.rawValue,
-                        generationID: generationID
-                    )
-                    try db.execute(
-                        sql: """
-                        INSERT INTO context_relationship_versions (
-                            version_key, relationship_id, source_atom_id,
-                            target_atom_id, valid_from_generation, valid_to_generation, payload_json
-                        ) VALUES (?, ?, ?, ?, ?, NULL, ?)
-                        """,
-                        arguments: [
-                            versionKey,
-                            relationship.id.rawValue,
-                            relationship.sourceAtomID.rawValue,
-                            relationship.targetAtomID.rawValue,
-                            generationID,
-                            try Self.encodeJSON(relationship),
-                        ]
-                    )
-                }
-            }
-
             let sourceFingerprint = try Self.currentSourceFingerprint(db: db)
             let atomCount = try Int.fetchOne(
                 db,
@@ -351,24 +302,10 @@ public actor ContextSQLiteStore {
                 }
             }
 
-            let relationshipRows = try Row.fetchAll(
-                db,
-                sql: """
-                SELECT version_key, payload_json, valid_from_generation, valid_to_generation
-                FROM context_relationship_versions
-                WHERE valid_from_generation <= ?
-                  AND (valid_to_generation IS NULL OR valid_to_generation >= ?)
-                ORDER BY relationship_id ASC
-                """,
-                arguments: [id, id]
-            )
-            let relationships = try relationshipRows.map(Self.decodeRelationship)
-
             return ContextStoredGeneration(
                 generation: generation,
                 sources: sources,
-                atoms: atoms,
-                relationships: relationships
+                atoms: atoms
             )
         }
     }
@@ -399,12 +336,6 @@ public actor ContextSQLiteStore {
                 guard atomIDs.insert(atom.id).inserted else {
                     throw ContextFlowStoreError.duplicateAtom(atom.id.rawValue)
                 }
-            }
-            let localAtomIDs = Set(source.atoms.map(\.id))
-            for relationship in source.relationships where !localAtomIDs.contains(relationship.sourceAtomID) {
-                throw ContextFlowStoreError.relationshipSourceMissing(
-                    relationship.sourceAtomID.rawValue
-                )
             }
         }
     }
@@ -440,19 +371,6 @@ public actor ContextSQLiteStore {
             atomCount: atomCount,
             sourceCount: sourceCount
         )
-    }
-
-    private static func activeAtomExists(_ id: ContextAtomID, db: Database) throws -> Bool {
-        try Bool.fetchOne(
-            db,
-            sql: """
-            SELECT EXISTS(
-                SELECT 1 FROM context_atom_versions
-                WHERE atom_id = ? AND valid_to_generation IS NULL
-            )
-            """,
-            arguments: [id.rawValue]
-        ) ?? false
     }
 
     private static func currentSourceFingerprint(db: Database) throws -> String {

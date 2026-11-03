@@ -292,21 +292,219 @@ function requireStringArray(value, field, minimumCount, maximumCount, maximumIte
 }
 
 function requireKeySpec(value) {
+  trustedKeyEvents(value);
+}
+
+// The wire contract owns key spelling and CDP encoding. The page never
+// implements keyboard defaults; Chrome and the focused editor own them.
+export function trustedKeyEvents(value) {
   if (typeof value !== "string" || value.length === 0 || value.length > 64) {
     throw new ProtocolError("invalid_payload", "key must be a bounded key specification.");
   }
-  const parts = value.split("+");
-  const base = parts.pop();
-  const modifiers = new Set(["Alt", "Control", "Meta", "Shift"]);
-  const bases = new Set([
-    "Enter", "Tab", "Escape", "ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight",
-    "Home", "End", "PageUp", "PageDown", "Backspace", "Delete", "Space", "A",
-  ]);
-  // Accept one printable character for site handlers reached by synthetic key events.
-  const printable = typeof base === "string" && [...base].length === 1 && base.trim().length === 1;
-  if ((!bases.has(base) && !printable) || parts.some((part, index) => !modifiers.has(part) || parts.indexOf(part) !== index)) {
-    throw new ProtocolError("invalid_payload", "key uses an unsupported key or modifier combination.");
+  const parts = [];
+  let base = value, match;
+  while ((match = /^(Alt|Control|Meta|Shift)\+/.exec(base))) {
+    if (parts.includes(match[1])) throw new ProtocolError("invalid_payload", "A key modifier may occur only once.");
+    parts.push(match[1]); base = base.slice(match[0].length);
   }
+  const named = { Enter: ["Enter", 13, "\r"], Tab: ["Tab", 9], Escape: ["Escape", 27],
+    ArrowDown: ["ArrowDown", 40], ArrowUp: ["ArrowUp", 38], ArrowLeft: ["ArrowLeft", 37], ArrowRight: ["ArrowRight", 39],
+    Home: ["Home", 36], End: ["End", 35], PageUp: ["PageUp", 33], PageDown: ["PageDown", 34],
+    Backspace: ["Backspace", 8], Delete: ["Delete", 46], Space: ["Space", 32, " "], F5: ["F5", 116],
+    // Physical keypad definitions match Playwright's server/usKeyboardLayout.ts.
+    NumpadEnter: ["NumpadEnter", 13, "\r", "Enter"],
+    Numpad5: ["Numpad5", 12, "", "Clear", { key: "5", keyCode: 101, text: "5" }],
+    NumpadSubtract: ["NumpadSubtract", 109, "-", "-"] };
+  const printable = [...base].length === 1 && !/[\p{C}\p{Zl}\p{Zp}]/u.test(base);
+  if (!named[base] && !printable) throw new ProtocolError("invalid_payload", "Use a named navigation/editing key or one printable character, with optional modifiers.");
+  const modifiers = (parts.includes("Alt") ? 1 : 0) | (parts.includes("Control") ? 2 : 0)
+    | (parts.includes("Meta") ? 4 : 0) | (parts.includes("Shift") ? 8 : 0);
+  const shiftedNamed = parts.includes("Shift") ? named[base]?.[4] : undefined;
+  let key = shiftedNamed?.key ?? named[base]?.[3] ?? (base === "Space" ? " " : base);
+  let code = named[base]?.[0] ?? "", windowsVirtualKeyCode = shiftedNamed?.keyCode ?? named[base]?.[1] ?? 0;
+  if (/^[a-z]$/i.test(base)) {
+    key = parts.includes("Shift") ? base.toUpperCase() : base;
+    code = `Key${base.toUpperCase()}`; windowsVirtualKeyCode = base.toUpperCase().charCodeAt(0);
+  } else if (/^[0-9]$/.test(base)) {
+    code = `Digit${base}`; windowsVirtualKeyCode = base.charCodeAt(0);
+    if (parts.includes("Shift")) key = ")!@#$%^&*("[Number(base)];
+  } else if (printable && !named[base]) {
+    const physical = { "`": ["Backquote", 192], "~": ["Backquote", 192], "-": ["Minus", 189], "_": ["Minus", 189],
+      "=": ["Equal", 187], "+": ["Equal", 187], "[": ["BracketLeft", 219], "{": ["BracketLeft", 219],
+      "]": ["BracketRight", 221], "}": ["BracketRight", 221], "\\": ["Backslash", 220], "|": ["Backslash", 220],
+      ";": ["Semicolon", 186], ":": ["Semicolon", 186], "'": ["Quote", 222], '"': ["Quote", 222],
+      ",": ["Comma", 188], "<": ["Comma", 188], ".": ["Period", 190], ">": ["Period", 190], "/": ["Slash", 191], "?": ["Slash", 191] };
+    if (physical[base]) [code, windowsVirtualKeyCode] = physical[base];
+    if (parts.includes("Shift")) {
+      const plain = "`-=[]\\;',./", shifted = '~_+{}|:"<>?';
+      const index = plain.indexOf(base);
+      if (index >= 0) key = shifted[index];
+    }
+    const shiftedDigit = ")!@#$%^&*(".indexOf(base);
+    if (shiftedDigit >= 0) { code = `Digit${shiftedDigit}`; windowsVirtualKeyCode = 48 + shiftedDigit; }
+  }
+  const text = modifiers & (1 | 2 | 4) ? "" : shiftedNamed?.text ?? named[base]?.[2] ?? (printable ? key : "");
+  const common = { key, code, windowsVirtualKeyCode, modifiers,
+    ...(code.startsWith("Numpad") ? { location: 3, isKeypad: true } : {}) };
+  return { expectedKeydown: { key, altKey: !!(modifiers & 1), ctrlKey: !!(modifiers & 2),
+    metaKey: !!(modifiers & 4), shiftKey: !!(modifiers & 8) }, events: [
+    // Combined keyDown lets Chromium generate (and cancel) its own character.
+    // Without text, keyDown has rawKeyDown semantics. Never send a second char.
+    { ...common, type: "keyDown", ...(text ? { text, unmodifiedText: text } : {}), commands: macEditingCommands(code, modifiers) },
+    { ...common, type: "keyUp" },
+  ] };
+}
+
+// CDP bypasses AppKit's NSStandardKeyBindingResponding translation. Complete
+// Playwright macEditingCommands table (including multi-command entries):
+// https://github.com/microsoft/playwright/blob/main/packages/playwright-core/src/server/macEditingCommands.ts
+// Chromium command vocabulary:
+// https://chromium.googlesource.com/chromium/src/+/main/third_party/blink/renderer/core/editing/commands/editor_command_names.h
+// Chromium also defines Shift+Meta+KeyV in its macOS editing menu accelerators:
+// https://chromium.googlesource.com/chromium/src/+/main/chrome/browser/ui/cocoa/accelerators_cocoa.mm
+// Keep exact modifier+code entries; never infer a command from a partial match.
+/*
+ * Copyright 2017 Google Inc. All rights reserved.
+ * Modifications copyright (c) Microsoft Corporation.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const MAC_EDITING_COMMANDS = {
+  'Backspace': 'deleteBackward:',
+  'Enter': 'insertNewline:',
+  'NumpadEnter': 'insertNewline:',
+  'Escape': 'cancelOperation:',
+  'ArrowUp': 'moveUp:',
+  'ArrowDown': 'moveDown:',
+  'ArrowLeft': 'moveLeft:',
+  'ArrowRight': 'moveRight:',
+  'F5': 'complete:',
+  'Delete': 'deleteForward:',
+  'Home': 'scrollToBeginningOfDocument:',
+  'End': 'scrollToEndOfDocument:',
+  'PageUp': 'scrollPageUp:',
+  'PageDown': 'scrollPageDown:',
+  'Shift+Backspace': 'deleteBackward:',
+  'Shift+Enter': 'insertNewline:',
+  'Shift+NumpadEnter': 'insertNewline:',
+  'Shift+Escape': 'cancelOperation:',
+  'Shift+ArrowUp': 'moveUpAndModifySelection:',
+  'Shift+ArrowDown': 'moveDownAndModifySelection:',
+  'Shift+ArrowLeft': 'moveLeftAndModifySelection:',
+  'Shift+ArrowRight': 'moveRightAndModifySelection:',
+  'Shift+F5': 'complete:',
+  'Shift+Delete': 'deleteForward:',
+  'Shift+Home': 'moveToBeginningOfDocumentAndModifySelection:',
+  'Shift+End': 'moveToEndOfDocumentAndModifySelection:',
+  'Shift+PageUp': 'pageUpAndModifySelection:',
+  'Shift+PageDown': 'pageDownAndModifySelection:',
+  'Shift+Numpad5': 'delete:',
+  'Control+Tab': 'selectNextKeyView:',
+  'Control+Enter': 'insertLineBreak:',
+  'Control+NumpadEnter': 'insertLineBreak:',
+  'Control+Quote': 'insertSingleQuoteIgnoringSubstitution:',
+  'Control+KeyA': 'moveToBeginningOfParagraph:',
+  'Control+KeyB': 'moveBackward:',
+  'Control+KeyD': 'deleteForward:',
+  'Control+KeyE': 'moveToEndOfParagraph:',
+  'Control+KeyF': 'moveForward:',
+  'Control+KeyH': 'deleteBackward:',
+  'Control+KeyK': 'deleteToEndOfParagraph:',
+  'Control+KeyL': 'centerSelectionInVisibleArea:',
+  'Control+KeyN': 'moveDown:',
+  'Control+KeyO': ['insertNewlineIgnoringFieldEditor:', 'moveBackward:'],
+  'Control+KeyP': 'moveUp:',
+  'Control+KeyT': 'transpose:',
+  'Control+KeyV': 'pageDown:',
+  'Control+KeyY': 'yank:',
+  'Control+Backspace': 'deleteBackwardByDecomposingPreviousCharacter:',
+  'Control+ArrowUp': 'scrollPageUp:',
+  'Control+ArrowDown': 'scrollPageDown:',
+  'Control+ArrowLeft': 'moveToLeftEndOfLine:',
+  'Control+ArrowRight': 'moveToRightEndOfLine:',
+  'Shift+Control+Enter': 'insertLineBreak:',
+  'Shift+Control+NumpadEnter': 'insertLineBreak:',
+  'Shift+Control+Tab': 'selectPreviousKeyView:',
+  'Shift+Control+Quote': 'insertDoubleQuoteIgnoringSubstitution:',
+  'Shift+Control+KeyA': 'moveToBeginningOfParagraphAndModifySelection:',
+  'Shift+Control+KeyB': 'moveBackwardAndModifySelection:',
+  'Shift+Control+KeyE': 'moveToEndOfParagraphAndModifySelection:',
+  'Shift+Control+KeyF': 'moveForwardAndModifySelection:',
+  'Shift+Control+KeyN': 'moveDownAndModifySelection:',
+  'Shift+Control+KeyP': 'moveUpAndModifySelection:',
+  'Shift+Control+KeyV': 'pageDownAndModifySelection:',
+  'Shift+Control+Backspace': 'deleteBackwardByDecomposingPreviousCharacter:',
+  'Shift+Control+ArrowUp': 'scrollPageUp:',
+  'Shift+Control+ArrowDown': 'scrollPageDown:',
+  'Shift+Control+ArrowLeft': 'moveToLeftEndOfLineAndModifySelection:',
+  'Shift+Control+ArrowRight': 'moveToRightEndOfLineAndModifySelection:',
+  'Alt+Backspace': 'deleteWordBackward:',
+  'Alt+Enter': 'insertNewlineIgnoringFieldEditor:',
+  'Alt+NumpadEnter': 'insertNewlineIgnoringFieldEditor:',
+  'Alt+Escape': 'complete:',
+  'Alt+ArrowUp': ['moveBackward:', 'moveToBeginningOfParagraph:'],
+  'Alt+ArrowDown': ['moveForward:', 'moveToEndOfParagraph:'],
+  'Alt+ArrowLeft': 'moveWordLeft:',
+  'Alt+ArrowRight': 'moveWordRight:',
+  'Alt+Delete': 'deleteWordForward:',
+  'Alt+PageUp': 'pageUp:',
+  'Alt+PageDown': 'pageDown:',
+  'Shift+Alt+Backspace': 'deleteWordBackward:',
+  'Shift+Alt+Enter': 'insertNewlineIgnoringFieldEditor:',
+  'Shift+Alt+NumpadEnter': 'insertNewlineIgnoringFieldEditor:',
+  'Shift+Alt+Escape': 'complete:',
+  'Shift+Alt+ArrowUp': 'moveParagraphBackwardAndModifySelection:',
+  'Shift+Alt+ArrowDown': 'moveParagraphForwardAndModifySelection:',
+  'Shift+Alt+ArrowLeft': 'moveWordLeftAndModifySelection:',
+  'Shift+Alt+ArrowRight': 'moveWordRightAndModifySelection:',
+  'Shift+Alt+Delete': 'deleteWordForward:',
+  'Shift+Alt+PageUp': 'pageUp:',
+  'Shift+Alt+PageDown': 'pageDown:',
+  'Control+Alt+KeyB': 'moveWordBackward:',
+  'Control+Alt+KeyF': 'moveWordForward:',
+  'Control+Alt+Backspace': 'deleteWordBackward:',
+  'Shift+Control+Alt+KeyB': 'moveWordBackwardAndModifySelection:',
+  'Shift+Control+Alt+KeyF': 'moveWordForwardAndModifySelection:',
+  'Shift+Control+Alt+Backspace': 'deleteWordBackward:',
+  'Meta+NumpadSubtract': 'cancel:',
+  'Meta+Backspace': 'deleteToBeginningOfLine:',
+  'Meta+ArrowUp': 'moveToBeginningOfDocument:',
+  'Meta+ArrowDown': 'moveToEndOfDocument:',
+  'Meta+ArrowLeft': 'moveToLeftEndOfLine:',
+  'Meta+ArrowRight': 'moveToRightEndOfLine:',
+  'Shift+Meta+NumpadSubtract': 'cancel:',
+  'Shift+Meta+Backspace': 'deleteToBeginningOfLine:',
+  'Shift+Meta+ArrowUp': 'moveToBeginningOfDocumentAndModifySelection:',
+  'Shift+Meta+ArrowDown': 'moveToEndOfDocumentAndModifySelection:',
+  'Shift+Meta+ArrowLeft': 'moveToLeftEndOfLineAndModifySelection:',
+  'Shift+Meta+ArrowRight': 'moveToRightEndOfLineAndModifySelection:',
+  'Meta+KeyA': 'selectAll:',
+  'Meta+KeyC': 'copy:',
+  'Meta+KeyX': 'cut:',
+  'Meta+KeyV': 'paste:',
+  'Meta+KeyZ': 'undo:',
+  'Shift+Meta+KeyZ': 'redo:',
+  'Shift+Meta+KeyV': 'pasteAndMatchStyle:',
+};
+
+function macEditingCommands(code, modifiers) {
+  // Same canonical spelling and CDP conversion as Playwright's crInput.ts:
+  // https://github.com/microsoft/playwright/blob/main/packages/playwright-core/src/server/chromium/crInput.ts
+  const shortcut = [["Shift", 8], ["Control", 2], ["Alt", 1], ["Meta", 4]]
+    .filter(([, mask]) => modifiers & mask).map(([name]) => name).concat(code).join("+");
+  if (!Object.hasOwn(MAC_EDITING_COMMANDS, shortcut)) return [];
+  const entry = MAC_EDITING_COMMANDS[shortcut];
+  // CDP does not support AppKit insert* selectors as editing commands. Chrome
+  // receives text through the combined keyDown instead, as in Playwright.
+  return (Array.isArray(entry) ? entry : [entry])
+    .filter(command => !command.startsWith("insert")).map(command => command.slice(0, -1));
 }
 
 function requireTabAndSequence(payload) {

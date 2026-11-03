@@ -14,7 +14,7 @@ import WorkshopExecution
 import Senses
 import SwarmRuns
 import NativeAgentShared
-// Blueprint: | `HerScreen.swift` | `HerScreen` enum; `withNames`, `resolve`, compact Senses home projection and readable full senses item from registry/news and owner-reported live watches, with scoped sense changes and named corners, sharing the live built-ability line with turn context; shared home/room crew rows and worker details preserve canonical SwarmCrew liveness. Name counters and retained mappings validate; checked allocation reports exhaustion through rendering and resolution. Only a missing name book bootstraps; damaged bytes are preserved and cached executable aliases share the checked read. Home acknowledges displayed identities only, retaining hidden and capped changes. Invalid saved observation timestamps remain visible and preserved; age conversion is checked. |
+// Blueprint: | `HerScreen.swift` | `HerScreen` enum; `withNames`, `resolve`, compact Senses home projection and readable full senses item from registry/news and owner-reported live watches, with scoped sense changes and named corners, sharing the live built-ability line with turn context; shared home/room crew rows and worker details preserve canonical SwarmCrew liveness and expose checked receipt gaps before rendering worker counts. Name counters and retained mappings validate; item numbering compares canonical locators and preserves retained title-bearing keys, with current titles as display metadata; checked allocation reports exhaustion. Only a missing name book bootstraps; damaged bytes are preserved and cached executable aliases share the checked read. Home acknowledges displayed identities only, retaining hidden and capped changes. Invalid saved observation timestamps remain visible and preserved; age conversion is checked. |
 
 /// Home renders retained owner state in layout order without reading another domain.
 package enum HerScreen {
@@ -30,6 +30,8 @@ package enum HerScreen {
         var slugs: [String: Slug] = [:]
         var numbers: [String: [String: Int]] = [:]
         var next: [String: Int] = [:]
+        /// Display metadata, keyed by issued room/number; never an identity.
+        var titles: [String: String]? = nil
 
         mutating func slug(id: String, name: String) -> String {
             if let (key, entry) = slugs.first(where: { $0.value.id == id }) {
@@ -68,16 +70,39 @@ package enum HerScreen {
             }
         }
 
-        mutating func number(_ kind: String, id: String, existing: () -> Set<String>) throws -> Int {
-            if let n = numbers[kind]?[id] { return n }
+        mutating func number(_ kind: String, id: String, title: String? = nil, existing: () -> Set<String>) throws -> Int {
+            func retainedNumber() -> Int? {
+                if let n = numbers[kind]?[id] { return n }
+                // DATA PRESENT: old record keys contain a display title. Keep
+                // their issued numbers and their one reader; compare only the
+                // owner's locator. Duplicate historical numbers remain aliases
+                // for that same item, never numbers available for reassignment.
+                guard kind.hasPrefix("item."), let locator = HerScreen.recordIdentity(id) else { return nil }
+                return numbers[kind]?.filter { HerScreen.recordIdentity($0.key) == locator }.map(\.value).min()
+            }
+            if let n = retainedNumber() {
+                if let title {
+                    titles = titles ?? [:]
+                    titles?[kind + ":" + String(n)] = title
+                    if let locator = HerScreen.recordIdentity(id) {
+                        for (key, alias) in numbers[kind] ?? [:] where HerScreen.recordIdentity(key) == locator {
+                            titles?[kind + ":" + String(alias)] = title
+                        }
+                    }
+                }
+                return n
+            }
             let n = next[kind] ?? 1
             let (following, overflow) = n.addingReportingOverflow(1)
             guard n > 0, !overflow else { throw NameFailure("The \(kind) name counter is exhausted") }
             numbers[kind, default: [:]][id] = n
             next[kind] = following
+            if let title { titles = titles ?? [:]; titles?[kind + ":" + String(n)] = title }
             if let row = numbers[kind], row.count > 200 {
                 let keep = existing().union([id])
-                numbers[kind] = row.filter { keep.contains($0.key) }
+                numbers[kind] = row.filter { entry in
+                    keep.contains(entry.key) || (HerScreen.recordIdentity(entry.key).map { keep.contains($0) } == true)
+                }
             }
             return n
         }
@@ -93,7 +118,10 @@ package enum HerScreen {
     }
 
     static func nameFailure(_ error: Error) -> String {
-        "Workspace names unavailable: " + error.localizedDescription + ". Saved bytes are preserved; repair her_screen/names.json before using names."
+        let typed = error as? ToolFailureError
+        return readFailure(error, reason: "workspace_source_unavailable", remedy: Repair.remedy(owner: typed?.owner ?? "Workspace source",
+            nextCall: nil, tap: typed?.tap,
+            instruction: typed?.instruction ?? "Preserve saved bytes and repair the reported source's read/write access before continuing; do not repeat completed work."))
     }
 
     /// User's Agent view renders under this: names show as they would, and
@@ -164,7 +192,7 @@ package enum HerScreen {
             }
             if let target = buildTarget(name, dataRoot: dataRoot) { return target }
             // A text room's row or verb: `today.3`, `mail.find`, `arrivals.2.dismiss`.
-            if name.hasPrefix("elsewhere."), !MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) {
+            if name.hasPrefix("elsewhere."), try !MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) {
                 return .page(elsewhereRoom(dataRoot: dataRoot, scope: scope))
             }
             let cachedName = name.hasPrefix("windows.") || name.hasPrefix("elsewhere.") ? scope + "\u{0}" + name : name
@@ -187,7 +215,8 @@ package enum HerScreen {
             }
             if let web = webTarget(name, verb: verb, dataRoot: dataRoot, scope: scope) { return web }
             if name == "desk", verb == "add" { return .action(.configure(tool: "desk_add_item", input: [:], title: "Add work")) }
-            if name.hasPrefix("desk."), let state = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() {
+            if name.hasPrefix("desk.") {
+                let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
                 let alias = String(name.dropFirst(5))
                 guard let item = state.items.first(where: { $0.alias == alias }) else { return nil }
                 let handle: [String: JSONValue] = ["handle": .string(item.handle)]
@@ -212,7 +241,7 @@ package enum HerScreen {
             }
             if verb == nil, name.hasPrefix("chat.") || UUID(uuidString: name) != nil || name == scope.lowercased() {
                 let id = name.hasPrefix("chat.") ? try Int(name.dropFirst(5)).flatMap { n in try withNames(dataRoot, { $0.id("chat", n) }) } : raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let id, let row = try? HumanConversationIndex.rows(dataRoot: dataRoot).first(where: {
+                if let id, let row = try HumanConversationIndex.rows(dataRoot: dataRoot).first(where: {
                     $0["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })?.caseInsensitiveCompare(id) == .orderedSame
                 }), let session = row["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) {
                     return open(.record(tool: "chat_conversations", input: ["conversation_session_id": .string(session)],
@@ -273,17 +302,23 @@ package enum HerScreen {
     static func home(dataRoot: URL, scope: String, browserPages: [AgentWorkspaceLocation], windows: [String] = [],
                      now: Date = Date(), markSeen: Bool = true) async -> String {
         do {
+            let layout = SurfaceLayoutStore.layout(dataRoot: dataRoot)
             let (agent, person) = names(dataRoot)
             let world = await readWorld(dataRoot, now: now)
+            if !world.failures.isEmpty {
+                return screen(["HOME", "unavailable"], [[freshness(world, now: now)]
+                    + [layout.failure?.localizedDescription].compactMap { $0 }],
+                    verbs: [("home", "read again after repairing the reported sources")])
+            }
             let seen = await lastSeen(dataRoot)
-            let presence = MacPersonInput.presence()
+            let presence = PersonPresence.read(dataRoot: dataRoot, now: now)
             let connected = BrowserConnectionMirror.connected == true
             let page = ChromePageMirror.page(tab: nil, dataRoot: dataRoot, session: scope)
             var marks = try worldMarks(world, dataRoot: dataRoot, person: person, now: now)
             // Home alone acknowledges presence, Chrome, day badges and this chat's tabs.
             var shown: [String: Mark] = [:]
-            if let presence {
-                let word = presence.here ? " here" : " away"
+            if let transition = presence.transition {
+                let word = transition.here ? " here" : " away"
                 shown["home:presence"] = Mark(fp: word, line: person + word, at: now.timeIntervalSince1970)
             }
             shown["home:browser"] = Mark(fp: connected ? "on" : "off",
@@ -310,8 +345,8 @@ package enum HerScreen {
             if !baseline { marks.merge(shown) { a, _ in a } }
 
             var header = [agent.uppercased(), "Snapshot as of " + now.formatted(.iso8601), freshness(world, now: now)]
-            header.append(presence.map { $0.here ? person + " here" : person + " away " + age($0.seconds) }
-                ?? person + " presence unknown" + (MacPersonInput.idle() == nil ? ": needs Input Monitoring" : ""))
+            if let failure = layout.failure { header.append(failure.localizedDescription) }
+            header.append(person + ": " + presence.line)
             let defaults = UserDefaults.standard
             if let mode = defaults.string(forKey: "nativeagent.viewMode") { header.append(mode.capitalized + " view") }
             if let problem = seen?.problem { header.append(problem) }
@@ -326,9 +361,10 @@ package enum HerScreen {
             let (helpers, helpersMore) = helperRows(world, dataRoot: dataRoot, person: person, now: now)
 
             // Her home's sections in the layout's order, as the window's view
-            // shows them (ui/layout.json); a hidden one is not read.
-            let layout = SurfaceLayoutStore.layout(dataRoot: dataRoot), profile = SurfaceLayoutStore.profile
-            let blocks = layout.shown("home", profile: profile).map(\.name)
+            // shows them (ui/layout.json); an unavailable layout exposes the
+            // shipped content with its repair, without inventing a layout.
+            let profile = SurfaceLayoutStore.profile
+            let blocks = layout.contentNames("home", profile: profile)
             var rows: [String: [String]] = [:]
             var acknowledged: Set<String> = presence == nil ? [] : ["home:presence"]
             for name in blocks {
@@ -354,7 +390,7 @@ package enum HerScreen {
                         + (windows.count > 3 ? " +\(windows.count - 3)" : "") + " · item \"windows\""]))
                 case "people": rows[name] = section("PEOPLE", ["Contacts, recorded exchanges and helper health; no full Doctor check."] + columns(people) + (peopleMore > 0 ? ["+\(peopleMore) more · item \"people\""] : []) + world.found)
                 case "helpers": rows[name] = section("HELPERS", ["Definitions, latest shelf results and run queue; not full run history."] + columns(helpers) + (helpersMore > 0 ? ["+\(helpersMore) more · item \"helpers\""] : []))
-                case "senses": rows[name] = section("MY SENSES", ["Registered abilities and recent changes; no sensory observation."] + world.senses)
+                case "senses": rows[name] = section("MY SENSES", [person + ": " + presence.line] + world.senses)
                 case "elsewhere": rows[name] = section("ELSEWHERE", ["Latest speakers across recent transcripts; not a complete activity log."] + elsewhereRows(world, dataRoot: dataRoot, scope: scope, person: person, now: now))
                 case "places":
                     // Places show prior read badges; calendar and reminders expire each day.
@@ -375,10 +411,10 @@ package enum HerScreen {
                     }
                     let pulses = ["mail": mailPulse(dataRoot: dataRoot, now: now), "calendar": lifePulse("calendar", dataRoot: dataRoot, now: now), "desk": desk.pulse,
                                   "browser": browser, "reminders": lifePulse("reminders", dataRoot: dataRoot, now: now)]
-                    let places = layout.shown("places", profile: profile).map { AppDoorNames.resolve($0.name) }
+                    let places = layout.contentNames("places", profile: profile).map(AppDoorNames.resolve)
                     rows[name] = section("PLACES", ["Navigation, Chrome mirror and prior read badges; calendar, reminders and mail not read here."] + placeLines(places).map { $0.map { pulses[$0] ?? $0 }.joined(separator: " · ") })
                 case "mac":
-                    let mine = touched(dataRoot: dataRoot, now: now)
+                    let mine = try touched(dataRoot: dataRoot, now: now)
                     rows[name] = section("MAC", ["Front app/lock; recorded app reads/actions over \(Int(touchedHours))h; no fresh window content.", await macFront(person) + " · Mac apps my mac verbs read or acted in: "
                         + (mine.isEmpty ? "none" : mine.prefix(4).map { clip($0.app, 30) + ($0.readout.map { " · " + clip($0, 20) } ?? "") }
                             .joined(separator: ", "))])
@@ -424,14 +460,14 @@ package enum HerScreen {
             }
             if rows["helpers"]?.isEmpty == false { acknowledged.formUnion(helpers.map(\.name)) }
             if rows["places"]?.isEmpty == false {
-                let places = Set(layout.shown("places", profile: profile).map { AppDoorNames.resolve($0.name) })
+                let places = Set(layout.contentNames("places", profile: profile).map(AppDoorNames.resolve))
                 for place in ["browser", "calendar", "reminders"] where places.contains(place) {
                     acknowledged.insert("home:" + place)
                 }
                 // A tab's exact identity is shown only by the live page cell.
                 if places.contains("browser"), let page { acknowledged.insert(ownTabs + "tab:" + String(page.tab)) }
             }
-            if markSeen, world.pending.isEmpty {
+            if markSeen, world.pending.isEmpty, world.failures.isEmpty {
                 Self.markSeen(dataRoot, marks: marks, only: acknowledged, now: now)
             }
             return lines.joined(separator: "\n")
@@ -576,8 +612,8 @@ package enum HerScreen {
     /// `answered`: her message is the newest in the chat, so what they said there she has seen.
     package struct BridgeChat { package let id: String; package let who: String; package let title: String; package let at: Date; package var heard: Date? = nil; package var answered = false }
 
-    package static func bridgeChats(dataRoot: URL) -> [BridgeChat] {
-        var chats: [BridgeChat] = AgentWorkSession.verified(dataRoot: dataRoot).compactMap { session in
+    package static func bridgeChats(dataRoot: URL) throws -> [BridgeChat] {
+        var chats: [BridgeChat] = try AgentWorkSession.verified(dataRoot: dataRoot).compactMap { session in
             let row = session.row
             guard let at = row["updatedAt"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }).flatMap(date) else { return nil }
             let raw = row["title"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? session.topic
@@ -593,7 +629,7 @@ package enum HerScreen {
         var looked: [String: Int] = [:]
         for index in chats.indices where looked[chats[index].who, default: 0] < 2 {
             looked[chats[index].who, default: 0] += 1
-            let tail = chatTail(chats[index].id, dataRoot: dataRoot, bytes: 32_768)
+            let tail = try chatTail(chats[index].id, dataRoot: dataRoot, bytes: 32_768)
             chats[index].heard = tail.last { !$0.mine }?.date
             chats[index].answered = tail.last?.mine == true
         }
@@ -636,9 +672,9 @@ package enum HerScreen {
     }
 
     /// The contact's latest live exchange, from the supplied transcript inventory.
-    static func thread(_ contact: Contact, dataRoot: URL, identity: AgentContactIdentity, transcripts: [(String, URL)]) -> BridgeChat? {
+    static func thread(_ contact: Contact, dataRoot: URL, identity: AgentContactIdentity, transcripts: [(String, URL)]) throws -> BridgeChat? {
         let owner = String(contact.id.dropFirst(5))
-        guard let tail = try? ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, tailBytes: 65_536, identity: identity, transcripts: transcripts) else { return nil }
+        let tail = try ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, tailBytes: 65_536, identity: identity, transcripts: transcripts)
         guard let last = tail.last else { return nil }
         return BridgeChat(id: ContactThread.session(owner: owner), who: contact.id, title: "", at: last.at,
                           heard: tail.last { !$0.mine }?.at, answered: last.mine)
@@ -768,10 +804,13 @@ package enum HerScreen {
             return try withNames(dataRoot) { book in
                 try rows.compactMap { row -> String? in
                     guard let id = row["id"] as? String else { return nil }
+                    if let unavailable = row["receiptUnavailable"] as? String {
+                        return "Crew receipt unavailable · " + unavailable
+                    }
                     let workers = row["workers"] as? [[String: Any]] ?? []
-                    let working = workers.filter { ($0["status"] as? String ?? "working") == "working" }.count
+                    let working = workers.filter { $0["status"] as? String == "working" }.count
                     let status = SwarmCrew.liveness(of: row) == .running ? "\(working) of \(workers.count) working"
-                        : crewState(row, fallback: "done") + " · \(workers.count) workers"
+                        : crewState(row) + " · \(workers.count) workers"
                     let at = (liveOnly ? row["createdAt"] as? String
                         : row["completedAt"] as? String ?? (row["status"] as? String == "interrupted" ? nil : row["createdAt"] as? String)).flatMap(date)
                     let n = try book.number("crew", id: id) { Set(all.compactMap { $0["id"] as? String }) }
@@ -783,8 +822,8 @@ package enum HerScreen {
     }
 
     /// A completed crew's status must disclose workers truncated at the output cap.
-    static func crewState(_ row: [String: Any], fallback: String) -> String {
-        let status = row["status"] as? String ?? fallback
+    static func crewState(_ row: [String: Any]) -> String {
+        let status = row["status"] as? String ?? "unknown"
         if status == "interrupted", row["completedAt"] == nil { return "interrupted · completion time unknown" }
         let workers = row["workers"] as? [[String: Any]] ?? []
         let cut = workers.filter { $0["outputTruncated"] as? Bool == true }.count
@@ -799,15 +838,18 @@ package enum HerScreen {
         catch { return readFailure(error, reason: "crew_records_unavailable", remedy: crewStoreRemedy) }
         let row = all.first { $0["id"] as? String == id }
         guard let row else { return nil }
+        if let unavailable = row["receiptUnavailable"] as? String {
+            return name + " · Crew receipt unavailable\n" + unavailable + "\nBack: home · crews."
+        }
         let workers = row["workers"] as? [[String: Any]] ?? []
         var lines = [name + " · " + clip(firstLine(row["objective"] as? String ?? "A task"), 80) + " · "
-            + crewState(row, fallback: "running") + " · \(workers.count) workers"]
+            + crewState(row) + " · \(workers.count) workers"]
         // Read-only workers get the brief and nothing else (SwarmExecutor's worker prompt).
         if row["access"] as? String == "read_only" { lines.append("  read-only: workers answered from the brief alone, with no app, screen, files or tools") }
         for (index, worker) in workers.enumerated() {
             let role = nonEmpty(worker["role"] as? String) ?? nonEmpty(worker["name"] as? String) ?? "worker \(index + 1)"
             let said = nonEmpty(worker["output"] as? String) ?? nonEmpty(worker["error"] as? String) ?? ""
-            var status = worker["status"] as? String ?? "working"
+            var status = worker["status"] as? String ?? "unknown"
             if status == "working", SwarmCrew.liveness(of: row) == .unknown { status = "unknown" }
             if status == "completed", worker["outputTruncated"] as? Bool == true { status = "cut off" }
             lines.append("  \(index + 1) " + pad(clip(role, 16), 18) + pad(clip(status, 12), 11) + clip(firstLine(said), 90))
@@ -817,7 +859,7 @@ package enum HerScreen {
                         nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("agent.jobs"), "args": .object(["agent": .string("swarm"), "run_id": .string(id)])])]))])))
             }
         }
-        let synthesis = (row["synthesis"] as? [String: Any])?["output"] as? String ?? row["synthesis"] as? String
+        let synthesis = (row["synthesis"] as? [String: Any])?["output"] as? String
         if let synthesis = nonEmpty(synthesis) { lines.append("synthesis: " + clip(synthesis.replacingOccurrences(of: "\n", with: " "), 400)) }
         let read = ToolFailureError.call("app", ["action": .string("agent.jobs"), "args": .object(["agent": .string("swarm"), "run_id": .string(id)])])
         lines.append("Full record: " + read + ". Back: app {}.")
@@ -858,8 +900,9 @@ package enum HerScreen {
 
     static func sensesRows(dataRoot: URL, now: Date, full: Bool = false) async -> [String] {
         let abilities = await AgentWorkspacePorts.current.tools.builtAbilities(dataRoot: dataRoot, now: now)
+        let presenceRows = full ? [names(dataRoot).person + ": " + PersonPresence.read(dataRoot: dataRoot, now: now).line] : []
         guard let registry = SensesHub.shared.registry else {
-            return [abilities, failureFace(.object(["status": .string("unavailable"), "reason": .string("sense_registry_unattached"),
+            return presenceRows + [abilities, failureFace(.object(["status": .string("unavailable"), "reason": .string("sense_registry_unattached"),
                 "detail": .string("The runtime has no sense registry attached."), "effects": .string("none"),
                 "remedy": Repair.reconcile(instruction: "The app's runtime wiring needs repair; open doctor to inspect it.",
                     nextCall: .object(["tool": .string("app"), "input": .object(["item": .string("doctor")])]))]))]
@@ -868,12 +911,12 @@ package enum HerScreen {
         async let news = SenseNewsBoard.shared.latest(limit: SenseNewsBoard.capacity)
         let all: [SenseRecord]
         do { all = try await records }
-        catch { return [abilities, readFailure(error, reason: "sense_registry_unavailable", remedy: Repair.reconcile(
+        catch { return presenceRows + [abilities, readFailure(error, reason: "sense_registry_unavailable", remedy: Repair.reconcile(
             instruction: "Inspect the sense registry's reported cause before repairing it.",
             nextCall: .object(["tool": .string("app"), "input": .object(["item": .string("doctor")])])))] }
         let active = all.filter { $0.status == .on }.sorted { $0.corner.key < $1.corner.key }
         let corners = active.prefix(full ? active.count : 5).map { full ? $0.corner.surfaceName : clip($0.corner.surfaceName, 36) }.joined(separator: ", ")
-        var rows = [abilities, "have: " + (active.isEmpty ? "none yet" : corners)
+        var rows = presenceRows + [abilities, "have: " + (active.isEmpty ? "none yet" : corners)
             + (!full && active.count > 5 ? " +\(active.count - 5) more" : "")]
         let grown = all.filter { $0.origin == .grown && $0.status == .on && $0.createdAt.map { now.timeIntervalSince($0) < 86_400 } == true }
             .sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }.prefix(full ? all.count : 2)
@@ -933,7 +976,8 @@ package enum HerScreen {
         if case .object(let fields) = value {
             let keys: Set<String> = ["status", "reason", "failure_code", "error_code", "code", "detail", "message", "error",
                 "effects", "remedy", "fix", "hint", "owner", "next_call", "tap", "not_run_status", "provenance", "input_excerpt",
-                "recovery_hint", "argument_path", "accepted", "connected", "needs", "needs_input", "needs_authentication"]
+                "recovery_hint", "argument_path", "accepted", "connected", "needs", "needs_input", "needs_authentication",
+                "gaps", "unresponsive_engines", "total_is_complete"]
             evidence = .object(fields.filter { keys.contains($0.key) && $0.value != .null })
         } else { evidence = value }
         return UntrustedText.neutralized((try? evidence.serialize(pretty: false)) ?? String(describing: evidence))

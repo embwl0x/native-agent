@@ -15,7 +15,8 @@ import Dispatcher
 import MacControl
 import Senses
 import StandingBots
-// Blueprint: | `BuiltInToolSchemaFactory+PersonalAppSchemas.swift` | `BuiltInToolSchemaFactory`: `personalAppSchemas`: calendar, reminders, notifications, Spotlight, contacts, Mail, Messages, Notes and Music; bridge declarations retain their place in the sequence |
+import MacIntegration
+// Blueprint: | `BuiltInToolSchemaFactory+PersonalAppSchemas.swift` | `BuiltInToolSchemaFactory`: `personalAppSchemas`: calendar, reminders, notifications, Spotlight, contacts, Mail, Messages, Notes and Music; Contacts schemas come from their concrete owner; bridge declarations retain their place in the sequence |
 
 extension BuiltInToolSchemaFactory {
     func personalAppSchemas() -> [LLMToolSchema?] {
@@ -33,7 +34,7 @@ extension BuiltInToolSchemaFactory {
             return fields
         }
         let mailReplyFields: [(String, JSONValue)] = [
-            ("subject", ToolSchema.strSchema("Subject for legacy matching; omit when using the exact message locator.")),
+            ("subject", ToolSchema.strSchema("Subject selection when no exact message locator is supplied; optional sender disambiguates matches.")),
         ] + mailIdentityFields("Exact positive inbox message ID from the latest read.", accountID: "expected_account_id from the same row.") + [
             ("body", ToolSchema.strSchema("Reply body (required).")),
             ("sender", ToolSchema.strSchema("Optional sender filter — disambiguates when multiple messages share the subject.")),
@@ -133,7 +134,7 @@ extension BuiltInToolSchemaFactory {
                 )
             ),
             requestedSchema(name: "mac_reminders_list_due_today", toolClass: .read, reach: .his,
-                description: "List Mac Reminders in two named parts: today (due in the local day, earliest first) and overdue (due before today, oldest first). Each has its full count, returned_count, reminders and has_more. Returns total and a summary naming both counts; top-level reminders is their union. Read-only; requires Reminders -> Read permission.",
+                description: "List Mac Reminders in two named parts: today (due in the local day, earliest first) and overdue (due before today, oldest first). Each has its full count, returned_count, reminders and has_more. Returns total and a summary naming both counts. Read-only; requires Reminders -> Read permission.",
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("limit", ToolSchema.intSchema("Maximum reminders per part, independently (1-200, default 50). Counts and total include unreturned reminders.")),
@@ -190,29 +191,13 @@ extension BuiltInToolSchemaFactory {
             ),
             // Sensitive Mac Integration writes default off and require the user's toggle.
             requestedSchema(name: "contacts_search", toolClass: .read, reach: .his,
-                description: "Search the user's local Mac Contacts by name (including saved names like Mom or Dad), phone, or email and return matching records (name, organization, phones, emails, identifier). Read-only; requires Contacts -> Read permission.",
-                parametersJSON: ToolSchema.params(
-                    properties: [
-                        ("query", ToolSchema.strSchema("Search string — matches against name, phone, or email.")),
-                        ("limit", ToolSchema.intSchema("Maximum contacts to return (1-100, default 20).")),
-                    ],
-                    required: ["query"]
-                )
+                description: "Search local Mac Contacts once by identifier, name, phone or email. Supply at least one search field; query selects email for @, phone for phone-shaped text, otherwise name. Returns matching records and the selected lookup. Read-only; requires Contacts -> Read permission.",
+                parametersJSON: try! MacContactsExecutor.searchParameters.serializedData(pretty: false)
             ),
             requestedSchema(name: "contacts_create_or_update",
                 toolClass: .write, reach: .his, capabilities: ["filesystem_write", "outside_app_data_write", "tool_call"],
                 description: "Create a Mac contact, or update one: by identifier, or the single existing contact with the same full name. Phones and emails are added, never replaced. Requires Contacts -> Write permission.",
-                parametersJSON: ToolSchema.params(
-                    properties: [
-                        ("given_name", ToolSchema.strSchema("First name (optional).")),
-                        ("family_name", ToolSchema.strSchema("Last name (optional).")),
-                        ("organization", ToolSchema.strSchema("Organization / company (optional).")),
-                        ("phones", stringArraySchema("Optional list of phone numbers.")),
-                        ("emails", stringArraySchema("Optional list of email addresses.")),
-                        ("identifier", ToolSchema.strSchema("Contact to update: identifier from contacts.search, or its exact full name.")),
-                    ],
-                    required: []
-                )
+                parametersJSON: try! MacContactsExecutor.saveParameters.serializedData(pretty: false)
             ),
             requestedSchema(name: "mail_list_recent", toolClass: .read, reach: .his,
                 description: "List Apple Mail's inbox, sent or drafts metadata and exact mailbox totals; inbox_unread_by_category counts Primary, Transactions, Updates, Promotions and unclassified across the whole inbox. Primary is not proof of a human sender. Filtered or explicitly sorted lists cover all categories. Pass scope + message_id + expected_message_id + expected_account_id from one row to read a body and attachments (filename, content_type, size in bytes, 1-based index). Read-only; requires Mail → Read permission.",
@@ -601,13 +586,8 @@ extension BuiltInToolSchemaFactory {
             ),
             requestedSchema(name: "contacts_delete",
                 toolClass: .destructive, reach: .his, capabilities: ["destructive", "filesystem_delete", "outside_app_data_write", "tool_call"],
-                description: "Delete a Mac contact by its identifier from contacts.search or its exact full name. Requires Contacts -> Write permission.",
-                parametersJSON: ToolSchema.params(
-                    properties: [
-                        ("identifier", ToolSchema.strSchema("identifier from contacts.search, or the exact full name.")),
-                    ],
-                    required: ["identifier"]
-                )
+                description: "Delete a Mac contact by its exact identifier from contacts.search. A name is never an identifier. Requires Contacts -> Write permission.",
+                parametersJSON: try! MacContactsExecutor.deleteParameters.serializedData(pretty: false)
             ),
         ]
         return schemas

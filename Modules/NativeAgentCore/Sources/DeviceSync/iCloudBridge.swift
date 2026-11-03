@@ -10,8 +10,7 @@ import ChatTurnRuntime
 import PersistenceCore
 import ProviderRouting
 import OSLog
-import Network
-// Blueprint: | `iCloudBridge.swift` | Owns ChatRecord admission, reply binding, recovery, durable mutation and terminal retention interpretation for icloud/chat_transactions; rejected CloudKit envelopes have no local journal/quarantine copy. `setup`, `recordCloudKitPushEvidence` (data-root-scoped chat-subscription push proof persisted across launches; subscription failure or unannounced aged delivery revokes), `scheduleNextDeviceDrainFallback` (obligations or push unavailable/unproven; idle rests), `cloudKitActionResponseMessage` (sending and sizing), `failedReplyClaims` (startup snapshot or exact delivery event) |
+// Blueprint: | `iCloudBridge.swift` | Owns ChatRecord admission, reply binding, recovery, durable mutation and terminal retention interpretation for icloud/chat_transactions; rejected CloudKit envelopes have no local journal/quarantine copy. Receive is push and lifecycle-event driven; registration failure reports unavailable wakes with no timed alternate reader |
 // BridgeMessage, BridgeError, and all HMAC helpers are now in NativeAgentShared.
 typealias KVSKey = NativeAgentICloudBridgeConstants.KVSKey
 typealias DriveFolder = NativeAgentICloudBridgeConstants.DriveFolder
@@ -21,7 +20,7 @@ typealias DriveFolder = NativeAgentICloudBridgeConstants.DriveFolder
 public final class iCloudBridge: ObservableObject {
     static let pushLog = Logger(subsystem: "NativeAgent.DeviceSync", category: "push")
     enum DrainTrigger: String {
-        case fallbackTimer, cloudKitPush, legacyKVS, coalesced, repair, wake, network
+        case cloudKitPush, kvsNudge, coalesced, repair, wake, network
     }
     unowned let sync: DeviceSync
     @Published public internal(set) var available: Bool = false
@@ -39,6 +38,7 @@ public final class iCloudBridge: ObservableObject {
         didSet { refreshPhoneConnection() }
     }
     var accountFailureGeneration: UInt64 = 0
+    var accountFailureReadError: String? { didSet { refreshPhoneConnection() } }
     /// Another Mac on this Apple Account holds the phone's pairing; this Mac
     /// stays quiet toward the phone until the person moves it here.
     @Published public internal(set) var phonePairedElsewhere = false {
@@ -61,6 +61,7 @@ public final class iCloudBridge: ObservableObject {
     var pairingKeyUnreadable = false { didSet { refreshPhoneConnection() } }
     /// When the phone was last there, from a message this Mac accepted.
     var lastPhoneContactAt: Date? { didSet { refreshPhoneConnection() } }
+    var phoneContactReadFailure: String? { didSet { refreshPhoneConnection() } }
     /// When this Mac last turned away a phone message signed with another key.
     var lastPhoneRejectedAt: Date? { didSet { refreshPhoneConnection() } }
     var pairedPhonesSubscription: AnyCancellable?
@@ -92,32 +93,26 @@ public final class iCloudBridge: ObservableObject {
     var usesCloudKitDeviceTransport: Bool {
         isSetUp && deviceTransport != nil
     }
-    // Push/receive deadlines coalesce; the transport owns message deduplication.
+    // Receive events coalesce; the transport owns message deduplication.
     var deviceDrainTask: Task<Bool, Never>?
     var deviceDrainGeneration: Int?
-    var activeCloudKitChats = 0
     var deviceDrainQueued = false
-    var deviceDrainTimerTask: Task<Void, Never>?
     var cloudKitPushProofAt: Date?
-    var cloudKitPushProven: Bool { cloudKitPushProofAt != nil }
     var deviceDrainTriggeredByPush = false
     var cloudKitPushUnavailable = false
-    var deviceDrainCadence: TimeInterval?
-    var deviceNetworkMonitor: NWPathMonitor?
-    var deviceNetworkSatisfied: Bool?
+    var deviceMetadataDrainTask: Task<Void, Never>?
+    var nextDeviceMetadataDrainAt = Date.distantPast
+    var deviceNetworkChanges: Task<Void, Never>?
     // Retention has its own single-flight slot beside the delivery drain.
     var deviceRetentionSweepTask: Task<Void, Never>?
-    /// Owns the receive deadline while delivery needs one.
-    var drainPolicy = AdaptiveDrainPolicy()
-    var lastDeviceDrainAt = Date.distantPast
     /// Last successfully published deterministic provider projection. Repeated
     /// UI refreshes often discover identical state; skip those CloudKit writes.
-    var lastPublishedProviderCatalogStatus: String?
+    var lastPublishedProviderCatalogStatus: (pairing: Data, value: String)?
     // One owner spans the read and send. Callers join it and queue a fresh read,
     // including a return to the cached selection while a different send awaits.
     var providerCatalogPublicationTask: Task<Bool, Never>?
     var providerCatalogPublicationQueued = false
-    var lastPublishedMobileSnapshotStatus: [NAMobileSnapshotGroup: String] = [:]
+    var lastPublishedMobileSnapshotStatus: [NAMobileSnapshotGroup: (pairing: Data, value: String)] = [:]
     // Insertion-ordered message identities remain bounded across launches.
     var seenMessageIDs: Set<String> = []
     var seenMessageIDsOrdered: [String] = []
@@ -140,10 +135,14 @@ public final class iCloudBridge: ObservableObject {
     /// retained transport cannot route work after this bridge has torn down.
     var incomingObserverGeneration: UInt64 = 0
     var incomingObserverTask: Task<Void, Never>?
+    /// Controls remain owned here until their signed publication and receipt land.
+    /// This also retains the original envelope while ledger storage is unavailable.
+    var pendingControlPublications: [String: BridgeMessage] = [:]
+    /// Fair selection among owed outcomes; never evidence about delivery.
+    var controlPublicationCursor = ""
     var incomingObserverTaskID = UUID()
     var transportSetupTask: Task<Void, Never>?
     var transportSetupTaskID = UUID()
-    var incomingObserverInstalled = false
     var outboxScanTask: Task<Void, Never>?
     var outboxScanQueued = false
     /// Each admitted Drive backlog owns its settlement; teardown closes its
@@ -168,12 +167,26 @@ public final class iCloudBridge: ObservableObject {
         self.sync = sync
         let url = ICloudSyncStatePaths.accountFailure(dataRoot: sync.dataRoot)
         Task {
-            let failure = await sync.storage.perform {
-                try? JSONDecoder().decode(DeviceSyncAccountFailure.self, from: Data(contentsOf: url))
+            let restored = await sync.storage.perform { () -> Result<DeviceSyncAccountFailure?, Error> in
+                do {
+                    return .success(try JSONDecoder().decode(DeviceSyncAccountFailure.self, from: Data(contentsOf: url)))
+                } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                    return .success(nil)
+                } catch { return .failure(error) }
             }
-            guard accountFailureGeneration == 0, let failure else { return }
-            accountFailure = failure
-            syncStatus = DeviceSyncAccountFailure.macMessage
+            guard accountFailureGeneration == 0 else { return }
+            switch restored {
+            case .success(let failure):
+                if let failure {
+                    accountFailure = failure
+                    syncStatus = DeviceSyncAccountFailure.macMessage
+                }
+            case .failure(let error):
+                let message = "Saved iCloud account status could not be read (\(error.localizedDescription)); restore access to icloud/account_failure.json and check Connection."
+                accountFailureReadError = message
+                syncStatus = message
+                doctorTransportHealth = .unavailable(message)
+            }
         }
         ICloudBridgeHealthReader.register(dataRoot: sync.dataRoot) { [weak self] in
             self?.doctorHealthSnapshot
@@ -216,7 +229,9 @@ public final class iCloudBridge: ObservableObject {
         // health; each refused write is that same fact, not a send failure.
         if case .pairedElsewhere? = error as? DeviceSyncError { return }
         doctorSendMeasured = true
-        doctorSendFailures[operation] = error.map(Self.transportHealth)
+        // A transient no is its retry's to answer: unmeasured until the retry meets it too.
+        let retrying = if case .transient? = error as? DeviceSyncError { doctorSendFailures[operation] == nil } else { false }
+        doctorSendFailures[operation] = error.map { retrying ? .unmeasured : Self.transportHealth($0) }
         if let error, case .account(let failure) = error as? DeviceSyncError {
             await recordAccountFailure(failure)
         }
@@ -249,16 +264,23 @@ public final class iCloudBridge: ObservableObject {
             cap: Self.seenMessageIDsCap
         )
     }
-    func loadCKSeenIDs() {
-        let ckIDs = ICloudSeenIDDefaultsStore.load(
-            defaults: .standard,
-            key: Self.ckProcessedIDsDefaultsKey,
-            cap: Self.seenMessageIDsCap
-        )
+    @discardableResult
+    func loadCKSeenIDs() -> Bool {
+        let ckIDs: [String]
+        do {
+            ckIDs = try ICloudSeenIDDefaultsStore.load(defaults: .standard,
+                key: Self.ckProcessedIDsDefaultsKey, cap: Self.seenMessageIDsCap)
+        } catch {
+            available = false
+            syncStatus = "The phone message replay window could not be read. Restore NativeAgent.iCloud.ckProcessedIDs.v1 in this app's preferences, then reconnect the phone."
+            doctorTransportHealth = .unavailable(syncStatus)
+            return false
+        }
         for id in ckIDs where seenMessageIDs.insert(id).inserted {
             seenMessageIDsOrdered.append(id)
         }
         trimSeenMessageIDsIfNeeded()
+        return true
     }
     @objc nonisolated func kvsDidChange(_ note: Notification) {
         let changedKeys = note.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]
@@ -268,7 +290,7 @@ public final class iCloudBridge: ObservableObject {
                 || changedKeys?.contains(KVSKey.newMessageInDrive) == true
             if messageChanged {
                 if self.deviceTransport != nil {
-                    _ = await self.drainDeviceTransport(trigger: .legacyKVS)
+                    _ = await self.drainDeviceTransport(trigger: .kvsNudge)
                 } else {
                     self.syncStatus = "KVS trigger received — checking Drive…"
                     self.checkIosOutbox()
@@ -286,7 +308,6 @@ public final class iCloudBridge: ObservableObject {
         setupTask = nil
         setupGeneration += 1
         incomingObserverGeneration &+= 1
-        incomingObserverInstalled = false
         incomingObserverTask?.cancel()
         transportSetupTask?.cancel()
         outboxScanGeneration &+= 1
@@ -298,13 +319,12 @@ public final class iCloudBridge: ObservableObject {
         metadataQuery = nil
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
-        deviceNetworkMonitor?.cancel()
-        deviceNetworkMonitor = nil
-        deviceNetworkSatisfied = nil
+        deviceNetworkChanges?.cancel()
+        deviceNetworkChanges = nil
+        deviceMetadataDrainTask?.cancel()
+        nextDeviceMetadataDrainAt = .distantPast
         cloudKitPushProofAt = nil
         cloudKitPushUnavailable = false
-        deviceDrainCadence = nil
-        drainPolicy = AdaptiveDrainPolicy()
         messageHandler = nil
         deviceTransport = nil
         phonePairingSettled = false
@@ -315,8 +335,6 @@ public final class iCloudBridge: ObservableObject {
         // behind it instead of overlapping the retired lifecycle's publication.
         providerCatalogPublicationQueued = false
         lastPublishedMobileSnapshotStatus = [:]
-        deviceDrainTimerTask?.cancel()
-        deviceDrainTimerTask = nil
         // The drain and retention handles keep exclusion until actual exit.
         deviceDrainQueued = false
         deviceRetentionSweepTask?.cancel()

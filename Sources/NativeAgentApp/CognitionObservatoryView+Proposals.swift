@@ -23,7 +23,7 @@ extension CognitionObservatoryView {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(row.title).font(.caption).textSelection(.enabled)
                         if let detail = row.detail, !detail.isEmpty {
-                            Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
+                            Text(detail).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
                         }
                         if let value = row.value, !value.isEmpty {
                             Text(value).font(.caption2).foregroundStyle(.tertiary)

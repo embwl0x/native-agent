@@ -3,7 +3,7 @@ import Foundation
 import CloudKit
 import CryptoKit
 import OSLog
-// Blueprint: | `CloudKitDeviceTransport+Retention.swift` | Bounded record retention and per-record-family sweep cursors |
+// Blueprint: | `CloudKitDeviceTransport+Retention.swift` | Bounded oldest-page record retention; subsequent sweeps advance through confirmed deletions |
 
 extension CloudKitDeviceTransport {
     // MARK: retention sweep
@@ -17,7 +17,7 @@ extension CloudKitDeviceTransport {
     public static let retentionSweepBatch = 100
 
     /// Minimum spacing between sweeps in the steady state. Drains run as often
-    /// as every eight seconds; retention is housekeeping, not a per-drain cost.
+    /// at subsecond cadence during phone contact; retention is housekeeping, not a per-drain cost.
     static let retentionSweepInterval: TimeInterval = 60 * 60
 
     /// Spacing while a sweep's page still comes back full. The first sweep on a
@@ -42,7 +42,7 @@ extension CloudKitDeviceTransport {
     /// Safe to call on every drain — it self-throttles and no-ops on iOS.
     @discardableResult
     public func sweepExpiredRecords() async -> Int {
-        guard !pairingHeldElsewhere else { return 0 }
+        guard holdsPairing else { return 0 }
         let now = Date()
         guard claimRetentionSweep(now: now) else { return 0 }
         let cutoff = now.addingTimeInterval(-Self.retentionWindow)
@@ -97,7 +97,6 @@ extension CloudKitDeviceTransport {
 
     private func sweepExpiredRecords(recordType: String, cutoff: Date) async -> DeviceCKSweepOutcome {
         var outcome = DeviceCKSweepOutcome()
-        let orderedByServerModDate = serverModDateSortAvailable(recordType: recordType)
         let page: DeviceCKSweepPage
         do {
             page = try await withDeviceCKTimeoutThrowing(
@@ -105,51 +104,18 @@ extension CloudKitDeviceTransport {
                 seconds: 10,
                 onFailure: accountFailureReporter
             ) {
-                if orderedByServerModDate {
-                    do {
-                        return try await self.expiredRecordPage(
-                            recordType: recordType,
-                            cutoff: cutoff,
-                            orderByServerModDate: true,
-                            resumeCursor: nil
-                        )
-                    } catch is DeviceCKUnsortableField {
-                        // Same missing `___modTime` index the pull depends on;
-                        // latch it once so neither lane pays for a rejected
-                        // query again.
-                        self.markServerModDateSortRejected(recordType: recordType)
-                    }
-                }
                 return try await self.expiredRecordPage(
                     recordType: recordType,
-                    cutoff: cutoff,
-                    orderByServerModDate: false,
-                    resumeCursor: self.retentionFallbackCursor(recordType: recordType)
+                    cutoff: cutoff
                 )
             }
         } catch {
             nativeLog("[ck-device] retention sweep query failed for %@: %@", recordType, String(describing: error))
-            // A stored cursor can go stale on the server; keeping it would make
-            // every later sweep fail the same way. Drop it and walk again from
-            // the oldest record next time.
-            if !serverModDateSortAvailable(recordType: recordType) {
-                setRetentionFallbackCursor(nil, recordType: recordType)
-            }
             return outcome
         }
-        // The order actually used: a first query rejected for its sort
-        // descriptor latched the fallback above.
-        let usedServerModDateOrder = orderedByServerModDate
-            && serverModDateSortAvailable(recordType: recordType)
-        if !usedServerModDateOrder {
-            // Advance (or, on nil, reset) the walk before deleting: a delete
-            // that fails leaves those records for the next full walk rather
-            // than pinning the sweep on a page it cannot clear.
-            setRetentionFallbackCursor(page.fetched == 0 ? nil : page.cursor, recordType: recordType)
-        }
-        // Continue a full fetched page even when no records in it expired.
+        // The oldest page advances only by confirmed deletion.
         outcome.backlog = page.fetched >= Self.retentionSweepBatch
-            && (!usedServerModDateOrder || page.names.count == page.fetched)
+            && page.names.count == page.fetched
         let names = page.names
         guard !names.isEmpty else { return outcome }
         do {
@@ -182,53 +148,23 @@ extension CloudKitDeviceTransport {
         return outcome
     }
 
-    private func retentionFallbackCursor(recordType: String) -> CKQueryOperation.Cursor? {
-        lock.lock(); defer { lock.unlock() }
-        return retentionFallbackCursors[recordType]
-    }
-
-    private func setRetentionFallbackCursor(_ cursor: CKQueryOperation.Cursor?, recordType: String) {
-        lock.lock()
-        retentionFallbackCursors[recordType] = cursor
-        lock.unlock()
-    }
-
     /// One bounded page of the OLDEST records of `recordType`, filtered to those
     /// the cutoff has passed. In modificationDate order, ascending is what makes
     /// a single page enough: the page is either wholly eligible or contains the
     /// cutoff boundary, and deleting it moves the next sweep's page forward.
-    /// Eligibility is ALWAYS the server modificationDate — the client
-    /// `createdAt` is only a fallback sort key for a container whose
-    /// `___modTime` index is not sortable. In THAT order the page is not sorted
-    /// by the eligibility clock and nothing on it need be deletable, so the
-    /// caller passes `resumeCursor` to continue past the records this page
-    /// already examined instead of re-reading them forever. `desiredKeys = []`
+    /// Eligibility and ordering use server modificationDate. `desiredKeys = []`
     /// keeps the page to system fields, so a sweep never downloads payloads it
     /// is about to delete.
     private func expiredRecordPage(
         recordType: String,
-        cutoff: Date,
-        orderByServerModDate: Bool,
-        resumeCursor: CKQueryOperation.Cursor?
+        cutoff: Date
     ) async throws -> DeviceCKSweepPage {
-        let op: CKQueryOperation
-        // Only a FRESH query carries the sort descriptor, so only a fresh query
-        // can be rejected for it; an `.invalidArguments` on a cursor
-        // continuation is a stale cursor and must not latch the fallback order.
-        let carriesSortDescriptor = resumeCursor == nil
-        if let resumeCursor {
-            op = CKQueryOperation(cursor: resumeCursor)
-        } else {
-            // Use the queryable createdAt field to enumerate records when recordName is not queryable.
-            let query = CKQuery(recordType: recordType, predicate: NSPredicate(
-                format: "direction IN %@",
-                [NAChatDirection.mac2ios.rawValue, NAChatDirection.ios2mac.rawValue]
-            ))
-            query.sortDescriptors = [
-                NSSortDescriptor(key: orderByServerModDate ? "modificationDate" : "createdAt", ascending: true)
-            ]
-            op = CKQueryOperation(query: query)
-        }
+        let query = CKQuery(recordType: recordType, predicate: NSPredicate(
+            format: "direction IN %@",
+            [NAChatDirection.mac2ios.rawValue, NAChatDirection.ios2mac.rawValue]
+        ))
+        query.sortDescriptors = [NSSortDescriptor(key: "modificationDate", ascending: true)]
+        let op = CKQueryOperation(query: query)
         op.qualityOfService = .utility
         op.resultsLimit = Self.retentionSweepBatch
         op.desiredKeys = []
@@ -244,31 +180,18 @@ extension CloudKitDeviceTransport {
             op.queryResultBlock = { result in
                 let page = holder.snapshot()
                 switch result {
-                case .success(let cursor):
+                case .success:
                     cont.resume(returning: DeviceCKSweepPage(
                         names: page.names,
-                        fetched: page.fetched,
-                        cursor: cursor
+                        fetched: page.fetched
                     ))
                 case .failure(let err):
-                    if carriesSortDescriptor,
-                       orderByServerModDate,
-                       Self.rejectsServerModDateSort(err) {
-                        cont.resume(throwing: DeviceCKUnsortableField())
-                    } else {
-                        cont.resume(throwing: Self.mapError(err))
-                    }
+                    cont.resume(throwing: Self.mapError(err))
                 }
             }
             self.database.add(op)
         }
     }
 
-    // Only rejection naming the server-date field proves its sort is unsupported.
-    static func rejectsServerModDateSort(_ error: Error) -> Bool {
-        guard (error as? CKError)?.code == .invalidArguments else { return false }
-        let text = String(describing: error)
-        return text.contains("modTime") || text.contains("modificationDate")
-    }
 }
 #endif

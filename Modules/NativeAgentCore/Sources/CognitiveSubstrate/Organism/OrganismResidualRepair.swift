@@ -74,7 +74,8 @@ public enum OrganismResidualRepair {
         field: OrganismField,
         repairState: OrganismDreamRepairState,
         lastSignalAt: Date?,
-        at now: Date
+        at now: Date,
+        satisfyWait: Bool = false
     ) -> OrganismResidualRepairOpportunity {
         let lastRepairAt = repairState.lastReceipt?.generatedAt
         let acknowledgedFieldGeneration = repairState.lastReceipt?.sourceFieldGeneration ?? 0
@@ -203,7 +204,7 @@ public enum OrganismResidualRepair {
         let localEligible = localRepairPressure >= minimumPressure
             && evidenceCount > 0
             && repairableFieldEvidenceCount > 0
-        let localReady = localEligible && now >= localQuietUntil
+        let localReady = localEligible && (satisfyWait || now >= localQuietUntil)
         let localNext = localEligible ? max(now, localQuietUntil) : nil
 
         let pendingPredictionDue = ledger.predictions.values

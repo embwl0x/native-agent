@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SwarmRunsReader.swift` | `SwiftNativeSwarmRunsReader`: owns live-board and receipt storage and worker report IDs; one read-only recovery projection for crews, report inspection and the live board; inspection gives pending live workers their deterministic IDs and marks absent output unavailable, preserving strict terminal-report validation; durable receipts win, interrupted completion time stays unknown, and `SwarmCrew.liveness(of:)` classifies every crew view without promoting unknown to running or replaying work; its writer records recoveryObservedAt once when committing projected recovery before the next board write and removes it only after receipt durability |
+// Blueprint: | `SwarmRunsReader.swift` | `SwiftNativeSwarmRunsReader`: owns live-board and receipt storage and worker report IDs; crews and inspection share checked receipt admission after read-only recovery, with damaged rows exposed as unavailable independently of valid siblings; pending workers have deterministic report IDs and explicitly unavailable output; durable receipts win, interrupted completion time stays unknown, and `SwarmCrew.liveness(of:)` never promotes unavailable evidence to running; its writer records recoveryObservedAt once when committing projected recovery before the next board write and removes it only after receipt durability |
 
 /// Shared crew projection and inspection of live and retained swarm evidence.
 /// JSON run array: off-disk backup only; no local backup/export/raw phone sync.
@@ -61,9 +61,22 @@ public struct SwiftNativeSwarmRunsReader: Sendable {
     /// Read-only projection; updateLive commits recovery before its next write.
     public func readCrews() throws -> [[String: Any]] {
         do {
-            let (live, runs) = try projection()
-            guard let runs = runs as? [[String: Any]] else { throw PersistenceCoreError.ioFailure("receipt_store_malformed") }
-            return live + runs
+            let (live, runs) = try projection(includingUnavailableRows: true)
+            let rows: [Any] = live + runs
+            let counts = rows.reduce(into: [String: Int]()) { counts, row in
+                if let id = (row as? [String: Any])?["id"] as? String { counts[id, default: 0] += 1 }
+            }
+            return rows.enumerated().map { index, raw in
+                if let row = raw as? [String: Any], let id = row["id"] as? String, counts[id] == 1,
+                   Self.checkedReports(JSONValue(fromFoundation: row), runID: id) != nil { return row }
+                // A display locator is not a fabricated run identity or receipt.
+                // Keep every bad row visible without hiding its valid siblings.
+                let id = (raw as? [String: Any])?["id"] as? String
+                let reason = id.flatMap { counts[$0] }.map { $0 > 1 } == true
+                    ? "receipt_id_ambiguous" : "receipt_store_malformed"
+                return ["id": "unavailable:receipt-row:\(index)", "objective": "Crew receipt unavailable",
+                        "status": "unavailable", "receiptUnavailable": "\(reason) at row \(index + 1)\(id.map { " (run \($0))" } ?? ""). Repair the retained evidence without rerunning workers."]
+            }
         } catch PersistenceCoreError.ioFailure(let reason) where reason.hasPrefix("receipt_store_") {
             throw PersistenceCoreError.ioFailure(reason == "receipt_store_malformed"
                 ? "Swarm store malformed at \(runsPath.path); repair the retained store before continuing."
@@ -72,30 +85,44 @@ public struct SwiftNativeSwarmRunsReader: Sendable {
     }
 
     /// One recovery read for every reader; durable receipts win, completion stays unknown.
-    func projection() throws -> (live: [[String: Any]], runs: [Any]) {
+    func projection(includingUnavailableRows: Bool = false) throws -> (live: [[String: Any]], runs: [Any]) {
         let livePath = runsPath.deletingLastPathComponent().appendingPathComponent("live.json")
-        let live = try Self.rows(at: livePath)
+        let live = try Self.readArray(at: livePath) ?? []
         let runs = try Self.readArray(at: runsPath) ?? []
         let done = Set(runs.compactMap { ($0 as? [String: Any])?["id"] as? String })
         var working: [[String: Any]] = []
         var ids = Set<String>()
-        for row in live {
+        for raw in live {
+            guard let row = raw as? [String: Any] else {
+                guard includingUnavailableRows else {
+                    throw PersistenceCoreError.ioFailure("Swarm live store malformed; repair swarms/live.json without discarding retained worker results.")
+                }
+                working.append([:]) // The checked reader exposes this row's gap.
+                continue
+            }
             if let id = row["id"] as? String, done.contains(id) { continue }
             guard let id = row["id"] as? String, !id.isEmpty, ids.insert(id).inserted,
                   let workers = row["workers"] as? [[String: Any]],
                   workers.allSatisfy({ worker in
                       guard let status = worker["status"] as? String else { return false }
                       return !["completed", "failed", "cancelled"].contains(status) || worker["output"] is String
-                          || (status == "failed" && worker["error"] is String)
                   }) else {
-                throw PersistenceCoreError.ioFailure("Swarm live store malformed; repair swarms/live.json without discarding retained worker results.")
+                guard includingUnavailableRows else {
+                    throw PersistenceCoreError.ioFailure("Swarm live store malformed; repair swarms/live.json without discarding retained worker results.")
+                }
+                working.append(row)
+                continue
             }
             if row["pid"] == nil, ["completed", "partial", "failed", "cancelled", "interrupted"].contains(row["status"] as? String ?? "") {
                 working.append(row)
                 continue
             }
             guard let pid = row["pid"] as? Int, pid > 0, pid <= Int(Int32.max) else {
-                throw PersistenceCoreError.ioFailure("Swarm live store malformed; repair swarms/live.json without discarding retained worker results.")
+                guard includingUnavailableRows else {
+                    throw PersistenceCoreError.ioFailure("Swarm live store malformed; repair swarms/live.json without discarding retained worker results.")
+                }
+                working.append(row)
+                continue
             }
             // A matching start time identifies the process incarnation;
             // unreadable identity stays unknown and unsettled on the board.
@@ -129,7 +156,7 @@ public struct SwiftNativeSwarmRunsReader: Sendable {
                 return result
             }
             if row["synthesis"] == nil, row["synthesize"] as? Bool != false {
-                receipt["synthesis"] = ["status": "unknown", "output": "", "error": "Synthesis did not settle before its crew process ended; its outcome is unknown."]
+                receipt["synthesis"] = ["status": AgentSwarmSynthesisStatus.unknown.rawValue, "output": "", "error": "Synthesis did not settle before its crew process ended; its outcome is unknown."]
             }
             working.append(receipt)
         }
@@ -215,7 +242,7 @@ public struct SwiftNativeSwarmRunsReader: Sendable {
         }
         let rows: [JSONValue]
         do {
-            let (live, runs) = try projection()
+            let (live, runs) = try projection(includingUnavailableRows: true)
             rows = (live + runs).map { JSONValue(fromFoundation: $0) }
         } catch PersistenceCoreError.ioFailure(let reason) {
             return envelope("unavailable", reason)
@@ -226,7 +253,7 @@ public struct SwiftNativeSwarmRunsReader: Sendable {
         for row in rows {
             guard case .object(let object) = row, case .string(let id)? = object["id"], !id.isEmpty,
                   case .string(let status)? = object["status"],
-                  let validated = Self.retainedReports(object, runID: id) else {
+                  let validated = Self.checkedReports(row, runID: id) else {
                 if case .object(let object) = row, case .string(let id)? = object["id"], id == runID {
                     return envelope("unavailable", "receipt_store_malformed")
                 }
@@ -276,12 +303,35 @@ public struct SwiftNativeSwarmRunsReader: Sendable {
 
     static func workerReportID(runID: String, index: Int) -> String { "\(runID)-\(String(format: "%02d", index + 1))" }
 
+    /// Admission shared by every presentation and report inspection. Missing
+    /// evidence is unavailable; only the recovery owner establishes liveness.
+    private static func checkedReports(_ row: JSONValue, runID: String) -> [RetainedSwarmReport]? {
+        guard case .object(let receipt) = row,
+              case .string(let id)? = receipt["id"], id == runID, !id.isEmpty,
+              case .string(let objective)? = receipt["objective"], !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              case .string(let status)? = receipt["status"],
+              case .string(let createdAt)? = receipt["createdAt"], NativeTimestampFormat.parseISO8601FractionalFirst(createdAt) != nil else { return nil }
+        if receipt["pid"] != nil {
+            guard status == "running" || status == "unknown",
+                  case .int(let pid)? = receipt["pid"], pid > 0, pid <= Int64(Int32.max) else { return nil }
+        } else {
+            guard ["completed", "partial", "failed", "cancelled", "interrupted"].contains(status) else { return nil }
+            if status != "interrupted" {
+                guard case .string(let completedAt)? = receipt["completedAt"],
+                      NativeTimestampFormat.parseISO8601FractionalFirst(completedAt) != nil else { return nil }
+            }
+        }
+        return retainedReports(receipt, runID: runID)
+    }
+
     private static func retainedReports(_ receipt: [String: JSONValue], runID: String) -> [RetainedSwarmReport]? {
-        guard case .array(let workers)? = receipt["workers"], workers.count <= AgentSwarmPolicy.hardMaxAgents else { return nil }
+        guard case .array(let workers)? = receipt["workers"], !workers.isEmpty, workers.count <= AgentSwarmPolicy.hardMaxAgents else { return nil }
         var reports: [RetainedSwarmReport] = []
         var reportIDs = Set<String>()
         for (index, worker) in workers.enumerated() {
-            guard case .object(var object) = worker else { return nil }
+            guard case .object(var object) = worker,
+                  case .string(let name)? = object["name"], !name.isEmpty,
+                  case .string(let role)? = object["role"], !role.isEmpty else { return nil }
             let pending = receipt["pid"] != nil && object["status"] == .string("working")
             if pending, object["id"] == nil { object["id"] = .string(workerReportID(runID: runID, index: index)) }
             guard case .string(let id)? = object["id"],
@@ -290,17 +340,8 @@ public struct SwiftNativeSwarmRunsReader: Sendable {
             reports.append(report)
         }
         if let synthesis = receipt["synthesis"], synthesis != .null {
-            let object: [String: JSONValue]
-            switch synthesis {
-            case .object(let value): object = value
-            case .string(let text):
-                // The historical run-list preserved raw string synthesis.
-                // Text alone proves neither completion nor clipping state;
-                // even an empty string is not proof synthesis was skipped.
-                object = ["status": .string("unknown"), "output": .string(text)]
-            default: return nil
-            }
-            guard let report = RetainedSwarmReport(id: "synthesis", kind: "synthesis", object: object) else { return nil }
+            guard case .object(let object) = synthesis,
+                  let report = RetainedSwarmReport(id: "synthesis", kind: "synthesis", object: object) else { return nil }
             reports.append(report)
         }
         return reports
@@ -319,16 +360,18 @@ private struct RetainedSwarmReport {
 
     init?(id: String, kind: String, object: [String: JSONValue], pending: Bool = false) {
         guard case .string(let status)? = object["status"],
+              (kind == "synthesis"
+                ? AgentSwarmSynthesisStatus(rawValue: status) != nil
+                : ["completed", "failed", "cancelled", "unknown"].contains(status) || (pending && status == "working")),
               object["error"] == nil || object["error"] == .null || object["error"]?.stringValue != nil else { return nil }
         let error = object["error"]?.stringValue
         switch object["output"] {
         case .string(let value):
             output = value
             outputUnavailableReason = nil
-        case nil where pending || (kind == "worker" && status == "failed" && error?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false):
-            // Pending work and older error-only failures have no retained output.
+        case nil where pending:
             output = ""
-            outputUnavailableReason = pending ? "worker_not_settled" : "legacy_failed_worker_omitted_output"
+            outputUnavailableReason = "worker_not_settled"
         default: return nil
         }
         self.id = id
@@ -400,12 +443,15 @@ public struct SwarmCrew: Identifiable, Equatable, Sendable {
     public enum Liveness: Equatable, Sendable { case running, unknown, settled }
     public let liveness: Liveness
     package nonisolated static func liveness(of row: [String: Any]) -> Liveness {
-        row["status"] as? String == "unknown" ? .unknown : row["pid"] == nil ? .settled : .running
+        if row["receiptUnavailable"] != nil { return .unknown }
+        return row["status"] as? String == "unknown" ? .unknown : row["pid"] == nil ? .settled : .running
     }
     public var live: Bool { liveness == .running }
-    /// The run's own status: running, unknown, completed, partial, failed, cancelled or interrupted.
+    /// The run's own status, or unavailable when its receipt cannot be admitted.
     public let status: String
-    public let at: Date
+    public let at: Date?
+    /// A named evidence gap, never a fabricated empty or running crew.
+    public let receiptUnavailable: String?
     public let workers: [Worker]
     /// The workers' findings pulled together, when the run asked for it.
     public let synthesis: String?
@@ -418,34 +464,39 @@ public struct SwarmCrew: Identifiable, Equatable, Sendable {
         public let text: String
     }
 
-    public var settled: Bool { workers.allSatisfy { $0.status != "working" } }
+    public var settled: Bool {
+        receiptUnavailable == nil && workers.allSatisfy { ["completed", "failed", "cancelled"].contains($0.status) }
+    }
 
     /// Unsettled crews (including unknown liveness), then three settled crews by completion or creation.
     public nonisolated static func read(root: URL) throws -> [SwarmCrew] {
         let all = try SwiftNativeSwarmRunsReader(runsPath: root.appendingPathComponent("swarms/runs.json")).readCrews()
-        let projected = all.compactMap(crew)
+        let projected = try all.map(crew)
         let finished = projected.filter { $0.liveness == .settled }
         let live = projected.filter { $0.liveness != .settled }
-        return live.sorted { $0.at > $1.at } + finished.sorted { $0.at > $1.at }.prefix(3)
+        return live.sorted { ($0.at ?? .distantPast) > ($1.at ?? .distantPast) }
+            + finished.sorted { ($0.at ?? .distantPast) > ($1.at ?? .distantPast) }.prefix(3)
     }
 
-    nonisolated private static func crew(_ row: [String: Any]) -> SwarmCrew? {
-        guard let id = row["id"] as? String, let objective = row["objective"] as? String else { return nil }
+    nonisolated private static func crew(_ row: [String: Any]) throws -> SwarmCrew {
+        guard let id = row["id"] as? String, let objective = row["objective"] as? String,
+              let status = row["status"] as? String else { throw PersistenceCoreError.ioFailure("receipt_store_malformed") }
+        let unavailable = row["receiptUnavailable"] as? String
         let at = (row["completedAt"] as? String ?? row["createdAt"] as? String)
-            .flatMap(NativeTimestampFormat.parseISO8601FractionalFirst) ?? .distantPast
+            .flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
         let workers = (row["workers"] as? [[String: Any]] ?? []).enumerated().map { index, worker in
             let role = (worker["role"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? worker["name"] as? String ?? "Worker \(index + 1)"
             let output = (worker["output"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             return Worker(id: index, name: role.prefix(1).uppercased() + role.dropFirst(),
-                          status: worker["status"] as? String ?? "working",
+                          status: worker["status"] as? String ?? "unavailable",
                           text: output.isEmpty ? worker["error"] as? String ?? "" : output)
         }
-        let synthesis = ((row["synthesis"] as? [String: Any])?["output"] as? String ?? row["synthesis"] as? String)
+        let synthesis = ((row["synthesis"] as? [String: Any])?["output"] as? String)
             .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
         let task = String(objective.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
             .first { !$0.isEmpty }?.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "`", with: "")
             .trimmingCharacters(in: CharacterSet(charactersIn: "#>-* ")) .prefix(120) ?? "")
         return SwarmCrew(id: id, task: task.isEmpty ? "A task" : task, liveness: Self.liveness(of: row),
-                          status: row["status"] as? String ?? "running", at: at, workers: workers, synthesis: synthesis)
+                          status: status, at: at, receiptUnavailable: unavailable, workers: workers, synthesis: synthesis)
     }
 }

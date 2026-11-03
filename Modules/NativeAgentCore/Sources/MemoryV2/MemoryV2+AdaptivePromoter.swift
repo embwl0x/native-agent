@@ -4,11 +4,12 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+import Experiences
 import CognitiveSubstrate
 import ChatTurnContracts
 import TurnTrace
 
-// Blueprint: | `MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter` actor and live interpretation; meaning before apply, trusted fact acceptance by operation identity, learned complete-no-op deferral and labels under the judging model |
+// Blueprint: | `MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter` actor and live interpretation; settlement records queue.add's origin principal and carried steer; meaning before apply, trusted fact acceptance by operation identity, non-owner-turn and learned complete-no-op deferral with labels under the judging model |
 
 // Only the shared interpretation judges facts and care movements from the exchange and known memories.
 // Facts from the owner, trusted peers or her reply are kept; other facts await review.
@@ -21,7 +22,7 @@ public actor AdaptiveMemoryPromoter {
     /// A nil memory manager stages no facts.
     var memoryManager: (any MemoryManaging)?
     /// The person's configured name, read fresh so a rename shows up.
-    var personName: (@Sendable () -> String?)? = nil
+    var personName: (@Sendable () throws -> String?)? = nil
     /// The fold. The String identifies the recorded moment; true when every
     /// piece of her landed.
     var finishInterpretation: (@Sendable (AfterTurnContext, AfterTurnInterpretation?, String?) async -> Bool)?
@@ -41,7 +42,6 @@ public actor AdaptiveMemoryPromoter {
     var owedDrainTimer: (id: UUID, deadline: Date, task: Task<Void, Never>)?
     /// Live observations waiting on or running under the shared tail.
     var pendingLiveObservations = 0
-    var heldImported = false
     var observationTail: Task<AdaptiveMemoryObservation, Never>?
     /// Every observation or drain still running (the tail and the ones it waits
     /// on), so sleep can stop them all.
@@ -51,12 +51,12 @@ public actor AdaptiveMemoryPromoter {
     var owedDrain: Task<AdaptiveMemoryObservation, Never>?
     var heldDrainIsIdle: (@Sendable () async -> Bool)?
     /// Injected fact-promotion policy; no configured owner means enabled.
-    var adaptivePromotionEnabled: (@Sendable () -> Bool)?
+    var adaptivePromotionEnabled: (@Sendable () throws -> Bool)?
 
     public init(
         memory: SwiftNativeMemoryV2? = nil,
         memoryManager: (any MemoryManaging)? = nil,
-        adaptivePromotionEnabled: (@Sendable () -> Bool)? = nil
+        adaptivePromotionEnabled: (@Sendable () throws -> Bool)? = nil
     ) {
         self.memory = memory
         self.memoryManager = memoryManager
@@ -66,8 +66,8 @@ public actor AdaptiveMemoryPromoter {
     public func configure(
         memory: SwiftNativeMemoryV2?,
         memoryManager: (any MemoryManaging)? = nil,
-        adaptivePromotionEnabled: (@Sendable () -> Bool)? = nil,
-        personName: (@Sendable () -> String?)? = nil
+        adaptivePromotionEnabled: (@Sendable () throws -> Bool)? = nil,
+        personName: (@Sendable () throws -> String?)? = nil
     ) {
         guard !stopped else { return }
         self.memory = memory
@@ -119,7 +119,8 @@ public actor AdaptiveMemoryPromoter {
     }
 
     /// Record accepted transcript settlements as owed under the turn's provenance,
-    /// before earlier promotions finish, even during sleep. Her own work is not a moment.
+    /// before earlier promotions finish, even during sleep. Only a care-bearing
+    /// wake with a reply is a moment among her own work.
     @discardableResult
     public func recordOwedTurn(
         userMessage: String,
@@ -127,22 +128,26 @@ public actor AdaptiveMemoryPromoter {
         sessionId: String,
         surface: String = "chat",
         standingAgentName: String? = nil,
-        turnId: String? = nil
+        turnId: String? = nil, repliedAt: Date? = nil
     ) async -> String? {
         guard let door else { return nil }
         let origin = AfterTurnSource.origin
+        let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
+                                          peerID: ChatToolSessionContext.envelope?.verifiedUserId)
         let turn = CognitiveMomentTurn(
             sessionId: sessionId, surface: surface, user: userMessage,
             asked: origin?.userMessage ?? userMessage, assistant: assistantMessage,
             turnId: turnId ?? origin?.runId, runId: origin?.runId, messageId: origin?.messageId,
-            occurredAt: origin?.occurredAt, took: origin?.took, standingAgentName: standingAgentName,
+            occurredAt: origin?.occurredAt, repliedAt: repliedAt, took: origin?.took, standingAgentName: standingAgentName,
             envelope: TurnEnvelope.current(surface: surface).persistedMetadata(),
             sourceCheckpoint: MemoryDataProvenance.sources(in: MemoryDataProvenance.stamping(nil)),
-            elevatedSources: PeerDataTaint.current?.elevatedSources ?? [])
+            elevatedSources: steer.elevated, originPrincipal: ChatPersistenceContext.originPrincipal,
+            carriedSources: steer.sources, careWakes: origin?.careWakes)
         let recordingID = UUID()
         let recording = Task<String?, Never> {
             defer { owedRecordings[recordingID] = nil }
-            guard await conversationKind(sessionId)?.isOwnWork != true else { return nil }
+            let ownWork = await conversationKind(sessionId)?.isOwnWork == true
+            guard !ownWork || turn.isCareWake else { return nil }
             // Everything the door needs is in the captured turn; settlement
             // does not inherit task locals or the caller's cancellation.
             let id = await settle { await door.recordOwed(turn) }
@@ -219,21 +224,39 @@ public actor AdaptiveMemoryPromoter {
         let momentID = liveMomentID(sessionId: sessionId, origin: origin)
         defer { if let momentID { inFlightMoments.remove(momentID) } }
         // ResidentWake's dedicated session carries app-authored arrivals.
-        guard let momentID, await conversationKind(sessionId)?.isOwnWork != true,
+        guard let momentID,
               !Task.isCancelled, let memory else { return skipped }
         let standingAgent = standingAgentName != nil
         let peerSeat = Self.isAgentSeatUserMessage(userMessage)
         let peerSpeaker = standingAgent ? (standingAgentName ?? "standing agent")
             : (peerSeat ? Self.bridgeSender(userMessage) : nil)
-        var observation = await runMemoryManager(
+        let observation = await runMemoryManager(
             speaker: peerSpeaker, memory: memory, userMessage: userMessage,
             assistantMessage: assistantMessage, sessionId: sessionId, surface: surface,
             origin: origin, turnId: turnId, standingAgent: standingAgent,
             momentID: momentID)
-        if adaptivePromotionEnabled?() == false && observation.extraction.failure == nil {
-            observation.extraction = .init(candidates: [], semanticStatus: .skipped)
-        }
+        // The fact owner checks authority before interpretation and commit.
+        // A later policy read cannot erase the result of effects already saved.
         return observation
+    }
+
+    func unavailablePromotionPolicy(_ error: Error, surface: String) async -> AdaptiveMemoryObservation {
+        let cause = error.localizedDescription
+        await RepairOwed.owe(door?.dataRoot ?? PersistenceCore.defaultDataRoot(),
+            id: "trust-policy:adaptive-promotion", kind: .run,
+            operation: "memory.promotion.authority", owner: "Trust policy", words: cause,
+            nextCall: ToolFailureError.call("app", ["action": .string("doctor.run")])).value
+        return AdaptiveMemoryObservation(proposals: [], extraction: .init(candidates: [], semanticStatus: .failed,
+            failure: AfterTurnMemoryFailure(reason: .trustUnavailable, recovery: cause, model: nil, surface: surface)))
+    }
+
+    func promotionPolicyEnabled() async throws -> Bool {
+        guard let adaptivePromotionEnabled else { return true }
+        let enabled = try adaptivePromotionEnabled()
+        let root = door?.dataRoot ?? PersistenceCore.defaultDataRoot()
+        await RepairOwed.settle(root, operation: "memory.promotion.authority",
+            evidence: .init(source: "trust", id: SavedTrustPolicyAuthority.policyURL(dataRoot: root).path)).value
+        return enabled
     }
 
     /// The proposal metadata key carrying a fact decision's operation identity

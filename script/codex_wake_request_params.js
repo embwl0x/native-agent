@@ -8,16 +8,14 @@ function createCodexWakeRequestParams({
   stringSetting,
 }) {
 function clientUserMessageIdForEntries(entries) {
-  const retryCount = Math.max(0, ...entries.map((entry) => Number(entry && entry.hangRetryCount || 0)));
-  const retrySuffix = retryCount > 0 ? `-hang-retry-${retryCount}` : "";
   if (entries.length === 1) {
     const messageId = entries[0].payload.messageId || entries[0].id || crypto.randomUUID();
-    return `nativeagent-codex-${messageId}${retrySuffix}`;
+    return `nativeagent-codex-${messageId}`;
   }
   const key = entries
     .map((entry) => entry.payload.messageId || entry.id || "")
     .join("|");
-  return `nativeagent-codex-batch-${crypto.createHash("sha256").update(key).digest("hex").slice(0, 24)}${retrySuffix}`;
+  return `nativeagent-codex-batch-${crypto.createHash("sha256").update(key).digest("hex").slice(0, 24)}`;
 }
 
 function freshThreadStartParams(config, entries = []) {

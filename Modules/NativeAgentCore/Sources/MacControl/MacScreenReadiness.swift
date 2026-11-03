@@ -151,19 +151,32 @@ public enum MacScreenLock {
     public static let passiveReply = "raw view · passive observation · screen covered; observation waits"
 
     /// The same session/window evidence used by wake, without posting input.
-    public static func isCovered() -> Bool {
-        isLocked() || loginWindowUp()
+    public static func isCovered() throws -> Bool {
+        let state = defaultMacSessionStateSource().currentState()
+        guard state.sessionReadable else {
+            throw Covered(detail: "The macOS screen session could not be read. Read the screen again after restoring session access.", code: "screen_readiness_unavailable")
+        }
+        return try state.screenIsLocked || loginWindowUp()
     }
 
-    private static func loginWindowUp() -> Bool {
+    private static func loginWindowUp() throws -> Bool {
         #if canImport(CoreGraphics) && os(macOS)
-        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
-        return windows.contains {
-            $0[kCGWindowOwnerName as String] as? String == "loginwindow"
-                && ($0[kCGWindowLayer as String] as? Int ?? 0) >= Int(CGWindowLevelForKey(.screenSaverWindow))
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+            throw Covered(detail: "The window server did not return its on-screen window inventory. Read the screen again after restoring window-server access.", code: "screen_readiness_unavailable")
         }
-        #else
+        for window in windows {
+            guard let owner = window[kCGWindowOwnerName as String] as? String else {
+                throw Covered(detail: "An on-screen window has unreadable owner identity. Read the screen again before using the apps underneath.", code: "screen_readiness_unavailable")
+            }
+            guard owner == "loginwindow" else { continue }
+            guard let layer = window[kCGWindowLayer as String] as? Int else {
+                throw Covered(detail: "The login window's layer could not be read. Read the screen again before using the apps underneath.", code: "screen_readiness_unavailable")
+            }
+            if layer >= Int(CGWindowLevelForKey(.screenSaverWindow)) { return true }
+        }
         return false
+        #else
+        throw Covered(detail: "Window-server readiness is unavailable on this platform.", code: "screen_readiness_unavailable")
         #endif
     }
 
@@ -224,7 +237,10 @@ public enum MacScreenLock {
         var mouseEvents = 0
         var keyEvents = 0
         #if canImport(CoreGraphics) && canImport(AppKit) && os(macOS)
-        func covered() -> Bool { after.screenIsLocked || loginWindowUp() }
+        func covered() throws -> Bool {
+            guard after.sessionReadable else { throw Covered(detail: "The macOS screen session could not be read.", code: "screen_readiness_unavailable") }
+            return try after.screenIsLocked || loginWindowUp()
+        }
         func loginPasswordFocused() -> Bool {
             let system = AXUIElementCreateSystemWide()
             AXUIElementSetMessagingTimeout(system, 0.2)
@@ -237,20 +253,20 @@ public enum MacScreenLock {
             return MacAXAttributeRead.copyString(field, kAXRoleAttribute) == kAXSecureTextFieldSubrole
                 || MacAXAttributeRead.copyString(field, kAXSubroleAttribute) == kAXSecureTextFieldSubrole
         }
-        guard settleMs != nil || covered() else { return (before, after, 0, 0) }
+        guard try settleMs != nil || covered() else { return (before, after, 0, 0) }
         guard AXIsProcessTrusted() else {
             throw Covered(detail: "Accessibility permission is required to wake the screensaver; no input was sent.")
         }
         let driver: MacDriverBinding
         if let binding = MacDriverContext.binding { driver = binding }
-        else { driver = await MacAttentionSessionStore.shared.bindDriver() }
-        let personActive = Covered(detail: "Someone is using the Mac right now, so I stopped the wake nudge.")
+        else { driver = try await MacAttentionSessionStore.shared.bindDriver() }
+        let personActive = Covered(detail: MacAttentionSessionStore.driverRefusal, code: "human_takeover")
         let inputUnavailable = Covered(detail: "I couldn't create the safe screensaver wake input.")
         for attempt in 0..<(settleMs == nil ? 2 : 1) {
             if attempt > 0 {
                 after = source.currentState()
                 if let reason = MacWakeGuard.nudgeRefusalReason(for: after) { throw Covered(detail: reason) }
-                if !covered() { return (before, after, mouseEvents, keyEvents) }
+                if try !covered() { return (before, after, mouseEvents, keyEvents) }
             }
             try Task.checkCancellation()
             guard MacPersonInput.activeSecondsAgo() == nil else { throw personActive }
@@ -294,10 +310,10 @@ public enum MacScreenLock {
                 try await Task.sleep(for: .milliseconds(200))
                 after = source.currentState()
                 if let reason = MacWakeGuard.nudgeRefusalReason(for: after) { throw Covered(detail: reason) }
-                if !covered() { return (before, after, mouseEvents, keyEvents) }
+                if try !covered() { return (before, after, mouseEvents, keyEvents) }
             }
         }
-        let loginWindow = loginWindowUp()
+        let loginWindow = try loginWindowUp()
         // A focused secure field is positive authentication evidence;
         // loginwindow alone also draws passwordless savers.
         let locked = loginWindow && !after.displayAsleep && loginPasswordFocused()

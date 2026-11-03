@@ -4,7 +4,7 @@ import Observation
 
 /// Save a submitted note with its signed action identity and reuse that identity until Mac confirmation.
 struct MobileDeskPendingNote: Codable, Identifiable, Sendable {
-    /// Stable across a pre-execution replacement of `submission`.
+    /// Stable while the original submission awaits Mac confirmation.
     let localID: UUID
     var id: String { localID.uuidString }
     let handle: String
@@ -15,12 +15,12 @@ struct MobileDeskPendingNote: Codable, Identifiable, Sendable {
     /// Last delivery problem, kept for honesty. A note that has not reached the
     /// Mac yet is still waiting — it is never described as lost.
     var lastError: String?
-    var rejectedByMac: Bool? = nil
-    /// Missing legacy provenance stays held; a new pairing never adopts it.
-    var pairingFingerprint: String? = nil
+    var rejectedByMac: Bool = false
+    /// Captured on acceptance; a new pairing never adopts it.
+    var pairingFingerprint: String
 
     var statusLine: String {
-        if rejectedByMac == true { return "Your Mac did not add this note" }
+        if rejectedByMac { return "Your Mac did not add this note" }
         if lastError != nil { return "Delivery is unconfirmed" }
         return "Waiting to reach your Mac"
     }
@@ -45,23 +45,23 @@ final class MobileDeskNoteOutbox {
     private let defaults: UserDefaults
     private let storage: MobileLocalStorage
     private var inFlight: Set<String> = []
+    private(set) var storageErrors: [String: String] = [:]
+    var storageError: String? { storageErrors.values.sorted().first }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         storage = MobileLocalStorage(defaults: defaults)
-        if let data = defaults.data(forKey: Self.draftsKey),
-           let restored = try? JSONDecoder().decode([String: String].self, from: data) {
-            drafts = restored
-        }
-        if let data = defaults.data(forKey: Self.pendingKey),
-           let restored = try? JSONDecoder().decode([MobileDeskPendingNote].self, from: data) {
-            pending = restored
-        }
+        do { drafts = try MobileLocalStorage.restore([String: String].self, key: Self.draftsKey, defaults: defaults) ?? [:] }
+        catch { storageErrors[Self.draftsKey] = "Saved Desk drafts could not be read: \(error.localizedDescription). The saved bytes are retained; repair this iPhone's saved Desk drafts before editing notes." }
+        do { pending = try MobileLocalStorage.restore([MobileDeskPendingNote].self, key: Self.pendingKey, defaults: defaults) ?? [] }
+        catch { storageErrors[Self.pendingKey] = "Submitted Desk notes could not be read: \(error.localizedDescription). The saved bytes are retained; repair this iPhone's saved notes before submitting or delivering notes." }
     }
 
     private func persist<Value: Encodable & Sendable>(_ value: Value, key: String) {
+        guard storageErrors[key] == nil else { return }
         storage.save(key: key, value: { value }) { error in
             NSLog("[DeskNoteOutbox] Could not save note: %@", error.localizedDescription)
+            Task { @MainActor [weak self] in self?.storageErrors[key] = "Could not save Desk notes: \(error.localizedDescription). Keep this screen open and repair iPhone storage before submitting." }
         }
     }
 
@@ -79,6 +79,7 @@ final class MobileDeskNoteOutbox {
     /// A half-written note belongs to the item, not to the sheet that happened
     /// to be open. Closing the sheet keeps it.
     func setDraft(_ text: String, for handle: String) {
+        guard storageErrors[Self.draftsKey] == nil else { return }
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             drafts.removeValue(forKey: handle)
         } else {
@@ -92,10 +93,12 @@ final class MobileDeskNoteOutbox {
         pending.filter { $0.handle == handle }.sorted { $0.createdAt < $1.createdAt }
     }
 
-    /// Saves the note immediately under a durable signed identity and starts
-    /// delivering it. The caller is free to dismiss straight away.
-    func submit(handle: String, text: String, engine: iCloudSyncEngine = .shared) {
-        guard let pairing = AgentNameCache.fingerprint(engine.pairingStore?.iCloudPairingSecret) else { return }
+    /// Checkpoint acceptance before the caller clears or dismisses its draft.
+    func submit(handle: String, text: String, engine: iCloudSyncEngine = .shared) async throws {
+        if let storageError { throw SyncError.persistence(storageError) }
+        guard let pairing = AgentNameCache.fingerprint(engine.pairingStore?.iCloudPairingSecret) else {
+            throw SyncError.sendFailed("Connect this iPhone to a Mac before adding a note. Your draft is retained.")
+        }
         let note = MobileDeskPendingNote(
             localID: UUID(),
             handle: handle,
@@ -106,19 +109,25 @@ final class MobileDeskNoteOutbox {
             pairingFingerprint: pairing
         )
         pending.append(note)
+        do { try await storage.flush() }
+        catch {
+            storageErrors[Self.pendingKey] = "Submitted Desk notes could not be saved: \(error.localizedDescription). Keep the draft and repair iPhone storage before submitting again."
+            throw error
+        }
         drafts.removeValue(forKey: handle)
         deliver(note, engine: engine)
     }
 
     /// Re-attempts every note still waiting, under its retained identity.
     func deliverPending(engine: iCloudSyncEngine = .shared) {
+        guard storageErrors[Self.pendingKey] == nil else { return }
         for note in pending { deliver(note, engine: engine) }
     }
 
     private func deliver(_ note: MobileDeskPendingNote, engine: iCloudSyncEngine) {
-        guard note.rejectedByMac != true, !inFlight.contains(note.id) else { return }
-        guard let pairing = note.pairingFingerprint,
-              pairing == AgentNameCache.fingerprint(engine.pairingStore?.iCloudPairingSecret) else {
+        guard !note.rejectedByMac, !inFlight.contains(note.id) else { return }
+        let pairing = note.pairingFingerprint
+        guard pairing == AgentNameCache.fingerprint(engine.pairingStore?.iCloudPairingSecret) else {
             noteFailure(id: note.id, message: "Saved for another pairing. Submit a new note to send it to this Mac.", rejected: false)
             return
         }
@@ -134,14 +143,7 @@ final class MobileDeskNoteOutbox {
                     handle: note.handle,
                     text: note.text,
                     submission: note.submission,
-                    intentionalNewRequest: true,
-                    onReplacement: { [weak self = self] replacement in
-                        // Persist the replacement before its first send so an
-                        // uncertain delivery is retried under the same identity.
-                        guard let self else { throw CancellationError() }
-                        self.replaceSubmission(id: note.id, with: replacement)
-                        try await self.storage.flush()
-                    }
+                    intentionalNewRequest: true
                 )
                 // The Mac owns the Desk: its confirmation is what retires this
                 // copy, and the refreshed snapshot is what shows the real note.
@@ -157,11 +159,6 @@ final class MobileDeskNoteOutbox {
                 noteFailure(id: note.id, message: error.localizedDescription, rejected: rejected)
             }
         }
-    }
-
-    private func replaceSubmission(id: String, with replacement: InboxAction) {
-        guard let index = pending.firstIndex(where: { $0.id == id }) else { return }
-        pending[index].submission = replacement
     }
 
     private func resolve(id: String) {

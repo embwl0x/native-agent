@@ -5,23 +5,20 @@ import EngineRuntime
 import PersonaEngine
 import ChatTurnRuntime
 import ChatSessionWork
-// Blueprint: | `AppModel+ChatState.swift` | `AppModel`: `loadDetachedSessionMessages`, `pinChatSessionForDetachedWindow`, `pruneSessionChatState`, `pruneStaleSessionChatState` |
+// Blueprint: | `AppModel+ChatState.swift` | `AppModel`: checked profile reload through PersonaFacade, detached transcript reads, pinning and stale chat-state pruning |
 
 @MainActor
 extension AppModel {
-    func drainPendingResidentRefreshIfTurnsIdle() {
-        engine.drainPendingResidentRefreshIfTurnsIdle(
-            publishProfile: { await self.reloadPersonality() },
-            refreshMind: { await NativeAgentEngine.live.refreshResidentMindAfterOnboardingTransition() }
-        )
-    }
-
     /// Publish the profile from this root after launch or repair; a failed
-    /// read keeps the visible name rather than clearing the header.
+    /// read retains the owner's error and presentation marks identity unavailable.
     func reloadPersonality() async {
         let previousName = engine.persona.profile?.name
-        guard (try? await engine.persona.loadProfile()) != nil else { return }
-        teachMemoryHygieneName(previousName: previousName)
+        do {
+            try await engine.persona.loadProfile()
+            teachMemoryHygieneName(previousName: previousName)
+        } catch {
+            // PersonaFacade retains this checked read's cause for every identity surface.
+        }
     }
 
     /// Drop the cached messages for a deleted session.

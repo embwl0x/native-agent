@@ -135,23 +135,34 @@ extension HeartbeatBackgroundWork {
             .appendingPathComponent("workshop", isDirectory: true)
             .appendingPathComponent("executions", isDirectory: true)
         var stale: [(id: String, title: String, status: String, age: TimeInterval)] = []
-        if let subs = try? FileManager.default.contentsOfDirectory(
-            at: executionsDir, includingPropertiesForKeys: nil) {
+        do {
+            let subs: [URL]
+            do { subs = try FileManager.default.contentsOfDirectory(at: executionsDir,
+                includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) }
+            catch CocoaError.fileReadNoSuchFile { subs = [] }
             for sub in subs {
+                guard try sub.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
                 let mp = ExecutionRecordFile.canonicalPath(in: sub)
-                guard let data = try? Data(contentsOf: mp),
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let status = obj["status"] as? String else { continue }
+                let data = try Data(contentsOf: mp)
+                guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let status = obj["status"] as? String else {
+                    throw PersistenceCoreError.ioFailure("Execution status unreadable at \(mp.path)")
+                }
                 guard ["queued", "running", "blocked_on_approval"].contains(status) else { continue }
                 let updated = obj["updated_at"] as? String
                 let created = obj["created_at"] as? String
                 guard let age = heartbeatAgeSeconds(updatedAt: updated, createdAt: created, now: now,
-                        crossingAge: heartbeatExecutionStuckAge, deadline: deadline),
-                      age >= heartbeatExecutionStuckAge else { continue }
+                        crossingAge: heartbeatExecutionStuckAge, deadline: deadline) else {
+                    throw PersistenceCoreError.ioFailure("Active execution timestamp unavailable at \(mp.path)")
+                }
+                guard age >= heartbeatExecutionStuckAge else { continue }
                 let id = obj["id"] as? String ?? sub.lastPathComponent
                 let title = obj["title"] as? String ?? id
                 stale.append((id: id, title: title, status: status, age: age))
             }
+        } catch {
+            return HeartbeatIssue(id: "execution-evidence-unavailable", summary: "Execution health could not be measured.",
+                detail: "\(error.localizedDescription). Repair the execution records before judging their health.", priority: 30, actions: [])
         }
         guard !stale.isEmpty else { return nil }
         let rows = stale.prefix(5).map {
@@ -191,17 +202,13 @@ extension HeartbeatBackgroundWork {
 
         // Error-only sinks can be absent or quiet during healthy operation.
         // Availability is a file-access fact, not time since the last error.
-        let unreadable = statuses.filter {
-            let path = $0.feed.url(dataRoot: dataRoot).path
-            return FileManager.default.fileExists(atPath: path)
-                && !FileManager.default.isReadableFile(atPath: path)
-        }
+        let unreadable = statuses.compactMap(\.unavailable)
         if !unreadable.isEmpty {
             return HeartbeatIssue(
                 id: "error-feeds-unreadable",
                 summary: "Some error logs could not be read.",
                 detail: "Unreadable error logs: "
-                    + unreadable.map { $0.feed.relativePath }.joined(separator: ", "),
+                    + unreadable.joined(separator: ", ") + ". Repair the retained logs before judging error health.",
                 priority: 30,
                 actions: []
             )
@@ -225,7 +232,13 @@ extension HeartbeatBackgroundWork {
         now: Date,
         deadline: (Date) -> Void = { _ in }
     ) async -> HeartbeatIssue? {
-        let stale = ((try? await SwiftNativeTaskLedger(dataRoot: dataRoot).listTasks(includeTerminal: false)) ?? []).filter { task in
+        let tasks: [TaskLedgerTaskState]
+        do { tasks = try await SwiftNativeTaskLedger(dataRoot: dataRoot).listTasks(includeTerminal: false) }
+        catch {
+            return HeartbeatIssue(id: "task-evidence-unavailable", summary: "Task health could not be measured.",
+                detail: "\(error.localizedDescription). Repair the task ledger before judging its claims.", priority: 30, actions: [])
+        }
+        let stale = tasks.filter { task in
             guard [.claimed, .update].contains(task.status), task.owner != nil,
                   let updated = DeskClock.parseISO(task.updatedTs) else { return false }
             deadline(updated.addingTimeInterval(heartbeatClaimStaleAge))

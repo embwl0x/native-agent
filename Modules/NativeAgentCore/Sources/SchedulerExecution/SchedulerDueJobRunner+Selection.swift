@@ -6,11 +6,11 @@ import TelegramBot
 import TriggerScheduler
 import DeviceSync
 import DreamREMCycle
-// Blueprint: | `SchedulerDueJobRunner+Selection.swift` | `SchedulerDueJobRunner`: `nextMeaningfulDeadline`, `claimDueJob`, `dueJobs`, `ensureDefaultCycleJobs`; default cycle jobs and one `part` job per part and `schedule:` wake; saved built-in reader watches moved to their door reads |
+// Blueprint: | `SchedulerDueJobRunner+Selection.swift` | `SchedulerDueJobRunner`: body-rhythm-only `nextMeaningfulDeadline`, `claimDueJob`, `dueJobs`, `ensureDefaultCycleJobs`; retired intention kinds cannot claim even after a racing restore; default cycle jobs and one `part` job per part and `schedule:` wake; default cycles match their canonical IDs |
 
 extension SchedulerDueJobRunner {
     /// Earliest future `SchedulerJobRuntime.scheduledEpoch` crossing: unclaimed
-    /// civil work follows the current zone; claims and retry floors keep their
+    /// civil work follows the current zone; active claims keep their
     /// instant. Capped batches request a coalesced continuation; overdue,
     /// unreadable or failed state waits for source/repair invalidation and the
     /// slow missed-event integrity sweep, never a fabricated retry.
@@ -26,6 +26,7 @@ extension SchedulerDueJobRunner {
         for row in rows {
             guard case .object(let obj) = row,
                   SchedulerJobRuntime.bool(obj["enabled"], default: true) else { continue }
+            guard JobKind(rawValue: (SchedulerJobRuntime.string(obj["kind"]) ?? "notify").lowercased()) != nil else { continue }
             guard let epoch = SchedulerJobRuntime.scheduledEpoch(for: obj),
                   epoch.isFinite else { continue }
             if epoch > nowEpoch, earliestFuture.map({ epoch < $0 }) ?? true {
@@ -66,6 +67,9 @@ extension SchedulerDueJobRunner {
         var earliest: (row: JSONValue, fields: [String: JSONValue], id: String, epoch: Double)?
         for row in rows {
             guard case .object(let obj) = row else { continue }
+            // Retired intention kinds cannot acquire a claim, including a
+            // restore racing this pass's stopped-record reconciliation.
+            guard JobKind(rawValue: (SchedulerJobRuntime.string(obj["kind"]) ?? "notify").lowercased()) != nil else { continue }
             let active = obj["activeOccurrence"] != nil
             // A retained claim owes reconciliation even when future runs were cancelled.
             guard active || SchedulerJobRuntime.bool(obj["enabled"], default: true) else { continue }
@@ -83,10 +87,11 @@ extension SchedulerDueJobRunner {
             }
         }
         guard let earliest else { return [] }
-        let name = SchedulerJobRuntime.string(earliest.fields["name"]) ?? earliest.id
-        let kind = (SchedulerJobRuntime.string(earliest.fields["kind"]) ?? "notify").lowercased()
-        let payload: [String: JSONValue]
-        if case .object(let p)? = earliest.fields["payload"] { payload = p } else { payload = [:] }
+        guard case .string(let name)? = earliest.fields["name"],
+              case .string(let kind)? = earliest.fields["kind"],
+              case .object(let payload)? = earliest.fields["payload"] else {
+            throw PersistenceCoreError.ioFailure("Selected scheduler authority is unreadable; no occurrence was admitted.")
+        }
         return [try DueJob(id: earliest.id, name: name, kind: kind, payload: payload,
                        row: earliest.row, dueEpoch: earliest.epoch)]
     }
@@ -100,7 +105,7 @@ extension SchedulerDueJobRunner {
     public func ensureDefaultCycleJobs(now: Date, reactivateCancelled: Bool = false) async throws -> (repaired: [String], nightlyDream: JSONValue) {
         let runDateKey = NativeAgentDreamCycleSchedule.runDateKey(now)
         let dreamDateKey = NativeAgentDreamCycleSchedule.dreamEntryDateKey(now)
-        let dreamAlreadyHasEntry = ((try? FileBackedDreamDiary(dataRoot: root).discover(in: .active, matching: .markdown)) ?? [])
+        let dreamAlreadyHasEntry = (try FileBackedDreamDiary(dataRoot: root).discover(in: .active, matching: .markdown))
             .contains { $0.name == "\(dreamDateKey).md" || $0.name.hasPrefix("\(dreamDateKey)_") }
         let scheduledDreamTimePassed = NativeAgentDreamCycleSchedule.clockHasReached(
             now,
@@ -141,8 +146,8 @@ extension SchedulerDueJobRunner {
                 for wake in wakes {
                     let schedule: [String: JSONValue] = ["type": .string("cron"), "expression": .string(String(wake.signal.dropFirst(9)))]
                     do {
-                        if try SwiftNativeTriggerScheduler.upsertDefaultCycleJob(rows: &rows, id: wake.id, legacyNames: [],
-                            name: "\(wake.part) wakes on \(wake.signal)", kind: "part", intervalSeconds: 86_400, schedule: schedule,
+                        if try SwiftNativeTriggerScheduler.upsertDefaultCycleJob(rows: &rows, id: wake.id,
+                            name: "\(wake.part) wakes on \(wake.signal)", kind: "part", schedule: schedule,
                             objective: wake.signal, extraPayload: ["part": .string(wake.part), "signal": .string(wake.signal)],
                             nextRunEpoch: try Self.nextEpoch(schedule: schedule, now: now), now: now).changed {
                             repaired.append(wake.id)
@@ -162,15 +167,12 @@ extension SchedulerDueJobRunner {
             let agentName = NativeAgentNotificationDefaults.agentDisplayName(dataRoot: root)
             let dreamJobName = "\(agentName) Nightly Dream"
             let remJobName = "\(agentName) Weekly REM"
-            let legacyAgentKey = agentName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 
             let dream = try SwiftNativeTriggerScheduler.upsertDefaultCycleJob(
                 rows: &rows,
                 id: "nativeagent-nightly-dream",
-                legacyNames: ["nightly reflection", "assistant nightly dream", "\(legacyAgentKey) nightly dream"],
                 name: dreamJobName,
                 kind: "dream",
-                intervalSeconds: 86_400,
                 schedule: dreamSchedule,
                 objective: "Scheduled reflection",
                 extraPayload: [:],
@@ -185,10 +187,8 @@ extension SchedulerDueJobRunner {
             if try SwiftNativeTriggerScheduler.upsertDefaultCycleJob(
                 rows: &rows,
                 id: "nativeagent-weekly-rem",
-                legacyNames: ["weekly rem", "assistant weekly rem", "\(legacyAgentKey) weekly rem", "rem consolidation"],
                 name: remJobName,
                 kind: "rem",
-                intervalSeconds: 604_800,
                 schedule: remSchedule,
                 objective: "Scheduled REM consolidation",
                 extraPayload: [:],
@@ -198,7 +198,6 @@ extension SchedulerDueJobRunner {
                 repaired.append(remCatchUp ? "\(remJobName) (catch-up due now)" : remJobName)
             }
 
-            repaired += SwiftNativeTriggerScheduler.moveReaderWatchesToDoor(&rows)
             return (repaired, unscheduled, dream.job)
         }
         let unscheduled = wakeFaults + (inventoryFault.map { [$0] } ?? [])
@@ -211,18 +210,16 @@ extension SchedulerDueJobRunner {
     func backfillDreamReceiptIfNeeded(now: Date) async throws -> String? {
         let dateKey = NativeAgentDreamCycleSchedule.dreamEntryDateKey(now)
         guard !(try await notificationInboxContains(source: "dream_cycle", dateKey: dateKey)) else { return nil }
-        let entries = Self.dreamEntriesForToday(dataRoot: root, dateKey: dateKey)
+        let entries = try Self.dreamEntriesForToday(dataRoot: root, dateKey: dateKey)
         guard !entries.isEmpty else { return nil }
 
         let paths = entries.map { $0.path }
         let agentName = NativeAgentNotificationDefaults.agentDisplayName(dataRoot: root)
-        let title = "\(agentName) dreamed"
-        let message = Self.dreamInboxMessage(
-            entriesWritten: entries.count,
-            sessionsProcessed: entries.count,
-            errors: [],
-            entries: entries
-        )
+        let title = "\(agentName)'s dream diary"
+        let message = (["Found existing diary entries; this card records the observed files, not a new dream pass or a count of processed conversations."]
+            + entries.map { entry in
+                ([entry.path, entry.title, entry.summary].filter { !$0.isEmpty }).joined(separator: "\n")
+            }).joined(separator: "\n\n")
         let itemId = "dream-cycle-\(dateKey)-backfill"
         try await appendNotificationInbox(
             title: title,
@@ -241,11 +238,6 @@ extension SchedulerDueJobRunner {
             jobId: "nativeagent-nightly-dream",
             source: "dream_cycle",
             itemId: itemId
-        )
-        try await schedulerJobs.markDefaultCycleJobRun(
-            id: "nativeagent-nightly-dream",
-            detail: "dream entries found; inbox receipt backfilled",
-            at: now
         )
         return itemId
     }

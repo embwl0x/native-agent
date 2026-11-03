@@ -2,7 +2,7 @@ import NativeAgentCore
 import Foundation
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `SecurityCenter.swift` | Security decisions including permission-reset approval, audit JSONL, preserved pretrim archive and completion marker; local backup/export/phone exclusions and Security Audit privacy scope declared at the owner; status accepts the facade's checked policy generation without rereading it |
+// Blueprint: | `SecurityCenter.swift` | Checked security decisions including unavailable effect profiles and permission-reset approval, current audit JSONL retention without completed archival migration; local backup/export/phone exclusions and Security Audit privacy scope declared at the owner; status accepts the facade's checked policy generation without rereading it |
 
 struct OriginAssessment: Sendable {
     var trusted: Bool
@@ -198,15 +198,19 @@ public actor SwiftNativeSecurityCenter {
         snapshot: TrustPolicyAuthorizationSnapshot,
         evaluatedAt: Date
     ) async throws -> SecurityToolEnvelope {
+        if let reason = MacInjectionArgRedaction.withheldArgumentReason(in: .object(input)) {
+            throw ToolFailureError(reason, effects: .none, owner: "Action argument contract",
+                code: "argument_contract_unavailable",
+                instruction: "Repair or identify the current action, then submit its original arguments again. Withheld arguments cannot be executed or approved.")
+        }
         let policy = snapshot.policy
         let security = Self.object(policy["securityPolicy"])
         let canonicalTool = Self.policyToolName(tool)
         let trustedRoots = Self.trustedWorkspaceRoots(
-            policy: policy,
             filePolicy: Self.object(policy["filePolicy"]),
             dataRoot: dataRoot
         )
-        let profile = Self.profile(
+        let profile = try Self.profile(
             tool: canonicalTool,
             input: input,
             dataRoot: dataRoot,
@@ -224,7 +228,7 @@ public actor SwiftNativeSecurityCenter {
             snapshot: snapshot
         )
         // The one decision: User's posture and the class the call declares.
-        let (toolClass, autonomyLevel, autonomyReason, autonomyRemedy) = PermissionLaw.answer(
+        let (toolClass, autonomyLevel, autonomyReason, autonomyRemedy) = try PermissionLaw.answer(
             tool: tool, input: input, policy: policy, capabilities: profile.capabilities)
         // Typed-secret redaction precedes generic redaction so persisted audit previews cannot contain injected secrets.
         let redacted = Self.redactValue(
@@ -304,6 +308,7 @@ public actor SwiftNativeSecurityCenter {
         evaluatedAt: Date
     ) -> SecurityToolEnvelope {
         let canonicalTool = Self.policyToolName(tool)
+        let failure = error as? ToolFailureError
         return SecurityToolEnvelope(
             id: UUID().uuidString,
             createdAt: Self.isoTimestamp(evaluatedAt),
@@ -311,79 +316,41 @@ public actor SwiftNativeSecurityCenter {
             surface: origin.surface,
             origin: origin,
             originTrusted: false,
-            originTrustReason: "saved trust policy is unavailable",
+            originTrustReason: "admission evidence is unavailable",
             capabilities: [],
-            risk: CanonicalToolRisk.critical.rawValue,
+            risk: CanonicalToolRisk.unavailable.rawValue,
             autonomyLevel: "blocked",
             fullMacYoloAuthority: .unavailable,
             decision: .block,
             allowed: false,
             requiresApproval: false,
-            reasons: [.init(.cause, "\(dataRoot.appendingPathComponent("trust/policy.json").path) could not authorize \(canonicalTool): \(error.localizedDescription)")],
+            reasons: [.init(.cause, "\(canonicalTool) could not be authorized: \(error.localizedDescription)")],
             redactedInputPreview: Self.redactValue(
                 .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input))
             ),
             auditReceiptsEnabled: true,
-            remedy: Repair.remedy(owner: "trust/policy.json", nextCall: nil,
-                tap: "Trust > Access and policy > Preserve damaged policy and authorize Safe")
+            remedy: Repair.remedy(owner: failure?.owner ?? "trust/policy.json", nextCall: nil,
+                tap: failure?.tap,
+                instruction: failure?.instruction ?? "Preserve the unavailable source and repair the reported cause before retrying.")
         )
     }
 
     public func record(_ envelope: SecurityToolEnvelope) async throws {
         guard envelope.auditReceiptsEnabled else { return }
-        // Owns security/audit.jsonl (envelope JSONL), audit-archive-<date>.jsonl
-        // (preserved bytes) and .audit-pretrim-archive-complete-v1 (completed\n).
+        // Owns security/audit.jsonl (envelope JSONL). Prior archives remain inert.
         // Deliberately local: no local backup, data export or phone sync.
         // PrivacyMap lists Security Audit. Archive and append share this lock.
         let path = auditReceiptsPath
         let event = envelope.toJSONValue()
-        let now = clock()
         try await SwiftNativePersistenceCore.withFileLock(path) {
             try await appendJSONLCapped(
                 event,
                 to: path,
                 maxLines: JSONLLineCaps.securityAudit,
                 logLabel: "SecurityCenter.audit",
-                trimWhenBytesExceed: JSONLLineCaps.securityAuditTrimTriggerBytes,
-                beforePotentialLineCap: { dropped in
-                    guard let dropped, !dropped.isEmpty else { return }
-                    try Self.archivePreTrimAuditIfNeeded(path: path, now: now)
-                }
+                trimWhenBytesExceed: JSONLLineCaps.securityAuditTrimTriggerBytes
             )
         }
-    }
-
-    /// Archive the complete original once before selected rows are removed; failure aborts trimming.
-    private static func archivePreTrimAuditIfNeeded(path: URL, now: Date) throws {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: path.path) else { return }
-        let dir = path.deletingLastPathComponent()
-        let completionMarker = dir.appendingPathComponent(
-            ".audit-pretrim-archive-complete-v1"
-        )
-        guard !fm.fileExists(atPath: completionMarker.path) else { return }
-        let existing = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
-        if existing.contains(where: {
-            $0.hasPrefix("audit-archive-") && $0.hasSuffix(".jsonl")
-        }) {
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(
-                Data("completed\n".utf8),
-                to: completionMarker
-            )
-            return
-        }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        let destination = dir.appendingPathComponent(
-            "audit-archive-\(formatter.string(from: now)).jsonl"
-        )
-        try fm.copyItem(at: path, to: destination)
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(
-            Data("completed\n".utf8),
-            to: completionMarker
-        )
     }
 
     private var auditReceiptsPath: URL {
@@ -424,12 +391,12 @@ public actor SwiftNativeSecurityCenter {
             return OriginAssessment(trusted: false, reason: "\(surface) origin is not in allowlist", isRemote: true)
         }
         if surfaceProfile.isIOSRemote {
-            let iosRemote = Self.object(policy["iosRemotePolicy"])
-            // iOS trust requires iosRemotePolicy or transport-verified, signed Full Mac authority.
+            let macControl = Self.object(policy["macControlPolicy"])
+            // Only a transport-verified command may use the current phone grant.
             let signedFullMac = Self.fullMacActive(policy: policy)
                 && origin.commandSignatureVerified == true
-            let pairedAllowed = signedFullMac
-                || Self.bool(iosRemote["remote_from_ios_allowed"], default: false)
+            let pairedAllowed = origin.commandSignatureVerified == true && (signedFullMac
+                || Self.bool(macControl["remote_from_ios_allowed"], default: false))
             return OriginAssessment(
                 trusted: pairedAllowed,
                 reason: pairedAllowed ? "paired iOS remote control enabled" : "iOS remote control not trusted for high-risk actions",
@@ -481,10 +448,10 @@ public actor SwiftNativeSecurityCenter {
     /// The turn's verified SENDER is one the person allowlisted by user id
     /// on Telegram or Slack: the allowlists `assessOrigin` trusts, without its
     /// allowed-chat match, which admits anyone in that chat. A private
-    /// Telegram chat's id is its sender's. Anything unreadable is not him.
-    public func remoteSenderIsAllowlisted(_ origin: SecurityOriginContext) async -> Bool {
+    /// Telegram chat's id is its sender's. Unreadable authority throws its cause.
+    public func remoteSenderIsAllowlisted(_ origin: SecurityOriginContext) async throws -> Bool {
         let surface = ConversationSurfaceProfile(origin.surface).id
-        guard let allowed = try? await (surface == "telegram" ? telegramSecurityAllowlist()
+        guard let allowed = try await (surface == "telegram" ? telegramSecurityAllowlist()
             : surface == "slack" ? slackSecurityAllowlist() : nil) else { return false }
         if let user = origin.userId { return allowed.userIds.contains(user) }
         return surface == "telegram" && origin.chatId.map(allowed.userIds.contains) == true

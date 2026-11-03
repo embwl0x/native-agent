@@ -10,16 +10,16 @@ import Senses
 import Transcripts
 import TurnTrace
 import NativeAgentShared
-// Blueprint: | `TurnPart.swift` | `TurnPart`: their turn as a part (`abilities/turn.js` `step(state, event)`) in one held helper per turn (a helper short of resources is an observation retried on the helper backoff until Stop; any other start failure ends the turn with its fix), version choice (prior shipped bodies come from generated `shipped`) and seed install (write failures name the person and storage repair), the effect queue, the turn's event log and reconstruction for resume and heal; `provider_failure` carries the repair's callable input, permits explicit `app` repair calls through the ordinary dispatcher or a re-issued `model.call`, and can end incomplete without healing an authored part; compare-and-swap heal in one store transaction |
+// Blueprint: | `TurnPart.swift` | `TurnPart`: exclusive source-bound turn helper; checked current/seed installation; identity-only effect starts and one event-log reconstruction for resume/heal; non-Stop program/helper failures invoke bounded compare-and-swap recovery through an unfailed previous program or seed, with one fresh seed-helper lease under the same checked current admission; original cause/selected digest traced; storage failures propagate without running an uncommitted replacement |
 
 /// Her turn as a part (docs/AGENT_IS_THE_APP.md, contract 1). `abilities/turn.js`
 /// exports `step(state, event) → {state, do: [effects]}` and runs no loop of its
 /// own: the stem hands each event here and runs the effects queued here.
 ///
 /// The log holds events only: what each step was handed (with the reach answers
-/// it read), each effect the stem started (by identity and payload digest) and
+/// it read), each effect the stem started (by identity) and
 /// the reply text it streamed. Resume and heal rebuild from it the same way
-/// (`reconstruct`). A step that throws or answers malformed heals the part, the
+/// (`reconstruct`). A step that fails or answers malformed heals the part, the
 /// one law applied to the part that must always exist: the version before it
 /// (or the seed the app ships) comes back and the log replays through it. She
 /// hears about it when the turn ends, with the evidence.
@@ -45,79 +45,66 @@ struct TurnPart {
     /// to her exactly, so a call she proposes again is the same call.
     private(set) var uncertain: [JSONValue] = []
     private var finished = false
-    private var queue: [(effect: [String: JSONValue], identity: String, digest: String, step: Int)] = []
+    private var queue: [(effect: [String: JSONValue], identity: String, step: Int)] = []
     private var state: JSONValue = .null
-    /// The current model round: its ordinal, call ids and payload digests; an
+    /// The current model round: its ordinal and call ids; an
     /// app effect runs each call once.
-    private var round: (ordinal: Int, ids: [String], digests: [String], used: Set<Int>, repair: Bool)?
+    private var round: (ordinal: Int, ids: [String], used: Set<Int>, repair: Bool)?
     private var rounds = 0
     private var seen: [String: Int] = [:]
     private var file: AbilityStore.File
     private let seed: AbilityStore.File
     private var failed: Set<String> = []
-    /// One helper for the whole turn; nil until a step needs it, again after a heal.
+    /// Exclusive source-bound opened program; each event gets fresh frozen input.
     private var helper: OwnedProgramRunner.Held?
     private var arrivals: [ResidentWake.Item] = []
     private var heals = 0
+    /// A helper failure can happen before the seed ever executes. Allow one
+    /// fresh seed lease, independently of defective source recovery.
+    private var seedHelperRetried = false
 
-    /// The version that runs: the root's turn.js if it reads cleanly, else a
-    /// clean `.prev`, else the seed. Installing the seed is recorded when the
-    /// store accepts it; it is never a precondition of the turn.
+    /// The installed current version runs. Only an absent current slot admits
+    /// seed installation; a failed read or write ends with its storage cause.
     init(dataRoot: URL, surface: String, stop: URL?, context: TurnContext, log: [JSONValue]) async throws {
         self.dataRoot = dataRoot; self.surface = surface; self.stop = stop; self.log = log
         gathered = context.turnReach; tools = context.toolSchemas.map(\.name)
         seed = try AbilityStore.decode(Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/abilities/turn.js"))
         let store = AbilityStore(dataRoot: dataRoot)
-        let current = Self.read(store, .current)
-        if let chosen = current.file ?? Self.read(store, .previous).file {
+        if let chosen = try Self.read(store, .current) {
             file = chosen
-            var metadata = chosen.metadata
-            metadata["version"] = seed.metadata["version"]
-            // Upgrade only an unchanged shipped version, never an authored part.
-            if current.unread == nil, case .int(let version)? = chosen.metadata["version"], metadata == seed.metadata,
-               Self.shipped[version]?.contains(chosen.bodyDigest) == true {
-                file = await Self.install(seed, over: chosen, store: store, dataRoot: dataRoot)
-            }
         } else {
-            file = seed
-            if current.unread == nil { file = await Self.install(seed, over: nil, store: store, dataRoot: dataRoot) }
-        }
-        // Another version running in place of an unreadable one is hers to hear.
-        if let why = current.unread {
-            arrivals.append(.init(id: "turn-unreadable:" + file.bodyDigest, line:
-                "Your turn part abilities/turn.js could not be read (\(why)), so I ran \(Self.name(file, seed: seed)) for that turn.",
-                key: "turn-heal", home: true))
+            file = try await Self.install(seed, store: store, dataRoot: dataRoot)
         }
     }
 
-    /// Installing the shipped part is the stem's bookkeeping, never a
-    /// precondition of the turn: a store that refuses the write leaves the turn
-    /// running the shipped part, and the abilities directory owes repair until
-    /// a later turn's install works. What someone else wrote meanwhile is adopted.
-    private static func install(_ seed: AbilityStore.File, over expected: AbilityStore.File?,
-                                store: AbilityStore, dataRoot: URL) async -> AbilityStore.File {
+    /// Seed installation must land before it runs. A concurrent current write
+    /// wins under the same lock; its checked bytes are adopted without a swap.
+    private static func install(_ seed: AbilityStore.File,
+                                store: AbilityStore, dataRoot: URL) async throws -> AbilityStore.File {
         do {
             let installed = try await asStem {
                 try AbilityStore.withLock {
-                    if let latest = try store.read(id: id), latest != expected { return latest }
+                    if let latest = try Self.read(store, .current) { return (file: latest, written: false) }
                     try store.write(seed)
-                    return seed
+                    return (file: seed, written: true)
                 }
             }
-            RepairOwed.settle(dataRoot, operation: "turn.part.install", evidence: .init(source: "abilities", id: seed.bodyDigest))
-            return installed
+            if installed.written {
+                RepairOwed.settle(dataRoot, operation: "turn.part.install", evidence: .init(source: "abilities", id: seed.bodyDigest))
+            }
+            return installed.file
         } catch {
-            let owner = store.root.path + " (turn.js)"
-            let words = "The shipped turn part was not written to \(owner): \(error.localizedDescription). Turns run the shipped part meanwhile; repair is owed until a turn installs it."
+            let owner = store.root.appendingPathComponent("turn.js")
+            let words = "The turn part could not be installed at \(owner.path): \(error.localizedDescription). This turn ended incomplete."
             RepairOwed.owe(dataRoot, id: "turn-part-install:" + UUID().uuidString, kind: .run,
-                operation: "turn.part.install", owner: owner, words: words,
-                tap: "Tell the person: repair NativeAgent's turn-part installation/storage failure at \(owner). Restore write access there, preserving every ability file and its .prev version; repair is proved only when a turn installs the shipped part.")
-            return seed
+                operation: "turn.part.install", owner: owner.path, words: words,
+                tap: "Tell the person: repair NativeAgent's turn-part installation/storage failure at \(owner.path). Restore access there, preserving every ability file and its .prev version; repair is proved only when a turn installs the shipped part.")
+            throw store.repairFailure(source: owner, detail: words)
         }
     }
 
-    /// Each event is one step. A fault anywhere in the batch heals and replays
-    /// the whole batch.
+    /// Each event is one step. A program/helper fault heals and replays the
+    /// batch; Stop and storage failures retain their own boundaries.
     mutating func deliver(_ events: [JSONValue]) async throws {
         let first = log.count
         log += events.map { .object(["event": $0]) }
@@ -152,7 +139,7 @@ struct TurnPart {
             _ = try await heal(Fault(code: "stalled", why: "Its steps left the turn with nothing to do and no reply.end."))
         }
         let item = queue.removeFirst()
-        log.append(.object(["start": .object(["id": .string(item.identity), "digest": .string(item.digest)])]))
+        log.append(.object(["start": .object(["id": .string(item.identity)])]))
         if case .object(let entry) = log[item.step], case .object(let event)? = entry["event"],
            event["type"] == .string("provider_failure") {
             if item.effect["effect"] == .string("model.call") {
@@ -188,21 +175,21 @@ struct TurnPart {
         arrivals = []
     }
 
-    private struct Fault: Error { let code: String; let why: String }
+    private struct Fault: Error { let code: String; let why: String; var helperFailure = false }
 
-    /// `unread`: why the slot holds no usable turn part, when it holds something.
-    private static func read(_ store: AbilityStore, _ slot: AbilityStore.Slot) -> (file: AbilityStore.File?, unread: String?) {
-        do {
-            let found = try store.read(id: id, slot: slot)
-            return (found?.kind == .turn ? found : nil, found.flatMap { $0.kind != .turn ? "it is not a turn part" : nil })
-        } catch {
-            nativeLog("Her turn part's %@ file is unreadable: %@", slot.rawValue, error.localizedDescription)
-            return (nil, error.localizedDescription)
+    /// Nil is a missing slot only. Unreadable or wrong-kind bytes stay a
+    /// storage failure, never evidence that another version should run.
+    private static func read(_ store: AbilityStore, _ slot: AbilityStore.Slot) throws -> AbilityStore.File? {
+        let found = try store.read(id: id, slot: slot)
+        if let found, found.kind != .turn {
+            throw store.repairFailure(source: try store.path(id: id, slot: slot, pathExtension: found.pathExtension),
+                                      detail: "The turn slot does not hold a turn part.")
         }
+        return found
     }
 
-    private static func digest(_ value: JSONValue) -> String {
-        let text = (try? value.serialize(pretty: false)) ?? ""
+    private static func digest(_ value: JSONValue) throws -> String {
+        let text = try value.serialize(pretty: false)
         return SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
@@ -253,7 +240,7 @@ struct TurnPart {
         }
     }
 
-    private static func callIdentity(_ round: (ordinal: Int, ids: [String], digests: [String], used: Set<Int>, repair: Bool), _ at: Int) -> String {
+    private static func callIdentity(_ round: (ordinal: Int, ids: [String], used: Set<Int>, repair: Bool), _ at: Int) -> String {
         round.ids[at].isEmpty ? "app:\(round.ordinal):\(at)" : "app:" + round.ids[at]
     }
 
@@ -263,7 +250,7 @@ struct TurnPart {
         if case .object(let answers)? = entry["reach"] { logged = answers }
         let host = Reach(gathered: gathered, tools: tools, answers: logged)
         defer { entry["reach"] = .object(host.answers); log[index] = .object(entry) }
-        guard let answer = try await run(.object(["state": state, "event": .object(event)]), host: host) else { return }
+        let answer = try await run(.object(["state": state, "event": .object(event)]), host: host)
         guard let next = answer["state"], case .array(let list)? = answer["do"] else {
             throw Fault(code: "malformed", why: "Its step returned no {state, do: [effects]}.")
         }
@@ -272,15 +259,15 @@ struct TurnPart {
         if event["type"] == .string("model") || event["type"] == .string("provider_failure") {
             rounds += 1
             round = (rounds, calls.map { if case .object(let call) = $0, case .string(let id)? = call["id"] { id } else { "" } },
-                     calls.map(Self.digest), [], event["type"] == .string("provider_failure"))
+                     [], event["type"] == .string("provider_failure"))
         } else if event["type"] != .string("result") { round = nil }
-        var effects: [(effect: [String: JSONValue], identity: String, digest: String, step: Int)] = []
+        var effects: [(effect: [String: JSONValue], identity: String, step: Int)] = []
         var opened: (system: SystemPromptSegments, tools: [String]?)?
         for item in list {
             guard case .object(var effect) = item, case .string(let name)? = effect["effect"], Self.effects.contains(name) else {
                 throw Fault(code: "malformed", why: "Its step returned an effect the stem does not run: \((try? item.serialize(pretty: false)) ?? "?").")
             }
-            var admittedCall: (identity: String, digest: String)?
+            var admittedCall: String?
             switch name {
             case "app":
                 if event["type"] == .string("provider_failure"), var current = round,
@@ -289,10 +276,10 @@ struct TurnPart {
                     let position = current.ids.count
                     let id = "repair:\(current.ordinal):\(position)"
                     call["id"] = .string(id)
-                    current.ids.append(id); current.digests.append(Self.digest(.object(call))); current.used.insert(position)
+                    current.ids.append(id); current.used.insert(position)
                     round = current
                     effect = ["effect": .string("app"), "index": .int(Int64(position)), "call": .object(call)]
-                    admittedCall = (Self.callIdentity(current, position), current.digests[position])
+                    admittedCall = Self.callIdentity(current, position)
                     break
                 }
                 // A call of this model round, by id (index when id-less), each once.
@@ -307,7 +294,7 @@ struct TurnPart {
                 }
                 round = current
                 effect = ["effect": .string("app"), "index": .int(Int64(position))]
-                admittedCall = (Self.callIdentity(current, position), current.digests[position])
+                admittedCall = Self.callIdentity(current, position)
             case "reply.end":
                 let repairResult = event["type"] == .string("result") && round?.repair == true
                 guard (event["type"] == .string("model") && calls.isEmpty) || event["type"] == .string("provider_failure") || repairResult else {
@@ -338,18 +325,15 @@ struct TurnPart {
                 opened = (SystemPromptSegments(stable: stable, dynamic: dynamic), tools)
             default: break
             }
-            // App effects already have the model call's identity and digest.
-            // Hash only effects whose own payload supplies their digest.
-            let digest = admittedCall?.digest ?? Self.digest(item)
             var identity: String
-            if let admittedCall { identity = admittedCall.identity }
+            if let admittedCall { identity = admittedCall }
             else if case .string(let own)? = effect["id"], !own.isEmpty { identity = name + ":" + own }
             else {
-                identity = name + ":" + digest
+                identity = name + ":" + (try Self.digest(item))
                 seen[identity, default: 0] += 1
                 identity += "#\(seen[identity] ?? 1)"
             }
-            effects.append((effect, identity, digest, index))
+            effects.append((effect, identity, index))
         }
         if let opened { (system, offeredTools) = opened }
         if event["type"] == .string("message"), system == nil {
@@ -360,57 +344,70 @@ struct TurnPart {
         if event["type"] == .string("model"), calls.isEmpty, case .string(let text)? = event["text"] { answered += text }
     }
 
-    /// The step's answer object; nil when the turn was stopped meanwhile. A
-    /// helper that cannot start for want of resources (`spawn_busy`) is an
-    /// observation, retried on the provider backoff until it starts or the
-    /// turn is stopped; any other start failure is the stem's own and permanent,
-    /// and ends the turn at once with its fix.
-    private mutating func run(_ input: JSONValue, host: Reach) async throws -> [String: JSONValue]? {
+    /// Each selected source gets one helper attempt. Every non-Stop failure
+    /// reaches the same bounded turn-program recovery, regardless of origin.
+    private mutating func run(_ input: JSONValue, host: Reach) async throws -> [String: JSONValue] {
         let runner = OwnedProgramRunner(dataRoot: dataRoot)
-        var attempt = 0
-        while helper == nil {
-            if Task.isCancelled || ChatCancelFlag.isRaised(stop) { return nil }
-            do { helper = try runner.hold() } catch {
-                guard (error as? SenseFailure)?.code == "spawn_busy" else {
-                    let code = (error as? SenseFailure)?.code ?? "helper_start_failed"
-                    throw TurnEngineError.turnHelperUnavailable("\(code): \(error.localizedDescription) Tell the person: this copy of NativeAgent could not start its turn helper at \(SenseHostLocator.helperURL.path).")
-                }
-                attempt += 1
-                let delay = ProviderRecoveryPolicy.backoffSeconds(forRetry: attempt)
-                TurnObservation.record(.helperUnavailable(why: error.localizedDescription, retryIn: Int(delay)), surface: surface)
-                guard await waitUnlessStopped(delay) else { return nil }
+        let program = OwnedProgram(kind: .turn, id: file.id, version: file.bodyDigest, source: file.body, entry: .run, resident: true)
+        let opening = helper == nil
+        if Task.isCancelled || ChatCancelFlag.isRaised(stop) { throw CancellationError() }
+        if helper == nil {
+            do {
+                helper = try runner.holdTurn(program)
+            } catch is CancellationError { throw CancellationError() }
+            catch {
+                let code = (error as? SenseFailure)?.code ?? "helper_start_failed"
+                TurnTraceBus.fireFromContext(kind: "turn.part.unavailable", surface: surface,
+                    payload: .object(["phase": .string("admission"), "reason": .string(code),
+                                      "detail": .string(error.localizedDescription)]))
+                throw Fault(code: code, why: "\(error.localizedDescription) Helper: \(SenseHostLocator.helperURL.path).", helperFailure: true)
             }
         }
-        guard let held = helper else { return nil }
-        let program = OwnedProgram(kind: .turn, id: file.id, version: file.bodyDigest, source: file.body, entry: .run, resident: true)
+        guard let held = helper else { throw Fault(code: "helper_lease_missing", why: "The helper owner returned no lease.", helperFailure: true) }
         let receipt = await runner.run(program, input: input, host: host, on: held)
-        if Task.isCancelled { return nil }
+        if opening, case .object(let out) = receipt {
+            var payload: [String: JSONValue] = ["reused": .bool(held.reused),
+                "sourceDigest": .string(program.digest), "version": .string(program.version)]
+            payload["status"] = out["status"]
+            if case .bool(let reused)? = out["programReused"] {
+                payload["programReused"] = .bool(reused)
+                payload["freshContext"] = .bool(!reused)
+            }
+            TurnTraceBus.fireFromContext(kind: "turn.part.helper", surface: surface, payload: .object(payload))
+        }
+        if Task.isCancelled || ChatCancelFlag.isRaised(stop) { throw CancellationError() }
         guard case .object(let out) = receipt, out["status"] == .string("ok") else {
             helper = nil
-            var why = "Its step did not finish.", code = "threw"
+            var why = "The helper returned no terminal receipt.", code = "helper_receipt_invalid"
+            var remedy: JSONValue?
+            var helperFailure = true
             if case .object(let fields) = receipt {
-                if fields["status"] == .string("timed_out") { code = "timed_out" }
+                if case .string(let status)? = fields["status"] {
+                    code = status; why = "The helper returned \(status) without failure detail."
+                }
+                if case .string(let reason)? = fields["reason"] { code = reason }
+                if case .string(let detail)? = fields["detail"] { why = detail }
+                if case .object(let stopped)? = fields["stopped"] {
+                    if stopped["reason"] == .string("cancelled") { throw CancellationError() }
+                    if case .string(let reason)? = stopped["reason"] { code = reason }
+                    if case .string(let detail)? = stopped["detail"] { why = detail }
+                }
                 if case .object(let error)? = fields["error"] {
                     if case .string(let message)? = error["message"] { why = message }
                     if case .string(let reason)? = error["reason"] { code = reason }
+                    remedy = error["remedy"]
+                    helperFailure = error["origin"] != .string("javascript")
                 }
             }
-            throw Fault(code: code, why: why)
+            TurnTraceBus.fireFromContext(kind: "turn.part.unavailable", surface: surface,
+                payload: .object(["phase": .string("execution"), "reason": .string(code), "detail": .string(why),
+                                  "remedy": remedy ?? .null]))
+            throw Fault(code: code, why: why, helperFailure: helperFailure)
         }
         guard case .object(let answer)? = out["returned"] else {
             throw Fault(code: "malformed", why: "Its step returned no {state, do: [effects]}.")
         }
         return answer
-    }
-
-    /// False when Stop (the turn's cancellation or its cancel flag) ends the wait.
-    private func waitUnlessStopped(_ seconds: TimeInterval) async -> Bool {
-        do {
-            try await SwiftNativeTurnEngine.untilStopped(stop) {
-                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            }
-            return !Task.isCancelled && !ChatCancelFlag.isRaised(stop)
-        } catch { return false }
     }
 
     /// Compare-and-swap on the failing version, in one store transaction: only
@@ -421,47 +418,76 @@ struct TurnPart {
     /// adopted as it is.
     private mutating func heal(_ fault: Fault) async throws -> Bool {
         let broken = file
-        failed.insert(broken.bodyDigest)
+        let retrySeedHelper = broken.bodyDigest == seed.bodyDigest && fault.helperFailure && !seedHelperRetried
+        if !retrySeedHelper { failed.insert(broken.bodyDigest) }
         helper = nil; heals += 1
-        guard broken.bodyDigest != seed.bodyDigest else { throw TurnEngineError.turnPartFailed(fault.why) }
         let store = AbilityStore(dataRoot: dataRoot), seed = seed, failed = failed
-        let outcome = try await Task.detached { () -> (file: AbilityStore.File, swapped: Bool, kept: String, refused: String?, unread: String?) in
-            AbilityStore.withLock {
-                let usable = { (file: AbilityStore.File?) in file.flatMap { failed.contains($0.bodyDigest) ? nil : $0 } }
-                let read = Self.read(store, .current), current = read.file, previous = Self.read(store, .previous).file
-                guard current?.bodyDigest == broken.bodyDigest else {
-                    return (usable(current) ?? usable(previous) ?? seed, false, "", nil, read.unread)
+        let outcome = try await Self.asStem { () throws -> (file: AbilityStore.File, swapped: Bool, kept: String, freshHelper: Bool) in
+            try AbilityStore.withLock {
+                guard let current = try Self.read(store, .current) else {
+                    throw store.repairFailure(source: store.root.appendingPathComponent("turn.js"),
+                                              detail: "The failing turn's current slot disappeared before recovery.")
                 }
-                var chosen = seed, kept = "\(Self.name(broken, seed: seed)) is kept as abilities/turn.prev.js."
+                guard current.bodyDigest == broken.bodyDigest else {
+                    guard !failed.contains(current.bodyDigest) else {
+                        throw store.repairFailure(source: store.root.appendingPathComponent("turn.js"),
+                                                  detail: "A concurrently selected turn version already failed this turn.")
+                    }
+                    return (current, false, "", false)
+                }
+                // Even a fresh seed lease uses the same checked current
+                // admission; a concurrent write wins, storage errors remain.
+                if retrySeedHelper { return (current, false, "", true) }
+                // Only a turn-program/helper fault reaches this read. An unreadable
+                // previous slot is a storage error, never permission to seed.
+                let previous = try Self.read(store, .previous)
+                let chosen: AbilityStore.File
+                let kept: String
                 do {
-                    if let back = usable(previous) {
+                    if let back = previous, !failed.contains(back.bodyDigest) {
                         chosen = back
+                        kept = "\(Self.name(broken, seed: seed)) is kept as abilities/turn.prev.js."
                         try store.swap(id: Self.id)
+                    } else if failed.contains(seed.bodyDigest) {
+                        throw TurnEngineError.turnPartFailed("No unfailed turn program remains after \(fault.code): \(fault.why)")
                     } else if let previous {
+                        chosen = seed
                         kept = "abilities/turn.prev.js still holds \(Self.name(previous, seed: seed))."
                         try store.write(seed)
                     } else {
+                        chosen = seed
+                        kept = "\(Self.name(broken, seed: seed)) is kept as abilities/turn.prev.js."
                         try store.write(seed, slot: .previous)
                         try store.swap(id: Self.id)
                     }
-                    return (chosen, true, kept, nil, nil)
-                } catch { return (chosen, true, kept, error.localizedDescription, nil) }
+                    return (chosen, true, kept, false)
+                } catch {
+                    throw store.repairFailure(source: store.root.appendingPathComponent("turn.js"),
+                                              detail: "Authored turn recovery could not be committed: \(error.localizedDescription)")
+                }
             }
-        }.value
+        }
         file = outcome.file
+        if outcome.freshHelper { seedHelperRetried = true }
+        TurnTraceBus.fireFromContext(kind: "turn.part.recovered", surface: surface, payload: .object([
+            "reason": .string(fault.code), "detail": .string(fault.why),
+            "fromDigest": .string(broken.bodyDigest), "sourceDigest": .string(file.bodyDigest),
+            "program": .string(file.bodyDigest == seed.bodyDigest ? "seed" : outcome.swapped ? "previous" : "current"),
+            "swapped": .bool(outcome.swapped),
+            "freshHelper": .bool(outcome.freshHelper),
+        ]))
+        if outcome.freshHelper {
+            arrivals.append(.init(id: "turn-heal:seed-helper:" + broken.bodyDigest,
+                line: "Your seed turn helper failed (\(fault.code): \(fault.why)); the stem replayed the turn through the seed with a fresh helper lease. The helper cause still needs repair.",
+                key: "turn-heal", home: true))
+        }
         if outcome.swapped {
             let from = Self.name(broken, seed: seed), to = Self.name(file, seed: seed)
             TurnObservation.record(.healed(from: from, to: to, why: fault.why), surface: surface)
-            var line = outcome.refused.map {
-                "Your turn part \(from) failed (\(fault.code)), so I ran \(to) in its place for that turn; the swap was not recorded (\($0))."
-            } ?? "Your turn part \(from) failed (\(fault.code)), so I swapped in \(to) and replayed the same turn through it. " + outcome.kept
+            var line = "Your turn part \(from) failed (\(fault.code)), so I swapped in \(to) and replayed the same turn through it. " + outcome.kept
             let steering = (PeerDataTaint.current?.checkpointSources ?? []).filter { !PeerDataTaint.ownerTrusts($0) }
             if !steering.isEmpty { line += " The turn was steered by \(steering.joined(separator: ", "))." }
             arrivals.append(.init(id: "turn-heal:" + broken.bodyDigest, line: line, key: "turn-heal", home: true))
-        } else if let why = outcome.unread {
-            arrivals.append(.init(id: "turn-unreadable:" + file.bodyDigest, line:
-                "Your turn part \(Self.name(broken, seed: seed)) failed (\(fault.code)) and abilities/turn.js could not be read (\(why)), so I ran \(Self.name(file, seed: seed)) for that turn.",
-                key: "turn-heal", home: true))
         }
         return try await rebuild()
     }

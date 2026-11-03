@@ -2,55 +2,71 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacControl+OperationSupport.swift` | `SwiftNativeMacControl`: `attachingOperation`, `replayResult`, `unknownResult` |
+// Blueprint: | `MacControl+OperationSupport.swift` | Separate bounded response signal and actual-exit result; root-bound registry retains the newest 32 settled outcomes in process, including produced output on settlement failure; receipt projections preserve unknown effects on unanswered cancellation/deadline |
 
-enum MacControlExecutionSignal: Sendable {
-    case result(Result<MacControlResult, Error>)
+enum MacControlExecutionSignal: Sendable, Equatable {
+    case result
     case deadline
     case cancellationRequested
 }
 
-final class MacControlInFlightExecution: Sendable {
+final class MacControlInFlightExecution: @unchecked Sendable {
     let task: Task<MacControlResult, Error>
     private let signal = ContinuationOnce<MacControlExecutionSignal>()
+    private let lock = NSLock()
+    private var retainedResult: Result<MacControlResult, Error>?
+    var settledResult: Result<MacControlResult, Error>? { lock.withLock { retainedResult } }
 
     init(task: Task<MacControlResult, Error>) {
         self.task = task
     }
 
-    func wait() async -> MacControlExecutionSignal { await signal.wait() }
-    func finish(_ result: Result<MacControlResult, Error>) { signal.resume(.result(result)) }
+    func wait() async -> MacControlExecutionSignal {
+        await signal.wait(cancellingWith: TaskWaitDeadline.expired ? .deadline : .cancellationRequested,
+            onCancel: { self.task.cancel() })
+    }
+    func finish(_ result: Result<MacControlResult, Error>) {
+        lock.withLock { retainedResult = result }
+        signal.resume(.result)
+    }
 
     func requestCancellation() {
         signal.resume(.cancellationRequested) { task.cancel() }
     }
 
-    func reachDeadline() {
-        signal.resume(.deadline) { task.cancel() }
-    }
 }
 
 final class MacControlInFlightRegistry: @unchecked Sendable {
     static let shared = MacControlInFlightRegistry()
     private let lock = NSLock()
-    private var executions: [String: MacControlInFlightExecution] = [:]
+    struct Key: Hashable, Sendable {
+        let store: URL
+        let operationId: String
+    }
+    private var executions: [Key: MacControlInFlightExecution] = [:]
+    // Payload remains in this process, never in the payload-free lifecycle file.
+    // Keep the newest 32 settled bodies for idempotent result retrieval.
+    private var completed: [Key] = []
 
-    func insert(_ execution: MacControlInFlightExecution, operationId: String) {
+    func insert(_ execution: MacControlInFlightExecution, key: Key) {
         lock.lock()
-        executions[operationId] = execution
+        executions[key] = execution
         lock.unlock()
     }
 
-    func remove(operationId: String) {
-        lock.lock()
-        executions.removeValue(forKey: operationId)
-        lock.unlock()
+    func finished(key: Key) {
+        lock.withLock {
+            completed.append(key)
+            while completed.count > 32 {
+                executions.removeValue(forKey: completed.removeFirst())
+            }
+        }
     }
 
-    func execution(operationId: String) -> MacControlInFlightExecution? {
+    func execution(key: Key) -> MacControlInFlightExecution? {
         lock.lock()
         defer { lock.unlock() }
-        return executions[operationId]
+        return executions[key]
     }
 }
 
@@ -116,6 +132,43 @@ public enum MacControlReceiptOutcome: String, Sendable, Equatable {
 }
 
 extension SwiftNativeMacControl {
+    /// A failed lifecycle write is its own failure, never permission to erase
+    /// what the completed body produced. The raw outcome stays attached here.
+    static func settlementFailure(_ error: Error, body: Result<MacControlResult, Error>,
+                                  action: String, operationId: String) -> MacControlResult {
+        var output: [String: JSONValue] = ["status": .string("settlement_failed"),
+            "effects": .string("unknown"), "settlement_error": .string(error.localizedDescription)]
+        switch body {
+        case .success(let result): output["body_result"] = result.toJSON()
+        case .failure(let bodyError):
+            output["body_error"] = .string(bodyError.localizedDescription)
+            let produced: ProcessRunResult?
+            if let stopped = bodyError as? ProcessRunCancellation { produced = stopped.result }
+            else if let incomplete = bodyError as? ProcessRunIOFailure { produced = incomplete.result }
+            else { produced = nil }
+            if let produced {
+                output["stdout"] = .string(produced.stdout)
+                output["stderr"] = .string(produced.stderr)
+                output["stdout_truncated"] = .bool(produced.stdoutTruncated)
+                output["stderr_truncated"] = .bool(produced.stderrTruncated)
+                output["exit_code"] = .int(Int64(produced.exitCode))
+                output["timed_out"] = .bool(produced.timedOut)
+            }
+        }
+        return MacControlResult(ok: false, action: action, output: .object(output),
+            error: "mac_operation_settlement_failed", durationMs: 0, operationId: operationId,
+            verification: .unverified)
+    }
+
+    public static func deadlineResult(action: String) -> MacControlResult {
+        MacControlResult(ok: false, action: action, output: .object([
+            "status": .string("timed_out"), "timed_out": .bool(true),
+            "effects": .string("unknown"), "verification": .string("unverified"),
+            "detail": .string("The tool call timed out and cancellation was requested. Earlier input or changes may have reached the app; completion was not verified. Inspect the affected app before another action.")
+        ]), error: "Mac Control tool-call deadline exceeded", durationMs: 0,
+            httpStatus: 408, verification: .unverified)
+    }
+
     static func attachingOperation(
         _ result: MacControlResult,
         record: MacControlOperationRecord
@@ -150,6 +203,7 @@ extension SwiftNativeMacControl {
             output: .object([
                 "status": .string("idempotent_replay"),
                 "operation_state": .string(record.state.rawValue),
+                "result_available": .bool(false),
             ]),
             error: ok ? nil : record.outcomeCode,
             durationMs: 0,

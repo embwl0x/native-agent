@@ -18,7 +18,7 @@ import AppKit
 import Carbon
 #endif
 
-// Blueprint: | `MacInputEvents.swift` | `MacEventSink`, `DriverCheckedMacEventSink` and `CGEventSink`: driver-checked input, native event preparation and HID/per-process emission |
+// Blueprint: | `MacInputEvents.swift` | Driver-checked synthesized input; CGEventSink checks the integration Write switch for the live point/frontmost/per-process target before emission; looking and held-input releases remain available |
 
 /// The ONLY route to synthesized input in this module. Tests inject a recorder
 /// so the whole executor is exercised without moving the real cursor.
@@ -60,7 +60,9 @@ struct DriverCheckedMacEventSink: MacEventSink {
 
     func post(key event: MacKeyEvent) {
         guard !event.down || Self.waitWhilePersonTypes(), let binding = MacDriverContext.binding, binding.allowsEmission else { return }
+        if event.down, !MacAppActGate.admit(MacAppActGate.frontRefusal()) { return }
         base.post(key: event)
+        guard binding.appActRefusal == nil else { return }
         binding.notePostedEvent()
         let key = "key:\(event.keyCode)"
         if event.down {
@@ -83,6 +85,7 @@ struct DriverCheckedMacEventSink: MacEventSink {
     func post(key event: MacKeyEvent, toPid pid: Int32) -> Bool {
         guard let binding = MacDriverContext.binding, binding.allowsAction,
               base.post(key: event, toPid: pid) else { return false }
+        guard binding.appActRefusal == nil else { return false }
         binding.notePostedEvent()
         let key = "pid:\(pid):\(event.keyCode)"
         if event.down {
@@ -96,6 +99,7 @@ struct DriverCheckedMacEventSink: MacEventSink {
     func post(mouse event: MacMouseEvent) {
         guard let binding = MacDriverContext.binding, binding.allowsEmission else { return }
         base.post(mouse: event)
+        guard binding.appActRefusal == nil else { return }
         binding.notePostedEvent()
         let key = "mouse:\(event.button)"
         if event.phase == .down {
@@ -139,6 +143,7 @@ public struct CGEventSink: MacEventSink {
 
     public func post(key event: MacKeyEvent, toPid pid: Int32) -> Bool {
         guard pid > 0, pid != getpid(), let cg = keyEvent(event) else { return false }
+        guard !event.down || MacAppActGate.admit(MacAppActGate.refusal(pid: pid, looking: MacAppActGate.looking)) else { return false }
         NativeAgentMotorEpoch.noteAgentMotorEvent()
         MacPersonInput.noteHerPost(targeted: true)
         cg.postToPid(pid)
@@ -187,12 +192,26 @@ public struct CGEventSink: MacEventSink {
     }
 
     package func postNative(_ event: CGEvent) {
+        // Releases settle an already-held input, even if the switch changed.
+        // Reading moves/scrolls carry looking. Only her synthesized input enters here.
+        let refusal: MacAppActRefusal?
+        switch event.type {
+        case .keyDown: refusal = MacAppActGate.frontRefusal()
+        case .mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown,
+             .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            refusal = MacAppActGate.pointRefusal(x: event.location.x, y: event.location.y)
+        default: refusal = nil
+        }
+        guard MacAppActGate.admit(refusal) else { return }
         NativeAgentMotorEpoch.notePostedHIDEvent()
         event.post(tap: .cghidEventTap)
     }
 
     public func post(mouse event: MacMouseEvent) {
         let point = CGPoint(x: event.x, y: event.y)
+        if event.phase != .up {
+            guard MacAppActGate.admit(MacAppActGate.pointRefusal(x: event.x, y: event.y)) else { return }
+        }
         // Her own pointer: the person's mouse is unhooked for her action and
         // their cursor goes back where it was after it.
         AgentPointerHold.begin(warpTo: nil)

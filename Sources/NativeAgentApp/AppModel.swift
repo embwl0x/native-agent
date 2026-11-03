@@ -215,10 +215,7 @@ final class AppModel: Sendable {
         }
     }
     /// The active session's loaded transcript (`engine.transcripts`).
-    var chatMessages: [ChatMessage] {
-        get { engine.transcripts.messages(for: activeChatSessionId) }
-        set { engine.transcripts.setMessages(newValue, for: activeChatSessionId) }
-    }
+    var chatMessages: [ChatMessage] { engine.transcripts.messages(for: activeChatSessionId) }
     typealias PanelRefreshStatus = EngineRuntime.PanelRefreshStatus
 
     enum CompactReadPresentationState: Equatable, Sendable {
@@ -242,6 +239,9 @@ final class AppModel: Sendable {
     var panelRefreshCounts: [SidebarItem: Int] = [:]
     /// Compact readers keep independent freshness from full-page refreshes.
     var sidebarActivityRefreshStatus: PanelRefreshStatus?
+    @ObservationIgnored let sidebarActivityRead = LatestRead()
+    /// A selected saved identity awaiting its live page, never an offscreen read.
+    var pendingPaletteDestination: PaletteSavedDestination?
     var detachedChatRefreshStatus: [String: PanelRefreshStatus] = [:]
 
     /// Set by `performLoadChatState` when the chat message/session fetch threw.
@@ -277,7 +277,8 @@ final class AppModel: Sendable {
         if previousName != engine.persona.profile?.name { NativeAgentShortcuts.updateAppShortcutParameters() }
         // Every sentence about the agent, wherever it is built, speaks in
         // the persona's name and the chosen pronoun.
-        AgentVoice.live = AgentVoice.current(name: agentDisplayName)
+        let name = agentDisplayName
+        if !name.isEmpty { AgentVoice.live = AgentVoice.current(name: name) }
     }
     /// Repeated Tools refresh clicks share one toolbar operation and receipt.
     var isRefreshingTools = false
@@ -291,8 +292,12 @@ final class AppModel: Sendable {
     var trustCenterActionOutcome: TrustCenterActionOutcome?
     var isSavingChatBrain: Bool { engine.providers.isSavingChatBrain }
     var chatProvider: String { pendingChatBrainSelection?.provider ?? engine.providers.selection(for: "chat").provider }
+    enum CapabilityRunStatus { case reported, failed }
+    /// Context and tone for the current status line, set by run-action producers.
+    /// Any other status writer retires this context without inspecting its words.
+    var capabilityRunStatus: CapabilityRunStatus?
     var statusText: String = "Not checked" {
-        didSet { statusCause = nil }
+        didSet { statusCause = nil; capabilityRunStatus = nil }
     }
     /// The raw error behind a failure `statusText` names in plain words. User's
     /// screen shows `statusText` only; the agent's tool results read
@@ -349,16 +354,10 @@ final class AppModel: Sendable {
             }
         }
     }
-    var agentDisplayName: String {
-        let profileName = (engine.persona.profile?.name ?? engine.memory.cachedAgentDisplayName)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !profileName.isEmpty { return profileName }
-        return NativeAgentIdentity.displayName(chatPersona)
-    }
+    var agentDisplayName: String { engine.persona.displayName }
 
-    /// Address surfaces show "The agent" for the unnamed seed; agentDisplayName preserves the profile name.
-    var agentAddressName: String {
-        NativeAgentIdentity.displayName(engine.persona.profile?.name ?? engine.memory.cachedAgentDisplayName ?? chatPersona, fallback: "The agent")
-    }
+    /// Address and display names share the persona owner's availability.
+    var agentAddressName: String { agentDisplayName }
     var isLoadingSkillManifests = false
     var skillManifestError: String?
     /// Event-identified feedback for the mounted Skill Lifecycle banner/toast.
@@ -383,8 +382,6 @@ final class AppModel: Sendable {
     }
 
     init() {
-        // Telegram config owns credentials; remove any plaintext UserDefaults draft.
-        UserDefaults.standard.removeObject(forKey: "telegramToken")
         self.engine = .live
         engine.bindResidentPresentation(
             publishWorkStatus: { [weak self] in await self?.publishWorkStatus() },
@@ -395,9 +392,7 @@ final class AppModel: Sendable {
             },
             memoryProposalsChanged: { [weak self] in
                 guard let self else { return }
-                if let reminder = engine.memory.reviewReminder(pending: pendingMemoryProposalsCount, agentName: agentDisplayName) {
-                    NativeAgentNotifications.post(title: reminder.title, body: reminder.body)
-                }
+                NativeAgentNotifications.postMemoryReview(pending: pendingMemoryProposalsCount, agentName: agentDisplayName)
             }
         )
         Task { @MainActor in await self.refreshProviderPresentation() }

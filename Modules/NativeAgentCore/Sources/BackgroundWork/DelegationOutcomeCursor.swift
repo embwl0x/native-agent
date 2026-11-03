@@ -8,8 +8,6 @@ import PersistenceCore
 /// Exact handled identities; completion timestamps never prove receipt arrival.
 public struct DelegationOutcomeCursor: Sendable, Equatable {
     public struct StoreCursor: Sendable, Equatable {
-        /// Upgrade-only boundary for history older cursors no longer retained by id.
-        var legacyLastSeen: Date?
         /// Exact handled job ids, retained while receipts can reappear.
         public var cardedIDs: Set<String>
         public var deliveryReceiptVersions: [String: String] = [:]
@@ -99,10 +97,6 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
         for (source, value) in stores {
             guard case .object(let obj) = value else { throw CocoaError(.fileReadCorruptFile) }
             var cursor = StoreCursor()
-            if let value = obj["last_seen"] {
-                guard case .string(let iso) = value, let date = parseISO(iso) else { throw CocoaError(.fileReadCorruptFile) }
-                cursor.legacyLastSeen = date
-            }
             cursor.cardedIDs = Set(try strings(obj["carded_ids"]))
             cursor.cardedOutcomes = try dictionary(obj["carded_outcomes"])
             guard cursor.cardedOutcomes.values.allSatisfy({ DelegationOutcome(rawValue: $0) != nil })
@@ -119,7 +113,6 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
             var obj: [String: JSONValue] = [
                 "carded_ids": .array(cursor.cardedIDs.sorted().map { .string($0) }),
             ]
-            if let boundary = cursor.legacyLastSeen { obj["last_seen"] = .string(Self.formatISO(boundary)) }
             if !cursor.cardedOutcomes.isEmpty {
                 var outcomes: [String: JSONValue] = [:]
                 for (id, raw) in cursor.cardedOutcomes { outcomes[id] = .string(raw) }

@@ -101,13 +101,15 @@ public enum ICloudSyncStatePaths {
 
     /// Marker msgIds currently on disk. Missing directory = none, which is the
     /// normal case and never an error.
-    public static func completedUnarchivedMsgIds(dataRoot: URL) -> [String] {
+    public static func completedUnarchivedMsgIds(dataRoot: URL) throws -> [String] {
         let dir = completedUnarchivedDirectory(dataRoot: dataRoot)
-        guard let items = try? FileManager.default.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
+        let items: [URL]
+        do {
+            items = try FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return []
+        }
         return items
             .filter { $0.pathExtension == completedUnarchivedExtension }
             .map { $0.deletingPathExtension().lastPathComponent }

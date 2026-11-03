@@ -47,21 +47,24 @@ extension InlineInteractionResolver {
     /// The envelope of the turn that raised this card.
     ///
     /// Read from the SAME row the interaction lives on — `metadata.envelope` is
-    /// written there by the one writer that stamps the card
-    /// (`ChatOrchestrationClient+MessagePersistence`), at the same moment, and
+    /// written there by the card's producer (`raise` or `appendToolMessage`)
+    /// with the same origin used to stamp its continuation, and
     /// the resolver's own locked rewrite preserves it. So it is the originating
     /// envelope by construction, with no second copy to drift.
     ///
     /// Provenance only: it says WHO and WHERE, and the gate still re-decides.
     public static func originEnvelope(
         of id: String, sessionID: String, dataRoot: URL
-    ) async -> TurnEnvelope? {
-        guard let read = try? await checkedRows(sessionID, dataRoot) else { return nil }
+    ) async throws -> TurnEnvelope? {
+        let read = try await checkedRows(sessionID, dataRoot)
         for row in read.rows.reversed() {
-            guard SwiftNativeChatOrchestrationClient.inlineInteraction(in: row, lifeID: read.lifeID)?.id == id,
-                  case .object(let object) = row,
-                  case .object(let metadata)? = object["metadata"]
+            guard case .object(let object) = row,
+                  case .object(let metadata)? = object["metadata"],
+                  metadata["kind"] == .string(InlineInteractionWire.transcriptKind),
+                  case .object(let raw)? = metadata[InlineInteractionWire.metadataKey],
+                  raw["id"] == .string(id)
             else { continue }
+            _ = try SwiftNativeChatOrchestrationClient.checkedInlineInteraction(in: row, lifeID: read.lifeID)
             return TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
         }
         return nil
@@ -69,7 +72,7 @@ extension InlineInteractionResolver {
     static func require(
         id: String, sessionID: String, dataRoot: URL
     ) async throws -> InlineInteraction {
-        guard let found = await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot)
+        guard let found = try await interaction(id: id, sessionID: sessionID, dataRoot: dataRoot)
         else { throw ResolveError.notFound }
         return found
     }

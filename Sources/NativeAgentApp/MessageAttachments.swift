@@ -37,19 +37,19 @@ import MacControl
 import ChatToolParsing
 import UniformTypeIdentifiers
 import Desk
-// Blueprint: | `MessageAttachments.swift` | Transcript-owned local image previews and attachment chips |
+// Blueprint: | `MessageAttachments.swift` | Transcript-owned local image previews, voice-note partition and attachment chips |
 
 enum ChatAttachmentPresentation {
-    static func partition(_ attachments: [PersistedAttachment]) -> (localImages: [PersistedAttachment], chips: [PersistedAttachment]) {
+    static func partition(_ attachments: [PersistedAttachment]) -> (localImages: [PersistedAttachment], audio: [PersistedAttachment], chips: [PersistedAttachment]) {
         let localImages = attachments.filter { attachment in
             attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image"
                 && (attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
         }
         let chips = attachments.filter { attachment in
-            !(attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image"
+            attachment.type != "audio" && !(attachment.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "image"
                 && (attachment.path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false))
         }
-        return (localImages, chips)
+        return (localImages, attachments.filter { $0.type == "audio" }, chips)
     }
 }
 

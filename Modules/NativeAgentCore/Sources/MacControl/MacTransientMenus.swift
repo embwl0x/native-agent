@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `MacTransientMenus.swift` | `MacTransientMenus`: bounded near-focus native menu evidence and capture geometry, without a second window address space |
+// Blueprint: | `MacTransientMenus.swift` | Bounded near-focus native menu evidence with named optional-attribute/action-read gaps and retained observation nodes for structural presentation and gap summaries; menus never widen a window's pixel capture |
 
 /// Current native menu evidence, not a second accessibility address space.
 /// Item paths remain private to this read and are never used as window paths.
@@ -43,8 +43,12 @@ public enum MacTransientMenus {
 
     public struct Menu: Sendable, Equatable {
         public let frame: MacAXFrame
-        public let items: [MacAXAttributes]
+        public var items: [MacAXAttributes] { itemIndices.map { observedNodes[$0].attributes } }
         public let truncated: Bool
+        /// The actual bounded read, including its root and structural nodes,
+        /// supplies gap counts even for elements without a displayed item.
+        let observedNodes: [MacAXNode]
+        let itemIndices: [Int]
     }
 
     static func validFrame(_ frame: MacAXFrame) -> Bool {
@@ -64,17 +68,18 @@ public enum MacTransientMenus {
                 source: source, root: root,
                 limits: MacAXLimits(maxNodes: maxItems + 1, maxDepth: 5, valueChars: 200)
             )
-            let items = snapshot.nodes.compactMap { node -> MacAXAttributes? in
-                let item = node.attributes
+            let itemIndices = snapshot.nodes.indices.filter { index in
+                let item = snapshot.nodes[index].attributes
                 guard item.role == "AXMenuItem", let rect = item.frame, validFrame(rect),
-                      item.enabled || !(item.title ?? item.value ?? "").isEmpty,
+                      item.enabled == true || !(item.title ?? item.value ?? "").isEmpty,
                       rect.x >= frame.x - 1, rect.y >= frame.y - 1,
                       rect.x + rect.w <= frame.x + frame.w + 1,
-                      rect.y + rect.h <= frame.y + frame.h + 1 else { return nil }
-                return item
+                      rect.y + rect.h <= frame.y + frame.h + 1 else { return false }
+                return true
             }.prefix(remaining)
-            remaining -= items.count
-            return Menu(frame: frame, items: Array(items), truncated: snapshot.truncated || remaining == 0)
+            remaining -= itemIndices.count
+            return Menu(frame: frame, truncated: snapshot.truncated || remaining == 0,
+                observedNodes: snapshot.nodes, itemIndices: Array(itemIndices))
         }
     }
 
@@ -85,10 +90,18 @@ public enum MacTransientMenus {
                 "truncated": .bool(menu.truncated),
                 "items": .array(menu.items.map { item in
                     var result: [String: JSONValue] = [
-                        "role": .string("AXMenuItem"), "enabled": .bool(item.enabled),
+                        "role": .string("AXMenuItem"), "enabled": item.enabled.map(JSONValue.bool) ?? .null,
                         "frame": item.frame?.toJSON() ?? .null,
-                        "actions": .array(item.actions.map { .string($0) }),
                     ]
+                    if !item.attributeGaps.isEmpty {
+                        result["attribute_gaps"] = .array(item.attributeGaps.map(JSONValue.string))
+                    }
+                    if item.labelUnreadable { result["label_source"] = .string("unreadable") }
+                    if let reason = item.actionsUnreadable {
+                        result["actions_unreadable"] = .string(reason)
+                    } else {
+                        result["actions"] = .array(item.actions.map { .string($0) })
+                    }
                     if let title = item.title ?? item.value, !title.isEmpty {
                         result["label"] = MacScreenViewTextRedaction.redactedLegendString(title, valueChars: 200)
                     }
@@ -99,16 +112,4 @@ public enum MacTransientMenus {
         })
     }
 
-    /// Include real open menu geometry in the capture without changing the
-    /// document window's identity or inventing a full-screen semantic root.
-    public static func captureFrame(window: MacAXFrame?, menus: [Menu]) -> MacAXFrame? {
-        guard var frame = window, validFrame(frame) else { return window }
-        for menu in menus {
-            let x = min(frame.x, menu.frame.x), y = min(frame.y, menu.frame.y)
-            frame = MacAXFrame(x: x, y: y,
-                               w: max(frame.x + frame.w, menu.frame.x + menu.frame.w) - x,
-                               h: max(frame.y + frame.h, menu.frame.y + menu.frame.h) - y)
-        }
-        return frame
-    }
 }

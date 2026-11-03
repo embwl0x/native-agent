@@ -4,7 +4,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `ProviderRouting.swift` | `SwiftNativeProviderRouting` actor; `checkedProviderSnapshot`, `checkedRoutingSnapshot`, `saveGroupSelection`, `adoptConnectedProvider`, `catalogContextLength`, `routingRepairInput`, `reconstructRouting`; effort-only group rows inherit Chat's current model/account without seeding other controls; provider interpretation, byte-checked picker/configuration decode reuse with fresh credential/readiness checks; checked picker revisions come from both files under the transaction lock and travel with phone snapshots/readbacks, recoverable group writes/adoption and byte-preserving explicit routing reconstruction |
+// Blueprint: | `ProviderRouting.swift` | `SwiftNativeProviderRouting` actor; `checkedProviderSnapshot`, `checkedRoutingSnapshot`, `saveGroupSelection`, `adoptConnectedProvider`, `catalogContextLength`, `routingRepairInput`, `reconstructRouting`; effort-only and tier-only group rows inherit Chat's current model/account without seeding other controls; provider interpretation, byte-checked picker/configuration decode reuse with fresh credential/readiness checks; checked picker revisions come from both files under the transaction lock and travel with phone snapshots/readbacks, recoverable forward group writes/adoption and byte-preserving explicit routing reconstruction; preview snapshots use existing checked read-only admission and refuse pending recovery |
 /// Owns provider registry, credentials and per-surface routing state.
 public actor SwiftNativeProviderRouting: Sendable {
     let dataRoot: URL
@@ -84,7 +84,6 @@ public actor SwiftNativeProviderRouting: Sendable {
         for (surface, value) in surfaces {
             let model: String?
             switch value {
-            case .string(let selected): model = selected
             case .object(let selected):
                 if case .string(let id)? = selected["model"] { model = id } else { model = nil }
             default: model = nil
@@ -174,18 +173,17 @@ public actor SwiftNativeProviderRouting: Sendable {
     }
     private nonisolated static func validateSurfacePreferences(_ root: [String: JSONValue]) throws {
         for (surface, value) in root {
-            if case .string = value { continue } // Supported legacy model pin.
             guard case .object(let fields) = value else {
-                throw ProviderRoutingError.underlying("saved surface preference for \(surface) must be a string or object")
+                throw ProviderRoutingError.underlying("saved surface preference for \(surface) must be an object")
             }
-            for field in ["model", "reasoningEffort", "reasoning_effort", "serviceTier", "service_tier"] {
+            for field in ["model", "reasoningEffort", "serviceTier"] {
                 guard let value = fields[field] else { continue }
                 guard case .string = value else {
                     throw ProviderRoutingError.underlying("saved surface preference \(surface).\(field) must be a string")
                 }
             }
-            if let fast = fields["fastMode"], case .bool = fast {} else if fields["fastMode"] != nil {
-                throw ProviderRoutingError.underlying("saved surface preference \(surface).fastMode must be a boolean")
+            for field in fields.keys where !["model", "reasoningEffort", "serviceTier"].contains(field) {
+                throw ProviderRoutingError.underlying("saved surface preference \(surface) has an unsupported field \(field)")
             }
         }
     }
@@ -197,8 +195,8 @@ public actor SwiftNativeProviderRouting: Sendable {
         catch { throw providerStateFailure(at: path, description: "active-provider", detail: error.localizedDescription) }
     }
     public nonisolated static func validateProviderConfiguration(_ fields: [String: JSONValue]) throws {
-        for field in ["auth_mode", "authMode", "api_key", "apiKey", "key", "access_token", "accessToken",
-                      "refresh_token", "id_token", "setup_token", "token", "default_model", "defaultModel", "model", "token_type", "scope"] {
+        for field in ["auth_mode", "api_key", "access_token",
+                      "refresh_token", "id_token", "setup_token", "token", "default_model", "model", "token_type", "scope"] {
             guard let value = fields[field] else { continue }
             guard case .string = value else {
                 throw ProviderRoutingError.underlying("saved provider field \(field) must be a string")
@@ -312,11 +310,9 @@ public actor SwiftNativeProviderRouting: Sendable {
         serviceTier: String?,
         seedMissingControls: Bool
     ) -> [String: JSONValue] {
-        let root = canonicalizeRootForWrite(root, surface: surface)
         var updated = root
         var entry: [String: JSONValue] = [:]
         if case .object(let existing)? = updated[surface] { entry = existing }
-        if case .string(let existing)? = updated[surface] { entry["model"] = .string(existing) }
         if let model { entry["model"] = .string(model) }
         if let reasoningEffort {
             entry["reasoningEffort"] = .string(reasoningEffort)
@@ -336,40 +332,26 @@ public actor SwiftNativeProviderRouting: Sendable {
         surface: String,
         providerId: String
     ) -> [String: JSONValue] {
-        let root = canonicalizeRootForWrite(root, surface: surface)
         var updated = root
         updated[surface] = .string(providerId)
-        return updated
-    }
-    /// Canonicalize only the surface being written; untouched surfaces keep their bytes.
-    nonisolated static func canonicalizeRootForWrite(
-        _ root: [String: JSONValue],
-        surface: String
-    ) -> [String: JSONValue] {
-        guard surface == WorkshopSurfaceVocabulary.canonical,
-              let legacyEntry = root[WorkshopSurfaceVocabulary.legacy] else { return root }
-        var updated = root
-        updated.removeValue(forKey: WorkshopSurfaceVocabulary.legacy)
-        if updated[surface] == nil { updated[surface] = legacyEntry }
         return updated
     }
     /// Finish an interrupted two-file picker commit before any later read or mutation observes the surface/model tuple. The durable intent is valid only while each live projection is either its recorded base bytes or the exact intended
     /// object; unrelated concurrent bytes fail closed and leave the marker available for explicit recovery instead of being silently overwritten.
     func reconcilePendingSurfaceConfigurationLocked() async throws {
-        guard FileManager.default.fileExists(atPath: surfaceTransactionPath.path) else { return }
-        let raw = try Self.loadProviderStateObjectChecked(
-            at: surfaceTransactionPath,
-            description: "pending provider selection"
-        )
+        guard let data = try ProviderStateValidation.dataIfPresent(at: surfaceTransactionPath) else { return }
+        guard case .object(let raw) = try JSONValue.parse(data) else {
+            throw Self.providerStateFailure(at: surfaceTransactionPath, description: "pending provider selection", detail: "must be an object")
+        }
         let pending: PendingSurfaceConfiguration
         do { pending = try PendingSurfaceConfiguration(json: raw) }
         catch { throw Self.providerStateFailure(at: surfaceTransactionPath, description: "pending provider selection", detail: error.localizedDescription) }
         let surfacesAtBase = try Self.fileSHA256(surfacesPath) == pending.surfacesBaseHash
         let activeAtBase = try Self.fileSHA256(activeProviderPath) == pending.activeBaseHash
-        let surfacesAtTarget = try surfacesAtBase || Self.loadProviderStateObjectChecked(
-            at: surfacesPath, description: "surface preference") == pending.surfaces
-        let activeAtTarget = try activeAtBase || Self.loadProviderStateObjectChecked(
-            at: activeProviderPath, description: "active-provider") == pending.active
+        let surfacesAtTarget = try surfacesAtBase || (ProviderStateValidation.dataIfPresent(at: surfacesPath) != nil
+            && Self.loadProviderStateObjectChecked(at: surfacesPath, description: "surface preference") == pending.surfaces)
+        let activeAtTarget = try activeAtBase || (ProviderStateValidation.dataIfPresent(at: activeProviderPath) != nil
+            && Self.loadProviderStateObjectChecked(at: activeProviderPath, description: "active-provider") == pending.active)
         guard surfacesAtTarget, activeAtTarget else {
             throw Self.providerStateFailure(at: surfaceTransactionPath, description: "pending provider selection", detail: "conflicts with newer provider state")
         }
@@ -441,8 +423,8 @@ public actor SwiftNativeProviderRouting: Sendable {
             // Both files enter memory through one vocabulary; only a write migrates their bytes.
             let checked = PickerGeneration(
                 surfacesBytes: surfacesBytes, activeBytes: activeBytes,
-                surfaces: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(surfaces),
-                active: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(active)
+                surfaces: surfaces,
+                active: active
             )
             generation = checked
             return (checked.surfaces, checked.active, revision)
@@ -455,8 +437,9 @@ public actor SwiftNativeProviderRouting: Sendable {
     /// Preferences, active-provider hints, and explicit pins derived from one recovered tuple while the common transaction lock is held by `reconciledPickerState()`. No caller can observe a model from one picker commit paired with the
     /// provider from another.
     public func checkedRoutingSnapshot() async throws -> ProviderRoutingSnapshot {
+        if LLMCallContext.preview { return try await checkedRoutingSnapshotReadOnly() }
         let pickerState = try await reconciledPickerState()
-        return selectionRoutingSnapshot(
+        return try selectionRoutingSnapshot(
             surfaces: pickerState.surfaces,
             active: pickerState.active, revision: pickerState.revision
         )
@@ -467,14 +450,14 @@ public actor SwiftNativeProviderRouting: Sendable {
     public func checkedRoutingSnapshotReadOnly() async throws -> ProviderRoutingSnapshot {
         let transactionPath = surfaceTransactionPath
         let (surfaces, active, revision) = try await SwiftNativePersistenceCore.withFileLock(transactionPath) {
-            guard !FileManager.default.fileExists(atPath: transactionPath.path) else {
+            guard try ProviderStateValidation.dataIfPresent(at: transactionPath) == nil else {
                 throw ProviderRoutingError.underlying(
                     "provider selection is pending recovery; the read-only preference probe will not reconcile it"
                 )
             }
             return try self.checkedPickerStateLocked()
         }
-        return selectionRoutingSnapshot(
+        return try selectionRoutingSnapshot(
             surfaces: surfaces, active: active, revision: revision
         )
     }
@@ -499,14 +482,7 @@ public actor SwiftNativeProviderRouting: Sendable {
         if Set(connected) == ["openai_oauth_direct", "codex"] { return "openai_oauth_direct" }
         return nil
     }
-    /// Read `<dataRoot>/providers/active.json`, returning the surface→providerId map. Missing is empty; the throwing preference path rejects corruption. This nonthrowing compatibility view stays conservative on corruption. Surfaces the
-    /// value the user's picker writes via `setActiveProvider(surface:providerId:)` so the dispatch layer can honor it as a tiebreaker when a model id is ambiguous.
-    public func activeProvidersForSurfaces() async -> [String: String] {
-        (try? await activeProvidersForSurfacesChecked()) ?? [:]
-    }
-    public func readActiveProvidersChecked() async throws -> [String: String] {
-        try await activeProvidersForSurfacesChecked()
-    }
+    /// Read the canonical surface→provider map, preserving routing read failures.
     public func activeProvidersForSurfacesChecked() async throws -> [String: String] {
         try await checkedRoutingSnapshot().activeProviders
     }

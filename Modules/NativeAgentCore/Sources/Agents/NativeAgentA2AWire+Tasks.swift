@@ -13,25 +13,30 @@ import CoreFoundation
 import ProviderRouting
 import CryptoKit
 import SQLite3
-// Blueprint: | `NativeAgentA2AWire+Tasks.swift` | Canonical contact task projection and record-owned accepted workers; failed settlement preserves streamed prose and offsets; transmitted reply acknowledgements route outbound evidence through AgentPeerStore.recordProof for MCP-host reply health; synchronous bridge admission closure precedes generation-ordered passive cleanup; approval/receipt observations, reply waiters/streams and push tails retire on stop, with canceled handles retained through exit; activation restores persisted owed callbacks, including terminal tasks outside live records; coalesced approval-refresh requests retain a pending pass so worker settlement and observation rearming cannot lose their wake; accepted workers and durable recovery finish independently of the listener, and explicit task cancellation remains separate; resumable work retains DataRootLife; other-life (no stamp = first life) work reads stopped/restored and explicit resumption starts fresh |
+// Blueprint: | `NativeAgentA2AWire+Tasks.swift` | Canonical contact task projection and record-owned accepted workers; failed settlement preserves streamed prose and offsets; transmitted reply acknowledgements retain reads independently of execution outcome and route outbound evidence through AgentPeerStore.recordProof for MCP-host reply health; synchronous bridge admission closure precedes generation-ordered passive cleanup; approval/receipt observations, reply waiters/streams and push tails retire on stop, with canceled handles retained through exit; activation restores persisted owed callbacks, including terminal tasks outside live records; coalesced approval-refresh requests retain a pending pass so worker settlement and observation rearming cannot lose their wake; accepted workers and durable recovery finish independently of the listener, and explicit task cancellation remains separate; resumable work retains DataRootLife; other-life (no stamp = first life) work reads stopped/restored and explicit resumption starts fresh |
 /// Retained tasks use the shared chat client; network subscribers never own a turn's lifetime.
 public actor AgentContactTasks {
     typealias Runner = @Sendable (AgentContactTurn, @escaping @Sendable (AgentContactProgress) async -> Void) async throws -> AgentContactOutcome
+    final class TaskWait {
+        let done = ScopedWaiter()
+        var result: Result<AgentContactTask, Error>?
+    }
     struct Record {
         var task: AgentContactTask
         var worker: Task<Void, Never>?
         var cancelling = false
         var rawTool = false
         var subscribers: [UUID: AsyncStream<AgentContactEvent>.Continuation] = [:]
-        var waiters: [UUID: CheckedContinuation<AgentContactTask, Error>] = [:]
+        var waiters: [UUID: TaskWait] = [:]
     }
     private let runner: Runner
-    private let claims: AgentPeerReplayClaimStore
+    let claims: AgentPeerReplayClaimStore
     let dataRoot: URL
     var records: [String: Record] = [:]
     var order: [String] = []
     var pushConfigs: [String: [String: AgentContactPushConfig]] = [:]
     var pushDeliveries: [String: (generation: UUID, worker: Task<Void, Never>)] = [:]
+    var pushRestorations: [String: (generation: UUID, worker: Task<Void, Never>)] = [:]
     let capacity: Int
     private let inbox: SwiftNativeApprovalInbox
     private var approvalObservation: Task<Void, Never>?
@@ -63,6 +68,7 @@ public actor AgentContactTasks {
         approvalRefresh?.cancel()
         receiptObservation?.cancel()
         for delivery in pushDeliveries.values { delivery.worker.cancel() }
+        for restoration in pushRestorations.values { restoration.worker.cancel() }
     }
     /// Listener transitions are ordered even when their actor hops arrive out
     /// of order. Stop retires passive resources; accepted turns keep their
@@ -80,6 +86,8 @@ public actor AgentContactTasks {
         approvalRefresh?.cancel()
         receiptObservation?.cancel(); receiptObservation = nil
         for delivery in pushDeliveries.values { delivery.worker.cancel() }
+        for restoration in pushRestorations.values { restoration.worker.cancel() }
+        pushRestorations.removeAll()
         pushConfigs.removeAll()
         if active {
             scheduleApprovalRefresh()
@@ -92,7 +100,10 @@ public actor AgentContactTasks {
         } else {
             for id in Array(records.keys) {
                 records[id]?.subscribers.values.forEach { $0.finish() }
-                records[id]?.waiters.values.forEach { $0.resume(throwing: CancellationError()) }
+                records[id]?.waiters.values.forEach {
+                    $0.result = .failure(CancellationError())
+                    $0.done.resume()
+                }
                 records[id]?.subscribers.removeAll()
                 records[id]?.waiters.removeAll()
             }
@@ -202,7 +213,7 @@ public actor AgentContactTasks {
         case .stopped: throw AgentContactFailure(code: -32004, message: "That message is stopped (restored). Start a new task in the conversation.")
         case .claimed: break
         }
-        let task: AgentContactTask
+        var task: AgentContactTask
         do {
             if let continued = send.continuedTask {
                 let existing = try get(continued, owner: principal.id)
@@ -233,41 +244,50 @@ public actor AgentContactTasks {
         notifyPush(task)
         // Retain the original locator before launching work. A process exit or
         // lost response must never authorize executing the same message again.
-        claims.recordReceipt(key: key, digest: digest, receipt: ["taskID": task.id])
-        let turn = AgentContactTurn(taskID: task.id, context: task.context, requestID: send.request,
+        if let detail = claims.recordReceipt(key: key, digest: digest, receipt: ["taskID": task.id]) {
+            task.detail = detail
+            try retain(task)
+            records[task.id]?.task = task
+        }
+        let acceptedTask = task
+        let turn = AgentContactTurn(taskID: acceptedTask.id, context: acceptedTask.context, requestID: send.request,
                                     principal: principal, parts: send.parts,
-                                    bindRun: { session, run in try await self.bindRun(task.id, session: session, run: run) })
+                                    bindRun: { session, run in try await self.bindRun(acceptedTask.id, session: session, run: run) })
         let runner = self.runner
-        startWorker(task.id) {
-            try await runner(turn) { progress in await self.progress(task.id, progress) }
+        startWorker(acceptedTask.id) {
+            try await runner(turn) { progress in await self.progress(acceptedTask.id, progress) }
         }
         return task
     }
     @discardableResult
-    private func startWorker(_ id: String, operation: @escaping @Sendable () async throws -> AgentContactOutcome?) -> Task<Void, Never> {
+    func startWorker(_ id: String, operation: @escaping @Sendable () async throws -> AgentContactOutcome?) -> Task<Void, Never> {
         let worker = Task {
+            let outcome: AgentContactOutcome
             do {
                 try Task.checkCancellation()
-                let outcome = try await operation()
-                try Task.checkCancellation()
-                if let outcome { self.finish(id, outcome: outcome) }
+                let produced = try await operation()
+                // Once produced, output is settled even if Stop arrived at return.
+                if Task.isCancelled { records[id]?.cancelling = true }
+                if let produced { outcome = produced }
                 else {
-                    guard let record = records[id], let recovered = try canonicalReply(record.task) else {
-                        self.finish(id, outcome: .init(state: .failed, parts: [],
-                            detail: "The resumed turn has no saved completion. Do not resend automatically."))
-                        return
+                    if let record = records[id], let recovered = try canonicalReply(record.task) {
+                        records[id]?.task.approvalIDs = recovered.approvals
+                        records[id]?.task.detail = recovered.outcome.detail
+                        outcome = recovered.outcome
+                    } else {
+                        outcome = .init(state: .working, parts: [],
+                            detail: "The resumed turn has no saved terminal observation. Inspect its exact retained run; do not resend automatically.")
                     }
-                    records[id]?.task.approvalIDs = recovered.approvals
-                    records[id]?.task.detail = recovered.outcome.detail
-                    self.finish(id, outcome: recovered.outcome)
                 }
             } catch is CancellationError {
-                self.finish(id, outcome: .init(state: .canceled, parts: []))
+                outcome = .init(state: .canceled, parts: [])
             } catch {
                 let failure = ProviderFailure.report(error)
-                self.finish(id, outcome: .init(state: .failed, parts: [],
-                    detail: failure?.errorDescription ?? "The reply could not be finished. Work: outcome unknown.", failure: failure))
+                outcome = .init(state: .failed, parts: [],
+                    detail: (failure?.errorDescription ?? (error as? AgentContactFailure)?.message ?? error.localizedDescription)
+                        + " Do not resend automatically.", failure: failure)
             }
+            await settle { await self.finish(id, outcome: outcome) }
         }
         records[id]?.worker = worker
         return worker
@@ -333,7 +353,11 @@ public actor AgentContactTasks {
             try retain(task)
             records[id] = Record(task: task, rawTool: true)
             order.append(id)
-            claims.recordReceipt(key: key, digest: digest, receipt: ["taskID": id])
+            if let detail = claims.recordReceipt(key: key, digest: digest, receipt: ["taskID": id]) {
+                task.detail = detail
+                try retain(task)
+                records[id]?.task = task
+            }
             return (task, true)
         } catch { claims.release(key: key); throw error }
     }
@@ -399,7 +423,8 @@ public actor AgentContactTasks {
             }
             guard let task = records[id]?.task else { throw AgentContactFailure.missing }
             try retainCompletionReplies(task)
-            return task
+            restoreCallbacks(task)
+            return records[id]?.task ?? task
         }
         guard NativeAgentA2AWire.locator(id) != nil else { throw AgentContactFailure.missing }
         guard var task = try retainedTasks(id: id, owner: owner).first else { throw AgentContactFailure.missing }
@@ -410,17 +435,20 @@ public actor AgentContactTasks {
         if task.needsReplyRecovery {
             // Settlement can retire the checkpoint, so read it before the reply.
             var checkpointed = false
-            if let session = task.canonicalSession, let run = task.canonicalRunID,
-               session.hasPrefix(AgentBridgePrincipal.genericAgentSessionPrefix(owner: owner)) {
+            if let session = task.canonicalSession, let run = task.canonicalRunID {
                 checkpointed = try SwiftNativeChatOrchestrationClient.hasReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run)
             }
             var queued: AgentContactTurn?
             if let recovered = try canonicalReply(task) {
-                task.state = recovered.outcome.state
+                if !task.state.terminal { task.state = recovered.outcome.state }
                 task.approvalIDs = recovered.approvals
                 task.parts = recovered.outcome.parts.compactMap { $0.accepted(in: task.acceptedOutputModes ?? ["*/*"]) }
                 task.text = task.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
                 task.detail = recovered.outcome.detail
+                task.replyRecovery = recovered.outcome.replyRecovery
+            } else if task.state.terminal {
+                // Missing payload evidence cannot change a known execution outcome.
+                // Its typed debt remains until this exact source can be read.
             } else if let approvals = task.approvalIDs, !approvals.isEmpty {
                 task.state = .inputRequired
                 task.detail = "Waiting for the person to answer the permission card"
@@ -448,7 +476,7 @@ public actor AgentContactTasks {
             }
             task.updated = Date()
             try retain(task)
-            if !task.state.terminal {
+            if !task.state.terminal || task.replyRecovery != nil {
                 guard records.count < capacity else { throw AgentContactFailure(code: -32004, message: "Too much work is active. Try again later.") }
                 records[id] = Record(task: task)
                 order.append(id)
@@ -482,7 +510,8 @@ public actor AgentContactTasks {
     /// Called only after a reply-reading door successfully transmitted the reply.
     public func recordReplyFetch(_ task: AgentContactTask) {
         AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: task.owner, outbound: true)
-        guard task.state == .completed, let session = task.canonicalSession, let run = task.canonicalRunID else { return }
+        // Reading produced output is independent of how its execution ended.
+        guard let session = task.canonicalSession, let run = task.canonicalRunID else { return }
         ContactReplyReads.record(dataRoot: dataRoot, session: session, request: task.id, run: run)
     }
     /// A message a restart left queued, from its saved input (the chat owner
@@ -490,6 +519,20 @@ public actor AgentContactTasks {
     /// runner revalidates its authority). Nil when its words or files cannot
     /// be read back whole.
     func queuedTurn(_ task: AgentContactTask, input: CodexCompletionTranscriptEvidence.SavedTurnInput) -> AgentContactTurn? {
+        if let binding = task.bridgeInput {
+            guard binding.principal.id == task.owner, let session = task.canonicalSession,
+                  let locator = NativeAgentA2AWire.locator(task.id),
+                  case .success(let attachments) = input.attachments else { return nil }
+            var files: [AgentContactPart] = []
+            for attachment in attachments {
+                guard let bytes = Data(base64Encoded: attachment.base64) else { return nil }
+                files.append(.file(name: attachment.name ?? "", mediaType: attachment.mime, bytes: bytes, metadata: .null))
+            }
+            return AgentContactTurn(taskID: task.id, context: task.context, requestID: locator.request,
+                principal: binding.principal, parts: [.text(input.content)] + files,
+                bindRun: { session, run in try await self.bindRun(task.id, session: session, run: run) },
+                accepted: EnqueuedUserMessage(sessionId: session, runId: input.runId), bridgeInput: binding)
+        }
         guard let session = task.canonicalSession, let locator = NativeAgentA2AWire.locator(task.id),
               let peer = (try? AgentPeerStore(dataRoot: dataRoot).list())?.first(where: { $0.id == task.owner }),
               let words = AgentBridgeSurface.message(inTurn: input.content),
@@ -502,10 +545,6 @@ public actor AgentContactTasks {
             parts: [.text(words)] + files, bindRun: { session, run in try await self.bindRun(task.id, session: session, run: run) },
             accepted: EnqueuedUserMessage(sessionId: session, runId: input.runId))
     }
-    public func recordReplyFetch(session: String, request: String, run: String, owner: String) {
-        ContactReplyReads.record(dataRoot: dataRoot, session: session, request: request, run: run)
-        AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: owner, outbound: true)
-    }
     func bindRun(_ id: String, session: String, run: String) throws {
         guard var record = records[id], !record.task.state.terminal else { throw AgentContactFailure.missing }
         record.task.canonicalSession = session
@@ -516,8 +555,7 @@ public actor AgentContactTasks {
     }
     private func canonicalReply(_ task: AgentContactTask) throws -> (outcome: AgentContactOutcome, approvals: Set<String>)? {
         guard let session = task.canonicalSession, let run = task.canonicalRunID,
-              NativeAgentChatSessionID.normalizedPathComponent(session) == session,
-              session.hasPrefix(AgentBridgePrincipal.genericAgentSessionPrefix(owner: task.owner)) else { return nil }
+              NativeAgentChatSessionID.normalizedPathComponent(session) == session else { return nil }
         let url = dataRoot.appendingPathComponent("chat/messages/\(session).jsonl")
         let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         if fd < 0, errno == ENOENT { return nil }
@@ -543,29 +581,39 @@ public actor AgentContactTasks {
             if row["role"] as? String == "tool", metadata["resultStatus"] as? String == "needs_input" { waitingOnPerson = true }
             guard row["role"] as? String == "assistant",
                   let outcome = metadata["outcomeObservation"] as? [String: Any],
-                  let content = row["content"] as? String else { continue }
+                  let savedContent = row["content"] as? String else { continue }
+            let commentaryBoundary: Int?
+            if let raw = metadata["workingCommentaryChars"] {
+                guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                      number.doubleValue == Double(number.intValue) else {
+                    throw AgentContactFailure(code: -32603, message: "The saved reply's commentary boundary is invalid")
+                }
+                commentaryBoundary = number.intValue
+            } else { commentaryBoundary = nil }
+            let content = ChatResponse.answerOnly(savedContent, workingCommentaryCharacters: commentaryBoundary)
             let persistence = outcome["responsePersistence"] as? String
-            if persistence == "cancelled" || metadata["cancelled"] as? Bool == true {
-                replies.append(.init(state: .canceled, parts: [.text(content)]))
-            } else if persistence == "failed" {
-                replies.append(.init(state: .failed, parts: [.text(content)]))
-            } else if persistence == "persisted", metadata["partial"] as? Bool != true {
+            let state: AgentContactTaskState
+            if persistence == "cancelled" || metadata["cancelled"] as? Bool == true { state = .canceled }
+            else if persistence == "failed" { state = .failed }
+            else if persistence == "persisted", metadata["partial"] as? Bool != true {
                 // A turn that stopped at a card waits on the person; it did not fail.
-                let state: AgentContactTaskState = metadata["completionState"] as? String == "completed" ? .completed
+                state = metadata["completionState"] as? String == "completed" ? .completed
                     : waitingOnPerson ? .inputRequired : .failed
+            } else { continue }
                 var parts: [AgentContactPart] = content.isEmpty ? [] : [.text(content)]
-                var detail: String? = switch state {
+                let detail: String? = switch state {
                 case .failed: "The saved reply does not confirm that the work finished"
                 case .inputRequired: "Waiting on the person: a card is up in NativeAgent. Send the next message once they answer."
                 default: nil
                 }
-                do {
+                var failures: [String] = []
                     for key in ["attachments", "outputFiles"] {
                         guard let raw = metadata[key] else { continue }
                         guard let attachments = raw as? [[String: Any]], attachments.count <= 64 else {
-                            throw AgentContactFailure(code: -32603, message: "Invalid saved attachments")
+                            failures.append("Invalid saved \(key)"); continue
                         }
-                        for saved in attachments {
+                        for (index, saved) in attachments.enumerated() {
+                          do {
                             guard let type = saved["type"] as? String, let mime = saved["mime"] as? String,
                                   let path = saved["path"] as? String, !path.isEmpty else {
                                 throw AgentContactFailure(code: -32603, message: "Invalid saved attachment")
@@ -584,13 +632,12 @@ public actor AgentContactTasks {
                                 parts.removeLast()
                                 throw AgentContactFailure(code: -32603, message: "Saved attachments exceed the reply limit")
                             }
+                          } catch { failures.append("\(key)[\(index)]: \(error.localizedDescription)") }
                         }
                     }
-                } catch {
-                    detail = "Some saved reply files could not be recovered. Do not resend automatically."
-                }
-                replies.append(.init(state: state, parts: parts, detail: detail))
-            }
+                let recovery = failures.isEmpty ? nil : AgentContactReplyRecovery(source: url.path,
+                    detail: "Saved reply files could not be recovered: \(failures.joined(separator: "; ")). Repair those files and read this task again; do not resend the work.")
+                replies.append(.init(state: state, parts: parts, detail: detail, replyRecovery: recovery))
         }
         guard replies.count <= 1 else { throw AgentContactFailure(code: -32603, message: "The conversation has ambiguous completion records") }
         if let terminal = replies.first, terminal.state == .canceled {
@@ -598,7 +645,7 @@ public actor AgentContactTasks {
         }
         if !approvals.isEmpty {
             return (.init(state: .inputRequired, parts: replies.first?.parts ?? [],
-                detail: "Waiting for the person to answer the permission card"), approvals)
+                detail: "Waiting for the person to answer the permission card", replyRecovery: replies.first?.replyRecovery), approvals)
         }
         return replies.first.map { ($0, approvals) }
     }
@@ -639,7 +686,9 @@ public actor AgentContactTasks {
         let context = params["contextId"] as? String
         let state: String?
         if let raw = params["status"] as? String {
-            let parsed = AgentA2AWire.canonicalState(raw, version: "1.0")
+            let parsed: String
+            do { parsed = try AgentA2AWire.canonicalState(raw, version: "1.0") }
+            catch { throw invalid("status") }
             guard parsed != "unknown" else { throw invalid("status") }
             state = parsed
         } else { state = nil }
@@ -704,17 +753,12 @@ public actor AgentContactTasks {
         let task = try get(id, owner: owner)
         if records[id]?.worker == nil { return task }
         let waiter = UUID()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                if Task.isCancelled { continuation.resume(throwing: CancellationError()) }
-                else { records[id]?.waiters[waiter] = continuation }
-            }
-        } onCancel: {
-            Task { await self.cancelWaiter(id, waiter: waiter) }
-        }
-    }
-    private func cancelWaiter(_ id: String, waiter: UUID) {
-        records[id]?.waiters.removeValue(forKey: waiter)?.resume(throwing: CancellationError())
+        let response = TaskWait()
+        records[id]?.waiters[waiter] = response
+        await response.done.park()
+        records[id]?.waiters.removeValue(forKey: waiter)
+        guard let result = response.result else { throw CancellationError() }
+        return try result.get()
     }
     func cancel(_ id: String, owner: String) async throws -> AgentContactTask {
         let task = try get(id, owner: owner)
@@ -775,43 +819,60 @@ public actor AgentContactTasks {
         guard var record = records[id], record.task.needsReplyRecovery else { return }
         let acceptedOutputModes = record.task.acceptedOutputModes ?? ["*/*"]
         var parts = outcome.parts.compactMap { $0.accepted(in: acceptedOutputModes) }
-        if outcome.state == .failed, !record.cancelling {
-            if parts.isEmpty, let recovered = try? canonicalReply(record.task) {
-                parts = recovered.outcome.parts.compactMap { $0.accepted(in: acceptedOutputModes) }
+        var recovery = outcome.replyRecovery
+        var executionState = outcome.state
+        var detail = outcome.detail
+        if (outcome.state == .failed || outcome.state == .canceled || record.cancelling), parts.isEmpty {
+            do {
+                if let recovered = try canonicalReply(record.task) {
+                    parts = recovered.outcome.parts.compactMap { $0.accepted(in: acceptedOutputModes) }
+                    recovery = recovered.outcome.replyRecovery
+                    if outcome.state == .failed {
+                        executionState = recovered.outcome.state
+                        detail = recovered.outcome.detail
+                    }
+                }
+            } catch {
+                recovery = AgentContactReplyRecovery(source: record.task.canonicalSession.map { "chat/messages/\($0).jsonl" } ?? id,
+                    detail: "The produced reply could not be read: \(error.localizedDescription). Repair its retained transcript and read this task again; do not resend the work.")
             }
+        }
+        if outcome.state == .failed || outcome.state == .canceled || record.cancelling {
             // A failed turn keeps the prose already read by its peer at the same offsets.
-            if !record.task.text.isEmpty,
+            if !parts.contains(where: { if case .text(let text) = $0 { return !text.isEmpty }; return false }),
+               !record.task.text.isEmpty,
                let draft = AgentContactPart.text(record.task.text).accepted(in: acceptedOutputModes) {
                 parts.removeAll { if case .text = $0 { return true }; return false }
                 parts.insert(draft, at: 0)
             }
         }
-        record.task.state = record.cancelling ? .canceled : outcome.state
-        record.task.detail = outcome.detail ?? record.task.detail
-        record.task.failure = outcome.failure
+        if !record.task.state.terminal { record.task.state = record.cancelling ? .canceled : executionState }
+        record.task.detail = executionState == .completed ? detail : detail ?? record.task.detail
+        record.task.failure = executionState == .completed ? nil : outcome.failure
+        record.task.replyRecovery = recovery
+        if let result = outcome.toolResult { record.task.toolResult = result }
         record.task.updated = Date()
-        if !record.cancelling {
-            record.task.parts = parts
-            record.task.text = parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
-        }
+        record.task.parts = parts
+        record.task.text = parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
         record.worker = nil
         // Ended before its turn was admitted: a restored place it held is let go.
         if let session = record.task.canonicalSession, let run = record.task.canonicalRunID {
             Task { await TurnAdmission.shared.withdraw(sessionID: session, runID: run) }
         }
         do {
-            if record.task.state == .canceled, let session = record.task.canonicalSession,
-               let run = record.task.canonicalRunID {
+            try retain(record.task)
+            // Produced output must be retained before retiring recovery evidence.
+            if record.task.state == .canceled, record.task.replyRecovery == nil,
+               let session = record.task.canonicalSession, let run = record.task.canonicalRunID {
                 try SwiftNativeChatOrchestrationClient.removeReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run)
             }
-            try retain(record.task)
         }
         catch {
-            record.task.state = .failed
-            record.task.detail = "The reply could not be saved. Do not resend automatically."
+            record.task.replyRecovery = AgentContactReplyRecovery(source: dataRoot.appendingPathComponent("agents/a2a-receipts/outcomes.sqlite").path,
+                detail: "The reply settlement could not be saved: \(error.localizedDescription). Repair the receipt store and read this task again; do not resend the work.")
         }
         records[id] = record
-        if !record.cancelling, !parts.isEmpty {
+        if !parts.isEmpty {
             // Replace the streamed draft with the canonical final artifact.
             broadcast(id, .artifact(task: record.task, artifactID: id + "-reply", parts: parts, append: false, last: true))
         }
@@ -821,7 +882,10 @@ public actor AgentContactTasks {
         let waiters = records[id]?.waiters.values.map { $0 } ?? []
         records[id]?.subscribers.removeAll(); records[id]?.waiters.removeAll()
         subscribers.forEach { $0.finish() }
-        waiters.forEach { $0.resume(returning: record.task) }
+        waiters.forEach {
+            $0.result = .success(record.task)
+            $0.done.resume()
+        }
         if record.task.state == .inputRequired {
             scheduleApprovalRefresh()
         }

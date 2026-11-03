@@ -74,15 +74,20 @@ public struct DeskWorkAttempt: Sendable, Equatable {
 
     public static func fromJSON(_ value: JSONValue) -> DeskWorkAttempt? {
         guard case .object(let object) = value,
-              let attemptId = object["attemptId"]?.stringValue ?? object["reservationId"]?.stringValue,
-              let lane = object["lane"]?.stringValue.flatMap(Lane.init(rawValue:))
-                ?? (object["reservationId"] != nil ? .pursuit : nil),
+              object["reservationId"] == nil,
+              let attemptId = object["attemptId"]?.stringValue, !attemptId.isEmpty,
+              let lane = object["lane"]?.stringValue.flatMap(Lane.init(rawValue:)),
               let day = object["day"]?.stringValue,
               let slot = object["slot"]?.stringValue,
-              let reservedAt = object["reservedAt"]?.stringValue else { return nil }
+              let reservedAt = object["reservedAt"]?.stringValue,
+              DeskClock.parseISO(reservedAt) != nil,
+              DeskJSON.optionalStringsAreValid(object, keys: ["receipt", "completedAt", "disposition"]),
+              let artifacts = DeskJSON.strings(object["artifactRefs"]) else { return nil }
         if let value = object["receiptHandedOff"] {
             guard case .bool = value else { return nil }
         }
+        if let raw = object["disposition"]?.stringValue, DeskWorkDisposition(rawValue: raw) == nil { return nil }
+        if let raw = object["completedAt"]?.stringValue, DeskClock.parseISO(raw) == nil { return nil }
         return DeskWorkAttempt(
             attemptId: attemptId,
             lane: lane,
@@ -93,23 +98,15 @@ public struct DeskWorkAttempt: Sendable, Equatable {
             completedAt: object["completedAt"]?.stringValue,
             receiptHandedOff: object["receiptHandedOff"] == .bool(true),
             disposition: object["disposition"]?.stringValue.flatMap(DeskWorkDisposition.init(rawValue:)),
-            artifactRefs: (object["artifactRefs"]?.arrayValue?.compactMap(\.stringValue) ?? [])
+            artifactRefs: artifacts
         )
     }
-    /// Historical embedded reservations enter the item ledger only at decode.
+    /// The one current attempt collection. Missing means no attempts because
+    /// the writer omits an empty collection; a present collection is complete.
     static func readAttempts(_ object: [String: JSONValue]) -> [DeskWorkAttempt]? {
-        var attempts: [DeskWorkAttempt] = []
-        var collections = [object["workAttempts"]]
-        if case .object(let pursuit)? = object["pursuit"] { collections.append(pursuit["reservations"]) }
-        for value in collections.compactMap({ $0 }) {
-            guard case .array(let rows) = value else { return nil }
-            let decoded = rows.compactMap(Self.fromJSON)
-            guard decoded.count == rows.count else { return nil }
-            for attempt in decoded {
-                guard !attempts.contains(where: { $0.attemptId == attempt.attemptId }) else { return nil }
-                attempts.append(attempt)
-            }
-        }
+        if case .object(let pursuit)? = object["pursuit"], pursuit["reservations"] != nil { return nil }
+        guard let attempts = DeskJSON.collection(object["workAttempts"], decode: Self.fromJSON),
+              Set(attempts.map(\.attemptId)).count == attempts.count else { return nil }
         return attempts
     }
 }
@@ -119,7 +116,8 @@ public struct DeskWorkAttempt: Sendable, Equatable {
 // All REQUIRED fields (why/evidence/doneLooksLike/abandonCondition) ride the
 // create op payload so a pursuit is fully evidenced the moment it
 // exists; the store REFUSES a create missing any of them. maxSessions/maxDays
-// bound the pursuit ("unbounded pursuits are theater") — defaulted and capped.
+// bound the pursuit ("unbounded pursuits are theater"); creation has defaults,
+// and the write/read gates reject values outside the declared bounds.
 // Item attempts and retired daily counts preserve the pursuit lifetime budget.
 
 public struct Pursuit: Sendable, Equatable {
@@ -135,7 +133,6 @@ public struct Pursuit: Sendable, Equatable {
     public var maxDays: Int                 // default 10, cap 21
     public var abandonCondition: String     // required
     public var privateName: String?         // hers, optional
-    public var workSessionsToday: Int        // derived from item work slots
     public var lastWorkedAt: String?
     public var retiredSessionsByDay: [String: Int]
     public var retiredSessions: Int { retiredSessionsByDay.values.reduce(0, +) }
@@ -150,25 +147,24 @@ public struct Pursuit: Sendable, Equatable {
         maxDays: Int = Pursuit.defaultMaxDays,
         abandonCondition: String,
         privateName: String? = nil,
-        workSessionsToday: Int = 0,
         lastWorkedAt: String? = nil,
         retiredSessionsByDay: [String: Int] = [:]
     ) {
         self.why = why
         self.evidence = evidence
         self.doneLooksLike = doneLooksLike
-        // Clamp to [1, cap] — a create can only tighten the bound, never lift it.
-        self.maxSessions = max(1, min(maxSessions, Pursuit.maxMaxSessions))
-        self.maxDays = max(1, min(maxDays, Pursuit.maxMaxDays))
+        self.maxSessions = maxSessions
+        self.maxDays = maxDays
         self.abandonCondition = abandonCondition
         self.privateName = privateName
-        self.workSessionsToday = workSessionsToday
         self.lastWorkedAt = lastWorkedAt
         self.retiredSessionsByDay = retiredSessionsByDay
     }
 
-    /// The required-field gate (structural). Trimmed-empty required strings are refused; evidence must pass the dossier gate. Returns a human reason or nil. Enforced at WRITE time only.
+    /// The required-field gate (structural). Trimmed-empty required strings are refused; evidence must pass the dossier gate. Returns a human reason or nil; shared by admission and stored-value decoding.
     public func validationError() -> String? {
+        if !(1...Self.maxMaxSessions).contains(maxSessions) { return "pursuit: maxSessions must be in 1...\(Self.maxMaxSessions)" }
+        if !(1...Self.maxMaxDays).contains(maxDays) { return "pursuit: maxDays must be in 1...\(Self.maxMaxDays)" }
         if why.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "pursuit: 'why' is required" }
         if doneLooksLike.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "pursuit: 'doneLooksLike' is required" }
         if abandonCondition.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "pursuit: 'abandonCondition' is required" }
@@ -184,7 +180,6 @@ public struct Pursuit: Sendable, Equatable {
             "maxSessions": .int(Int64(maxSessions)),
             "maxDays": .int(Int64(maxDays)),
             "abandonCondition": .string(abandonCondition),
-            "workSessionsToday": .int(Int64(workSessionsToday)),
         ]
         if let privateName, !privateName.isEmpty { obj["privateName"] = .string(privateName) }
         if let lastWorkedAt, !lastWorkedAt.isEmpty { obj["lastWorkedAt"] = .string(lastWorkedAt) }
@@ -196,30 +191,39 @@ public struct Pursuit: Sendable, Equatable {
 
     /// Both feed and base inputs must carry lossless, representable accounting.
     public static func fromJSON(_ value: JSONValue) -> Pursuit? {
-        guard case .object(let obj) = value else { return nil }
+        guard case .object(let obj) = value, obj["reservations"] == nil,
+              let why = obj["why"]?.stringValue,
+              let evidenceValue = obj["evidence"], let evidence = PromotionDossier.fromJSON(evidenceValue),
+              let doneLooksLike = obj["doneLooksLike"]?.stringValue,
+              case .int(let rawSessions)? = obj["maxSessions"], let maxSessions = Int(exactly: rawSessions),
+              case .int(let rawDays)? = obj["maxDays"], let maxDays = Int(exactly: rawDays),
+              let abandonCondition = obj["abandonCondition"]?.stringValue,
+              DeskJSON.optionalStringsAreValid(obj, keys: ["privateName", "lastWorkedAt"]) else { return nil }
+        if let last = obj["lastWorkedAt"]?.stringValue, DeskClock.parseISO(last) == nil { return nil }
         var retiredSessionsByDay: [String: Int] = [:]
         var total = 0
         if let value = obj["retiredSessionsByDay"] {
             guard case .object(let days) = value else { return nil }
             for (day, value) in days {
-                guard case .int(let raw) = value, raw > 0, let count = Int(exactly: raw) else { return nil }
+                guard DeskClock.normalizedDay(day) == day,
+                      case .int(let raw) = value, raw > 0, let count = Int(exactly: raw) else { return nil }
                 let addition = total.addingReportingOverflow(count)
                 guard !addition.overflow else { return nil }
                 total = addition.partialValue
                 retiredSessionsByDay[day] = count
             }
         }
-        return Pursuit(
-            why: obj["why"]?.stringValue ?? "",
-            evidence: obj["evidence"].map { PromotionDossier.fromJSON($0) } ?? PromotionDossier(citations: []),
-            doneLooksLike: obj["doneLooksLike"]?.stringValue ?? "",
-            maxSessions: jsonInt(obj, "maxSessions") ?? Pursuit.defaultMaxSessions,
-            maxDays: jsonInt(obj, "maxDays") ?? Pursuit.defaultMaxDays,
-            abandonCondition: obj["abandonCondition"]?.stringValue ?? "",
+        let pursuit = Pursuit(
+            why: why,
+            evidence: evidence,
+            doneLooksLike: doneLooksLike,
+            maxSessions: maxSessions,
+            maxDays: maxDays,
+            abandonCondition: abandonCondition,
             privateName: obj["privateName"]?.stringValue,
-            workSessionsToday: jsonInt(obj, "workSessionsToday") ?? 0,
             lastWorkedAt: obj["lastWorkedAt"]?.stringValue,
             retiredSessionsByDay: retiredSessionsByDay
         )
+        return pursuit.validationError() == nil ? pursuit : nil
     }
 }

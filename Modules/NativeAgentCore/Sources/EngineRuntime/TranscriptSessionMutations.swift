@@ -21,7 +21,7 @@ import MacControl
 import Darwin
 import ChatTurnContracts
 import ChatToolParsing
-// Blueprint: | `TranscriptSessionMutations.swift` | TranscriptsFacade session creation, rename/archive and canonical transcript clear with unchanged lock ordering |
+// Blueprint: | `TranscriptSessionMutations.swift` | TranscriptsFacade creates current generation-zero sessions; rename/archive and canonical transcript clear preserve lock ordering |
 extension TranscriptsFacade {
     /// A new session row at the top of the index.
     public nonisolated func create(title: String, sourceKey: String? = nil) async throws -> NativeAgentShared.ChatSession {
@@ -37,6 +37,7 @@ extension TranscriptsFacade {
             "updatedAt": .string(now),
             "archived": .bool(false),
             "messageCount": .int(0),
+            ChatSessionIndexFile.transcriptGenerationKey: .int(0),
         ]
         if let sourceKey, !sourceKey.isEmpty { sessionRow["sourceKey"] = .string(sourceKey) }
         let rowToInsert = sessionRow
@@ -83,7 +84,7 @@ extension TranscriptsFacade {
         try await ChatSessionRetention.archiveSession(id: id, dataRoot: dataRoot)
             .map(NativeAgentShared.ChatSession.init(row:))
     }
-    /// Clear the canonical flat transcript under its lock, remove any stale nested copy and publish the empty index row.
+    /// Clear the canonical flat transcript under its lock and publish the empty index row.
     public nonisolated func clear(sessionId: String) async throws {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             throw NSError(
@@ -95,10 +96,6 @@ extension TranscriptsFacade {
         let messagesPath = chatRoot
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeSessionId).jsonl")
-        let staleNestedPath = chatRoot
-            .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(safeSessionId, isDirectory: true)
-            .appendingPathComponent("messages.jsonl")
         let sessionsPath = self.sessionsPath
         let usagePath = chatRoot
             .appendingPathComponent("session_state", isDirectory: true)
@@ -125,9 +122,6 @@ extension TranscriptsFacade {
                 usage = nil
             }
             try ContactThread.replace(Data(), to: messagesPath)
-            if FileManager.default.fileExists(atPath: staleNestedPath.path) {
-                try? FileManager.default.removeItem(at: staleNestedPath)
-            }
             return usage
         }
         await publishClearedTranscript(safeSessionId)

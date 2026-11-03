@@ -64,11 +64,11 @@ extension REMConsolidator {
         // An unreadable GROWTH.md aborts the pass; pending history stays pending.
         let body = try String(contentsOf: growth, encoding: .utf8)
         // Reconcile pending history against the locked body before the cap can skip this pass.
-        await REMGrowthEvictionHistory.reconcilePending(
+        try await REMGrowthEvictionHistory.reconcilePending(
             growthBody: body,
             dataRoot: dataRoot,
             kgNodeExists: { [dataRoot] id in
-                await Self.growthDistillationNodeExists(id: id, dataRoot: dataRoot)
+                try await Self.growthDistillationNodeExists(id: id, dataRoot: dataRoot)
             }
         )
         // Failed distillation leaves the source passage intact in GROWTH.md.
@@ -166,7 +166,7 @@ extension REMConsolidator {
             // THE NODE POINTS AT THE ORIGINAL. The id is already shared with the
             // retained-passage record, but a compressed node whose pointer is an
             // unwritten convention is a node nobody expands — so it says where
-            // the full passage is, in both the SQLite and legacy-JSON paths.
+            // the full passage is in the canonical SQLite graph.
             // The 400-character bound is the summary's; the pointer after it stays whole.
             summary: String(summary.prefix(400)) + "\n\n" + REMGrowthEvictionHistory.pointer(id: id),
             sourceLines: text.split(separator: "\n").count,
@@ -182,18 +182,14 @@ extension REMConsolidator {
     }
 
     /// Corroborating identity for a reconciled eviction: the distilled node
-    /// carrying the record's id in the graph (memory.sqlite). Any failure
-    /// reads as "not present" — reconciliation then leaves the row pending,
-    /// which is the safe side.
-    fileprivate static func growthDistillationNodeExists(id: String, dataRoot: URL) async -> Bool {
+    /// carrying the record's id in the graph (memory.sqlite). An unavailable
+    /// graph fails reconciliation with the original pending record intact.
+    fileprivate static func growthDistillationNodeExists(id: String, dataRoot: URL) async throws -> Bool {
         let sqliteURL = dataRoot
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("memory.sqlite")
-        guard let indexer = try? SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqliteURL),
-              let exists = try? await indexer.growthDistillationExists(id: id) else {
-            return false
-        }
-        return exists
+        let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqliteURL)
+        return try await indexer.growthDistillationExists(id: id)
     }
 
     /// Merge a GROWTH-eviction distillation node into the graph in
@@ -210,10 +206,7 @@ extension REMConsolidator {
             id: node.id,
             summary: node.summary,
             sourceLines: node.sourceLines,
-            createdAt: node.createdAt,
-            // The graph's own one-time legacy import source; a no-op once
-            // `.kg_migrated_to_sqlite_v1` stands.
-            legacyJSONPath: kgDir.appendingPathComponent("knowledge_graph.json")
+            createdAt: node.createdAt
         )
     }
 

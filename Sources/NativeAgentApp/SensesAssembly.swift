@@ -12,12 +12,16 @@ import ChatTurnContracts
 import MemoryV2
 import MacControl
 import TrustCenter
+import AuthoredCapabilities
+import Cognition
+import DoctorChecks
 
-// Blueprint: | `SensesAssembly.swift` | `SensesAssembly`: launch-only shared hub installation and gated raw-read bindings; quiet reads borrow no turn authority |
+// Blueprint: | `SensesAssembly.swift` | `SensesAssembly`: shared hub installation and gated raw-read bindings; checked readiness belongs to dependent reads and subscriptions, never global loop launch; successful registration publishes its repair edge, repair retries only on canonical ability/resource/memory-file changes; quiet reads borrow no turn authority |
 
 /// Launch composition only. Runtime callers go through the shared hub.
 enum SensesAssembly {
     private static let installation = Mutex<Task<Void, Error>?>(nil)
+    private static let installationFinished = ScopedWaiter()
 
     static func install(dataRoot: URL) {
         installation.withLock { installation in
@@ -48,22 +52,41 @@ enum SensesAssembly {
             // (app sense.make), and then it's built.
             SensesHub.shared.install(registry: registry, runner: runner, source: source)
             installation = Task {
-                await SenseNewsBoard.shared.configure(dataRoot: dataRoot)
-                do {
-                    let memory = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-                    SensesHub.shared.installMemoryProvenanceSink(memory)
-                    try await BuiltInSenses.registerAll(dataRoot: dataRoot)
-                } catch {
-                    ModuleLog.app("[senses] Registration failed: %@", error.localizedDescription)
-                    throw error
+                defer { installationFinished.resume() }
+                let resources = Bundle.main.resourceURL?.appendingPathComponent("Senses")
+                var paths = [dataRoot.appendingPathComponent("memory/memory.sqlite"), dataRoot.appendingPathComponent("senses/news/unread.json")]
+                if let resources { paths.append(resources.appendingPathComponent("builtin.json")) }
+                let repairs = EventDeadlinePhysiology.storeAndFileEvents(paths: paths, notifications: [AbilityStore.didChange])
+                var changes = repairs.makeAsyncIterator()
+                while !Task.isCancelled {
+                    do {
+                        guard await SenseNewsBoard.shared.configure(dataRoot: dataRoot) else {
+                            let detail = await SenseNewsBoard.shared.storageFailure
+                            throw SenseFailure(code: "news_unavailable", message: "Private sense news storage could not be installed: " + (detail ?? "binding unavailable"))
+                        }
+                        let memory = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
+                        SensesHub.shared.installMemoryProvenanceSink(memory)
+                        try await BuiltInSenses.registerAll(dataRoot: dataRoot)
+                        try Task.checkCancellation()
+                        await DoctorReadout.recordReadings([CheckResult(source: "Senses installation",
+                            id: "launch.senses", title: "Senses installation", status: "ok", detail: "Senses registered; dependent reads and file subscriptions may proceed.")], dataRoot: dataRoot)
+                        NotificationCenter.default.post(name: SensesHub.didBecomeReady, object: nil)
+                        return
+                    } catch is CancellationError { throw CancellationError() }
+                    catch {
+                        let detail = "Senses registration unavailable; dependent reads are unavailable until a source repair/change: " + error.localizedDescription
+                        ModuleLog.app("[senses] %@", detail)
+                        await DoctorReadout.recordReadings([CheckResult(source: "Senses installation",
+                            id: "launch.senses", title: "Senses installation", status: "fail", detail: detail,
+                            human_action: "Preserve the failed source named in this reading; repair it at its owner. A canonical ability/resource/memory-file change rechecks registration; otherwise relaunch after repair. Only dependent sense reads and subscriptions are unavailable; other resident work continues.")], dataRoot: dataRoot)
+                    }
+                    // No repair edge means still unavailable, never ready.
+                    guard await changes.next() != nil else { throw CancellationError() }
                 }
+                throw CancellationError()
             }
+            if let installation { SensesHub.shared.installReadiness(installation, finished: installationFinished) }
         }
-    }
-
-    static func waitUntilReady() async throws {
-        let installation = Self.installation.withLock { $0 }
-        try await installation?.value
     }
 
     static func shutdown() async {

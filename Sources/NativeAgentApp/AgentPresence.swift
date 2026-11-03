@@ -38,7 +38,8 @@ struct SimpleAgentCard: View {
         }
         if appModel.engine.turns.isThinkingBeforeReply(for: appModel.activeChatSessionId) { return ("Thinking…", false) }
         if appModel.isBusy || appModel.isChatStreaming { return ("Replying…", false) }
-        return (appModel.engine.desk.ownerWaitingCount ?? 0) > 0 ? ("Waiting on you", true) : ("Here", false)
+        guard let count = appModel.engine.desk.ownerWaitingCount else { return ("Attention unavailable", false) }
+        return count > 0 ? ("Waiting on you", true) : ("Here", false)
     }
 
     private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: Self.radius, style: .continuous) }

@@ -3,7 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
 
-// Blueprint: | `ConversationAnchor.swift` | `ConversationAnchor`: shared current-person conversation publication, protected sessions and adoption decisions across surfaces; only a session whose row records it as their direct conversation may anchor (`mayAnchor`), whatever door publishes |
+// Blueprint: | `ConversationAnchor.swift` | `ConversationAnchor`: shared current-person conversation publication, protected sessions and adoption decisions across surfaces; only a session whose row records it as their direct conversation may anchor (`mayAnchor`), whatever door publishes; checked anchor reads hold retention on unavailable bytes or invalid ids and refuse publication over damage |
 
 // MARK: - The conversation anchor
 //
@@ -141,7 +141,7 @@ public enum ConversationAnchor {
             guard (sessions.kind(cleanSession) ?? conversationKind).isHisConversation else { return .refused(.notADirectConversation) }
             let parent = anchorPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-            let existing = readUnlocked(at: anchorPath)
+            let existing = try readUnlocked(at: anchorPath)
             // Preserve activity order even if an older publication was delayed.
             // The numeric stamp retains precision lost by ISO display formatting.
             let committedStamp = NativeTimestampFormat.fractionalZulu(now)
@@ -176,12 +176,20 @@ public enum ConversationAnchor {
     /// of an atomically-written file is not possible and a stale-by-milliseconds
     /// pin is harmless (the next refresh corrects it).
     public static func current(dataRoot: URL = defaultDataRoot()) -> ConversationAnchorPin? {
-        readUnlocked(at: path(dataRoot: dataRoot))?.pin
+        do { return try readUnlocked(at: path(dataRoot: dataRoot))?.pin }
+        catch {
+            nativeLog("Conversation anchor unavailable: %@", error.localizedDescription)
+            return nil
+        }
     }
 
     /// Convenience for the common consumer: just the id.
     public static func currentSessionId(dataRoot: URL = defaultDataRoot()) -> String? {
         current(dataRoot: dataRoot)?.sessionId
+    }
+
+    public static func checkedCurrent(dataRoot: URL = defaultDataRoot()) throws -> ConversationAnchorPin? {
+        try readUnlocked(at: path(dataRoot: dataRoot))?.pin
     }
 
     /// Retention's hook. The anchor is the conversation User is IN; archiving it
@@ -192,9 +200,10 @@ public enum ConversationAnchor {
     /// strip auto-INCLUDES the anchor for visibility, but a human can unpin
     /// anything, and an unpin must not be able to make the live conversation
     /// archivable.
-    public static func protectedSessionIds(dataRoot: URL = defaultDataRoot()) -> Set<String> {
-        guard let id = currentSessionId(dataRoot: dataRoot) else { return [] }
-        return [id]
+    /// Unknown protection throws: a damaged anchor never means no anchor.
+    public static func protectedSessionIds(dataRoot: URL = defaultDataRoot()) throws -> Set<String> {
+        guard let pin = try readUnlocked(at: path(dataRoot: dataRoot))?.pin else { return [] }
+        return [pin.sessionId]
     }
 
     /// Put the anchor at the FRONT of a pinned-session list, without disturbing
@@ -238,15 +247,25 @@ public enum ConversationAnchor {
 
     // MARK: - Internals
 
-    static func readUnlocked(at path: URL) -> (pin: ConversationAnchorPin, activityAt: Date?)? {
-        guard let data = try? Data(contentsOf: path),
-              let parsed = try? JSONValue.parse(data),
+    static func readUnlocked(at path: URL) throws -> (pin: ConversationAnchorPin, activityAt: Date?)? {
+        let data: Data
+        do { data = try Data(contentsOf: path) }
+        catch CocoaError.fileReadNoSuchFile { return nil }
+        catch { throw unavailable(path, error.localizedDescription) }
+        let parsed: JSONValue
+        do { parsed = try JSONValue.parse(data) }
+        catch { throw unavailable(path, error.localizedDescription) }
+        guard
               case .object(let object) = parsed,
-              case .string(let sessionId)? = object["sessionId"] else { return nil }
+              case .string(let sessionId)? = object["sessionId"] else {
+            throw unavailable(path, "The saved anchor has no sessionId.")
+        }
         let clean = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty,
-              mayAnchor(clean, sessionsPath: path.deletingLastPathComponent().appendingPathComponent("sessions.json"))
-        else { return nil }
+        guard !clean.isEmpty else { throw unavailable(path, "The saved anchor has an empty sessionId.") }
+        // A failed index read cannot prove that this is no longer his conversation.
+        let root = path.deletingLastPathComponent().deletingLastPathComponent()
+        let sessions = try SessionConversation(dataRoot: root)
+        guard sessions.kind(clean)?.isHisConversation == true else { return nil }
         let source: String = {
             if case .string(let value)? = object["source"] { return value }
             return ""
@@ -264,10 +283,12 @@ public enum ConversationAnchor {
                 seconds.flatMap { $0.isFinite ? Date(timeIntervalSince1970: $0) : nil })
     }
 
-    /// Lenient on purpose: a pin written by an older build, or by a surface
-    /// that omitted fractional seconds, must not be treated as "unorderable
-    /// therefore newer" — that would wedge the anchor permanently. Anything
-    /// unparseable simply makes no recency claim and loses.
+    private static func unavailable(_ path: URL, _ reason: String) -> PersistenceCoreError {
+        .ioFailure("The conversation anchor at \(path.path) is unavailable: \(reason) Conversations have been left in place; repair or restore access to the saved anchor, preserving its bytes.")
+    }
+
+    /// Current surfaces write valid ISO8601 timestamps; precision does not
+    /// change ordering. Anything unparseable makes no recency claim.
     private static func parseISO8601(_ raw: String) -> Date? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }

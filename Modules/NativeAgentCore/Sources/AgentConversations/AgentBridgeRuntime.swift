@@ -1,4 +1,6 @@
 import Foundation
+import PersonaEngine
+import NativeAgentCore
 import CryptoKit
 import PersistenceCore
 import MacControl
@@ -29,7 +31,8 @@ public enum AgentBridgeRuntime {
 
     public static func startOMPReplyJobRecovery() async {
         let dataRoot = PersistenceCore.defaultDataRoot()
-        guard AgentConversationDelivery.lane(for: "omp", dataRoot: dataRoot) != nil else { return }
+        do { guard try AgentConversationDelivery.lane(for: "omp", dataRoot: dataRoot) != nil else { return } }
+        catch { nativeLog("OMP reply recovery contact resolution failed: %@", error.localizedDescription); return }
         var environment = AgentBridgeRuntime.processEnvironment()
         environment["NATIVE_AGENT_DATA_ROOT"] = dataRoot.path
         let configRoot = InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
@@ -87,7 +90,15 @@ public enum AgentBridgeRuntime {
         // Helpers address the agent and user by their configured names.
         var environment = environment
         if environment["NATIVE_AGENT_AGENT_NAME"] == nil || environment["NATIVE_AGENT_USER_NAME"] == nil {
-            let names = AgentBridgeRuntime.configuredNames(dataRoot: PersistenceCore.defaultDataRoot())
+            let names: (agent: String, user: String)
+            do { names = try AgentBridgeRuntime.configuredNames(dataRoot: PersistenceCore.defaultDataRoot()) }
+            catch {
+                return .object(["status": .string("failed"), "reason": .string("persona_profile_unavailable"),
+                    "admissionOutcome": .string("not_admitted"), "effects": .string("none"),
+                    "detail": .string(error.localizedDescription),
+                    "remedy": Repair.remedy(owner: "memory/profile.json", nextCall: nil,
+                        tap: "Repair the unreadable persona profile before starting the helper.")])
+            }
             environment["NATIVE_AGENT_AGENT_NAME"] = environment["NATIVE_AGENT_AGENT_NAME"] ?? names.agent
             environment["NATIVE_AGENT_USER_NAME"] = environment["NATIVE_AGENT_USER_NAME"] ?? names.user
         }
@@ -157,14 +168,9 @@ public enum AgentBridgeRuntime {
         if result.stdoutTruncated { return unavailable("helper_output_truncated", "The helper's output exceeded its byte limit.") }
 
         let stdoutText = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lastLine = stdoutText.split(separator: "\n").last.map(String.init) ?? ""
-        let parsed = [stdoutText, lastLine]
-            .lazy
-            .filter { !$0.isEmpty }
-            .compactMap { $0.data(using: .utf8) }
-            .compactMap { try? JSONValue.parse($0) }
-            .first
-        guard let parsed else { return unavailable("helper_returned_no_json", "The helper returned no JSON receipt.") }
+        let parsed: JSONValue
+        do { parsed = try JSONValue.parse(Data(stdoutText.utf8)) }
+        catch { return unavailable("helper_invalid_receipt", "The helper's stdout must contain exactly one JSON receipt: " + error.localizedDescription) }
         guard case .object(var object) = parsed,
               case .string(let status)? = object["status"],
               !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -271,20 +277,15 @@ public enum AgentBridgeRuntime {
         return bundledHelper(named: name, resourceRoot: bundleResourceRoot).standardizedFileURL
     }
 
-    /// The configured agent and user names from the persona profile, for the
-    /// wake helpers' prompts and receipts. Nothing shipped names a specific
-    /// agent; an install without a profile yet gets "the agent" / "the user".
-    public static func configuredNames(dataRoot: URL) -> (agent: String, user: String) {
-        let path = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("profile.json")
-        var agent = "the agent", user = "the user"
-        if let data = try? Data(contentsOf: path),
-           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let n = (object["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !n.isEmpty { agent = n }
-            if let n = (object["userName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !n.isEmpty { user = n }
+    /// The profile owner's checked identity, shared by helper wording and
+    /// desktop routes. An absent or incomplete saved identity cannot name a send.
+    public static func configuredNames(dataRoot: URL) throws -> (agent: String, user: String) {
+        do { return try PersonaCompiler.configuredNames(dataRoot: dataRoot) }
+        catch {
+            throw ToolFailureError(error.localizedDescription, effects: .none,
+                owner: dataRoot.appendingPathComponent("memory/profile.json").path,
+                tap: "Repair memory/profile.json before starting the helper.", code: "persona_profile_unavailable")
         }
-        return (agent, user)
     }
 
     public static func executableURL(
@@ -300,12 +301,15 @@ public enum AgentBridgeRuntime {
         case "node": environment["NATIVE_AGENT_BRIDGE_NODE_BIN"]
         default: nil
         }
+        if let override {
+            return firstExecutable([URL(fileURLWithPath: override)], fileManager: fileManager)
+        }
 
         let directories = (processEnvironment(base: environment, homeDirectory: homeDirectory)["PATH"] ?? "")
             .split(separator: ":")
             .map { URL(fileURLWithPath: String($0), isDirectory: true) }
 
-        var candidates = override.map { [URL(fileURLWithPath: $0)] } ?? []
+        var candidates: [URL] = []
         if name == "codex" {
             candidates.append(homeDirectory.appendingPathComponent(".codex/packages/standalone/current/bin/codex"))
             candidates.append(homeDirectory.appendingPathComponent("Desktop/Codex.app/Contents/Resources/codex"))

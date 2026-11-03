@@ -22,8 +22,9 @@ extension ChatSessionAutocompactor {
         let messagesPath = pass.messagesPath
         let before = rows.count
         let replaceCount = fold.replaced.count
-        let transcriptChars = Self.transcriptCharacterCount(rows)
-        let estimatedTokens = max(0, Int((Double(transcriptChars) / pass.divisor).rounded()))
+        let transcriptChars = try Self.transcriptCharacterCount(rows)
+        let estimatedTokens = try await SessionContextMeasurement.read(rows: rows, sessionId: sessionId,
+            model: pass.model, providerID: pass.providerID, dataRoot: dataRoot, windowTokens: pass.windowTokens, requestBuilder: requestBuilder).tokens
         let sourceNote = ChatCompactionRowRendering.receiptSourceNote(fold.removableRows, sessionId: sessionId)
         let summary = "Recollection pending; original messages are retained in the compaction backup."
         let nowISO = ISO8601DateFormatter().string(from: now())
@@ -109,7 +110,7 @@ extension ChatSessionAutocompactor {
         }
         try Task.checkCancellation()
         try ContactThread.replace(transcript, to: messagesPath)
-        let sourceBytesAfter = Self.fileSize(messagesPath)
+        let sourceBytesAfter = Int64(transcript.count)
         let outcome = ChatSessionCompactionOutcome(
             sessionId: sessionId,
             compacted: true,
@@ -121,7 +122,7 @@ extension ChatSessionAutocompactor {
             messagesBefore: before,
             messagesAfter: nextRows.count,
             messagesReplaced: replaceCount,
-            summaryChars: Self.transcriptCharacterCount(summaryRows),
+            summaryChars: try Self.transcriptCharacterCount(summaryRows),
             sourceBytesBefore: pass.sourceBytesBefore,
             sourceBytesAfter: sourceBytesAfter,
             summaryRowId: recollection == nil ? summaryId : nil,
@@ -207,7 +208,7 @@ extension ChatSessionAutocompactor {
             return ChatSessionCompactionOutcome(
                 sessionId: sessionId, compacted: false, reason: "distillation pending",
                 trigger: trigger, thresholdTokens: config.thresholdTokens,
-                estimatedTokensBefore: 0, transcriptCharsBefore: Self.transcriptCharacterCount(rows),
+                estimatedTokensBefore: 0, transcriptCharsBefore: try Self.transcriptCharacterCount(rows),
                 messagesBefore: rows.count, messagesAfter: rows.count,
                 messagesReplaced: Int(count), summaryChars: 0,
                 sourceBytesBefore: sourceBytes, sourceBytesAfter: sourceBytes,

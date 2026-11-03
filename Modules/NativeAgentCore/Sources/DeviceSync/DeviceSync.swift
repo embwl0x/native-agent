@@ -2,6 +2,7 @@ import Foundation
 import Cognition
 import Desk
 import NativeAgentShared
+import PersistenceCore
 
 // Blueprint: | `DeviceSync.swift` | `DeviceSync` and shared aliases: resident phone bridge, snapshot/inbox assembly and overview-driven needs-person notification binding |
 
@@ -12,8 +13,7 @@ typealias MultimodalAttachment = NativeAgentShared.MultimodalAttachment
 typealias ChatSession = NativeAgentShared.ChatSession
 
 /// The resident app's phone bridge, snapshots, inbox and notification relay.
-/// Storage uses dataRoot; snapshot watches/integrity and CloudKit actions also
-/// use the default app root. This is not an isolated-root sync implementation.
+/// This resident owner is bound by construction to the canonical app data root.
 @MainActor
 public final class DeviceSync {
     nonisolated let storage = DeviceSyncStorage()
@@ -28,7 +28,8 @@ public final class DeviceSync {
     public lazy var relay = MacSyncMobileNotificationRelay(sync: self)
     public lazy var pairedPhones = PairedPhoneStore(url: dataRoot.appendingPathComponent("paired_phones.json"), storage: storage)
 
-    public nonisolated init(dataRoot: URL, host: any DeviceSyncHost, cognition: NativeCognitionRuntime) {
+    public nonisolated init(host: any DeviceSyncHost, cognition: NativeCognitionRuntime) {
+        let dataRoot = PersistenceCore.defaultDataRoot()
         self.dataRoot = dataRoot
         self.host = host
         self.cognition = cognition

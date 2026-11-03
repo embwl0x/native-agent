@@ -17,7 +17,7 @@ import os
 import CoreText
 import ScreenCaptureKit
 #endif
-// Blueprint: | `MacAXValues.swift` | Accessibility identity, geometry, node and query values |
+// Blueprint: | `MacAXValues.swift` | Accessibility identity, geometry, node and query values; window identities carry optional-attribute gaps without scoring failed titles as absent; typed optional-attribute and action-name gaps retain element evidence and derive observation summaries, counting transient-menu nodes once by native identity; enabled evidence stays optional and snapshots retain bounded read-failure causes |
 public struct MacAXFrame: Sendable, Hashable {
     public let x: Double
     public let y: Double
@@ -38,18 +38,25 @@ public struct MacAXFrame: Sendable, Hashable {
         ])
     }
 }
-/// One element's readable attributes. Every optional field means "the element
-/// did not expose this attribute" — a missing AX attribute is an ABSENT field,
-/// never a fabricated default and never a crash.
+/// One element's readable attributes. Missing AX attributes remain absent.
+/// `actionsUnreadable` names a failed action-name read, distinct from an
+/// observed empty list; it does not discard the other readable attributes.
+/// `attributeGaps` names optional attributes whose reads failed, not absence.
 public struct MacAXAttributes: Sendable, Equatable {
     public let role: String
     public let subrole: String?
     public let title: String?
     public let value: String?
-    public let enabled: Bool
+    public let enabled: Bool?
     public let selected: Bool?
     public let frame: MacAXFrame?
     public let actions: [String]
+    /// When present, `actions` contains no claimed names, not evidence that
+    /// this element supports no actions. Actuation checks the live source.
+    public let actionsUnreadable: String?
+    public let attributeGaps: [String]
+    /// A name or caption read failed; no alternate name is claimed for this control.
+    public let labelUnreadable: Bool
     /// An editable field's placeholder ("Search Maps") — what a person sees in
     /// it and calls it by, when its AX name says something else.
     public let placeholder: String?
@@ -74,10 +81,11 @@ public struct MacAXAttributes: Sendable, Equatable {
         subrole: String? = nil,
         title: String? = nil,
         value: String? = nil,
-        enabled: Bool = true,
+        enabled: Bool? = nil,
         selected: Bool? = nil,
         frame: MacAXFrame? = nil,
         actions: [String] = [],
+        actionsUnreadable: String? = nil,
         placeholder: String? = nil,
         selectionRange: NSRange? = nil,
         state: String? = nil,
@@ -87,7 +95,9 @@ public struct MacAXAttributes: Sendable, Equatable {
         displayTitle: String? = nil,
         listSummary: String? = nil,
         isHiddenMenuItem: Bool = false,
-        menuCommandKey: String? = nil
+        menuCommandKey: String? = nil,
+        attributeGaps: [String] = [],
+        labelUnreadable: Bool = false
     ) {
         self.placeholder = placeholder
         self.selectionRange = selectionRange
@@ -107,6 +117,9 @@ public struct MacAXAttributes: Sendable, Equatable {
         self.selected = selected
         self.frame = frame
         self.actions = actions
+        self.actionsUnreadable = actionsUnreadable
+        self.attributeGaps = attributeGaps
+        self.labelUnreadable = labelUnreadable
     }
 }
 /// An emitted tree node. `path` is the child-index chain from the window root
@@ -142,6 +155,12 @@ public struct MacAXAppInfo: Sendable, Equatable {
             "pid": .int(Int64(processIdentifier)),
         ])
     }
+}
+/// Call-local foreground lease. Native window identity never goes through JSON.
+struct MacForegroundSnapshot: Sendable {
+    let app: MacAXAppInfo
+    let window: MacAXWindowIdentity?
+    @TaskLocal static var restoring: MacForegroundSnapshot?
 }
 /// WHICH WINDOW a look was taken of, in terms that survive a new
 /// `AXUIElement` instance.
@@ -181,6 +200,8 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
     public let subrole: String?
     public let title: String?
     public let frame: MacAXFrame?
+    /// Optional window attributes that failed, distinct from unsupported/absent values.
+    public let attributeGaps: [String]
     #if canImport(ApplicationServices) && os(macOS)
     package var nativeWindow: MacAXNativeWindowIdentity?
     package func retaining(_ window: AXUIElement) -> Self {
@@ -203,7 +224,8 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
         role: String,
         subrole: String? = nil,
         title: String? = nil,
-        frame: MacAXFrame? = nil
+        frame: MacAXFrame? = nil,
+        attributeGaps: [String] = []
     ) {
         self.pid = pid
         self.index = index
@@ -211,6 +233,7 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
         self.subrole = subrole
         self.title = title
         self.frame = frame
+        self.attributeGaps = attributeGaps
     }
     /// Rects drift by a point under a re-layout; two DIFFERENT windows are
     /// never a point apart in both origin and size.
@@ -241,7 +264,7 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
         if titleContradicts && rectContradicts { return nil }
         var score = 0
         if let title, let other = candidate.title, title == other { score += 4 }
-        if title == nil, candidate.title == nil { score += 1 }
+        // An absent or unreadable title is not a positive identity signal.
         if Self.rectsMatch(frame, candidate.frame) { score += 3 }
         if let index, let other = candidate.index, index == other { score += 1 }
         return score
@@ -321,6 +344,7 @@ public struct MacAXWindowIdentity: Sendable, Equatable {
             )
         }
         if let frame { object["frame"] = frame.toJSON() }
+        if !attributeGaps.isEmpty { object["attribute_gaps"] = .array(attributeGaps.map(JSONValue.string)) }
         return .object(object)
     }
 }
@@ -406,16 +430,47 @@ public struct MacAXTreeSnapshot: Sendable, Equatable {
     /// Sorted, stable reason slugs: `depth_cap`, `node_cap`, `unreadable_element`.
     public let truncationReasons: [String]
     public let skippedAtLeast: Int
+    public let readFailures: [String]
+    /// Derived from this snapshot's elements, never a second error ledger.
+    /// Counts describe only the elements actually read, not unseen branches.
+    var readGapsJSON: [String: JSONValue] {
+        let errors = nodes.compactMap { $0.attributes.actionsUnreadable }
+        let attributeErrors = nodes.flatMap { $0.attributes.attributeGaps }
+        return ["actions_unreadable_count": .int(Int64(errors.count)),
+                "actions_unreadable_first_error": errors.first.map(JSONValue.string) ?? .null,
+                "attribute_gaps_count": .int(Int64(attributeErrors.count)),
+                "attribute_gaps_first_error": attributeErrors.first.map(JSONValue.string) ?? .null]
+    }
+    /// Menus may also appear in the window walk. Count native identities once,
+    /// using the later menu observation for an overlap; never equate their
+    /// private menu paths with window-relative paths.
+    func readGapsJSON(including additionalNodes: [MacAXNode], source: any MacAXElementSource) -> [String: JSONValue] {
+        var combined = nodes
+        for node in additionalNodes {
+            if let ref = node.element, let index = combined.firstIndex(where: {
+                $0.element.map { source.sameElement($0, ref) } == true
+            }) {
+                combined[index] = node
+            } else {
+                combined.append(node)
+            }
+        }
+        return MacAXTreeSnapshot(nodes: combined, truncated: truncated,
+            truncationReasons: truncationReasons, skippedAtLeast: skippedAtLeast,
+            readFailures: readFailures).readGapsJSON
+    }
     public init(
         nodes: [MacAXNode],
         truncated: Bool,
         truncationReasons: [String],
-        skippedAtLeast: Int
+        skippedAtLeast: Int,
+        readFailures: [String] = []
     ) {
         self.nodes = nodes
         self.truncated = truncated
         self.truncationReasons = truncationReasons
         self.skippedAtLeast = skippedAtLeast
+        self.readFailures = readFailures
     }
 }
 public struct MacAXQuery: Sendable, Equatable {

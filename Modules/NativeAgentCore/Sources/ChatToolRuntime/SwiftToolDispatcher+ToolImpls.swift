@@ -22,7 +22,7 @@ extension SwiftToolDispatcher {
     }
 
     func impl_read_file(input: [String: JSONValue], surface: String? = nil) async throws -> JSONValue {
-        let fullMac = if let surface { await fullMacToolAccess(surface: surface).fileOpsAllowed } else { false }
+        let fullMac = if let surface { try await fullMacToolAccess(surface: surface).fileOpsAllowed } else { false }
         let path: String, address: String
         let raw: @Sendable () async throws -> JSONValue
         if fullMac, let surface {
@@ -53,10 +53,11 @@ extension SwiftToolDispatcher {
         if input["raw"] == .bool(true) || input["wrong"] == .bool(true) || SenseDoor.readingRaw { return result }
         guard case .object(let object) = result else { return result }
         if fullMac {
-            if object["ok"] == .bool(false), object["raw"] != nil, object["sense_provenance"] != nil { return result }
+            // A sense's own failure returns as itself: identity, provenance and repair.
+            if object["ok"] == .bool(false), object["sense_provenance"] != nil { return result }
             if case .string? = object["content"] { return Self.fileReadPresentation(result, callerPath: path) }
             if case .string(let code)? = object["error_code"],
-               ["file_changed", "bad_input", "window_too_small", "continuation_unavailable", "read_failed", "unsupported_file_type"].contains(code) { return result }
+               ["file_changed", "bad_input", "window_too_small", "continuation_unavailable", "read_failed", "unsupported_file_type", "invalid_utf8"].contains(code) { return result }
         }
         if let pathMiss = filePathMissEnvelope(tool: "read_file", input: input, resultObject: object) {
             return pathMiss
@@ -105,8 +106,8 @@ extension SwiftToolDispatcher {
         ) else {
             throw AutonomyGateError.toolDenied(reason: "\(tool) has no Swift local connector implementation")
         }
-        // Repo-relative paths and absolute paths have intentionally different
-        // trust resolution. Continue with the spelling that passed the gate;
+        // Workspace-relative and absolute paths have different trust
+        // resolution. Continue with the spelling that passed the gate;
         // the connector snapshot remains bound to the resolved directory.
         if case .object(var object) = result, case .object(var next)? = object["next"] {
             next["path"] = .string(path)
@@ -124,7 +125,7 @@ extension SwiftToolDispatcher {
         do {
             let result = try await FileReadSourceMaterial.$metadataOnly.withValue(true) {
                 if tool == "read_file" { return try await self.impl_read_file(input: input, surface: surface) }
-                if await self.fullMacToolAccess(surface: surface).fileOpsAllowed || tool == "file_excerpt" {
+                if try await self.fullMacToolAccess(surface: surface).fileOpsAllowed || tool == "file_excerpt" {
                     return try await self.impl_local_connector_tool(tool: tool, input: input, surface: surface)
                 }
                 return try await self.impl_file_metadata(tool: tool, input: input)
@@ -139,10 +140,10 @@ extension SwiftToolDispatcher {
     func impl_trusted_file_mutation(tool: String, input: [String: JSONValue], attachment: (filename: String, data: Data)? = nil) async throws -> JSONValue {
         let path = try requireString(input, "path")
         if tool == "write_file" { _ = try requireString(input, "content") }
-        let roots = await trustedWorkspaceRoots()
-        let url = try await resolveTrustedFilePath(path, includeRepoSandbox: false, trustedRoots: roots)
+        let roots = try await trustedWorkspaceRoots()
+        let url = try await resolveTrustedFilePath(path, write: true, trustedRoots: roots)
         if ["move_file", "copy_file"].contains(tool) {
-            _ = try await resolveTrustedFilePath(requireString(input, "destination"), includeRepoSandbox: false, trustedRoots: roots)
+            _ = try await resolveTrustedFilePath(requireString(input, "destination"), write: true, trustedRoots: roots)
         }
         let ctx = ConnectorActionContext(
             repoRoot: nil,

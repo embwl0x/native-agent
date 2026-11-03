@@ -6,7 +6,7 @@ import PersistenceCore
 
 extension SwiftNativeTrustCenter {
     /// Default trust policy for the Swift runtime. Saved policy values are
-    /// merged over this shape by `loadTrustPolicy()`.
+    /// merged over this shape by `loadTrustPolicyChecked()`.
     public nonisolated func defaultTrustPolicy() -> [String: JSONValue] {
         var policy: [String: JSONValue] = [:]
         policy["permissionLevel"] = .string("balanced")
@@ -20,7 +20,7 @@ extension SwiftNativeTrustCenter {
         // Read-time default when absent on disk; patching does not stamp edits.
         policy["updatedAt"] = .string(Self.isoTimestamp(clock()))
         policy["appDataRoot"] = .string(dataRoot.path)
-        // Readers accept both Workshop spellings; writers retain missionPolicy.
+        // The Mac and phone share the current workshopPolicy key.
         policy[WorkshopPolicyBlockVocabulary.wireKey] = .object([
             "enabled": .bool(true),
         ])

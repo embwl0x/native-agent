@@ -64,7 +64,7 @@ enum CognitiveAssociationGraphPresentation {
     }
 
     private static func nodeSnippet(_ summary: String?) -> String {
-        guard let summary else { return "(forgotten)" }
+        guard let summary else { return "(endpoint unavailable)" }
         return summary.count > 44 ? String(summary.prefix(44)) + "…" : summary
     }
 }

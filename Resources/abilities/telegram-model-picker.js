@@ -7,13 +7,11 @@ function run(input) {
     const menu = input.menu;
     const normalized = raw => {
         const text = raw.trim().toLowerCase();
-        if (["xai","xai_oauth_direct","xai-oauth","grok-oauth","x-ai-oauth","xai-grok-oauth"].includes(text)) return "xai_oauth_direct";
-        if (["moonshot","kimi"].includes(text)) return "moonshot";
         return text;
     };
     const matches = (a,b) => a.trim().toLowerCase() === b.trim().toLowerCase();
     const label = (id,name) => name && name.trim() && name.trim() !== id.trim() ? name.trim() + " [" + id.trim() + "]" : input.op === "command" ? id : id.trim();
-    const all = menu ? menu.providers.flatMap(p => p.models.map(m => ({providerId:p.id,providerDisplayName:p.displayName,modelId:m.id,modelName:m.name,markedCurrent:m.isCurrent,isCurrent:m.isCurrent || m.id === menu.currentModel && normalized(p.id) === normalized(menu.currentProvider)}))) : [];
+    const all = menu ? menu.providers.flatMap(p => p.models.map(m => ({providerId:p.id,providerDisplayName:p.displayName,modelId:m.id,modelName:m.name,markedCurrent:m.isCurrent,isCurrent:m.isCurrent}))) : [];
     const choices = [];
     const seen = new Set();
     for (const m of all) {
@@ -23,7 +21,7 @@ function run(input) {
     const providerName = () => {
         const family = raw => {
             const text = normalized(raw);
-            if (["anthropic","anthropic_oauth_direct","anthropic_mcp"].includes(text)) return "anthropic";
+            if (["anthropic","anthropic_oauth_direct"].includes(text)) return "anthropic";
             if (["openai","openai_oauth_direct"].includes(text)) return "openai";
             return text;
         };

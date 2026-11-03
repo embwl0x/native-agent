@@ -14,7 +14,7 @@ import Dispatcher
 import MacControl
 import MacIntegration
 import ToolRegistry
-// Blueprint: | `SwiftToolDispatcher+BuilderConversation.swift` | `SwiftToolDispatcher`: builder conversation handles, topic spelling and inbox/wake/receipt projections |
+// Blueprint: | `SwiftToolDispatcher+BuilderConversation.swift` | Builder conversation handles, topic spelling and inbox/wake/receipt projections; explicit new/resume mode is required before selection |
 
 extension SwiftToolDispatcher {
     /// Handles reference CLI-owned state: Codex threads and Claude/OMP topic pointers.
@@ -148,22 +148,9 @@ extension SwiftToolDispatcher {
         topic: String?,
         messageId: String
     ) -> Result<BuilderConversationSelection, BuilderConversationReferenceError> {
-        let requestedMode: BuilderConversationMode?
-        if let rawMode = input["conversation_mode"], rawMode != .null {
-            guard case .string(let raw) = rawMode else {
-                return .failure(.invalidMode)
-            }
-            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if normalized.isEmpty {
-                requestedMode = nil
-            } else {
-                guard let mode = BuilderConversationMode(rawValue: normalized) else {
-                    return .failure(.invalidMode)
-                }
-                requestedMode = mode
-            }
-        } else {
-            requestedMode = nil
+        guard case .string(let rawMode)? = input["conversation_mode"],
+              let requestedMode = BuilderConversationMode(rawValue: rawMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
+            return .failure(.invalidMode)
         }
 
         let suppliedReference: String?

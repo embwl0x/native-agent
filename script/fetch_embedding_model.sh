@@ -8,16 +8,22 @@
 #      NATIVEAGENT_EMBEDDING_MODEL_TAG (default embedding-model-bge-large-en-v1.5).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/script/lib/embedding_model_contract.sh"
 DEST="${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}"
 TAG="${NATIVEAGENT_EMBEDDING_MODEL_TAG:-embedding-model-bge-large-en-v1.5}"
-# The public repository hosts the asset for anonymous downloads; the private
-# development repository carries the same release for the maintainers' builds.
-PUBLIC_REPO="${NATIVEAGENT_EMBEDDING_MODEL_REPO:-embwl0x/native-agent}"
-PRIVATE_REPO="embwl0x/NativeAgent"
+# Select one repository and one authentication method before any request.
+REPO="${NATIVEAGENT_EMBEDDING_MODEL_REPO:-embwl0x/native-agent}"
+AUTH="${NATIVEAGENT_EMBEDDING_FETCH_AUTH:-anonymous}"
+case "$AUTH" in
+  anonymous) ;;
+  github-cli) command -v gh >/dev/null || { echo '[embedding] github-cli authentication requires gh; install it and run gh auth login' >&2; exit 1; } ;;
+  *) echo '[embedding] NATIVEAGENT_EMBEDDING_FETCH_AUTH must be anonymous or github-cli' >&2; exit 2 ;;
+esac
 ASSET="bge-large-en-v1.5-coreml.zip"
-BASE_URL="https://github.com/$PUBLIC_REPO/releases/download/$TAG"
+BASE_URL="https://github.com/$REPO/releases/download/$TAG"
 
-if [[ -f "$DEST/embedding.json" && -d "$DEST/embedding.mlpackage" && -f "$DEST/vocab.txt" ]]; then
+if [[ -e "$DEST" || -L "$DEST" ]]; then
+  nativeagent_require_embedding_model "$DEST"
   echo "[embedding] already present at $DEST"
   exit 0
 fi
@@ -37,8 +43,8 @@ fetch_small() { curl -fsL --http1.1 --connect-timeout 15 --max-time 60 --retry 8
 fetch_parallel() { # $1 = url, $2 = destination
   local url="$1" dest="$2" final size chunk i start end n=0
   local pids=()
-  final="$(curl -sIL --http1.1 --connect-timeout 15 --max-time 60 -o /dev/null -w '%{url_effective}' "$url")" || return 1
-  size="$(curl -sI --http1.1 --connect-timeout 15 --max-time 60 "$final" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}' | tail -1)" || return 1
+  final="$(curl -fsSIL --http1.1 --connect-timeout 15 --max-time 60 -o /dev/null -w '%{url_effective}' "$url")" || return 1
+  size="$(curl -fsSI --http1.1 --connect-timeout 15 --max-time 60 "$final" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}' | tail -1)" || return 1
   [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 ]] || { echo "[embedding] could not read the asset size" >&2; return 1; }
   chunk=$(( (size + PARTS - 1) / PARTS ))
   mkdir -p "$dest.parts"
@@ -48,7 +54,7 @@ fetch_parallel() { # $1 = url, $2 = destination
     (
       part="$dest.parts/$i"; want=$(( end - start + 1 ))
       for attempt in 1 2 3 4 5 6; do
-        have=0; [[ -f "$part" ]] && have="$(stat -f %z "$part" 2>/dev/null || stat -c %s "$part")"
+        have=0; [[ -f "$part" ]] && have="$(stat -f %z "$part")"
         (( have == want )) && exit 0
         (( have > want )) && rm -f "$part" && have=0
         curl -fsL --http1.1 --connect-timeout 15 --speed-limit 1024 --speed-time 60 --retry 3 --retry-delay 2 --retry-all-errors \
@@ -56,7 +62,7 @@ fetch_parallel() { # $1 = url, $2 = destination
           -r "$(( start + have ))-$end" -o "$part.tmp" "$final" && cat "$part.tmp" >> "$part" && rm -f "$part.tmp" && continue
         sleep $(( attempt * 3 ))
       done
-      have=0; [[ -f "$part" ]] && have="$(stat -f %z "$part" 2>/dev/null || stat -c %s "$part")"
+      have=0; [[ -f "$part" ]] && have="$(stat -f %z "$part")"
       (( have == want ))
     ) &
     pids[n]=$!; n=$(( n + 1 ))
@@ -68,7 +74,7 @@ fetch_parallel() { # $1 = url, $2 = destination
   : > "$dest"
   for ((i = 0; i < PARTS; i++)); do [[ -f "$dest.parts/$i" ]] && cat "$dest.parts/$i" >> "$dest"; done
   rm -rf "$dest.parts"
-  local got; got="$(stat -f %z "$dest" 2>/dev/null || stat -c %s "$dest")"
+  local got; got="$(stat -f %z "$dest")"
   (( got == size )) || { echo "[embedding] joined size $got != $size" >&2; return 1; }
 }
 fetch_authenticated() {
@@ -102,10 +108,6 @@ fetch_authenticated() {
   IFS=$'\t' read -r asset_url digest <<<"$metadata"
   [[ "$asset_url" == "https://api.github.com/repos/$repo/releases/assets/"* && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
   printf '%s  %s\n' "${digest#sha256:}" "$ASSET" > "$WORK/$ASSET.sha256"
-  # A failed checksum request must not throw away a completed model archive.
-  if [[ -f "$WORK/$ASSET" ]] && (cd "$WORK" && shasum -a 256 -c "$ASSET.sha256" >/dev/null 2>&1); then
-    return 0
-  fi
   token="$(gh auth token)" || return $?
   # Request only redirect headers; never let gh stream the model payload.
   # Keep the credential out of curl's argv and do not forward it to the CDN.
@@ -114,26 +116,24 @@ fetch_authenticated() {
       -H 'Accept: application/octet-stream' "$asset_url" | \
     tr -d '\r' | awk 'tolower($1)=="location:" {print $2}')" || return $?
   [[ "$signed_url" == https://release-assets.githubusercontent.com/* ]] || return 1
-  # Resume the public asset's existing parts. A different repository may
-  # contain different bytes, so isolate its parts until checksum verification.
   archive="$WORK/$ASSET"
-  [[ "$repo" == "$PUBLIC_REPO" ]] || archive="$WORK/auth-${repo##*/}.zip"
   fetch_parallel "$signed_url" "$archive" || return $?
-  [[ "$archive" == "$WORK/$ASSET" ]] || mv "$archive" "$WORK/$ASSET" || return $?
-  (cd "$WORK" && shasum -a 256 -c "$ASSET.sha256")
 }
-archive_ok=0
-checksum_ok=0
-fetch_parallel "$BASE_URL/$ASSET" "$WORK/$ASSET" && archive_ok=1
-fetch_small "$BASE_URL/$ASSET.sha256" "$WORK/$ASSET.sha256" && checksum_ok=1
-if [[ "$archive_ok" != 1 || "$checksum_ok" != 1 ]]; then
-  command -v gh >/dev/null || { echo "[embedding] download failed and gh is not installed" >&2; exit 1; }
-  fetch_authenticated "$PUBLIC_REPO" || fetch_authenticated "$PRIVATE_REPO"
-fi
+case "$AUTH" in
+  anonymous)
+    fetch_small "$BASE_URL/$ASSET.sha256" "$WORK/$ASSET.sha256"
+    fetch_parallel "$BASE_URL/$ASSET" "$WORK/$ASSET"
+    ;;
+  github-cli) fetch_authenticated "$REPO" ;;
+esac
+# A checksum document must describe exactly this asset, never another path.
+awk -v asset="$ASSET" 'NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ || $2 != asset {exit 1} END {if (NR != 1) exit 1}' "$WORK/$ASSET.sha256" \
+  || { echo '[embedding] invalid SHA-256 document for the selected asset' >&2; exit 1; }
 ( cd "$WORK" && shasum -a 256 -c "$ASSET.sha256" )
 mkdir -p "$(dirname "$DEST")"
 rm -rf "$WORK/unpacked" && mkdir -p "$WORK/unpacked"
 unzip -q "$WORK/$ASSET" -d "$WORK/unpacked"
-rm -rf "$DEST"
+nativeagent_require_embedding_model "$WORK/unpacked/embedding"
+[[ ! -e "$DEST" && ! -L "$DEST" ]] || { echo "[embedding] destination appeared during download; preserved at $DEST" >&2; exit 1; }
 mv "$WORK/unpacked/embedding" "$DEST"
 echo "[embedding] installed $(du -sh "$DEST" | cut -f1) at $DEST"

@@ -12,7 +12,7 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import AppToolRuntime
-// Blueprint: | `SimpleSidebar.swift` | Shared contact/helper/crew sidebar and Simple settings menu retain engine projections and native navigation |
+// Blueprint: | `SimpleSidebar.swift` | Shared contact/helper/crew sidebar and Simple settings menu retain engine projections and native navigation; unavailable crew receipts name the evidence gap without inventing worker counts |
 
 /// Settings shares update, colour, warmth and view-mode preferences with Advanced.
 private struct SimpleSettingsMenuItems: View {
@@ -30,6 +30,9 @@ private struct SimpleSettingsMenuItems: View {
             Divider()
         }
         Picker(selection: $hazeRaw) {
+            if HazeColor(stored: hazeRaw) == .unavailable {
+                Text("Unsupported saved color — choose a color").tag(hazeRaw).disabled(true)
+            }
             ForEach(HazeColor.allCases) { color in
                 Label { Text(color.name) } icon: { Image(nsImage: Self.swatch(color)) }
                     .tag(color.rawValue)
@@ -89,6 +92,8 @@ struct SimpleSidebar: View {
         // Native selection, keys and folds; the home card uses its own quiet wash.
         List(selection: Binding<SimpleShellView.Pane?>(get: { pane == .agent && !embedded ? nil : pane },
                                                        set: { if let next = $0 { pane = next } })) {
+            ConversationReadNotice(detail: appModel.engine.transcripts.navigationReadIssue)
+                .selectionDisabled()
             if embedded {
                 row(.agent) {
                     HStack(spacing: 10) {
@@ -106,9 +111,11 @@ struct SimpleSidebar: View {
                 .padding(.bottom, Self.sectionGap)
             }
             // Her home's people and helpers, in its order: the two sections.
-            ForEach(appModel.engine.layout.layout.shown("home", profile: layoutProfile).filter { ["people", "helpers"].contains($0.name) },
-                    id: \.name) { block in
-                if block.name == "people" { agentsSection(talked: talked, unheard: unheard) } else { helpersSection }
+            SurfaceLayoutContent(appModel.engine.layout.availability) { layout in
+            ForEach(layout.contentNames("home", profile: layoutProfile).filter { ["people", "helpers"].contains($0) },
+                    id: \.self) { block in
+                if block == "people" { agentsSection(talked: talked, unheard: unheard) } else { helpersSection }
+            }
             }
         }
         .listStyle(.sidebar)
@@ -248,8 +255,10 @@ struct SimpleSidebar: View {
     /// went once it has finished.
     private func crewRow(_ crew: SimpleCrew) -> some View {
         let selected = pane == .crew(crew.id)
-        let workers = crew.workers.count == 1 ? "1 worker" : "\(crew.workers.count) workers"
-        let name = crew.liveness == .unknown ? "Liveness unknown" : crew.live ? "Working now" : crew.task
+        let workers = crew.receiptUnavailable != nil ? "worker count unavailable"
+            : crew.workers.count == 1 ? "1 worker" : "\(crew.workers.count) workers"
+        let name = crew.receiptUnavailable != nil ? "Receipt unavailable"
+            : crew.liveness == .unknown ? "Liveness unknown" : crew.live ? "Working now" : crew.task
         let line = crew.liveness != .settled ? "\(crew.task) · \(workers)" : "\(SimpleCrewThread.outcome(crew)) · \(workers)"
         return row(.crew(crew.id)) {
             HStack(spacing: 10) {
@@ -318,7 +327,9 @@ struct SimpleSidebar: View {
         // probe's output reads like a status and is not one. The words are in the thread.
         let ago = RelativeDateTimeFormatter()
         ago.unitsStyle = .short
-        let when = (last.fromAgent ? "sent " : "replied ") + ago.localizedString(for: last.at, relativeTo: max(Date(), last.at))
+        // A line whose time is unreadable still says what moved, without inventing when.
+        let when = (last.fromAgent ? "sent" : "replied")
+            + (last.at.map { " " + ago.localizedString(for: $0, relativeTo: max(Date(), $0)) } ?? "")
         return word.map { "\($0) · \(when)" } ?? when.prefix(1).uppercased() + when.dropFirst()
     }
 

@@ -12,6 +12,7 @@ extension ContextPreparation {
     func feedbackSnapshot(
         for generation: ContextStoredGeneration
     ) throws -> ContextFeedbackSnapshot {
+        if let feedbackRestoreFailure { throw ContextFlowStoreError.malformedStoredValue(feedbackRestoreFailure) }
         let bucket = try Self.feedbackTimeBucket()
         if let cachedFeedback, cachedFeedback.generationID == generation.generation.id,
            cachedFeedback.feedbackOrdinal == feedbackOrdinal,
@@ -47,28 +48,30 @@ extension ContextPreparation {
         do {
             let snapshot = try feedbackReducer.rebuild(seeds: seeds, events: applicable, through: bucket)
             cachedFeedback = (generation.generation.id, feedbackOrdinal, bucket, snapshot)
-            publishedFeedback = snapshot
             return snapshot
         } catch {
-            // The published feedback stands and the failed update is the
-            // receipt; nothing is rebuilt without the retained events, and
-            // nothing is cached, so the next turn tries the update again.
-            lastError = "a context feedback update could not be applied; the last published feedback stands: \(error)"
+            lastError = "Context feedback could not be reduced; repair its saved events before preparing another turn: \(error)"
             diagnostics("[context-flow] \(lastError ?? "")")
-            return publishedFeedback ?? ContextFeedbackSnapshot(states: [])
+            throw error
         }
     }
 
     /// Rest needs proof that this delivery is in this conversation's retained
-    /// words. Older events still train global reachability, never local rest.
-    func servedTurnsAgo(sessionID: String?, recentTurns: [String]) -> [ContextAtomID: Int] {
+    /// exchanges. Older events still train global reachability, never local rest.
+    func servedTurnsAgo(sessionID: String?, recentExchanges: [[String]]) -> [ContextAtomID: Int] {
         guard let sessionID else { return [:] }
-        let fingerprints = Set(recentTurns.map { ContextStableID.digest(parts: [$0]) })
+        var distances: [String: Int] = [:]
+        for (distance, words) in recentExchanges.reversed().enumerated() {
+            for text in words {
+                let fingerprint = ContextStableID.digest(parts: [text])
+                if distances[fingerprint] == nil { distances[fingerprint] = distance }
+            }
+        }
         var result: [ContextAtomID: Int] = [:]
         let deliveries = feedbackEvents.reversed().filter { $0.signal == .selection && $0.sessionID == sessionID }
-        for (distance, event) in deliveries.enumerated() {
-            guard let fingerprint = event.historyMessageFingerprint, fingerprints.contains(fingerprint) else { continue }
-            for id in event.atomIDs where result[id] == nil { result[id] = distance }
+        for event in deliveries {
+            guard let fingerprint = event.historyMessageFingerprint, let distance = distances[fingerprint] else { continue }
+            for id in event.atomIDs { result[id] = min(result[id] ?? distance, distance) }
         }
         return result
     }
@@ -118,6 +121,7 @@ extension ContextPreparation {
     func restoreFeedbackEvents() async {
         let lifecycleID = self.lifecycleID
         cachedFeedback = nil
+        feedbackRestoreFailure = "Context feedback restoration is in progress."
         do {
             let restored = try await store.recentFeedbackEvents(limit: 4_096)
             guard isCurrent(lifecycleID) else { return }
@@ -128,9 +132,11 @@ extension ContextPreparation {
             feedbackEvents = restored
             feedbackOrdinal = ordinal
             cachedFeedback = nil
+            feedbackRestoreFailure = nil
         } catch {
             guard isCurrent(lifecycleID) else { return }
             lastError = "context feedback restore failed: \(error)"
+            feedbackRestoreFailure = lastError
             diagnostics("[context-flow] \(lastError ?? "context feedback restore failed")")
         }
     }

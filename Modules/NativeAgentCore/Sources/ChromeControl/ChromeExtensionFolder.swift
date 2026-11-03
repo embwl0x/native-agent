@@ -74,17 +74,18 @@ public enum ChromeExtensionFolder {
                 personDecides: remedy["kind"] == .string("person_decides"))
         }
         await chrome.reconcilePolicy()
-        let status = await chrome.setupConnectionStatus()
+        var status = await chrome.setupConnectionStatus()
         try require(.init(ok: status.enabled, text: "Chrome control is off or unavailable in Trust.",
             detail: ["remedy": status.diagnostics["remedy"] ?? .null, "effects": .string("none")]))
         let folder = try prepare()
+        // Copying can replace same-version bytes. Observe after that write.
+        status = await chrome.setupConnectionStatus(fresh: true)
         if status.state == .connected, status.diagnostics["extension_path"] == .string(folder.path),
-           let shipped = status.diagnostics["extension_shipped_version"],
-           shipped == status.diagnostics["extension_running_version"] { return folder }
+           status.diagnostics["extension_code_matches_folder"] == .bool(true) { return folder }
         let current = MacDriverContext.binding
         let driver: MacDriverBinding
         if let current { driver = current }
-        else { driver = await MacAttentionSessionStore.shared.bindDriver() }
+        else { driver = try await MacAttentionSessionStore.shared.bindDriver() }
         return try await MacDriverContext.$binding.withValue(driver) {
             defer { if current == nil { driver.cancel() } }
             let hands = MacFourVerbs(host: makeMacControl(

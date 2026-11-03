@@ -184,6 +184,7 @@ extension QuietComposerCommands {
                 return .refuse("Desk item", "desk_unreadable", "The Desk could not be read (\(error.localizedDescription)), so nothing was opened. Try again.")
             }
         }
+        let leftOtherView = SimpleViewMode.current != SimpleViewMode.advanced
         guard coordinator.deliverQuietly(destination) else {
             return .refuse(
                 "rail", "no_mounted_window",
@@ -193,15 +194,13 @@ extension QuietComposerCommands {
         }
         if let tab { UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(shown)) }
         if !handle.isEmpty { appModel.pendingDeskHandle = handle }
-        let leftSimple = SimpleViewMode.isShowing
-        if leftSimple { UserDefaults.standard.set(SimpleViewMode.advanced, forKey: SimpleViewMode.key) }
         guard coordinator.currentPage?.item == shown else {
             return .refuse("rail", "page_not_shown", "The window has not switched to \(title).", effects: .unknown)
         }
         return .done(
             "rail row \"\(title)\"",
             "The window is now showing \(title)" + (handle.isEmpty ? "" : ", opening Desk item \(handle)")
-                + (leftSimple ? ", in Advanced view (Simple view has no pages)." : ".")
+                + (leftOtherView ? ", in Advanced view." : ".")
         )
     }
 
@@ -285,6 +284,9 @@ extension AppModel: QuietComposerCommandPort {
             }
             body["context_used_tokens"] = .int(Int64(status.used_tokens))
             body["context_budget_tokens"] = .int(Int64(status.budget))
+            body["context_compact_at_percent"] = .string(ContextFillPresentation.compactionPercent(status))
+            body["context_compact_at_tokens"] = .int(Int64(status.auto_compact_threshold))
+            body["context_measurement_source"] = status.context_mode.map(JSONValue.string) ?? .null
         }
         return body
     }
@@ -302,7 +304,7 @@ extension QuietComposerCommands.Routing {
     var isBotConversation: Bool { botContract != nil }
     var providerGroups: [ChatComposerModelGroup] { residentPresentation?.providerGroups ?? [] }
     var efforts: [ReasoningEffortOption] { presentation?.efforts ?? [] }
-    var effortIndex: Int { efforts.firstIndex { $0.id == routeChoice?.reasoningEffort } ?? 0 }
+    var effortIndex: Int? { efforts.firstIndex { $0.id == routeChoice?.reasoningEffort } }
     var selectedModelSupportsFast: Bool { residentPresentation?.supportsFast == true }
 
 
@@ -321,6 +323,8 @@ extension QuietComposerCommands.Routing {
     var effortWord: String {
         guard presentation != nil else { return "Reading thinking…" }
         if isBotConversation, routeChoice?.reasoningEffort == nil { return "Bot thinking" }
+        if presentation?.selectedModel?.supportedReasoningEfforts == [] { return "Thinking not configurable" }
+        guard !efforts.isEmpty else { return "Thinking unavailable" }
         return effortLabel(routeChoice?.reasoningEffort ?? "")
     }
 
@@ -347,11 +351,12 @@ extension QuietComposerCommands.Routing {
             return Task { "This conversation's model controls are unavailable. Open Providers or Helpers." }
         }
         guard !appModel.isSavingChatBrain else { return nil }
+        guard model.supportedReasoningEfforts != nil else {
+            return Task { "This model's thinking choices are unavailable. Reload Providers before choosing it." }
+        }
         let choice = ProviderTurnChoice(
             provider: provider, model: model.id,
-            reasoningEffort: appModel.chatReasoningEffort, fast: appModel.chatFastMode,
-            supportedReasoningEfforts: model.supportedReasoningEfforts ?? ProvidersFacade.chatComposerFallbackEfforts,
-            defaultReasoningEffort: model.defaultReasoningEffort, supportsFast: model.supportsFast
+            reasoningEffort: appModel.chatReasoningEffort, fast: appModel.chatFastMode
         )
 
         let generation = appModel.enqueueChatBrainDefaultsSave(choice)

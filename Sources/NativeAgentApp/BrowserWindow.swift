@@ -4,12 +4,12 @@ import WebKit
 import Network
 import AppKit
 import PersistenceCore
-import ApprovalInbox
 import AppToolRuntime
 import Browser
 import Dispatcher
 import NativeAgentCore
-// Blueprint: | `BrowserWindow.swift` | MainActor-owned `BrowserNavDelegate` and `BrowserCallbackWait`; `BrowserActionRoutes.app` over the visible window's route effects; callbacks or cancellation settle once; physical exclusion remains until late WebKit callbacks exit |
+import NativeAgentShared
+// Blueprint: | `BrowserWindow.swift` | MainActor BrowserNavDelegate and one native bounded callback owner for navigation/snapshot/JS/DOM; cancellation/deadline/renderer exit retire the exact view with unknown outcome, late callbacks cannot settle twice or release a newer owner; BrowserActionRoutes.app supplies visible effects |
 
 // MARK: - Models
 
@@ -19,10 +19,11 @@ typealias BrowserLink = EngineRuntime.BrowserLink
 
 @MainActor
 final class BrowserNavDelegate: NSObject, WKNavigationDelegate {
-    // Continuation is set before navigation begins and consumed on load/fail.
+    // Completion is set before navigation begins and consumed on load/fail.
     var onFinish: ((Result<BrowserNavigationResult, Error>) -> Void)?
     /// Only this navigation may settle `onFinish`, never the implicit about:blank load.
     var expectedNavigation: WKNavigation?
+    var onContentProcessTerminated: ((WKWebView) -> Void)?
     // Real status captured from the main-frame navigation response. nil when no
     // HTTP response was seen — didFinish must NOT fabricate a 200 (404/500 pages
     // load "successfully" and would persist receipts claiming success).
@@ -32,6 +33,7 @@ final class BrowserNavDelegate: NSObject, WKNavigationDelegate {
     var rejectedScheme: String?
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        guard navigation === expectedNavigation else { return }
         // Reset per navigation so a prior page's status can't leak into a
         // navigation that never produces an HTTP response.
         lastHTTPStatus = nil
@@ -113,20 +115,26 @@ final class BrowserNavDelegate: NSObject, WKNavigationDelegate {
         guard navigation === expectedNavigation else { return }
         finishFailure(error)
     }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        onContentProcessTerminated?(webView)
+    }
 }
 
 // MARK: - BrowserWindowController
 
 /// Callback and cancellation settle on the window's actor. Late WebKit replies
-/// cannot resume a retired wait. Physical exclusion lasts until WebKit exits.
+/// cannot resume a retired wait. Interrupted views are retired rather than
+/// allowing another operation onto a renderer whose work is still unknown.
 @MainActor
 private final class BrowserCallbackWait<Value: Sendable> {
-    var continuation: CheckedContinuation<Value, Error>?
+    let done = ScopedWaiter()
+    var result: Result<Value, Error>?
 
     func finish(_ result: Result<Value, Error>) {
-        guard let continuation else { return }
-        self.continuation = nil
-        continuation.resume(with: result)
+        guard self.result == nil else { return }
+        self.result = result
+        done.resume()
     }
 }
 
@@ -134,9 +142,7 @@ private final class BrowserCallbackWait<Value: Sendable> {
 final class BrowserWindowController: NSObject, ObservableObject {
     static let shared = BrowserWindowController()
 
-    /// The production controller uses the canonical data root.  Tests may give
-    /// the real loopback listener a disposable root so its discovery token can
-    /// be exercised without ever touching a resident app's IPC files.
+    /// The production controller uses the canonical data root.
     init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         self.dataRoot = dataRoot
         super.init()
@@ -144,16 +150,16 @@ final class BrowserWindowController: NSObject, ObservableObject {
 
     private var window: NSWindow?
     private var webView: WKWebView?
-    private let navDelegate = BrowserNavDelegate()
+    private var navDelegate = BrowserNavDelegate()
     fileprivate var navigationInProgress: Bool { navDelegate.onFinish != nil }
     private var activeNavigationID: String?
     private var browserOwnerID: String?
-    private var pendingWebKitCallbacks = 0
+    private var pendingWebKitWait: (id: UUID, interrupt: @MainActor (Error) -> Void)?
 
     private let ipcTransport = NativeLoopbackListener(port: InstallPaths.current.loopbackPorts().browserIPC, label: "BrowserIPC")
     private lazy var ipcServer = BrowserIPCServer(dataRoot: dataRoot, transport: ipcTransport, effects: AppBrowserRouteEffects())
     private let dataRoot: URL
-    nonisolated var ipcListenerHealth: NativeLoopbackListener.Health { ipcTransport.health }
+    var ipcListenerSnapshot: (failure: String?, boundPort: UInt16?, isActive: Bool, port: UInt16) { ipcServer.listenerSnapshot }
     var ipcPort: UInt16 { ipcServer.ipcPort }
     func startIPCServer() { ipcServer.start() }
     func stopIPCServer() { ipcServer.stop() }
@@ -161,7 +167,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
     // MARK: - Window lifecycle
 
     func ensureWindow() {
-        guard window == nil else { return }
+        guard webView == nil else { return }
 
         let config = WKWebViewConfiguration()
         // Browser routes enforce http/https before navigation and read/screenshot
@@ -173,6 +179,16 @@ final class BrowserWindowController: NSObject, ObservableObject {
         wv.customUserAgent = "NativeAgent/1.0 WKWebView"
         wv.navigationDelegate = navDelegate
         self.webView = wv
+        navDelegate.onContentProcessTerminated = { [weak self] view in
+            guard let self, self.webView === view else { return }
+            if let pending = self.pendingWebKitWait { pending.interrupt(BrowserError.contentProcessTerminated) }
+            else { self.retireWebView(view) }
+        }
+
+        if let window {
+            window.contentView = wv
+            return
+        }
 
         let win = NSWindow(
             contentRect: NSRect(x: 100, y: 100, width: 1024, height: 768),
@@ -193,7 +209,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
         ensureWindow()
         guard let window else { return }
         NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         if window.isMiniaturized {
             window.deminiaturize(nil)
         }
@@ -214,12 +230,73 @@ final class BrowserWindowController: NSObject, ObservableObject {
 
     func acquireBrowser(runID: String) throws {
         guard browserOwnerID == nil, navDelegate.onFinish == nil,
-              pendingWebKitCallbacks == 0 else { throw BrowserError.busy }
+              pendingWebKitWait == nil else { throw BrowserError.busy }
         browserOwnerID = runID
     }
 
     func releaseBrowser(runID: String) {
         if browserOwnerID == runID { browserOwnerID = nil }
+    }
+
+    /// One native deadline owns each WebKit wait, including a renderer that
+    /// never calls back. Ending the wait never claims a dispatched write was
+    /// stopped. Its exact view is discarded; there is no automatic replay.
+    /// Only a later explicit navigation can establish a new page.
+    private func withWebKitCallback<Value: Sendable>(
+        in view: WKWebView, timeout: Duration = .seconds(10),
+        start: (@escaping @MainActor (Result<Value, Error>) -> Void) -> Void
+    ) async throws -> Value {
+        try Task.checkCancellation()
+        if TaskWaitDeadline.expired { throw TaskWaitDeadline.Exceeded() }
+        guard pendingWebKitWait == nil, webView === view else { throw BrowserError.busy }
+        let id = UUID()
+        let wait = BrowserCallbackWait<Value>()
+        let finish: @MainActor (Result<Value, Error>) -> Void = { [weak self] result in
+            guard wait.result == nil else { return }
+            if self?.pendingWebKitWait?.id == id { self?.pendingWebKitWait = nil }
+            wait.finish(result)
+        }
+        let interrupt: @MainActor (Error) -> Void = { [weak self, weak view] error in
+            guard wait.result == nil else { return }
+            if let view { self?.retireWebView(view) }
+            finish(.failure(error))
+        }
+        pendingWebKitWait = (id, interrupt)
+        let deadline = Task { @MainActor in
+            do { try await Task.sleep(for: timeout) } catch { return }
+            interrupt(BrowserError.timeout)
+        }
+        defer { deadline.cancel() }
+        return try await withTaskCancellationHandler {
+            start(finish)
+            let done = wait.done
+            await Task { await done.park() }.value
+            // ScopedWaiter may wake at the inherited call ceiling before
+            // WebKit produces evidence. Wakeup alone is never a result.
+            if wait.result == nil {
+                interrupt(TaskWaitDeadline.expired ? BrowserError.timeout : BrowserError.outcomeUnknown)
+            }
+            guard let result = wait.result else { throw BrowserError.outcomeUnknown }
+            return try result.get()
+        } onCancel: {
+            Task { @MainActor in interrupt(BrowserError.outcomeUnknown) }
+        }
+    }
+
+    private func retireWebView(_ view: WKWebView) {
+        guard webView === view else { return }
+        navDelegate.onFinish = nil
+        navDelegate.expectedNavigation = nil
+        navDelegate.rejectedScheme = nil
+        navDelegate.onContentProcessTerminated = nil
+        activeNavigationID = nil
+        view.navigationDelegate = nil
+        view.stopLoading()
+        window?.contentView = nil
+        webView = nil
+        // An already-enqueued callback still belongs to the retired delegate,
+        // never the next view's navigation or content-process observer.
+        navDelegate = BrowserNavDelegate()
     }
 
     func navigate(_ url: URL, runID: String, ownerID: String) async throws -> BrowserNavigationResult {
@@ -231,38 +308,17 @@ final class BrowserWindowController: NSObject, ObservableObject {
             throw BrowserError.busy
         }
 
-        return try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            return try await withCheckedThrowingContinuation { cont in
-                activeNavigationID = runID
-                let timeoutTask = Task { @MainActor [weak self] in
-                    do {
-                        try await Task.sleep(for: .seconds(30))
-                    } catch {
-                        return
-                    }
-                    guard !Task.isCancelled else { return }
-                    _ = self?.cancelNavigation(runID: runID, error: BrowserError.timeout)
-                }
-                navDelegate.rejectedScheme = nil
-                navDelegate.onFinish = { [weak self] result in
-                    timeoutTask.cancel()
-                    self?.activeNavigationID = nil
-                    cont.resume(with: result)
-                }
-                guard let navigation = webView.load(URLRequest(url: url)) else {
-                    timeoutTask.cancel()
-                    navDelegate.onFinish = nil
-                    activeNavigationID = nil
-                    cont.resume(throwing: BrowserError.notReady)
-                    return
-                }
-                navDelegate.expectedNavigation = navigation
+        activeNavigationID = runID
+        defer { activeNavigationID = nil }
+        return try await withWebKitCallback(in: webView, timeout: .seconds(30)) { finish in
+            navDelegate.rejectedScheme = nil
+            navDelegate.onFinish = finish
+            guard let navigation = webView.load(URLRequest(url: url)) else {
+                navDelegate.onFinish = nil
+                finish(.failure(BrowserError.notReady))
+                return
             }
-        } onCancel: { [weak self] in
-            Task { @MainActor in
-                _ = self?.cancelNavigation(runID: runID, error: BrowserError.outcomeUnknown)
-            }
+            navDelegate.expectedNavigation = navigation
         }
     }
 
@@ -274,44 +330,29 @@ final class BrowserWindowController: NSObject, ObservableObject {
     func cancelNavigation(runID: String?, error: Error = CancellationError()) -> Bool {
         guard let activeNavigationID,
               runID == nil || runID?.isEmpty == true || runID == activeNavigationID,
-              let finish = navDelegate.onFinish else { return false }
-        navDelegate.onFinish = nil
-        navDelegate.expectedNavigation = nil
-        self.activeNavigationID = nil
-        webView?.stopLoading()
-        finish(.failure(error))
+              let pending = pendingWebKitWait else { return false }
+        pending.interrupt(error is CancellationError ? BrowserError.outcomeUnknown : error)
         return true
     }
 
     func screenshot() async throws -> Data {
-        ensureWindow()
         guard let webView else { throw BrowserError.notReady }
         let config = WKSnapshotConfiguration()
-        let wait = BrowserCallbackWait<Data>()
-        return try await withTaskCancellationHandler {
-          try Task.checkCancellation()
-          return try await withCheckedThrowingContinuation { cont in
-            wait.continuation = cont
-            pendingWebKitCallbacks += 1
+        return try await withWebKitCallback(in: webView) { finish in
             webView.takeSnapshot(with: config) { image, error in
-                self.pendingWebKitCallbacks -= 1
-                guard wait.continuation != nil else { return }
                 if let error {
-                    wait.finish(.failure(error))
+                    finish(.failure(error))
                     return
                 }
                 guard let image,
                       let tiff = image.tiffRepresentation,
                       let bitmapRep = NSBitmapImageRep(data: tiff),
                       let png = bitmapRep.representation(using: .png, properties: [:]) else {
-                    wait.finish(.failure(BrowserError.screenshotFailed))
+                    finish(.failure(BrowserError.screenshotFailed))
                     return
                 }
-                wait.finish(.success(png))
+                finish(.success(png))
             }
-          }
-        } onCancel: {
-            Task { @MainActor in wait.finish(.failure(CancellationError())) }
         }
     }
 
@@ -319,21 +360,11 @@ final class BrowserWindowController: NSObject, ObservableObject {
         guard let webView else { throw BrowserError.notReady }
         // Wrap the untyped result in a sendable box to satisfy Swift 6 strict concurrency.
         final class Box: @unchecked Sendable { let value: Any?; init(_ v: Any?) { value = v } }
-        let wait = BrowserCallbackWait<Box>()
-        let box: Box = try await withTaskCancellationHandler {
-          try Task.checkCancellation()
-          return try await withCheckedThrowingContinuation { cont in
-            wait.continuation = cont
-            pendingWebKitCallbacks += 1
+        let box: Box = try await withWebKitCallback(in: webView) { finish in
             webView.evaluateJavaScript(js) { result, error in
-                self.pendingWebKitCallbacks -= 1
-                if let error { wait.finish(.failure(error)) }
-                else { wait.finish(.success(Box(result))) }
+                if let error { finish(.failure(error)) }
+                else { finish(.success(Box(result))) }
             }
-          }
-        } onCancel: {
-            // WebKit provides no cancellation/proof of non-execution for JS.
-            Task { @MainActor in wait.finish(.failure(BrowserError.outcomeUnknown)) }
         }
         return box.value
     }
@@ -355,33 +386,15 @@ final class BrowserWindowController: NSObject, ObservableObject {
     }
 
     /// The DOM read owns its observer/deadline in an isolated content world.
-    /// Cancellation settles the caller now and asks that exact script to retire;
-    /// physical exclusion remains until both WebKit callbacks have returned.
+    /// The native owner bounds this wait even when the renderer cannot run the
+    /// DOM script's own timer. Interruption retires this view without dispatching
+    /// a second JavaScript callback into the blocked renderer.
     private func runDOMRead(_ script: String) async throws -> Any? {
         guard let webView else { throw BrowserError.notReady }
         final class Box: @unchecked Sendable { let value: Any?; init(_ value: Any?) { self.value = value } }
-        let id = UUID().uuidString
-        let wait = BrowserCallbackWait<Box>()
-        let box: Box = try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            return try await withCheckedThrowingContinuation { continuation in
-                wait.continuation = continuation
-                pendingWebKitCallbacks += 1
-                webView.callAsyncJavaScript(script, arguments: ["operationID": id], in: nil, in: .defaultClient) { result in
-                    self.pendingWebKitCallbacks -= 1
-                    wait.finish(result.map { Box($0) })
-                }
-            }
-        } onCancel: {
-            Task { @MainActor in
-                guard wait.continuation != nil else { return }
-                wait.finish(.failure(CancellationError()))
-                self.pendingWebKitCallbacks += 1
-                webView.callAsyncJavaScript("""
-                    if (globalThis.__nativeAgentDOMRead?.id === operationID) globalThis.__nativeAgentDOMRead.cancel();
-                    """, arguments: ["operationID": id], in: nil, in: .defaultClient) { _ in
-                    self.pendingWebKitCallbacks -= 1
-                }
+        let box: Box = try await withWebKitCallback(in: webView) { finish in
+            webView.callAsyncJavaScript(script, arguments: [:], in: nil, in: .defaultClient) { result in
+                finish(result.map { Box($0) })
             }
         }
         try Task.checkCancellation()
@@ -460,12 +473,6 @@ private struct AppBrowserRouteEffects: BrowserIPCWindowEffects {
 
     func observeMotorAction(_ model: MotorActionReadModel) async {
         await NativeAgentEngine.liveCognition.observeMotorActionState(model)
-    }
-
-    func annotateApprovalExecution(id: String, executedAction: JSONValue, detail: String, dataRoot: URL) async throws {
-        try await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-            id, executedAction: executedAction, detail: detail
-        )
     }
 
     func showProducedImage(at path: URL, name: String) -> (shown: Bool, note: String) {

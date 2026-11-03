@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentShared
 import TrustCenter
+import NativeAgentCore
 import MacControl
 // Blueprint: | `MacSyncActionRouter+TrustCommand.swift` | `MobileTrustAction`: checked trust writes |
 
@@ -31,8 +32,7 @@ extension MobileTrustAction {
             case .outsideDefault: body = ["filePolicy": ["outsideWorkspaceDefault": value]]
             case .developerMode:
                 body = TrustPolicyActions.developerModePatchBody(enabled: value == "true")
-            case .workshopEnabled: body = ["missionPolicy": ["enabled": value == "true"]]
-            case .autonomousTraining: throw MobileTrustActionError.trainingUnavailable
+            case .workshopEnabled: body = [WorkshopPolicyBlockVocabulary.wireKey: ["enabled": value == "true"]]
             case .dreamScheduler: body = ["trainingPolicy": ["dream_scheduler": value == "true"]]
             }
             saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
@@ -52,11 +52,9 @@ extension MobileTrustAction {
 
 private enum MobileTrustActionError: LocalizedError {
     case invalidRequest
-    case trainingUnavailable
     case outsideFullMac
     var errorDescription: String? {
         switch self {
-        case .trainingUnavailable: "Autonomous training is no longer available."
         case .invalidRequest: "Invalid or unconfirmed trust change."
         case .outsideFullMac: MobileTrustAction.outsideFullMacRefusal
         }

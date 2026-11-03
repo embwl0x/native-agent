@@ -79,15 +79,6 @@ extension CognitiveSubstrate {
         case .toolSucceeded:
             next.uncertainty = saturatingApproach(next.uncertainty, -0.15)
             next.taskPressure = saturatingApproach(next.taskPressure, -0.15)
-        case .workshopExecutionCompleted:
-            if event.isPositiveTerminalOutcome {
-                next.uncertainty = saturatingApproach(next.uncertainty, -0.15)
-                next.taskPressure = saturatingApproach(next.taskPressure, -0.15)
-            } else if event.isNegativeTerminalOutcome {
-                next.arousal = saturatingApproach(next.arousal, 0.25 + importance * 0.25)
-                next.uncertainty = saturatingApproach(next.uncertainty, 0.3 + importance * 0.2)
-                next.taskPressure = saturatingApproach(next.taskPressure, 0.2)
-            }
         case .userMessageReceived:
             next.arousal = saturatingApproach(next.arousal, 0.05 + importance * 0.07)
             // Affect-warmth is ADDITIVE to Agent's persona, which is already naturally warm

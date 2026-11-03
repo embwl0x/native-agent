@@ -5,9 +5,18 @@ import PersistenceCore
 import NativeAgentCore
 import TrustCenter
 import MacControl
-// Blueprint: | `ChromeControlRuntime+Reload.swift` | `ChromeControlRuntime` reload members: manifest/file observations, automatic/manual attempts and reconnect-confirmed receipts with running/folder code digests; browser process identity and listener generation fence reload proof |
+// Blueprint: | `ChromeControlRuntime+Reload.swift` | `ChromeControlRuntime` reload members: one optional accepted running-code/folder-code comparison serves setup, current status and reload settlement at the shipped version; manifest/file observations and attempts, unavailable identity never matches, browser process identity and listener generation fence proof |
 
 extension ChromeControlRuntime {
+    /// One current-code comparison for setup, status and reload settlement.
+    /// Nil means identity has not been observed, never a match or mismatch.
+    var acceptedExtensionMatchesFolder: Bool? {
+        guard readyChannel != nil, let files = extensionFiles,
+              let version = facts.extensionVersion,
+              let running = facts.extensionCode, let folder = files.code else { return nil }
+        return version == files.shippedVersion && files.diskVersion == files.shippedVersion && running == folder
+    }
+
     public enum ReloadSource: String, Sendable, Codable { case automatic, manual, verb }
     struct ExtensionReloadAttempt: Codable {
         let id: String
@@ -48,9 +57,11 @@ extension ChromeControlRuntime {
     var currentReloadReceipt: JSONValue {
         if extensionReload?.pending == true { return extensionReload!.receipt }
         let latest = reloadPreflightFailure ?? extensionReload?.receipt ?? facts.extensionReload
-        if readyChannel != nil, let files = extensionFiles, facts.extensionVersion == files.shippedVersion {
+        if acceptedExtensionMatchesFolder == true, let files = extensionFiles {
             if case .object(let receipt)? = latest, receipt["status"] == .string("succeeded"),
-               receipt["after_version"] == .string(files.shippedVersion) { return .object(receipt) }
+               receipt["after_version"] == .string(files.shippedVersion),
+               receipt["after_code"] == facts.extensionCode.map(JSONValue.string),
+               receipt["folder_code"] == files.code.map(JSONValue.string) { return .object(receipt) }
             // Only an accepted greeting after a failed read/preflight supersedes that failure.
             if case .object(let receipt)? = latest, receipt["status"] == .string("failed"),
                let completed = facts.extensionReloadAt, let seen = facts.extensionSeenAt,
@@ -60,11 +71,16 @@ extension ChromeControlRuntime {
             return .object([
                 "status": .string("matched"), "running_version": .string(files.shippedVersion),
                 "shipped_version": .string(files.shippedVersion),
-                "reason": .string("The accepted extension is running the shipped version."),
-                "provenance": .string("raw view · accepted Chrome extension greeting and shipped manifest; previous reload attempts are last-seen history."),
+                "running_code": facts.extensionCode.map(JSONValue.string) ?? .null,
+                "folder_code": files.code.map(JSONValue.string) ?? .null,
+                "reason": .string("The accepted extension's running code matches the registered folder at the shipped version."),
+                "provenance": .string("raw view · accepted Chrome extension greeting and registered folder code digest; previous reload attempts are last-seen history."),
             ])
         }
-        return latest ?? .null
+        // A stored successful reload is history, not proof of current code.
+        if case .object(let receipt)? = latest,
+           receipt["status"] != .string("succeeded"), receipt["status"] != .string("matched") { return .object(receipt) }
+        return .null
     }
 
     func readExtensionFiles(fresh: Bool = false) {
@@ -130,19 +146,13 @@ extension ChromeControlRuntime {
         }
         if extensionReload?.pending != true { return extensionReload!.receipt }
         let waiter = UUID()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                if Task.isCancelled { continuation.resume(throwing: CancellationError()) }
-                else if extensionReload?.pending != true { continuation.resume(returning: extensionReload!.receipt) }
-                else { reloadWaiters[waiter] = continuation }
-            }
-        } onCancel: {
-            Task { await self.cancelReloadWaiter(waiter) }
-        }
-    }
-
-    private func cancelReloadWaiter(_ id: UUID) {
-        reloadWaiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
+        try Task.checkCancellation()
+        let response = ReloadWait()
+        reloadWaiters[waiter] = response
+        await response.done.park()
+        reloadWaiters.removeValue(forKey: waiter)
+        guard let result = response.result else { throw CancellationError() }
+        return try result.get()
     }
 
     private func recordReloadPreflightFailure(_ error: Error, source: ReloadSource) -> JSONValue {
@@ -184,7 +194,7 @@ extension ChromeControlRuntime {
         attempt.phase = phase
         attempt.after = after
         attempt.afterCode = afterCode
-        attempt.diskCode = folderCode ?? attempt.diskCode
+        attempt.diskCode = folderCode
         attempt.reason = reason
         attempt.completedAt = Date()
         extensionReload = attempt
@@ -193,7 +203,10 @@ extension ChromeControlRuntime {
         saveConnectionFacts()
         let waiters = reloadWaiters.values
         reloadWaiters.removeAll()
-        for waiter in waiters { waiter.resume(returning: attempt.receipt) }
+        for waiter in waiters {
+            waiter.result = .success(attempt.receipt)
+            waiter.done.resume()
+        }
     }
 
     private func beginExtensionReload(on connection: ChromeControlChannel, source: ReloadSource) async throws {

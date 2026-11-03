@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 import ProviderRouting
-// Blueprint: | `AgentA2AWire.swift` | `AgentA2AWire` enum; `selectInterface`, `messageRequest` |
+// Blueprint: | `AgentA2AWire.swift` | `AgentA2AWire` enum; `selectInterface`, `messageRequest`; admitted outgoing file parts share the versioned part encoder on every binding |
 
 /// A2A 1.0 and 0.3 wire projection. Endpoints, parts and metadata remain
 /// untrusted data; the transport must authorize the destination and credentials.
@@ -82,8 +82,17 @@ public enum AgentA2AWire {
 
     public static func selectInterface(card: JSONValue, cardURL: URL) throws -> Interface {
         let card = try object(card, "agent card")
+        var streaming = false, extendedAgentCard = false, pushNotifications = false
         if let capabilities = card["capabilities"] {
             let caps = try object(capabilities, "capabilities")
+            func flag(_ name: String) throws -> Bool {
+                guard let value = caps[name] else { return false } // Omitted means not offered.
+                guard case .bool(let flag) = value else { throw WireError.invalid("capabilities.\(name) must be boolean") }
+                return flag
+            }
+            streaming = try flag("streaming")
+            extendedAgentCard = try flag("extendedAgentCard")
+            pushNotifications = try flag("pushNotifications")
             for item in try array(caps["extensions"], "extensions") {
                 let ext = try object(item, "extension")
                 if let required = ext["required"] {
@@ -135,9 +144,7 @@ public enum AgentA2AWire {
             return Interface(endpoint: url, version: version, binding: binding,
                              tenant: try optionalString(entry["tenant"], "tenant"),
                              securityRequirements: version == "0.3" ? (card["security"] ?? requirements) : requirements, securitySchemes: schemes,
-                             streaming: (try? object(card["capabilities"] ?? .null, "capabilities"))?["streaming"] == .bool(true),
-                             extendedAgentCard: (try? object(card["capabilities"] ?? .null, "capabilities"))?["extendedAgentCard"] == .bool(true),
-                             pushNotifications: (try? object(card["capabilities"] ?? .null, "capabilities"))?["pushNotifications"] == .bool(true))
+                             streaming: streaming, extendedAgentCard: extendedAgentCard, pushNotifications: pushNotifications)
         }
         throw WireError.unsupported("no advertised supported version/binding pair")
     }
@@ -145,14 +152,15 @@ public enum AgentA2AWire {
     public static func messageRequest(text: String, messageID: String, contextID: String? = nil,
                                       taskID: String? = nil, interface: Interface,
                                       requestID: String? = nil, streaming: Bool = false,
-                                      pushConfiguration: JSONValue? = nil) throws -> Request {
+                                      pushConfiguration: JSONValue? = nil, fileParts: [JSONValue] = []) throws -> Request {
         try validate(interface)
         guard !streaming || interface.streaming else { throw WireError.unsupported("streaming was not offered") }
         _ = try requiredString(.string(messageID), "messageId")
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WireError.invalid("empty message") }
         let legacy = interface.version == "0.3"
+        let parts: [JSONValue] = [.object(["text": .string(text)])] + fileParts
         var message: [String: JSONValue] = ["messageId": .string(messageID), "role": .string(legacy ? "user" : "ROLE_USER"),
-            "parts": .array([try wirePart(.object(["text": .string(text)]), version: interface.version)])]
+            "parts": .array(try parts.map { try wirePart($0, version: interface.version) })]
         if legacy { message["kind"] = .string("message") }
         if let contextID { message["contextId"] = .string(try requiredString(.string(contextID), "contextId")) }
         if let taskID { message["taskId"] = .string(try requiredString(.string(taskID), "taskId")) }
@@ -258,18 +266,21 @@ public enum AgentA2AWire {
         let contextID = try optionalString(payload["contextId"], "contextId")
         var taskID: String?
         var state = "reply"
+        var failure: ProviderFailure.Report?
         if kind == "message" {
             messageID = try validateMessage(payload, legacy: legacy)
+            failure = try providerFailure(payload)
             taskID = try optionalString(payload["taskId"], "taskId")
             parts = try array(payload["parts"], "message parts", required: true)
         } else if kind == "task" {
             taskID = try requiredString(payload["id"], "task ID")
             let status = try object(payload["status"] ?? .null, "task status")
             let wireState = try requiredString(status["state"], "task state")
-            state = canonicalState(wireState, version: interface.version)
+            state = try canonicalState(wireState, version: interface.version)
             if let message = status["message"] {
                 let message = try object(message, "status message")
                 messageID = try validateMessage(message, legacy: legacy)
+                failure = try providerFailure(message)
                 parts = try array(message["parts"], "status message parts", required: true)
             }
             artifacts = try array(payload["artifacts"], "artifacts")
@@ -288,16 +299,21 @@ public enum AgentA2AWire {
         let text = outputParts.compactMap { part -> String? in
             guard case .object(let object) = part, case .string(let text)? = object["text"] else { return nil }; return text
         }.joined(separator: "\n")
-        var result = Result(kind: kind, taskID: taskID, contextID: contextID, messageID: messageID, text: text,
+        return Result(kind: kind, taskID: taskID, contextID: contextID, messageID: messageID, text: text,
                       parts: parts, artifacts: artifacts, state: state,
                       terminal: ["completed", "failed", "canceled", "rejected"].contains(state), completed: state == "completed",
-                      needsInput: state == "input-required", needsAuthentication: state == "auth-required")
-        if case .object(let status)? = payload["status"], case .object(let message)? = status["message"],
-           case .object(let metadata)? = message["metadata"], let failure = metadata["provider_failure"],
-           let data = try? failure.serializedData(pretty: false) {
-            result.failure = try? JSONDecoder().decode(ProviderFailure.Report.self, from: data)
+                      needsInput: state == "input-required", needsAuthentication: state == "auth-required", failure: failure)
+    }
+
+    private static func providerFailure(_ message: [String: JSONValue]) throws -> ProviderFailure.Report? {
+        guard let metadata = message["metadata"] else { return nil }
+        let fields = try object(metadata, "message metadata")
+        guard let failure = fields["provider_failure"] else { return nil }
+        do {
+            return try JSONDecoder().decode(ProviderFailure.Report.self, from: failure.serializedData(pretty: false))
+        } catch {
+            throw WireError.invalid("message metadata.provider_failure: \(error.localizedDescription)")
         }
-        return result
     }
 
     private static func validateMessage(_ message: [String: JSONValue], legacy: Bool) throws -> String {

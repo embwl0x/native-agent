@@ -48,11 +48,20 @@ package enum AgentWorkspaceEnvironment {
     }
 
     static func schema(_ name: String, catalog: AgentWorkspace.Catalog) async throws -> LLMToolSchema {
-        let matches = try await catalog().filter { $0.name == name && browsable($0) }
-        guard matches.count == 1, let schema = matches.first else {
-            throw AgentWorkspaceForm.Failure(message: "This action is no longer uniquely available in this session. Nothing was run.")
+        guard let schema = try await optionalSchema(name, catalog: catalog) else {
+            throw AgentWorkspaceForm.Failure(message: "This action is no longer available in this session. Nothing was run.")
         }
         return schema
+    }
+
+    /// Nil is a successful catalog read with no exact action; storage/catalog
+    /// failures and duplicate contracts remain errors at every lookup boundary.
+    static func optionalSchema(_ name: String, catalog: AgentWorkspace.Catalog) async throws -> LLMToolSchema? {
+        let matches = try await catalog().filter { $0.name == name && browsable($0) }
+        guard matches.count <= 1 else {
+            throw AgentWorkspaceForm.Failure(message: "This action is no longer uniquely available in this session. Nothing was run.")
+        }
+        return matches.first
     }
 
     static func outcome(_ value: JSONValue) -> JSONValue {
@@ -76,7 +85,7 @@ package enum AgentWorkspaceEnvironment {
             return .record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10000)], title: "Selected browser page")
         }
         if ["desk_note", "desk_update_item", "desk_set_status", "desk_add_ref"].contains(tool), let handle = input["handle"] {
-            return .record(tool: "desk_read", input: ["handle": handle, "structured": .bool(true)], title: "Updated work")
+            return .record(tool: "desk_read", input: ["handle": handle], title: "Updated work")
         }
         if tool == "messages_send", let thread = input["thread_id"] {
             return .record(tool: "messages_recent_threads", input: ["thread_id": thread], title: "Messages conversation")
@@ -102,12 +111,11 @@ package enum AgentWorkspaceEnvironment {
         case .work(let query): return try await perform("work_context", ["query": .string(query)])
         case .documents(let query): return try await perform("artifact_find", ["query": .string(query), "limit": .int(6)])
         case .people: return try await perform("agent_contacts", [:])
-        case .record(let tool, var input, _):
+        case .record(let tool, let input, _):
             let appRead = tool == "app" && input["action"] == nil && input["script"] == nil
             guard appRead || readTools.contains(tool) || isStatusReader(tool) else {
                 throw AgentWorkspaceFailure(message: "This item has no supported workspace reader.")
             }
-            if tool == "desk_read" { input["structured"] = .bool(true) }
             return tool == "chat_conversations" ? try await HumanConversationRead.read(input, dataRoot: dataRoot) : try await perform(tool, input)
         default: throw AgentWorkspaceFailure(message: "This view is unavailable. Return to Workspace home.")
         }

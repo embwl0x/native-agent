@@ -10,8 +10,8 @@
 //
 //   An entity is an orphan candidate iff ALL of:
 //   1. metadata_json[created_by_indexer] is present — the entity was PROVABLY
-//      created by this indexer from a MemoryV2 memory. Daemon-era JSON imports
-//      and pre-stamp rows have unknowable sources and are NEVER swept.
+//      created by this indexer from a MemoryV2 memory. Unknown ownership never
+//      proves that an entity is an orphan.
 //   2. metadata_json.last_memory_id is present AND not in the transaction's
 //      live memory IDs — its most recent source is gone.
 //   3. Re-extraction over the transaction's live memory contents does not
@@ -49,9 +49,8 @@ public struct KnowledgeGraphGCCandidate: Sendable, Equatable {
 public struct KnowledgeGraphGCReport: Sendable, Equatable {
     /// Entities that met the orphan definition at scan time.
     public var candidates: [KnowledgeGraphGCCandidate]
-    /// Entities GC can never prove orphaned (no created_by_indexer stamp —
-    /// daemon-era imports / pre-stamp rows). Reported for visibility only.
-    public var legacyUntrackedEntities: Int
+    /// Entities without creation ownership evidence; reported, never swept.
+    public var untrackedEntities: Int
     /// True when deletions were performed.
     public var applied: Bool
     public var candidateSetDiverged: Bool
@@ -72,8 +71,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
         expectedCandidateIDs: Set<String>? = nil
     ) async throws -> KnowledgeGraphGCReport {
         let dbPool = try await pool()
-        let primaryUserName = resolvedPrimaryUserName()
-        let knownPeople = self.knownPeople
+        let identity = try resolvedExtractionIdentity()
+        let primaryUserName = identity.primaryUserName
+        let knownPeople = identity.knownPeople
         if !apply {
             return try await dbPool.read { db in
                 let scan = try Self.scanForOrphans(
@@ -81,7 +81,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 )
                 return KnowledgeGraphGCReport(
                     candidates: scan.candidates,
-                    legacyUntrackedEntities: scan.legacyUntracked,
+                    untrackedEntities: scan.untracked,
                     applied: false,
                     candidateSetDiverged: false,
                     entitiesDeleted: 0,
@@ -99,7 +99,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                Set(scan.candidates.map(\.id)) != expectedCandidateIDs {
                 return KnowledgeGraphGCReport(
                     candidates: scan.candidates,
-                    legacyUntrackedEntities: scan.legacyUntracked,
+                    untrackedEntities: scan.untracked,
                     applied: false,
                     candidateSetDiverged: true,
                     entitiesDeleted: 0,
@@ -142,7 +142,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             edgesDeleted += db.changesCount
             return KnowledgeGraphGCReport(
                 candidates: scan.candidates,
-                legacyUntrackedEntities: scan.legacyUntracked,
+                untrackedEntities: scan.untracked,
                 applied: true,
                 candidateSetDiverged: false,
                 entitiesDeleted: orphanIDs.count,
@@ -154,7 +154,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
 
     private struct OrphanScan {
         var candidates: [KnowledgeGraphGCCandidate]
-        var legacyUntracked: Int
+        var untracked: Int
         var staleIndexIDs: [String]
     }
 
@@ -197,19 +197,13 @@ extension SwiftNativeKnowledgeGraphIndexer {
             SELECT id, name, type, mention_count, metadata_json FROM kg_entities
             """)
         var candidates: [KnowledgeGraphGCCandidate] = []
-        var legacyUntracked = 0
+        var untracked = 0
         for r in entityRows {
             let id: String = r["id"] ?? ""
             let name: String = r["name"] ?? ""
             let type: String = r["type"] ?? ""
             guard !id.isEmpty else { continue }
-            let meta: [String: JSONValue] = {
-                guard let raw: String = r["metadata_json"],
-                      let data = raw.data(using: .utf8),
-                      let parsed = try? JSONValue.parse(data),
-                      case .object(let obj) = parsed else { return [:] }
-                return obj
-            }()
+            let meta = try Self.metadataObject(r["metadata_json"])
             // Condition 4: never the stable primary-user role hub. v4 hubs
             // have no creation stamp, but keep the explicit role guard so a
             // future metadata migration cannot make identity sweepable.
@@ -218,7 +212,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             }
             // Condition 1: provably indexer-created.
             guard meta[createdByKey] != nil else {
-                legacyUntracked += 1
+                untracked += 1
                 continue
             }
             // Condition 2: most recent source memory gone.
@@ -237,7 +231,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
         return OrphanScan(
             candidates: candidates,
-            legacyUntracked: legacyUntracked,
+            untracked: untracked,
             staleIndexIDs: staleIndexIDs
         )
     }

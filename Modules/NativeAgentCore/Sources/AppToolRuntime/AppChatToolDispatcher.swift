@@ -12,6 +12,7 @@ import Cognition
 import CognitiveSubstrate
 import Context
 import MacControl
+import MacIntegration
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -21,7 +22,7 @@ import StandingBots
 import ToolRegistry
 import Senses
 import PersonaEngine
-// Blueprint: | `AppChatToolDispatcher.swift` | Composed tool dispatch, Security Center admission and settled-result observers; `withAuthoredProgramHost` is the one host binding for turns and native scheduled/UI owners, retaining their originating gated reentry |
+// Blueprint: | `AppChatToolDispatcher.swift` | Composed tool dispatch, Security Center admission and settled-result observers; the common result return files permission remedies through permissions.request and nonblocking per-item batch needs through the existing card owner, retaining the original outcome; `withAuthoredProgramHost` is the one host binding for turns and native scheduled/UI owners, retaining their originating gated reentry; preview retains security evaluation but skips policy recording and motor feedback |
 
 /// Composes the engine's tool catalog with Security Center admission,
 /// app effects and settled-result motor observations.
@@ -78,19 +79,70 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
     }
 
     public func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        // Walk 3: her natural guess for Back is a tool of its own — it is navigate url:"back".
-        let bare = tool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            .replacingOccurrences(of: "browser.", with: "").replacingOccurrences(of: "browser_", with: "")
-            .replacingOccurrences(of: ".", with: "_")
-        if let direction = ["chrome_back": "back", "chrome_go_back": "back",
-                            "chrome_forward": "forward", "chrome_go_forward": "forward"][bare] {
-            var go = input
-            go["url"] = .string(direction)
-            return try await dispatch(tool: "browser.chrome_navigate", input: go, surface: surface)
+        let result: JSONValue
+        do {
+            result = ChatToolOutcome.normalizedFailure(try await withToolArguments(tool: tool, input: input) { input in
+                try await MacAppActGate.withAdmission(origin: Self.securityOrigin(surface: surface), dataRoot: securityCenter.dataRoot) {
+                    try await dispatchNormalized(tool: tool, input: input, surface: surface)
+                }
+            }, tool: tool)
+        } catch {
+            let filed = await filePermissionRemedy(in: ChatToolOutcome.failure(error: error, tool: tool), input: input, surface: surface)
+            if filed.objectValue?["permission_card"] != nil { return filed }
+            throw error
         }
-        return ChatToolOutcome.normalizedFailure(try await withToolArguments(tool: tool, input: input) { input in
-            try await dispatchNormalized(tool: tool, input: input, surface: surface)
-        }, tool: tool)
+        let withCards = await fileBatchNeeds(in: result, tool: tool, input: input, surface: surface)
+        return await filePermissionRemedy(in: withCards, input: input, surface: surface)
+    }
+
+    /// Partial exports carry one nonblocking need envelope per refused file.
+    /// File them before a script/list can wrap the result. The same card owner
+    /// writes each card, without replaying an export that may already have files.
+    private func fileBatchNeeds(in result: JSONValue, tool: String, input: [String: JSONValue], surface: String) async -> JSONValue {
+        guard input["preview"] != .bool(true), !Task.isCancelled, !SkillRunContext.handsBack,
+              case .object(var fields) = result, fields["needCards"] == nil,
+              fields["status"] == .string("partial"),
+              case .array(let envelopes)? = fields[InlineInteractionWire.needsKey] else { return result }
+        var filings: [JSONValue] = []
+        var retainedEnvelopes = envelopes
+        var retainedIDs: [String: String] = [:]
+        for (index, envelope) in envelopes.enumerated() {
+            guard let need = InlineInteractionNeed.interaction(in: envelope),
+                  !InlineInteractionNeed.blocksTurn(need) else { continue }
+            guard let session = ChatToolSessionContext.verifiedSessionId else {
+                filings.append(.object(["id": .string(need.id), "status": .string("unavailable"),
+                    "detail": .string("No card was filed: this call has no originating conversation.")]))
+                continue
+            }
+            if let filed = await InlineInteractionResolver.raise(need, sessionID: session,
+                requestingTool: tool,
+                origin: TurnEnvelope.current(surface: surface), dataRoot: securityCenter.dataRoot) {
+                retainedEnvelopes[index] = InlineInteractionNeed.envelope(filed)
+                retainedIDs[need.id] = filed.id
+                filings.append(.object(["id": .string(filed.id), "session_id": .string(session),
+                    "status": .string("filed")]))
+            } else {
+                filings.append(.object(["id": .string(need.id), "status": .string("unavailable"),
+                    "detail": .string("The card could not be saved; inspect this item's need before asking again.")]))
+            }
+        }
+        guard !filings.isEmpty else { return result }
+        // The exporter also points to each need from its per-file receipt.
+        // Project those pointers from the same filing result as the envelopes.
+        if case .object(var saved)? = fields["saved"], case .array(let files)? = saved["files"] {
+            saved["files"] = .array(files.map { file in
+                guard case .object(var item) = file, case .string(let id)? = item["card_id"],
+                      let retainedID = retainedIDs[id] else { return file }
+                item["card_id"] = .string(retainedID)
+                return .object(item)
+            })
+            fields["saved"] = .object(saved)
+        }
+        // A filing receipt also keeps an outer folded app return from filing
+        // the same envelopes twice. It never claims the grant was answered.
+        fields["needCards"] = .array(filings)
+        fields[InlineInteractionWire.needsKey] = .array(retainedEnvelopes)
+        return .object(fields)
     }
 
     private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -108,8 +160,55 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         let result = try await withAuthoredProgramHost(surface: surface) {
             try await self.dispatchWithoutOrganismPosture(tool: tool, input: canonicalInput, surface: surface)
         }
-        await observeMotorOutcomeIfNeeded(tool: tool, result: result)
+        if tool != "app" || input["preview"] != .bool(true) {
+            await observeMotorOutcomeIfNeeded(tool: tool, result: result)
+        }
         return result
+    }
+
+    /// All executed app and underlying tool results leave through dispatch.
+    /// Read only the owner's remedy, never infer a permission from error prose.
+    private func filePermissionRemedy(in result: JSONValue, input: [String: JSONValue], surface: String) async -> JSONValue {
+        guard input["preview"] != .bool(true), !Task.isCancelled,
+              !SkillRunContext.handsBack, case .object(var fields) = result,
+              fields["permission_card"] == nil else { return result }
+        let detail = fields["detail"]?.objectValue
+        let calls = [fields["remedy"], detail?["remedy"]].compactMap { remedy -> [String: JSONValue]? in
+            guard case .object(let remedy)? = remedy, case .object(let next)? = remedy["next_call"],
+                  next["tool"] == .string("app"), case .object(let call)? = next["input"],
+                  call["action"] == .string("permissions.request") else { return nil }
+            return call
+        }
+        guard var call = calls.first else { return result }
+        guard let session = ChatToolSessionContext.verifiedSessionId, let perform = AppDoorReentry.perform else {
+            fields["permission_card"] = .object(["status": .string("unavailable"),
+                "detail": .string("No permission card was filed: this call has no originating conversation and gated app door.")])
+            return .object(fields)
+        }
+        call["__session_id"] = .string(session)
+        do {
+            // This is the body's ask, not a part step that waits for an answer.
+            // It still re-enters all gates as the declared request action.
+            let request = try await SkillRunContext.$partID.withValue(nil) {
+                try await perform("app", call)
+            }
+            try Task.checkCancellation()
+            if let need = InlineInteractionNeed.interaction(in: request), need.kind == .permission {
+                let filed = try await InlineInteractionResolver.filePermissionRequest(need, sessionID: session,
+                    origin: TurnEnvelope.current(surface: surface), dataRoot: securityCenter.dataRoot)
+                let name = AppleScriptExecution.automationTarget(need.target).map { "Automation for " + $0 }
+                    ?? SystemPermissionPreflight.cardSettingsCapability(need.target)?.displayName ?? need.target
+                fields["permission_card"] = .object(["status": .string("up"), "id": .string(filed.id),
+                    "session_id": .string(filed.sessionID),
+                    "detail": .string("A permission card for \(name) is up for \(HerScreen.names(securityCenter.dataRoot).person).")])
+            } else {
+                // Already granted or refused by its real owner: keep that evidence.
+                fields["permission_card"] = request
+            }
+        } catch {
+            fields["permission_card"] = ChatToolOutcome.failure(error: error, tool: "permissions.request")
+        }
+        return .object(fields)
     }
 
     /// Turns and native owners bind the same host. The caller supplies its
@@ -154,7 +253,8 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
                     return await InlineInteractionResolver.waitForAnswer(need, tool: tool, input: input,
                         sessionID: session, dataRoot: self.securityCenter.dataRoot)
                 }) {
-                    try await operation()
+                    try await MacAppActGate.withAdmission(origin: Self.securityOrigin(surface: surface), dataRoot: securityCenter.dataRoot,
+                                                         operation: operation)
                 }
             }
         }
@@ -178,7 +278,9 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             origin: Self.securityOrigin(surface: surface),
             enforceAutonomy: enforceAutonomySecurity
         )
-        try await securityCenter.record(envelope)
+        // A preview still passes the real security decision. Its evidence is
+        // trace-only; it must not add a durable act or policy receipt.
+        if tool != "app" || input["preview"] != .bool(true) { try await securityCenter.record(envelope) }
         // Composed chat and approved replay resolve asks in the outer approval
         // membrane. Recheck hard blocks here without asking a second time.
         guard envelope.decision != .block,

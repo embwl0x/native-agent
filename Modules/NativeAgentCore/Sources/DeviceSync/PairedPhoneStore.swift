@@ -46,9 +46,15 @@ public final class PairedPhoneStore: ObservableObject {
     }
 
     /// Phones paired right now, read from disk (a setup card's done-check).
-    public func pairedCount() async -> Int {
+    public func pairedCount() async -> Int? {
         let url = url
-        return await storage.perform { (try? Self.pairedCountChecked(at: url)) ?? 0 }
+        let result = await storage.perform { Result { try Self.pairedCountChecked(at: url) } }
+        switch result {
+        case .success(let count): return count
+        case .failure(let error):
+            message = "The paired-phone count could not be read: \(error.localizedDescription). Restore access to paired_phones.json and try again."
+            return nil
+        }
     }
 
     public func reload() async {

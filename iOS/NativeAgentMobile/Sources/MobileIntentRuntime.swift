@@ -73,13 +73,22 @@ enum MobileIntentRuntime {
         waiters.arm(id)
         let observer = bridge.observeIncomingMessages { message in
             receiveRetainedChatMessage(message)
-            guard message.correlationID == id,
+            guard message.sender == "mac", message.correlationID == id,
                   message.sessionID == session else { return }
-            switch message.metadata?["kind"] {
-            case "error", "rejection", "cancelled":
+            let kind = message.metadata?["kind"]
+            if kind == "rejection" {
                 result = .failure(failure(message.metadata?["errorDetail"] ?? message.text))
-            case nil, "final": result = .success(message.text)
-            default: return
+            } else {
+                switch MobileChatTerminal.classify(kind) {
+                case .completed: result = .success(message.text)
+                case .failed, .stopped:
+                    result = .failure(failure(message.metadata?["errorDetail"] ?? message.text))
+                case .incomplete:
+                    let status = message.metadata?["status"] ?? "Reply ending is unconfirmed."
+                    let words = message.text.isEmpty ? status : "\(message.text)\n\n\(status)"
+                    result = .failure(failure(words))
+                case nil: return
+                }
             }
             waiters.signal(id)
         }

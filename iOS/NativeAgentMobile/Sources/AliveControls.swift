@@ -1,4 +1,5 @@
 import SwiftUI
+import Foundation
 import NativeAgentShared
 import UIKit
 // Blueprint: | `AliveControls.swift` | Status lights, actions, search, glass controls and haze swatches |
@@ -225,9 +226,9 @@ extension View {
     }
 
     /// Keep the navigation title for VoiceOver and the app switcher, but do
-    /// not draw it: the page's serif header says it. Below iOS 18 it shows.
+    /// not draw it: the page's serif header says it.
     @ViewBuilder func aliveHiddenTitle() -> some View {
-        if #available(iOS 18.0, *) { toolbar(removing: .title) } else { self }
+        toolbar(removing: .title)
     }
 
     /// Tint ONE control with the chosen haze. Per control, never a page.
@@ -269,11 +270,30 @@ private struct HazeControlTint: ViewModifier {
 
 /// The seven haze swatches, the chosen one ringed. Same palette as the Mac.
 struct HazeSwatches: View {
+    @MainActor static var settingControl: PhoneLocalSetting {
+        PhoneLocalSetting(id: "phone.haze_color", label: "iPhone haze", type: "choice",
+            choices: HazeColor.allCases.map(\.rawValue), read: {
+                guard let saved = UserDefaults.standard.object(forKey: HazeColor.key) else { return HazeColor.defaultValue.rawValue }
+                guard let raw = saved as? String, HazeColor(stored: raw) != .unavailable else {
+                    throw PhoneLocalSetting.failure("The saved iPhone haze is invalid. Choose a haze in iPhone NativeAgent Settings.")
+                }
+                return raw
+            }, write: { raw in
+                guard HazeColor.allCases.contains(where: { $0.rawValue == raw }) else { throw PhoneLocalSetting.failure("Choose a listed haze.") }
+                try PhoneSettingWrite.check()
+                UserDefaults.standard.set(raw, forKey: HazeColor.key)
+            })
+    }
     @AppStorage(HazeColor.key) private var colorRaw = HazeColor.defaultValue.rawValue
 
     var body: some View {
         let selected = HazeColor(stored: colorRaw)
         // 7 × 36 + 6 × 2 = 264pt: fits a Settings row on the narrowest iPhone.
+        VStack(alignment: .leading, spacing: 6) {
+        if selected == .unavailable {
+            Text("The saved color is unsupported. Choose a color to repair this setting.")
+                .font(.footnote).foregroundStyle(AlivePalette.secondary)
+        }
         HStack(spacing: 2) {
             ForEach(HazeColor.allCases) { color in
                 Button {
@@ -296,5 +316,6 @@ struct HazeSwatches: View {
         }
         .frame(maxWidth: .infinity)
         .sensoryFeedback(.selection, trigger: colorRaw)
+        }
     }
 }

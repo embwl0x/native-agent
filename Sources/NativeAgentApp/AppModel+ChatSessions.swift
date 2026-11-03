@@ -252,25 +252,19 @@ extension AppModel: MacChatSessionSelectionPort {
         }
     }
 
-    func refreshChatMessagesAfterTurn(sessionId: String, messagesAlreadyRefreshed: Bool = false) async {
-        await engine.refreshChatMessagesAfterTurn(
-            sessionId: sessionId, messagesAlreadyRefreshed: messagesAlreadyRefreshed,
-            isMounted: { activeChatSessionId == sessionId },
-            failure: { setFailureStatus($0, action: "refresh your chats") }
-        )
+    /// The open conversation reads the store when its file changes.
+    func readActiveTranscript(sessionId: String) async {
+        guard activeChatSessionId == sessionId else { return }
+        await engine.readMountedTranscript(sessionId: sessionId, failure: { setFailureStatus($0, action: "refresh your chats") })
     }
 
-    func refreshDetachedChatMessagesAfterTurn(sessionId: String, messagesAlreadyRefreshed: Bool = false) async {
-        await engine.refreshDetachedChatMessagesAfterTurn(
-            sessionId: sessionId, messagesAlreadyRefreshed: messagesAlreadyRefreshed,
-            isDetached: { DetachedChatWindowController.shared.isDetached(sessionId) },
-            finished: { failures in
-                detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
-                    previous: detachedChatRefreshStatus[sessionId],
-                    failedEndpoints: failures, at: Date()
-                )
-            }
-        )
+    /// A detached conversation reads the store when its file changes.
+    func readDetachedTranscript(sessionId: String) async {
+        guard DetachedChatWindowController.shared.isDetached(sessionId) else { return }
+        var failures: [String] = []
+        await engine.readMountedTranscript(sessionId: sessionId, failure: { _ in failures = ["messages"] })
+        detachedChatRefreshStatus[sessionId] = Self.nextRefreshStatus(
+            previous: detachedChatRefreshStatus[sessionId], failedEndpoints: failures, at: Date())
     }
 
     @MainActor

@@ -8,7 +8,7 @@ import PersistenceCore
 import ScreenCaptureKit
 import Senses
 import Synchronization
-// Blueprint: | `VisionImageGeometry.swift` | `VisionImageDecoder`, `VisionImageCrop`, `VisionImageCropper`: owned image decoding and geometry-preserving crops |
+// Blueprint: | `VisionImageGeometry.swift` | Owned image decoding and geometry-preserving crops; no-region requests keep the whole image, invalid or failed requested crops return unavailable |
 
 /// Decode the fused Mac view into an owned bitmap.
 public enum VisionImageDecoder {
@@ -39,21 +39,24 @@ public enum VisionImageCropper {
         to globalFrame: MacAXFrame?,
         origin: (x: Double, y: Double),
         logicalSize: (width: Double, height: Double)
-    ) -> VisionImageCrop {
-        guard let globalFrame,
-              logicalSize.width > 0,
-              logicalSize.height > 0 else {
+    ) -> VisionImageCrop? {
+        guard let globalFrame else {
             return VisionImageCrop(image: image, origin: origin, logicalSize: logicalSize)
         }
+        guard [origin.x, origin.y, logicalSize.width, logicalSize.height,
+               globalFrame.x, globalFrame.y, globalFrame.w, globalFrame.h].allSatisfy(\.isFinite),
+              logicalSize.width > 0, logicalSize.height > 0,
+              globalFrame.w > 0, globalFrame.h > 0 else { return nil }
         let geometry = MacScreenViewGeometry(bounds: MacAXFrame(x: origin.x, y: origin.y,
             w: logicalSize.width, h: logicalSize.height), pixelWidth: image.width, pixelHeight: image.height)
         let rect = geometry.imageRect(globalFrame)
+        guard [rect.x, rect.y, rect.w, rect.h].allSatisfy(\.isFinite), rect.w > 0, rect.h > 0 else { return nil }
         let requested = CGRect(x: rect.x, y: rect.y, width: rect.w, height: rect.h).integral
         let available = CGRect(x: 0, y: 0, width: image.width, height: image.height)
         let clipped = requested.intersection(available)
         guard !clipped.isNull, clipped.width >= 1, clipped.height >= 1,
               let cropped = image.cropping(to: clipped) else {
-            return VisionImageCrop(image: image, origin: origin, logicalSize: logicalSize)
+            return nil
         }
         let frame = geometry.screenRect(VisionRect(x: clipped.minX, y: clipped.minY, w: clipped.width, h: clipped.height))
         return VisionImageCrop(image: cropped, origin: (frame.x, frame.y), logicalSize: (frame.w, frame.h))

@@ -9,24 +9,16 @@ import TurnTrace
 import ChatSessionWork
 import ChatTurnContracts
 import ProviderRouting
-// Blueprint: | `ChatOrchestration+SessionHistory.swift` | `SwiftNativeTurnEngine`: `buildTurnContextWithHistory` pins selection to the persisted window before row/character advancement; exact sent user context and keyframe/window metadata replayed from the row; history and digest gathered for their turn part; `fireAssemblyStageEvent`, `injectingSessionDigest` |
+import Experiences
+import Transcripts
+// Blueprint: | `ChatOrchestration+SessionHistory.swift` | `SwiftNativeTurnEngine`: checked whole-transcript replay fails with repair owed before provider admission; only measured recollection folds move the head; exact sent user context and recollection-window metadata replayed from the row; `fireAssemblyStageEvent`, `injectingSessionDigest` |
 
 // MARK: - SwiftNativeTurnEngine + history threading
-
-public enum TurnHistoryError: Error, LocalizedError {
-    case unsupportedLimit(Int)
-
-    public var errorDescription: String? {
-        switch self {
-        case .unsupportedLimit(let limit): return "History limit \(limit) exceeds the supported row budget."
-        }
-    }
-}
 
 extension SwiftNativeTurnEngine {
     /// Same as `buildTurnContextWithHistory(...)` but with a Mac UI
     /// `UserDefaults["chatPersona"]` override forwarded into the compiled
-    /// persona packet. nil → no override (legacy callers unaffected).
+    /// persona packet. nil uses the selected persona.
     /// `sessionDigest` is an explicit opt-in: nil never builds or reads the
     /// prior-session anchor. Supplied, it is injected on the first turn only.
     public func buildTurnContextWithHistory(
@@ -51,56 +43,51 @@ extension SwiftNativeTurnEngine {
         // its lock; nil reads the file once here.
         transcript: Data? = nil
     ) async throws -> TurnContext {
-        // Admit the row budget before any context reads or multiplication.
-        // Nonpositive limits disable history, including Int.min.
-        let prefixRows = max(0, historyLimit).multipliedReportingOverflow(by: 2)
-        let tailRows = prefixRows.partialValue.multipliedReportingOverflow(by: 2)
-        guard !prefixRows.overflow, !tailRows.overflow else {
-            throw TurnHistoryError.unsupportedLimit(historyLimit)
-        }
         // A non-nil queryUserMessage is authoritative even when blank, including attachment-only turns.
         let queryMessage = queryUserMessage ?? userMessage
-        func beforeReplacedQuestion(_ messages: [ChatMessage]) -> [ChatMessage] {
-            guard let id = ChatPersistenceContext.replacementUserMessageID,
-                  let index = messages.firstIndex(where: {
-                      if case .object(let row)? = $0.extras { return row["id"] == .string(id) }
-                      return false
-                  }) else { return messages }
-            return Array(messages[..<index])
+        let replacementAnswerID = ChatPersistenceContext.replacementAssistantMessageID
+        let replacementQuestion = OSAllocatedUnfairLock(initialState: ChatPersistenceContext.replacementUserMessageID)
+        @Sendable func beforeReplacedQuestion(_ messages: [ChatMessage]) -> [ChatMessage] {
+            let id = replacementQuestion.withLock { questionID in
+                // Some ingress names only the answer. Resolve its saved
+                // question once; a selection without it leaves it unresolved.
+                if questionID == nil,
+                   let answer = replacementAnswerID,
+                   let end = messages.firstIndex(where: { $0.extras?.objectValue?["id"] == .string(answer) }),
+                   let question = messages[..<end].last(where: { $0.role == "user" }),
+                   let savedID = question.extras?.objectValue?["id"]?.stringValue {
+                    questionID = savedID
+                }
+                return questionID
+            }
+            return SessionReplaySpec.beforeQuestion(messages, id: id)
         }
         var trace = ContextStageTrace()
         // One instant and preference snapshot feed facts, base receipts and composition.
         let currentTurnClock = clockNowOverride ?? clock()
-        let quietHoursWindow = readTurnQuietHours()
+        let quietHoursWindow = try readTurnQuietHours()
         // The read-only facts of this moment read nothing the history and base
         // context assemble, so they gather beside that work from the start.
         // The composition below reads the facts that consume state, and the
         // peer-sensitive elsewhere line after this history latched its evidence.
-        async let currentFacts = currentTurnFacts(
+        async let currentFacts = try currentTurnFacts(
             clockNow: currentTurnClock,
             quietHours: quietHoursWindow,
             sessionID: sessionId,
             queryUserMessage: queryMessage
         )
-        // v2 replays history as REAL messages behind a cache breakpoint, so
-        // carrying more of it is nearly free and continuity is the whole point
-        // — a broad replay window. Both row and character pressure use the
-        // cursor's 1.15 trigger and 0.70 target.
-        let prefixRowCap = max(1, prefixRows.partialValue)
-        let cursorStore = HistoryWindowCursorStore(dataRoot: historyReader.dataRoot)
-        let windowCursor = historyLimit > 0
-            ? try await cursorStore.current(sessionId: sessionId) : HistoryWindowCursor(sessionId: sessionId)
+        // Replay the complete current transcript. Only a measured recollection
+        // fold may move its head; positive historyLimit values never cap rows.
         let prior: [ChatMessage]
         let middleCandidates: [ChatMessage]
         let priorStats: SessionHistoryReadStats
         let middleStats: SessionHistoryReadStats?
-        var unreadHistory: Error?
         if historyLimit > 0 {
             // One transcript read per turn: the bytes this turn's compaction
             // pass already read under its lock, else the file once, here.
             // Every selection below (prompt head and tail, middle candidates)
             // runs over those bytes.
-            let selected: (prompt: SessionHistoryReadResult, relevance: SessionHistoryReadResult?)?
+            let selected: (prompt: SessionHistoryReadResult, relevance: SessionHistoryReadResult?)
             // Measured inline: the read's closure holds actor state and cannot be sent to the trace.
             let promptReadStart = DispatchTime.now().uptimeNanoseconds
             do {
@@ -110,28 +97,34 @@ extension SwiftNativeTurnEngine {
                 }
                 selected = historyReader.promptMessagesWithStats(
                     transcript: bytes,
-                    anchorLimit: 3,
-                    // 2C > 1.15C + the boundary row; selection also retains
-                    // the exact boundary if raw/filtered rows exceed that slack.
-                    tailLimit: max(96, tailRows.partialValue),
-                    windowCursor: windowCursor,
                     excludingRunId: excludeHistoryRunId,
                     relevanceWhen: { beforeReplacedQuestion($0.messages).count > historyLimit || $0.stats.truncated }
                 )
+                _ = try selected.prompt.checkedMessages()
+                if let relevance = selected.relevance { _ = try relevance.checkedMessages() }
                 trace.record(.promptRead, since: promptReadStart)
             } catch {
                 trace.record(.promptRead, since: promptReadStart)
                 if error is CancellationError { throw error }
-                selected = nil
-                unreadHistory = error
+                let path = historyReader.dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl").path
+                let nextCall = ToolFailureError.call("app", ["action": .string("files.read"), "args": .object(["path": .string(path)])])
+                let failure = ToolFailureError(
+                    "This conversation's history could not be read: \(error.localizedDescription) Repair its retained transcript before continuing.",
+                    effects: .none, owner: path, nextCall: nextCall, code: "transcript_unavailable", recovery: .repair)
+                RepairOwed.owe(historyReader.dataRoot, id: UUID().uuidString, kind: .run,
+                    operation: "chat.history:\(sessionId)", owner: path, words: failure.localizedDescription, nextCall: nextCall)
+                TurnTraceBus.fireFromContext(kind: "context.history.failed", sessionId: sessionId, surface: surface,
+                    payload: .object(["code": .string("transcript_unavailable"), "reason": .string(error.localizedDescription)]))
+                throw failure
             }
-            let priorResult = selected?.prompt ?? SessionHistoryReadResult(
-                messages: [],
-                stats: SessionHistoryReadStats(mode: "prompt_read_failed")
-            )
+            if selected.prompt.stats.mode != "missing" {
+                RepairOwed.settle(historyReader.dataRoot, operation: "chat.history:\(sessionId)",
+                    evidence: .init(source: "transcript", id: sessionId))
+            }
+            let priorResult = selected.prompt
             prior = beforeReplacedQuestion(priorResult.messages)
             priorStats = priorResult.stats
-            if let middleResult = selected?.relevance {
+            if let middleResult = selected.relevance {
                 middleCandidates = beforeReplacedQuestion(middleResult.messages)
                 middleStats = middleResult.stats
             } else {
@@ -148,6 +141,23 @@ extension SwiftNativeTurnEngine {
             prior.compactMap(SessionHistoryPromptRenderer.renderable)
         }
         let baseStartNs = DispatchTime.now().uptimeNanoseconds
+        // Use the transcript owner's exchange pairing, including repeated runs
+        // and interrupted replies. The four-message relevance window is not a clock.
+        let paired = ChatSessionRecollections.pairExchanges(prior.map {
+            (sessionId, $0.extras?.objectValue?["runId"]?.stringValue, $0.role,
+             $0.role == "user" || $0.role == "assistant")
+        })
+        var exchangeWords: [Int: [String]] = [:]
+        var exchangeOrder: [Int] = []
+        for entry in paired {
+            if exchangeWords[entry.exchange] == nil {
+                exchangeOrder.append(entry.exchange)
+                exchangeWords[entry.exchange] = []
+            }
+            if prior[entry.row].role == "user" {
+                exchangeWords[entry.exchange, default: []].append(prior[entry.row].content)
+            }
+        }
         let rawBase: TurnContext
         do {
             rawBase = try await buildTurnContext(
@@ -160,6 +170,7 @@ extension SwiftNativeTurnEngine {
                 sessionID: sessionId,
                 recentTurns: prior.filter { $0.role == "user" || $0.role == "assistant" }.suffix(4)
                     .map { $0.content },
+                recentExchanges: exchangeOrder.map { exchangeWords[$0, default: []] },
                 queryUserMessage: queryMessage,
                 clockNowOverride: currentTurnClock,
                 quietHoursSnapshot: quietHoursWindow,
@@ -182,10 +193,10 @@ extension SwiftNativeTurnEngine {
         // The admitted model determines every history budget through ContextBudgetPolicy.resolve.
         let historyWindowTokens = ContextBudgetPolicy.windowTokens(
             forModel: base.modelId,
-            providerID: LLMCallContext.providerId,
+            providerID: base.providerId,
             dataRoot: historyReader.dataRoot
         )
-        let historyBudget = ContextBudgetPolicy.resolve(
+        let historyBudget = try ContextBudgetPolicy.resolve(
             windowTokens: historyWindowTokens
         )
         let preparedMiddle = middleStats == nil
@@ -193,42 +204,28 @@ extension SwiftNativeTurnEngine {
         var deliveredHistoryIdentities = Set<String>()
         var historyMessages: [LLMMessage] = []
         var historyMessageChars = 0
-        var historyWindowReceipt: HistoryWindowReceipt?
         var replayedRunIds = Set<String>()
         var replayedContexts: [SentTurnContext] = []
+        var historyRowCharacters: [String: Int] = [:]
         var contextWindow = "0:"
         // With cross-session recall enabled, absent recollection borrows the anchor only in the replay prefix; prior stays untouched.
-        let priorForPrefix = MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: historyReader.dataRoot)
-            ? CarriedAnchorRecollection.seeded(
+        let priorForPrefix = try MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: historyReader.dataRoot)
+            ? try CarriedAnchorRecollection.seeded(
                 prior, sessionId: sessionId, dataRoot: historyReader.dataRoot,
                 admittedPriorSessionId: sessionDigest?.dataRoot == historyReader.dataRoot ? admittedPriorSessionId : nil
             )
             : prior
         trace.setFlag("prefix.carriedRecollection", priorForPrefix.count != prior.count)
-        if let admission = SessionHistoryMessages.admission(
+        if let admission = try SessionHistoryMessages.admission(
             renderables: priorForPrefix.prefix(priorForPrefix.count - prior.count)
                 .compactMap(SessionHistoryPromptRenderer.renderable) + preparedHistory,
             historyLimit: historyLimit,
             windowTokens: historyWindowTokens
            ) {
-            // The window head moves at most once per turn, oldest-first, and
-            // after compaction only if its result still exceeds a budget (see
-            // HistoryWindowCursor). The turn-id guard inside the store makes a
-            // tool loop's later iterations no-ops by construction, so a lane
-            // that rebuilds context per iteration cannot slide the prefix
-            // mid-turn.
-            let advance = try await cursorStore.advanceIfNeeded(
-                sessionId: sessionId,
-                admitted: admission.rows,
-                budgetChars: historyBudget.historyChars,
-                // The same row budget whose 2x tail is read above.
-                rowCap: prefixRowCap,
-                turnId: TurnTraceContext.turnId,
-                compactionRanThisTurn: HistoryWindowTurnFacts.compactionRanThisTurn
-            )
-            let projected = SessionHistoryMessages.project(admission, cursor: advance.cursor)
+            let projected = SessionHistoryMessages.project(admission)
             deliveredHistoryIdentities = projected.historyIdentities
             replayedContexts = projected.replayedContexts
+            historyRowCharacters = projected.rowCharacters
             contextWindow = projected.contextWindow
             replayedRunIds = projected.replayedRunIds
             historyMessages = projected.messages
@@ -238,22 +235,13 @@ extension SwiftNativeTurnEngine {
                     return $0
                 }
             }
-            historyWindowReceipt = HistoryWindowReceipt(
-                advanceCount: advance.cursor.advanceCount,
-                slid: advance.didAdvance
-            )
         }
         trace.setLabel("prefix.shapeVersion", "v2Prefix")
         trace.setCount("prefix.historyMessageCount", historyMessages.count)
         trace.setCount("prefix.historyMessageChars", historyMessageChars)
-        trace.setCount(
-            "prefix.windowCursorAdvanceCount", historyWindowReceipt?.advanceCount ?? 0
-        )
-        trace.setFlag("prefix.windowSlid", historyWindowReceipt?.slid ?? false)
         trace.setCount("prefix.replayedTurnCount", replayedRunIds.count)
         trace.setCount("budget.windowTokens", historyWindowTokens ?? 0)
         trace.setFlag("budget.derived", historyBudget.isDerived)
-        trace.setCount("budget.historyChars", historyBudget.historyChars)
         trace.setCount("budget.memoryBlockChars", historyBudget.memoryBlockChars)
         trace.setCount("budget.recallRowLimit", historyBudget.recallRowLimit)
         // History is context, not a read this turn: an agent's words kept here are
@@ -262,8 +250,8 @@ extension SwiftNativeTurnEngine {
         // restores its own (`ChatOrchestration+Continuation`).
         let receiptStrip = ChatTranscriptEvidenceRendering.recentReceiptStrip(from: prior)
         deliveredHistoryIdentities.formUnion(receiptStrip?.historyIdentities ?? [])
-        let renderedHistory = await trace.measure(.render) {
-            SessionHistoryPromptRenderer.renderDetailed(
+        let renderedHistory = try await trace.measure(.render) {
+            try SessionHistoryPromptRenderer.renderDetailed(
                 renderables: preparedHistory,
                 middleCandidates: preparedMiddle,
                 deliveredHistoryIdentities: deliveredHistoryIdentities,
@@ -278,6 +266,8 @@ extension SwiftNativeTurnEngine {
         trace.setCount("history.prompt.bytesRead", priorStats.bytesRead)
         trace.setCount("history.prompt.linesRead", priorStats.linesRead)
         trace.setCount("history.prompt.decoded", priorStats.decodedCount)
+        trace.setCount("history.prompt.decodeCacheHits", priorStats.decodeCacheHits)
+        trace.setCount("history.prompt.decodeCacheMisses", priorStats.decodeCacheMisses)
         trace.setCount("history.prompt.excludedByRunId", priorStats.excludedByRunId)
         trace.setCount("history.prompt.returned", priorStats.returnedCount)
         trace.setFlag("history.prompt.truncated", priorStats.truncated)
@@ -305,18 +295,19 @@ extension SwiftNativeTurnEngine {
             contextWithHistory.turnReach.history = historyBlock
         }
         contextWithHistory.historyMessages = historyMessages
-        contextWithHistory.historyWindowReceipt = historyWindowReceipt
+        contextWithHistory.historyRowCharacters = historyRowCharacters
+        contextWithHistory.historyReplaySpec = SessionReplaySpec(historyLimit: historyLimit,
+            excludedRunID: excludeHistoryRunId,
+            replacementUserMessageID: replacementQuestion.withLock { $0 },
+            carryAnchor: true, admittedPriorSessionID: sessionDigest?.dataRoot == historyReader.dataRoot ? admittedPriorSessionId : nil)
         contextWithHistory.replayedTurnContexts = replayedContexts
         contextWithHistory.historyContextWindow = contextWindow
         let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
-        let clocked = await contextByAppendingCurrentTurnFacts(
-            contextWithHistory, facts: currentFacts, sessionID: sessionId, clockNowOverride: currentTurnClock)
+        let facts = try await currentFacts
+        trace.record(.factsJoin, since: runtimeStartNs)
+        let clocked = try await contextByAppendingCurrentTurnFacts(
+            contextWithHistory, facts: facts, sessionID: sessionId, clockNowOverride: currentTurnClock, trace: &trace)
         var finalContext = clocked
-        // An unread history is a fact of this turn, never a quiet empty one.
-        if let unreadHistory {
-            finalContext = Self.contextByAppendingRuntimeContext(finalContext, runtimeContext:
-                "This conversation's history could not be read for this turn (\(unreadHistory.localizedDescription)); nothing before this message is in front of you.")
-        }
         trace.record(ContextStageName.contextClockRuntime, since: runtimeStartNs)
         trace.setCount("userMessageChars", finalContext.userMessage.count)
         trace.setCount("toolSchemaCount", finalContext.toolSchemas.count)
@@ -378,8 +369,6 @@ extension SwiftNativeTurnEngine {
             "shapeVersion": .string("v2Prefix"),
             "historyMessageCount": .int(Int64(context.historyMessages.count)),
             "historyMessageChars": .int(Int64(historyMessageChars)),
-            "windowCursorAdvanceCount": .int(Int64(context.historyWindowReceipt?.advanceCount ?? 0)),
-            "windowSlid": .bool(context.historyWindowReceipt?.slid ?? false),
         ]
         TurnTraceBus.fireFromContext(
             kind: "assembly.stage",
@@ -400,7 +389,7 @@ extension SwiftNativeTurnEngine {
         // Guard before provider/cache access: a surface that did not ask for
         // the carry-over never reads or writes anchor bytes.
         guard let provider else { return (base, nil) }
-        guard MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: provider.dataRoot) else { return (base, nil) }
+        guard try MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: provider.dataRoot) else { return (base, nil) }
         // FIRST TURN ONLY. The anchor exists to hand a BRAND-NEW session the
         // thread it was cut from. From turn 2 the session's own history block
         // carries that thread, and re-injecting two lines that point at a
@@ -409,27 +398,24 @@ extension SwiftNativeTurnEngine {
         // uses — non-empty prior ⇒ a history block renders — and the current
         // turn's own user row is excluded by runId, so turn 1 is empty here.
         guard !hasPriorHistory else { return (base, nil) }
-        // The handoff is housekeeping: the turn takes what is published. When
-        // none is, its builder runs on its own and the turn says what is missing.
-        let unavailable: String
+        // The first turn is the handoff's delivery opportunity. Join the
+        // existing single-flight builder before admitting that first answer.
         do {
             if let digest = try await provider.published(forSessionId: sessionId) {
-                guard !digest.text.isEmpty else { return (base, digest.priorSessionId) }
+                guard !digest.text.isEmpty else { return (base, nil) }
                 var copy = base
                 copy.turnReach.digest = digest.text
                 return (copy, digest.priorSessionId)
             }
             guard let prior = try PriorChatSession.latest(excluding: sessionId, dataRoot: provider.dataRoot) else { return (base, nil) }
-            let (model, surface, message) = (base.modelId, base.surface, base.userMessage)
-            Task {
-                do { _ = try await provider.digest(forSessionId: sessionId, prior: prior, model: model, surface: surface, userMessage: message) }
-                catch {
-                    TurnTraceBus.fireFromContext(kind: "context.digest.failed", sessionId: sessionId, surface: surface,
-                        payload: .object(["reason": .string(String(describing: error))]))
-                }
+            _ = try await provider.digest(forSessionId: sessionId, prior: prior,
+                model: base.modelId, surface: base.surface, userMessage: base.userMessage)
+            guard let digest = try await provider.published(forSessionId: sessionId) else {
+                throw ChatOrchestrationError.underlying("The conversation handoff builder completed without publishing its result. Repair the session digest owner.")
             }
-            unavailable = "The handoff from your previous conversation with this participant was not ready for this message; the handoff builder is writing it from that conversation now. "
-                + SessionDigestProvider.pointerSentence(sessionId: prior.id)
+            var copy = base
+            if !digest.text.isEmpty { copy.turnReach.digest = digest.text }
+            return (copy, digest.priorSessionId.isEmpty ? nil : digest.priorSessionId)
         } catch {
             if error is CancellationError { throw error }
             try Task.checkCancellation()
@@ -437,8 +423,7 @@ extension SwiftNativeTurnEngine {
                 kind: "context.digest.failed", sessionId: sessionId, surface: base.surface,
                 payload: .object(["reason": .string(String(describing: error))])
             )
-            unavailable = "The handoff from your previous conversation with this participant could not be read (\(error.localizedDescription))."
+            throw TurnEngineError.contextLoadFailed(underlying: error)
         }
-        return (contextByAppendingRuntimeContext(base, runtimeContext: unavailable), nil)
     }
 }

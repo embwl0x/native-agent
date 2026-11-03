@@ -8,7 +8,7 @@ import NativeAgentCore
 // Blueprint: | `NativeAgentA2AGRPCService.swift` | gRPC authentication, protocol/error projection and acknowledged stream delivery |
 
 /// Protobuf is a wire projection of the same canonical endpoint used by JSON-RPC and HTTP+JSON.
-struct AgentA2AGRPCEndpoint: Lf_A2a_V1_A2AService.ServiceProtocol {
+struct AgentA2AGRPCEndpoint: Lf_A2a_V1_A2AService.StreamingServiceProtocol {
     let endpoint: @Sendable () -> AgentContactA2AEndpoint
     let authenticate: @Sendable (Metadata) throws -> AgentBridgePrincipal
 
@@ -74,24 +74,29 @@ struct AgentA2AGRPCEndpoint: Lf_A2a_V1_A2AService.ServiceProtocol {
         return try Output(jsonUTF8Data: bytes)
     }
 
-    private func unary<Input: SwiftProtobuf.Message, Output: SwiftProtobuf.Message>(_ request: ServerRequest<Input>, method: String) async throws -> ServerResponse<Output> {
-        // gRPC replies never acknowledge a fetch; HTTP transports own onSent.
-        guard case .json(let value, _) = try await handle(request, method: method) else {
+    private func unary<Input: SwiftProtobuf.Message, Output: SwiftProtobuf.Message>(_ request: StreamingServerRequest<Input>, method: String) async throws -> StreamingServerResponse<Output> {
+        guard case .json(let value, let onSent) = try await handle(ServerRequest(stream: request), method: method) else {
             throw RPCError(code: .internalError, message: "Unexpected stream")
         }
-        return ServerResponse(message: try decode(value))
+        let message: Output = try decode(value)
+        return StreamingServerResponse { writer in
+            try await writer.write(message)
+            await onSent?()
+            return [:]
+        }
     }
 
-    private func stream<Input: SwiftProtobuf.Message>(_ request: ServerRequest<Input>, method: String) async throws -> StreamingServerResponse<Lf_A2a_V1_StreamResponse> {
-        switch try await handle(request, method: method) {
+    private func stream<Input: SwiftProtobuf.Message>(_ request: StreamingServerRequest<Input>, method: String) async throws -> StreamingServerResponse<Lf_A2a_V1_StreamResponse> {
+        switch try await handle(ServerRequest(stream: request), method: method) {
         case .json(let value, _):
             let _: Lf_A2a_V1_StreamResponse = try decode(value)
             throw RPCError(code: .internalError, message: "Expected stream")
-        case .stream(_, let events, _):
+        case .stream(_, let events, _, let onSent):
             return StreamingServerResponse { writer in
                 for await event in events {
                     try Task.checkCancellation()
                     try await writer.write(try decode(NativeAgentA2AWire.event(event, id: "grpc", version: "1.0")))
+                    await onSent(event)
                     switch event {
                     case .snapshot(let task), .status(let task, _):
                         if task.state.terminal || task.state == .inputRequired { return [:] }
@@ -103,37 +108,37 @@ struct AgentA2AGRPCEndpoint: Lf_A2a_V1_A2AService.ServiceProtocol {
         }
     }
 
-    func sendMessage(request: ServerRequest<Lf_A2a_V1_SendMessageRequest>, context: ServerContext) async throws -> ServerResponse<Lf_A2a_V1_SendMessageResponse> {
+    func sendMessage(request: StreamingServerRequest<Lf_A2a_V1_SendMessageRequest>, context: ServerContext) async throws -> StreamingServerResponse<Lf_A2a_V1_SendMessageResponse> {
         try await unary(request, method: "SendMessage")
     }
-    func sendStreamingMessage(request: ServerRequest<Lf_A2a_V1_SendMessageRequest>, context: ServerContext) async throws -> StreamingServerResponse<Lf_A2a_V1_StreamResponse> {
+    func sendStreamingMessage(request: StreamingServerRequest<Lf_A2a_V1_SendMessageRequest>, context: ServerContext) async throws -> StreamingServerResponse<Lf_A2a_V1_StreamResponse> {
         try await stream(request, method: "SendStreamingMessage")
     }
-    func getTask(request: ServerRequest<Lf_A2a_V1_GetTaskRequest>, context: ServerContext) async throws -> ServerResponse<Lf_A2a_V1_Task> {
+    func getTask(request: StreamingServerRequest<Lf_A2a_V1_GetTaskRequest>, context: ServerContext) async throws -> StreamingServerResponse<Lf_A2a_V1_Task> {
         try await unary(request, method: "GetTask")
     }
-    func listTasks(request: ServerRequest<Lf_A2a_V1_ListTasksRequest>, context: ServerContext) async throws -> ServerResponse<Lf_A2a_V1_ListTasksResponse> {
+    func listTasks(request: StreamingServerRequest<Lf_A2a_V1_ListTasksRequest>, context: ServerContext) async throws -> StreamingServerResponse<Lf_A2a_V1_ListTasksResponse> {
         try await unary(request, method: "ListTasks")
     }
-    func cancelTask(request: ServerRequest<Lf_A2a_V1_CancelTaskRequest>, context: ServerContext) async throws -> ServerResponse<Lf_A2a_V1_Task> {
+    func cancelTask(request: StreamingServerRequest<Lf_A2a_V1_CancelTaskRequest>, context: ServerContext) async throws -> StreamingServerResponse<Lf_A2a_V1_Task> {
         try await unary(request, method: "CancelTask")
     }
-    func subscribeToTask(request: ServerRequest<Lf_A2a_V1_SubscribeToTaskRequest>, context: ServerContext) async throws -> StreamingServerResponse<Lf_A2a_V1_StreamResponse> {
+    func subscribeToTask(request: StreamingServerRequest<Lf_A2a_V1_SubscribeToTaskRequest>, context: ServerContext) async throws -> StreamingServerResponse<Lf_A2a_V1_StreamResponse> {
         try await stream(request, method: "SubscribeToTask")
     }
-    func createTaskPushNotificationConfig(request: ServerRequest<Lf_A2a_V1_TaskPushNotificationConfig>, context: ServerContext) async throws -> ServerResponse<Lf_A2a_V1_TaskPushNotificationConfig> {
+    func createTaskPushNotificationConfig(request: StreamingServerRequest<Lf_A2a_V1_TaskPushNotificationConfig>, context: ServerContext) async throws -> StreamingServerResponse<Lf_A2a_V1_TaskPushNotificationConfig> {
         try await unary(request, method: "CreateTaskPushNotificationConfig")
     }
-    func getTaskPushNotificationConfig(request: ServerRequest<Lf_A2a_V1_GetTaskPushNotificationConfigRequest>, context: ServerContext) async throws -> ServerResponse<Lf_A2a_V1_TaskPushNotificationConfig> {
+    func getTaskPushNotificationConfig(request: StreamingServerRequest<Lf_A2a_V1_GetTaskPushNotificationConfigRequest>, context: ServerContext) async throws -> StreamingServerResponse<Lf_A2a_V1_TaskPushNotificationConfig> {
         try await unary(request, method: "GetTaskPushNotificationConfig")
     }
-    func listTaskPushNotificationConfigs(request: ServerRequest<Lf_A2a_V1_ListTaskPushNotificationConfigsRequest>, context: ServerContext) async throws -> ServerResponse<Lf_A2a_V1_ListTaskPushNotificationConfigsResponse> {
+    func listTaskPushNotificationConfigs(request: StreamingServerRequest<Lf_A2a_V1_ListTaskPushNotificationConfigsRequest>, context: ServerContext) async throws -> StreamingServerResponse<Lf_A2a_V1_ListTaskPushNotificationConfigsResponse> {
         try await unary(request, method: "ListTaskPushNotificationConfigs")
     }
-    func deleteTaskPushNotificationConfig(request: ServerRequest<Lf_A2a_V1_DeleteTaskPushNotificationConfigRequest>, context: ServerContext) async throws -> ServerResponse<Google_Protobuf_Empty> {
+    func deleteTaskPushNotificationConfig(request: StreamingServerRequest<Lf_A2a_V1_DeleteTaskPushNotificationConfigRequest>, context: ServerContext) async throws -> StreamingServerResponse<Google_Protobuf_Empty> {
         try await unary(request, method: "DeleteTaskPushNotificationConfig")
     }
-    func getExtendedAgentCard(request: ServerRequest<Lf_A2a_V1_GetExtendedAgentCardRequest>, context: ServerContext) async throws -> ServerResponse<Lf_A2a_V1_AgentCard> {
+    func getExtendedAgentCard(request: StreamingServerRequest<Lf_A2a_V1_GetExtendedAgentCardRequest>, context: ServerContext) async throws -> StreamingServerResponse<Lf_A2a_V1_AgentCard> {
         try await unary(request, method: "GetExtendedAgentCard")
     }
 }

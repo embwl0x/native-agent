@@ -8,15 +8,27 @@ extension QuietSettings {
     @MainActor
     public static func mobileSettings(host: any QuietSettingsHost) async throws -> [MobileAppSetting] {
         var rows: [MobileAppSetting] = []
-        for setting in QuietSettings.all(host: host, snapshotBots: true) {
-            rows.append(await Self.row(setting, host: host))
+        // Phone-local settings already live in its native controls. Do not echo
+        // a request to the phone while it is waiting for this Mac projection.
+        for setting in try QuietSettings.all(host: host, snapshotBots: true) where !setting.id.hasPrefix("phone.") {
+            try Task.checkCancellation()
+            do {
+                rows.append(try await Self.row(setting, host: host))
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                rows.append(MobileAppSetting(
+                    id: setting.id, page: setting.page, label: setting.label, type: setting.kind.rawValue,
+                    choices: [], writable: false, value: nil, unavailableReason: error.localizedDescription))
+            }
         }
+        try Task.checkCancellation()
         return rows
     }
 
     @MainActor
     public static func setMobileSetting(host: any QuietSettingsHost, id: String, value: String, actionID: String, clientID: String) async throws -> MobileAppSetting {
-        guard let setting = QuietSettings.all(host: host).first(where: { $0.id == id }) else {
+        guard let setting = try QuietSettings.all(host: host).first(where: { $0.id == id }) else {
             throw QuietSettingError.badValue("No setting is called \(id). Refresh the settings list.")
         }
         guard Self.writable(setting), let write = setting.write else {
@@ -28,7 +40,7 @@ extension QuietSettings {
                 try await write(host, wanted)
             }
         }
-        return await Self.row(setting, host: host)
+        return try await Self.row(setting, host: host)
     }
 
     /// Every row with a setter, except Trust: its posture and the switches
@@ -38,24 +50,24 @@ extension QuietSettings {
     }
 
     @MainActor
-    private static func row(_ setting: QuietSetting, host: any QuietSettingsHost) async -> MobileAppSetting {
+    private static func row(_ setting: QuietSetting, host: any QuietSettingsHost) async throws -> MobileAppSetting {
         MobileAppSetting(
             id: setting.id, page: setting.page, label: setting.label, type: setting.kind.rawValue,
-            choices: await setting.liveChoices?({ host }) ?? setting.choices,
+            choices: try await setting.liveChoices?({ host }) ?? setting.choices,
             writable: writable(setting),
-            value: text(await setting.read(host))
+            value: try text(try await setting.read(host))
         )
     }
 
-    private static func text(_ value: JSONValue) -> String {
+    private static func text(_ value: JSONValue) throws -> String {
         switch value {
         case .null: return ""
         case .bool(let flag): return flag ? "true" : "false"
         case .int(let number): return String(number)
         case .double(let number): return String(number)
         case .string(let raw): return raw
-        case .array(let items): return items.map(text).joined(separator: "\n")
-        case .object: return (try? value.serialize(pretty: false)) ?? ""
+        case .array(let items): return try items.map(text).joined(separator: "\n")
+        case .object: return try value.serialize(pretty: false)
         }
     }
 

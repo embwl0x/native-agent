@@ -10,14 +10,13 @@ import Desk
 import StandingBots
 import Transcripts
 import ChatToolParsing
-// Blueprint: | `DelegationContactEvidence.swift` | Contact-specific retained delivery evidence, lifecycle ordering and scalar interpretation |
+// Blueprint: | `DelegationContactEvidence.swift` | Contact-specific retained delivery evidence with recorded job IDs and execution-only completion timestamps; transport times order receipts without becoming completion; pending Codex observation failures keep unknown execution without a stall verdict |
 
 extension DelegationStatusProjector {
     // MARK: - Claude projection
 
     static func projectClaude(url: URL, now: Date, object job: [String: JSONValue]) -> DelegationReadout? {
-        // messageId is the claude record's identity (it is also the filename stem). Fall back to the stem so a record that lost the field still shows up addressable rather than being dropped.
-        let id = string(job, "messageId") ?? url.deletingPathExtension().lastPathComponent
+        guard let id = string(job, "messageId") else { return nil }
         let createdAt = string(job, "createdAt")
         let claimedAt = string(job, "claimedAt")
         let startedAt = string(job, "startedAt")
@@ -70,7 +69,7 @@ extension DelegationStatusProjector {
             startedAt: startedAt,
             lastLiveness: liveness,
             completedAt: completedAt,
-            elapsedSeconds: elapsed,
+            elapsedSeconds: terminal && date(completedAt) == nil ? nil : elapsed,
             stalled: stalled,
             stallBasis: basis,
             deliveryLost: job["deliveryLost"]?.boolValue,
@@ -93,7 +92,7 @@ extension DelegationStatusProjector {
     // MARK: - Codex projection
 
     static func projectCodex(url: URL, undelivered: Bool, now: Date, object job: [String: JSONValue]) -> DelegationReadout? {
-        let id = string(job, "id") ?? url.deletingPathExtension().lastPathComponent
+        guard let id = recordedLookupID(job["id"]) else { return nil }
         let createdAt = string(job, "createdAt")
         // boundAt is when the watcher bound this job to a live turn — the closest analogue the codex record has to claude's claimedAt.
         let claimedAt = string(job, "boundAt")
@@ -102,8 +101,11 @@ extension DelegationStatusProjector {
         if case .object(let exec)? = job["completedExecution"], case .object(let tr)? = exec["turnResult"] {
             turnResult = tr
         }
-        let completedAt = string(turnResult, "completedAt")
+        let pendingObservationStatus = nestedString(job, objectKey: "lastWait", field: "status")
         let runStatus = string(turnResult, "status")
+            ?? (pendingObservationStatus == "observation_unavailable" ? pendingObservationStatus : nil)
+        let observationUnavailable = runStatus == "observation_unavailable"
+        let completedAt = observationUnavailable ? nil : string(turnResult, "completedAt")
 
         var probe: [String: JSONValue] = [:]
         if case .object(let value)? = job["stallProbe"] { probe = value }
@@ -119,15 +121,15 @@ extension DelegationStatusProjector {
         let end = date(completedAt) ?? now
         let elapsed = start.map { Int(max(0, end.timeIntervalSince($0)).rounded()) }
 
-        let terminal = completedAt != nil || !turnResult.isEmpty
+        let terminal = !observationUnavailable && (completedAt != nil || !turnResult.isEmpty)
         let (idleStalled, idleBasis, stallDeadline) = stallVerdict(
             terminal: terminal, deadlineAt: nil,
             stallSeconds: probe["idleThresholdMs"]?.numberValue(coercingStrings: true, finiteOnly: false).map { $0 / 1000 },
             lastLiveness: liveness, now: now
         )
         let recordedStall = runStatus == "stalled" || runStatus == "failed_hung"
-        let stalled = recordedStall || idleStalled
-        let basis: DelegationReadout.StallBasis = recordedStall ? .recordedStall
+        let stalled = !observationUnavailable && (recordedStall || idleStalled)
+        let basis: DelegationReadout.StallBasis = observationUnavailable ? .none : recordedStall ? .recordedStall
             : idleBasis == .stallSeconds ? .rolloutIdle : idleBasis
         var recordedDeliveryStatus: String?
         var recordedDeliveryOutcome: String?
@@ -138,13 +140,13 @@ extension DelegationStatusProjector {
         let deliveryOutcome = recordedDeliveryOutcome ?? (undelivered ? "unknown" : nil)
         let recordedPhase = string(job, "phase")
         let effectiveState: String? = {
+            if observationUnavailable { return "observation_unavailable" }
             guard terminal else { return recordedPhase }
             switch deliveryOutcome {
             case "delivered": return "settled"
             case "unknown": return "delivery_unknown"
             default:
-                // Old records predate the explicit execution/delivery split. Their completedExecution is canonical terminal evidence, so never repeat the stale pre-terminal `watching_turn` label.
-                return recordedPhase == "watching_turn" ? "execution_completed" : recordedPhase
+                return recordedPhase
             }
         }()
 
@@ -163,7 +165,7 @@ extension DelegationStatusProjector {
             startedAt: nil,  // codex records no runner start; boundAt is the closest
             lastLiveness: liveness,
             completedAt: completedAt,
-            elapsedSeconds: elapsed,
+            elapsedSeconds: terminal && date(completedAt) == nil ? nil : elapsed,
             stalled: stalled,
             stallBasis: basis,
             // The codex record has NO deliveryLost field, and living under undelivered/ does not prove loss — it proves the bridge could not confirm the outcome. So `deliveryLost` stays nil and the disposition is reported as "unknown"
@@ -173,15 +175,16 @@ extension DelegationStatusProjector {
             completionTextHead: head(string(turnResult, "message") ?? string(turnResult, "lastAgentMessage")),
             producerSchemaVersion: codexProducerSchemaVersion(job),
             producerSourceRevision: codexProducerSourceRevision(job),
-            stallDeadline: stallDeadline
+            stallDeadline: observationUnavailable ? nil : stallDeadline
         )
         row.recencyKey = firstDate(completedAt, watcherObservedAt, liveness, claimedAt, createdAt)
-        row.watcherObservedAt = watcherObservedAt
+        row.watcherObservedAt = string(turnResult, "observedAt") ?? watcherObservedAt
         let evidence = terminal ? turnResult : probe
         row.toolActivityCount = int(evidence, "toolActivityCount")
         row.noWorkObserved = evidence["noWorkObserved"]?.boolValue
         if case .object(let recovery)? = turnResult["hangRecovery"] { row.recoveryStatus = string(recovery, "status") }
         row.executionError = Self.codexExecutionError(turnResult)
+            ?? head(nestedString(job, objectKey: "observationFailure", field: "error"))
         row.recordKind = undelivered ? "retained_reply_job" : "reply_job"
         row.completionDeliveryID = id
         Self.retainReply(string(turnResult, "message") ?? string(turnResult, "lastAgentMessage"), truncated: false, in: &row)
@@ -213,24 +216,12 @@ extension DelegationStatusProjector {
             var bridge: [String: JSONValue] = [:]
             if case .object(let value)? = delivery["bridge"] { bridge = value }
             let runStatus = string(turnResult, "status")
-            let completedAt = string(turnResult, "completedAt") ?? string(delivery, "createdAt") ?? string(delivery, "settledAt")
+            let completedAt = runStatus == "observation_unavailable" ? nil
+                : string(turnResult, "completedAt")
             let bridgeStatus = string(bridge, "status")
             let replyStatus = string(bridge, "replyStatus")
-            // Older receipts have no explicit persistence flag, but retain the chat return and its separate notification settlement.
-            var completionDelivery: [String: JSONValue] = [:]
-            if case .object(let value)? = bridge["completionDelivery"] { completionDelivery = value }
             let persisted = bridge["replyPersisted"]?.boolValue == true
-                || (string(bridge, "nativeAgentReplyPreview")?.isEmpty == false
-                    && string(bridge, "nativeAgentSessionId") != nil
-                    && string(bridge, "nativeAgentSessionId") == string(delivery, "sessionId")
-                    && string(completionDelivery, "surface") != nil
-                    && string(completionDelivery, "surface") != "caller-result")
-            let outcome: String? = string(delivery, "settlement") ?? { switch (persisted, bridgeStatus, replyStatus) {
-            case (true, _, _), (_, "delivered", _), (_, _, "ok"): "delivered"
-            // A failed POST or notification proves neither transcript absence nor a delivery deadline. Keep uncertainty instead of minting loss.
-            case (_, .some, _), (_, _, .some): "unknown"
-            default: nil
-            } }()
+            let outcome = string(delivery, "settlement")
             let effectiveState: String = switch outcome {
             case "delivered": "settled"
             case "unknown": "delivery_unknown"
@@ -264,12 +255,13 @@ extension DelegationStatusProjector {
                     producerSourceRevision: nil,
                     stallDeadline: nil
                 )
-                row.recencyKey = date(completedAt)
+                row.recencyKey = firstDate(completedAt, string(delivery, "createdAt"), string(delivery, "settledAt"))
                 row.executionError = Self.codexExecutionError(turnResult)
                 row.toolActivityCount = int(turnResult, "toolActivityCount")
                 row.noWorkObserved = turnResult["noWorkObserved"]?.boolValue
                 if case .object(let recovery)? = turnResult["hangRecovery"] { row.recoveryStatus = string(recovery, "status") }
                 row.recordKind = "delivery_receipt"
+                row.deliveryUpdatedAt = string(delivery, "createdAt")
                 row.completionDeliveryID = string(delivery, "jobId")
                 row.deliveryReceiptVersion = [string(delivery, "createdAt"),
                     string(delivery, "threadId"), string(delivery, "turnId"),
@@ -293,7 +285,7 @@ extension DelegationStatusProjector {
 
     /// OMP keeps settled job records, like Claude, but writes the delivery result as a nested `bridge.status` and the topic inside `payload`.
     static func projectOMP(url: URL, now: Date, object job: [String: JSONValue]) -> DelegationReadout? {
-        let id = string(job, "messageId") ?? url.deletingPathExtension().lastPathComponent
+        guard let id = recordedLookupID(job["messageId"]) else { return nil }
         let createdAt = string(job, "createdAt")
         let startedAt = string(job, "startedAt")
         let completedAt = string(job, "completedAt")
@@ -319,9 +311,7 @@ extension DelegationStatusProjector {
         // Decode historical combined verdicts only when the turn's own verdict is absent.
         let received = int(bridge, "httpStatus") == 200 && string(payload, "sessionId") != nil
             && string(bridge, "nativeAgentSessionId") == string(payload, "sessionId")
-            && (string(bridge, "execution_result_class").map { $0 == "succeeded" }
-                ?? ["ok", "delivery_failed_pre_dispatch", "delivery_rejected", "delivery_lifecycle_unavailable",
-                    "delivery_in_progress", "outcome_unknown", "completion_already_settled"].contains(string(bridge, "replyStatus") ?? ""))
+            && string(bridge, "execution_result_class") == "succeeded"
         let delivery: String? = switch (received, bridgeStatus) {
         // A dry run made no POST, regardless of other retained bridge fields.
         case (_, "dry_run"): "dry_run"
@@ -349,7 +339,7 @@ extension DelegationStatusProjector {
             startedAt: startedAt,
             lastLiveness: liveness,
             completedAt: completedAt,
-            elapsedSeconds: elapsed,
+            elapsedSeconds: terminal && date(completedAt) == nil ? nil : elapsed,
             stalled: stalled,
             stallBasis: basis,
             deliveryLost: delivery == "lost" ? true : nil,
@@ -368,7 +358,10 @@ extension DelegationStatusProjector {
         row.acceptedMessageIDs = Set([Self.recordedLookupID(job["messageId"])].compactMap { $0 })
         // What was sent, and why a failed run failed (a provider's error, else the runner's reason).
         row.requestTextHead = head(string(payload, "text"))
-        if status == "failed" { row.executionError = head(string(job, "assistantError") ?? string(job, "reason")) }
+        row.executionError = head(nestedString(job, objectKey: "ownerFailure", field: "error"))
+        if status == "failed" {
+            row.executionError = row.executionError ?? head(string(job, "assistantError") ?? string(job, "reason"))
+        }
         if delivery == "blocked", string(bridge, "reason") == "missing_origin_session" {
             row.deliveryReason = "missing_origin_session"
         }
@@ -476,10 +469,11 @@ extension DelegationStatusProjector {
         return (false, .none, nil)
     }
 
-    /// The helper retains provider failures even when no final reply exists. Surface only that terminal error, never the surrounding diagnostics or an inferred retry instruction. Absence remains absence of evidence.
+    /// The helper retains provider failures and unavailable completion evidence.
+    /// The returned cause does not decide execution or delivery status.
     static func codexExecutionError(_ result: [String: JSONValue]) -> String? {
         guard let status = string(result, "status"),
-              ["failed", "error", "timed_out", "timeout"].contains(status.lowercased()) else { return nil }
+              ["failed", "error", "timed_out", "timeout", "observation_unavailable"].contains(status.lowercased()) else { return nil }
         let nested: String? = {
             guard case .object(let error)? = result["error"] else { return nil }
             return string(error, "message")

@@ -16,7 +16,9 @@ extension FileSenseRegistry {
             let version = store.senses[try Self.index(id, in: store)].current
             guard version.record.language != .native else { throw Self.failure("Built-in native code cannot be shared as a portable sense.") }
             guard userApproved else { return (false, .approvalNeeded(senseID: id)) }
-            let files = try self.sourceFiles(version.record).filter { version.files.contains($0.key) }
+            if let failure = version.sourceFailure { throw Self.failure(failure) }
+            guard let names = version.files else { throw Self.failure("Sense source membership has not been checked.") }
+            let files = try self.sourceFiles(version.record).filter { names.contains($0.key) }
             var record = version.record
             // Local paths and usage history do not travel with code.
             record.reach.readPaths = []

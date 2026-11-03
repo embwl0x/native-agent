@@ -10,7 +10,7 @@ import Desk
 import StandingBots
 import Transcripts
 import ChatToolParsing
-// Blueprint: | `DelegationReadout.swift` | Delegation read values, source availability and retained status snapshots |
+// Blueprint: | `DelegationReadout.swift` | Delegation read values, source availability and retained status snapshots; delivery-owner update times remain distinct from execution completion |
 
 // MARK: - Delegation status projection
 // The bridge writers own their distinct record shapes; this reader joins job
@@ -87,6 +87,8 @@ public struct DelegationReadout: Sendable, Equatable {
     public var deliveryLost: Bool?
     /// Receipt or reconciled settlement; retained files alone never prove loss.
     public var deliveryOutcome: String?
+    /// Raw delivery-owner update time; never an execution completion timestamp.
+    public var deliveryUpdatedAt: String? = nil
     /// Allowlisted machine reason only; never raw helper errors or prose.
     public var deliveryReason: String? = nil
     public var onwardDelivery: JSONValue? = nil
@@ -154,6 +156,7 @@ public struct DelegationReadout: Sendable, Equatable {
         put("conversation_id", conversationID)
         obj["accepted_message_ids"] = .array(acceptedMessageIDs.sorted().map(JSONValue.string))
         put("delivery_outcome", deliveryOutcome)
+        put("delivery_updated_at", deliveryUpdatedAt)
         put("delivery_reason", deliveryReason)
         if let onwardDelivery { obj["onward_delivery"] = onwardDelivery }
         put("producer_source_revision", producerSourceRevision)
@@ -185,11 +188,12 @@ package struct DelegationSourceAvailability: Sendable {
     package var readableRecords = 0
     package var malformedRecords = 0
     package var unreadableFiles = 0
+    package var detail: String? = nil
 
     package var json: JSONValue {
         .object(["source": .string(source), "agent": .string(agent), "status": .string(status),
                  "readable_records": .int(Int64(readableRecords)), "malformed_records": .int(Int64(malformedRecords)),
-                 "unreadable_files": .int(Int64(unreadableFiles))])
+                 "unreadable_files": .int(Int64(unreadableFiles)), "detail": detail.map(JSONValue.string) ?? .null])
     }
 }
 

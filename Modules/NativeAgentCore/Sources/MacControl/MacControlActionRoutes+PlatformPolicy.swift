@@ -14,20 +14,22 @@ public struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
         self.operatorOrigin = operatorOrigin
     }
 
-    public func currentPolicy() async -> MacControlPolicy? {
-        guard let snapshot = try? await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked() else { return nil }
+    public func currentPolicy() async throws -> MacControlPolicy {
+        let snapshot = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
         let policy = MacControlPolicy.fromTrustPolicyObject(snapshot.policy, dataRoot: dataRoot)
         guard let operatorOrigin else { return policy }
         let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
-            origin: operatorOrigin
+            origin: operatorOrigin, snapshot: snapshot
         )
+        guard authority.state != .unavailable else { throw SavedTrustPolicyAuthority.unavailable(authority.reason) }
         return MacControlGate.policyForAdmittedFullMac(policy, admitted: authority.admitted)
     }
 
     /// Raw doors (the phone remote, a bridge) meet "Pause everything" for
     /// every action, and the permission law for a command line, here. A raw
-    /// AppleScript can `do shell script`, so it is one: judged by the shell's
-    /// declaration, never its script. The person's own Mac workbench is his decision.
+    /// AppleScript entry retains shell-tier admission; its declared app and
+    /// per-event target checks constrain execution, without inspecting command
+    /// text for authority. The person's own Mac workbench is his decision.
     public func authorize(tool: String, input: [String: JSONValue]) async -> (level: String, reason: String, remedy: JSONValue?)? {
         guard operatorOrigin == nil else { return nil }
         do {
@@ -36,7 +38,7 @@ public struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
                 return ("blocked", paused.reason, paused.remedy)
             }
             guard tool == "shell" || tool == "applescript" else { return nil }
-            let answer = PermissionLaw.answer(tool: "shell", input: tool == "shell" ? input : nil,
+            let answer = try PermissionLaw.answer(tool: "shell", input: tool == "shell" ? input : nil,
                                               policy: snapshot.policy, dataRoot: dataRoot)
             return (answer.level, answer.reason, answer.remedy)
         } catch {

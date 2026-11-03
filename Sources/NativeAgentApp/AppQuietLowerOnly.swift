@@ -18,8 +18,12 @@ import TrustCenter
 
 extension AppQuietSettingsHost {
     var statusForAgent: String { appModel.statusForAgent }
-    var activityCaptureEnabled: Bool { appModel.engine.activityWatch.policy.captureEnabled }
-    var activityModelAccessEnabled: Bool { appModel.engine.activityWatch.policy.allowModelAccess }
+    var activityCaptureEnabled: Bool {
+        get async throws { try await appModel.engine.activityWatch.checkedPolicy().captureEnabled }
+    }
+    var activityModelAccessEnabled: Bool {
+        get async throws { try await appModel.engine.activityWatch.checkedPolicy().allowModelAccess }
+    }
     var restartQuietTelegram: @Sendable () async -> Void {
         { [loops = appModel.backgroundLoopsManager] in _ = await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll", manager: loops) }
     }
@@ -36,9 +40,12 @@ extension AppQuietSettingsHost {
             model: "", reasoningEffort: "", enabled: enabled)
     }
     func refreshQuietTelegram() async { _ = await appModel.refreshTelegram() }
-    func slackIsEnabled() async -> Bool {
-        (try? await appModel.engine.connectors.refresh().get())?
-            .first(where: { $0.id == "slack" })?.enabled == true
+    func slackIsEnabled() async throws -> Bool {
+        let connectors = try await appModel.engine.connectors.refresh().get()
+        guard let slack = connectors.first(where: { $0.id == "slack" }) else {
+            throw QuietSettingError.unavailable("Slack is absent from the checked connector inventory. Read Connectors before changing its ingress policy.")
+        }
+        return slack.enabled
     }
     func refreshQuietConnectors() async { _ = await appModel.refreshForSidebarItem(.connectors) }
     func slackIngressPolicy(dataRoot: URL) throws -> (allowedChannelIds: Set<String>, allowedUserIds: Set<String>, requireMention: Bool) {
@@ -130,9 +137,8 @@ extension AppQuietToolHost {
         case "telegram_disconnect":
             // Telegram's Disconnect. The poll loop restarts only once every
             // Telegram turn is done: its shutdown awaits them, this one too.
-            guard await appModel.refreshTelegram() else {
-                return AppToolExecutor.failure("telegram_disconnect_failed", "Telegram didn't read; nothing was removed.")
-            }
+            // Disconnect reads checked metadata itself; a Keychain read fault
+            // cannot make the current settings disappear or block revocation.
             let result = await appModel.clearTelegramToken(restartPollLoop: false)
             let loops = appModel.backgroundLoopsManager
             Task.detached {

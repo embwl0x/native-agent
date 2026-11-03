@@ -41,7 +41,7 @@ extension BuiltInToolSchemaFactory {
                 ], required: ["origin", "destination"])
             ),
             requestedSchema(name: "web_search", toolClass: .read,
-                description: "Search the web through SearXNG: its results, or its failure said plainly. On a Mac without SearXNG the result hands you browser_search, the same search in Chrome (or your own browser), to run and read. categories=news (or it, science) searches that SearXNG category. time_range=day|week|month|year asks for recent pages. Returns titles, URLs and snippets, the route and its time.",
+                description: "Search the web through SearXNG: its results, or its failure with setup or repair guidance. An unconfigured SearXNG returns search unavailable. categories=news (or it, science) searches that SearXNG category. time_range=day|week|month|year asks for recent pages. Returns titles, URLs and snippets, the route and its time.",
                 parametersJSON: ToolSchema.params(properties: [
                     ("query", ToolSchema.strSchema()),
                     ("categories", ToolSchema.strSchema("Optional SearXNG category, such as news, it or science.")),

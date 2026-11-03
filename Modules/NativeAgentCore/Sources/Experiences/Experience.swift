@@ -265,6 +265,11 @@ public actor ExperienceStore {
     /// journal), in an owner-only folder so its sidecars are private from the first byte.
     private func database() throws -> DatabasePool {
         if let opened { return opened }
+        let newStore: Bool
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: path.path)
+            newStore = false
+        } catch CocoaError.fileReadNoSuchFile { newStore = true }
         let folder = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: NSNumber(value: Int16(0o700))])
@@ -274,27 +279,29 @@ public actor ExperienceStore {
         config.busyMode = .timeout(2)
         config.prepareDatabase { db in try db.execute(sql: "PRAGMA journal_size_limit = 4194304") }
         let pool = try DatabasePool(path: path.path, configuration: config)
-        var migrator = DatabaseMigrator()
-        migrator.registerMigration("v1") { db in
-            try db.execute(sql: """
-                CREATE TABLE experience (id TEXT PRIMARY KEY NOT NULL, kind TEXT NOT NULL, at TEXT NOT NULL,
-                                         born TEXT NOT NULL, open INTEGER NOT NULL);
-                CREATE INDEX experience_open ON experience(at) WHERE open;
-                CREATE TABLE event (seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                                    experience_id TEXT NOT NULL REFERENCES experience(id),
-                                    at TEXT NOT NULL, event TEXT NOT NULL);
-                CREATE INDEX event_experience ON event(experience_id, seq);
-                """)
+        try pool.write { db in
+            if try db.tableExists("experience") {
+                let columns = Set(try db.columns(in: "experience").map(\.name))
+                guard columns.isSuperset(of: ["id", "kind", "at", "born", "open", "updated_at"]),
+                      try db.tableExists("event") else {
+                    throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: path.path])
+                }
+            } else {
+                guard newStore else {
+                    throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: path.path])
+                }
+                try db.execute(sql: """
+                    CREATE TABLE experience (id TEXT PRIMARY KEY NOT NULL, kind TEXT NOT NULL, at TEXT NOT NULL,
+                                             born TEXT NOT NULL, open INTEGER NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE INDEX experience_open ON experience(at) WHERE open;
+                    CREATE INDEX experience_recent ON experience(updated_at DESC);
+                    CREATE TABLE event (seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                                        experience_id TEXT NOT NULL REFERENCES experience(id),
+                                        at TEXT NOT NULL, event TEXT NOT NULL);
+                    CREATE INDEX event_experience ON event(experience_id, seq);
+                    """)
+            }
         }
-        migrator.registerMigration("projection") { db in
-            try db.execute(sql: """
-                ALTER TABLE experience ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
-                UPDATE experience SET updated_at = COALESCE(
-                    (SELECT MAX(at) FROM event WHERE experience_id = experience.id), at);
-                CREATE INDEX experience_recent ON experience(updated_at DESC);
-                """)
-        }
-        try migrator.migrate(pool)
         opened = pool
         return pool
     }

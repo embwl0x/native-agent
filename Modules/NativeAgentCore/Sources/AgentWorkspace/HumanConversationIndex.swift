@@ -2,14 +2,14 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
-// Blueprint: | `HumanConversationIndex.swift` | `HumanConversationIndex` enum; `rows`, `list` |
+// Blueprint: | `HumanConversationIndex.swift` | Current-source human index rows and bounded lists; unavailable source/revision never acquire invented provenance |
 
 package enum HumanConversationIndex {
     package static func rows(dataRoot: URL) throws -> [[String: JSONValue]] {
         try ChatSessionIndexFile.loadObjectRowsForMutation(at: dataRoot.appendingPathComponent("chat/sessions.json"))
             .filter { row in
-                let source = row["source"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "app"
-                return ["app", "chat", "mac", "telegram", "slack", "ios", "iphone", "mobile", "icloud"].contains(source)
+                guard let source = row["source"]?.stringValue else { return false }
+                return ["app", "telegram", "slack", "ios"].contains(source)
                     && row["archived"] != .bool(true)
                     && row["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }).flatMap(NativeAgentChatSessionID.normalizedPathComponent) != nil
             }
@@ -27,9 +27,9 @@ package enum HumanConversationIndex {
         let selected = rows.dropFirst(offset).prefix(limit)
         let conversations = selected.map { row -> JSONValue in
             .object(["conversation_session_id": row["id"] ?? .null, "title": row["title"] ?? .string("Conversation"),
-                "surface": row["source"] ?? .string("app"), "updated_at": row["updatedAt"] ?? .null,
-                "revision": .string(ChatSessionIndexFile.transcriptGeneration(in: row).map(String.init) ?? "legacy"),
-                "source_revision": .string(ChatSessionIndexFile.transcriptGeneration(in: row).map(String.init) ?? "legacy"),
+                "surface": row["source"] ?? .null, "updated_at": row["updatedAt"] ?? .null,
+                "revision": ChatSessionIndexFile.transcriptGeneration(in: row).map { .string(String($0)) } ?? .null,
+                "source_revision": ChatSessionIndexFile.transcriptGeneration(in: row).map { .string(String($0)) } ?? .null,
                 "preview": .string(String((shownPreview(row) ?? "").prefix(400)))])
         }
         let next = offset + selected.count

@@ -1,11 +1,12 @@
 // CognitiveSubstrate+InnerState.swift
 // Introspection pulls a bounded, pure projection of existing records without changing state or injecting context.
-// Felt readings expose labels and signals, never summaries or subject IDs; free text is limited to her care and stance.
+// Felt readings expose labels and signals, never summaries or subject IDs;
+// her cares and her own dream-authored self-reading retain their words.
 
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+InnerState.swift` | `CognitiveSubstrate.innerStateReading`: record-backed mind/body introspection, selection reasons and felt/care/toward projections |
+// Blueprint: | `CognitiveSubstrate+InnerState.swift` | `CognitiveSubstrate.innerStateReading`: record-backed mind/body introspection, felt/care/toward projections, standing day knowledge and the cached evidence-linked nightly self-reading |
 
 // MARK: - The reading
 
@@ -223,6 +224,9 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     public let timeOfDayPhase: String?
 
     public let expectations: [Expectation]
+    /// A pull-only account of his standing day claims, with confidence in words.
+    public let personDayTitle: String?
+    public let personDay: [String]
     /// The nearest open horizon, or nil when she is facing nothing — which
     /// renders as silence, not as a flat word.
     public let toward: Toward?
@@ -234,6 +238,10 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     /// `full` only: her depth changes and what her nights settled or let go,
     /// newest first, one plain line each.
     public let story: [String]
+    /// Her own bounded nightly reading, with its exact evidence and night.
+    public let selfKnowledge: CognitiveSelfKnowledge?
+    public let selfKnowledgeIssue: String?
+    public let carePeopleIssue: String?
 
     public init(
         generatedAt: Date,
@@ -252,11 +260,16 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         fatigue: Double? = nil,
         timeOfDayPhase: String? = nil,
         expectations: [Expectation] = [],
+        personDayTitle: String? = nil,
+        personDay: [String] = [],
         toward: Toward? = nil,
         dream: DreamResidue? = nil,
         growthWeek: [String] = [],
         cares: [Care] = [],
-        story: [String] = []
+        story: [String] = [],
+        selfKnowledge: CognitiveSelfKnowledge? = nil,
+        selfKnowledgeIssue: String? = nil,
+        carePeopleIssue: String? = nil
     ) {
         self.generatedAt = generatedAt
         self.windowHours = min(
@@ -288,6 +301,11 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
         self.growthWeek = detail == .full ? Array(growthWeek.prefix(Self.maximumGrowthWeekLines)) : []
         self.cares = detail == .full ? cares : Array(cares.prefix(Self.compactCares))
         self.story = detail == .full ? story : []
+        self.selfKnowledge = selfKnowledge
+        self.selfKnowledgeIssue = selfKnowledgeIssue
+        self.carePeopleIssue = carePeopleIssue
+        self.personDayTitle = personDayTitle.map { String($0.prefix(160)) }
+        self.personDay = personDay.prefix(3).map { String($0.prefix(400)) }
     }
 
     /// The honest "cognition is off" answer. Not zeros pretending to be a mood.
@@ -313,19 +331,25 @@ public struct CognitiveInnerStateOrganismReads: Sendable {
     /// The nearest open horizon, from the organism's horizon register.
     public var toward: OrganismTowardRead?
     public var expectations: [CognitiveInnerStateReading.Expectation]
+    public var personDayTitle: String?
+    public var personDay: [String]
 
     public init(
         projection: OrganismReadout? = nil,
         fatigue: Double? = nil,
         diurnal: OrganismDiurnalRead? = nil,
         toward: OrganismTowardRead? = nil,
-        expectations: [CognitiveInnerStateReading.Expectation] = []
+        expectations: [CognitiveInnerStateReading.Expectation] = [],
+        personDayTitle: String? = nil,
+        personDay: [String] = []
     ) {
         self.projection = projection
         self.fatigue = fatigue
         self.diurnal = diurnal
         self.toward = toward
         self.expectations = expectations
+        self.personDayTitle = personDayTitle
+        self.personDay = personDay
     }
 
     public static let none = CognitiveInnerStateOrganismReads()
@@ -352,9 +376,16 @@ extension CognitiveSubstrate {
             return .unavailable(at: now, windowHours: window, detail: detail)
         }
 
-        let read = await frozenRead(at: now)
+        let read = frozenRead(at: now)
+        // All substrate-owned inputs are captured before the growth face suspends.
+        let frozenDisposition = decayedDispositionValence(at: now, dynamics: read.personalityDynamics)
+        let frozenDream = innerStateDreamResidue()
+        let frozenStory = detail == .full ? careStoryLines() : []
+        let frozenSelf = selfKnowledge
+        let frozenSelfIssue = selfKnowledgeReadFailure
+        let frozenPeopleIssue = carePeopleReadFailure
+        let growthInput = detail == .full ? growthWeekInput(at: now) : nil
         let dyn = read.personalityDynamics
-        let currentAffect = read.affect
         let mood = read.mood
         // The canonical bounded workspace is selected on a copied field.
         let capsuleItems = read.workspace.items
@@ -370,8 +401,8 @@ extension CognitiveSubstrate {
         )
         let signals = feltSignalsForCapsule(
             from: capsuleItems, request: request, frozenRead: read)
-        let fingerprintParts = Self.feltFingerprintParts(
-            signals, intensityFloor: dyn.feltIntensityFloor)
+        let fingerprintParts = signals.flatMap { Self.feltFingerprintParts(
+            $0, intensityFloor: dyn.feltIntensityFloor) }
         let fingerprint = fingerprintParts?.text
 
         let dominant = Self.feltDominantNode(
@@ -386,7 +417,7 @@ extension CognitiveSubstrate {
         // the felt-day summary uses, so the two surfaces never disagree about
         // which moment mattered most.
         let windowSeconds = window * 3600
-        let feltCandidates = field.peekNodes()
+        let feltCandidates = read.snapshot.nodes
             .filter { node in
                 // Diagnostic traffic cannot contribute a lived feeling.
                 guard node.turnKind.contributesToLivedState else { return false }
@@ -453,6 +484,9 @@ extension CognitiveSubstrate {
                     arousal: node.arousal, warmth: node.warmth, selection: .recent)
             }
         let felt = Array(strongest) + recent
+        let growthLines: [String]
+        if let growthInput { growthLines = await growthWeek(input: growthInput).lines }
+        else { growthLines = [] }
 
         return CognitiveInnerStateReading(
             generatedAt: now,
@@ -464,13 +498,15 @@ extension CognitiveSubstrate {
             moodValence: mood.valence,
             moodBasis: mood.basis,
             moodWord: Self.innerStateMoodWord(mood.valence),
-            dispositionValence: decayedDispositionValence(at: now, dynamics: dyn),
-            dispositionWord: Self.innerStateDispositionWord(decayedDispositionValence(at: now, dynamics: dyn)),
+            dispositionValence: frozenDisposition,
+            dispositionWord: Self.innerStateDispositionWord(frozenDisposition),
             feltNodes: Array(felt),
             chemistryWords: Self.innerStateChemistryWords(organism.projection),
             fatigue: organism.fatigue,
             timeOfDayPhase: Self.innerStateTimeOfDayWord(organism.diurnal),
             expectations: organism.expectations,
+            personDayTitle: organism.personDayTitle,
+            personDay: organism.personDay,
             toward: organism.toward.map {
                 CognitiveInnerStateReading.Toward(
                     label: $0.displayLabel,
@@ -480,11 +516,11 @@ extension CognitiveSubstrate {
                     isOverdue: $0.isOverdue
                 )
             },
-            dream: innerStateDreamResidue(),
+            dream: frozenDream,
             // Computed only when she asked for `full` — the projection walks
             // the timeline, and "how are you" must stay cheap.
-            growthWeek: detail == .full ? await growthWeekLines(at: now) : [],
-            cares: cares.values.filter { $0.fadedAt == nil }
+            growthWeek: growthLines,
+            cares: read.cares.filter { $0.fadedAt == nil }
                 .map { (care: $0, charge: $0.charge(at: now)) }
                 .sorted { abs($0.charge) != abs($1.charge) ? abs($0.charge) > abs($1.charge)
                     : $0.care.updatedAt > $1.care.updatedAt }
@@ -495,7 +531,10 @@ extension CognitiveSubstrate {
                         open: $0.care.open, stance: $0.care.stance?.text,
                         because: $0.care.stance?.because, wouldChangeMind: $0.care.stance?.wouldChangeMind)
                 },
-            story: detail == .full ? careStoryLines() : []
+            story: frozenStory,
+            selfKnowledge: frozenSelf,
+            selfKnowledgeIssue: frozenSelfIssue,
+            carePeopleIssue: frozenPeopleIssue
         )
     }
 

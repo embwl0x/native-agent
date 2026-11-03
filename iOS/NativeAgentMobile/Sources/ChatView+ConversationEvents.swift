@@ -4,7 +4,7 @@ import UIKit
 import Speech
 import NativeAgentShared
 import UniformTypeIdentifiers
-// Blueprint: | `ChatView+ConversationEvents.swift` | Mounted reply observers, foreground refresh and session-bound dictation callbacks on ChatView |
+// Blueprint: | `ChatView+ConversationEvents.swift` | Attaches the store-owned reply receiver; foreground refresh and session-bound dictation callbacks on ChatView |
 
 extension ChatView {
     func restoreConversation() async {
@@ -38,7 +38,11 @@ extension ChatView {
         if MobileQuickAskRoute.consume() { composerIsFocused = true }
         consumeNotifiedChatSessionIfNeeded()
         importSharedItems()
-        store.onReply = { [voiceOutput] text in
+        store.onReply = { [voiceOutput, voiceInput, weak store] text, run in
+            guard !TalkModeController.shared.consumeEndedReply(run) else { return }
+            guard let store, ChatStore.visibleStore === store else { return }
+            guard !TalkModeController.shared.isPresented else { return }
+            guard !voiceInput.isListening, !voiceInput.isStarting else { return }
             voiceOutput.speak(text)
         }
         // Every session change ends dictation at the shared switch boundary.
@@ -46,31 +50,9 @@ extension ChatView {
             guard voiceInput.isListening || voiceInput.isStarting
                 || origin.wrappedValue != nil else { return }
             origin.wrappedValue = nil
-            voiceInput.stop()
+            voiceInput.cancel()
         }
-        if iCloudReplyObserverID == nil {
-            iCloudReplyObserverID = bridgeClient.observeICloudReplies { msg in
-                Task { @MainActor in
-                    await store.receiveICloudReply(msg)
-                }
-            }
-        }
-        if iCloudRejectionObserverID == nil {
-            iCloudRejectionObserverID = bridgeClient.observeICloudReplyRejections { rejection in
-                Task { @MainActor in
-                    store.receiveICloudRejection(rejection)
-                }
-            }
-        }
-        // Resync hints resume observation through the bridge's installed pairing key.
-        store.pendingRetryClient = bridgeClient
-        if iCloudResyncObserverID == nil {
-            iCloudResyncObserverID = bridgeClient.observeICloudResyncHints { hint in
-                Task { @MainActor in
-                    store.receiveICloudResyncHint(hint, client: bridgeClient)
-                }
-            }
-        }
+        store.attachReplyReceiver(using: bridgeClient)
         // Resume observing accepted exchanges without sending them again.
         store.resumeObservingPendingExchanges(using: bridgeClient)
         NativeAgentDeepLinkSendHook.deliverPending(
@@ -113,14 +95,10 @@ extension ChatView {
     }
 
     func conversationDisappeared() {
+        dictationSessionKey = nil
+        sendWhenDictationLands = false
+        voiceInput.cancel()
         if ChatStore.visibleStore === store { ChatStore.visibleStore = nil }
-        guard !store.hasPendingICloudReplies && !store.isLoading else { return }
-        bridgeClient.removeICloudReplyObserver(iCloudReplyObserverID)
-        bridgeClient.removeICloudReplyRejectionObserver(iCloudRejectionObserverID)
-        bridgeClient.removeICloudResyncHintObserver(iCloudResyncObserverID)
-        iCloudReplyObserverID = nil
-        iCloudRejectionObserverID = nil
-        iCloudResyncObserverID = nil
     }
 
     /// Final words and a pending one-tap send belong only to the dictated conversation.
@@ -130,13 +108,20 @@ extension ChatView {
         guard !newValue.isEmpty else { return }
         guard let origin = dictationSessionKey,
               origin == store.queueSessionKey(store.selectedSessionID) else { return }
-        if let attachment = voiceInput.lastAttachment { pendingFiles.append(attachment) }
+        // A voice note is spoken words sent on release; only the text travels.
+        if voiceInput.isVoiceNote, sendNow {
+            if store.send(text: newValue, client: bridgeClient, controls: runtimeControls) {
+                autoFollowChat = true
+                return
+            }
+            store.errorBanner = "Voice note kept in the draft. Reconnect and tap Send."
+        }
         if draft.text.isEmpty {
             draft.text = newValue
         } else {
             draft.text += " " + newValue
         }
-        if sendNow { DispatchQueue.main.async { submitMessage() } }
+        if sendNow && !voiceInput.isVoiceNote { DispatchQueue.main.async { submitMessage() } }
     }
 
     func photoSelectionChanged(_ previousItems: [PhotosPickerItem], _ items: [PhotosPickerItem]) {

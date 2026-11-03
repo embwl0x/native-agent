@@ -37,7 +37,7 @@ import MacControl
 import ChatToolParsing
 import UniformTypeIdentifiers
 import Desk
-// Blueprint: | `MessageBubble.swift` | Transcript message bubbles, provenance, streaming settlement, hover and accessible actions |
+// Blueprint: | `MessageBubble.swift` | Transcript message bubbles, provenance, streaming settlement without folding spoken pre-tool words, hover and accessible actions |
 
 enum ChatTranscriptPresentation {
     static func hasVisibleText(_ text: some StringProtocol) -> Bool {
@@ -71,7 +71,6 @@ struct MessageBubble: View {
             && lm.reasoningEffort == rm.reasoningEffort
             && lm.fileAccessMode == rm.fileAccessMode
             && lm.attachments == rm.attachments
-            && lm.workingCommentaryChars == rm.workingCommentaryChars
             && lm.providerRefusal == rm.providerRefusal
             && lm.providerRefusalDraft == rm.providerRefusalDraft
             && lm.envelope == rm.envelope
@@ -97,7 +96,6 @@ struct MessageBubble: View {
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @Environment(\.chatPageIsVisible) private var chatPageIsVisible
     @Environment(\.troubleCardOwnsRetry) private var troubleCardOwnsRetry
-    @Environment(\.readingPlace) private var readingPlace
     /// Set when a retry of this failed turn could repeat a real action.
     @State private var retryConfirmation: ChatTurnFailure?
     @State private var showJSONSheet = false
@@ -107,8 +105,6 @@ struct MessageBubble: View {
     /// tracked separately.
     @State private var isBarHovered = false
     private var showsHoverBar: Bool { isHovered || isBarHovered }
-    /// Working commentary starts folded unless the reader is in this reply at settlement.
-    @State private var commentaryExpanded = false
     /// Holds the stream for one frame so settlement can swap in an animated transaction.
     @State private var holdsLive = false
     /// Text length the paced reveal last came to rest at: the stream settles
@@ -143,7 +139,7 @@ struct MessageBubble: View {
         MacChatMessageProvenance.make(
             role: message.role,
             source: message.source,
-            origin: message.metadata?.origin
+            envelope: message.metadata?.envelope
         )
     }
     private var userCorners: RectangleCornerRadii { NativeAgentShellLayout.userBubbleCorners }
@@ -225,13 +221,23 @@ struct MessageBubble: View {
                 VStack(alignment: seatsRight ? .trailing : .leading, spacing: NativeAgentSpacing.sm) {
                     // A live reply mounts its paced text while still empty, so
                     // the first words pace in instead of arriving as a mount.
-                    if hasVisibleContent || isLiveReply {
+                    if attachments.audio.isEmpty && (hasVisibleContent || isLiveReply) {
                         renderedMessageText
-                    } else if attachments.localImages.isEmpty && attachments.chips.isEmpty {
+                    } else if attachments.localImages.isEmpty && attachments.chips.isEmpty && attachments.audio.isEmpty {
                         Text(" ")
                     }
                     ForEach(attachments.localImages, id: \.id) { attachment in
                         MessageLocalImageAttachmentView(attachment: attachment)
+                    }
+                    ForEach(attachments.audio, id: \.id) { attachment in
+                        VoiceNoteBubble(id: attachment.id,
+                            transcript: attachment.utterance?.correctedText ?? attachment.utterance?.text ?? message.content,
+                            isOwn: isUser, speaker: appModel.agentDisplayName) {
+                            guard let path = attachment.path, !path.isEmpty else {
+                                throw CocoaError(.fileNoSuchFile)
+                            }
+                            return URL(fileURLWithPath: path)
+                        }
                     }
                     ForEach(attachments.chips, id: \.id) { attachment in
                         MessageAttachmentChipView(attachment: attachment)
@@ -457,11 +463,9 @@ struct MessageBubble: View {
         // last does not remount or crossfade when the next turn starts;
         // `isLiveReply` checks eligibility before observing streaming state.
         if message.role == "assistant" {
-            // Stream, settled prose and folded notes crossfade at the incoming phase's size.
+            // Every streamed word remains visible when the reply settles.
             let live = isLiveReply || holdsLive
-            let split: (commentary: String?, answer: String) = live ? (nil, "") : workingCommentarySplit
-            let phase = live ? 0 : (split.commentary == nil ? 1 : 2)
-            ChatCrossfadeStack(current: phase) {
+            ChatCrossfadeStack(current: live ? 0 : 1) {
                 if live {
                     // Keep the reply width fixed while its edge grows.
                     PacedStreamingText(text: displayContent, inline: ChatInlineMarkdown(ChatRichContentParser.inline), isVisible: chatPageIsVisible) {
@@ -471,16 +475,8 @@ struct MessageBubble: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .layoutValue(key: ChatCrossfadePhase.self, value: 0)
                         .transition(NativeAgentMotion.replyDissolve)
-                } else if let commentary = split.commentary {
-                    VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-                        workingCommentaryFold(commentary)
-                        settledContent(split.answer)
-                    }
-                    .layoutValue(key: ChatCrossfadePhase.self, value: 2)
-                    .zIndex(2)
-                    .transition(NativeAgentMotion.replyDissolve)
                 } else {
-                    settledContent(split.answer)
+                    settledContent(displayContent)
                         .layoutValue(key: ChatCrossfadePhase.self, value: 1)
                         .zIndex(1)
                         .transition(NativeAgentMotion.replyDissolve)
@@ -494,48 +490,14 @@ struct MessageBubble: View {
                 }
             }
         } else {
-            let split = workingCommentarySplit
-            if let commentary = split.commentary {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-                    workingCommentaryFold(commentary)
-                    settledContent(split.answer)
-                }
-            } else {
-                settledContent(split.answer)
-            }
+            settledContent(displayContent)
         }
     }
 
     /// The stream hands over to settled prose, once, in one eased crossfade.
     private func settle() {
         guard holdsLive else { return }
-        if readingPlace?.isReading(message.id) == true { commentaryExpanded = true }
         withAnimation(NativeAgentMotion.arrive) { holdsLive = false }
-    }
-
-    /// Where the working commentary ends and the answer begins, per the
-    /// engine's recorded offset. Anything that does not line up exactly (a
-    /// bridge-stripped body, a bad offset, an empty half) falls back to the
-    /// whole reply, unfolded.
-    private var workingCommentarySplit: (commentary: String?, answer: String) {
-        let text = displayContent
-        guard message.role == "assistant",
-              text == message.content,
-              let offset = message.metadata?.workingCommentaryChars,
-              offset > 0, offset < text.count
-        else { return (nil, text) }
-        let cut = text.index(text.startIndex, offsetBy: offset)
-        let commentary = String(text[..<cut]).trimmingCharacters(in: .whitespacesAndNewlines)
-        let answer = String(text[cut...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !commentary.isEmpty, !answer.isEmpty else { return (nil, text) }
-        return (commentary, answer)
-    }
-
-    @ViewBuilder
-    private func workingCommentaryFold(_ commentary: String) -> some View {
-        ChatActivityRow(title: "Working notes", isExpanded: $commentaryExpanded) {
-            proseText(commentary)
-        }
     }
 
     private func settledContent(_ content: String) -> some View {
@@ -543,10 +505,6 @@ struct MessageBubble: View {
     }
 
     private var bubbleLineSpacing: CGFloat { isUser ? 2 : NativeAgentShellLayout.replyLineSpacing }
-
-    private func proseText(_ text: String) -> some View {
-        ChatPreparedContent(text: text, lineSpacing: bubbleLineSpacing, proseOnly: true)
-    }
 
     /// Every retry and Regenerate on this bubble asks the one gate first: a
     /// failed turn that acted, or whose outcome is unknown, is confirmed

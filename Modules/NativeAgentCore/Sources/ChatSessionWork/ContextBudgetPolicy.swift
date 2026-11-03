@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import ProviderRouting
 import os
-// Blueprint: | `ContextBudgetPolicy.swift` | Shared model-input budgets for every door; `compactionHistoryCharacters`, `floors`; derived budget reuse by exact effective window after current model/catalog resolution |
+// Blueprint: | `ContextBudgetPolicy.swift` | Shared per-row and non-history context budgets for every door; no replay ceiling; derived budget reuse by exact effective window after current model/catalog resolution |
 
 /// Prompt-assembly budgets scale with the effective context window and never undercut floors.
 public enum ContextBudgetPolicy {
@@ -30,25 +30,10 @@ public enum ContextBudgetPolicy {
     /// model's prompt.
     static let floorWindowTokens = 32_768
 
-    /// Rendered history + memory (including row markup) + capsule floors:
-    /// the denominator for the derived character allowance's scale factor.
+    /// Fixed reference mass for gentle per-row/non-history scaling. The 22k
+    /// term preserves that scale; it is never an aggregate replay allowance.
     static let referenceFloorTotalCharacters =
         22_000 + (5 * (1_200 + memoryRowOverheadChars)) + 4_000
-
-    /// Ceiling of the scaled-history term; the separate history rule can raise the final budget.
-    static let maximumHistoryCharacters = 96_000
-
-    /// Reserve tokens for persona, tools, other context, one tool round, a working note and output.
-    static let requestReserveTokens = 128_000
-    /// The whole request, including output, stays inside this share of the model window.
-    static let requestWindowFraction = 0.90
-
-    /// Separate history rule: effective-window room limited by the model's request share after reserve.
-    static func compactionHistoryCharacters(windowTokens: Int) -> Int {
-        let modelFloor = Double(windowTokens) / ChatSessionAutocompactionConfig.maximumContextWindowFraction
-        let room = Int(modelFloor * requestWindowFraction) - requestReserveTokens
-        return Int(Double(min(windowTokens, room)) * charactersPerToken)
-    }
 
     static let maximumMemoryBlockCharacters = 24_000
     static let maximumRelevantCharacters = 24_000
@@ -83,7 +68,6 @@ public enum ContextBudgetPolicy {
     /// existed and is reproduced EXACTLY; the floor regime returns these
     /// structs untouched.
     public struct Floors: Sendable {
-        public let historyChars: Int
         public let userCap: Int
         public let systemCap: Int
         public let compactionSummaryCap: Int
@@ -93,7 +77,6 @@ public enum ContextBudgetPolicy {
 
     /// Every door assembles the same model input; delivery owns reply limits.
     static let floors = Floors(
-        historyChars: 22_000,
         userCap: 1_800,
         systemCap: 1_200,
         compactionSummaryCap: ChatCompactionDistiller.maxSummaryChars,
@@ -120,7 +103,6 @@ public enum ContextBudgetPolicy {
     /// the renderer typealiases straight onto this type.
     public struct Resolved: Sendable {
         // History renderer
-        public let historyChars: Int
         public let userCap: Int
         public let systemCap: Int
         public let compactionSummaryCap: Int
@@ -150,7 +132,7 @@ public enum ContextBudgetPolicy {
         Int(Double(windowTokens) * charactersPerToken * combinedUtilizationFraction)
     }
 
-    /// Use the effective window; unresolved model or route windows return nil and use floor budgets.
+    /// Use the effective window; unresolved model or route windows remain unavailable.
     public static func windowTokens(
         forModel modelID: String?,
         providerID: String? = nil,
@@ -170,11 +152,12 @@ public enum ContextBudgetPolicy {
     /// every model-based call before reaching this cache; no route is frozen.
     private static let resolvedGeneration = OSAllocatedUnfairLock<Resolved?>(initialState: nil)
 
-    /// The one entry point. `windowTokens == nil` (unknown/unresolved model)
-    /// or a window at/below `floorWindowTokens` returns the floor table with no
-    /// arithmetic applied.
-    public static func resolve(windowTokens: Int?) -> Resolved {
-        guard let windowTokens, windowTokens > floorWindowTokens else {
+    /// The one entry point requires the admitted model's actual room.
+    public static func resolve(windowTokens: Int?) throws -> Resolved {
+        guard let windowTokens, windowTokens > 0 else {
+            throw ProviderRoutingError.configurationFailed("The selected model's context window is unavailable. Refresh its catalog in Providers before preparing this turn.")
+        }
+        guard windowTokens > floorWindowTokens else {
             return floorBudget(floors: floors, windowTokens: windowTokens)
         }
         return resolvedGeneration.withLock { generation in
@@ -206,11 +189,6 @@ public enum ContextBudgetPolicy {
         )
 
         return Resolved(
-            // Final history takes the larger of scaled history and the effective-window/request-reserve rule.
-            historyChars: max(
-                min(maximumHistoryCharacters, grow(floors.historyChars, scale)),
-                compactionHistoryCharacters(windowTokens: windowTokens)
-            ),
             userCap: grow(floors.userCap, rowScale),
             systemCap: grow(floors.systemCap, rowScale),
             // The distiller never writes more than maxSummaryChars, so more
@@ -249,8 +227,8 @@ public enum ContextBudgetPolicy {
         model: String?,
         providerID: String? = nil,
         dataRoot: URL? = nil
-    ) -> Resolved {
-        resolve(
+    ) throws -> Resolved {
+        try resolve(
             windowTokens: windowTokens(
                 forModel: model, providerID: providerID, dataRoot: dataRoot
             )
@@ -263,7 +241,6 @@ public enum ContextBudgetPolicy {
     /// is carried through for the trace even though it did not change anything.
     private static func floorBudget(floors: Floors, windowTokens: Int?) -> Resolved {
         Resolved(
-            historyChars: floors.historyChars,
             userCap: floors.userCap,
             systemCap: floors.systemCap,
             compactionSummaryCap: floors.compactionSummaryCap,

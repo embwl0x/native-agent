@@ -11,8 +11,9 @@ import NativeAgentCore
 import PersistenceCore
 import CognitiveSubstrate
 import TurnTrace
+import Desk
 
-// Blueprint: | `MemoryV2+MemoryManager.swift` | `MemoryManagerLane`: semantic after-turn memory decisions (one turn, or a bounded batch of owed turns via `MemoryBatchInput`) with writer-named plan dates, grounded correction validation and reconciliation against existing rows |
+// Blueprint: | `MemoryV2+MemoryManager.swift` | `MemoryManagerLane`: checked bounded after-turn decisions with grounded correction validation and reviewed targets; `MemoryManagerPromise` validates an absent/empty or complete reply-grounded promises section; malformed present sections refuse interpretation |
 
 // MARK: - What the manager returns
 
@@ -150,12 +151,50 @@ public struct MemoryManagerRequest: Sendable, Equatable {
     }
 }
 
+/// What she said she would do later in this reply, not a request made to her.
+public struct MemoryManagerPromise: Codable, Sendable, Equatable {
+    public let words: String
+    public let when: String
+    public let source: String
+
+    /// Absence and [] are valid. A malformed present section is never abstention.
+    public static func parse(_ value: Any?, reply: String) throws -> [Self] {
+        guard let value else { return [] }
+        guard let rows = value as? [[String: Any]] else {
+            throw FoundationModelsError.decodeFailed("promises must be an array of objects")
+        }
+        var promises: [Self] = []
+        for row in rows {
+            guard let words = row["words"] as? String,
+                  !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let when = row["when"] as? String,
+                  let source = row["source"] as? String,
+                  !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  reply.contains(source) else {
+                throw FoundationModelsError.decodeFailed("promise \(promises.count) requires nonempty words, when and exact reply source")
+            }
+            switch when {
+            case "next_turn", "own_turn", "when_user_messages": break
+            default:
+                if when.hasPrefix("after_card "), case .afterCard(let id)? = MyQueue.When(when),
+                   !id.contains(where: \.isWhitespace), reply.contains(id) { break }
+                if when.hasPrefix("at "), case .at? = MyQueue.When(when) { break }
+                throw FoundationModelsError.decodeFailed("promise \(promises.count) has invalid when: \(when)")
+            }
+            promises.append(Self(words: words.trimmingCharacters(in: .whitespacesAndNewlines),
+                                 when: when, source: source))
+        }
+        return promises
+    }
+}
+
 public struct AfterTurnInterpretation: Codable, Sendable {
     public let memories: [MemoryManagerDecision]
     public let affect: CognitiveSubstrate.AffectAppraisal
     public let caring: CaringAppraisalVerdict
     /// What moved her against the cares she was shown.
     public let cares: [CognitiveCareJudgment]
+    public let promises: [MemoryManagerPromise]
     /// The incoming words were the app's, so only her side of the exchange counts.
     public let appAuthored: Bool
     public let model: String?
@@ -170,15 +209,32 @@ public struct AfterTurnInterpretation: Codable, Sendable {
 
     public init(memories: [MemoryManagerDecision],
                 affect: CognitiveSubstrate.AffectAppraisal, caring: CaringAppraisalVerdict,
-                cares: [CognitiveCareJudgment] = [], appAuthored: Bool = false,
+                cares: [CognitiveCareJudgment] = [], promises: [MemoryManagerPromise] = [], appAuthored: Bool = false,
                 model: String?, surface: String) {
         self.memories = memories
         self.affect = affect
         self.caring = caring
         self.cares = cares
+        self.promises = promises
         self.appAuthored = appAuthored
         self.model = model
         self.surface = surface
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case memories, affect, caring, cares, promises, appAuthored, model, surface
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        memories = try values.decode([MemoryManagerDecision].self, forKey: .memories)
+        affect = try values.decode(CognitiveSubstrate.AffectAppraisal.self, forKey: .affect)
+        caring = try values.decode(CaringAppraisalVerdict.self, forKey: .caring)
+        cares = try values.decode([CognitiveCareJudgment].self, forKey: .cares)
+        promises = try values.decode([MemoryManagerPromise].self, forKey: .promises)
+        appAuthored = try values.decode(Bool.self, forKey: .appAuthored)
+        model = try values.decodeIfPresent(String.self, forKey: .model)
+        surface = try values.decode(String.self, forKey: .surface)
     }
 }
 
@@ -192,18 +248,8 @@ public struct AfterTurnMemoryFailure: Error, Codable, Sendable, Hashable {
         case deadline, cancelled, provider, invalidJSON, missingSections
         case invalidCaring, invalidAffect, invalidMemories, invalidCares
         case authExpired, codexCLISessionExpired, rateLimited, overloaded, contextTooLong
-        case network, outputLimit, refused, requestRejected, invalidProviderResponse, routingUnavailable, modelUnavailable
+        case network, outputLimit, refused, requestRejected, invalidProviderResponse, routingUnavailable, modelUnavailable, trustUnavailable
 
-        /// A held queue written before moments became care story may still say
-        /// `invalidMoment`; it reads as the memories failure it now is.
-        public init(from decoder: Decoder) throws {
-            let raw = try decoder.singleValueContainer().decode(String.self)
-            guard let reason = Reason(rawValue: raw == "invalidMoment" ? "invalidMemories" : raw) else {
-                throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath,
-                                                        debugDescription: "unknown after-turn failure \(raw)"))
-            }
-            self = reason
-        }
     }
     public let reason: Reason
     public let recovery: String
@@ -312,6 +358,13 @@ public enum MemoryManagerLane {
 
     /// Parse the decoded candidates; an empty array is valid abstention.
     public static func parse(_ array: [Any]) throws -> [MemoryManagerDecision] {
+        for (index, candidate) in array.enumerated() {
+            if let object = candidate as? [String: Any], let raw = object["statement"] as? String,
+               raw.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines).count > statementCap {
+                throw FoundationModelsError.decodeFailed("memory candidate \(index) exceeds the \(statementCap)-character statement bound")
+            }
+        }
         // An empty list is abstention; a candidate that is not the declared
         // shape is a failed reply, held for retry, never a silent drop.
         let decisions = array.map { ($0 as? [String: Any]).flatMap(decision(from:)) }
@@ -328,11 +381,8 @@ public enum MemoryManagerLane {
         let normalizedStatement = rawStatement
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let statement = MemoryTextClip.sentenceClip(normalizedStatement, cap: statementCap)
-        if normalizedStatement.count > statementCap {
-            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("M13"), "site": .string("MemoryV2+MemoryManager.swift:decision")]))
-        }
-        guard !statement.isEmpty else { return nil }
+        guard !normalizedStatement.isEmpty, normalizedStatement.count <= statementCap else { return nil }
+        let statement = normalizedStatement
         guard let actionRaw = object["action"] as? String,
               let action = MemoryManagerAction(rawValue: actionRaw),
               let kindRaw = object["kind"] as? String, allowedKinds.contains(kindRaw) else { return nil }
@@ -481,7 +531,8 @@ public enum MemoryManagerLane {
                                                    pending: kept == nil) }, grounding: decision.grounding)
         }
         return AfterTurnInterpretation(memories: decisions, affect: interpretation.affect,
-            caring: interpretation.caring, cares: interpretation.cares, appAuthored: interpretation.appAuthored,
+            caring: interpretation.caring, cares: interpretation.cares, promises: interpretation.promises,
+            appAuthored: interpretation.appAuthored,
             model: interpretation.model, surface: interpretation.surface)
     }
 
@@ -513,7 +564,6 @@ public enum MemoryManagerLane {
         let now = Date()
         if let due = decision.due, due > now {
             meta[MemoryDueDateStamp.dueAtKey] = .string(MemoryDueDateStamp.iso8601(due))
-            meta[MemoryDueDateStamp.dueLabelKey] = .string(MemoryDueDateStamp.label(for: due, at: now))
             meta[MemoryDueDateStamp.dueSourceKey] = .string("memory_manager")
         }
         if decision.kind == "correction", let subject = decision.correctionSubject {

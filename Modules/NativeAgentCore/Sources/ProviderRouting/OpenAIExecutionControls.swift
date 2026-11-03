@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import PersistenceCore
 
 // Blueprint: | `OpenAIExecutionControls.swift` | `OpenAIExecutionControls`: transport-specific catalog capability admission and reasoning/service-tier wire serialization |
 
@@ -23,20 +24,36 @@ public enum OpenAIExecutionControls {
         }
     }
 
-    private static let standardEfforts: Set<String> = ["low", "medium", "high", "xhigh"]
 
-    /// Models intentionally exposed by the model-facing Codex bridge tools.
-    /// The parser remains open to account-discovered models for compatibility;
-    /// these are the built-in choices advertised to the model.
-    public static let codexBridgeModelIDs = FirstPartyModelCatalog.chatGPTAccountFallbackModels.map(\.id)
+    /// Builder tools use the command CLI's selected account, like admission.
+    public static var codexBridgeModelIDs: [String] {
+        CodexAccountModelCatalog.matchingModels(providerID: "codex",
+            oauthAuthURL: ChatGPTTransport.preferredAuthPath(source: .commandCLI)).map(\.id)
+    }
 
-    /// The efforts the transport's catalog row declares for the model; a model
-    /// no row carries takes the standard set, whatever its spelling.
+    /// The selected account's checked row for account transports; public API
+    /// controls belong only to its shipped descriptor. No row means unknown.
     public static func supportedReasoningEfforts(
         model: String,
-        transport: Transport = .publicAPI
+        transport: Transport = .publicAPI,
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        oauthAuthURL: URL? = nil
     ) -> Set<String> {
-        FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: transport.route).map(Set.init) ?? standardEfforts
+        switch transport {
+        case .publicAPI:
+            return FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: transport.route).map(Set.init) ?? []
+        case .chatGPTOAuth, .codexCLI:
+            return accountModel(model: model, transport: transport, dataRoot: dataRoot, oauthAuthURL: oauthAuthURL)
+                .map { Set($0.supportedReasoningEfforts) } ?? []
+        }
+    }
+
+    private static func accountModel(model: String, transport: Transport, dataRoot: URL, oauthAuthURL: URL?) -> CodexAccountModelCatalog.Model? {
+        CodexAccountModelCatalog.matchingModels(
+            providerID: transport.route,
+            oauthAuthURL: oauthAuthURL ?? ChatGPTTransport.preferredAuthPath(dataRoot: dataRoot),
+            dataRoot: dataRoot
+        ).first { $0.id == model }
     }
 
     static func usesResponses(model: String) -> Bool {
@@ -47,15 +64,18 @@ public enum OpenAIExecutionControls {
         model: String,
         requested: String?,
         transport: Transport = .publicAPI,
-        supportedEfforts: [String]? = nil
-    ) -> String? {
+        supportedEfforts: [String]? = nil,
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        oauthAuthURL: URL? = nil
+    ) throws -> String? {
         guard let requested else { return nil }
         let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let supported = supportedEfforts.map { Set($0) }
-            ?? supportedReasoningEfforts(model: model, transport: transport)
-        return supported.contains(normalized)
-            ? normalized
-            : nil
+            ?? supportedReasoningEfforts(model: model, transport: transport, dataRoot: dataRoot, oauthAuthURL: oauthAuthURL)
+        guard supported.contains(normalized) else {
+            throw LLMError.providerError(message: "Think level '\(requested)' is unsupported or unknown for \(model) on \(transport.route). Refresh Providers and choose a supported level.")
+        }
+        return normalized
     }
 
     /// Convert a selectable account tier into the exact value accepted by the
@@ -69,8 +89,8 @@ public enum OpenAIExecutionControls {
         requested: String?,
         transport: Transport = .publicAPI,
         supportedEfforts: [String]? = nil
-    ) -> String? {
-        guard let selected = reasoningEffort(
+    ) throws -> String? {
+        guard let selected = try reasoningEffort(
             model: model,
             requested: requested,
             transport: transport,
@@ -89,12 +109,25 @@ public enum OpenAIExecutionControls {
         model: String,
         requested: String?,
         transport: Transport = .publicAPI,
-        supportsFast: Bool? = nil
-    ) -> String? {
-        guard supportsFast ?? FirstPartyModelCatalog.descriptor(
-            for: model, providerID: transport.route)?.supportsFast == true else { return nil }
-        let normalized = requested?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard normalized == "priority" || normalized == "fast" else { return nil }
+        supportsFast: Bool? = nil,
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        oauthAuthURL: URL? = nil
+    ) throws -> String? {
+        guard let requested else { return nil }
+        let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized == "default" { return nil }
+        let declaredFast: Bool?
+        if let supportsFast { declaredFast = supportsFast }
+        else {
+            switch transport {
+            case .publicAPI: declaredFast = FirstPartyModelCatalog.descriptor(for: model, providerID: transport.route)?.supportsFast
+            case .chatGPTOAuth, .codexCLI:
+                declaredFast = accountModel(model: model, transport: transport, dataRoot: dataRoot, oauthAuthURL: oauthAuthURL)?.supportsFast
+            }
+        }
+        guard normalized == "priority", declaredFast == true else {
+            throw LLMError.providerError(message: "Service tier '\(requested)' is unsupported or unknown for \(model) on \(transport.route). Choose a supported tier in Providers.")
+        }
         return "priority"
     }
 
@@ -104,8 +137,8 @@ public enum OpenAIExecutionControls {
         transport: Transport = .publicAPI,
         supportedEfforts: [String]? = nil,
         supportsFast: Bool? = nil
-    ) {
-        if let effort = wireReasoningEffort(
+    ) throws {
+        if let effort = try wireReasoningEffort(
             model: model,
             requested: LLMCallContext.reasoningEffort,
             transport: transport,
@@ -120,7 +153,7 @@ public enum OpenAIExecutionControls {
             reasoning["summary"] = "auto"
             body["reasoning"] = reasoning
         }
-        if let tier = serviceTier(
+        if let tier = try serviceTier(
             model: model,
             requested: LLMCallContext.serviceTier,
             transport: transport,
@@ -130,14 +163,14 @@ public enum OpenAIExecutionControls {
         }
     }
 
-    static func applyChatCompletionsControls(to body: inout [String: Any], model: String) {
-        if let effort = wireReasoningEffort(
+    static func applyChatCompletionsControls(to body: inout [String: Any], model: String) throws {
+        if let effort = try wireReasoningEffort(
             model: model,
             requested: LLMCallContext.reasoningEffort
         ) {
             body["reasoning_effort"] = effort
         }
-        if let tier = serviceTier(model: model, requested: LLMCallContext.serviceTier) {
+        if let tier = try serviceTier(model: model, requested: LLMCallContext.serviceTier) {
             body["service_tier"] = tier
         }
     }

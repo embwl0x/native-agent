@@ -79,7 +79,7 @@ public enum AgentBridgeSurface {
 /// A route handle locates a who, never a grant. Only the door whose own key
 /// authenticated the call can carry its elevation. The shared listener bearer
 /// cannot attest a door or borrow its identity or grant.
-public struct AgentBridgePrincipal: Sendable {
+public struct AgentBridgePrincipal: Sendable, Codable {
     /// Authenticated door id used in replay claims, or the anonymous caller id.
     public let id: String
     public let peerID: String?

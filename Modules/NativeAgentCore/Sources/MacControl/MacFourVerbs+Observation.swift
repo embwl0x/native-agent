@@ -8,6 +8,11 @@ import Senses
 extension MacFourVerbs {
     // MARK: 1 — EYES
 
+    /// An app can be running without supplying a window for an act.
+    static func windowlessApp(_ observation: [String: JSONValue]) -> Bool {
+        observation["running"] == .bool(true) && observation["windows"] == .int(0)
+    }
+
     static func runningAppsLine(_ output: [String: JSONValue]) -> String {
         guard case .array(let running)? = output["running_apps"] else { return "" }
         let names = running.compactMap { value -> String? in
@@ -32,6 +37,13 @@ extension MacFourVerbs {
                                          detail: ["error": .string("menu_unavailable"), "message": .string("\(error)")])
             }
             guard result.ok else {
+                if result.error == "app_not_running", let app {
+                    // The menu reader keeps its strict target precondition;
+                    // through look, a stopped app is an observation of absence.
+                    let message = Self.string(Self.object(result.output)["message"]) ?? "\(app) is not running."
+                    return MacFourVerbsReply(ok: true, text: message + " Nothing was launched or opened.",
+                        detail: ["status": .string("ok"), "app": .string(app), "running": .bool(false)])
+                }
                 return MacFourVerbsReply(ok: false, text: "I couldn't read that app's menu bar: "
                     + (Self.string(Self.object(result.output)["message"]) ?? result.error ?? "the Mac refused the read") + ".",
                     detail: Self.operationDetail(result).merging(["error": .string("menu_unavailable")]) { current, _ in current })
@@ -40,7 +52,8 @@ extension MacFourVerbs {
             let rows = Self.array(output["paths"]).compactMap { row -> String? in
                 let item = Self.object(row)
                 guard let path = Self.string(item["path"]) else { return nil }
-                return path + (Self.bool(item["enabled"]) == false ? "  (greyed out)" : "")
+                let enabled = Self.bool(item["enabled"])
+                return path + (enabled == false ? "  (greyed out)" : enabled == true ? "" : "  (enabled state unavailable)")
             }
             let name = Self.string(Self.object(output["app"])["name"]) ?? "The app"
             return MacFourVerbsReply(
@@ -52,12 +65,12 @@ extension MacFourVerbs {
                 detail: ["menu_items": .int(Int64(rows.count))]
             )
         }
-        switch await sight(part: part, app: app) {
+        switch await sight(part: part, app: app, requiresWindow: false) {
         case .blind(let reply):
             return reply
         case .seen(let sighting):
-            let contentRoute = ["com.apple.mail": "mail.*", "com.apple.MobileSMS": "messages.*",
-                                "com.apple.Notes": "notes.*"][sighting.bundleIdentifier ?? ""]
+            let contentRoute = MacIntegrationID.owning(appBundleID: sighting.bundleIdentifier ?? "")
+                .flatMap { [MacIntegrationID.mail: "mail.*", MacIntegrationID.messages: "messages.*", MacIntegrationID.notes: "notes.*"][$0] }
             var lead = "Looking at " + sighting.place + "."
             if let part, let note = sighting.zoomNote {
                 lead = "Zoomed on \"\(part)\" in " + sighting.place + ". " + note
@@ -175,8 +188,8 @@ extension MacFourVerbs {
     /// resolvable targets behind it, and the bookkeeping (frame id, handles)
     /// that stays on this side of the wall. Scratch for the duration of a single
     /// call — never stored, never carried across calls.
-    /// A look either happened or it didn't, and a blind verb answers in words
-    /// rather than throwing: "I can't see the screen right now" IS the reply.
+    /// A blind result has no window targets. For a look, a stopped or
+    /// windowless app is still a successful observation; acts require a window.
     enum Sighted {
         case seen(Sighting)
         case blind(MacFourVerbsReply)
@@ -205,8 +218,6 @@ extension MacFourVerbs {
         /// selections. Normal prose screen calls do not emit this extra data.
         let controls: JSONValue
         let detail: [String: JSONValue]
-        /// The prior front app for restoring after an explicitly raised anchored act; nil for an unanchored look.
-        var frontmostApp: (name: String, pid: Int32, window: JSONValue?)? = nil
         /// Window kind used as the app-map key.
         var windowKind: String? = nil
         /// Where keyboard focus is in this read (same paths as targets' sourceAXPath).
@@ -243,7 +254,7 @@ extension MacFourVerbs {
         /// is how repeated unnamed controls remain addressable as `button 2`
         /// without pretending that one of them is uniquely named.
         let roleOrdinal: Int?
-        let enabled: Bool
+        let enabled: Bool?
         let frame: MacAXFrame?
         let observedFrame: MacAXFrame?
         let excludedFrames: [MacAXFrame]
@@ -271,7 +282,7 @@ extension MacFourVerbs {
             secret: Bool = false,
             ordinal: Int?,
             roleOrdinal: Int? = nil,
-            enabled: Bool,
+            enabled: Bool?,
             frame: MacAXFrame? = nil,
             observedFrame: MacAXFrame? = nil,
             excludedFrames: [MacAXFrame] = [],

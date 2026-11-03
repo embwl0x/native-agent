@@ -13,9 +13,11 @@ import Darwin
 
 extension SwiftNativeTriggerScheduler {
 
-    /// Saved inbox authority gates all inbox fires; default-on authority fails closed when damaged.
+    /// Saved inbox authority gates all inbox fires; damage throws instead of saying the person disabled it.
     nonisolated var inboxMasterOn: Bool {
-        SavedTrustPolicyAuthority.flag(block: "inboxPolicy", key: "enabled", default: true, dataRoot: root)
+        get throws {
+            try SavedTrustPolicyAuthority.flag(block: "inboxPolicy", key: "enabled", default: true, dataRoot: root)
+        }
     }
 
     /// The full fire envelopes for this tick, in fire order.
@@ -39,9 +41,9 @@ extension SwiftNativeTriggerScheduler {
         // receipt is an error row, never an empty pass.
         var unavailable: [TriggerFireResult] = []
         for (surface, statePath) in [("inbox", inboxStatePath), ("workshop", workshopExecutionStatePath)] {
-            if surface == "inbox", !inboxMasterOn { continue }
             let configs: [TriggerConfig]
             do {
+                if surface == "inbox", try !inboxMasterOn { continue }
                 configs = try await surface == "inbox" ? listInboxTriggers() : listWorkshopTriggers()
             } catch {
                 unavailable.append(TriggerFireResult(status: "error", name: "\(surface) triggers",
@@ -70,14 +72,16 @@ extension SwiftNativeTriggerScheduler {
                     deferredDueToCap = true
                     break
                 }
+                let occurrence: String
                 do {
-                    guard try await claimIfDue(cfg, statePath: statePath) else { continue }
+                    guard let claimed = try await claimIfDue(cfg, statePath: statePath) else { continue }
+                    occurrence = claimed
                 } catch {
                     unavailable.append(TriggerFireResult(status: "error", name: cfg.name,
                         error: "Trigger \(cfg.name) is due but could not be claimed, so it did not fire: \(error.localizedDescription)"))
                     continue
                 }
-                fired.append(await runClaimedTrigger(surface: surface, name: cfg.name))
+                fired.append(await runClaimedTrigger(surface: surface, name: cfg.name, occurrence: occurrence))
             }
         }
         if deferredDueToCap {
@@ -92,77 +96,131 @@ extension SwiftNativeTriggerScheduler {
     }
 
     public func repairTrigger(surface: String, name: String, occurrence: String? = nil) async -> TriggerFireResult {
-        let path = surface == "inbox" ? inboxStatePath : workshopExecutionStatePath
-        if case .parsed(let state) = Self.readStateRaw(path), state[name]?.objectValue?["state"] == .string("stopped") {
-            do { return try await surface == "inbox" ? fireInboxTrigger(name: name) : fireWorkshopTrigger(name: name) }
-            catch { return TriggerFireResult(status: "error", name: name, error: error.localizedDescription) }
-        }
         return await runClaimedTrigger(surface: surface, name: name, occurrence: occurrence)
     }
 
-    private func runClaimedTrigger(surface: String, name: String, occurrence: String? = nil) async -> TriggerFireResult {
-        let statePath = surface == "inbox" ? inboxStatePath : workshopExecutionStatePath
-        if case .parsed(let state) = Self.readStateRaw(statePath), state[name]?.objectValue?["state"] == .string("stopped") {
-            return TriggerFireResult(status: "stopped", name: name, error: DataRootLife.stoppedReason)
+    private func runClaimedTrigger(surface: String, name: String, occurrence requestedOccurrence: String? = nil) async -> TriggerFireResult {
+        guard ["inbox", "workshop"].contains(surface) else {
+            return TriggerFireResult(status: "error", name: name, error: "surface must be inbox or workshop")
         }
-        let claimed: String? = if case .parsed(let state) = Self.readStateRaw(statePath),
-            let at = Self.lastFiredFromState(state, name: name) { Self.isoTimestamp(at) } else { nil }
-        let occurrence = occurrence ?? claimed ?? uuid()
+        let statePath = surface == "inbox" ? inboxStatePath : workshopExecutionStatePath
+        let occurrence: String
+        do { occurrence = try retainedClaim(statePath: statePath, name: name, requested: requestedOccurrence) }
+        catch { return TriggerFireResult(status: "error", name: name, error: error.localizedDescription) }
         let operation = "trigger:\(surface):\(name):\(occurrence)"
         var result: TriggerFireResult
         do {
-            // A competing repair can finish while the part thinks; the locked
-            // read below still decides whether anything may be published.
-            let prepared: InboxPreparation
-            let workshopSeed: [JSONValue]
-            switch surface {
-            case "inbox":
-                prepared = try await prepareInboxTrigger(name: name)
-                workshopSeed = []
-            case "workshop":
-                prepared = .refused(TriggerFireResult(status: "not_found", name: name))
-                workshopSeed = if case .missing = Self.readConfigsRaw(workshopExecutionsPath) { try await defaults().workshop } else { [] }
-            default: throw TriggerSchedulerError.invalidRequest("surface must be inbox or workshop")
-            }
-            result = try await SwiftNativePersistenceCore.withFileLock(statePath) { [self] in
-                var result: TriggerFireResult
+            // Admission precedes the part's model/tools. Release both locks
+            // while it thinks, then use the same admission again to publish.
+            if let refused = try await withEnabledTriggerClaim(surface: surface, name: name, occurrence: occurrence, work: { _ in nil }) {
+                result = refused
+            } else {
+                let prepared: InboxPreparation
                 switch surface {
                 case "inbox":
-                    result = await publishInboxTrigger(name: name, occurrence: occurrence, prepared: prepared)
+                    prepared = try await prepareInboxTrigger(name: name)
                 case "workshop":
-                    let rows = try await workshopRunner.listWorkshopExecutions()
-                    let source = "trigger:\(name):occurrence:\(occurrence)"
-                    if let prior = rows.first(where: {
-                        guard case .object(let row) = $0 else { return false }
-                        return row["trigger_source"] == .string(source)
-                    }), case .object(let row) = prior, case .string(let id)? = row["id"] {
-                        result = TriggerFireResult(status: "fired", name: name, executionId: id)
-                    } else {
-                        result = try await fireWorkshopTrigger(name: name, occurrence: occurrence, seed: workshopSeed)
-                    }
+                    prepared = .refused(TriggerFireResult(status: "not_found", name: name))
                 default: throw TriggerSchedulerError.invalidRequest("surface must be inbox or workshop")
                 }
-                if result.status == "fired" {
-                    guard case .parsed(var state) = Self.readStateRaw(statePath),
-                          case .object(var entry)? = state[name] else { return result }
-                    if case .array(let pending)? = entry["unfinished_occurrences"] {
-                        entry["unfinished_occurrences"] = .array(pending.filter { $0 != .string(occurrence) })
-                        state[name] = .object(entry)
-                        try await SwiftNativePersistenceCore.writeJSON(.object(state), to: statePath)
+                guard let published = try await withEnabledTriggerClaim(surface: surface, name: name, occurrence: occurrence, work: { [self] current in
+                    var result: TriggerFireResult
+                    switch surface {
+                    case "inbox":
+                        let currentPreparation: InboxPreparation
+                        switch prepared {
+                        case .ready(_, let notify, let item): currentPreparation = .ready(row: current, notify: notify, item: item)
+                        case .refused: currentPreparation = prepared
+                        }
+                        result = await publishInboxTrigger(name: name, occurrence: occurrence, prepared: currentPreparation)
+                    case "workshop":
+                        let rows = try await workshopRunner.listWorkshopExecutions()
+                        let source = "trigger:\(name):occurrence:\(occurrence)"
+                        if let prior = rows.first(where: {
+                            guard case .object(let row) = $0 else { return false }
+                            return row["trigger_source"] == .string(source)
+                        }), case .object(let row) = prior, case .string(let id)? = row["id"] {
+                            result = TriggerFireResult(status: "fired", name: name, executionId: id)
+                        } else {
+                            result = try await fireWorkshopTrigger(name: name, occurrence: occurrence, seed: [])
+                        }
+                    default: throw TriggerSchedulerError.invalidRequest("surface must be inbox or workshop")
                     }
+                    return result
+                }) else {
+                    throw TriggerSchedulerError.persistenceFailure("Trigger publication returned no result; its retained claim remains unfinished.")
                 }
-                return result
+                result = published
             }
         } catch {
             result = TriggerFireResult(status: "error", name: name, error: error.localizedDescription)
         }
-        if result.status == "fired" {
+        if result.status == "fired" || result.status == "disabled" {
             await RepairOwed.settle(root, operation: operation,
                 evidence: .init(source: "trigger", id: result.itemId ?? result.executionId ?? name)).value
-        } else {
-            await oweTrigger(surface: surface, name: name, occurrence: occurrence).value
         }
         return result
+    }
+
+    /// nil means admission succeeded without publication (the preparation pass).
+    /// Both passes use the same config → state transaction and exact claim.
+    private func withEnabledTriggerClaim(
+        surface: String, name: String, occurrence: String,
+        work: @Sendable (TriggerConfig) async throws -> TriggerFireResult?
+    ) async throws -> TriggerFireResult? {
+        try Task.checkCancellation()
+        let configPath = surface == "inbox" ? inboxPath : workshopExecutionsPath
+        let statePath = surface == "inbox" ? inboxStatePath : workshopExecutionStatePath
+        return try await SwiftNativePersistenceCore.withFileLock(configPath) { [self] in
+            // A retained claim requires an existing definition, never seeded defaults.
+            if case .missing = Self.readConfigsRaw(configPath) {
+                throw TriggerSchedulerError.persistenceFailure("The current trigger definition is unavailable; its retained claim has not been run.")
+            }
+            let configs = try await Self._readList(path: configPath, defaultValue: [])
+            guard let current = configs.first(where: { $0.name == name }) else {
+                throw TriggerSchedulerError.persistenceFailure("The current trigger definition is unavailable; its retained claim has not been run.")
+            }
+            return try await SwiftNativePersistenceCore.withFileLock(statePath) { [self] in
+                _ = try retainedClaim(statePath: statePath, name: name, requested: occurrence)
+                guard case .parsed(var state) = Self.readStateRaw(statePath),
+                      case .object(var entry)? = state[name],
+                      case .array(let pending)? = entry["unfinished_occurrences"] else {
+                    throw TriggerSchedulerError.persistenceFailure("Retained trigger claim became unreadable before admission; no effect was attempted.")
+                }
+                try Task.checkCancellation()
+                let result: TriggerFireResult?
+                if !current.enabled {
+                    result = TriggerFireResult(status: "disabled", name: name, error: "The current trigger definition is disabled; its retained occurrence was settled without running.")
+                } else if surface == "inbox", try !inboxMasterOn {
+                    result = TriggerFireResult(status: "disabled", name: name, error: "Raising things unasked is off (Notifications); its retained occurrence was settled without running.")
+                } else {
+                    result = try await work(current)
+                }
+                if result?.status == "fired" || result?.status == "disabled" {
+                    entry["unfinished_occurrences"] = .array(pending.filter { $0 != .string(occurrence) })
+                    state[name] = .object(entry)
+                    try await SwiftNativePersistenceCore.writeJSON(.object(state), to: statePath)
+                }
+                return result
+            }
+        }
+    }
+
+    private nonisolated func retainedClaim(statePath: URL, name: String, requested: String?) throws -> String {
+        guard case .parsed(let state) = Self.readStateRaw(statePath),
+              case .object(let entry)? = state[name],
+              entry["state"] == .string("running"),
+              case .string(let life)? = entry["lifeID"], UUID(uuidString: life) != nil,
+              try DataRootLife.isCurrent(life, in: root),
+              case .array(let pending)? = entry["unfinished_occurrences"] else {
+            throw TriggerSchedulerError.persistenceFailure("No readable current-life claim for \(name) at \(statePath.path); no repair effect was attempted.")
+        }
+        let claims = pending.compactMap { value -> String? in
+            if case .string(let stamp) = value { return stamp }; return nil
+        }
+        if let requested, claims.contains(requested) { return requested }
+        if requested == nil, claims.count == 1 { return claims[0] }
+        throw TriggerSchedulerError.invalidRequest("Supply the exact retained unfinished occurrence for \(name); no repair effect was attempted")
     }
 
     private func oweTrigger(surface: String, name: String, occurrence: String) -> Task<Void, Never> {
@@ -185,19 +243,33 @@ extension SwiftNativeTriggerScheduler {
     /// backstop. Overdue work never manufactures a retry deadline.
     public func nextMeaningfulDeadline(after reference: Date) async -> Date? {
         var candidates: [Date] = []
-        if inboxMasterOn, let inbox = try? await listInboxTriggers() {
-            candidates.append(contentsOf: deadlines(
-                for: inbox,
-                statePath: inboxStatePath,
-                after: reference
-            ))
+        do {
+            if try inboxMasterOn {
+                let inbox = try await listInboxTriggers()
+                candidates.append(contentsOf: deadlines(for: inbox, statePath: inboxStatePath, after: reference))
+            }
+            await RepairOwed.settle(root, operation: "scheduler.inbox.discovery",
+                evidence: .init(source: "trust", id: SavedTrustPolicyAuthority.policyURL(dataRoot: root).path)).value
+        } catch {
+            await RepairOwed.owe(root, id: "trigger-inbox-policy", kind: .run,
+                operation: "scheduler.inbox.discovery", owner: "Trust policy and inbox triggers",
+                words: "Inbox trigger deadline is unavailable: \(error.localizedDescription)",
+                nextCall: ToolFailureError.call("app", ["action": .string("doctor.run")])).value
         }
-        if let executions = try? await listWorkshopTriggers() {
+        do {
+            let executions = try await listWorkshopTriggers()
             candidates.append(contentsOf: deadlines(
                 for: executions,
                 statePath: workshopExecutionStatePath,
                 after: reference
             ))
+            await RepairOwed.settle(root, operation: "scheduler.workshop.discovery",
+                evidence: .init(source: "trigger", id: workshopExecutionsPath.path)).value
+        } catch {
+            await RepairOwed.owe(root, id: "trigger-workshop-config", kind: .run,
+                operation: "scheduler.workshop.discovery", owner: workshopExecutionsPath.path,
+                words: "Workshop trigger deadline is unavailable: \(error.localizedDescription)",
+                nextCall: ToolFailureError.call("app", ["action": .string("doctor.run")])).value
         }
         return candidates.min()
     }
@@ -245,7 +317,7 @@ extension SwiftNativeTriggerScheduler {
     }
 
     /// Trigger admission stays strict: absent minute means zero; invalid fields are dormant.
-    private nonisolated static func dailySchedule(_ cfg: TriggerConfig) -> [String: JSONValue]? {
+    nonisolated static func dailySchedule(_ cfg: TriggerConfig) -> [String: JSONValue]? {
         guard cfg.kind == "time", let hour = intField(cfg.config, "hour"), (0...23).contains(hour) else { return nil }
         let minute: Int
         if case .object(let object)? = cfg.config, object["minute"] != nil {
@@ -322,16 +394,15 @@ extension SwiftNativeTriggerScheduler {
         guard o.values.allSatisfy({ value in
             guard case .object(let entry) = value,
                   case .string(let stamp)? = entry["last_fired_at"],
-                  parseISOTimestamp(stamp) != nil else { return false }
-            if let occurrence = entry["last_fired_occurrence"] {
-                guard case .string(let key) = occurrence, SchedulerJobRuntime.civilEpoch(key) != nil else { return false }
-            }
-            if let unfinished = entry["unfinished_occurrences"] {
-                guard case .array(let pending) = unfinished, pending.allSatisfy({
+                  parseISOTimestamp(stamp) != nil,
+                  case .string(let life)? = entry["lifeID"], UUID(uuidString: life) != nil,
+                  case .string(let state)? = entry["state"], ["running", "stopped"].contains(state) else { return false }
+            guard case .string(let key)? = entry["last_fired_occurrence"],
+                  SchedulerJobRuntime.civilEpoch(key) != nil else { return false }
+                guard case .array(let pending)? = entry["unfinished_occurrences"], pending.allSatisfy({
                     if case .string(let stamp) = $0 { return parseISOTimestamp(stamp) != nil }
                     return false
                 }) else { return false }
-            }
             return true
         }) else { return .corrupt }
         guard let life = try? DataRootLife.current(in: statePath.deletingLastPathComponent().deletingLastPathComponent()) else { return .corrupt }
@@ -361,9 +432,7 @@ extension SwiftNativeTriggerScheduler {
         if case .object(let entry)? = state[cfg.name], case .string(let completed)? = entry["last_fired_occurrence"] {
             return completed >= occurrence
         }
-        // Older claims retain the firing date; their configured clock time is still known.
-        let date = SchedulerJobRuntime.occurrence(at: last, zone: .autoupdatingCurrent).prefix(10)
-        return date + occurrence.dropFirst(10) >= occurrence
+        return false // readStateRaw rejects missing civil evidence.
     }
 
     private static func timeOccurrence(_ cfg: TriggerConfig, scheduled: Date) -> String {
@@ -371,49 +440,56 @@ extension SwiftNativeTriggerScheduler {
         return date + String(format: " %02d:%02d", intField(cfg.config, "hour")!, intField(cfg.config, "minute") ?? 0)
     }
 
-    /// Recheck dueness and claim the scheduled instant under the state-file lock.
-    /// False means not due or already claimed; unavailable claims throw.
-    private func claimIfDue(_ cfg: TriggerConfig, statePath: URL) async throws -> Bool {
-        // The locked check remains authoritative when the clock moves.
-        guard scheduledInstantIfDue(cfg) != nil else { return false }
+    /// Lock order is configuration → state, shared with the configuration writer.
+    /// Re-read the enabled definition before claiming its scheduled instant.
+    /// Nil means not due or already claimed; unavailable claims throw.
+    private func claimIfDue(_ cfg: TriggerConfig, statePath: URL) async throws -> String? {
         let name = cfg.name
-
-        let work: @Sendable () async throws -> Bool = { [self] in
-            guard let scheduled = self.scheduledInstantIfDue(cfg) else { return false }
-            let stamp = Self.isoTimestamp(scheduled)
-            var state: [String: JSONValue]
-            switch Self.readStateRaw(statePath) {
-            case .corrupt:
-                throw TriggerSchedulerError.invalidRequest("\(statePath.path) is damaged; restore it so the trigger can be claimed")
-            case .missing:
-                state = [:]
-            case .parsed(let o):
-                state = o
+        let configPath = statePath == inboxStatePath ? inboxPath : workshopExecutionsPath
+        let seed: [JSONValue]
+        if case .missing = Self.readConfigsRaw(configPath) {
+            let proposed = try await defaults()
+            seed = statePath == inboxStatePath ? proposed.inbox : proposed.workshop
+        } else { seed = [] }
+        return try await SwiftNativePersistenceCore.withFileLock(configPath) { [self] in
+            let configs = try await Self._readList(path: configPath, defaultValue: seed)
+            guard let cfg = configs.first(where: { $0.name == name }), cfg.enabled else { return nil }
+            return try await SwiftNativePersistenceCore.withFileLock(statePath) { [self] in
+                guard let scheduled = self.scheduledInstantIfDue(cfg) else { return nil }
+                let stamp = Self.isoTimestamp(scheduled)
+                var state: [String: JSONValue]
+                switch Self.readStateRaw(statePath) {
+                case .corrupt:
+                    throw TriggerSchedulerError.invalidRequest("\(statePath.path) is damaged; restore it so the trigger can be claimed")
+                case .missing:
+                    state = [:]
+                case .parsed(let o):
+                    state = o
+                }
+                // Re-check under the lock: another instance may have just claimed
+                // this same occurrence.
+                if Self.hasFired(cfg, state: state, scheduled: scheduled) {
+                    return nil
+                }
+                let surface = statePath == inboxStatePath ? "inbox" : "workshop"
+                // `last_fired_at` stamps the scheduled instant at claim, not successful completion.
+                var entry: [String: JSONValue] = if case .object(let saved)? = state[name] { saved } else { [:] }
+                let life = try DataRootLife.current(in: root)
+                let unfinished: [JSONValue] = if DataRootLife.life(of: entry["lifeID"]) == life, case .array(let saved)? = entry["unfinished_occurrences"] { saved } else { [] }
+                entry["unfinished_occurrences"] = .array(unfinished + [.string(stamp)])
+                entry["lifeID"] = .string(life)
+                entry["state"] = .string("running")
+                entry.removeValue(forKey: "reason")
+                entry["last_fired_at"] = .string(stamp)
+                if cfg.kind == "time" {
+                    entry["last_fired_occurrence"] = .string(Self.timeOccurrence(cfg, scheduled: scheduled))
+                }
+                state[name] = .object(entry)
+                try await SwiftNativePersistenceCore.writeJSON(.object(state), to: statePath)
+                await oweTrigger(surface: surface, name: name, occurrence: stamp).value
+                return stamp
             }
-            // Re-check under the lock: another instance may have just claimed
-            // this same occurrence.
-            if Self.hasFired(cfg, state: state, scheduled: scheduled) {
-                return false
-            }
-            let surface = statePath == inboxStatePath ? "inbox" : "workshop"
-            // `last_fired_at` stamps the scheduled instant at claim, not successful completion.
-            var entry: [String: JSONValue] = if case .object(let saved)? = state[name] { saved } else { [:] }
-            let life = try DataRootLife.current(in: root)
-            let unfinished: [JSONValue] = if DataRootLife.life(of: entry["lifeID"]) == life, case .array(let saved)? = entry["unfinished_occurrences"] { saved } else { [] }
-            entry["unfinished_occurrences"] = .array(unfinished + [.string(stamp)])
-            entry["lifeID"] = .string(life)
-            entry["state"] = .string("running")
-            entry.removeValue(forKey: "reason")
-            entry["last_fired_at"] = .string(stamp)
-            if cfg.kind == "time" {
-                entry["last_fired_occurrence"] = .string(Self.timeOccurrence(cfg, scheduled: scheduled))
-            }
-            state[name] = .object(entry)
-            try await SwiftNativePersistenceCore.writeJSON(.object(state), to: statePath)
-            await oweTrigger(surface: surface, name: name, occurrence: stamp).value
-            return true
         }
-        return try await SwiftNativePersistenceCore.withFileLock(statePath, work)
     }
 
     /// Accept integer fields and whole finite doubles within Int32 bounds; fractional fields are dormant.

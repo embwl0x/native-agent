@@ -6,10 +6,8 @@ import AgentWorkspace
 import PersistenceCore
 import CryptoKit
 import Senses
-import MacControl
 import Privacy
-import Research
-// Blueprint: | `ChromePageText.swift` | `ChromePageText` enum; one `VisiblePageText` shares rendered text and addressable rows with the mirror and envelope; ordered inline prose with link proofs, section-named continuation headers, `project`, `rows`, page and folded-control `next`; empty image-document reads point to chrome.look; `readDocument` adds a bounded independent HTTP PDF transcript explicitly unverified against Chrome beside its displayed picture; `contentVersion` shared by the envelope and Chrome news without rendering |
+// Blueprint: | `ChromePageText.swift` | `ChromePageText` enum; one `VisiblePageText` shares rendered text and addressable rows with the mirror and envelope; ordered inline prose with link proofs, section-named continuation headers, `project`, `rows`, page and folded-control `next`; empty image-document reads point to chrome.look; PDF pictures explicitly report unavailable document text without fetching another source; `contentVersion` shared by the envelope and Chrome news without rendering |
 
 /// Chrome's ordered prose and action rows, with the same receipt on raw and
 /// sense-served reads. Continuations name positions in the rendered page.
@@ -33,61 +31,11 @@ enum ChromePageText {
         return rendering["loaded"] == .bool(false)
     }
 
-    /// An independent HTTP read retains its own coverage; it cannot prove
-    /// which PDF Chrome displayed with its cookies and authentication.
-    static func readDocument(_ snapshot: JSONValue) async throws -> JSONValue {
-        guard case .object(var page) = snapshot, case .object(var document)? = page["document"],
-              document["kind"] == .string("pdf") else { return snapshot }
-        document["status"] = .string("failed")
-        document["text"] = .string("")
-        document["source"] = .string("http_pdf")
-        document["chrome_document_verified"] = .bool(false)
-        do {
-            guard let address = page["url"]?.stringValue, let url = URL(string: address),
-                  ["https", "http"].contains(url.scheme?.lowercased() ?? "") else {
-                throw SenseFailure(code: "unsupported_document_url", message: "This PDF has no HTTP(S) document address to read.")
-            }
-            let response = try await URLSessionResearchHTTPClient().getBounded(url: url, timeout: 20,
-                maxBytes: MacDocumentRead.maxFileBytes)
-            document["read_at"] = .string(NativeTimestampFormat.plainZulu(Date()))
-            document["final_url"] = response.finalURL.map { .string($0.absoluteString) } ?? .string(address)
-            document["http_status"] = .int(Int64(response.status))
-            document["retained_body_bytes"] = .int(Int64(response.body.count))
-            document["body_truncated"] = .bool(response.truncated)
-            guard (200...299).contains(response.status) else {
-                throw SenseFailure(code: "pdf_http_failed", message: "The PDF read returned HTTP \(response.status); no document text was read.")
-            }
-            let extraction = response.truncated ? .failure(MacDocumentRead.ExtractionFailure.fileTooLarge)
-                : MacDocumentRead.extract(data: response.body, kind: .pdf)
-            switch extraction {
-            case .success(let extracted):
-                document["text"] = .string(NativeAppSecretRedactor.redactText(extracted.text))
-                document["status"] = .string("unverified")
-                document["http_read_status"] = .string(extracted.truncated ? "partial" : "completed")
-                document["reason"] = .string("Independent HTTP PDF text; Chrome's displayed document has not been verified. Chrome cookies and authentication were not used.")
-                document["pages"] = extracted.pages.map { .int(Int64($0)) } ?? .null
-                document["text_truncated"] = .bool(extracted.truncated)
-            case .failure(let failure):
-                document["error"] = .string(failure.rawValue)
-                document["reason"] = .string(MacDocumentRead.words(for: failure, path: url.path))
-            }
-        } catch {
-            if error is CancellationError || Task.isCancelled { throw CancellationError() }
-            document["error"] = .string((error as? SenseFailure)?.code ?? "pdf_read_failed")
-            document["reason"] = .string(NativeAppSecretRedactor.redactText(error.localizedDescription))
-        }
-        page["document"] = .object(document)
-        return .object(page)
-    }
-
     private static func render(_ snapshot: JSONValue, visible: [Line], rows mirrorRows: [ChromePageMirror.Row]) -> String? {
         guard case .object(let page) = snapshot else { return nil }
         if case .object(let document)? = page["document"], document["kind"] == .string("pdf") {
-            let content = document["text"]?.stringValue ?? ""
-            let status = content.isEmpty ? "failed" : document["status"]?.stringValue ?? "partial"
-            return safe(page["url"]?.stringValue ?? "") + "\nPDF read: " + status + "\n\n"
-                + safe(document["reason"]?.stringValue ?? "The PDF document text was not read.")
-                + (content.isEmpty ? "" : "\n\n" + UntrustedText.neutralized(content))
+            return safe(page["url"]?.stringValue ?? "")
+                + "\nPDF text is unavailable from Chrome's picture reader. The displayed document is returned as a picture."
         }
         guard page["snapshotId"]?.stringValue != nil, case .array(let nodes)? = page["nodes"] else { return nil }
         // Prose uses the home's markup defuse. Code is quoted behind a fence

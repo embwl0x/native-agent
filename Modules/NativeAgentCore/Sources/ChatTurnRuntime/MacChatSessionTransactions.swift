@@ -31,11 +31,13 @@ public protocol MacChatSessionSelectionPort: AnyObject {
 /// once a write has started, the next intent waits and writes last.
 actor ChatRenameMutationGate {
     private var held = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [ScopedWaiter] = []
 
     func acquire() async {
         guard held else { held = true; return }
-        await withCheckedContinuation { waiters.append($0) }
+        let done = ScopedWaiter()
+        waiters.append(done)
+        await Task { await done.park() }.value
     }
 
     func release() {
@@ -57,7 +59,7 @@ public final class MacChatSessionTransactions {
 
     public private(set) var loadInFlight = false
     @ObservationIgnored private var loadCompleted = false
-    @ObservationIgnored private var loadWaiters: [CheckedContinuation<Void, Never>] = []
+    @ObservationIgnored private var loadDone = ScopedWaiter()
 
     public init() {}
 
@@ -70,14 +72,14 @@ public final class MacChatSessionTransactions {
         await operation()
         loadInFlight = false
         loadCompleted = true
-        let waiters = loadWaiters
-        loadWaiters.removeAll()
-        for waiter in waiters { waiter.resume() }
+        loadDone.resume()
+        loadDone = ScopedWaiter()
     }
 
     public func waitForLoadCompletion() async {
         guard loadInFlight || !loadCompleted else { return }
-        await withCheckedContinuation { loadWaiters.append($0) }
+        let done = loadDone
+        await Task { await done.park() }.value
     }
 
     public func existingMainSession(in sessions: [NativeAgentShared.ChatSession], anchorSessionId: String? = nil,

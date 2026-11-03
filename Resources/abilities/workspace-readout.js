@@ -1,6 +1,6 @@
 /* NativeAgent ability
 {
-  "id":"workspace-readout", "kind":"tool", "version":1,
+  "id":"workspace-readout", "kind":"ability", "version":1,
   "reach":{"capabilities":[],"readPaths":[],"hosts":[],"apps":[]},
   "face":{"projection":true},
   "record":{"description":"Compose Today, Music and helper workspace faces from native read facts, selecting only bound item and action keys.","actions":[],"inputSchema":{"type":"object","required":["mode"]}}
@@ -54,7 +54,7 @@ function run(input) {
         if (input.state === "unavailable") return {title:"Music",content:{note:screen},items:[],actions:["play","pause","stop","next","previous","playlist","track","find","playlists"].map(action)};
         const r=input.result, now=input.tool === "music_control" ? r.now_playing : r;
         function playing(row) {
-            const state=row.state || row.playerState;
+            const state=row.state;
             const since=text(row.since) ? " · observed since "+row.since+" (transition time unknown)" : " · since unknown";
             if (row.track === null) return state+since+(text(row.reason) ? " · "+row.reason : "");
             const track=row.track, name=text(track.name);

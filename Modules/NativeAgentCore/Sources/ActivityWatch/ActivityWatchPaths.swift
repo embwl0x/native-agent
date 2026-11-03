@@ -12,8 +12,8 @@ import Foundation
 ///
 /// So the watcher gets its own directory, and that directory appears in NO
 /// backup, export, support-bundle, or iCloud/CloudKit snapshot list.
-/// `ActivityWatchArchitectureTests.activityStoreIsExcludedFromSyncAndBackup`
-/// asserts exactly that, by reading those lists out of the app sources.
+/// `ActivitySpanStore` owns these local bytes; `PrivacyMap` classifies them as
+/// local-only and `TrustBackupOffDisk` excludes this directory from backup.
 public enum ActivityWatchPaths {
     /// Directory name under the data root. Deliberately NOT "activity".
     public static let directoryName = "activity_watch"

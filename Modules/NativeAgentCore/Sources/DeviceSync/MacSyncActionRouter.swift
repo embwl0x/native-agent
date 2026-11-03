@@ -31,9 +31,7 @@ struct MacSyncActionRouter {
         func clean(_ key: String) -> String {
             (payload[key] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        // Fold the legacy `missions` spelling before the MODEL_SURFACES guard —
-        // an iOS build or signed action one version behind still sends it.
-        let surface = WorkshopSurfaceVocabulary.canonicalSurface(clean("surface").lowercased())
+        let surface = clean("surface").lowercased()
         let providerID = clean("provider_id")
         let model = clean("model")
         let reasoning = clean("reasoning_effort").lowercased()
@@ -103,19 +101,18 @@ struct MacSyncActionRouter {
 
     nonisolated static func unpinChatSessionID(from payload: [String: String]) -> String? {
         NativeAgentChatSessionID.normalizedPathComponent(
-            payload["sessionId"] ?? payload["session_id"]
+            payload["sessionId"]
         )
     }
 
     /// Publish organism evidence only after the canonical phone-delivery receipt is durable.
-    /// Only authenticated iOS receipts default an omitted direction to mac_to_ios; explicit values stay literal.
+    /// Receipt direction is explicit in the current phone schema.
     static func notificationReceiptResponse(
         payload: [String: String],
-        senderIsAuthenticatedIOSPeer: Bool,
         confirm: (String, String, String) async -> Bool,
         receive: (String, String) async -> Void
     ) async -> [String: String] {
-        let eventID = (payload["eventId"] ?? payload["event_id"] ?? "")
+        let eventID = (payload["eventId"] ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard NativeAgentDeviceEventIdentity.isCanonical(eventID) else {
             return [
@@ -125,11 +122,8 @@ struct MacSyncActionRouter {
                 "message": "Notification receipt requires a canonical eventId.",
             ]
         }
-        var direction = (payload["direction"] ?? payload["receiptDirection"] ?? "")
+        let direction = (payload["direction"] ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if direction.isEmpty, senderIsAuthenticatedIOSPeer {
-            direction = "mac_to_ios"
-        }
         guard direction == "mac_to_ios" || direction == "ios_to_mac" else {
             return [
                 "status": "error",
@@ -168,7 +162,7 @@ struct MacSyncActionRouter {
     /// The runs a cancelChat action names, if any. An empty result means the
     /// caller did not name one and the session's current turn is the target.
     static func cancelChatRunIDs(from payload: [String: String]) -> [String] {
-        let raw = payload["runId"] ?? payload["run_id"] ?? ""
+        let raw = payload["runId"] ?? ""
         return raw
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -284,21 +278,22 @@ struct MacSyncActionRouter {
                     .appendNote(handle, text: note)
                 return observed(["status": "ok", "handle": handle])
 
-            case "submitWorkshopTask", "submitMission":
+            case "submitWorkshopTask":
                 let title = payload["title"] ?? "iOS Desk Task"
                 let objective = payload["objective"] ?? ""
                 let result = try await api.submitWorkshopExecution(title: title, objective: objective)
-                return [
+                var response = [
                     "status": "ok",
-                    // Preserve the response key read by existing iOS installations.
-                    InboxActionExecutionIdVocabulary.wireKey: result.executionId ?? result.id ?? "",
                     "deskHandle": result.desk_handle ?? "",
                     "deskAlias": result.desk_alias ?? "",
                 ]
+                if let executionID = result.executionId {
+                    response[InboxActionExecutionIdVocabulary.wireKey] = executionID
+                }
+                return response
 
             case "approveStep", "rejectStep":
                 let rejecting = action.action == "rejectStep"
-                // Accept both executionId and the phone's missionId wire spelling.
                 let executionId = InboxActionExecutionIdVocabulary.executionId(payload) ?? ""
                 let stepId = payload["stepId"] ?? ""
                 guard !executionId.isEmpty, !stepId.isEmpty, stepId != "pending" else {
@@ -326,13 +321,13 @@ struct MacSyncActionRouter {
                 return observed(try await memoryActionResponse(["ok": "true", "status": "rejected"], proposalID: proposalId, api: api))
 
             case "deleteMemory":
-                let memoryId = payload["memoryId"] ?? payload["id"] ?? ""
+                let memoryId = payload["memoryId"] ?? ""
                 guard !memoryId.isEmpty else { return observed(["status": "error", "message": "Missing memoryId"]) }
                 try await api.deleteMemory(id: memoryId)
                 return observed(try await memoryActionResponse(["status": "ok", "ok": "true"], memoryID: memoryId, api: api))
 
             case "approveApproval", "rejectApproval", "cancelApproval":
-                let approvalId = payload["approvalId"] ?? payload["id"] ?? ""
+                let approvalId = payload["approvalId"] ?? ""
                 let response: [String: String]
                 if approvalId.isEmpty {
                     response = ["status": "error", "message": "Missing approvalId"]
@@ -354,16 +349,18 @@ struct MacSyncActionRouter {
                 return try await api.interactionAction(payload: fields, actionID: action.msgId, clientID: action.clientId)
 
             case "inboxAction":
-                let itemId = payload["itemId"] ?? payload["id"] ?? ""
-                let actionId = payload["actionId"] ?? payload["action"] ?? "act"
+                let itemId = payload["itemId"] ?? ""
+                let actionId = payload["actionId"]
                 guard !itemId.isEmpty else { return ["status": "error", "message": "Missing inbox item id"] }
-                guard !actionId.isEmpty else { return ["status": "error", "message": "Missing inbox action"] }
+                guard let actionId,
+                      let endpointAction = InboxActionVocabulary.routedAction(actionId, itemID: itemId) else {
+                    return ["status": "error", "code": "invalid_action", "message": "Unknown or missing inbox action"]
+                }
                 if itemId.hasPrefix("interaction:"), actionId == "act" {
                     let response = try await api.interactionAction(payload: ["action": "open", "itemID": itemId],
                         actionID: action.msgId, clientID: action.clientId)
                     return try await inboxActionResponse(response, itemID: itemId, api: api)
                 }
-                let endpointAction = InboxActionVocabulary.routedAction(actionId, itemID: itemId)
                 if (endpointAction == "approve" || endpointAction == "reject"), !itemId.hasPrefix("interaction:") {
                     return observed(try await approvalActionResponse(approvalId: itemId,
                         decision: endpointAction, action: action, inboxItemID: itemId))
@@ -379,7 +376,7 @@ struct MacSyncActionRouter {
             case "registerWorkActivity":
                 guard let deviceID = payload["deviceId"], !deviceID.isEmpty,
                       let enabled = payload["enabled"], ["true", "false"].contains(enabled),
-                      let environment = payload["environment"], ["development", "production"].contains(environment),
+                      let environment = payload["environment"],
                       let bundleID = payload["bundleId"], !bundleID.isEmpty else {
                     return ["status": "error", "message": "Invalid Live Activity registration"]
                 }
@@ -410,9 +407,11 @@ struct MacSyncActionRouter {
                 guard !token.isEmpty else {
                     return ["status": "error", "message": "Missing push device token"]
                 }
-                let deviceId = payload["deviceId"] ?? payload["device_id"] ?? "ios"
-                let environment = payload["environment"] ?? payload["sandbox"] ?? "prod"
-                let bundleId = payload["bundleId"] ?? payload["bundle_id"] ?? ""
+                guard let deviceId = payload["deviceId"], !deviceId.isEmpty,
+                      let environment = payload["environment"],
+                      let bundleId = payload["bundleId"], !bundleId.isEmpty else {
+                    return ["status": "error", "message": "Push registration requires deviceId, environment and bundleId"]
+                }
                 try await MacSyncMobileNotificationRelay.storePushToken(
                     deviceId: deviceId,
                     pairedDeviceID: action.clientId,
@@ -435,11 +434,6 @@ struct MacSyncActionRouter {
             case "recordNotificationReceipt":
                 return observed(await Self.notificationReceiptResponse(
                     payload: payload,
-                    // `dispatch` is reached only from MacSyncEngine+Inbox after
-                    // the action's HMAC and timestamp validated, on both the
-                    // Drive and CloudKit lanes — so the sender IS the paired
-                    // iPhone.
-                    senderIsAuthenticatedIOSPeer: true,
                     confirm: { direction, eventID, channel in
                         await iCloudBridge.confirmChatDeliveryReceipt(
                             direction: direction,
@@ -462,8 +456,14 @@ struct MacSyncActionRouter {
                 return observed(await steerChat(payload))
 
             case "cancelChat":
-                var sessionId = payload["sessionId"] ?? payload["session_id"] ?? ""
-                let sourceKey = payload["sourceKey"] ?? payload["source_key"] ?? ""
+                // A discarded target spelling must not become "Stop the current
+                // turn" when the current run/session field was not supplied.
+                guard Set(payload.keys).isSubset(of: ["sessionId", "source", "sourceKey", "runId"]) else {
+                    return observed(["status": "error", "ok": "false", "code": "invalid_payload",
+                        "message": "cancelChat requires current sessionId, source, sourceKey and runId fields."])
+                }
+                var sessionId = payload["sessionId"] ?? ""
+                let sourceKey = payload["sourceKey"] ?? ""
                 if sessionId.isEmpty, !sourceKey.isEmpty {
                     if let sessions = try? await api.getChatSessions() {
                         sessionId = sessions.first(where: { $0.sourceKey == sourceKey })?.id ?? ""
@@ -482,9 +482,12 @@ struct MacSyncActionRouter {
                     // of them is in flight here, from whichever door started it:
                     // the shared turn owner keeps those exact requested ids
                     // through the marker write (never a later run). A named
-                    // run not yet here is held against its id — registration
-                    // cancels it — and that is said as pending, never as a stop that happened.
+                    // run not yet here is held in its admission row — dispatch
+                    // refuses it — and that is said as pending, never as a stop that happened.
                     let runIDs = Self.cancelChatRunIDs(from: payload)
+                    for runID in runIDs {
+                        try await iCloudBridge.recordChatStop(session: safeSessionId, runID: runID, dataRoot: sync.dataRoot)
+                    }
                     let cancelOutcome = cancelChatTask(safeSessionId, runIDs)
                     let stopsHere = runIDs.isEmpty
                         ? cancelOutcome == .cancelled || cancelOutcome == .noActiveTask
@@ -760,7 +763,7 @@ extension MacSyncActionRouter {
     /// already working in that chat while it runs: she reads it at her next
     /// step, as on the Mac and Telegram. The phone hears "steered" once a
     /// round has read it, or "steer_returned" when the turn ended first (with
-    /// whether its row is already written), and then sends it as its own
+    /// its original run identity), and then sends it as its own
     /// message. No working turn for this door: not taken, said so at once.
     func steerChat(_ payload: [String: String]) async -> [String: String] {
         guard let sessionId = payload["sessionId"].flatMap(NativeAgentChatSessionID.normalizedPathComponent),
@@ -771,10 +774,18 @@ extension MacSyncActionRouter {
         let routeKey = payload["routeKey"] ?? ""
         let route = ChatToolSessionContext.ReplyRoute(surface: "ios", sourceKey: routeKey, replyTo: "iphone", correlationId: runId)
         let bridge = sync.bridge
-        func tell(_ kind: String, _ words: String, _ extra: [String: String] = [:]) async {
-            _ = try? await bridge.sendChatMessage(text: words, sessionID: sessionId, correlationID: runId,
-                metadata: ["kind": kind, "transport": "icloud", "source": "mac", "replyTo": "iphone",
-                           "targetSourceKey": routeKey].merging(extra) { $1 })
+        func tell(_ kind: String, _ words: String, _ extra: [String: String] = [:]) async -> Bool {
+            let id = "steer-" + MacSyncSnapshotIntegrity.digest(Data("\(runId)\n\(kind)".utf8))
+            do {
+                _ = try await bridge.sendChatMessage(text: words, sessionID: sessionId, correlationID: runId,
+                    metadata: ["kind": kind, "transport": "icloud", "source": "mac", "replyTo": "iphone",
+                               "targetSourceKey": routeKey].merging(extra) { $1 }, messageID: id)
+                return true
+            } catch {
+                bridge.syncStatus = "Phone steering outcome delivery remains owed: \(error.localizedDescription)"
+                nativeLog("[MacSyncEngine] steering outcome %@ remains owed: %@", id, error.localizedDescription)
+                return false
+            }
         }
         // 0 offered, 1 reserved (its row written), 2 read.
         let phase = OSAllocatedUnfairLock(initialState: 0)
@@ -786,14 +797,23 @@ extension MacSyncActionRouter {
                     switch (phase, committed, read) {
                     case (0, false, false): phase = 1; return true
                     case (1, false, true): phase = 2; return true
+                    case (2, false, true): return true
                     case (2, true, _): return true
                     default: return false
                     }
                 }
-                if next, read { await tell("steered", "Read in the reply in progress") }
+                // Reading belongs to this turn. The retained phone notice owns
+                // its delivery repair and cannot un-read or abort her answer.
+                if next, read { _ = await tell("steered", "Read in the reply in progress") }
                 return next
             }, onReturned: { _ in
-                await tell("steer_returned", "Sending it as its own message", ["rowWritten": phase.withLock { $0 } == 1 ? "true" : "false"])
+                // A model already read phase 2 even if its phone notification
+                // failed. Re-signal that outcome; never ask for a duplicate turn.
+                if phase.withLock({ $0 }) == 2 {
+                    _ = await tell("steered", "Read in the reply in progress")
+                } else {
+                    _ = await tell("steer_returned", "Sending it as its own message", ["rowWritten": phase.withLock { $0 } == 1 ? "true" : "false"])
+                }
             })
         return ["status": "ok", "ok": "true", "steered": taken ? "true" : "false"]
     }

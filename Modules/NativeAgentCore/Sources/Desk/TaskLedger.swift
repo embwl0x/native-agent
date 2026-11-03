@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `TaskLedger.swift` | `SwiftNativeTaskLedger` owns the orchestration event feed and compaction base; the CLI and wrapper use `PersistenceCore.defaultDataRoot()` unless `--data-root` is explicit |
+// Blueprint: | `TaskLedger.swift` | `SwiftNativeTaskLedger` owns the checked, complete orchestration event feed and compaction base; current actors only; the CLI and wrapper use `PersistenceCore.defaultDataRoot()` unless `--data-root` is explicit |
 
 // MARK: - Cross-agent task ledger
 //
@@ -32,15 +32,9 @@ import PersistenceCore
 public enum TaskLedgerActor: String, Sendable, CaseIterable {
     case claude, assistant, codex, user
 
-    /// Decode accepts historical actor aliases; writes use canonical raw values without rewriting stored events.
+    /// The CLI and stored records use the same current actor vocabulary.
     public init?(wire raw: String) {
-        if let canonical = TaskLedgerActor(rawValue: raw) {
-            self = canonical
-        } else if raw == "agent" {
-            self = .assistant
-        } else {
-            return nil
-        }
+        self.init(rawValue: raw)
     }
 }
 
@@ -82,8 +76,8 @@ public struct TaskLedgerEvent: Sendable, Equatable {
     }
 
     /// Serialize to the JSONValue wire form persisted to the events feed.
-    /// Optional fields are omitted when nil/empty (NOT emitted as null) so the
-    /// Python CLI writer and this Swift writer produce the same shape.
+    /// Optional fields are omitted when nil/empty (NOT emitted as null).
+    /// The app and task-ledger CLI share this writer.
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = [
             "id": .string(id),
@@ -98,9 +92,8 @@ public struct TaskLedgerEvent: Sendable, Equatable {
         return .object(obj)
     }
 
-    /// Parse one event off the feed. Tolerant of unknown actor/kind tokens
-    /// (skipped → nil) so a future schema addition by one writer never crashes
-    /// an older reader.
+    /// Decode one complete current event. A rejected row makes the owning
+    /// history unavailable; callers never project a shortened successful feed.
     public static func fromJSON(_ value: JSONValue) -> TaskLedgerEvent? {
         guard case .object(let obj) = value,
               case .string(let id)? = obj["id"],
@@ -112,18 +105,25 @@ public struct TaskLedgerEvent: Sendable, Equatable {
               let kind = TaskLedgerKind(rawValue: kindRaw) else {
             return nil
         }
-        var title: String?
-        if case .string(let t)? = obj["title"] { title = t }
-        var note: String?
-        if case .string(let n)? = obj["note"] { note = n }
-        var refs: [String] = []
-        if case .array(let arr)? = obj["refs"] {
-            refs = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
+        for key in ["title", "note"] {
+            if let value = obj[key] {
+                guard case .string = value else { return nil }
+            }
         }
-        return TaskLedgerEvent(
+        var refs: [String] = []
+        if let value = obj["refs"] {
+            guard case .array(let arr) = value else { return nil }
+            for value in arr {
+                guard case .string(let ref) = value else { return nil }
+                refs.append(ref)
+            }
+        }
+        let event = TaskLedgerEvent(
             id: id, taskId: taskId, ts: ts, actor: actor, kind: kind,
-            title: title, note: note, refs: refs
+            title: obj["title"]?.stringValue, note: obj["note"]?.stringValue, refs: refs
         )
+        guard event.toJSON() == value else { return nil }
+        return event
     }
 }
 
@@ -164,24 +164,29 @@ public struct TaskLedgerTaskState: Sendable, Equatable {
               case .string(let updatedTs)? = obj["updatedTs"] else {
             return nil
         }
-        var title: String?
-        if case .string(let t)? = obj["title"] { title = t }
+        for key in ["title", "lastNote"] {
+            if let value = obj[key] {
+                guard case .string = value else { return nil }
+            }
+        }
         var owner: TaskLedgerActor?
-        if case .string(let o)? = obj["owner"] { owner = TaskLedgerActor(wire: o) }
-        var lastNote: String?
-        if case .string(let n)? = obj["lastNote"] { lastNote = n }
+        if let value = obj["owner"] {
+            guard case .string(let raw) = value, let actor = TaskLedgerActor(wire: raw) else { return nil }
+            owner = actor
+        }
         var refs: [String] = []
-        if case .array(let arr)? = obj["refs"] {
-            refs = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
+        if let value = obj["refs"] {
+            guard case .array(let arr) = value else { return nil }
+            for value in arr {
+                guard case .string(let ref) = value else { return nil }
+                refs.append(ref)
+            }
         }
         let state = TaskLedgerTaskState(
-            taskId: taskId, title: title, owner: owner, status: status,
-            createdTs: createdTs, updatedTs: updatedTs, lastNote: lastNote, refs: refs
+            taskId: taskId, title: obj["title"]?.stringValue, owner: owner, status: status,
+            createdTs: createdTs, updatedTs: updatedTs, lastNote: obj["lastNote"]?.stringValue, refs: refs
         )
-        // The sole surviving snapshot may normalize only the documented alias.
-        var migrated = obj
-        if migrated["owner"] == .string("agent") { migrated["owner"] = .string("assistant") }
-        guard state.toJSON() == .object(migrated) else { return nil }
+        guard state.toJSON() == value else { return nil }
         return state
     }
 }
@@ -222,17 +227,14 @@ struct TaskLedgerCompactionBase: Sendable, Equatable {
             guard let state = TaskLedgerTaskState.fromJSON(row) else { return nil }
             tasks.append(state)
         }
-        var migrated = obj
-        // Older bases omitted the accounting field; no task data is inferred.
-        if migrated["compactedOpCount"] == nil { migrated["compactedOpCount"] = .int(0) }
-        guard case .int(let rawCount)? = migrated["compactedOpCount"], rawCount >= 0,
+        guard case .int(let rawCount)? = obj["compactedOpCount"], rawCount >= 0,
               let compactedOpCount = Int(exactly: rawCount) else { return nil }
-        migrated["tasks"] = .array(tasks.map { $0.toJSON() })
+        guard Set(tasks.map(\.taskId)).count == tasks.count else { return nil }
         let base = TaskLedgerCompactionBase(
             tasks: tasks, lastCompactedOpId: lastCompactedOpId,
             compactedAt: compactedAt, compactedOpCount: compactedOpCount
         )
-        guard base.toJSON() == .object(migrated) else { return nil }
+        guard base.toJSON() == value else { return nil }
         return base
     }
 }
@@ -270,6 +272,17 @@ public struct TaskLedgerBaseUnreadable: Error, LocalizedError, Sendable {
     public let path: String
     public var errorDescription: String? {
         "task ledger: compaction base at \(path) exists but its bytes could not be read (transient IO — fd exhaustion or a dataless file); retry rather than treating the ledger as corrupt"
+    }
+}
+
+/// The file is retained intact; no derived state or mutation may use a feed
+/// whose complete event history could not be read.
+public struct TaskLedgerHistoryUnavailable: Error, LocalizedError, Sendable {
+    public let path: String
+    public let integrity: SnapshotTailOpLog.OpLogIntegrity
+
+    public var errorDescription: String? {
+        "task ledger history unavailable at \(path): \(integrity.summary). Original bytes retained; repair the named event feed before reading or changing tasks."
     }
 }
 
@@ -477,11 +490,9 @@ public struct SwiftNativeTaskLedger: Sendable {
         return now.timeIntervalSince(updated) < terminalTaskRetention
     }
 
-    /// All events in the FILE (no lock, no base), plus the accounting of what
-    /// the scan threw away.
-    /// `TaskLedgerEvent.fromJSON` returns nil for an unknown `kind` — tolerant
-    /// on read, but the count must reach `compactIfNeededUnlocked` so the fold
-    /// cannot delete rows it never folded.
+    /// Inspect all events in the file and retain the exact integrity receipt.
+    /// Diagnostic health reads may inspect this receipt; functional reads
+    /// require it to be complete before replay or mutation.
     func readEventsWithIntegrityUnlocked() async throws -> (events: [TaskLedgerEvent], integrity: SnapshotTailOpLog.OpLogIntegrity) {
         let (raw, report) = try await SwiftNativePersistenceCore.readJSONLReporting(eventsPath)
         let events = raw.compactMap { TaskLedgerEvent.fromJSON($0) }
@@ -509,7 +520,7 @@ public struct SwiftNativeTaskLedger: Sendable {
             feed: Self.logLabel,
             path: eventsPath,
             physicalRowCount: integrity.physicalRowCount,
-            byteCount: SnapshotTailOpLog.OpLogHealth.fileSize(eventsPath),
+            byteCount: try SnapshotTailOpLog.OpLogHealth.fileSize(eventsPath),
             compactionThreshold: Self.opsCompactionThreshold,
             integrity: integrity
         )
@@ -528,6 +539,9 @@ public struct SwiftNativeTaskLedger: Sendable {
     }
 
     private func readFeedUnlocked(events: [TaskLedgerEvent], integrity: SnapshotTailOpLog.OpLogIntegrity) throws -> TaskLedgerFeed {
+        guard integrity.isClean, !integrity.trailingPartialLine else {
+            throw TaskLedgerHistoryUnavailable(path: eventsPath.path, integrity: integrity)
+        }
         let fileEventCount = events.count
         guard FileManager.default.fileExists(atPath: basePath.path) else {
             return TaskLedgerFeed(base: nil, events: events, fileEventCount: fileEventCount, integrity: integrity)

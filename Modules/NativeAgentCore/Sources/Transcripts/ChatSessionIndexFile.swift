@@ -64,6 +64,7 @@ public enum ChatSessionIndexFile {
                 "threadKind": .string(kind.rawValue), "sourceKey": .string(sourceKey),
                 "createdAt": .string(now), "updatedAt": .string(now),
                 "archived": .bool(false), "messageCount": .int(0),
+                transcriptGenerationKey: .int(0),
             ]
             rows.insert(row, at: 0)
             try write(rows, to: path)
@@ -217,7 +218,7 @@ public enum ChatSessionIndexFile {
         sessionId: String, role normalizedRole: String, source: String, sourceKey: String?, kind: ChatThreadKind?, ownedSessionID: String?,
         timestamp: String, syncedAt: String, preview: String, stamp: TranscriptRowStamp,
         title: String?, continuityParticipant: String?, continuityScope: String?,
-        dataRoot: URL, messagesPath: URL, countMessages: @escaping @Sendable (URL) -> Int,
+        dataRoot: URL, messagesPath: URL, countMessages: @escaping @Sendable (URL) throws -> Int,
         clock retentionClock: @escaping @Sendable () -> Date
     ) async throws {
         let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
@@ -227,7 +228,7 @@ public enum ChatSessionIndexFile {
                 $0["id"] == .string(sessionId) && $0["continuityParticipant"] != nil
             }
             let snapshot = try await SwiftNativePersistenceCore.withFileLock(messagesPath) {
-                let count = countMessages(messagesPath)
+                let count = try countMessages(messagesPath)
                 var verifiedOpening = false
                 if needsOpeningProof, normalizedRole == "user", count > 1, let continuityParticipant {
                     let (transcript, report) = try await SwiftNativePersistenceCore.readJSONLReporting(messagesPath)
@@ -353,7 +354,7 @@ public enum ChatSessionIndexFile {
 
     /// A rewritten transcript acknowledges its exact filesystem version and count.
     package static func recordTranscriptRewrite(
-        sessionID: String, dataRoot: URL, countMessages: @escaping @Sendable (URL) -> Int
+        sessionID: String, dataRoot: URL, countMessages: @escaping @Sendable (URL) throws -> Int
     ) async throws {
         let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
         try await SwiftNativePersistenceCore.withFileLock(sessionsPath) {
@@ -362,7 +363,7 @@ public enum ChatSessionIndexFile {
             bumpTranscriptGeneration(in: &rows[index])
             let messagesPath = dataRoot.appendingPathComponent("chat/messages/\(sessionID).jsonl")
             let snapshot = try await SwiftNativePersistenceCore.withFileLock(messagesPath) {
-                (count: countMessages(messagesPath), version: transcriptVersion(at: messagesPath))
+                (count: try countMessages(messagesPath), version: transcriptVersion(at: messagesPath))
             }
             rows[index]["messageCount"] = .int(Int64(snapshot.count))
             rows[index][acknowledgedTranscriptKey] = snapshot.version

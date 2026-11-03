@@ -41,8 +41,10 @@ export function boundSnapshotForTransport(snapshot, routes, byteLimit = MAX_SNAP
     if (block !== paragraphKey) { paragraphKey = block; paragraphStart = { node, count: retainedOrder.length }; }
     const group = new Map([[node.nodeId, node]]);
     for (const part of node.inlineText ?? []) {
+      if (!part.elementPath) continue;
       const target = byPath.get(part.elementPath);
-      if (target && !retainedIDs.has(target.nodeId)) group.set(target.nodeId, target);
+      if (!target) throw new ProtocolError("snapshot_link_proof_missing", "An inline link has no action proof in this capture; the incomplete prose was not delivered.");
+      if (!retainedIDs.has(target.nodeId)) group.set(target.nodeId, target);
     }
     const cost = [...group.values()].reduce((sum, member) => sum + encodedBytes(member) + 1, 0);
     if (cost > remainingBytes) {

@@ -194,7 +194,7 @@ public struct ProcedureExactActivationReviewerDecision: Codable, Sendable, Equat
 }
 
 public struct ProcedureExactActivationManifest: Codable, Sendable, Equatable, Identifiable {
-    public static let schema = "procedure-exact-activation-manifest.v1"
+    public static let schema = "procedure-exact-activation-manifest.v2"
 
     public let schema: String
     public let id: String
@@ -202,7 +202,6 @@ public struct ProcedureExactActivationManifest: Codable, Sendable, Equatable, Id
     public let reviewerDecision: ProcedureExactActivationReviewerDecision
     public let selectionMode: String
     public let activatedAt: String
-    public let rollbackDeclaration: String
     public let controlAuthority: Bool
 
     package init(
@@ -215,7 +214,6 @@ public struct ProcedureExactActivationManifest: Codable, Sendable, Equatable, Id
         self.reviewerDecision = reviewerDecision
         self.selectionMode = "exact_typed"
         self.activatedAt = activatedAt
-        self.rollbackDeclaration = "delete_active_pointer_restore_ordinary_workshop_no_data_migration"
         self.controlAuthority = false
         self.id = CausalTransitionEvidence.opaqueIdentity([
             Self.schema,
@@ -234,8 +232,6 @@ public struct ProcedureExactActivationManifest: Codable, Sendable, Equatable, Id
             && reviewerDecision.proposalDigest == proposal.bindingDigest
             && selectionMode == "exact_typed"
             && procedureExactTimestamp(activatedAt)
-            && rollbackDeclaration
-                == "delete_active_pointer_restore_ordinary_workshop_no_data_migration"
             && !controlAuthority
             && id == CausalTransitionEvidence.opaqueIdentity([
                 Self.schema,
@@ -298,8 +294,7 @@ package struct ProcedureExactActivationStatus: Sendable, Equatable {
 
 extension ProcedureArtifactStore {
     /// Install one immutable activation and atomically move only the active
-    /// pointer. A crash before the pointer write leaves the new manifest inert;
-    /// deleting that pointer is the complete rollback.
+    /// pointer. A crash before the pointer write leaves the new manifest inert.
     @discardableResult
     public func installAndActivateExact(
         proposal: ProcedureExactActivationProposal,

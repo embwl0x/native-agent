@@ -15,8 +15,8 @@ extension MacActClosedLoop {
         public let afterLabel: String?
         public let beforeValue: String?
         public let afterValue: String?
-        public let beforeEnabled: Bool
-        public let afterEnabled: Bool
+        public let beforeEnabled: Bool?
+        public let afterEnabled: Bool?
         /// Each text side retains its own compile's enclosing-caption redaction.
         public let beforeLabelJSON: JSONValue?
         public let afterLabelJSON: JSONValue?
@@ -30,8 +30,8 @@ extension MacActClosedLoop {
             afterLabel: String?,
             beforeValue: String?,
             afterValue: String?,
-            beforeEnabled: Bool,
-            afterEnabled: Bool,
+            beforeEnabled: Bool?,
+            afterEnabled: Bool?,
             beforeLabelJSON: JSONValue? = nil,
             afterLabelJSON: JSONValue? = nil,
             beforeValueJSON: JSONValue? = nil,
@@ -78,8 +78,8 @@ extension MacActClosedLoop {
                     ?? redacted(afterValue, under: afterLabel ?? beforeLabel)
             }
             if beforeEnabled != afterEnabled {
-                object["enabled_before"] = .bool(beforeEnabled)
-                object["enabled_after"] = .bool(afterEnabled)
+                object["enabled_before"] = beforeEnabled.map(JSONValue.bool) ?? .null
+                object["enabled_after"] = afterEnabled.map(JSONValue.bool) ?? .null
             }
             return .object(object)
         }
@@ -320,17 +320,16 @@ extension MacActClosedLoop {
         return (own, structural || readoutOnly, readoutOnly)
     }
 
-    /// Only complete walks under matching known caps have a comparable census; absent cap records cannot prove a mismatch.
+    /// Both walks supply current caps; truncation or differing known bounds excludes their census.
     public static func comparability(
-        before: MacLookCompileCaps?,
-        after: MacLookCompileCaps?
+        before: MacLookCompileCaps,
+        after: MacLookCompileCaps
     ) -> (comparable: Bool, reason: String?) {
-        if before?.truncated == true, after?.truncated == true {
+        if before.truncated, after.truncated {
             return (false, "both the look's walk and the post-action walk truncated")
         }
-        if before?.truncated == true { return (false, "the look's walk truncated") }
-        if after?.truncated == true { return (false, "the post-action walk truncated") }
-        guard let before, let after else { return (true, nil) }
+        if before.truncated { return (false, "the look's walk truncated") }
+        if after.truncated { return (false, "the post-action walk truncated") }
         func mismatch(_ name: String, _ lhs: Int?, _ rhs: Int?) -> String? {
             guard let lhs, let rhs, lhs != rhs else { return nil }
             return "\(name) was \(lhs) for the look and \(rhs) for the post-action compile"
@@ -348,7 +347,7 @@ extension MacActClosedLoop {
         before: MacLookFrame,
         after: MacLookPercept,
         afterWindowTitle: String?,
-        afterCaps: MacLookCompileCaps? = nil
+        afterCaps: MacLookCompileCaps
     ) -> EffectDiff {
         var afterByHandle: [String: MacLookAffordance] = [:]
         for affordance in after.affordances where !affordance.handle.isEmpty {
@@ -397,8 +396,11 @@ extension MacActClosedLoop {
 
         let focusBefore = before.focusHandle
         let focusAfter = after.focus?.handle
-        let focusChanged = focusBefore != focusAfter
-            || (focusAfter == nil && before.focusHandle != nil)
+        // The canonical post-read walks this same entire window when the
+        // retained frame owns completeWindow. A page-scoped census cannot
+        // prove what disappeared outside its current scope.
+        let afterComplete = before.completeWindow && !after.truncated && !afterCaps.truncated
+        let focusChanged = focusBefore != focusAfter && (focusAfter != nil || afterComplete)
 
         let modalAfterLabel = normalizedLabel(after.modal?.label)
         let hadModal = before.hasModal
@@ -497,7 +499,7 @@ extension MacActClosedLoop {
             focusLabelJSONAfter: after.focus?.labelJSON,
             focusRoleAfter: after.focus?.role,
             modalAppeared: hasModal && !hadModal,
-            modalDisappeared: !hasModal && hadModal,
+            modalDisappeared: !hasModal && hadModal && afterComplete,
             modalLabelAfter: modalAfterLabel,
             windowTitleChanged: titleBefore != titleAfter,
             windowTitleAfter: titleAfter,

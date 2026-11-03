@@ -14,8 +14,7 @@ public enum FoundationModelsError: Error, Sendable, Equatable {
     case decodeFailed(String)
     case generationFailed(String)
     /// `classify` got a model reply that matches none of the candidate
-    /// categories. Callers must DROP the item (or retry), never substitute a
-    /// default — the associated value is the offending reply, for logs.
+    /// categories. The associated value retains the offending reply.
     case classificationNoMatch(String)
 }
 
@@ -58,7 +57,7 @@ public enum OnDeviceClassification {
         #endif
     }
 
-    /// Accept only a declared category; unparseable replies drop the row.
+    /// Accept only a declared category; an unparseable reply throws.
     public static func matchCategory(reply: String, categories: [String]) throws -> String {
         guard categories.contains(reply) else {
             throw FoundationModelsError.classificationNoMatch(reply)

@@ -51,11 +51,13 @@ public enum NativeScreenCapture {
         // SCDisplay.width/height are POINTS. Configuring the output size in
         // points downsamples Retina displays to 1x; use the display mode's
         // physical pixel dimensions so the capture is native-resolution.
-        // Consumers that need smaller transports (chat's 1600px ladder)
+        // Consumers that need smaller transports (chat's 1600px bound)
         // downscale on their side.
-        let mode = CGDisplayCopyDisplayMode(mainID)
-        configuration.width = mode?.pixelWidth ?? display.width
-        configuration.height = mode?.pixelHeight ?? display.height
+        guard let mode = CGDisplayCopyDisplayMode(mainID), mode.pixelWidth > 0, mode.pixelHeight > 0 else {
+            throw CaptureError.geometryUnavailable
+        }
+        configuration.width = mode.pixelWidth
+        configuration.height = mode.pixelHeight
         configuration.showsCursor = true
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
 
@@ -71,11 +73,16 @@ public enum NativeScreenCapture {
             throw CaptureError.captureFailed(reason)
         }
 
+        guard image.width == configuration.width, image.height == configuration.height else {
+            throw CaptureError.geometryUnavailable
+        }
         return image
     }
     public enum CaptureError: LocalizedError {
         case permissionRequired
         case noDisplay
+        case geometryUnavailable
+        case resizeFailed
         case encodingFailed
         case tooLarge
         // The underlying capture reason is logged; chat receives a short message.
@@ -87,6 +94,10 @@ public enum NativeScreenCapture {
                 return "Screen Recording permission is required for NativeAgent. Enable it in System Settings, then restart NativeAgent if macOS asks."
             case .noDisplay:
                 return "NativeAgent could not find a display to capture."
+            case .geometryUnavailable:
+                return "NativeAgent could not establish the screen's physical pixel dimensions."
+            case .resizeFailed:
+                return "NativeAgent captured the screen but could not resize it for chat."
             case .encodingFailed:
                 return "NativeAgent captured the screen but could not encode it as an image."
             case .tooLarge:
@@ -112,34 +123,15 @@ public enum NativeScreenCapture {
     }
 
     public static func encodeForChat(_ source: CGImage) throws -> (data: Data, mime: String, name: String) {
-        let image = resizedForChat(source)
+        let image = try resizedForChat(source)
         let bitmap = NSBitmapImageRep(cgImage: image)
-        return try fittingEncodedPayload(
-            maxBytes: maxCaptureBytes,
-            jpegData: { quality in
-                bitmap.representation(using: .jpeg, properties: [.compressionFactor: quality])
-            },
-            pngData: { bitmap.representation(using: .png, properties: [:]) }
-        )
+        guard let data = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.78]),
+              !data.isEmpty else { throw CaptureError.encodingFailed }
+        guard data.count <= maxCaptureBytes else { throw CaptureError.tooLarge }
+        return (data, "image/jpeg", "screen.jpg")
     }
 
-    public static func fittingEncodedPayload(
-        maxBytes: Int,
-        jpegData: (Double) -> Data?,
-        pngData: () -> Data?
-    ) throws -> (data: Data, mime: String, name: String) {
-        for quality in [0.78, 0.65, 0.52, 0.40] {
-            if let jpeg = jpegData(quality), jpeg.count <= maxBytes {
-                return (jpeg, "image/jpeg", "screen.jpg")
-            }
-        }
-        if let png = pngData(), png.count <= maxBytes {
-            return (png, "image/png", "screen.png")
-        }
-        throw CaptureError.tooLarge
-    }
-
-    public static func resizedForChat(_ source: CGImage) -> CGImage {
+    private static func resizedForChat(_ source: CGImage) throws -> CGImage {
         let width = source.width
         let height = source.height
         let largest = max(width, height)
@@ -156,11 +148,12 @@ public enum NativeScreenCapture {
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
-            return source
+            throw CaptureError.resizeFailed
         }
         context.interpolationQuality = .high
         context.draw(source, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
-        return context.makeImage() ?? source
+        guard let image = context.makeImage() else { throw CaptureError.resizeFailed }
+        return image
     }
 
 }

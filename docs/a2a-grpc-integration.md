@@ -32,6 +32,13 @@ The outbound adapter is
 It sends configured bearer credentials as metadata, sets a timeout, uses TLS
 for HTTPS, and permits plaintext only under the existing loopback URL policy.
 It has no retry policy: losing a reply must not replay an accepted send.
+Outgoing `agent.message` file attachments use the shared A2A message builder:
+`files: [{path}]`, at most four regular files and 8 MiB total, admitted through
+the ordinary attachment fence and secret-content inspection before the request.
+The captured bytes map to 1.0 `raw`/`filename`/`mediaType` parts (0.3 uses
+`kind: file` and `file.bytes`/`name`/`mimeType`). See
+[outgoing files](agent-communication.md#outgoing-files) for transport support and
+inspection limits. These outgoing limits are distinct from received output limits.
 Produced files retain the shared 10,000,000-byte file limit; encoded output
 parts share a 16,000,000-byte budget. HTTP and gRPC accept complete messages
 up to 32 MiB, including encoded files and task metadata. Streams bound each
@@ -46,6 +53,10 @@ through `AgentA2AWire` and authorizes it through `AgentPeerPolicy.peerAuthorizeI
 including after an extended-card fetch. The card's origin is required, with one
 exception: gRPC may use a sibling port on the same host and scheme.
 A card cannot redirect credentials to another host or downgrade TLS.
+Capability flags, task states and present provider-failure metadata use the
+checked wire readers on every binding; malformed evidence reports its cause.
+An eligible local webhook's configuration failure stops the send before it is
+built. See [Agent conversations](agent-communication.md) for the failure contract.
 
 ## Schema and packages
 

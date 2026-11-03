@@ -9,8 +9,7 @@ public enum ProcedureArtifactStoreError: String, Error, Sendable, Equatable {
     case immutableConflict = "immutable_conflict"
     case artifactNotFound = "artifact_not_found"
     case corruptArtifact = "corrupt_artifact"
-    case legacyArtifactRequiresRevalidation = "legacy_artifact_requires_revalidation"
-    /// The discovery ceiling signals capacity exhaustion, not artifact corruption.
+    /// Installation and discovery share this capacity refusal.
     case artifactCapacityExceeded = "artifact_capacity_exceeded"
     case corruptInvocationLedger = "corrupt_invocation_ledger"
     case invocationNotEligible = "invocation_not_eligible"
@@ -78,7 +77,7 @@ public enum ProcedureInvocationInterruption: String, Codable, Sendable {
 }
 
 public struct ProcedureInvocationReceipt: Codable, Sendable, Equatable {
-    public static let schema = "declarative-procedure-invocation.v1"
+    public static let schema = "declarative-procedure-invocation.v2"
     public let schema: String
     public let invocationID: String
     public let artifactID: String
@@ -90,13 +89,12 @@ public struct ProcedureInvocationReceipt: Codable, Sendable, Equatable {
     public let authorityRechecked: Bool
     public let canonicalEvidenceMatched: Bool
     public let verified: Bool
-    public let fallback: ProcedureFallbackRoute
     public let dispatched: Bool
     public let payloadFree: Bool
     public let permissionAuthority: Bool
     public let automaticSelection: Bool
     /// Present only when an exact typed activation admitted the invocation.
-    /// Older/manual rows decode with nil and retain their original meaning.
+    /// Manual invocations carry nil.
     public let activationID: String?
     public let procedureID: String?
     public let selectionMode: String?
@@ -114,7 +112,6 @@ public struct ProcedureInvocationReceipt: Codable, Sendable, Equatable {
         authorityRechecked: Bool,
         canonicalEvidenceMatched: Bool,
         verified: Bool,
-        fallback: ProcedureFallbackRoute,
         dispatched: Bool,
         payloadFree: Bool,
         permissionAuthority: Bool,
@@ -135,7 +132,6 @@ public struct ProcedureInvocationReceipt: Codable, Sendable, Equatable {
         self.authorityRechecked = authorityRechecked
         self.canonicalEvidenceMatched = canonicalEvidenceMatched
         self.verified = verified
-        self.fallback = fallback
         self.dispatched = dispatched
         self.payloadFree = payloadFree
         self.permissionAuthority = permissionAuthority

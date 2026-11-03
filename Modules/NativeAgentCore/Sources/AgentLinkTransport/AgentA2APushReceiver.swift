@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `AgentA2APushReceiver.swift` | `AgentA2APushReceiver` actor; `receive`, `consume`; authenticated task pushes invalidate the continuation through its canonical record writer; an owned invalidator registers before reads, replays pending hints, and retires on resident stop. Continuation startup makes saved waiting A2A task reads due after registering the invalidator, reconciling deadlines whose process-local push proof was lost at restart. The bounded mailbox retains current-process proof of delivery for each peer/task after consumption: proven push suspends sampling only after a validated task read; unavailable, invalid or thrown reads retain their short deadlines, while absent proof or an ended stream without push keeps fallback reads; GetTask stays authoritative and the one-day boundary remains |
+// Blueprint: | `AgentA2APushReceiver.swift` | `AgentA2APushReceiver` actor; `receive`, `consume`; authenticated task pushes accelerate the continuation's canonical GetTask read through its record writer; an owned invalidator registers before reads, replays pending hints, and retires on resident stop. Push evidence never selects a second state reader or changes the declared task-observation clock; the one-day boundary remains |
 
 /// A bounded delivery mailbox, not task state: authenticated webhook evidence
 /// is validated then reduced to a wake hint. GetTask remains authoritative.
@@ -52,9 +52,4 @@ public actor AgentA2APushReceiver {
         return true
     }
 
-    /// A card's capability alone cannot prove its callback reaches this app.
-    /// One authenticated delivery establishes push support for this exact task.
-    public func hasReceived(peerID: String, taskID: String) -> Bool {
-        hints.contains { $0.peer == peerID && $0.task == taskID }
-    }
 }

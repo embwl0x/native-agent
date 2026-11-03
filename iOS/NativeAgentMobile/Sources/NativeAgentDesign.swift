@@ -1,6 +1,7 @@
 // NativeAgentDesign.swift — Design tokens and reusable presentation primitives.
 
 import SwiftUI
+import Foundation
 import UIKit
 import NativeAgentShared
 // Blueprint: | `NativeAgentDesign.swift` | `View`: `appShimmer` |
@@ -13,6 +14,21 @@ enum NativeAgentPalette {
 
 enum NativeAgentAppearance: String, CaseIterable, Identifiable {
     static let storageKey = "NativeAgentMobile.appearance"
+
+    @MainActor static var settingControl: PhoneLocalSetting {
+        PhoneLocalSetting(id: "phone.appearance", label: "iPhone color scheme", type: "choice",
+            choices: allCases.map(\.rawValue), read: {
+                guard let saved = UserDefaults.standard.object(forKey: storageKey) else { return system.rawValue }
+                guard let raw = saved as? String, Self(rawValue: raw) != nil else {
+                    throw PhoneLocalSetting.failure("The saved iPhone appearance is invalid. Choose a color scheme in iPhone NativeAgent Settings.")
+                }
+                return raw
+            }, write: { raw in
+                guard Self(rawValue: raw) != nil else { throw PhoneLocalSetting.failure("Choose a listed color scheme.") }
+                try PhoneSettingWrite.check()
+                UserDefaults.standard.set(raw, forKey: storageKey)
+            })
+    }
 
     case system
     case light

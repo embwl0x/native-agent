@@ -4,7 +4,7 @@ import os
 import PersistenceCore
 import TurnTrace
 
-// Blueprint: | `RunawayOutputDetector.swift` | `RunawayOutputDetector`: streamed tool/prose boundaries, complete-call retention and read/action classification through parser/registry owners |
+// Blueprint: | `RunawayOutputDetector.swift` | `RunawayOutputDetector`: streamed tool/prose boundaries, complete-call retention and read/action classification through parser/registry owners; one preview-suppressed, request/adapter-rooted, redacted cutoff diagnostic writer |
 
 /// Correctness boundaries retain complete calls before a repeated action or
 /// fabricated result. Text after a boundary is withheld; the turn continues
@@ -16,6 +16,7 @@ public struct RunawayOutputDetector: Sendable {
     public private(set) var toolBoundary: Int?
     public private(set) var toolBoundaryReason: LLMToolBoundaryReason?
     private let endsAtToolBoundary: Bool
+    private let diagnosticDataRoot: URL?
     private var blockCursor = 0
     private var openBlock: (start: Int, close: String)?
     private var lastSignature: String?
@@ -61,8 +62,9 @@ public struct RunawayOutputDetector: Sendable {
     private var fenceStarts: [Int] = []
     private var firstHeader: Int?
 
-    public init(endsAtToolBoundary: Bool = false) {
+    public init(endsAtToolBoundary: Bool = false, diagnosticDataRoot: URL? = nil) {
         self.endsAtToolBoundary = endsAtToolBoundary
+        self.diagnosticDataRoot = diagnosticDataRoot
     }
 
     /// Feed one text delta; true when a correctness boundary ends the stream.
@@ -209,7 +211,7 @@ public struct RunawayOutputDetector: Sendable {
         reason = "tool_marker_boundary: \(why)"
         Logger(subsystem: "NativeAgent", category: "Cutoff")
             .error("tool_marker_boundary: \(why, privacy: .public) chars=\(chars, privacy: .public) end=\(end, privacy: .public)B")
-        Self.writeDiagnostic(text, reason: reason ?? "tool_marker_boundary")
+        Self.writeDiagnostic(text, reason: reason ?? "tool_marker_boundary", dataRoot: diagnosticDataRoot)
         return true
     }
 
@@ -273,9 +275,11 @@ public struct RunawayOutputDetector: Sendable {
     private static let diagnosticLock = OSAllocatedUnfairLock(initialState: ())
 
     @discardableResult
-    public static func writeDiagnostic(_ raw: String, reason: String) -> Result<URL, Error> {
-        diagnosticLock.withLock { _ in
-            do { return .success(try writeDiagnosticLocked(raw, reason: reason)) }
+    public static func writeDiagnostic(_ raw: String, reason: String, dataRoot: URL? = nil) -> Result<URL?, Error> {
+        // Preview has no durable effects, including retention pruning.
+        guard !LLMCallContext.preview else { return .success(nil) }
+        return diagnosticLock.withLock { _ in
+            do { return .success(try writeDiagnosticLocked(raw, reason: reason, dataRoot: dataRoot)) }
             catch {
                 Logger(subsystem: "NativeAgent", category: "Cutoff").error("Could not save cutoff: \(error.localizedDescription, privacy: .public)")
                 return .failure(error)
@@ -283,8 +287,8 @@ public struct RunawayOutputDetector: Sendable {
         }
     }
 
-    private static func writeDiagnosticLocked(_ raw: String, reason: String) throws -> URL {
-        let dir = PersistenceCore.defaultDataRoot()
+    private static func writeDiagnosticLocked(_ raw: String, reason: String, dataRoot: URL?) throws -> URL {
+        let dir = (LLMCallContext.traceDataRootOverride ?? dataRoot ?? PersistenceCore.defaultDataRoot())
             .appendingPathComponent("diagnostics/cutoffs", isDirectory: true)
         let stamp = Int(Date().timeIntervalSince1970 * 1000)
         let name = (TurnTraceContext.turnId?.filter { $0.isLetter || $0.isNumber || $0 == "-" })
@@ -295,7 +299,8 @@ public struct RunawayOutputDetector: Sendable {
         if FileManager.default.fileExists(atPath: file.path) {
             file = dir.appendingPathComponent("\(name)-\(UUID().uuidString).txt")
         }
-        let body = "reason: \(reason)\nchars: \(raw.count)\n\n" + raw
+        let safeReason = ContextSecretContentPolicy.redactedFragment(reason)
+        let body = "reason: \(safeReason)\nchars: \(raw.count)\n\n" + ContextSecretContentPolicy.redactedFragment(raw)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try Data(body.utf8).write(to: file, options: .atomic)
         if let files = try? FileManager.default.contentsOfDirectory(

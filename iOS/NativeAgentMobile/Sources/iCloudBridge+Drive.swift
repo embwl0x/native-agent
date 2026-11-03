@@ -188,14 +188,19 @@ extension iCloudBridge {
             }
         }
 
-        let messages = await Self.scanMacOutbox(docsURL: docsURL, seenIDs: seenMessageIDs)
+        let messages: [(URL, BridgeMessage)]
+        do { messages = try await Self.scanMacOutbox(docsURL: docsURL, seenIDs: seenMessageIDs) }
+        catch {
+            syncStatus = "Drive reply read did not finish: \(error.localizedDescription). Retained replies remain unresolved."
+            return
+        }
         for (fileURL, message) in messages {
             guard generation == setupGeneration else { return }
             _ = await handleIncomingFromTransport(message, archiveDriveFile: {
-                await VolumeIO.run {
+                do { try await VolumeIO.run {
                     ICloudLegacyReplyArchive.archive(fileURL,
                         processedRoot: docsURL.appendingPathComponent(DriveFolder.processed), fileManager: .default)
-                }
+                } } catch { NSLog("[iCloudBridge] consumed reply archive unverified: %@", error.localizedDescription) }
             })
         }
     }
@@ -291,15 +296,15 @@ extension iCloudBridge {
     private nonisolated static func scanMacOutbox(
         docsURL: URL,
         seenIDs: Set<String>
-    ) async -> [(URL, BridgeMessage)] {
-        await VolumeIO.run { () -> [(URL, BridgeMessage)] in
+    ) async throws -> [(URL, BridgeMessage)] {
+        try await VolumeIO.run { () -> [(URL, BridgeMessage)] in
             let macOutbox = docsURL.appendingPathComponent(DriveFolder.outboxMac)
             let processedDir = docsURL.appendingPathComponent(DriveFolder.processed)
             let fm = FileManager.default
             try? fm.startDownloadingUbiquitousItem(at: macOutbox)
-            guard let files = try? fm.contentsOfDirectory(
+            let files = try fm.contentsOfDirectory(
                 at: macOutbox, includingPropertiesForKeys: [.creationDateKey], options: .skipsHiddenFiles
-            ) else { return [] }
+            )
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             var messages: [(URL, BridgeMessage)] = []
@@ -310,8 +315,8 @@ extension iCloudBridge {
                     try? fm.startDownloadingUbiquitousItem(at: fileURL)
                     continue
                 }
-                guard let data = try? Data(contentsOf: fileURL),
-                      let message = try? decoder.decode(BridgeMessage.self, from: data),
+                let data = try VolumeIO.contents(of: fileURL)
+                guard let message = try? decoder.decode(BridgeMessage.self, from: data),
                       !seenIDs.contains(message.id) else { continue }
                 messages.append((fileURL, message))
             }

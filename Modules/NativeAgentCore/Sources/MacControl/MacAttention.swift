@@ -95,6 +95,18 @@ public final class MacDriverBinding: @unchecked Sendable {
     private var cancelled = false
     private var yielded = false
     private var postedEvents = 0
+    private var refusedAppAct: MacAppActRefusal?
+
+    public var appActRefusal: MacAppActRefusal? { lock.withLock { refusedAppAct } }
+    func takeAppActRefusal() -> MacAppActRefusal? {
+        lock.withLock {
+            defer { refusedAppAct = nil }
+            return refusedAppAct
+        }
+    }
+    func noteAppActRefusal(_ refusal: MacAppActRefusal) {
+        lock.withLock { if refusedAppAct == nil { refusedAppAct = refusal } }
+    }
     private var releases: [String: @Sendable () -> Void] = [:]
 
     init(owner: MacAttentionSessionStore, generation: UInt64, granted: Bool, handback: UInt64) {
@@ -104,7 +116,7 @@ public final class MacDriverBinding: @unchecked Sendable {
         self.handback = handback
     }
 
-    private var stopped: Bool { lock.withLock { cancelled } || Task.isCancelled }
+    private var stopped: Bool { lock.withLock { cancelled } || Task.isCancelled || TaskWaitDeadline.expired }
 
     /// Her hands on his cursor, keys, focus or screen: his own input ends it.
     public var allowsEmission: Bool {
@@ -209,7 +221,7 @@ public actor MacAttentionSessionStore {
 
     private struct Waiter {
         let after: Int64
-        let continuation: CheckedContinuation<Void, Never>
+        let done: ScopedWaiter
         let timeoutTask: Task<Void, Never>
     }
 
@@ -230,7 +242,6 @@ public actor MacAttentionSessionStore {
     }
     private nonisolated let driverState = Mutex(DriverState())
     private var driverObservers: [UUID: AsyncStream<UInt64>.Continuation] = [:]
-    private var driverReturnWaiters: Set<UUID> = []
 
     public nonisolated func permitsDriver(_ generation: UInt64) -> Bool {
         driverState.withLock { $0.driverOpen && $0.agentDriving && generation == $0.driverGeneration }
@@ -286,14 +297,14 @@ public actor MacAttentionSessionStore {
         if changed { publishDriver() }
     }
 
-    public func bindDriver(eventSource: any MacAttentionEventSource = defaultMacAttentionEventSource()) async -> MacDriverBinding {
+    public func bindDriver(eventSource: any MacAttentionEventSource = defaultMacAttentionEventSource()) async throws -> MacDriverBinding {
         ensureDriverObservation(eventSource: eventSource)
         // Full Mac grants the next act; physical input revokes earlier bindings.
         // Input during the policy read prevents reacquiring foreground control;
         // background authority remains granted.
         let generation = makeDriverBinding().generation
         var granted = currentDriverAllowed
-        if !granted, await Self.savedFullMac() {
+        if !granted, try await Self.savedFullMac() {
             granted = true
             giveAgentControl(userGeneration: generation)
         }
@@ -302,17 +313,22 @@ public actor MacAttentionSessionStore {
 
     /// Whether the composer's hand-back would change anything now: a Mac
     /// action has asked for the driver this run, the person holds it, and the
-    /// posture is below Full Mac, or a turn is waiting for control to return.
-    public func handoffWouldChange() async -> Bool {
+    /// posture is below Full Mac. Full Mac can reacquire on its next action.
+    public func handoffWouldChange() async throws -> Bool {
         guard observation != nil, !currentDriverAllowed else { return false }
-        if !driverReturnWaiters.isEmpty { return true }
-        return !(await Self.savedFullMac())
+        return !(try await Self.savedFullMac())
     }
 
-    private static func savedFullMac() async -> Bool {
-        guard let snapshot = try? await SwiftNativeTrustCenter().loadAuthorizationSnapshotChecked(),
-              let trust = MacControlPolicy.fromTrustPolicyObject(snapshot.policy).trustPolicy else { return false }
-        return MacControlGate.fullMacActive(trust)
+    private static func savedFullMac() async throws -> Bool {
+        do {
+            let snapshot = try await SwiftNativeTrustCenter().loadAuthorizationSnapshotChecked()
+            guard let trust = MacControlPolicy.fromTrustPolicyObject(snapshot.policy).trustPolicy else {
+                throw SavedTrustPolicyAuthority.unavailable("Mac control Trust projection is missing.")
+            }
+            return MacControlGate.fullMacActive(trust)
+        } catch {
+            throw SavedTrustPolicyAuthority.unavailable(error.localizedDescription)
+        }
     }
 
     private nonisolated func makeDriverBinding(granted: Bool = false) -> MacDriverBinding {
@@ -322,15 +338,11 @@ public actor MacAttentionSessionStore {
         }
     }
 
-    public func driverChanges(waitingForReturn: Bool = false) -> AsyncStream<UInt64> {
+    public func driverChanges() -> AsyncStream<UInt64> {
         guard !isShutDown else { return AsyncStream { $0.finish() } }
         let id = UUID()
         let (stream, continuation) = AsyncStream<UInt64>.makeStream(bufferingPolicy: .bufferingNewest(1))
         driverObservers[id] = continuation
-        if waitingForReturn {
-            driverReturnWaiters.insert(id)
-            publishDriver()
-        }
         continuation.yield(makeDriverBinding().generation)
         continuation.onTermination = { [weak self] _ in
             Task { await self?.removeDriverObserver(id) }
@@ -340,7 +352,6 @@ public actor MacAttentionSessionStore {
 
     private func removeDriverObserver(_ id: UUID) {
         driverObservers[id] = nil
-        if driverReturnWaiters.remove(id) != nil { publishDriver() }
     }
 
     private func publishDriver() {
@@ -377,7 +388,7 @@ public actor MacAttentionSessionStore {
         driverObservers.values.forEach { $0.finish() }
         for waiter in waiters.values {
             waiter.timeoutTask.cancel()
-            waiter.continuation.resume()
+            waiter.done.resume()
         }
     }
 
@@ -393,7 +404,6 @@ public actor MacAttentionSessionStore {
         observation = nil
         driverObservers.values.forEach { $0.finish() }
         driverObservers.removeAll()
-        driverReturnWaiters.removeAll()
         await screenViewStore.invalidate()
     }
 
@@ -433,7 +443,9 @@ public actor MacAttentionSessionStore {
     }
 
     @discardableResult
-    public func stopAttentionSession() async -> Bool {
+    public func stopAttentionSession(sessionId: String? = nil) async -> Bool {
+        // An owned release cannot stop a session that replaced it while work suspended.
+        if let sessionId, session?.id != sessionId { return false }
         let wasActive = session != nil
         stopInternal()
         await screenViewStore.invalidate()
@@ -572,24 +584,16 @@ public actor MacAttentionSessionStore {
     private func suspendUntilActivity(after sequence: Int64, timeoutMilliseconds: Int) async -> Bool {
         let id = UUID()
         let before = session?.sequence ?? sequence
-        let owner = self
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                if session == nil || (session?.sequence ?? 0) > sequence {
-                    continuation.resume()
-                    return
-                }
-                let timeoutTask = Task { [weak self] in
-                    do {
-                        try await Task.sleep(for: .milliseconds(timeoutMilliseconds))
-                        try Task.checkCancellation()
-                    } catch { return }
-                    await self?.resumeWaiter(id: id)
-                }
-                waiters[id] = Waiter(after: sequence, continuation: continuation, timeoutTask: timeoutTask)
+        if session != nil, (session?.sequence ?? 0) <= sequence {
+            let done = ScopedWaiter()
+            let timeoutTask = Task { [weak self] in
+                do { try await Task.sleep(for: .milliseconds(timeoutMilliseconds)) }
+                catch { return }
+                await self?.resumeWaiter(id: id)
             }
-        } onCancel: {
-            Task { await owner.resumeWaiter(id: id) }
+            waiters[id] = Waiter(after: sequence, done: done, timeoutTask: timeoutTask)
+            await done.park()
+            resumeWaiter(id: id)
         }
         return (session?.sequence ?? before) <= sequence
     }
@@ -597,7 +601,7 @@ public actor MacAttentionSessionStore {
     private func resumeWaiter(id: UUID) {
         guard let waiter = waiters.removeValue(forKey: id) else { return }
         waiter.timeoutTask.cancel()
-        waiter.continuation.resume()
+        waiter.done.resume()
     }
 
     private func resumeReadyWaiters(sequence: Int64) {
@@ -627,9 +631,21 @@ public actor MacAttentionSessionStore {
         waiters.removeAll()
         for waiter in pending {
             waiter.timeoutTask.cancel()
-            waiter.continuation.resume()
+            waiter.done.resume()
         }
     }
 
-    public static let driverRefusal = "human_takeover: the person used the Mac, so this action stopped. Under Full Mac, your next action reacquires control; otherwise ask them to use NativeAgent Mac chat > composer controls > Let [agent name] use the Mac."
+    public static let personUsingMac = "human_takeover: The person is using the Mac, so I held off. Nothing was sent."
+    /// A Mac action stopped by his input, or by an explicit handback.
+    public static var driverRefusal: String {
+        MacDriverContext.binding?.handedBack == true
+            ? "human_takeover: Mac control was explicitly handed back, so this action stopped. Earlier effects may have reached the app; inspect it before continuing. Return control to NativeAgent before another action."
+            : "human_takeover: the person took the Mac, so this action stopped. Let go: tell them where you stopped and leave the Mac to them. You continue when they press Resume in Shotgun or ask you to; an action before that would take it back from under their hands."
+    }
+    /// A message to a desktop app held off for the same reasons: nothing was sent.
+    public static var sendRefusal: String {
+        MacDriverContext.binding?.handedBack == true
+            ? "human_takeover: Mac control was explicitly handed back. Return control to NativeAgent before continuing; nothing was sent."
+            : personUsingMac
+    }
 }

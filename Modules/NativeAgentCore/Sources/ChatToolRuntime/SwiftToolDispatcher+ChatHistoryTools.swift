@@ -17,7 +17,7 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
-// Blueprint: | `SwiftToolDispatcher+ChatHistoryTools.swift` | Explicit history search selection and ranking; coverage honors parse validity and cached structure; chronological digests retain true first/last instants |
+// Blueprint: | `SwiftToolDispatcher+ChatHistoryTools.swift` | One explicit history search scope and ranking; coverage includes unresolved scope, parse validity and cached structure; chronological digests retain true first/last instants |
 
 
 struct ChatHistorySessionMetadata: Sendable {
@@ -47,8 +47,6 @@ private struct ChatHistorySearchHit: Sendable {
 // MARK: - Chat history search tools
 
 extension SwiftToolDispatcher {
-    static let chatHistoryCurrentSessionFloor = 0.3
-
     func impl_search_chat_history(
         input: [String: JSONValue], invokedAs: String,
         workContextQuery: WorkContextQuery? = nil,
@@ -60,18 +58,10 @@ extension SwiftToolDispatcher {
             .lowercased()
         let scope: String = try {
             switch requestedScope {
-            case "", "auto", "current_session_first", "current_session", "all_sessions":
-                return requestedScope.isEmpty ? "all_sessions" : requestedScope
-            case "current":
-                return "current_session"
-            case "previous_session", "last_session":
-                // The other half of the /new carry-over anchor. See the resolution branch below.
-                return "previous_session"
-            case "all", "global", "all_session":
-                // Explicit all-scope spellings search every session.
-                return "all_sessions"
+            case "current_session", "previous_session", "all_sessions":
+                return requestedScope
             default:
-                throw AutonomyGateError.toolDenied(reason: "Chat history scope must be all_sessions, current_session, previous_session, auto, or current_session_first.")
+                throw AutonomyGateError.toolDenied(reason: "Chat history scope must be all_sessions, current_session, or previous_session.")
             }
         }()
         // A resolved previous session is complete without a query; empty queries admit every row at score zero and sort by recency.
@@ -106,7 +96,7 @@ extension SwiftToolDispatcher {
         let currentSessionId = input["current_session_id"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let sessionMeta = readChatHistorySessionMetadata()
+        let sessionMeta = try readChatHistorySessionMetadata()
         let index = ChatHistoryIndex.shared(dataRoot: dataRoot)
         let tokens = chatSearchTokens(query)
         let normalizedQuery = query.lowercased()
@@ -143,15 +133,16 @@ extension SwiftToolDispatcher {
         let dayDigest = query.isEmpty && (before != nil || after != nil)
         let limit = max(1, min(requestedLimit, dayDigest ? 8 : (continuityMode ? 4 : 12)))
         let requestedSort = input["sort"]?.stringValue ?? "relevance"
-        guard ["relevance", "oldest", "newest", "recent", "latest"].contains(requestedSort) else {
+        guard ["relevance", "oldest", "newest"].contains(requestedSort) else {
             throw AutonomyGateError.toolDenied(reason: "Chat history sort must be relevance, oldest, or newest.")
         }
-        let sort = (dayDigest && requestedSort == "relevance") || ["recent", "latest"].contains(requestedSort) ? "newest" : requestedSort
-        // Count unique failures across the current-session probe and fallback. A partial scan must never masquerade as proof that evidence is absent.
+        let sort = dayDigest && requestedSort == "relevance" ? "newest" : requestedSort
+        // A partial scan must never masquerade as proof that evidence is absent.
         var unreadableSessions: Set<String> = []
         var malformedRows: Set<String> = []
         var undatedMatches: Set<String> = []
         var listingFailed = false
+        var scopeResolutionFailed = false
         var archived: [String: [URL]] = [:]
         do { archived = try ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot) }
         catch { listingFailed = true }
@@ -262,13 +253,11 @@ extension SwiftToolDispatcher {
 
         let selected: (hits: [ChatHistorySearchHit], sessions: Set<String>)
         let phase: String
-        let fallbackSkipped: String?
         var resolvedPreviousSessionId: String? = nil
         if let sessionFilter, !sessionFilter.isEmpty {
             // An explicit id stays the most specific instruction there is.
             selected = scan(try files(forSessionId: sessionFilter))
             phase = "explicit_session"
-            fallbackSkipped = nil
         } else if wholeSession {
             // Resolved through the SAME surface-scoped, bridge-excluding resolver the /new anchor used, so the session this opens is always the session the anchor named — which is why the anchor never has to carry a UUID.
             if let currentSessionId, !currentSessionId.isEmpty,
@@ -284,8 +273,8 @@ extension SwiftToolDispatcher {
             } else {
                 selected = ([], [])
                 phase = "previous_session_unavailable"
+                scopeResolutionFailed = true
             }
-            fallbackSkipped = "all_sessions"
         } else if scope == "current_session" {
             if let currentSessionId, !currentSessionId.isEmpty {
                 selected = scan(try files(forSessionId: currentSessionId))
@@ -293,32 +282,11 @@ extension SwiftToolDispatcher {
             } else {
                 selected = ([], [])
                 phase = "current_session_unavailable"
-            }
-            fallbackSkipped = "all_sessions"
-        } else if scope == "auto" || scope == "current_session_first" {
-            if let currentSessionId, !currentSessionId.isEmpty {
-                let current = scan(try files(forSessionId: currentSessionId))
-                // Only a plausible current-session answer skips the global search.
-                let bestCurrentScore = current.hits.map(\.score).max() ?? 0
-                if !current.hits.isEmpty && bestCurrentScore >= Self.chatHistoryCurrentSessionFloor {
-                    selected = current
-                    phase = "current_session"
-                    fallbackSkipped = "all_sessions"
-                } else {
-                    let remaining = scan(allFiles().filter { $0.0 != currentSessionId })
-                    selected = (current.hits + remaining.hits, current.sessions.union(remaining.sessions))
-                    phase = "all_sessions_fallback"
-                    fallbackSkipped = nil
-                }
-            } else {
-                selected = scan(allFiles())
-                phase = "all_sessions_no_current"
-                fallbackSkipped = nil
+                scopeResolutionFailed = true
             }
         } else {
             selected = scan(allFiles())
             phase = "all_sessions"
-            fallbackSkipped = nil
         }
 
         var hits = selected.hits
@@ -439,7 +407,7 @@ extension SwiftToolDispatcher {
             return .object(obj)
         }
         var response: [String: JSONValue] = [
-            "status": .string("ok"),
+            "status": .string(scopeResolutionFailed ? "unavailable" : "ok"),
             "runtime": .string("swift-native"),
             "tool": .string(invokedAs),
             "source": .string("chat_history_jsonl"),
@@ -449,7 +417,8 @@ extension SwiftToolDispatcher {
             "phase": .string(phase),
             "sort": .string(sort),
             "coverage": .object([
-                "complete": .bool(!listingFailed && unreadableSessions.isEmpty && malformedRows.isEmpty && undatedMatches.isEmpty),
+                "complete": .bool(!scopeResolutionFailed && !listingFailed && unreadableSessions.isEmpty && malformedRows.isEmpty && undatedMatches.isEmpty),
+                "scope_resolution_failed": .bool(scopeResolutionFailed),
                 "directory_listing_failed": .bool(listingFailed),
                 "unreadable_session_count": .int(Int64(unreadableSessions.count)),
                 "malformed_row_count": .int(Int64(malformedRows.count)),
@@ -492,7 +461,7 @@ extension SwiftToolDispatcher {
         if sort != "relevance", !exactMode, !query.isEmpty {
             response["search_hint"] = .string("Chronological sorting includes partial word matches in hybrid/continuity mode. Use mode: exact to find the whole query phrase.")
         }
-        if listingFailed || !unreadableSessions.isEmpty || !malformedRows.isEmpty || !undatedMatches.isEmpty {
+        if scopeResolutionFailed || listingFailed || !unreadableSessions.isEmpty || !malformedRows.isEmpty || !undatedMatches.isEmpty {
             response["coverage_note"] = .string("Some evidence could not be searched or dated. Missing results do not establish absence; coverage applies only to the reported search scope.")
         }
         if offset + out.count < selectableCount {
@@ -505,9 +474,6 @@ extension SwiftToolDispatcher {
         if let currentSessionId, !currentSessionId.isEmpty {
             response["current_session_id"] = .string(currentSessionId)
         }
-        if let fallbackSkipped {
-            response["fallback_skipped"] = .string(fallbackSkipped)
-        }
         if let resolvedPreviousSessionId {
             response["previous_session_id"] = .string(resolvedPreviousSessionId)
         }
@@ -516,21 +482,18 @@ extension SwiftToolDispatcher {
 
     static let toolReceiptCoverage = "Historical persisted receipt, potentially redacted or truncated; not the full original result or a fresh source read. Paging expands only the retained receipt."
 
-    func readChatHistorySessionMetadata() -> [String: ChatHistorySessionMetadata] {
+    func readChatHistorySessionMetadata() throws -> [String: ChatHistorySessionMetadata] {
         let path = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("sessions.json")
-        guard let data = try? Data(contentsOf: path),
-              let parsed = try? JSONValue.parse(data),
-              case .array(let rows) = parsed else {
-            return [:]
-        }
+        let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: path)
         var out: [String: ChatHistorySessionMetadata] = [:]
         for row in rows {
-            guard case .object(let obj) = row,
-                  let id = obj["id"]?.stringValue,
+            let obj = row
+            guard let id = obj["id"]?.stringValue,
                   !id.isEmpty else {
-                continue
+                throw ToolFailureError("A chat session index row has no valid id.", effects: .none,
+                    owner: path.path, instruction: "Repair the saved session index row before searching history.")
             }
             out[id] = ChatHistorySessionMetadata(
                 title: obj["title"]?.stringValue,

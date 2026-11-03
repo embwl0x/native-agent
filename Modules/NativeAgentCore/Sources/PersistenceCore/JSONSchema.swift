@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `JSONSchema.swift` | `JSONValue.SchemaProblem`, `validate`, `schemaProblem`: whole-tree schema preflight and value validation, ignoring unknown keywords with caller-owned error formatting; `ToolSchema` shared nullable/object/string/boolean/integer/enum/parameter constructors |
+// Blueprint: | `JSONSchema.swift` | `JSONValue.SchemaProblem`, `validate`, `schemaProblem`: whole-tree schema preflight and value validation, ignoring unknown keywords with caller-owned error formatting; `ToolSchema` shared constructors and current sense-view input properties |
 
 extension JSONValue {
     public struct SchemaProblem: Sendable {
@@ -149,6 +149,13 @@ extension JSONValue {
 
 /// Shared JSON-schema constructors; each tool owner still supplies its own schema.
 package enum ToolSchema {
+    /// Current inputs of a sense-aware read, declared by that read's owner.
+    package static let senseViewProperties: [(String, JSONValue)] = [
+        ("raw", boolSchema("Read the original view instead of its sense.")),
+        ("wrong", boolSchema("Read the original view and offer sense repair after a successful read.")),
+        ("why", strSchema("Optional explanation of what is wrong with the sense view.")),
+    ]
+
     /// Admit null once, preserving constraints and composite alternatives.
     package static func nullable(_ schema: JSONValue) -> JSONValue {
         if JSONValue.null.schemaProblem(schema: schema) == nil { return schema }
@@ -171,6 +178,11 @@ package enum ToolSchema {
         for (k, v) in pairs { d[k] = v }
         return .object(d)
     }
+    /// An owner-issued version (a row stamp, a digest) is one token: copied, never written.
+    package static func versionSchema(_ desc: String) -> JSONValue {
+        obj([("type", .string("string")), ("pattern", .string("^\\S+$")), ("description", .string(desc))])
+    }
+
     package static func strSchema(_ desc: String? = nil) -> JSONValue {
         var props: [(String, JSONValue)] = [("type", .string("string"))]
         if let desc { props.append(("description", .string(desc))) }

@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `DeviceSyncTransport.swift` | Shared device-sync role/message codecs, account/recovery outcomes and transport resolution |
+// Blueprint: | `DeviceSyncTransport.swift` | Shared role/message codecs, account/recovery outcomes and transport resolution; signed foreground/active-talk phone contact and shared receive/beat/window constants |
 
 /// A background recovery caller can bound reads without changing the transport
 /// operations. Foreground callers retain their ordinary per-operation budgets.
@@ -59,6 +59,36 @@ public enum NADeviceSyncRecordType {
 public enum NAMacPresence {
     public static let beat: TimeInterval = 120
     public static let phoneWindow: TimeInterval = 300
+}
+
+/// Foreground or active-talk phone contact travels over the existing signed CloudKit status
+/// singleton, never as chat. Older Macs ignore an unobserved status key.
+public enum NAPhoneForegroundPresence {
+    public static let statusKey = "phone.foreground"
+    public static let beat: TimeInterval = 30
+    public static let window: TimeInterval = 120
+    public static let receiveInterval: TimeInterval = 0.75
+
+    public static func signedValue(secret: Data) throws -> String {
+        let message = try BridgeMessage.make(sender: "ios", text: "",
+            metadata: ["kind": statusKey]).signed(with: secret)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return String(decoding: try encoder.encode(message), as: UTF8.self)
+    }
+
+    /// A missing, unreadable, unsigned or old beat says nothing about contact.
+    /// Server time limits freshness; the signed envelope binds it to this pair.
+    public static func activityDate(value: String, writtenAt: Date?, secret: Data, now: Date) -> Date? {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let writtenAt, writtenAt <= now, now.timeIntervalSince(writtenAt) < window,
+              let message = try? decoder.decode(BridgeMessage.self, from: Data(value.utf8)),
+              message.sender == "ios", message.metadata?["kind"] == statusKey,
+              abs(now.timeIntervalSince(message.timestamp)) < window,
+              message.verifySignature(secret: secret) else { return nil }
+        return writtenAt
+    }
 }
 
 /// Flat, CloudKit-queryable projection of a `BridgeMessage`.
@@ -121,7 +151,9 @@ public enum NAChatMessageCodec {
     public static let maxAssetPayloadBytes = 48 * 1024 * 1024
 
     public static func usesAsset(_ fields: NAChatMessageFields) -> Bool {
-        recordValueBytes(fields) > maxCloudKitRecordValueBytes
+        if recordValueBytes(fields) > maxCloudKitRecordValueBytes { return true }
+        // Even short voice notes keep audio out of scalar record values.
+        return (try? decode(fields).attachments?.contains { $0.type == "audio" && !$0.base64.isEmpty }) == true
     }
 
     public static func recordValueBytes(_ fields: NAChatMessageFields) -> Int {
@@ -289,42 +321,38 @@ public enum DeviceSyncError: Error, LocalizedError, Sendable {
     }
 }
 
-// MARK: - Build/runtime flag + resolver (deliverable 4)
+// MARK: - Required transport configuration
 
-/// Which transport a build selects. `NATIVE_AGENT_DEVICE_SYNC` env var:
-/// "cloudkit" | "kvs". DEFAULT is `.kvs` — with nothing set, runtime behavior
-/// is unchanged from today.
-public enum DeviceSyncTransportKind: String, Sendable {
-    case cloudkit
-    case kvs
+public enum DeviceSyncTransportConstructionFailure: Error, LocalizedError, Sendable {
+    case unsupportedSelection(String?)
+    case missingEntitlement
+    case missingContainer(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedSelection(let value):
+            return "CloudKit transport configuration is invalid (\(value ?? "missing")). Install a NativeAgent build configured for CloudKit."
+        case .missingEntitlement:
+            return "CloudKit transport cannot start because its iCloud service entitlement is absent. Install a correctly signed NativeAgent build."
+        case .missingContainer(let identifier):
+            return "CloudKit transport cannot start because container '\(identifier)' is not entitled. Install a NativeAgent build signed for this container."
+        }
+    }
 }
 
 public enum DeviceSyncTransportResolver {
     public static let envKey = "NATIVE_AGENT_DEVICE_SYNC"
-    /// Info.plist key baked into a build to select the transport when no env var
-    /// is present. This is REQUIRED on iOS: a shipped/standalone iOS app has no
-    /// per-process env-var mechanism (LSEnvironment is macOS-only; a scheme env
-    /// var applies only when Xcode launches the app), so the iOS build selects
-    /// its transport HERE. On macOS the env var (launchctl/LSEnvironment) still
-    /// works and takes precedence, so a test can always override a baked value.
     public static let infoKey = "NativeAgentDeviceSync"
 
-    /// Resolve the selected transport kind. Precedence: env var (runtime/test
-    /// override) → baked Info.plist value → `.kvs` (fail-safe: never silently
-    /// switch a live build to CloudKit on an unknown/typo value).
-    public static func resolvedKind(
+    /// The current transport must be explicitly configured. A missing, mistyped
+    /// or retired transport value never selects another data plane.
+    public static func requireCloudKitConfiguration(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         infoValue: String? = Bundle.main.object(forInfoDictionaryKey: infoKey) as? String
-    ) -> DeviceSyncTransportKind {
-        let envRaw = environment[envKey]?.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Env var wins only when non-empty; otherwise fall back to the baked value.
-        let chosen = ((envRaw?.isEmpty == false) ? envRaw : infoValue)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        switch chosen {
-        case "cloudkit": return .cloudkit
-        case "kvs", "", nil: return .kvs
-        default: return .kvs
+    ) throws {
+        let chosen = environment[envKey] ?? infoValue
+        guard chosen?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "cloudkit" else {
+            throw DeviceSyncTransportConstructionFailure.unsupportedSelection(chosen)
         }
     }
 }

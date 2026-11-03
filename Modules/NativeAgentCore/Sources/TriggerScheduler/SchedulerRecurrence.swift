@@ -9,7 +9,7 @@ import WorkshopExecution
 import Experiences
 import NotificationInbox
 import Darwin
-// Blueprint: | `SchedulerRecurrence.swift` | SchedulerJobNormalizer recurrence arithmetic, civil-minute matching and timestamp parsing |
+// Blueprint: | `SchedulerRecurrence.swift` | SchedulerJobNormalizer recurrence arithmetic, civil-minute matching, timestamp parsing and the shared queue intention timing schema, including system-read local date/time words |
 
 extension SchedulerJobNormalizer {
 
@@ -26,17 +26,6 @@ extension SchedulerJobNormalizer {
         let epoch = now().timeIntervalSince1970 + minutes * 60
         _ = try checkedEpoch(epoch)
         return ["type": .string("once"), "at": .double(epoch)]
-    }
-
-    static func scheduleFromLegacyBody(_ body: [String: JSONValue], interval: Int) -> [String: JSONValue] {
-        let rawRunAt = pyOr(body["run_at"], body["runAt"], body["nextRunAt"])
-        if let r = rawRunAt, r.isTruthy, isOneShot(body) {
-            return ["type": .string("once"), "run_at": r]
-        }
-        if let r = rawRunAt, r.isTruthy {
-            return ["type": .string("every"), "seconds": .int(Int64(interval)), "firstRunAt": r]
-        }
-        return ["type": .string("every"), "seconds": .int(Int64(interval))]
     }
 
     static func epochFromValue(_ raw: JSONValue, zone: TimeZone, now: @Sendable () -> Date) throws -> Double {
@@ -75,35 +64,35 @@ extension SchedulerJobNormalizer {
         return value
     }
 
-    static func everyInterval(_ schedule: [String: JSONValue], default defaultInterval: Int = 3600) throws -> Int {
-        var seconds = try pyIntOr(schedule["seconds"], default: 0)
-        for (key, multiplier) in [("minutes", 60), ("hours", 3600), ("days", 86400)] {
-            let value = try pyIntOr(schedule[key], default: 0)
+    static func everyInterval(_ schedule: [String: JSONValue]) throws -> Int {
+        var total = 0
+        var found = false
+        for (key, multiplier) in [("seconds", 1), ("minutes", 60), ("hours", 3600), ("days", 86400), ("interval_seconds", 1), ("intervalSeconds", 1)] {
+            guard let raw = schedule[key] else { continue }
+            found = true
+            let value = try integer(raw)
             let product = value.multipliedReportingOverflow(by: multiplier)
-            let sum = seconds.addingReportingOverflow(product.partialValue)
-            guard !product.overflow, !sum.overflow else {
-                throw TriggerSchedulerError.schedulerInvalid("schedule duration is too large")
+            let sum = total.addingReportingOverflow(product.partialValue)
+            guard value >= 0, !product.overflow, !sum.overflow else {
+                throw TriggerSchedulerError.schedulerInvalid("schedule duration is invalid or too large")
             }
-            seconds = sum.partialValue
+            total = sum.partialValue
         }
-        return try max(60, pyIntOr(
-            schedule["interval_seconds"], schedule["intervalSeconds"],
-            seconds != 0 ? .int(Int64(seconds)) : nil,
-            default: defaultInterval
-        ))
+        guard found, total >= 60 else { throw TriggerSchedulerError.schedulerInvalid("every requires a duration of at least 60 seconds") }
+        return total
     }
 
     static func scheduleType(_ schedule: [String: JSONValue]) -> String {
-        (string(schedule["type"]) ?? string(schedule["kind"]) ?? "every")
+        (string(schedule["type"]) ?? string(schedule["kind"]) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    /// Once schedules win; flag aliases use the first present key, including null.
+    /// Current schedule type and the saved oneShot projection agree.
     public static func isOneShot(_ body: [String: JSONValue], schedule: [String: JSONValue]? = nil) -> Bool {
         if let minutes = body["in_minutes"], minutes != .null { return true }
         if case .string? = body["schedule"] { return true }
         return scheduleType(schedule ?? body["schedule"]?.objectValue ?? [:]) == "once"
-            || boolValue(body["one_shot"] ?? body["oneShot"] ?? body["payload"]?.objectValue?["one_shot"], default: false)
+            || body["oneShot"] == .bool(true)
     }
 
     /// Find the next occurrence in the supplied zone, defaulting to the Mac's current zone.
@@ -125,28 +114,28 @@ extension SchedulerJobNormalizer {
 
         switch typ {
         case "once":
-            // Run-time aliases use their first truthy value.
-            return try epochFromValue(pyOr(schedule["run_at"], schedule["runAt"], schedule["at"]) ?? .null, zone: tz, now: now)
+            // Current saved jobs use at; the shared intention grammar declares its input units.
+            return try epochFromValue(firstPresent(schedule["run_at"], schedule["runAt"], schedule["at"]) ?? .null, zone: tz, now: now)
         case "every":
             let resolved = try everyInterval(schedule)
             let nextRun = nowEpoch + Double(resolved)
             _ = try checkedEpoch(nextRun)
             return nextRun
         case "hourly", "daily", "weekly", "monthly", "cron":
-            // An hourly minute is int(spec.get("minute", 0)), a present-default get.
-            let (hour, minute) = typ == "cron" ? (0, 0) : typ == "hourly" ? (0, try schedule["minute"].map { try pyInt($0) } ?? 0) : try timeParts(schedule)
+            // Only absence uses the documented hourly minute.
+            let (hour, minute) = typ == "cron" ? (0, 0) : typ == "hourly" ? (0, try schedule["minute"].map { try integer($0) } ?? 0) : try timeParts(schedule)
             guard (0...59).contains(minute) else {
                 throw TriggerSchedulerError.schedulerInvalid("hourly schedule minute out of range")
             }
-            // Weekday aliases use their first truthy value.
-            let weekdays = typ == "weekly" ? try weekdaySet(pyOr(schedule["weekdays"], schedule["weekday"])) : Set(0...6)
-            // month_day = max(1, min(31, int(spec.day or monthday or monthDay or 1)))
-            let monthDay = try max(1, min(31, pyIntOr(
+            // Shared intention input units meet at this recurrence owner.
+            let weekdays = typ == "weekly" ? try weekdaySet(firstPresent(schedule["weekdays"], schedule["weekday"])) : Set(0...6)
+            // Shared intention month-day units.
+            let monthDay = try max(1, min(31, integerOr(
                 schedule["day"], schedule["monthday"], schedule["monthDay"],
                 default: 1
             )))
-            // Cron-expression aliases use their first truthy value.
-            let expression = (string(pyOr(schedule["expression"], schedule["cron"], .string(""))) ?? "")
+            // Shared intention cron input units.
+            let expression = (string(firstPresent(schedule["expression"], schedule["cron"], .string(""))) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let fields: CronFields = try typ == "cron" ? cronFields(expression) : (
                 minute: [minute], hour: typ == "hourly" ? Set(0...23) : [hour],
@@ -174,21 +163,23 @@ extension SchedulerJobNormalizer {
 
     /// Parse at/time as H[:MM], otherwise strict hour/minute fields with defaults only when absent.
     static func timeParts(_ spec: [String: JSONValue], defaultHour: Int = 9, defaultMinute: Int = 0) throws -> (Int, Int) {
-        let raw = pyOr(spec["at"], spec["time"])
+        let raw = firstPresent(spec["at"], spec["time"])
         let hour: Int
         let minute: Int
-        if let r = raw, r.isTruthy {
-            // str(raw) then exact regex match over the WHOLE string.
-            let text = string(r) ?? ""
+        if let r = raw {
+            // A present clock must be text matching the whole field.
+            let text: String
+            if case .string(let value) = r { text = value }
+            else { text = String(try integer(r)) } // documented numeric hour unit
             guard let (h, m) = parseHHMM(text) else {
                 throw TriggerSchedulerError.schedulerInvalid("schedule.at must be HH:MM")
             }
             hour = h
             minute = m
         } else {
-            // present-default get → strict int().
-            hour = try spec["hour"].map { try pyInt($0) } ?? defaultHour
-            minute = try spec["minute"].map { try pyInt($0) } ?? defaultMinute
+            // Documented defaults apply only to absent fields.
+            hour = try spec["hour"].map { try integer($0) } ?? defaultHour
+            minute = try spec["minute"].map { try integer($0) } ?? defaultMinute
         }
         guard (0...23).contains(hour), (0...59).contains(minute) else {
             throw TriggerSchedulerError.schedulerInvalid("scheduled hour/minute out of range")
@@ -226,10 +217,14 @@ extension SchedulerJobNormalizer {
         ]
         guard let raw, !isEmptyForWeekdays(raw) else { return Set(0...6) }
         let values: [String]
+        func weekdayText(_ value: JSONValue) throws -> String {
+            if case .string(let text) = value { return text }
+            return String(try integer(value)) // documented 1=Monday … 7=Sunday
+        }
         if case .array(let arr) = raw {
-            values = arr.map { string($0) ?? "" }
+            values = try arr.map(weekdayText)
         } else {
-            values = (string(raw) ?? "")
+            values = try weekdayText(raw)
                 .replacingOccurrences(of: ",", with: " ")
                 .split(separator: " ").map(String.init)
         }
@@ -243,12 +238,14 @@ extension SchedulerJobNormalizer {
             } else if let n = names[text] {
                 result.insert(n)
             } else if let value = Int(text) {
-                result.insert(value >= 1 ? ((value - 1) % 7) : value)
+                guard (1...7).contains(value) else { throw TriggerSchedulerError.schedulerInvalid("weekday must be 1 through 7") }
+                result.insert(value - 1)
             } else {
                 throw TriggerSchedulerError.schedulerInvalid("Unknown weekday: \(item)")
             }
         }
-        return result.isEmpty ? Set(0...6) : result
+        guard !result.isEmpty else { throw TriggerSchedulerError.schedulerInvalid("weekday input contains no days") }
+        return result
     }
 
     static func cronValues(_ field: String, minimum: Int, maximum: Int, names: [String: Int] = [:]) throws -> Set<Int> {
@@ -355,5 +352,74 @@ extension SchedulerJobNormalizer {
             if let d = df.date(from: normalized) { return d.timeIntervalSince1970 }
         }
         return nil
+    }
+}
+
+// MARK: - An intention's rhythm
+
+extension SchedulerJobNormalizer {
+    /// The kinds an intention's rhythm takes; a `once` is an `at` moment, not a rhythm.
+    public static let rhythmKinds: Set<String> = ["every", "hourly", "daily", "weekly", "monthly", "cron"]
+
+    /// queue.add's timing grammar, beside the rhythm parser that reads these fields.
+    public static let intentionWhenSchema: JSONValue = {
+        let number: JSONValue = .object(["type": .array([.string("number"), .string("string")])])
+        let text = ToolSchema.strSchema()
+        let kinds = rhythmKinds.union(["once"]).sorted().joined(separator: "|")
+        let kind: JSONValue = .object(["type": .string("string"), "pattern": .string("(?i)^\\s*(" + kinds + ")\\s*$"),
+            "description": .string("Rhythm type: " + kinds + "; kind is an alias for type.")])
+        let weekdays: JSONValue = .object(["oneOf": .array([text, .object(["type": .string("integer")]),
+            .object(["type": .string("array"), "items": number])]),
+            "description": .string("Weekday names (mon…sun, weekdays, weekends) or numbers 1=Monday…7=Sunday; list, comma-separated or space-separated.")])
+        var fields: [String: JSONValue] = ["type": kind, "kind": kind,
+            "at": .object(["type": .array([.string("number"), .string("string")]),
+                "description": .string("H or HH:MM for daily/weekly/monthly; ISO or local date/time for a single moment.")]),
+            "time": number, "run_at": text, "runAt": text,
+            "expression": ToolSchema.strSchema("Five-field cron expression, on the Mac's local clock."), "cron": text,
+            "weekdays": weekdays, "weekday": weekdays]
+        for name in ["seconds", "minutes", "hours", "days", "interval_seconds", "intervalSeconds",
+                     "hour", "minute", "day", "monthday", "monthDay"] { fields[name] = number }
+        return .object(["description": .string("Omit for next_turn. Strings: own_turn, when_user_messages [door], when_user_here, when_user_away, on_news <words>, on <signal>, after_card <id>, at <ISO time>, a local date/time with optional weekday (Sun Nov 1 at 06:00), in N minutes|hours|days, every <cron>, every N minutes|hours|days. Objects name a rhythm type/kind, or cron/expression; {at:<ISO/local time>} and {type:once,at:<ISO/local time>} name one moment. Local words use the system date reader in the Mac's zone; ambiguous readings refuse with their interpretation. Rhythm defaults and cross-field timing are checked by the clock."),
+            "oneOf": .array([text, .object(["type": .string("object"), "properties": .object(fields),
+                "additionalProperties": .bool(true)])])])
+    }()
+
+    /// Her rhythm as the clock reads it: a bare `cron`/`expression` names a cron, "cron <expr>" or "every <expr>"
+    /// with five fields is one, and "every N minutes|hours|days" is an interval. Nil when it is no rhythm.
+    public static func rhythm(_ value: JSONValue) -> JSONValue? {
+        var fields: [String: JSONValue]
+        switch value {
+        case .object(let object): fields = object
+        case .string(let raw):
+            let words = raw.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ").map(String.init)
+            guard let head = words.first?.lowercased(), ["every", "cron"].contains(head), words.count > 1 else { return nil }
+            let rest = Array(words.dropFirst())
+            if rest.count == 5 { fields = ["type": .string("cron"), "expression": .string(rest.joined(separator: " "))] }
+            else if rest.count == 2, let count = Int(rest[0]),
+                    let unit = ["minute": "minutes", "minutes": "minutes", "hour": "hours", "hours": "hours", "day": "days", "days": "days"][rest[1].lowercased()] {
+                fields = ["type": .string("every"), unit: .int(Int64(count))]
+            } else { return nil }
+        default: return nil
+        }
+        if fields["type"] == nil, fields["kind"] == nil, fields["cron"] != nil || fields["expression"] != nil { fields["type"] = .string("cron") }
+        // A rhythm names its kind: an untyped object (a bare {at}) would read as the job grammar's hourly default.
+        guard fields["type"] != nil || fields["kind"] != nil, rhythmKinds.contains(scheduleType(fields)) else { return nil }
+        // It must read: one occurrence ahead proves the clock understands it.
+        guard (try? nextFromSchedule(fields, afterEpoch: Date().timeIntervalSince1970, now: { Date() })) != nil else { return nil }
+        return .object(fields)
+    }
+
+    /// The first occurrence after `date`, in the Mac's zone; nil when it has none.
+    public static func nextOccurrence(_ rhythm: JSONValue, after date: Date) -> Date? {
+        guard case .object(let fields) = rhythm, rhythmKinds.contains(scheduleType(fields)),
+              let epoch = try? nextFromSchedule(fields, afterEpoch: date.timeIntervalSince1970, now: { date }) else { return nil }
+        return Date(timeIntervalSince1970: epoch)
+    }
+
+    /// An `every` rhythm's interval, which counts from where it was filed; nil for calendar rhythms.
+    public static func rhythmInterval(_ rhythm: JSONValue) -> TimeInterval? {
+        guard case .object(let fields) = rhythm, scheduleType(fields) == "every",
+              let seconds = try? everyInterval(fields) else { return nil }
+        return TimeInterval(seconds)
     }
 }

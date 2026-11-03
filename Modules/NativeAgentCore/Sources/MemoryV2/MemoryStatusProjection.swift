@@ -13,11 +13,12 @@ public enum MemoryRecoveryReadout {
 
     public static func getMemoryV2Status(dataRoot: URL) async throws -> MemoryV2Status {
         // Counts stay in SQLite; embedding fields share one runtime snapshot.
-        var memCount = 0
-        var activeCount = 0
-        var pinnedCount = 0
+        var memCount: Int?
+        var activeCount: Int?
+        var pinnedCount: Int?
         var pendingProposals: Int? = nil
         var storageReadable = false
+        var storageFailure: String?
         do {
             let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
             let counts = try await storage.statusCounts()
@@ -27,7 +28,7 @@ public enum MemoryRecoveryReadout {
             pinnedCount = counts.pinned
             pendingProposals = counts.pendingProposals
         } catch {
-            storageReadable = false
+            storageFailure = String(describing: error)
         }
         let runtimeSnapshot = await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).embeddingRuntimeSnapshot()
         let effective = runtimeSnapshot?.effectiveBackend
@@ -37,7 +38,7 @@ public enum MemoryRecoveryReadout {
             guard !isReal else { return nil }
             switch effective {
             case ManagedEmbeddingProvider.mockBackend:
-                return "Semantic embeddings are explicitly set to mock (config or NATIVE_AGENT_EMBEDDING_MOCK)"
+                return "Semantic embeddings are explicitly set to mock in config/embeddings.json"
             case ManagedEmbeddingProvider.failClosedBackend:
                 return "bge-large-en-v1.5 semantic embeddings unavailable; recall is fail-closed. \(runtimeSnapshot?.lastLoadError ?? "Read Doctor for the model file and failure.")"
             default:
@@ -49,7 +50,7 @@ public enum MemoryRecoveryReadout {
             // An unreadable store is not an empty store. The Memory screen
             // uses this provenance to avoid claiming no memories are saved
             // when the real reader could not establish a count.
-            status: storageReadable ? (memCount > 0 ? "ready" : "empty") : "unavailable",
+            status: storageReadable ? (memCount == 0 ? "empty" : "ready") : "unavailable",
             version: "swift-native",
             embedding: MemoryV2Embedding(
                 activeBackend: backend,
@@ -63,36 +64,35 @@ public enum MemoryRecoveryReadout {
                 pendingProposals: pendingProposals
             ),
             afterTurn: await afterTurnRecovery(dataRoot: dataRoot),
-            createdAt: ISO8601DateFormatter().string(from: Date())
+            createdAt: ISO8601DateFormatter().string(from: Date()),
+            storageFailure: storageFailure
         )
     }
 
-    /// The miss ledger for the ISO `weeks` asked: every time she was given a
-    /// correction in them (graduated ones too — a lesson now kept in GROWTH was
-    /// still missed), grouped by the lesson it teaches, the most recently
-    /// missed lesson first. Weekly counts per lesson are the growth metric.
-    /// A correction given again collapses into its row; each turn-stamped
-    /// repeat in `duplicate_occurrences` is a miss of its own, at its turn.
+    /// All canonical correction occurrences for the ISO `weeks` asked,
+    /// including graduated rows, grouped by lesson, newest first. Incomplete
+    /// retained history fails explicitly; examples are bounded after counting.
     /// Read for a `surface`, a row its disclosure keeps from that surface still
     /// counts but shows no text (nil: the Mac's own page, which sees all).
     public static func misses(dataRoot: URL, weeks: [String], surface: String? = nil) async throws -> [MemoryMissLesson] {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-        var lessons: [String: (firstSeen: Int, misses: [(date: Date, miss: MemoryMiss)])] = [:]
-        for m in try await storage.listMemories(persona: nil, status: nil, limit: nil)
-        where m.status != "deleted" && m.metadata?.objectValue?["kind"]?.stringValue == "correction" {
-            let session = m.metadata?.objectValue?["session_id"]?.stringValue
-            // Dated by the turn that gave it (a held or recovered correction is
-            // kept later); rows kept before turns were stamped, by their insert.
-            var occurrences = [(at: m.metadata?.objectValue?["turn_at"]?.stringValue ?? m.createdAt, session: session,
-                                history: m.metadata?.objectValue?["history"]?.stringValue)]
-            if case .object(let meta)? = m.metadata, case .array(let repeats)? = meta["duplicate_occurrences"] {
-                for case .object(let repeated) in repeats {
-                    guard case .string(let at)? = repeated["turn_at"] else { continue }
-                    // A key the repeat shares with the row is left out of it.
-                    occurrences.append((at, repeated["session_id"]?.stringValue ?? session,
-                                        repeated["history"]?.stringValue))
-                }
+        let calendar = Calendar(identifier: .iso8601)
+        let windows = try weeks.map { week -> DateInterval in
+            let parts = week.components(separatedBy: "-W")
+            guard parts.count == 2, let year = Int(parts[0]), let number = Int(parts[1]),
+                  let start = calendar.date(from: DateComponents(weekday: 2, weekOfYear: number, yearForWeekOfYear: year)),
+                  isoWeek(start) == week,
+                  let end = calendar.date(byAdding: .weekOfYear, value: 1, to: start) else {
+                throw MemoryStorageError.invalidTemporalEvidence("invalid correction week: \(week)")
             }
+            return DateInterval(start: start, end: end)
+        }
+        guard let start = windows.map(\.start).min(), let end = windows.map(\.end).max() else { return [] }
+        var lessons: [String: (firstSeen: Int, misses: [(date: Date, miss: MemoryMiss)])] = [:]
+        for occurrence in try await storage.correctionOccurrences(from: start, to: end) {
+            let m = occurrence.memory
+            let week = isoWeek(occurrence.date)
+            guard weeks.contains(week) else { continue }
             // Scope only: a graduated or archived miss is history, not hidden.
             // A hidden one counts under one name and shows neither its words
             // nor the lesson named from them.
@@ -103,15 +103,10 @@ public enum MemoryRecoveryReadout {
             let name = !shown ? "not shown on this surface"
                 : m.metadata?.objectValue?["lesson"]?.stringValue ?? lesson(metadata: m.metadata, text: m.content)
             let text = shown ? m.content : ""
-            for occurrence in occurrences {
-                let date = MemoryMoments.parseTimestamp(occurrence.at) ?? .distantPast
-                let week = isoWeek(date)
-                guard weeks.contains(week) else { continue }
-                let miss = MemoryMiss(memoryId: m.id, text: text, at: occurrence.at, week: week,
-                                      sessionId: occurrence.session, history: occurrence.history)
-                let firstSeen = lessons.count
-                lessons[name, default: (firstSeen, [])].misses.append((date, miss))
-            }
+            let miss = MemoryMiss(originId: occurrence.originID, memoryId: m.id, text: text, at: occurrence.at, week: week,
+                                  sessionId: occurrence.sessionID, history: occurrence.history)
+            let firstSeen = lessons.count
+            lessons[name, default: (firstSeen, [])].misses.append((occurrence.date, miss))
         }
         var groups: [(name: String, firstSeen: Int, misses: [(date: Date, miss: MemoryMiss)])] = []
         for (name, group) in lessons {
@@ -122,7 +117,11 @@ public enum MemoryRecoveryReadout {
             let latestA = a.misses[0].date, latestB = b.misses[0].date
             return latestA == latestB ? a.firstSeen < b.firstSeen : latestA > latestB
         }
-        return groups.map { group in MemoryMissLesson(lesson: group.name, misses: group.misses.map(\.miss)) }
+        return groups.map { group in
+            let counts = Dictionary(grouping: group.misses, by: { $0.miss.week }).mapValues { $0.count }
+            return MemoryMissLesson(lesson: group.name, countsByWeek: counts,
+                                    misses: group.misses.prefix(10).map(\.miss))
+        }
     }
 
     /// "2026-W41": the ISO week `date` falls in, on this Mac's clock. `ago`
@@ -266,8 +265,9 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
             let counts = try await store.statusCounts()
             snap.storageReadable = true
             snap.sqliteRecordCount = counts.active
-            spotlightEligibleCount = counts.active
-            storageGeneration = try await store.spotlightSnapshot().fingerprint
+            let spotlightSnapshot = try await store.spotlightSnapshot()
+            spotlightEligibleCount = spotlightSnapshot.items.count
+            storageGeneration = spotlightSnapshot.fingerprint
             snap.sqliteProposalCount = counts.pendingProposals
             snap.spotlightLastError = await store.spotlightProjectionFailure
         } catch {

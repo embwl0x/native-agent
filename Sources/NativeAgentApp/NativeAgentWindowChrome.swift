@@ -24,7 +24,7 @@ struct MenuBarOpenButton: View {
     @Environment(\.openWindow) private var openWindow
     var body: some View {
         Button("Open NativeAgent", systemImage: "macwindow") {
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp.activate()
             // The main scene is a single-instance Window (not WindowGroup),
             // so openWindow(id:) reuses the existing one if visible or
             // recreates it if closed — never stacks copies.

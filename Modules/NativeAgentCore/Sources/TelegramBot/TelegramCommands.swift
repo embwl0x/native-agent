@@ -192,7 +192,7 @@ extension SwiftNativeTelegramBot {
             let s = try await self.getStatus()
             let up = (s.enabled ?? false) && (s.tokenConfigured ?? false)
             guard let partFace else { return "Telegram progress part unavailable: the originating app door is not bound." }
-            let model = await telegramPlainModelPhrase()
+            let model: String? = try await telegramPlainModelPhrase()
             let approvals = await approvalStatus(destination: destination)
             let face = await TelegramProgressFace(dataRoot: dataRoot, call: partFace)
             let reply = await face.text(input: .object([
@@ -273,12 +273,12 @@ extension SwiftNativeTelegramBot {
             """
         case .provider:
             guard let routing = deps?.routing else { return nil }
-            guard let menu = await routing.modelMenuForSurface(surface) else { return nil }
+            let menu = try await routing.modelMenuForSurface(surface)
             return menu.currentProvider
 
         case .model:
             guard let routing = deps?.routing else { return nil }
-            let menu = await routing.modelMenuForSurface(surface)
+            let menu = try await routing.modelMenuForSurface(surface)
             let decision: TelegramModelPickerDecision
             do { decision = try await modelPicker("command", menu: menu, args: args) }
             catch { return "Telegram model picker failed: \(error.localizedDescription)" }
@@ -291,7 +291,7 @@ extension SwiftNativeTelegramBot {
                         model: selection.modelId
                     )
                 }
-                return decision.reply
+                return [decision.reply, menu.catalogIssues.isEmpty ? nil : menu.catalogIssues].compactMap { $0 }.joined(separator: "\n")
             } catch {
                 return "Failed to set Telegram model: \(error.localizedDescription)"
             }
@@ -300,10 +300,11 @@ extension SwiftNativeTelegramBot {
             guard let routing = deps?.routing else {
                 return "think_routing_unavailable: Think was not changed. Open Providers → Chat to check model routing."
             }
-            guard let capabilities = await routing.modelMenuForSurface(surface)?.currentCapabilities else {
+            let capabilities = try await routing.modelMenuForSurface(surface).currentCapabilities
+            guard let efforts = capabilities.reasoningEfforts else {
                 return "think_capabilities_unavailable: The selected model's Think controls are unknown. Open Providers → Chat to check the selected model."
             }
-            let valid = Set(capabilities.reasoningEfforts)
+            let valid = Set(efforts)
             if valid.isEmpty {
                 return "think_unsupported: The selected model has no Think control. Send /model to choose a model with Think."
             }
@@ -320,7 +321,11 @@ extension SwiftNativeTelegramBot {
 
         case .fast:
             guard let routing = deps?.routing else { return nil }
-            guard let capabilities = await routing.modelMenuForSurface(surface)?.currentCapabilities, capabilities.supportsFast else {
+            let capabilities = try await routing.modelMenuForSurface(surface).currentCapabilities
+            guard let supportsFast = capabilities.supportsFast else {
+                return "fast_capabilities_unavailable: The selected model's Fast control is unknown. Refresh models in Providers."
+            }
+            guard supportsFast else {
                 return "/fast is unsupported for the selected model."
             }
             guard let arg = args.first?.lowercased(), ["on", "off"].contains(arg) else {
@@ -336,7 +341,7 @@ extension SwiftNativeTelegramBot {
 
         case .brain:
             guard let routing = deps?.routing else { return nil }
-            guard let menu = await routing.modelMenuForSurface(surface) else { return nil }
+            let menu = try await routing.modelMenuForSurface(surface)
             return "Brain: \(menu.currentModel)@\(menu.currentProvider)"
 
         case .help:

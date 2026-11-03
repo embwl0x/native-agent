@@ -8,7 +8,20 @@ import ImageIO
 import Desk
 import Experiences
 import ToolExecution
-// Blueprint: | `SwiftCodexImageGenerationClient.swift` | Codex image request/result values and process transport; isolated workspace, allowlisted environment and exact-thread raster collection; Stop settles captured output and produced images |
+// Blueprint: | `SwiftCodexImageGenerationClient.swift` | Codex image request/result values and process transport; isolated workspace, allowlisted environment and per-file exact-thread raster collection; Stop and worker failures retain produced images |
+
+/// The declared final-message file is the only reply source; process output is separate evidence.
+enum CodexFinalReply {
+    static func read(_ url: URL) -> (text: String?, failure: String?) {
+        do {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return (nil, "Final-message file is empty: \(url.path)")
+            }
+            return (text, nil)
+        } catch { return (nil, "\(url.path): \(error.localizedDescription)") }
+    }
+}
 
 struct CodexImageGenerationRequest: Sendable, Equatable {
     var prompt: String
@@ -38,6 +51,7 @@ struct CodexImageGenerationProcessResult: Sendable, Equatable {
     var lastMessage: String
     var durationMs: Int
     var stopped: Bool = false
+    var lastMessageFailure: String? = nil
 }
 
 struct CodexImageGenerationResult: Sendable, Equatable {
@@ -50,6 +64,7 @@ struct CodexImageGenerationResult: Sendable, Equatable {
     var durationMs: Int
     var evidence: [JSONValue] = []
     var stopped: Bool = false
+    var failures: [JSONValue] = []
 }
 
 final class SwiftCodexImageGenerationClient: Sendable {
@@ -126,26 +141,14 @@ final class SwiftCodexImageGenerationClient: Sendable {
             let collected = Result {
                 // Preserve captured output through Stop, even without an image or final reply.
                 try JSONEncoder().encode(["stdout": processResult.stdout, "stderr": processResult.stderr,
-                    "reply": processResult.lastMessage]).write(to: auditDir.appendingPathComponent("output.json"), options: .atomic)
-                if processResult.exitCode == 127 && !processResult.stopped {
-                    throw ImageGenerationToolError.codexUnavailable
-                }
-                if processResult.exitCode != 0 && !processResult.stopped {
-                    let detail = [processResult.lastMessage, processResult.stderr, processResult.stdout]
-                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                        .first { !$0.isEmpty } ?? "no stderr"
-                    throw ImageGenerationToolError.codexFailed(exitCode: processResult.exitCode, message: detail)
-                }
-
+                    "reply": processResult.lastMessage,
+                    "finalReplyError": processResult.lastMessageFailure]).write(to: auditDir.appendingPathComponent("output.json"), options: .atomic)
                 let threadIDs = Set(processResult.stdout.split(separator: "\n").compactMap { line -> String? in
                     guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                           row["type"] as? String == "thread.started", let id = row["thread_id"] as? String,
                           UUID(uuidString: id) != nil else { return nil }
                     return id
                 })
-                if threadIDs.count != 1 && !processResult.stopped {
-                    throw ImageGenerationToolError.noCodexImagesFound
-                }
                 let threadID = threadIDs.count == 1 ? threadIDs.first! : ""
                 let ownedDir = codexImagesDir.appendingPathComponent(threadID).standardizedFileURL
                 let newImages = (threadID.isEmpty ? [] : Self.imageFiles(in: ownedDir))
@@ -154,44 +157,72 @@ final class SwiftCodexImageGenerationClient: Sendable {
                     .sorted { Self.modificationDate($0) < Self.modificationDate($1) }
                     .prefix(max(1, min(Self.maxImageCount, request.count)))
 
-                if newImages.isEmpty && !processResult.stopped {
+                if newImages.isEmpty && processResult.exitCode == 0 && !processResult.stopped {
                     throw ImageGenerationToolError.noCodexImagesFound
                 }
-                let evidence: [JSONValue] = try newImages.map { path in
-                    guard let raster = CodexImageRaster.inspect(try Data(contentsOf: path)) else { throw ImageGenerationToolError.invalidImageData }
-                    return .object([
-                        "tool": .string("image_gen.imagegen"), "transport": .string("codex_builtin"),
-                        "executionBoundary": .string("general_agent"),
-                        "sandbox": .string("read-only"),
-                        "workingDirectory": .string(invocation.cwd.path),
-                        "environmentPolicy": .string("allowlist_only"),
-                        "environmentKeys": .array(invocation.environment.keys.sorted().map(JSONValue.string)),
-                        "toolRestriction": .string("shell, exec, agents, apps, plugins, hooks, computer/browser control, skill search/install, tool suggestions, image viewing, goals, sleep and web disabled; no universal built-in tool allowlist"),
-                        "codexThreadId": .string(threadID), "imageModel": .string("unknown"),
-                        "backendToolModel": .string("unknown"), "backendToolModelEvidenceSource": .string("not_exposed_by_builtin"),
-                        "responseModel": .string("not_applicable"), "modelVersion": .string("unverified"),
-                        "requestedQuality": .string(request.quality ?? "auto"), "outboundQuality": .string("not_exposed"),
-                        "qualityRequestForwarding": .string("prompt_preference"), "observedQuality": .string("unknown"),
-                        "qualityFulfillment": .string("unknown"), "requestedSize": .string(request.size ?? "auto"),
-                        "requestedOutputFormat": .string(request.outputFormat), "requestedBackground": .string(request.background),
-                        "actualFormat": .string(raster.format), "actualWidth": .int(Int64(raster.width)), "actualHeight": .int(Int64(raster.height)),
-                        "actualHasAlpha": .bool(raster.hasAlpha),
-                        "sizeFulfillment": .string(SwiftCodexImageGenerationClient.sizeFulfillment(requested: request.size ?? "auto", observed: "\(raster.width)x\(raster.height)")),
-                        "formatFulfillment": .string(SwiftCodexImageGenerationClient.qualityFulfillment(requested: request.outputFormat, observed: raster.format)),
-                        "actionFulfillment": .string("unknown"),
-                    ])
+                var sourceImages: [URL] = []
+                var evidence: [JSONValue] = []
+                var failures: [JSONValue] = []
+                for (index, path) in newImages.enumerated() {
+                    do {
+                        guard let raster = CodexImageRaster.inspect(try Data(contentsOf: path)) else { throw ImageGenerationToolError.invalidImageData }
+                        evidence.append(.object([
+                            "index": .int(Int64(index)),
+                            "tool": .string("image_gen.imagegen"), "transport": .string("codex_builtin"),
+                            "finalReplyAvailability": .string(processResult.lastMessageFailure == nil ? "available" : "unavailable"),
+                            "finalReplyError": processResult.lastMessageFailure.map(JSONValue.string) ?? .null,
+                            "executionBoundary": .string("general_agent"),
+                            "sandbox": .string("read-only"),
+                            "workingDirectory": .string(invocation.cwd.path),
+                            "environmentPolicy": .string("allowlist_only"),
+                            "environmentKeys": .array(invocation.environment.keys.sorted().map(JSONValue.string)),
+                            "toolRestriction": .string("shell, exec, agents, apps, plugins, hooks, computer/browser control, skill search/install, tool suggestions, image viewing, goals, sleep and web disabled; no universal built-in tool allowlist"),
+                            "codexThreadId": .string(threadID), "imageModel": .string("unknown"),
+                            "backendToolModel": .string("unknown"), "backendToolModelEvidenceSource": .string("not_exposed_by_builtin"),
+                            "responseModel": .string("not_applicable"), "modelVersion": .string("unverified"),
+                            "requestedQuality": .string(request.quality ?? "auto"), "outboundQuality": .string("not_exposed"),
+                            "qualityRequestForwarding": .string("prompt_preference"), "observedQuality": .string("unknown"),
+                            "qualityFulfillment": .string("unknown"), "requestedSize": .string(request.size ?? "auto"),
+                            "requestedOutputFormat": .string(request.outputFormat), "requestedBackground": .string(request.background),
+                            "actualFormat": .string(raster.format), "actualWidth": .int(Int64(raster.width)), "actualHeight": .int(Int64(raster.height)),
+                            "actualHasAlpha": .bool(raster.hasAlpha),
+                            "sizeFulfillment": .string(SwiftCodexImageGenerationClient.sizeFulfillment(requested: request.size ?? "auto", observed: "\(raster.width)x\(raster.height)")),
+                            "formatFulfillment": .string(SwiftCodexImageGenerationClient.qualityFulfillment(requested: request.outputFormat, observed: raster.format)),
+                            "actionFulfillment": .string("unknown"),
+                        ]))
+                        sourceImages.append(path)
+                    } catch {
+                        failures.append(.object([
+                            "index": .int(Int64(index)), "sourcePath": .string(path.path),
+                            "stage": .string("inspect"), "error": .string(error.localizedDescription),
+                        ]))
+                    }
+                }
+                // A worker's exit concerns the run, not the files it already produced.
+                if processResult.exitCode != 0 && !processResult.stopped {
+                    let detail = [processResult.lastMessage, processResult.stderr, processResult.stdout]
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .first { !$0.isEmpty } ?? "no stderr"
+                    let error = processResult.exitCode == 127
+                        ? ImageGenerationToolError.codexUnavailable
+                        : ImageGenerationToolError.codexFailed(exitCode: processResult.exitCode, message: detail)
+                    failures.append(.object([
+                        "stage": .string("worker"), "exitCode": .int(Int64(processResult.exitCode)),
+                        "error": .string(error.localizedDescription),
+                    ]))
                 }
 
                 return CodexImageGenerationResult(
                     runId: runId,
                     model: "unknown",
-                    sourceImages: Array(newImages),
+                    sourceImages: sourceImages,
                     reply: processResult.lastMessage.trimmingCharacters(in: .whitespacesAndNewlines),
                     stderr: processResult.stderr,
                     exitCode: processResult.exitCode,
                     durationMs: processResult.durationMs,
                     evidence: evidence,
-                    stopped: processResult.stopped
+                    stopped: processResult.stopped,
+                    failures: failures
                 )
             }
             if case .failure(let failure) = collected {
@@ -281,7 +312,7 @@ final class SwiftCodexImageGenerationClient: Sendable {
     }
 
     static func defaultRunner(_ invocation: CodexImageGenerationInvocation) async throws -> CodexImageGenerationProcessResult {
-        let process = Process()
+        let process = ManagedProcess()
         process.executableURL = URL(fileURLWithPath: invocation.executable)
         process.arguments = invocation.arguments
         process.currentDirectoryURL = invocation.cwd
@@ -292,15 +323,16 @@ final class SwiftCodexImageGenerationClient: Sendable {
         let started = Date()
         return await SwiftToolDispatcher.SubprocessWork(process).run(timeoutSeconds: invocation.timeoutSeconds) { exit in
             let (stdoutText, stderrText) = outputCapture.finish(strictUTF8: true)
-            let lastMessage = (try? String(contentsOf: invocation.lastMessagePath, encoding: .utf8)) ?? ""
+            let finalReply = CodexFinalReply.read(invocation.lastMessagePath)
             let durationMs = Int(Date().timeIntervalSince(started) * 1000)
             return CodexImageGenerationProcessResult(
                 exitCode: exit.code,
                 stdout: stdoutText,
                 stderr: exit.launchError ?? stderrText,
-                lastMessage: lastMessage,
+                lastMessage: finalReply.text ?? "",
                 durationMs: durationMs,
-                stopped: exit.stopped
+                stopped: exit.stopped,
+                lastMessageFailure: finalReply.failure
             )
         }
     }

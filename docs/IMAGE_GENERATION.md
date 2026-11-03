@@ -29,9 +29,9 @@ The checked **Work** provider route selects the backend. In
 Codex and `openai_oauth_direct` map to `codex`. An unsupported Work route stops
 with a model-choice card only after a successful routing read establishes its
 capability. A failed routing read returns its cause without asking for a model
-choice. Request arguments cannot select a different provider
-or image model; a conflicting `provider`, `backend`, or `model` is refused.
-`codex_cli` is accepted as an alias when Work resolves to Codex.
+choice. Work owns provider and image model. The retired `provider`, `backend`,
+`model`, `description`, `format` and `count` arguments are refused, including
+matching provider/model names. Use `prompt`, `output_format` and `n`.
 Recovery cards retain that request's checked route and routing snapshot; a
 resumed request reads routing again and applies its one-request model choice.
 
@@ -60,10 +60,52 @@ background. Only files from that exact Codex thread's `generated_images`
 directory are collected; outputs and receipts are kept under
 `<dataRoot>/generated_images`.
 
+The final-message file is the sole Codex reply source. Its missing, empty or
+unreadable contents are retained as `finalReplyError` in the run output and
+as `finalReplyAvailability:unavailable` with the cause in each image's evidence.
+Verified image artifacts retain their own result; process stdout stays separate
+from the assistant reply.
+
+`output_format` defaults to PNG only when omitted. Supplied values must be
+`png`, `jpeg` (also `jpg`) or `webp`, ignoring case and surrounding whitespace;
+empty, null, non-string and unsupported values fail before routing or provider
+execution. Codex quality accepts only `low`, `medium`, `high` or `auto`;
+image-model names are not quality selectors.
+
 Successful results from either backend return `status: ok` and pass through
 `make-generated` to register their images in Make. Try again uses the same
 path with the existing Make reference, adding a version. A stopped result
 keeps `status: stopped` and its produced images without registering success.
+Both backends settle produced output before returning, including after Stop.
+Each committed file stays in `images`, identified by run ID, index and path,
+with byte size and inspected format, dimensions and alpha evidence. Extensions
+follow actual bytes; requested format remains separate. A file failure adds
+its index, attempted path (or retained Codex source path) and cause to `failures`;
+sibling files still proceed. Any item failure returns `status: partial`.
+OpenAI decodes each response item independently: an undecodable item adds its
+original `index`, `stage: decode` and cause to `failures`, while decoded siblings
+continue to persistence. A missing or empty response data array remains a
+response failure; a nonempty batch of invalid items retains each named failure.
+Codex collects produced files before reporting a nonzero worker exit, keeping
+the committed images and `stage: worker` failure with its `exitCode` in the
+same partial receipt. Raster inspection failures are scoped to the source file
+with `stage: inspect`, its original index and source path; siblings continue.
+The terminal receipt is written once from those rows. `receiptPersistence`
+is `committed` with `receiptPath`, or `failed` with `receiptWriteFailure` and
+`status: partial`; committed image rows remain in the response either way.
+Partial results still supply thumbnails and reply attachments; they do not
+register a completed generation in Make. Inspect their retained paths rather
+than generating the batch again. `generationStopped` retains Codex Stop evidence
+even when persistence also fails. Existing redacted prompt-preview bounds remain.
+
+Mac chat's screenshot attachment requires the primary display's physical pixel
+geometry and a capture matching it. It scales once to at most 1600 pixels on
+the longest edge, then encodes JPEG at quality 0.78, with a 6 MiB byte bound.
+Geometry, resize and encoding failures are distinct; only encoded bytes over
+the bound report too large. It never substitutes point geometry, the unscaled
+image, another quality or PNG. Main and detached composers use this same owner.
+Clipboard image conversion failures show the decoder's refusal and stop;
+they do not open the file picker.
 
 Saved Trust authority gates routing, execution and reference reads; damaged
 policy fails with repair evidence. Codex accepts up to four local PNG/JPEG/WebP

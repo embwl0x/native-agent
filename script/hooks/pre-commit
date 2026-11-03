@@ -11,29 +11,25 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 
 if ! command -v gitleaks >/dev/null 2>&1; then
-  echo "[pre-commit] gitleaks not installed — 'brew install gitleaks'. Skipping scan." >&2
-  echo "[pre-commit] (install it: the repo relies on this guard before public release.)" >&2
-  exit 0
-fi
-
-if ! gitleaks git --staged --no-banner --redact -c "$ROOT/.gitleaks.toml"; then
+  echo "[pre-commit] BLOCKED: gitleaks is required. Install it with: brew install gitleaks" >&2
+  exit 1
+elif ! gitleaks git --staged --no-banner --redact -c "$ROOT/.gitleaks.toml"; then
   echo "" >&2
   echo "[pre-commit] BLOCKED: gitleaks found a secret or personal-data leak in staged changes." >&2
   echo "[pre-commit] Fix it, or if it is a verified false positive: git commit --no-verify" >&2
   exit 1
 fi
 
-# Release-gate drift guard (2026-08-06, "how did you miss all that"): six
-# waves added production timers/resources without updating the ship-time
-# inventories, and all of it failed at once at the 0.3.8 cut. When a staged
-# Swift change touches a sleep/timer primitive, the timer inventory must
-# classify it NOW, not on release day. Cheap (<5s). Bypass: --no-verify.
-if git diff --cached --name-only | grep -E '\.swift$' >/dev/null; then
-  if git diff --cached -U0 -- '*.swift' | grep -E '^\+.*((Task|Thread)\.sleep|usleep\(|timeoutNanoseconds)' >/dev/null; then
-    echo "[pre-commit] staged timer/sleep change — running timer inventory check..."
-    swift "$ROOT/script/check_timer_inventory.swift" || {
-      echo "[pre-commit] BLOCKED: classify the new timer in script/timer_inventory.tsv (see check output)." >&2
-      exit 1
-    }
-  fi
+# The classifier owns primitive recognition. Check a single immutable staged
+# tree (source, policy, classifier and inventory), including deletions/moves.
+if [[ -n "$(git diff --cached --name-only -- '*.swift' 'script/timer_inventory.tsv' 'docs/ARCHITECTURE_BLUEPRINT.md' 'script/hooks/pre-commit')" ]]; then
+  snapshot="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-staged.XXXXXX")"
+  trap 'rm -rf "$snapshot"' EXIT
+  staged_tree="$(git write-tree)"
+  git archive "$staged_tree" | tar -x -C "$snapshot"
+  echo "[pre-commit] timer ownership in staged tree $staged_tree"
+  swift "$snapshot/script/check_timer_inventory.swift" --repo "$snapshot" || {
+    echo "[pre-commit] BLOCKED: staged timer source, policy and script/timer_inventory.tsv must agree (see check output)." >&2
+    exit 1
+  }
 fi

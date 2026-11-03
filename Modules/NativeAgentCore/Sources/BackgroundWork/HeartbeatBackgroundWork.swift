@@ -49,11 +49,17 @@ public struct HeartbeatBackgroundWork: Sendable {
                 let desk = SwiftNativeDeskStore(dataRoot: dataRoot)
                 let executions = dataRoot.appendingPathComponent("workshop/executions", isDirectory: true)
                 let workflows = dataRoot.appendingPathComponent("workflows/run_state", isDirectory: true)
-                let executionFiles = ((try? FileManager.default.contentsOfDirectory(
-                    at: executions, includingPropertiesForKeys: nil)) ?? [])
-                    .map { ExecutionRecordFile.canonicalPath(in: $0) }
-                let workflowFiles = (try? FileManager.default.contentsOfDirectory(
-                    at: workflows, includingPropertiesForKeys: nil)) ?? []
+                func children(_ path: URL) -> [URL] {
+                    do { return try FileManager.default.contentsOfDirectory(at: path, includingPropertiesForKeys: nil) }
+                    catch CocoaError.fileReadNoSuchFile { return [] }
+                    catch {
+                        let cause = "Heartbeat source watches are incompletely armed at \(path.path): \(error.localizedDescription). Repair directory access and reopen NativeAgent to rearm its child watches; the parent watch remains active."
+                        Task { await BackgroundLoopLifetimes.shared.recordOutOfBandOutcome(loopId: "heartbeat", outcome: .failed(error: cause)) }
+                        return []
+                    }
+                }
+                let executionFiles = children(executions).map { ExecutionRecordFile.canonicalPath(in: $0) }
+                let workflowFiles = children(workflows)
                 // Nested records created after subscription retain the 12h
                 // missed-event backstop; the vnode watcher is not recursive.
                 return EventDeadlinePhysiology.storeAndFileEvents(
@@ -76,7 +82,8 @@ public struct HeartbeatBackgroundWork: Sendable {
             },
             loadChecklist: {
                 let path = personaRoot.appendingPathComponent("HEARTBEAT.md")
-                return try? String(contentsOf: path, encoding: .utf8)
+                do { return try String(contentsOf: path, encoding: .utf8) }
+                catch CocoaError.fileReadNoSuchFile { return nil }
             },
             gatherAssessment: {
                 await gatherHeartbeatAssessment(

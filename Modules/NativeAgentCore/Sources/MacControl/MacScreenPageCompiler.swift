@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 import Senses
-// Blueprint: | `MacScreenPageCompiler.swift` | `MacScreenPageCompiler` enum; complete nested AX reading order, structural/activation alias folding, adjacent checkbox captions in structured and aggregate documents, document title ownership, sentence-first links including aggregate document text, AX landmark and card sections, live-region text with duplicate container folding, display cleanup after full-context redaction, composite rows with status details and exact related-action bindings |
+// Blueprint: | `MacScreenPageCompiler.swift` | Native AX reading order with checked menu availability/coverage, structural/activation alias folding, adjacent checkbox captions, document title ownership, sentence-first links, AX landmark/card sections, live-region text, full-context redaction and exact related-action bindings |
 
 /// The complete AX window in native form. The source walk and look frame own
 /// identity; this compiler owns reading order and representation, never input.
@@ -28,7 +28,7 @@ public enum MacScreenPageCompiler {
     }
 
     public static func compile(snapshot: MacAXTreeSnapshot, redactedNodes: [JSONValue], percept: MacLookPercept,
-                               frameID: String, isFront: Bool, menuTitles: [String] = [],
+                               frameID: String, isFront: Bool, menuReading: MacMenuBar.Reading?,
                                settableAttributes: (MacAXNode) -> [String]) throws -> Compilation {
         let bundle = percept.app?.bundleIdentifier ?? "*"
         let corner = SenseCorner.app(bundleID: bundle)
@@ -75,8 +75,18 @@ public enum MacScreenPageCompiler {
         let windowTitle = percept.windowTitleJSON.flatMap { display($0) }
         append(appName + (windowTitle.map { " · " + $0 } ?? "") + (isFront ? " · FRONT" : " · not front"), at: [])
         // Menu titles make a menu path known without another read.
-        if !menuTitles.isEmpty {
-            append("Menus: " + menuTitles.joined(separator: " · ") + " — act target \"File > Save\" presses an item; mac.menu lists them whole.", at: [])
+        if let menuReading {
+            if let unavailable = menuReading.unavailable {
+                append("Menus unavailable: " + unavailable, at: [])
+            } else {
+                let titles = MacMenuBar.topLevelNames(menuReading.items)
+                if !titles.isEmpty {
+                    append("Menus: " + titles.joined(separator: " · ") + " — act target \"File > Save\" presses an item; mac.menu lists them whole.", at: [])
+                }
+                if menuReading.truncated { append("Menu coverage is partial; submenus or capped items were not read.", at: []) }
+            }
+        } else {
+            append("Menus unavailable: no confirmed app owner.", at: [])
         }
         append(SenseScreenThings.accessibilityReadLine, at: [])
         var shellStarted = false
@@ -152,6 +162,7 @@ public enum MacScreenPageCompiler {
         var captions: [[Int]: String] = [:]
         var captionPaths: [[Int]: Set<[Int]>] = [:]
         func controlLabel(_ node: MacAXNode) -> String? {
+            guard !node.attributes.labelUnreadable else { return nil }
             guard let control = controls[node.path] else { return nil }
             if let caption = captions[node.path] { return caption }
             let kind = MacScreenRender.kindName(role: node.attributes.role)
@@ -558,25 +569,27 @@ public enum MacScreenPageCompiler {
             var details = extraDetails + rowStates(node)
             if includeValue, !a.valueIsHelp, let value = display(control.valueJSON), !same(value, label) { details.append(value) }
             if let state = control.state { details.append(state) }
-            if !control.enabled { details.append("disabled") }
+            if control.enabled == false { details.append("disabled") }
+            if control.enabled == nil { details.append("enabled state unavailable") }
             if control.selected == true { details.append("selected") }
             if percept.focus?.path == node.path { details.append("focused") }
             if control.secret { details.append("secure") }
             var target: [String: JSONValue] = ["app": .string(bundle), "frame_id": .string(frameID),
                 "handle": .string(control.handle)]
-            var verbs = control.enabled ? SenseScreenThings.verbs(role: a.role, actions: a.actions,
+            var verbs = control.enabled == true ? SenseScreenThings.verbs(role: a.role, actions: a.actions,
                 settable: SenseScreenThings.editableRoles.contains(a.role) ? settableAttributes(node) : []) : []
-            if control.enabled, a.actions.contains("AXOpen") {
+            if control.enabled == true, a.actions.contains("AXOpen") {
                 verbs.insert("open", at: a.actions.contains("AXPress") ? 1 : 0)
             }
+            verbs = MacFourVerbs.offeredVerbs(verbs)
             var activations: [String: JSONValue] = [:]
             // A related action prints with its own handle, so `act` can use
             // exactly what the page shows.
             var printedVerbs = verbs
             for child in related {
                 guard let action = controls[child.path], let label = controlLabel(child) else { continue }
-                if !action.enabled {
-                    details.append(label + ": disabled")
+                if action.enabled != true {
+                    details.append(label + (action.enabled == false ? ": disabled" : ": enabled state unavailable"))
                     continue
                 }
                 // AX supplies the verb's words. Its binding is an exact frame

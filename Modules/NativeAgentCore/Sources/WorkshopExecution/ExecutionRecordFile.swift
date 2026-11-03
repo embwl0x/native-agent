@@ -11,7 +11,7 @@ import PersistenceCore
 /// No reader prepares, renames or repairs files on disk.
 /// Coverage: local backup and production export include workshop/; phone sync
 /// carries task projections only; PrivacyMap lists the Workshop tree.
-/// Mission-named JSON keys (`missionId` / `mission_id` / `missionPolicy` /
+/// Mission-named execution JSON keys (`missionId` / `mission_id` /
 /// `related_mission_id`), event kinds, surface strings and tool names keep
 /// their persisted wire IDs.
 public enum ExecutionRecordFile {

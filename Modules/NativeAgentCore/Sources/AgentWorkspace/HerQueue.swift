@@ -3,10 +3,11 @@ import ApprovalInbox
 import ChatSessionWork
 import Desk
 import Experiences
+import MacControl
 import NativeAgentCore
 import PersistenceCore
 import Synchronization
-// Blueprint: | `HerQueue.swift` | `MyQueueTurnProjectionProviding` protocol over cognition's Desk-revision-checked candidates and explicit refresh-pending-after-write state; `MyQueueReady` reads named experience conditions by primary key for unattended and recorded-session eligibility; `HerScreen`: `queueContext`, async `queueRows` shows those obligations, `resume` |
+// Blueprint: | `HerQueue.swift` | `MyQueueTurnProjectionProviding` over cognition's Desk-revision-checked candidates and refresh-pending-after-write state; checked approval/conversation evidence precedes queue conditions; `MyQueueReady` reads named experience conditions by primary key for unattended and recorded-session eligibility; `HerScreen.queueContext` reads PersonPresence transitions; `queueRows` lists waiting steps by desk.N; `resume` preserves unavailable follow-up evidence |
 
 private let queueDoors: [String: Set<String>] = ["mac": ["app", "chat", "mac"], "phone": ["ios", "iphone", "mobile", "icloud"],
                                                "ios": ["ios", "iphone", "mobile", "icloud"]]
@@ -68,7 +69,8 @@ public enum MyQueueReady {
             guard !item.isPursuit, plan.byHandle[item.handle]?.isReady == true,
                   item.project == MyQueue.project || item.assignee == "agent" else { return false }
             guard let entry = MyQueue.entry(item) else { return true }
-            switch MyQueue.when(entry) {
+            guard entry.step.status != "stopped", let when = MyQueue.when(entry) else { return false }
+            switch when {
             case .nextTurn: return !entry.owedToPerson(dataRoot: dataRoot) && context.ownTurn
             case .userWrites: return false
             default: return MyQueue.isReady(entry, context)
@@ -81,9 +83,11 @@ public enum MyQueueReady {
     package static func forTurn(items: [DeskItem], session: String, door: String, personTurn: Bool, at: Date, dataRoot: URL) -> [MyQueue.Entry] {
         let plan = DeskSequencing.compute(DeskState(items: items, generatedTs: ""), now: at)
         return items.compactMap(MyQueue.entry).filter { entry in
-            guard entry.owedToPerson(dataRoot: dataRoot) == personTurn, entry.step.session == session, plan.byHandle[entry.item.handle]?.isReady == true,
-                  let filed = DeskClock.parseISO(entry.step.filedAt ?? entry.item.openedAt), at > filed else { return false }
-            switch MyQueue.when(entry) {
+            guard entry.step.status != "stopped",
+                  entry.owedToPerson(dataRoot: dataRoot) == personTurn, entry.step.session == session, plan.byHandle[entry.item.handle]?.isReady == true,
+                  let filed = DeskClock.parseISO(entry.step.filedAt ?? entry.item.openedAt), at > filed,
+                  let when = MyQueue.when(entry) else { return false }
+            switch when {
             case .nextTurn: return true
             case .userWrites(let wanted): return personTurn && (wanted.map { (queueDoors[$0] ?? [$0]).contains(door) } ?? true)
             default: return false
@@ -93,8 +97,8 @@ public enum MyQueueReady {
 }
 
 extension HerScreen {
-    package static func queueContext(dataRoot: URL, now: Date, ownTurn: Bool) -> MyQueue.Context {
-        let completed = ((try? SwiftNativeApprovalInbox(root: dataRoot).resolvedUnlocked()) ?? []).filter { record in
+    package static func queueContext(dataRoot: URL, now: Date, ownTurn: Bool) throws -> MyQueue.Context {
+        let completed = try SwiftNativeApprovalInbox(root: dataRoot).resolvedUnlocked().filter { record in
             guard record.decision == "approved", case .object(let result)? = record.executedAction else { return false }
             if let resultClass = result["resultClass"] {
                 return resultClass == .string(ChatToolOutcome.ExactResultClass.succeeded.rawValue)
@@ -111,32 +115,32 @@ extension HerScreen {
             }
             return ChatToolOutcome.exactResultClass(.object(evidence)) == .succeeded
         }
-        // One observation per context; each entry still selects its own three
-        // newest conversations after applying its door and timestamp filters.
-        let observation = Mutex<(rows: [(id: String?, source: String, updatedAt: Date)]?, latest: [String: Date?])>((nil, [:]))
+        let rows = try HumanConversationIndex.rows(dataRoot: dataRoot).map { row in
+            (id: row["id"]?.stringValue, source: row["source"]?.stringValue ?? "app",
+             updatedAt: row["updatedAt"]?.stringValue.flatMap(date) ?? .distantPast)
+        }
+        // Read the three newest per actual door before creating a nonthrowing
+        // condition callback. A failed evidence read cannot become false.
+        var counts: [String: Int] = [:], latest: [String: Date] = [:]
+        for row in rows where counts[row.source, default: 0] < 3 {
+            counts[row.source, default: 0] += 1
+            guard let id = row.id else { throw CocoaError(.fileReadCorruptFile) }
+            let tail = try logTail(dataRoot.appendingPathComponent("chat/messages/\(id).jsonl"), bytes: 16_384, humanOnly: true)
+            if let at = tail.filter({ !$0.mine }).compactMap(\.at).max() { latest[id] = at }
+        }
+        let observed = latest
+        let presence = PersonPresence.read(dataRoot: dataRoot, now: now).transition
         return MyQueue.Context(now: now, ownTurn: ownTurn, completedCards: Set(completed.map(\.id))) { door, since in
-            observation.withLock { observation in
-                if observation.rows == nil {
-                    observation.rows = ((try? HumanConversationIndex.rows(dataRoot: dataRoot)) ?? []).map { row in
-                        (row["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }), row["source"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "app",
-                         row["updatedAt"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }).flatMap(date) ?? .distantPast)
-                    }
-                }
                 let wanted = door.map { queueDoors[$0] ?? [$0] }
-                return observation.rows!.filter { row in
+                return rows.filter { row in
                     (wanted?.contains(row.source) ?? true) && row.updatedAt > since
                 }.prefix(3).contains { row in
                     guard let id = row.id,
                           NativeAgentChatSessionID.normalizedPathComponent(id) != nil else { return false }
-                    if observation.latest[id] == nil {
-                        let latest = logTail(dataRoot.appendingPathComponent("chat/messages/\(id).jsonl"), bytes: 16_384, humanOnly: true)
-                            .filter { !$0.mine }.map { $0.at ?? .distantPast }.max()
-                        observation.latest.updateValue(latest, forKey: id)
-                    }
-                    return (observation.latest[id] ?? nil).map { $0 > since } ?? false
+                    return observed[id].map { $0 > since } ?? false
                 }
-            }
-        }
+        } occurrence: { step, now in IntentionClock.occurrence(step, at: now) }
+          presence: { presence }
     }
 
     /// MY QUEUE's steps on home: the ready ones in her words (one queued on a
@@ -151,7 +155,9 @@ extension HerScreen {
         func noted(_ entry: MyQueue.Entry) -> String? {
             entry.item.notes.compactMap { DeskClock.parseISO($0.ts) }.max().map { "note " + age(now.timeIntervalSince($0)) }
         }
-        let context = queueContext(dataRoot: dataRoot, now: now, ownTurn: false)
+        let context: MyQueue.Context
+        do { context = try queueContext(dataRoot: dataRoot, now: now, ownTurn: false) }
+        catch { return ["Queue evidence unavailable: \(error.localizedDescription). Repair approval or conversation storage before evaluating these conditions."] }
         let conditions: [String: Experience]
         do { conditions = try await MyQueueReady.conditions(items: desk.items, dataRoot: dataRoot) }
         catch { return ["Wait conditions are unavailable: \(error.localizedDescription) · experiences/experiences.sqlite"] }
@@ -175,9 +181,16 @@ extension HerScreen {
                 return "on " + MyQueueReady.conditionName(experience) + " " + id
             }.joined(separator: ", ")
         }
-        var ready: [MyQueue.Entry] = [], waiting: [MyQueue.Entry] = []
+        var ready: [MyQueue.Entry] = [], waiting: [MyQueue.Entry] = [], unavailable: [String] = []
         for entry in entries {
-            if plan.byHandle[entry.item.handle]?.isReady == true && MyQueue.isReady(entry, context) { ready.append(entry) } else { waiting.append(entry) }
+            guard plan.byHandle[entry.item.handle]?.isReady == true else {
+                waiting.append(entry); continue
+            }
+            switch MyQueue.readiness(entry, context) {
+            case .ready: ready.append(entry)
+            case .waiting: waiting.append(entry)
+            case .unavailable(let detail): unavailable.append(pad(entry.name, 10) + " · " + detail)
+            }
         }
         var rows = ready.prefix(4).map { entry in
             pad(entry.name, 10) + (entry.peerBorn ? clip(entry.item.title, 44) + " · open it to read"
@@ -187,9 +200,20 @@ extension HerScreen {
                 + (noted(entry).map { " · " + $0 } ?? "")
         }
         rows += otherWaits.compactMap(waitLine)
+        rows += unavailable
         if ready.count > 4 { rows.append("+\(ready.count - 4) more ready · app desk.read {query:\"\(MyQueue.project)\"}") }
-        var waits: [(String, Int)] = [], notes: [String] = []
+        // Each waiting step by its name, so what she is shown she can finish or drop.
+        var waits: [String] = [], notes: [String] = []
         for entry in waiting {
+            if entry.step.status == "stopped" {
+                waits.append(pad(entry.name, 10) + " · stopped: " + (entry.step.reason ?? "read its saved state before resuming"))
+                continue
+            }
+            guard let when = MyQueue.when(entry) else {
+                waits.append(pad(entry.name, 10) + " · condition unavailable: " + entry.step.when
+                    + ". Repair the saved condition before continuing this step.")
+                continue
+            }
             if let line = waitLine(entry.item) { rows.append(line); continue }
             if let reason = nonEmpty(entry.item.blockedReason) {
                 var blocked = entry.name + " blocked: " + reason
@@ -200,20 +224,27 @@ extension HerScreen {
                     blocked += " Peer elevation is the person's: Trust > Connected agents > \(name) (\(id)) > Trusted."
                 }
                 notes.append(blocked)
-            } else if let note = noted(entry) { notes.append(entry.name + " " + note) }
-            let word = switch MyQueue.when(entry) {
+            }
+            let word = switch when {
             case .afterCard: "on a card"
             case .userWrites: "for \(person) to write"
+            case .userHere: "for \(person) to be here"
+            case .userAway: "for \(person) to step away"
+            case .news(let words): "for news about " + words
+            case .signal(let name): "on " + name
             case .ownTurn, .quiet: "for my own turn"
-            case .at: "for their time"
+            case .at(let date): ResidentWake.shown(date)
+            case .every: IntentionClock.next(entry.step, after: now).map { "next " + ResidentWake.shown($0) } ?? "with no next time"
             case .nextTurn: "for next turn"
             }
-            if let index = waits.firstIndex(where: { $0.0 == word }) { waits[index].1 += 1 } else { waits.append((word, 1)) }
+            waits.append(pad(entry.name, 10) + (entry.peerBorn ? clip(entry.item.title, 44) + " · open it to read"
+                                                              : "\"" + clip(entry.step.words, 52) + "\"")
+                + (entry.step.source == nil ? "" : " · inferred") + " · waits " + word
+                + (noted(entry).map { " · " + $0 } ?? ""))
         }
-        if !waits.isEmpty {
-            rows.append("\(waits.map(\.1).reduce(0, +)) waiting: " + waits.map { "\($0.1) \($0.0)" }.joined(separator: ", ")
-                + notes.prefix(3).map { " · " + $0 }.joined())
-        }
+        rows += waits.prefix(6)
+        if waits.count > 6 { rows.append("+\(waits.count - 6) more waiting · app desk.read {query:\"\(MyQueue.project)\"}") }
+        rows += notes.prefix(3)
         rows.append("done or dropped: app {action:\"queue.done\" or \"queue.drop\", args:{id:\"desk.N\"}}")
         return rows
     }
@@ -227,7 +258,9 @@ extension HerScreen {
     package static func resume(card: String, decision: String, completed: Bool, dataRoot: URL) async
         -> (text: String, sources: [String], elevated: [String]) {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        guard let state = try? await store.liveState() else { return ("", [], []) }
+        let state: DeskState
+        do { state = try await store.liveState() }
+        catch { return ("Queued follow-up unavailable: \(error.localizedDescription). The card settled, but its queued work could not be read; repair Desk storage before continuing it.", [], []) }
         var lines: [String] = [], sources: [String] = [], elevated: [String] = []
         for entry in MyQueue.entries(state) where entry.step.card == card {
             sources += entry.step.peers
@@ -252,7 +285,7 @@ extension HerScreen {
                     + "\"\(entry.item.title)\" now. It was not run; look at it and decide.")
             } else {
                 lines.append("You queued this step for after this card (\(entry.name) in MY QUEUE): \"\(entry.step.words)\""
-                    + (entry.step.action.map { "\nPlanned call: " + $0 } ?? ""))
+                    + (entry.step.actionText.map { "\nHabit: " + $0 } ?? ""))
                 lines.append("Do it now with your usual tools, then mark it done: "
                     + "app {action:\"queue.done\", args:{id:\"\(entry.name)\"}}.")
             }

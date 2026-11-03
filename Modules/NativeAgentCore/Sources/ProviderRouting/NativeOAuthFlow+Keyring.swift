@@ -133,7 +133,10 @@ extension Keyring {
             throw Refusal(code: "permission_denied", message: "Secret \(name) is granted for \(line.isEmpty ? "nowhere" : line), not \(destination). "
                 + "Ask for it again naming \(destination); the card keeps where it already goes and adds this.")
         }
-        guard let renewal = entry.renewal, renewal.expires <= Date().addingTimeInterval(OAuthGrantOperations.renewalMargin) || rejected == entry.value else {
+        // A grant with no stated expiry (RFC 6749: expires_in omitted) is used until the
+        // provider rejects it; only a known, near expiry or a rejection renews it.
+        guard let renewal = entry.renewal,
+              renewal.expires.map({ $0 <= Date().addingTimeInterval(OAuthGrantOperations.renewalMargin) }) == true || rejected == entry.value else {
             return (entry.value, rejected.map { $0 != entry.value } ?? false, entry.at)
         }
         let read = entry
@@ -142,11 +145,15 @@ extension Keyring {
         var answered: String?
         do {
             let tokens = try await OAuthGrantOperations.postToken(renewal.token, form, basic: renewal.clientAuth == "basic")
-            guard let value = tokens["access_token"] as? String, !value.isEmpty else { throw Refusal(code: "not_connected", message: "no access token came back") }
+            let answer = try OAuthGrantOperations.validateTokenResponse(tokens, requiringRefreshToken: false)
             answered = account(tokens, hiding: [renewal.refreshToken, renewal.clientSecret])
-            entry.value = value
-            entry.renewal = Self.renewal(tokens, token: renewal.token, clientID: renewal.clientID, clientSecret: renewal.clientSecret,
-                                         clientAuth: renewal.clientAuth, refreshToken: renewal.refreshToken)
+            entry.value = answer.accessToken
+            var updatedRenewal = renewal
+            if let refresh = answer.refreshToken { updatedRenewal.refreshToken = refresh }
+            updatedRenewal.expires = answer.expiresIn.map { Date().addingTimeInterval($0) }
+            entry.renewal = updatedRenewal
+        } catch let failure as ProviderFailure.Diagnostic {
+            throw failure
         } catch {
             throw Refusal(code: "not_connected", message: "Secret \(name)'s sign-in could not be renewed (\(exchangeFailure(error))). "
                 + "Ask for it again with replace:true, and the person signs in once more.")
@@ -179,14 +186,14 @@ extension Keyring {
             .filter { !$0.isEmpty }.reduce(subject) { $0.replacingOccurrences(of: $1, with: "[secret]") }
     }
 
-    /// How a token answer renews: its refresh token (or the one it renewed
-    /// with) until its expiry; nil when the service gave no way to renew.
-    static func renewal(_ tokens: [String: Any], token: String, clientID: String, clientSecret: String?, clientAuth: String?,
-                        refreshToken: String?) -> Renewal? {
-        guard let refresh = tokens["refresh_token"] as? String ?? refreshToken else { return nil }
-        let seconds = OAuthGrantOperations.seconds(tokens["expires_in"])
+    /// Only admitted provider evidence constructs renewal authority. A grant
+    /// without a refresh token is nonrenewable. Refresh responses may keep the
+    /// current renewal's refresh token by omitting a replacement (RFC 6749 §6).
+    static func renewal(_ answer: OAuthGrantOperations.TokenResponse, token: String, clientID: String, clientSecret: String?,
+                        clientAuth: String?) -> Renewal? {
+        guard let refresh = answer.refreshToken else { return nil }
         return Renewal(token: token, clientID: clientID, clientSecret: clientSecret, clientAuth: clientAuth, refreshToken: refresh,
-                       expires: seconds.map { Date().addingTimeInterval($0) } ?? .distantFuture)
+                       expires: answer.expiresIn.map { Date().addingTimeInterval($0) })
     }
 }
 
@@ -210,13 +217,11 @@ extension NativeOAuthFlow {
             return "oauth_client_secret_missing: This sign-in requires HTTP Basic client authentication. Enter the service-issued client secret on this sign-in card."
         }
         func keep(_ tokens: [String: Any]) async -> String? {
-            guard let value = tokens["access_token"] as? String, !value.isEmpty else {
-                return "oauth_token_missing: The service returned no access token; sign-in is incomplete. Check sign_in.token in app card.request before starting a new sign-in."
-            }
             do {
-                try await Keyring.grant(name, value: value, hosts: ask.hosts, programs: ask.programs,
-                                        renewal: Keyring.renewal(tokens, token: signIn.token, clientID: signIn.clientID, clientSecret: clientSecret,
-                                                                 clientAuth: signIn.clientAuth, refreshToken: nil),
+                let answer = try OAuthGrantOperations.validateTokenResponse(tokens, requiringRefreshToken: false)
+                try await Keyring.grant(name, value: answer.accessToken, hosts: ask.hosts, programs: ask.programs,
+                                        renewal: Keyring.renewal(answer, token: signIn.token, clientID: signIn.clientID, clientSecret: clientSecret,
+                                                                 clientAuth: signIn.clientAuth),
                                         account: Keyring.account(tokens, hiding: [clientSecret]), generation: generation, open: open)
                 return nil
             } catch { return error.localizedDescription }
@@ -237,7 +242,7 @@ extension NativeOAuthFlow {
         let server: NativeOAuthLoopbackCallbackServer
         do {
             server = try NativeOAuthLoopbackCallbackServer(preferredPort: port, path: given.map(\.path).flatMap { $0.isEmpty ? nil : $0 } ?? "/callback",
-                                                           displayName: name, allowsPortFallback: false)
+                                                           displayName: name)
         } catch {
             return "oauth_listener_failed: Could not open the sign-in listener on port \(port): \(error.localizedDescription) Correct the reported socket problem or sign_in.redirect in app card.request before starting a new sign-in."
         }
@@ -272,6 +277,7 @@ extension NativeOAuthFlow {
         form["client_secret"] = clientSecret
         let tokens: [String: Any]
         do { tokens = try await OAuthGrantOperations.postToken(signIn.token, form, basic: signIn.clientAuth == "basic") }
+        catch let failure as ProviderFailure.Diagnostic { return failure.localizedDescription }
         catch { return "oauth_token_exchange_failed: Browser approval finished, but sign-in is incomplete (\(Keyring.exchangeFailure(error))). Inspect sign_in.token and client authentication in app card.request before starting a new sign-in." }
         return await keep(tokens)
     }

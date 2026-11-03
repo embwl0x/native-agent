@@ -1,4 +1,5 @@
 import AuthoredCapabilities
+import Experiences
 import ActivityWatch
 import Foundation
 import Context
@@ -8,6 +9,7 @@ import BackgroundLoops
 import BackgroundWork
 import Browser
 import ChatTurnRuntime
+import ChatTurnContracts
 import ChatToolParsing
 import ChatToolRuntime
 import ChatSessionWork
@@ -48,7 +50,7 @@ import NativeAgentShared
 import Senses
 import ToolExecution
 import Studio
-// Blueprint: | `EngineLaunch.swift` | `NativeAgentEngine`: canonical memory attachment and launch recovery; discovery starts independently at launch, its install observation once part wakes are registered; trusted bundled seeds installed before ingress; current seeds follow changed shipped bodies, while edited/non-seed content and other occupied slots are preserved, each failure retained by AbilityFilesCheck and reported through Doctor to the person while launch continues; an installed seed the readable bundle no longer ships, still its proof's candidate and never re-enabled, is switched off through its registry (restorable); root-bound derived-state invalidation; NativeAgentEngine launch/recovery ordering, procedure-retention root admission; one retained quit settlement joins producers and tracked turns before the final snapshot and dependency retirement, shared by both quit bounds, background loop manifest; resident composition lives in EngineChatSurfaces, EngineDreams and EngineScheduledWork; native effects arrive through EngineBackgroundWorkHost; MCP servers a data root kept are raised to their once by name as theirs to grow (`raiseKeptMCPServers`), their file untouched and, since a launch line can carry a key, fenced from their file readers with its backup copies; `tellRetiredConnectors` removes retired service rows and tells their once which were set up; old credentials stay untouched and unread; the engine exposes the existing activity controller through its body host; termination stops EnginePractice and waits for its settlement |
+// Blueprint: | `EngineLaunch.swift` | `NativeAgentEngine`: canonical memory attachment and launch recovery; discovery starts independently at launch, its install observation once part wakes are registered; trusted bundled seeds installed before ingress; the seed owner compares complete authored/sealed contracts, while edited/non-seed content and other occupied slots are preserved, each failure retained by AbilityFilesCheck and reported through Doctor to the person while launch continues; an installed seed the readable bundle no longer ships, still its proof's candidate and never re-enabled, is switched off through its registry (restorable); root-bound derived-state invalidation; NativeAgentEngine launch/recovery ordering, procedure-retention root admission; enabled scheduled work migrates once into intentions before resident loops start, with migration failure reported through Doctor and loops held; loop launch and continuation observers are independent of senses registration; sense reads and file subscriptions await readiness at their own owners; one retained quit settlement joins producers and tracked turns before the final snapshot and dependency retirement, shared by both quit bounds, background loop manifest; resident composition lives in EngineChatSurfaces, EngineDreams and EngineScheduledWork; native effects arrive through EngineBackgroundWorkHost; retired credential-bearing MCP files remain untouched and privacy-fenced with their backup copies; completed retired-connector notices have been removed; retained old credentials stay untouched and unread; the engine exposes the existing activity controller through its body host; launch starts the front-app perception after installing the crossing; termination closes and joins its delayed/admitted work |
 
 /// Native effects used by Core's background composition. Scheduling, admission and reconciliation remain with the existing engine and background owners.
 public protocol EngineBackgroundWorkHost: Sendable {
@@ -90,6 +92,7 @@ extension NativeAgentEngine {
     @MainActor private static var runtimeObservationsInstalled = false
     @MainActor private static var firstAnchorTask: Task<Void, Never>?
     @MainActor private static var firstAnchorObserver: NSObjectProtocol?
+    @MainActor private static var frontSenseDrain: Task<Void, Never>?
 
     @MainActor
     private static func retainLaunchWork(_ operation: @escaping @Sendable () async -> Void) {
@@ -106,6 +109,7 @@ extension NativeAgentEngine {
     @MainActor
     public static func stopLaunchWork() {
         launchStopped = true // Close admission synchronously, before any drain suspends.
+        frontSenseDrain = EngineFrontSense.shared.stop()
         for task in launchTasks.values { task.cancel() }
         firstAnchorTask?.cancel()
         if let firstAnchorObserver { NotificationCenter.default.removeObserver(firstAnchorObserver) }
@@ -158,7 +162,8 @@ extension NativeAgentEngine {
                     }
                 }
                 guard let session, !Task.isCancelled, !launchStopped else { return }
-                await InlineInteractionResolver.raise(card, sessionID: session, resumable: false, dataRoot: dataRoot)
+                await InlineInteractionResolver.raise(card, sessionID: session, resumable: false,
+                    origin: .native("launch:input-monitoring"), dataRoot: dataRoot)
             }
         }
     }
@@ -172,8 +177,7 @@ extension NativeAgentEngine {
         dataRoot: URL, currentVersion: String, resources: URL?,
         publicReleaseUnavailable: @MainActor @Sendable (String) -> Void,
         backupRestoreUnavailable: @MainActor @Sendable (String) -> Void,
-        confirmMissingRoots: @MainActor @Sendable ([String]) -> Bool,
-        macRecoveryUnavailable: @MainActor @Sendable () -> Void
+        confirmMissingRoots: @MainActor @Sendable ([String]) -> Bool
     ) async -> Bool {
         if case .failed(let error) = await Task.detached(priority: .userInitiated, operation: {
             InstallPaths.preparePublicReleaseDataRootIfNeeded()
@@ -198,19 +202,16 @@ extension NativeAgentEngine {
             let recovered = try await MacControlOperationStore(dataRoot: dataRoot).recoverInterruptedOperations()
             ModuleLog.app("[mac-control] startup recovered interrupted operations: %d", recovered)
         } catch {
-            ModuleLog.app("[mac-control] refusing startup after operation recovery failure: %@", error.localizedDescription)
-            macRecoveryUnavailable()
-            return false
+            ModuleLog.app("[mac-control] Mac actions unavailable after recovery failure; app will start: %@", error.localizedDescription)
         }
-        // Recovery precedes ingress; unreadable browser state is reported by its owner without blocking launch.
-        var strandedBrowserOperations = 0
-        var browserRecoveryNote: String?
+        // Recovery precedes ingress. Each owner retains its failure and refuses
+        // only its own new effects; chat and unrelated surfaces can start.
+        var strandedBrowserOperations: Int?
         do {
             strandedBrowserOperations = try await SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
                 .executeBrowserOperation(.recoverStrandedRunning).recoveredCount
         } catch {
-            ModuleLog.app("[browser] operation recovery failed; the browser owner reports it on use: %@", error.localizedDescription)
-            browserRecoveryNote = "recovery failed: " + error.localizedDescription
+            ModuleLog.app("[browser] Browser actions unavailable after recovery failure; app will start: %@", error.localizedDescription)
         }
         await withTaskGroup(of: Void.self) { group in
             group.addTask(priority: .utility) { if let resources { await installBundledParts(dataRoot: dataRoot, resources: resources) } }
@@ -225,14 +226,17 @@ extension NativeAgentEngine {
             }
         }
         _ = await Task.detached(priority: .userInitiated) { NativeAgentEngine.live }.value
-        OrganPulse.record("launch.browser_stranded", found: strandedBrowserOperations,
-            note: browserRecoveryNote ?? "\(strandedBrowserOperations) closed as outcome unknown before ingress")
+        if let strandedBrowserOperations {
+            OrganPulse.record("launch.browser_stranded", found: strandedBrowserOperations,
+                note: "\(strandedBrowserOperations) closed as outcome unknown before ingress")
+        }
         return true
     }
 
     private static func installBundledParts(dataRoot: URL, resources: URL) async {
         let abilities = AbilityStore(dataRoot: dataRoot)
         var failures: [String] = []
+        var currentSeeds = 0, preparedAdmissions = 0
         do {
             let bundled = AbilityStore(dataRoot: resources)
             let seeds = try AbilityStore.seedCatalog(resources: resources).sorted { $0.path < $1.path }.map { url in (url, Result { try AbilityStore.decode(url) }) }
@@ -241,9 +245,8 @@ extension NativeAgentEngine {
                 do { try fadeRetiredSeeds(abilities, shipped: Set(shipped), dataRoot: dataRoot) }
                 catch { failures.append("retired seeds: \(error.localizedDescription)") }
             }
-            // Her tools and skills take the one form of a part first (idempotent), with the owner's trust in agents bound, as their admissions read it.
+            // Bind the owner's peer trust before admitting the bundled seeds.
             PeerTrust.install(dataRoot: dataRoot)
-            do { try await Parts(root: dataRoot).migrate() } catch { failures.append("parts: \(error.localizedDescription)") }
             let host = AppToolExecutor.authoredProgramHost(dataRoot: dataRoot) { _, _ in nil }
             await OwnedProgramInvocation.$host.withValue(host) {
                 for (url, decoded) in seeds {
@@ -252,12 +255,31 @@ extension NativeAgentEngine {
                         guard try bundled.path(id: seed.id, pathExtension: seed.pathExtension) == url else {
                             throw CocoaError(.fileReadCorruptFile)
                         }
-                        // Already there: only an untouched seed whose bundle changed does any work.
+                        // Her own version stays hers. The seed owner compares the full
+                        // unsigned contract before admission and rechecks at installation.
                         if let current = try abilities.read(id: seed.id, slot: .current) {
-                            guard AbilityStore.isSeed(current), current.body != seed.body else { continue }
+                            guard AbilityStore.isSeed(current) else { continue }
                         } else if try abilities.contains(id: seed.id) { continue }
-                        let kept = seed.kind == .part ? try await Parts(root: dataRoot).bundledSeed(seed) : seed
-                        try abilities.installSeed(kept)
+                        let kept: AbilityStore.File
+                        if seed.kind == .part {
+                            guard let admitted = try await Parts(root: dataRoot).bundledSeed(seed) else {
+                                currentSeeds += 1
+                                continue
+                            }
+                            preparedAdmissions += 1
+                            kept = admitted
+                        } else { kept = seed }
+                        try abilities.installSeed(kept) { current in
+                            guard let digest = current.metadata["candidate"]?.objectValue?["program"]?.objectValue?["version"]?.stringValue else {
+                                throw ToolFailureError("Installed seed \(current.id) has no sealed candidate identity. Preserve its bytes and repair its authored source before upgrading.", effects: .none,
+                                    code: "seed_identity_missing", instruction: "Read this ability and repair its missing sealed candidate through its authoring owner.", recovery: .inspect)
+                            }
+                            guard let key = try SwiftNativeManifestSigner(dataRoot: dataRoot).existingSigningKey() else {
+                                throw ManifestSigningError.keyUnavailable("Installed seed authority is missing")
+                            }
+                            let programs = OwnedProgramStore(root: abilities.root)
+                            _ = try programs.proof(try programs.load(id: current.id, digest: digest), key: key)
+                        }
                     } catch {
                         failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
                     }
@@ -266,7 +288,8 @@ extension NativeAgentEngine {
         } catch {
             failures.append(error.localizedDescription)
         }
-        AbilityFilesCheck.recordSeedFailures(failures, root: dataRoot)
+        AbilityFilesCheck.recordSeedInstallation(failures: failures, current: currentSeeds,
+            prepared: preparedAdmissions, root: dataRoot)
         // Doctor's reading publishes on its own; launch never waits for it.
         if !failures.isEmpty {
             Task.detached(priority: .utility) {
@@ -305,58 +328,20 @@ extension NativeAgentEngine {
     }
 
     public static func installActionLabelsAtLaunch() {
-        let labels = AppActions.all.flatMap { action in
+        let actions: [AppAction]
+        do { actions = try AppActions.seedActions }
+        catch {
+            let root = PersistenceCore.defaultDataRoot()
+            RepairOwed.owe(root, id: "action-labels:" + UUID().uuidString.lowercased(), kind: .run,
+                operation: "actions.labels", owner: "Action declarations",
+                words: "Action labels were not installed: \(error.localizedDescription). Repair the declaration and relaunch.")
+            return
+        }
+        let labels = actions.flatMap { action in
             [(action.id, action.label)] + (action.isFold && action.label != action.tool ? [(action.tool, action.label)] : [])
         }
         ToolActivityPresentation.installActionLabels(
             Dictionary(labels, uniquingKeysWith: { first, _ in first }))
-    }
-
-    // Kept server names are raised once for authored adoption; their credential-bearing files remain untouched.
-    static func raiseKeptMCPServers(dataRoot: URL) {
-        let folder = dataRoot.appendingPathComponent("mcp", isDirectory: true)
-        let registry = folder.appendingPathComponent("servers.json"), told = folder.appendingPathComponent(".told")
-        guard !FileManager.default.fileExists(atPath: told.path), let bytes = try? Data(contentsOf: registry),
-              case .array(let rows)? = try? JSONValue.parse(bytes) else { return }
-        // Names only: a launch line or endpoint can carry a credential, and the file has them.
-        let servers = rows.compactMap { row -> String? in
-            guard case .object(let fields) = row, case .string(let id)? = fields["id"] else { return nil }
-            if case .string(let name)? = fields["name"], !name.isEmpty { return name }
-            return id
-        }
-        guard !servers.isEmpty else { return }
-        let line = "MCP servers this Mac kept are yours to grow as abilities now; NativeAgent no longer runs them: "
-            + servers.joined(separator: ", ") + ". Grow each from its own documentation, and ask for any key it needs on a card."
-        guard ResidentWake.shared.request(dataRoot: dataRoot, reason: "what NativeAgent handed you",
-                                          items: [.init(id: "mcp.kept", line: line, key: "mcp.kept", home: true)]) else { return }
-        FileManager.default.createFile(atPath: told.path, contents: Data())
-    }
-
-    // Retired service setup is reported once per retained marker; credentials remain untouched and unread.
-    static func tellRetiredConnectors(dataRoot: URL) async {
-        let exists = { (path: String) in FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent(path).path) }
-        let folds: [(marker: String, id: String, services: [(name: String, files: [String])], rows: [String])] = [
-            ("connectors/.retired-told", "connectors.retired", [
-                ("Notion", ["connectors/notion/auth.json"]), ("Gmail", ["connectors/gmail/auth.json"]),
-                ("Google Calendar", ["connectors/calendar/auth.json"]), ("X", ["connectors/x/auth.json", "oauth_tokens/x.json", "secrets/x.json"]),
-                ("AgentMail", ["secrets/agentmail.json"]), ("TradingView", ["secrets/tradingview.json"]),
-            ], ["notion", "gmail", "email", "gcal", "x", "agentmail"]),
-            ("connectors/.retired-github-told", "connectors.retired.github", [("GitHub", ["connectors/github/auth.json", "oauth_tokens/github.json"])], ["github"]),
-        ]
-        let pending = folds.filter { !exists($0.marker) }
-        guard let first = pending.first else { return }
-        let kept = pending.flatMap(\.services).filter { $0.files.contains(where: exists) }.map(\.name)
-        if !kept.isEmpty {
-            let line = "NativeAgent no longer runs " + kept.joined(separator: ", ")
-                + ": each is yours to grow as an ability when you are asked, with its key asked for once on a card. Their old files are untouched."
-            guard ResidentWake.shared.request(dataRoot: dataRoot, reason: "what NativeAgent handed you",
-                                              items: [.init(id: first.id, line: line, key: first.id, home: true)]) else { return }
-        }
-        do {
-            try await ConnectorOAuthRegistry.removeConnectorRegistryEntries(root: dataRoot, ids: Set(pending.flatMap(\.rows)))
-        } catch { return nativeLog("[connectors] retired rows stay until next launch: %@", error.localizedDescription) }
-        try? FileManager.default.createDirectory(at: dataRoot.appendingPathComponent("connectors"), withIntermediateDirectories: true)
-        for fold in pending { FileManager.default.createFile(atPath: dataRoot.appendingPathComponent(fold.marker).path, contents: Data()) }
     }
 
     @MainActor
@@ -382,7 +367,6 @@ extension NativeAgentEngine {
         dataRoot: URL, embeddingDescriptorURL: URL?,
         storageUnavailable: @escaping @MainActor @Sendable () -> Void,
         registerBackgroundTasks: @MainActor () -> Void,
-        waitForSenses: @escaping @Sendable () async throws -> Void,
         resumeMacTurn: @escaping @Sendable (TurnCheckpoint, TurnContinuationRuntime) async throws -> Void,
         approvals: ApprovalExecution
     ) {
@@ -399,45 +383,56 @@ extension NativeAgentEngine {
         WorkshopPlannerCatalog.configure(makeWorkshopPlannerConnectorActionsProvider())
         // Each bring-up remains independent so one blocked store cannot hold the other resident owners or the native launch callback.
         retainLaunchWork {
-            let descriptor = embeddingDescriptorURL.flatMap { try? Data(contentsOf: $0) }
-                .flatMap { try? EmbeddingModelDownload.Descriptor.parse($0) }
-            if descriptor?.distribution != "separate-download" {
+            do {
+                _ = try EmbeddingModelDownload.configuredDescriptor(at: embeddingDescriptorURL)
                 await SwiftNativeMemoryV2.shared.reconcileEmbeddingEpochAtLaunch()
+            } catch {
+                let detail = "Memory model bring-up unavailable: \(error.localizedDescription)"
+                ModuleLog.app("[embedding-download] %@", detail)
+                await DoctorReadout.recordReadings([CheckResult(source: "embedding-download.json",
+                    id: "launch.embeddings", title: "Memory model bring-up", status: "fail", detail: detail)], dataRoot: dataRoot)
             }
         }
         SensesHub.shared.installCrossing(NativeAgentEngine.liveCognition)
+        EngineFrontSense.shared.start(dataRoot: dataRoot)
         retainLaunchWork { await NativeAgentEngine.liveCognition.bootstrap() }
         // Callbacks a peer is owed from before the relaunch go out now, not when the task is next read.
         retainLaunchWork { await NativeAgentEngine.live.agents.tasks.redeliverOwedCallbacks() }
         retainLaunchWork { await reconcileTranscriptsAtLaunch(dataRoot: dataRoot) }
         retainLaunchWork { _ = await ChatHistoryIndex.shared(dataRoot: dataRoot).absorbAll() }
-        retainLaunchWork { raiseKeptMCPServers(dataRoot: dataRoot) }
         // The person's login PATH, read once here so no caller waits on it later.
         retainLaunchWork { _ = AgentHostCommandLines.loginEnvironment }
         retainLaunchWork {
-            do { try AgentLaneHandles.migrate(dataRoot: dataRoot) } catch {
-                Logger(subsystem: "com.nativeagent.app", category: "agents")
-                    .error("lane handles not migrated: \(String(describing: error), privacy: .public)")
-            }
             guard !Task.isCancelled else { return }
             _ = await AgentDiscoverySession.shared.candidates(refresh: true, probe: false, dataRoot: dataRoot)
         }
         retainLaunchWork {
+            do {
+                try await migrateScheduledIntentionsAtLaunch(dataRoot: dataRoot)
+            } catch is CancellationError {
+                return
+            } catch {
+                let detail = "Scheduled work could not become intentions; resident loops did not start: " + error.localizedDescription
+                ModuleLog.app("[intentions] %@", detail)
+                await DoctorReadout.recordReadings([CheckResult(source: "Launch intention migration",
+                    id: "launch.intentions", title: "Scheduled intentions", status: "fail", detail: detail)], dataRoot: dataRoot)
+                return
+            }
+            guard !Task.isCancelled else { return }
             await ProcedureArtifactStore.startRetention(dataRoot: dataRoot)
             await startBackgroundWorkAtLaunch(
                 dataRoot: dataRoot,
                 makeLoops: {
                     _ = NativeAgentEngine.live
-                    do { try await waitForSenses() }
-                    catch { ModuleLog.app("[senses] Launch registration unavailable: %@", error.localizedDescription) }
-                    guard !Task.isCancelled else { return [] }
-                    // Before the loops start: their sources signal parts, and senses watch files.
+                    guard !Task.isCancelled else { return nil }
+                    // Register signals before loop sources fire. Individual sense reads
+                    // and file subscriptions own readiness; neither holds loop launch.
                     await EnginePartWake.shared.start(dataRoot: dataRoot)
-                    guard !Task.isCancelled else { return [] }
+                    guard !Task.isCancelled else { return nil }
                     // The delegation runner starts and stops contact observation.
                     let loops = assembleAllLoops()
                     await installBotProviderCheck()
-                    guard !Task.isCancelled else { return [] }
+                    guard !Task.isCancelled else { return nil }
                     return loops
                 },
                 resume: { checkpoint in
@@ -453,42 +448,25 @@ extension NativeAgentEngine {
                 makeLLMClient: { makeSharedLLMClient() })
         }
         retainLaunchWork {
-            let records = await ApprovalExecution.resolvedApprovalsForReconciliation(dataRoot: dataRoot)
-            guard !Task.isCancelled else { return }
-            let executions = await approvals.reconcileUnappliedApprovalExecutions(dataRoot: dataRoot, records: records)
-            guard !Task.isCancelled else { return }
-            OrganPulse.record("launch.approval_executions", found: executions, note: "\(executions) re-run")
+            do {
+                let records = try await ApprovalExecution.resolvedApprovalsForReconciliation(dataRoot: dataRoot)
+                guard !Task.isCancelled else { return }
+                let executions = try await approvals.reconcileUnappliedApprovalExecutions(dataRoot: dataRoot, records: records)
+                guard !Task.isCancelled else { return }
+                await RepairOwed.settle(dataRoot, operation: "approval.reconcile",
+                    evidence: .init(source: "workflows/approvals/requests.json", id: "checked reconciliation scan")).value
+                OrganPulse.record("launch.approval_executions", found: executions, note: "\(executions) re-run")
+            } catch {
+                await RepairOwed.owe(dataRoot, id: "approval.reconcile", kind: .run,
+                    operation: "approval.reconcile", owner: "Approval reconciliation",
+                    words: error.localizedDescription,
+                    lever: "Repair the approval store or reconciliation cursor, then restart to reconcile the retained decisions.").value
+            }
             await retainLaunchWork {
-                await MemoryRepairOneShot.archiveInventoryRows(dataRoot: dataRoot)
-                guard !Task.isCancelled else { return }
-                await LegacyCorrectionScopeMigration.runIfNeeded(dataRoot: dataRoot)
-                guard !Task.isCancelled else { return }
                 await MemoryApprovalTransactions.stageKindBackfillIfNeeded(dataRoot: dataRoot,
                     makeLLMClient: { makeSharedLLMClient() })
             }
             await retainLaunchWork {
-                // Revalidation precedes activation; unverified procedures stay off.
-                let keptOff = await WorkshopProcedureLegacyRevalidation.runIfNeeded(dataRoot: dataRoot)
-                guard !Task.isCancelled else { return }
-                OrganPulse.record("launch.procedure_revalidation", found: keptOff.count, note: "\(keptOff.count) kept off")
-                for line in keptOff {
-                    guard !Task.isCancelled else { return }
-                    let cardID = "procedure-legacy-revalidation-\(CausalTransitionEvidence.opaqueIdentity(line).prefix(16))"
-                    _ = try? await LiveNotificationInbox(
-                        path: LiveNotificationInbox.livePath(dataRoot: dataRoot)
-                    ).appendUnique(.object([
-                        "id": .string(cardID),
-                        "created_at": .string(NativeTimestampFormat.fractionalZulu(Date())),
-                        "source": .string("workshop"),
-                        "severity": .string("info"),
-                        "title": .string("A saved procedure stays off"),
-                        "summary": .string(line),
-                        "actions": .array([.object(["id": .string("dismiss"), "label": .string("Dismiss"),
-                                                    "description": .string("Dismiss this card")])]),
-                        "status": .string("unread"),
-                    ]), id: cardID)
-                }
-                guard !Task.isCancelled else { return }
                 let activationCards = await WorkshopProcedureActivation.reconcileLocalFileCopyIfQualified()
                 guard !Task.isCancelled else { return }
                 OrganPulse.record("launch.procedure_activation", found: activationCards, note: "\(activationCards) review staged")
@@ -531,7 +509,6 @@ extension NativeAgentEngine {
         // Idempotently remove superseded statements' tombstones so their corrections remain admissible.
         await SwiftNativeMemoryV2.shared.repairSupersededTombstones()
         // Admit the trusted backlog once under the current keep rules.
-        await AdaptiveMemoryPromoter.keepTrustedBacklogOnce(memory: SwiftNativeMemoryV2.shared, dataRoot: dataRoot)
         if let generator = await SwiftNativeMemoryV2.shared.bindUserMDGenerator(
             dataRoot: dataRoot,
             personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
@@ -567,10 +544,9 @@ extension NativeAgentEngine {
     }
 
     public static func reconcileConnectorCredentialsAtLaunch(dataRoot: URL) async {
-        // Canonical metadata and verified Keychain migration precede ingress.
+        // Current credential save recovery and checked metadata precede ingress.
         do { try SlackCredentials.withSnapshot(dataRoot: dataRoot) {} }
-        catch { nativeLog("[slack-credential] Migration failed: %@", error.localizedDescription) }
-        Task.detached(priority: .utility) { await tellRetiredConnectors(dataRoot: dataRoot) }
+        catch { nativeLog("[slack-credential] Saved credential state unavailable: %@", error.localizedDescription) }
     }
 
     public static func installDerivedStateInvalidationAtLaunch(
@@ -582,13 +558,12 @@ extension NativeAgentEngine {
 
     public static func startBackgroundWorkAtLaunch(
         dataRoot: URL,
-        makeLoops: @Sendable () async -> [LoopRegistration],
+        makeLoops: @Sendable () async -> [LoopRegistration]?,
         resume: @escaping @Sendable (TurnCheckpoint) async throws -> Void
     ) async {
         guard !Task.isCancelled else { return }
         // Reply journal owners start before the checkpoint sweep hands resumed answers to them. The one start path: failure notices wired, and the startup Doctor pass that gives a relaunch its report.
-        let loops = await makeLoops()
-        guard !Task.isCancelled else { return }
+        guard let loops = await makeLoops(), !Task.isCancelled else { return }
         await startBackgroundLoops(loops: loops)
         guard !Task.isCancelled else { return }
         await MainActor.run {
@@ -606,8 +581,8 @@ extension NativeAgentEngine {
         await AdaptiveMemoryPromoter.shared.configure(
             memory: SwiftNativeMemoryV2.shared,
             memoryManager: MindMemoryJudgment(makeLLMClient: makeLLMClient),
-            adaptivePromotionEnabled: { MemoryPolicyGate.adaptivePromotionEnabled() },
-            personName: { NativeCognitionRuntime.resolveUserName(dataRoot: dataRoot) }
+            adaptivePromotionEnabled: { try MemoryPolicyGate.adaptivePromotionEnabled() },
+            personName: { try NativeCognitionRuntime.resolveUserName(dataRoot: dataRoot) }
         )
     }
 
@@ -728,6 +703,7 @@ extension NativeAgentEngine {
         stopLaunchWork()
         let launch = Array(launchTasks.values)
         let anchor = firstAnchorTask
+        let frontSense = frontSenseDrain
         let otherDoors = OtherDoorTurns.shared.stop()
         let make = NativeAgentEngine.live.make.shutdown()
         let activity = NativeAgentEngine.live.activityWatch.makeTerminationDrain()
@@ -737,17 +713,17 @@ extension NativeAgentEngine {
         NativeAgentNotifications.shutdown()
         return Task.detached {
             async let wakes: Void = EnginePartWake.shared.stop()
-            async let practice: Void = EnginePractice.shared.stop()
             async let loops: Void = BackgroundLoopLifetimes.shared.shutdown()
             async let aging: Void = ChatSessionAgingConsolidation.stop()
             for task in launch { await task.value }
             await appLaunch?.value
             await anchor?.value
+            await frontSense?.value
             for observer in appObservers { await observer.value }
             await otherDoors.value
             await make.value
             await activity.value
-            _ = await (wakes, practice, loops, aging)
+            _ = await (wakes, loops, aging)
         }
     }
 
@@ -780,6 +756,9 @@ extension NativeAgentEngine {
             async let projections: Void = SwiftNativeMemoryV2.shared.shutdownProjections()
             async let notifications: Void = attention.shutdown()
             _ = await (chrome, senses, programs, acp, context, artifacts, embeddings, promoter, projections, notifications)
+            // Producers, admitted turns and resident senses/programs have all
+            // settled; none can still need the app inventory or its stream.
+            await MacAppIndex.shared.shutdown()
             group.leave()
         }
         NativeAgentEngine.live.trace.stop()

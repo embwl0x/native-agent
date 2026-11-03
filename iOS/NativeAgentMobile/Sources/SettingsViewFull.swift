@@ -1,10 +1,14 @@
 // Settings owns Telegram, Providers and Mac settings; More links to Personality, Trust and Connectors.
 import SwiftUI
-import Combine
 import NativeAgentShared
-// Blueprint: | `SettingsViewFull.swift` | Device settings, shared SettingsStore refresh/loading and snapshot availability presentation |
+// Blueprint: | `SettingsViewFull.swift` | Device settings with immediate appearance control and release-only version; shared SettingsStore refresh/loading and snapshot availability presentation; push diagnostics live in Status |
 
 enum SettingsMacHealthPresentation {
+    static func versionText(_ version: String) -> String {
+        // release.sh stamps internal builds as <version>-dev.<sha8>[.dirty].
+        version.components(separatedBy: "-dev.").first ?? version
+    }
+
     static func uptimeText(_ seconds: Double) -> String {
         let formatted = UserDisplayFormatters.humanizeDuration(seconds)
         return formatted.isEmpty ? "Unknown" : formatted
@@ -36,7 +40,6 @@ struct SettingsViewFull: View {
     @State private var showRePairSheet = false
     @State private var repairResult: String?
     @State private var isForceRefreshing = false
-    @State private var pushReceipts = PushReceiptLedger.load()
     @AppStorage(NativeAgentAppearance.storageKey) private var appearanceRawValue = NativeAgentAppearance.system.rawValue
 
     var body: some View {
@@ -58,7 +61,7 @@ struct SettingsViewFull: View {
                             Text(appearance.title).tag(appearance.rawValue)
                         }
                     }
-                    .pickerStyle(.menu)
+                    .pickerStyle(.segmented)
                     .labelsHidden()
                     .hazeTinted()
                 }
@@ -89,7 +92,7 @@ struct SettingsViewFull: View {
                     AliveDivider()
                     AliveValueRow(label: "App", value: health.app)
                     AliveDivider()
-                    AliveValueRow(label: "Version", value: health.version)
+                    AliveValueRow(label: "Version", value: SettingsMacHealthPresentation.versionText(health.version))
                     AliveDivider()
                     AliveValueRow(label: "Uptime", value: SettingsMacHealthPresentation.uptimeText(health.uptimeSeconds))
                     if !store.availableFields.contains(.health) {
@@ -114,30 +117,13 @@ struct SettingsViewFull: View {
             }
             MobileAppSettingsSections()
             PhonePlacesSettings()
+            PhoneSensesSettings()
             AliveSection("Live Activities") {
                 Toggle("Show task names on the Lock Screen", isOn: Binding(
                     get: { turnActivity.isEnabled }, set: { turnActivity.setEnabled($0) }))
                     .aliveRow()
                 AliveNote("Includes work started on the Mac, Telegram, helpers and agent bridges. Task names may be visible while this iPhone is locked. Without an APNs key on the Mac, activities start when this app is open or next wakes; updates can be delayed while it is asleep.")
                 if let error = turnActivity.errorMessage { AliveNote(error) }
-            }
-
-            AliveSection("Recent pushes") {
-                if pushReceipts.isEmpty {
-                    AliveNote("No pushes received yet.")
-                } else {
-                    ForEach(Array(pushReceipts.prefix(8).enumerated()), id: \.element.id) { index, entry in
-                        if index > 0 { AliveDivider() }
-                        MobileAdaptiveRow {
-                            Text(entry.source).foregroundStyle(AlivePalette.text)
-                            Spacer()
-                            Text(entry.receivedAt, style: .relative)
-                                .foregroundStyle(AlivePalette.secondary)
-                        }
-                        .font(.callout)
-                        .aliveRow()
-                    }
-                }
             }
 
             AliveSection("About") {
@@ -147,29 +133,21 @@ struct SettingsViewFull: View {
                 AliveDivider()
                 AliveValueRow(
                     label: "Version",
-                    value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
-                        as? String ?? "—"
+                    value: SettingsMacHealthPresentation.versionText(
+                        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—")
                 )
             }
         }
         .macSyncErrorBanner()
         .task {
-            pushReceipts = PushReceiptLedger.load()
             async let macSettings: Void = iCloudSyncEngine.shared.refreshAppSettings()
             await store.refresh()
             await macSettings
         }
         .refreshable {
-            pushReceipts = PushReceiptLedger.load()
             async let macSettings: Void = iCloudSyncEngine.shared.refreshAppSettings()
             await store.refresh()
             await macSettings
-        }
-        .onReceive(
-            NotificationCenter.default.publisher(for: PushReceiptLedger.didChange)
-                .receive(on: RunLoop.main)
-        ) { _ in
-            pushReceipts = PushReceiptLedger.load()
         }
         .fullScreenCover(isPresented: $showRePairSheet) {
             PairingView(onSkip: {
@@ -243,7 +221,7 @@ struct SettingsViewFull: View {
                         isForceRefreshing = true
                         defer { isForceRefreshing = false }
 
-                        let pairingMaterialChanged = await pairingStore.refreshFromKVS()
+                        let pairingMaterialChanged = await pairingStore.refreshFromCloudKit()
                         let settingsOutcome = await store.refresh()
                         repairResult = SettingsICloudRefreshPresentation.statusText(
                             pairingMaterialChanged: pairingMaterialChanged,

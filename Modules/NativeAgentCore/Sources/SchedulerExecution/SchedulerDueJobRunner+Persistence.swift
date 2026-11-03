@@ -9,7 +9,6 @@ import TelegramBot
 import TriggerScheduler
 import DeviceSync
 import AppToolRuntime
-import Synchronization
 // Blueprint: | `SchedulerDueJobRunner+Persistence.swift` | `SchedulerDueJobRunner`: execution-result adaptation to canonical scheduler settlement; `appendActivity` |
 
 extension SchedulerDueJobRunner {
@@ -89,7 +88,7 @@ extension SchedulerDueJobRunner {
             "title": .string(NativeAppSecretRedactor.redactText(String(title.prefix(160)))),
             "summary": .string(NativeAppSecretRedactor.redactText(String(message.prefix(500)))),
             "detail": .string(NativeAppSecretRedactor.redactText(String((detail ?? message).prefix(2000)))),
-            "related_mission_id": .null,
+            "related_execution_id": .null,
             "related_approval_id": .null,
             "related_paths": .array(relatedPaths.map { .string($0) }),
             "related_groups": .array(relatedGroups),
@@ -124,7 +123,7 @@ extension SchedulerDueJobRunner {
     }
 
     func notificationInboxContains(source: String, dateKey: String) async throws -> Bool {
-        let rows = (try? await SwiftNativePersistenceCore.readJSONL(notificationInboxPath)) ?? []
+        let rows = try await LiveNotificationInbox(path: notificationInboxPath).rows()
         for row in rows {
             guard case .object(let obj) = row else { continue }
             guard SchedulerJobRuntime.string(obj["source"]) == source else { continue }
@@ -146,35 +145,34 @@ extension SchedulerDueJobRunner {
         var delivered: [JSONValue] = []
         var errors: [JSONValue] = []
         var notDelivered: [JSONValue] = []
-        let macResult = Mutex<NativeAgentNotificationPostResult?>(nil)
+        var macOutcome: NotificationDeliveryOutcome?
 
         do {
-            // The router derives urgency from importance and defers cycle news during quiet hours.
+            // The router defers informational cycle news during quiet hours.
             var userInfo = ["screen": "inbox", "source": source, "jobId": jobId]
             if let itemId, !itemId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 userInfo["itemId"] = itemId
             }
+            let revision: String?
+            if let itemId, let row = try await LiveNotificationInbox.live(dataRoot: root).row(id: itemId) { revision = try LiveNotificationInbox.notificationRevision(row) }
+            else { revision = nil }
             // Cycle news is informational; the inbox card retains its receipt.
             let outcome = try await platform.attentionRouter.route(
                 eventId: "scheduler_cycle:\(userInfo["itemId"] ?? jobId)",
                 importance: .informational,
                 title: title,
                 body: body,
-                userInfo: userInfo,
-                postMacBanner: { [platform] in
-                    let mac = await platform.postNotification(title: title, body: body)
-                    macResult.withLock { $0 = mac }
-                }
+                userInfo: userInfo, macBanner: true,
+                sourceRevision: revision
             )
+            macOutcome = outcome.destinationOutcomes["mac"]
             // The router's delivery projection determines the channel receipt.
             switch outcome.deliveryProjection {
             case .accepted:
                 delivered.append(.string("push"))
             case .queued:
-                // Queued means CloudKit-only with APNS unavailable; the phone has received nothing.
-                notDelivered.append(.string("push: queued (APNS unavailable)"))
-            case .previouslyHandled:
-                delivered.append(.string("push_already_delivered"))
+                // CloudKit publication is not signed phone receipt; optional APNS acceptance cannot settle it.
+                notDelivered.append(.string("push: queued (phone receipt pending)"))
             case .failed:
                 errors.append(.string(
                     "push: the knock was tried and no channel accepted it; nothing was delivered"))
@@ -186,18 +184,17 @@ extension SchedulerDueJobRunner {
             errors.append(.string("push: \(error.localizedDescription)"))
         }
 
-        let mac = macResult.withLock { $0 }
-        if let mac {
-            if mac.posted { delivered.insert(.string("mac"), at: 0) }
-            else { errors.insert(.string("mac: \(mac.error ?? mac.delivery)"), at: 0) }
-        } else {
-            notDelivered.insert(.string("mac: deferred"), at: 0)
+        switch macOutcome {
+        case .delivered?: delivered.insert(.string("mac"), at: 0)
+        case .notDelivered(let reason)?: errors.insert(.string("mac: " + reason), at: 0)
+        case .unknown(_, let reason)?: notDelivered.insert(.string("mac: " + reason), at: 0)
+        case .suppressed(let preference)?: notDelivered.insert(.string("mac: suppressed by " + preference), at: 0)
+        case nil: notDelivered.insert(.string("mac: deferred"), at: 0)
         }
         var fields: [String: JSONValue] = [
             "delivered": .array(delivered),
             "errors": .array(errors),
         ]
-        if let mac { fields["mac"] = .object(mac.deliveryFields()) }
         if !notDelivered.isEmpty { fields["not_delivered"] = .array(notDelivered) }
         return .object(fields)
     }
@@ -208,21 +205,6 @@ extension SchedulerDueJobRunner {
         formatter.timeZone = TimeZone(identifier: "UTC")
         formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS'+00:00'"
         return formatter.string(from: date)
-    }
-
-    func deliveryText(
-        channel: String,
-        payload: [String: JSONValue],
-        fallbackTitle: String,
-        fallbackMessage: String
-    ) -> (title: String, message: String) {
-        guard case .object(let options)? = payload["deliveryOptions"] ?? payload["delivery_options"],
-              case .object(let channelOptions)? = options[channel] else {
-            return (fallbackTitle, fallbackMessage)
-        }
-        let title = string(channelOptions["title"]) ?? fallbackTitle
-        let message = string(channelOptions["message"]) ?? string(channelOptions["body"]) ?? fallbackMessage
-        return (title, message)
     }
 
     func string(_ raw: JSONValue?) -> String? {

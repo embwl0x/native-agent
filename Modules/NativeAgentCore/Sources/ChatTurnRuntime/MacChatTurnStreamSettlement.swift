@@ -78,10 +78,16 @@ public extension MacChatTurnPresentationPort {
             switch response.terminalState {
             case .completed: proof = .completed; kind = .completed
             case .stopped, .failed:
-                proof = response.output.isEmpty && response.attachments?.isEmpty != false
-                    && (response.terminalState == .stopped || SessionConversation.isHelper(identity.sessionId, dataRoot: macChatTurns.dataRoot))
-                    ? .absent : (response.terminalState == .stopped ? .canceled : .failed)
-                kind = response.terminalState == .stopped ? .cancellationConfirmed : .failed(reason: response.statusDetail)
+                do {
+                    let helper = try SessionConversation.checkedIsHelper(identity.sessionId, dataRoot: macChatTurns.dataRoot)
+                    proof = response.output.isEmpty && response.attachments?.isEmpty != false
+                        && (response.terminalState == .stopped || helper)
+                        ? .absent : (response.terminalState == .stopped ? .canceled : .failed)
+                    kind = response.terminalState == .stopped ? .cancellationConfirmed : .failed(reason: response.statusDetail)
+                } catch {
+                    proof = .unavailable
+                    kind = .outcomeUnknown(reason: "The conversation owner could not be read: \(error.localizedDescription)")
+                }
             case .waiting, .interrupted, nil:
                 proof = .incomplete
                 kind = .outcomeUnknown(reason: response.statusDetail ?? "This reply was saved, but the turn did not finish.")
@@ -112,27 +118,6 @@ public extension MacChatTurnPresentationPort {
 public extension MacChatTurnRuntime {
     nonisolated static let syntheticErrorIDPrefix = "na-synthetic-error-"
 
-    nonisolated static func restoredUnpersistedChatRequest<Message: MacChatRenderedMessage>(
-        originalUser: Message, predecessor: Message?, notice: Message,
-        canonicalMessages: [Message], syntheticPrefix: String,
-        markUnpersisted: (Message) -> Message
-    ) -> [Message]? {
-        guard let sessionID = originalUser.sessionId, !sessionID.isEmpty,
-              notice.sessionId == sessionID, originalUser.role == "user",
-              notice.id.hasPrefix(syntheticPrefix), notice.macChatHasMetadata else { return nil }
-        let unpersistedNotice = markUnpersisted(notice)
-        let local = [predecessor].compactMap { $0 } + [originalUser, unpersistedNotice]
-        guard let snapshot = MacChatRetrySnapshot.capture(
-            target: unpersistedNotice, messages: local, sessionId: sessionID, isSyntheticNotice: true
-        ), snapshot.matchesCanonical(canonicalMessages) else { return nil }
-        return canonicalMessages + [originalUser, unpersistedNotice]
-    }
-
-    nonisolated static func isCompletedAssistant<Message: MacChatRenderedMessage>(_ message: Message?) -> Bool {
-        guard let message, message.role == "assistant" else { return false }
-        return !message.macChatPartial && !message.macChatCancelled
-    }
-
     nonisolated static func normalizeStreamErrorForChat(_ error: Error, advice: (Error) -> String) -> String {
         if let person = ProviderRecoveryPolicy.personMessage(error) { return person }
         let raw = error.localizedDescription
@@ -146,13 +131,23 @@ public extension ChatStreamExecution {
         client: SwiftNativeChatOrchestrationClient,
         text: String, attachments: [NativeAgentShared.MultimodalAttachment],
         sessionId: String, activityIdentity: MacChatTurnIdentity, replyRowId: String,
-        hideUserBubble: Bool, serviceTier: @escaping @Sendable () -> String?,
+        hideUserBubble: Bool,
         onScreenPreview: @escaping @Sendable (MacScreenPreviewUpdate) async -> Void,
         helperSession: @escaping @Sendable (TurnEventSink?) -> BotRunnerSession,
         dataRoot: URL
     ) -> ChatStreamExecution {
         let message = text.isEmpty ? "(see attachments)" : text
-        if SessionConversation.isHelper(sessionId, dataRoot: dataRoot) {
+        let helper: Bool
+        do { helper = try SessionConversation.checkedIsHelper(sessionId, dataRoot: dataRoot) }
+        catch {
+            let (events, continuation) = AsyncThrowingStream<TurnStreamEvent, Error>.makeStream()
+            let producer = Task<Result<ChatResponse, any Error>, Never> {
+                continuation.finish(throwing: error)
+                return .failure(error)
+            }
+            return ChatStreamExecution(events: events, producer: producer)
+        }
+        if helper {
             let (events, continuation) = AsyncThrowingStream<TurnStreamEvent, Error>.makeStream()
             let producer = Task<Result<ChatResponse, any Error>, Never> {
                 do {
@@ -162,7 +157,7 @@ public extension ChatStreamExecution {
                     let bot = try BotDefinitionStore(dataRoot: dataRoot).get(helperID)
                     let session = helperSession { continuation.yield($0) }
                     let reply = try await TurnTraceContext.$turnId.withValue(activityIdentity.turnId) {
-                        try await TurnTraceContext.$replyRow.withValue(.init(turnId: activityIdentity.turnId, messageId: replyRowId)) {
+                        try await TurnTraceContext.$replyRow.withValue(.init(turnId: activityIdentity.turnId, sessionId: sessionId, messageId: replyRowId)) {
                         try await session(bot, message)
                         }
                     }
@@ -183,12 +178,11 @@ public extension ChatStreamExecution {
             return ChatStreamExecution(events: events, producer: producer)
         }
         return TurnTraceContext.$turnId.withValue(activityIdentity.turnId) {
-            // The producer owns the service-tier binding for its whole life.
             client.chatStreamExecution(
                 message: message, sessionId: sessionId,
                 model: "", reasoningEffort: "", fileAccess: "auto",
                 attachments: attachments, persona: nil, surface: "chat",
-                suppressUserAppend: hideUserBubble, choice: nil, serviceTier: serviceTier(),
+                suppressUserAppend: hideUserBubble, choice: nil,
                 consumerRendersInlineCards: true, replyRowID: replyRowId, onScreenPreview: onScreenPreview
             )
         }

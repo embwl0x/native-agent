@@ -32,11 +32,11 @@ public actor ChatGPTAccountModelRefresh {
         // This maintenance operation writes only the app-owned account cache;
         // do not discover an inactive sign-in when runtime selected another one.
         guard authPath.standardizedFileURL == NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: root).standardizedFileURL else { return false }
-        guard let token = ChatGPTTransport.storedAccessToken(at: authPath) else { return false }
+        guard let token = try ChatGPTTransport.storedAccessToken(at: authPath) else { return false }
         var key = CredentialKey(root: root, accessToken: token)
         if !force {
             if let failure = failedAt[key], Date().timeIntervalSince(failure) < 300 { return false }
-            if Self.isFresh(dataRoot: root, authPath: authPath) { return false }
+            if try Self.isFresh(dataRoot: root, authPath: authPath) { return false }
         }
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 30
@@ -58,7 +58,7 @@ public actor ChatGPTAccountModelRefresh {
         if let flight = flights[key] { return try await flight.value }
         if !force {
             if let failure = failedAt[key], Date().timeIntervalSince(failure) < 300 { return false }
-            if Self.isFresh(dataRoot: root, authPath: authPath) { return false }
+            if try Self.isFresh(dataRoot: root, authPath: authPath) { return false }
         }
         let flight = Task {
             try await Self.fetch(dataRoot: root, authPath: authPath, context: context, session: session)
@@ -76,12 +76,12 @@ public actor ChatGPTAccountModelRefresh {
         }
     }
 
-    private static func isFresh(dataRoot: URL, authPath: URL) -> Bool {
+    private static func isFresh(dataRoot: URL, authPath: URL) throws -> Bool {
         guard let bytes = try? Data(contentsOf: cacheURL(dataRoot: dataRoot)),
               let cache = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
               let stamp = cache["fetched_at"] as? String,
               let account = cache["nativeagent_account_id"] as? String,
-              let token = ChatGPTTransport.storedAccessToken(at: authPath),
+              let token = try ChatGPTTransport.storedAccessToken(at: authPath),
               account == (try? ChatGPTTransport(authPathOverride: authPath)
                 .currentAccountID(accessToken: token)),
               let models = cache["models"] as? [[String: Any]], !models.isEmpty else { return false }
@@ -133,7 +133,7 @@ public actor ChatGPTAccountModelRefresh {
         cache["nativeagent_account_id"] = context.accountID
         let saved = try JSONSerialization.data(withJSONObject: cache, options: [.sortedKeys])
         try CredentialFileLock.withLock(authPath) {
-            guard ChatGPTTransport.storedAccessToken(at: authPath) == context.accessToken else {
+            guard try ChatGPTTransport.storedAccessToken(at: authPath) == context.accessToken else {
                 throw OAuthRequestAccount.changed("openai_oauth_direct")
             }
             try SwiftNativePersistenceCore.writeDataAtomicDurable(saved, to: cacheURL(dataRoot: dataRoot))

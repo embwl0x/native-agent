@@ -2,7 +2,8 @@ import SwiftUI
 import NativeAgentShared
 
 // Settled blocks retain literal code and native prose layout; streaming uses
-// the same sanitized inline parse without caching growing text.
+// the same sanitized inline outcome without caching growing text. Failed
+// parses retain the shared cause/source notice on both paths.
 
 enum ChatMarkdownBlock: Sendable {
     case paragraph(AttributedString)
@@ -43,13 +44,13 @@ actor MobileChatMarkdown {
             let text = paragraph.joined(separator: "\n")
             paragraph.removeAll()
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-            blocks.append(.paragraph(inline(text)))
+            blocks.append(.paragraph(inline(text).presentation))
         }
 
         for row in ChatRichContentParser.listRows(prose) {
             if let marker = row.marker {
                 flush()
-                blocks.append(.listItem(marker: marker, indent: row.indent / 2, text: inline(row.text)))
+                blocks.append(.listItem(marker: marker, indent: row.indent / 2, text: inline(row.text).presentation))
             } else {
                 for line in row.text.split(separator: "\n", omittingEmptySubsequences: false) {
                     let trimmed = line.drop { $0 == " " || $0 == "\t" }
@@ -57,7 +58,7 @@ actor MobileChatMarkdown {
                         flush()
                     } else if let heading = heading(trimmed) {
                         flush()
-                        blocks.append(.heading(level: heading.level, text: inline(heading.text)))
+                        blocks.append(.heading(level: heading.level, text: inline(heading.text).presentation))
                     } else {
                         paragraph.append(line)
                     }
@@ -77,13 +78,14 @@ actor MobileChatMarkdown {
     }
 
     /// Also the live reply's parse, so it streams in the settled look.
-    nonisolated static func inline(_ text: String) -> AttributedString {
-        guard var out = ChatRichContentParser.inline(text) else { return AttributedString(text) }
+    nonisolated static func inline(_ text: String) -> ChatRichContentParser.InlineOutcome {
+        let outcome = ChatRichContentParser.inline(text)
+        guard case .parsed(var out) = outcome else { return outcome }
         // The reply's text colour wins over link tint, so underline live
         // links to keep them visible (teal stays for "needs you").
         let links = out.runs.compactMap { $0.link == nil ? nil : $0.range }
         for range in links { out[range].underlineStyle = Text.LineStyle(pattern: .solid) }
-        return out
+        return .parsed(out)
     }
 }
 

@@ -6,7 +6,7 @@ import TrustCenter
 import CryptoKit
 import GRDB
 import PersonaEngine
-// Blueprint: | `ContextPreparation.swift` | One ContextPreparation actor and state owner; lifecycle, health, compile/publication admission and cancellation; stop invalidates candidates and drains entered publication |
+// Blueprint: | `ContextPreparation.swift` | One ContextPreparation actor owns lifecycle, health and publication admission; committed source-read failures retain their identities for health and turn selection before any source row exists; stop invalidates candidates and drains entered publication |
 
 public enum ContextFlowMode: String, Codable, CaseIterable, Sendable {
     case off
@@ -95,6 +95,9 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     var started = false
     var lastReconciledAt: Date?
     var lastError: String?
+    /// Current preparation availability, separate from retained leased bytes and maintenance diagnostics.
+    var reconciliationFailure: String?
+    var feedbackRestoreFailure: String? = "Context feedback has not been restored."
     // Prune after successful commits, bounded by the maintenance interval.
     var lastPruneAt: Date?
     let pruneInterval: TimeInterval = 6 * 3_600
@@ -107,7 +110,6 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     var feedbackEvents: [ContextFeedbackEvent] = []
     var feedbackOrdinal: UInt64 = 0
     /// The last feedback that applied; a failed update never replaces it.
-    var publishedFeedback: ContextFeedbackSnapshot?
     var cachedFeedback: (
         generationID: Int64, feedbackOrdinal: UInt64, timeBucket: Int64,
         snapshot: ContextFeedbackSnapshot
@@ -119,19 +121,27 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     var pendingProjectionReconciliationRequestIDs: [String: UInt64] = [:]
     var pendingReconciliationReason = "source_change"
     private var publicationInProgress = false
-    private var publicationWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
-    /// Stop drains an entered publisher even if its own caller is cancelled.
-    /// Admission waiters, in contrast, leave on cancellation or stop.
-    private var publicationDrainWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Admission and drain waiters park on one ScopedWaiter per publication: its
+    /// park never touches this actor's state (a continuation body that did crashed
+    /// her on 10-30, swift_task_checkIsolated in reconcilePending). Admission
+    /// waiters leave on cancellation or stop; stop drains an entered publisher
+    /// even if its own caller is cancelled.
+    private var publicationDone = ScopedWaiter()
     var reconciliationClosed = false
     var lifecycleID: UInt64 = 0
     /// One compile at a time. A request arriving during one waits, and only
     /// the newest waiter compiles: an older one's commit would be refused.
     var compileInProgress = false
-    var compileWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    var compileDone = ScopedWaiter()
     /// Housekeeping rebuilds a turn requested or launch started; no turn awaits it.
     private var backgroundReconciliation: Task<Void, Never>?
     var degradedSourceIDs: Set<ContextSourceID> = []
+    enum SourceReadOwner: Hashable {
+        case registered
+        case projection(String)
+    }
+    /// Last committed source reads, including failures before any source row exists.
+    var sourceReadFailures: [SourceReadOwner: [ContextSourceID: String]] = [:]
     /// Cache only immutable generation derivations; keep feedback and live effects outside.
     var generationDerivedCache: [GenerationDerivedCacheKey: GenerationDerivedTurnState] = [:]
     /// Error-level diagnostic sink for context health and vocabulary drift.
@@ -183,7 +193,7 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
                 guard isCurrent(lifecycleID) else { return }
                 guard await beginPublication(for: nextReconciliationRequestID) else { return }
                 defer { finishPublication() }
-                try await activate(published)
+                try await activate(published, requestID: nextReconciliationRequestID)
             }
         } catch {
             guard isCurrent(lifecycleID) else { return }
@@ -223,7 +233,9 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
         await background?.value
         backgroundReconciliation = nil
         if publicationInProgress {
-            await withCheckedContinuation { publicationDrainWaiters.append($0) }
+            // Its own task, so the caller's cancellation never cuts the drain short.
+            let done = publicationDone
+            await Task { await done.park() }.value
         }
         coalescer = nil
         monitor = nil
@@ -276,7 +288,7 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
             feedbackEventCount: feedbackEvents.count,
             newestFeedbackEventID: feedbackEvents.last?.id,
             lastReconciledAt: lastReconciledAt,
-            lastError: measurementError ?? lastError
+            lastError: measurementError ?? sourceReadFailures.values.flatMap(\.values).sorted().first ?? lastError
         )
     }
 
@@ -294,29 +306,15 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
         resumeCompileWaiters()
     }
 
-    func cancelCompileWaiter(_ id: UUID) {
-        compileWaiters.removeValue(forKey: id)?.resume()
-    }
-
     private func resumeCompileWaiters() {
-        let waiters = Array(compileWaiters.values)
-        compileWaiters.removeAll(keepingCapacity: true)
-        for waiter in waiters {
-            waiter.resume()
-        }
+        compileDone.resume()
+        compileDone = ScopedWaiter()
     }
 
     func beginPublication(for requestID: UInt64) async -> Bool {
         while publicationInProgress, !reconciliationClosed, !Task.isCancelled {
-            let id = UUID()
-            await withTaskCancellationHandler {
-                await withCheckedContinuation { continuation in
-                    guard !Task.isCancelled else { continuation.resume(); return }
-                    publicationWaiters[id] = continuation
-                }
-            } onCancel: {
-                Task { await self.cancelPublicationWaiter(id) }
-            }
+            let done = publicationDone
+            await done.park()
         }
         guard !reconciliationClosed, requestID == nextReconciliationRequestID, !Task.isCancelled else { return false }
         publicationInProgress = true
@@ -326,21 +324,11 @@ public actor ContextPreparation: DerivedStateInvalidationSink {
     func finishPublication() {
         publicationInProgress = false
         resumePublicationWaiters()
-        let drains = publicationDrainWaiters
-        publicationDrainWaiters.removeAll(keepingCapacity: true)
-        for drain in drains { drain.resume() }
-    }
-
-    private func cancelPublicationWaiter(_ id: UUID) {
-        publicationWaiters.removeValue(forKey: id)?.resume()
     }
 
     private func resumePublicationWaiters() {
-        let waiters = Array(publicationWaiters.values)
-        publicationWaiters.removeAll(keepingCapacity: true)
-        for waiter in waiters {
-            waiter.resume()
-        }
+        publicationDone.resume()
+        publicationDone = ScopedWaiter()
     }
 
 }

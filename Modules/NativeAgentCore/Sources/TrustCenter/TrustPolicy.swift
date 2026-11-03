@@ -26,14 +26,9 @@ public struct TrustPolicy: Sendable, Codable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case permissionLevel, autonomyDefault, updatedAt, appDataRoot
-        case workshopPolicy = "missionPolicy" // compatibility wire ID
+        case workshopPolicy
         case filePolicy, chromeControlPolicy, multimodalPolicy
         case developerMode, enableAutonomy, trainingPolicy, memoryPolicy, macControlPolicy
-    }
-
-    /// Decoding accepts workshopPolicy and missionPolicy; encoding emits only missionPolicy.
-    private enum FutureCodingKeys: String, CodingKey {
-        case workshopPolicy
     }
 
     public init(
@@ -79,15 +74,7 @@ public struct TrustPolicy: Sendable, Codable, Hashable {
         autonomyDefault = try c.decodeIfPresent(String.self, forKey: .autonomyDefault)
         updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
         appDataRoot = try c.decodeIfPresent(String.self, forKey: .appDataRoot)
-        // Future spelling first, on-wire spelling as the fallback.
-        let futureWorkshopPolicy: TrustWorkshopPolicy? = {
-            guard let future = try? decoder.container(keyedBy: FutureCodingKeys.self) else {
-                return nil
-            }
-            return try? future.decodeIfPresent(TrustWorkshopPolicy.self, forKey: .workshopPolicy)
-        }()
-        workshopPolicy = try futureWorkshopPolicy
-            ?? c.decodeIfPresent(TrustWorkshopPolicy.self, forKey: .workshopPolicy)
+        workshopPolicy = try c.decodeIfPresent(TrustWorkshopPolicy.self, forKey: .workshopPolicy)
         filePolicy = try c.decodeIfPresent(TrustFilePolicy.self, forKey: .filePolicy)
         chromeControlPolicy = try c.decodeIfPresent(TrustChromeControlPolicy.self, forKey: .chromeControlPolicy)
         multimodalPolicy = try c.decodeIfPresent(TrustMultimodalPolicy.self, forKey: .multimodalPolicy)

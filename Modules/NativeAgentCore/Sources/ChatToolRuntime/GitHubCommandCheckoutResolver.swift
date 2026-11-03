@@ -1,6 +1,7 @@
 import Foundation
 import Dispatcher
-// Blueprint: | `GitHubCommandCheckoutResolver.swift` | `GitHubCommandCheckoutResolver` enum; `resolve` |
+import NativeAgentCore
+// Blueprint: | `GitHubCommandCheckoutResolver.swift` | Explicit repository selection requires exactly one remote-verified checkout; ambiguity lists candidates, directory/stat/remote read failures stop selection, and checked no-match returns no checkout |
 
 // Trusted repository-checkout resolution for explicit codex_message repository
 // selection.
@@ -16,7 +17,7 @@ enum GitHubCommandCheckoutResolver {
     static func resolve(
         repository: String,
         dataRoot: URL
-    ) -> URL? {
+    ) throws -> URL? {
         let parts = repository.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         guard parts.count == 2, parts.allSatisfy({
             !$0.isEmpty && $0 != "." && $0 != ".."
@@ -24,22 +25,18 @@ enum GitHubCommandCheckoutResolver {
         }) else { return nil }
         let repoName = parts[1]
         let roots = defaultSearchRoots(dataRoot: dataRoot)
-        let candidates = checkoutCandidates(repoName: repoName, roots: roots)
-        return candidates.compactMap { candidate -> (URL, Int)? in
-            guard remoteOutput(candidate).split(separator: "\n").contains(where: {
+        let candidates = try checkoutCandidates(repoName: repoName, roots: roots)
+        let matches = try candidates.filter { candidate in
+            try remoteOutput(candidate).split(separator: "\n").contains(where: {
                 remoteRepository(String($0)) == repository.lowercased()
-            }) else { return nil }
-            var score = 0
-            let name = candidate.lastPathComponent.lowercased()
-            if name == repoName.lowercased() { score += 20 }
-            if name.contains("contrib") { score += 10 }
-            return (candidate, score)
+            })
         }
-        .sorted { lhs, rhs in
-            if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
-            return lhs.0.path < rhs.0.path
+        guard matches.count <= 1 else {
+            throw ToolFailureError("More than one checkout matches \(repository). Select working_directory explicitly: \(matches.map(\.path).sorted().joined(separator: ", ")). No checkout was selected and no work started.",
+                argumentPath: "$.repository", effects: .none, code: "repository_checkout_ambiguous",
+                instruction: "Pass the exact intended checkout as working_directory.")
         }
-        .first?.0
+        return matches.first
     }
 
     private static func defaultSearchRoots(dataRoot: URL) -> [URL] {
@@ -53,33 +50,36 @@ enum GitHubCommandCheckoutResolver {
         ])
     }
 
-    private static func checkoutCandidates(repoName: String, roots: [URL]) -> [URL] {
+    private static func checkoutCandidates(repoName: String, roots: [URL]) throws -> [URL] {
         let fileManager = FileManager.default
         var candidates: [URL] = []
         for root in unique(roots) {
             candidates.append(root)
             candidates.append(root.appendingPathComponent(repoName, isDirectory: true))
             candidates.append(root.appendingPathComponent("\(repoName)-contrib", isDirectory: true))
-            if let children = try? fileManager.contentsOfDirectory(
+            let children: [URL]
+            do { children = try fileManager.contentsOfDirectory(
                 at: root,
                 includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsPackageDescendants, .skipsHiddenFiles]
-            ) {
-                candidates.append(contentsOf: children.filter {
-                    $0.lastPathComponent.localizedCaseInsensitiveContains(repoName)
-                })
-            }
+            ) } catch CocoaError.fileReadNoSuchFile { continue }
+            catch { throw unavailable(root, cause: error.localizedDescription) }
+            candidates.append(contentsOf: children.filter {
+                $0.lastPathComponent.localizedCaseInsensitiveContains(repoName)
+            })
         }
-        return unique(candidates).filter { candidate in
-            (try? candidate.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-                && fileManager.fileExists(
-                    atPath: candidate.appendingPathComponent(".git").path
-                )
+        return try unique(candidates).filter { candidate in
+            do {
+                guard try candidate.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { return false }
+                _ = try candidate.appendingPathComponent(".git").resourceValues(forKeys: [.isDirectoryKey])
+                return true
+            } catch CocoaError.fileReadNoSuchFile { return false }
+            catch { throw unavailable(candidate, cause: error.localizedDescription) }
         }
     }
 
-    private static func remoteOutput(_ directory: URL) -> String {
-        git(["remote", "-v"], at: directory)
+    private static func remoteOutput(_ directory: URL) throws -> String {
+        try git(["remote", "-v"], at: directory)
     }
 
     private static func remoteRepository(_ line: String) -> String? {
@@ -106,17 +106,26 @@ enum GitHubCommandCheckoutResolver {
         return normalized.hasSuffix(".git") ? String(normalized.dropLast(4)) : normalized
     }
 
-    private static func git(_ arguments: [String], at directory: URL) -> String {
+    private static func git(_ arguments: [String], at directory: URL) throws -> String {
         let result = runProcess(
             "/usr/bin/git", ["-C", directory.path] + arguments, timeout: 5
         )
         guard result.launched, !result.timedOut, !result.captureReadFailed,
-              result.status == 0 else { return "" }
+              result.status == 0 else {
+            throw unavailable(directory, cause: "git remote -v: launched=\(result.launched), timedOut=\(result.timedOut), captureReadFailed=\(result.captureReadFailed), exit=\(result.status)")
+        }
         return result.stdout
+    }
+
+    private static func unavailable(_ path: URL, cause: String) -> ToolFailureError {
+        ToolFailureError("Repository checkout discovery is unavailable at \(path.path): \(cause). No checkout was selected and no work started.",
+            effects: .none, owner: path.path, code: "repository_discovery_unavailable",
+            instruction: "Repair the reported directory or git remote read failure, then request the repository again.", recovery: .repair)
     }
 
     private static func unique(_ urls: [URL]) -> [URL] {
         var seen: Set<String> = []
-        return urls.map(\.standardizedFileURL).filter { seen.insert($0.path).inserted }
+        return urls.map { $0.standardizedFileURL.resolvingSymlinksInPath() }
+            .filter { seen.insert($0.path).inserted }
     }
 }

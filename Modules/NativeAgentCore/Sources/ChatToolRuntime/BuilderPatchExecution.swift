@@ -1,4 +1,5 @@
 import Foundation
+import ChatToolParsing
 import NativeAgentCore
 import PersistenceCore
 import AgentWorkspace
@@ -207,6 +208,9 @@ extension SwiftToolDispatcher {
         let runId = UUID().uuidString
         let startedAt = Date()
         if let files = validation.files {
+            let sandbox: BuilderShellSandboxMode
+            do { sandbox = try await builderShellSandboxMode(dataRoot: dataRoot) }
+            catch { return ChatToolOutcome.failure(error: error, tool: "apply_patch", effects: ToolFailureError.Effects.none) }
             return builderApplyRangeLessUnifiedPatch(
                 files: files,
                 patch: patch,
@@ -214,7 +218,7 @@ extension SwiftToolDispatcher {
                 runId: runId,
                 startedAt: startedAt,
                 dataRoot: dataRoot,
-                sandboxMode: await builderShellSandboxMode(dataRoot: dataRoot)
+                sandboxMode: sandbox
             )
         }
         let tmpURL = FileManager.default.temporaryDirectory
@@ -248,14 +252,22 @@ extension SwiftToolDispatcher {
         defer {
             try? FileManager.default.removeItem(at: tmpURL)
         }
-        // Select the mode in the same confined cwd/environment as the apply.
-        // This is repository discovery, never a retry of a failed three-way apply.
+        // Git's C-locale non-repository diagnostic is negative discovery
+        // evidence. Every other failure retains its exit and cause; it cannot
+        // select plain apply. Discovery and apply share this admitted launch.
         let command = """
-        if [ "$1" = true ] && git rev-parse --git-dir >/dev/null 2>&1; then
-            exec git apply --3way "$2"
-        else
-            exec git apply "$2"
+        if [ "$1" = true ]; then
+            discovery=$(LC_ALL=C git rev-parse --git-dir 2>&1)
+            discovery_status=$?
+            if [ "$discovery_status" = 0 ]; then
+                exec git apply --3way "$2"
+            fi
+            if [ "$discovery_status" != 128 ] || [ "$discovery" != 'fatal: not a git repository (or any of the parent directories): .git' ]; then
+                printf '%s\\n' "Git repository discovery failed; patch not applied: $discovery" >&2
+                exit "$discovery_status"
+            fi
         fi
+        exec git apply "$2"
         """
         return await runShellLikeProcess(
             toolName: "apply_patch",

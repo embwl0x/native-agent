@@ -75,8 +75,9 @@ public enum TurnTraceGrouping {
             guard case .object(let p) = ev.payload else { continue }
             // Only the recorder's camelCase keys count; aliases could double-count evidence.
             do {
-                for key in ["inputTokens", "outputTokens"] {
-                    if let n = try TraceMeasurement.value(p[key], field: key) {
+                let tokens = try TraceMeasurement.tokens(p)
+                for (key, count) in [("inputTokens", tokens.input), ("outputTokens", tokens.output)] {
+                    if let n = count {
                         tokenTotal = try TraceMeasurement.add(tokenTotal, n, field: key)
                         sawTokens = true
                     }
@@ -95,6 +96,12 @@ public enum TurnTraceGrouping {
 
 /// Recorded measurements are nonnegative integers; totals must remain exact.
 enum TraceMeasurement {
+    /// The recorder's current token vocabulary, shared by grouping and row titles.
+    static func tokens(_ payload: [String: JSONValue]) throws -> (input: Int64?, output: Int64?) {
+        (input: try value(payload["inputTokens"], field: "inputTokens"),
+         output: try value(payload["outputTokens"], field: "outputTokens"))
+    }
+
     static func value(_ value: JSONValue?, field: String) throws -> Int64? {
         guard let value, value != .null else { return nil }
         guard case .int(let n) = value, n >= 0 else {

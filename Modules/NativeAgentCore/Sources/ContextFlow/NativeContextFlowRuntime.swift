@@ -9,7 +9,7 @@ import PersistenceCore
 import TurnTrace
 import WorkshopExecution
 import NativeAgentShared
-// Blueprint: | `NativeContextFlowRuntime.swift` | `NativeContextFlowRuntime` actor; ordered, joined lifecycle transitions; stop drains retained picker, observation and embedding bodies; picker publication checks, turn preparation and memory provenance |
+// Blueprint: | `NativeContextFlowRuntime.swift` | `NativeContextFlowRuntime` actor; checked mode rejects invalid configuration at startup, mode/health reads and turn admission; ordered, joined lifecycle transitions; stop drains retained picker, observation and embedding bodies; picker publication checks, turn preparation and memory provenance |
 
 private struct NativeContextEmbeddingProvider: ContextMarkdownEmbeddingProvider {
     let memory: SwiftNativeMemoryV2
@@ -59,7 +59,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     /// reload owns teardown/replacement, and awaiting lends the caller's priority.
     var lifecycle: (
         id: UUID, operation: LifecycleOperation,
-        configuration: NativeContextFlowConfiguration?, task: Task<Void, Never>
+        configuration: Result<NativeContextFlowConfiguration, NativeContextFlowStartupError>?, task: Task<Void, Never>
     )?
     private var personaPickerReconcile: (id: UUID, task: Task<Void, Never>)?
     private var personaPickerRequestRevision: UInt64 = 0
@@ -115,15 +115,15 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         await task.value
     }
 
-    private func performStartup(configuration: NativeContextFlowConfiguration) async {
+    private func performStartup(configuration: Result<NativeContextFlowConfiguration, NativeContextFlowStartupError>) async {
         startupFailedClosed = false
         startupFailure = nil
-        guard configuration.mode != .off else {
-            nativeLog("[context-flow] disabled until onboarding or explicit enablement")
-            return
-        }
-
         do {
+            let configuration = try configuration.get()
+            guard configuration.mode != .off else {
+                nativeLog("[context-flow] disabled until onboarding or explicit enablement")
+                return
+            }
             let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
             guard await memory.embeddingEpoch() != nil else {
                 throw MemoryV2Error.storageUnavailable
@@ -232,7 +232,11 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     }
 
     public func modeStatus() async -> NativeContextFlowModeStatus {
-        return NativeContextFlowModeStatus(effectiveMode: await contextFlowMode())
+        do {
+            return NativeContextFlowModeStatus(effectiveMode: try await contextFlowMode(), unavailableReason: nil)
+        } catch {
+            return NativeContextFlowModeStatus(effectiveMode: nil, unavailableReason: error.localizedDescription)
+        }
     }
 
     public func prepareForSleep() async {
@@ -303,6 +307,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
 
     /// Health reads never wait for startup; an in-flight transition answers not-started.
     public func health() async -> ContextFlowCoordinatorHealth? {
+        guard case .success = resolvedConfiguration() else { return nil }
         guard lifecycle == nil else { return nil }
         return await coordinator?.health()
     }
@@ -310,24 +315,29 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     /// An intentionally disabled runtime is healthy; an unavailable health read is not.
     public func observatoryHealthState() async -> ContextFlowObservatoryHealthState {
         await lifecycle?.task.value
+        guard case .success(let configuration) = resolvedConfiguration() else { return .unavailable }
         if let coordinator {
             return .health(await coordinator.health())
         }
         if startupFailedClosed { return .unavailable }
-        return resolvedConfiguration().mode == .off ? .off : .unavailable
+        return configuration.mode == .off ? .off : .unavailable
     }
 
     /// During a lifecycle transition, report the configured mode without waiting.
-    public func contextFlowMode() async -> ContextFlowMode {
+    public func contextFlowMode() async throws -> ContextFlowMode {
+        let configuration = try resolvedConfiguration().get()
         if lifecycle == nil, let coordinator { return await coordinator.mode }
-        return resolvedConfiguration().mode
+        return configuration.mode
     }
 
-    func resolvedConfiguration() -> NativeContextFlowConfiguration {
-        NativeContextFlowConfiguration.resolve(dataRoot: dataRoot)
+    func resolvedConfiguration() -> Result<NativeContextFlowConfiguration, NativeContextFlowStartupError> {
+        do { return .success(try NativeContextFlowConfiguration.resolve(dataRoot: dataRoot)) }
+        catch let error as NativeContextFlowStartupError { return .failure(error) }
+        catch { return .failure(NativeContextFlowStartupError(detail: error.localizedDescription)) }
     }
 
     public func prepareContextTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn {
+        _ = try resolvedConfiguration().get()
         await start()
         // The person's selection is applied by the build; the turn never
         // waits on it, and an unpublished selection is the persona receipt below.

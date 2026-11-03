@@ -44,18 +44,14 @@ extension AnthropicOAuthTransport {
     // Blocks below the model's minimum cacheable prefix silently don't
     // cache (no error) — verified via usage.cache_read_input_tokens.
 
+    /// Every Anthropic cache marker, on both lanes, lives one hour (GA, no
+    /// beta header). A person's turns are minutes apart: with 5-minute entries
+    /// each turn after a pause rewrote her whole 250-400k-token prefix and her
+    /// first word took 8-16 s instead of 2-5 s (User 11-01). One lifetime also
+    /// keeps Anthropic's longer-before-shorter ordering rule true by construction.
     // Computed (not stored) — a stored static [String: Any] is rejected as a
     // non-Sendable mutable global under Swift 6 strict concurrency.
-    static var ephemeralCacheControl: [String: Any] { ["type": "ephemeral"] }
-
-    /// `cache_control` with an explicit TTL. `nil` ttl → the plain 5-minute
-    /// ephemeral dict, BYTE-IDENTICAL to `ephemeralCacheControl` (the `ttl`
-    /// key is absent, not `"5m"`, so no legacy body changes). `"1h"` is the
-    /// GA extended TTL — no beta header required.
-    static func ephemeralCacheControl(ttl: String?) -> [String: Any] {
-        guard let ttl, !ttl.isEmpty else { return ephemeralCacheControl }
-        return ["type": "ephemeral", "ttl": ttl]
-    }
+    static var ephemeralCacheControl: [String: Any] { ["type": "ephemeral", "ttl": "1h"] }
 
     /// The seeding owner binds the current user index for the whole loop.
     /// Calls without a seeded turn have no cross-turn boundary to mark.
@@ -68,32 +64,11 @@ extension AnthropicOAuthTransport {
         return nil
     }
 
-    /// ONE extended-TTL decision for the WHOLE request.
-    ///
-    /// ORDERING RULE (Anthropic): entries with the longer TTL must appear
-    /// BEFORE shorter ones — a 1h entry may not sit behind a 5m entry in the
-    /// system → messages render order. Deciding the TTL once, here, and
-    /// handing the same value to `makeSystemBlocks` and the previous-turn
-    /// boundary is what makes that structural instead of a rule each call
-    /// site has to remember. The current-turn boundary is always LAST and always 5m, which
-    /// the rule permits.
-    ///
-    /// Returns nil (plain 5m ephemeral, no `ttl` key on the wire) unless the
-    /// request has a valid segmented prefix.
-    static func requestLongTTL(
-        usesPrefixShape: Bool
-    ) -> String? {
-        // The stable prefix has a one-hour cache lifetime.
-        guard usesPrefixShape else { return nil }
-        return "1h"
-    }
-
     /// Mark the current append-only request boundary and, when a previous
     /// boundary index is supplied, the preceding one. Both indices are
-    /// explicit, using the seeded turn boundary where available. TTLs are
-    /// explicit too — the previous boundary is the CROSS-TURN read (1h), the
-    /// current boundary is re-read within this turn's own loop (5m — `nil`,
-    /// i.e. no `ttl` key on the wire, byte-identical to the legacy marker).
+    /// explicit, using the seeded turn boundary where available. The current
+    /// boundary is what the person's next turn reads after a pause, so it
+    /// lives as long as the previous one.
     ///
     /// INVARIANT, enforced HERE because this is the one place message markers
     /// are written: a `system` message never receives cache_control. The
@@ -102,26 +77,24 @@ extension AnthropicOAuthTransport {
     static func addConversationCacheControls(
         _ messages: inout [[String: Any]],
         previousBoundaryIndex: Int?,
-        currentBoundaryIndex: Int?,
-        previousBoundaryTTL: String? = nil,
-        currentBoundaryTTL: String? = nil
+        currentBoundaryIndex: Int?
     ) {
-        func mark(_ index: Int, ttl: String?) {
+        func mark(_ index: Int) {
             // The marker goes on the last block that carries something: never an empty text block.
             guard messages.indices.contains(index),
                   messages[index]["role"] as? String != "system",
                   var content = messages[index]["content"] as? [[String: Any]],
                   let at = content.lastIndex(where: { $0["type"] as? String != "text" || !(($0["text"] as? String) ?? "").isEmpty })
             else { return }
-            content[at]["cache_control"] = ephemeralCacheControl(ttl: ttl)
+            content[at]["cache_control"] = ephemeralCacheControl
             messages[index]["content"] = content
         }
         if let previousBoundaryIndex,
            previousBoundaryIndex != currentBoundaryIndex {
-            mark(previousBoundaryIndex, ttl: previousBoundaryTTL)
+            mark(previousBoundaryIndex)
         }
         if let currentBoundaryIndex {
-            mark(currentBoundaryIndex, ttl: currentBoundaryTTL)
+            mark(currentBoundaryIndex)
         }
     }
 
@@ -155,12 +128,8 @@ extension AnthropicOAuthTransport {
             previous = MessagesCacheHint.withinTurnReuse && wire.count >= 3
                 ? eligible.last(where: { $0 <= wire.count - 3 }) : nil
         }
-        // A longer-lived entry may not follow a shorter-lived tool/system
-        // entry. Native API markers use 5m; OAuth's segmented prefix uses 1h.
-        let previousTTL = usesPrefixShape && !markers.isEmpty && markers.allSatisfy { $0.ttl == "1h" }
-            ? "1h" : nil
         addConversationCacheControls(&wire, previousBoundaryIndex: slots >= 2 ? previous : nil,
-            currentBoundaryIndex: current, previousBoundaryTTL: previousTTL)
+            currentBoundaryIndex: current)
         body["messages"] = wire
     }
 
@@ -185,11 +154,10 @@ extension AnthropicOAuthTransport {
     /// Request-scoped segments apply only when they reassemble byte-for-byte into `system`.
     /// Non-identity block texts concatenate to `system`, with separators on preceding blocks.
     /// The last stable block carries the single system breakpoint, after identity and before dynamic text.
-    /// Long-TTL markers precede short-TTL markers; empty dynamic text emits no block.
+    /// Empty dynamic text emits no block.
     static func makeSystemBlocks(
         _ system: String?,
-        segments: SystemPromptSegments? = LLMCallContext.systemSegments,
-        longTTL: String? = nil
+        segments: SystemPromptSegments? = LLMCallContext.systemSegments
     ) -> [[String: Any]] {
         let usesPrefixShape = usesV2PrefixShape(system, segments: segments)
         var blocks: [[String: Any]] = [
@@ -212,7 +180,7 @@ extension AnthropicOAuthTransport {
             blocks += layout.texts.enumerated().map { index, text in
                 var block: [String: Any] = ["type": "text", "text": text]
                 if index == layout.lastStableIndex {
-                    block["cache_control"] = ephemeralCacheControl(ttl: longTTL)
+                    block["cache_control"] = ephemeralCacheControl
                 }
                 return block
             }
@@ -293,14 +261,11 @@ extension AnthropicOAuthTransport {
         coercedModel: String,
         maxTokens: Int,
         stream: Bool
-    ) -> [String: Any] {
+    ) throws -> [String: Any] {
         let usesPrefixShape = Self.usesV2PrefixShape(
             system, segments: LLMCallContext.systemSegments
         )
-        let longTTL = Self.requestLongTTL(
-            usesPrefixShape: usesPrefixShape
-        )
-        let systemBlocks = Self.makeSystemBlocks(system, longTTL: longTTL)
+        let systemBlocks = Self.makeSystemBlocks(system)
 
         // Encode each LLMMessage as an Anthropic message with structured
         // content blocks. Text-only messages can use the short `content:
@@ -311,7 +276,7 @@ extension AnthropicOAuthTransport {
             // Empty text is never sent beside real content (a tool-only reply
             // leaves one); the API rejects it and a cache marker on it fails the turn.
             let kept = m.content.filter { if case .text(let text) = $0 { !text.isEmpty } else { true } }
-            let blocks = (kept.isEmpty ? m.content : kept).map(AnthropicTransport.anthropicBlock)
+            let blocks = try (kept.isEmpty ? m.content : kept).map(AnthropicTransport.anthropicBlock)
             let entry: [String: Any] = [
                 "role": Self.wireRole(m.role),
                 "content": blocks,
@@ -330,7 +295,7 @@ extension AnthropicOAuthTransport {
             body["stream"] = true
         }
         Self.applyTextLaneStops(to: &body, system: system)
-        FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: coercedModel)
+        try FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: coercedModel)
         return body
     }
 

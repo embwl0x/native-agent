@@ -7,7 +7,7 @@ import PersistenceCore
 /// tool admission chain. No background refresh, app launch or remote probe.
 package enum AgentWorkspaceReadiness {
     struct Snapshot: Sendable {
-        let permissions: MacIntegrationPermissionReadiness?
+        let permissions: Result<MacIntegrationPermissionReadiness, Error>
     }
 
     @TaskLocal static var snapshot: Snapshot?
@@ -17,14 +17,16 @@ package enum AgentWorkspaceReadiness {
     /// across separate actions or write a second permission authority.
     package static func withSnapshot<T: Sendable>(dataRoot: URL,
         operation: @Sendable () async throws -> T) async rethrows -> T {
-        let permissions = try? await MacIntegrationPermissionStore(dataRoot: dataRoot).readinessChecked()
+        let permissions: Result<MacIntegrationPermissionReadiness, Error>
+        do { permissions = .success(try await MacIntegrationPermissionStore(dataRoot: dataRoot).readinessChecked()) }
+        catch { permissions = .failure(error) }
         return try await $snapshot.withValue(Snapshot(permissions: permissions), operation: operation)
     }
 
     static func allows(tool name: String) -> Bool {
         guard let gate = AgentWorkspacePorts.current.tools.macIntegrationGate(name)
             ?? AgentWorkspacePorts.current.tools.macIntegrationGate(name.replacingOccurrences(of: ".", with: "_")) else { return true }
-        guard let permissions = snapshot?.permissions else { return false }
+        guard case .success(let permissions)? = snapshot?.permissions else { return false }
         return !(gate.mode == .read ? permissions.operatorReadOff : permissions.operatorWriteOff).contains(gate.integration)
     }
 
@@ -52,18 +54,30 @@ package enum AgentWorkspaceReadiness {
             item.actions = buttons(item.actions)
             return item
         }
-        if hidden > 0 {
+        let permissions: MacIntegrationPermissionReadiness?
+        let cause: String?
+        switch snapshot?.permissions {
+        case .success(let value)?: permissions = value; cause = nil
+        case .failure(let error)?: permissions = nil; cause = error.localizedDescription
+        case nil: permissions = nil; cause = nil
+        }
+        if hidden > 0 || cause != nil {
             var content: [String: JSONValue]
             if case .object(let row) = result.content { content = row }
             else { content = ["result": result.content] }
-            content["permission_note"] = .string(snapshot?.permissions == nil
+            content["permission_note"] = .string(permissions == nil
                 ? "Mac permission settings could not be read. Integration actions are hidden until those settings are available."
                 : "Actions turned off by the operator are hidden. Existing drafts can still be kept or edited; no permission was changed.")
+            if let cause {
+                content["permission_note"] = .string("Mac permission settings are unavailable: \(cause) Integration actions are hidden until the saved authority is repaired.")
+                content["permission_remedy"] = Repair.why(owner: "security/mac_integration_permissions.json", tap: "Trust > Mac",
+                    instruction: "Preserve the saved permission bytes and repair the authority before continuing.")
+            }
             content["hidden_permission_actions"] = .int(Int64(hidden))
-            if content["preview_note"] != nil, snapshot?.permissions?.operatorWriteOff.contains("mail") == true {
+            if content["preview_note"] != nil, permissions?.operatorWriteOff.contains("mail") == true {
                 content["preview_note"] = .string("Open a recent message to read its body. Mail is read-only; sending and replying are turned off.")
             }
-            if content["conversation_note"] != nil, snapshot?.permissions?.operatorWriteOff.contains("messages") == true {
+            if content["conversation_note"] != nil, permissions?.operatorWriteOff.contains("messages") == true {
                 let history = content["history_status"] == .string("available")
                     ? "This conversation shows bounded local history; any unavailable message formats are labeled."
                     : "Open a conversation for bounded local history when available; its current history status explains any limitation."

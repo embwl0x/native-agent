@@ -5,7 +5,7 @@ import os
 import PersistenceCore
 import TurnTrace
 import Experiences
-// Blueprint: | `LLMClient+Real.swift` | `makeResidentProviderLLMClient` owns the nine-transport assembly for resident, planner and swarm calls; `SwiftNativeLLMClient` shared routing and non-streaming execution envelope, stream guard admission before adapter creation, and failed-call telemetry before error normalization |
+// Blueprint: | `LLMClient+Real.swift` | `makeResidentProviderLLMClient` owns the nine-transport assembly; `SwiftNativeLLMClient` checked throwing serving-provider admission, shared routing, adapter-owned output allowance and whole-reply collection with partial output beside unchanged errors; `ProviderToolCapability.checkedWire` admits the adapter-declared grammar; stream guard admission before adapter creation and failed-call telemetry before normalization; preview skips lifecycle feedback and repair writes |
 
 /// One provider assembly for resident turns and background body work. Routing,
 /// credentials, account catalogs and adapter transports have exactly one owner.
@@ -74,6 +74,7 @@ public func makeResidentProviderLLMClient(
                 telemetryDataRootOverride: telemetryRoot
             ),
             openRouter: OpenRouterTransport(session: stallSession ?? .shared, dataRootOverride: credentialRoot),
+            diagnosticDataRoot: dataRoot,
             streamGuardConfig: streamGuard,
             lifecycleObserver: lifecycleObserver,
             moonshotCatalogDataRoot: credentialRoot ?? PersistenceCore.defaultDataRoot()
@@ -101,6 +102,21 @@ private struct AlternateRootUnavailableChatLLMClient: LLMClient {
                   purpose: String, tools: [LLMToolSchema]?) async throws -> String {
         throw unavailable()
     }
+
+    func servingProviderID(model: String?, surface: String) async throws -> String {
+        throw unavailable()
+    }
+}
+
+extension ProviderToolCapability {
+    /// Execution distinguishes a known text-only adapter from an unknown
+    /// route. Missing capability cannot authorize a tool grammar.
+    public static func checkedWire(providerID: String) throws -> ProviderToolWire {
+        guard let transport = transport(providerID: providerID) else {
+            throw LLMError.notConfigured(provider: providerID)
+        }
+        return transport.toolWire
+    }
 }
 /// One provider transport, selected by the call's checked explicit provider route.
 public protocol LLMTransport: Sendable {
@@ -108,6 +124,8 @@ public protocol LLMTransport: Sendable {
     static var toolWire: ProviderToolWire { get }
     static var carriesImages: Bool { get }
     var providerId: String { get }
+    /// Exact wire output cap; zero explicitly declares no output-cap field.
+    func requestOutputTokens(model: String) throws -> Int
     /// Adapters declare whether native schemas or the text tool protocol
     /// can reach the provider; Codex CLI does not carry NativeAgent tools.
     func complete(
@@ -247,6 +265,7 @@ public final class SwiftNativeLLMClient: LLMClient {
     /// non-production wirings keep compiling — when nil, an `openrouter` route
     /// fails `notConfigured(provider: "openrouter")`.
     private let openRouter: (any LLMTransport)?
+    private let diagnosticDataRoot: URL?
     private let streamGuardConfig: ProviderStreamGuardConfig
     private let lifecycleObserver: (any LLMCallLifecycleObserving)?
     /// Exact root for provider-owned rebuildable model catalogs. The public
@@ -266,6 +285,7 @@ public final class SwiftNativeLLMClient: LLMClient {
         moonshot: (any LLMTransport)? = nil,
         kimiCode: (any LLMTransport)? = nil,
         openRouter: (any LLMTransport)? = nil,
+        diagnosticDataRoot: URL? = nil,
         streamGuardConfig: ProviderStreamGuardConfig = .fromEnvironment(),
         lifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
         moonshotCatalogDataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -280,6 +300,7 @@ public final class SwiftNativeLLMClient: LLMClient {
         self.moonshot = moonshot
         self.kimiCode = kimiCode
         self.openRouter = openRouter
+        self.diagnosticDataRoot = diagnosticDataRoot
         self.streamGuardConfig = streamGuardConfig
         self.lifecycleObserver = lifecycleObserver
         self.moonshotCatalogDataRoot = moonshotCatalogDataRoot
@@ -330,7 +351,7 @@ public final class SwiftNativeLLMClient: LLMClient {
             reasoningEffort: reasoningEffort,
             streaming: streaming
         )
-        await lifecycleObserver?.observeProviderCall(event)
+        if !LLMCallContext.preview { await lifecycleObserver?.observeProviderCall(event) }
         return event
     }
 
@@ -341,6 +362,7 @@ public final class SwiftNativeLLMClient: LLMClient {
         streamKind: LLMMessagesStreamKind? = nil,
         error: Error? = nil
     ) async {
+        guard !LLMCallContext.preview else { return }
         var noReply = false
         if case .noReply? = error.flatMap(ProviderFailure.classify) { noReply = true }
         guard let terminal = started.terminal(
@@ -372,6 +394,9 @@ public final class SwiftNativeLLMClient: LLMClient {
                 .recordNoReply(provider: started.providerId, seconds: seconds, events: events, surface: started.surface)
         }
         if case .outputLengthLimit = error as? LLMError { return error }
+        // This owns valid pipe prefixes and exact invalid bytes. A prose-only
+        // Diagnostic would discard the evidence needed to repair the encoding.
+        if error is CodexOutputEncodingFailure { return error }
         if ProviderFailure.classify(error) == .contextTooLong { return ProviderFailure.normalize(error) }
         let detail = ProviderFailure.diagnosticDescription(error)
         let repair = ProviderFailure.repair(error, provider: started.providerId, model: started.model, surface: started.surface,
@@ -411,18 +436,23 @@ public final class SwiftNativeLLMClient: LLMClient {
 
     /// The provider `streamMessages` resolves for this call — the same
     /// snapshot, requested-model and adapter resolution, under the caller's
-    /// bound `LLMCallContext`. Nil when the call itself would fail there first.
-    /// An admitted route already names its provider, so it answers without a
-    /// second picker read; dispatch still revalidates it against the snapshot.
-    public func servingProviderID(model: String?, surface: String) async -> String? {
-        if let bound = LLMCallContext.providerId?.trimmingCharacters(in: .whitespacesAndNewlines), !bound.isEmpty {
-            return ProviderToolCapability.transport(providerID: bound.lowercased()) == nil ? nil : bound.lowercased()
+    /// bound `LLMCallContext`. Read/configuration errors remain their own errors.
+    public func servingProviderID(model: String?, surface: String) async throws -> String {
+        let snapshot = try await checkedRoutingSnapshot()
+        let admission = try snapshot.routeAdmission(for: surface, suppliedModel: model ?? "", inheritingCall: true)
+        let resolution = try resolveAdapter(admission)
+        try validateCatalogAvailability(resolution)
+        return resolution.providerId
+    }
+
+    public func requestOutputTokens(model: String, surface: String) async throws -> Int {
+        let snapshot = try await checkedRoutingSnapshot()
+        let admission = try snapshot.routeAdmission(for: surface, suppliedModel: model, inheritingCall: true)
+        let resolution = try resolveAdapter(admission)
+        try validateCatalogAvailability(resolution)
+        return try LLMCallContext.$reasoningEffort.withValue(admission.reasoningEffort) {
+            try adapter(for: resolution, tools: nil).adapter.requestOutputTokens(model: resolution.model)
         }
-        guard let routingSnapshot = try? await checkedRoutingSnapshot(),
-              let admission = try? routingSnapshot.routeAdmission(for: surface,
-                suppliedModel: model ?? "", inheritingCall: true)
-        else { return nil }
-        return (try? resolveAdapter(admission))?.providerId
     }
 
     /// Exact routes select credentials once; marker-tool admission stays here.
@@ -468,52 +498,20 @@ public final class SwiftNativeLLMClient: LLMClient {
         return chosen
     }
 
-    /// Non-streaming completions need their own wall deadline; the stream guard covers only streams.
-    private func withCompletionWall<T: Sendable>(
-        _ label: String,
-        _ work: @escaping @Sendable () async throws -> T
-    ) async throws -> T {
-        // One wall for every route: a provider's name never shortens its clock.
-        let wall = streamGuardConfig.wallTimeout
-        let admittedWork: @Sendable () async throws -> T = {
-            try await LLMCallContext.$wallOwned.withValue(true) { try await work() }
-        }
-        guard wall > 0 else {
-            return try await ProviderStreamContext.$stallOnly.withValue(true) { try await admittedWork() }
-        }
-        let workTask = Task { try await admittedWork() }
-        return try await withTaskCancellationHandler {
-            do {
-                return try await TurnDeadline.withThrowingDeadline(seconds: wall, clock: .wallClock) {
-                    try await workTask.value
-                }
-            } catch {
-                workTask.cancel()
-                // The response clock may end first; the effect's settlement
-                // still owns its result until the real child and drains exit.
-                let settled = await settle { await workTask.result }
-                if Task.isCancelled, case .success(let value) = settled { return value }
-                if error is TurnDeadline.DeadlineExceeded {
-                    throw ProviderFailure.Diagnostic(cause: .network,
-                        detail: "\(label) completion wall timeout after \(Int(wall))s", deadlineExpired: true)
-                }
-                throw error
-            }
-        } onCancel: { workTask.cancel() }
-    }
-
     private func checkedRoutingSnapshot() async throws -> ProviderRoutingSnapshot {
         do {
             let snapshot = try await router.checkedRoutingSnapshot()
-            RepairOwed.settle(moonshotCatalogDataRoot, operation: "provider.routing.read",
-                             evidence: .init(source: "provider.routing", id: UUID().uuidString))
+            if !LLMCallContext.preview {
+                RepairOwed.settle(moonshotCatalogDataRoot, operation: "provider.routing.read",
+                                 evidence: .init(source: "provider.routing", id: UUID().uuidString))
+            }
             return snapshot
         }
         catch is CancellationError { throw CancellationError() }
         catch let error as URLError where error.code == .cancelled { throw CancellationError() }
         catch let failure as ToolFailureError {
             let id = "routing-repair:" + UUID().uuidString
-            if let owner = failure.owner {
+            if !LLMCallContext.preview, let owner = failure.owner {
                 RepairOwed.owe(moonshotCatalogDataRoot, id: id, kind: .act, operation: "provider.routing.read",
                     owner: owner, words: failure.message, nextCall: failure.nextCall, tap: failure.tap)
             }
@@ -533,66 +531,12 @@ public final class SwiftNativeLLMClient: LLMClient {
         purpose: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        try await LLMCallContext.$purpose.withValue(purpose) {
-            if LLMCallContext.turnTokenBudget != nil {
-                var result = ""
-                for try await event in streamMessages(messages: [.user(prompt)], system: system, model: model, surface: surface, tools: tools) {
-                    switch event {
-                    case .textDelta(let text): result += text
-                    case .toolCall(let call):
-                        let args = String(decoding: call.inputJSON, as: UTF8.self)
-                        result += "\n<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(args)</tool_use>"
-                    case .keepAlive, .replyTextSettled, .toolBoundary: break
-                    }
-                }
-                return result
+        try await LLMCallContext.$surface.withValue(surface) {
+            try await LLMCallContext.$purpose.withValue(purpose) {
+                return try await LLMMessageStreamEvent.reply(collecting:
+                    self.streamMessages(messages: [.user(prompt)], system: system, model: model, surface: surface, tools: tools),
+                    using: LLMCallTraceRecorder(dataRootOverride: diagnosticDataRoot))
             }
-            return try await executeCompletion(model: model, surface: surface, tools: tools) { adapter, effectiveModel in
-                try await adapter.complete(prompt: prompt, system: system, model: effectiveModel, tools: tools)
-            }
-        }
-    }
-
-    private func executeCompletion(
-        model: String?,
-        surface: String,
-        tools: [LLMToolSchema]?,
-        operation: @escaping @Sendable (any LLMTransport, String) async throws -> String
-    ) async throws -> String {
-        let routingSnapshot = try await checkedRoutingSnapshot()
-        let admission = try routingSnapshot.routeAdmission(for: surface,
-            suppliedModel: model ?? "", inheritingCall: true)
-        let resolution = try resolveAdapter(admission)
-        ProviderToolCapability.recordOfferedTools(providerID: resolution.providerId, tools: tools)
-        let attemptStartedAt = ProcessInfo.processInfo.systemUptime
-        let lifecycle = await providerLifecycleStart(
-            resolution: resolution,
-            surface: surface,
-            streaming: false,
-            reasoningEffort: admission.reasoningEffort
-        )
-        let recorded = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Receipt())
-        do {
-            try validateCatalogAvailability(resolution)
-            let result = try await withCompletionWall(resolution.providerId) { [self] in
-                    try await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) {
-                        try await LLMCallContext.$surface.withValue(surface) {
-                            try await LLMCallContext.$reasoningEffort.withValue(admission.reasoningEffort) {
-                                try await LLMCallContext.$serviceTier.withValue(admission.serviceTier) {
-                                    try await operation(adapter(for: resolution, tools: tools).adapter, resolution.model)
-                                }
-                            }
-                        }
-                    }
-            }
-            await providerLifecycleFinish(lifecycle, phase: Task.isCancelled ? .cancelled : .succeeded)
-            return result
-        } catch is CancellationError {
-            await providerLifecycleFinish(lifecycle, phase: .cancelled)
-            throw CancellationError()
-        } catch {
-            await providerLifecycleFinish(lifecycle, phase: .failed)
-            throw await recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
         }
     }
 
@@ -614,9 +558,19 @@ public final class SwiftNativeLLMClient: LLMClient {
                 let recorded = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Receipt())
                 recorded.withLock { $0.requestBytes = requestBytes }
                 do {
+                    if !ConversationPrefixTelemetry.requestShapeUnmeasured,
+                       LLMCallContext.conversationRequest {
+                        // Count the final request, never a second transcript projection.
+                        recorded.withLock {
+                            $0.requestCharacters = LLMMessage.inputCharacters(messages, system: system, tools: tools ?? [])
+                            $0.requestPlan = LLMCallContext.sessionRequestPlan
+                        }
+                    }
+                    try self.streamGuardConfig.validate()
                     let routingSnapshot = try await self.checkedRoutingSnapshot()
                     let admission = try routingSnapshot.routeAdmission(for: surface,
                         suppliedModel: model ?? "", inheritingCall: true)
+                    if ProviderReplyWork.current?.isStopped == true { throw CancellationError() }
 
                     var streamGuardConfig = self.streamGuardConfig
 
@@ -625,7 +579,10 @@ public final class SwiftNativeLLMClient: LLMClient {
                         providerLabel: String
                     ) async throws {
                     let guardedStream = ProviderStreamGuard.wrap(
-                            makeUpstream: { LLMCallContext.$wallOwned.withValue(true) { makeStream() } },
+                            makeUpstream: { LLMCallContext.$wallOwned.withValue(true) {
+                                LLMCallContext.$traceDataRootOverride.withValue(
+                                    LLMCallContext.traceDataRootOverride ?? self.diagnosticDataRoot) { makeStream() }
+                            } },
                             config: streamGuardConfig,
                             providerLabel: providerLabel,
                             isOutput: { _ in true }
@@ -684,6 +641,7 @@ public final class SwiftNativeLLMClient: LLMClient {
                     }
                     // EOF can arrive as nil after cancellation; check before recording success.
                     try Task.checkCancellation()
+                    if ProviderReplyWork.current?.isStopped == true { throw CancellationError() }
                     await self.providerLifecycleFinish(started, phase: .succeeded, receipt: recorded,
                                                        streamKind: streamKind)
                     continuation.finish()
@@ -704,6 +662,7 @@ public final class SwiftNativeLLMClient: LLMClient {
                 }
                 }
             }
+            ProviderReplyWork.current?.own(task, stop: {})
             continuation.onTermination = { _ in task.cancel() }
         }
     }
@@ -713,7 +672,7 @@ public final class SwiftNativeLLMClient: LLMClient {
 // MARK: - Credentials resolver
 
 /// One credential source per API-key provider: the Keychain reference Settings
-/// saves into `<dataRoot>/providers/<providerConfigFile>` (or a legacy api_key). No environment
+/// saves into `<dataRoot>/providers/<providerConfigFile>`. No environment
 /// variable and no other provider's file (the Codex CLI's `auth.json`) is
 /// consulted — a key that is not there is `nil`, and the caller fails with
 /// `notConfigured` naming the provider.
@@ -728,6 +687,9 @@ public enum LLMCredentialResolver {
             catch CocoaError.fileReadNoSuchFile { return nil }
             guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 throw CocoaError(.fileReadCorruptFile)
+            }
+            guard object["api_key"] == nil else {
+                throw ProviderFailure.Diagnostic(cause: .routingUnavailable, detail: "This provider has plaintext API-key bytes instead of a Keychain reference. Save the key in Providers to repair its storage.")
             }
             return try checkedAPIKey(providerConfigObject: object)
         } catch {
@@ -750,35 +712,74 @@ public enum LLMCredentialResolver {
         return key?.isEmpty == false ? key : nil
     }
 
-    public static func resolveAPIKey(providerConfigFile: String, dataRoot: URL) -> String? {
-        try? checkedAPIKey(providerConfigFile: providerConfigFile, dataRoot: dataRoot)
-    }
-
-    /// Use the caller's locked config snapshot so readiness and defaults use the same bytes.
-    public static func resolveAPIKey(providerConfigObject: [String: Any]?) -> String? {
-        try? checkedAPIKey(providerConfigObject: providerConfigObject)
-    }
 }
 
 extension LLMMessageStreamEvent {
     /// A whole reply is its stream, collected: text, then each complete call as a
     /// `<tool_use id name>args</tool_use>` marker. Every provider's buffered call is this,
     /// so a reply is decoded, validated and receipted exactly once, the way a turn's is.
-    public static func reply(collecting events: AsyncThrowingStream<LLMMessageStreamEvent, Error>) async throws -> String {
-        var text = ""
-        var markers: [String] = []
-        for try await event in events {
-            switch event {
-            case .textDelta(let delta): text += delta
-            case .toolCall(let call):
-                let arguments = String(decoding: call.inputJSON, as: UTF8.self)
-                markers.append("<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(arguments)</tool_use>")
-            case .toolBoundary(.outputLimit): throw LLMError.outputLengthLimit(partial: text)
-            case .keepAlive, .replyTextSettled, .toolBoundary: break
+    public static func reply(
+        collecting events: @autoclosure @escaping @Sendable () -> AsyncThrowingStream<LLMMessageStreamEvent, Error>,
+        using recorder: LLMCallTraceRecorder
+    ) async throws -> String {
+        let work = ProviderReplyWork()
+        // An unstructured task inherits the call's route, trace and partial
+        // sink, but not its cancellation. Its value is always joined below.
+        let collector = Task {
+            await ProviderReplyWork.$current.withValue(work) {
+                do {
+                    if work.isStopped { throw CancellationError() }
+                    return Result<String, Error>.success(try await collect(events(), using: recorder, work: work))
+                } catch { return Result<String, Error>.failure(error) }
             }
         }
-        try Task.checkCancellation()
-        return ([text.trimmingCharacters(in: .whitespacesAndNewlines)] + markers)
-            .filter { !$0.isEmpty }.joined(separator: "\n")
+        let result = await withTaskCancellationHandler {
+            await settle { await collector.value }
+        } onCancel: { work.stop() }
+        return try result.get()
+    }
+
+    private static func collect(
+        _ events: AsyncThrowingStream<LLMMessageStreamEvent, Error>,
+        using recorder: LLMCallTraceRecorder,
+        work: ProviderReplyWork
+    ) async throws -> String {
+        var text = ""
+        var markers: [String] = []
+        func output(trimmed: Bool = false) -> String {
+            let prose = trimmed ? text.trimmingCharacters(in: .whitespacesAndNewlines) : text
+            return ([prose] + markers).filter { !$0.isEmpty }.joined(separator: "\n")
+        }
+        do {
+            for try await event in events {
+                switch event {
+                case .textDelta(let delta): text += delta
+                case .toolCall(let call):
+                    let arguments = String(decoding: call.inputJSON, as: UTF8.self)
+                    markers.append("<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(arguments)</tool_use>")
+                case .toolBoundary(.outputLimit):
+                    // A budget cut cannot authorize calls from this reply.
+                    markers.removeAll()
+                    throw LLMError.outputLengthLimit(partial: text)
+                case .keepAlive, .replyTextSettled, .toolBoundary: break
+                }
+            }
+            await work.join()
+            if work.isStopped { throw CancellationError() }
+            return output(trimmed: true)
+        } catch {
+            // A deadline or decoding failure also stops and joins live work.
+            // Never publish a terminal partial while its producer still runs.
+            let stoppedByCaller = work.isStopped
+            work.stop()
+            await work.join()
+            let failure: any Error = stoppedByCaller ? CancellationError() : error
+            let partial = output()
+            // Partial text is evidence beside the failure, never its type.
+            // Neither sink throws or checks cancellation: Stop still settles.
+            await LLMCallContext.partialReply?(partial)
+            await recorder.recordPartialReply(output: partial, error: failure)
+            throw failure
+        }
     }
 }

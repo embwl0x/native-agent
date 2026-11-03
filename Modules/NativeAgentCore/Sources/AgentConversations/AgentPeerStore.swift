@@ -1,33 +1,20 @@
 import AgentLinkTransport
 import AgentWorkspace
 import Darwin
+import Dispatch
 import Foundation
+import Experiences
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
+import TurnTrace
 // Blueprint: | `AgentPeerStore.swift` | Canonical contact decoding, identity projections and proof; authenticated inbound proof connects hosts without a command line too. `isReady` checks route/key proof, unavailable mark and ACP startability, while `AgentContactHealth` owns version/digest freshness. `list` prepares/chmods its directory before reading; summaries retain every contact with reachability and owner trust separately |
 
 // AgentPeerStore owns agents/peers.json's checked contact array. Local backup
 // and export exclude contacts; phone sync projects helpers, never this file or
 // credentials. PrivacyMap lists Agent Contacts.
 
-public enum AgentPeerTransport: String, Codable, Sendable {
-    case a2a
-    case nativeAgent
-    case desktop
-    /// An agent host ON THIS MAC that this app set itself up inside: that
-    /// host's own MCP configuration now carries one entry running
-    /// `nativeagent-link mcp` with this connection's key in it. The host CALLS
-    /// IN, so the endpoint is an identity (`mcp://<host row id>`), never an
-    /// address to send to.
-    case mcpHost
-    case acp
-    case grokBot
-    /// A chat app on this Mac driven through its window (`app://<bundle id>`):
-    /// the message is typed into the agent's own thread there and its answer
-    /// read back in the same call. The thread's title is the conversation_id.
-    case desktopChat
-}
+public typealias AgentPeerTransport = NativeAgentCore.AgentPeerTransport
 
 /// Historical evidence, not a promise that the route is currently available.
 public struct AgentRoundTripProof: Codable, Sendable, Equatable {
@@ -67,10 +54,10 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     /// What "unverified" later compares against: the recipe the send used,
     /// as the transport captured it when the send started, and the app's own
     /// version (CFBundleShortVersionString).
-    func stampVersions(_ proof: inout AgentRoundTripProof, recipe: AgentRecipeStore.Recipe?) {
+    func stampVersions(_ proof: inout AgentRoundTripProof, recipe: AgentRecipeStore.Recipe?) throws {
         if let recipe {
             proof.recipeVersion = recipe.recipeVersion
-            proof.recipeDigest = recipe.hostDigest
+            proof.recipeDigest = try recipe.hostDigest
         }
         guard let app = appBundleIDs.compactMap(AgentHostRow.applicationURL).first else { return }
         proof.appVersion = Self.appVersion(at: app.path)
@@ -129,9 +116,14 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
 
     /// Why the person's grant cannot take effect on this contact now, from the
     /// credential owner's checked answer; nil when its own key resolves.
-    public func elevationUnavailable(peers: [AgentPeerContact], available: Bool? = nil) -> ToolFailureError? {
+    public func elevationUnavailable(peers: [AgentPeerContact], availability: Result<Bool, ToolFailureError>? = nil) -> ToolFailureError? {
+        let available: Bool
+        switch availability ?? AgentPeerCredentials.availability(self, peers: peers) {
+        case .success(let value): available = value
+        case .failure(let failure): return failure
+        }
         if credentialKey == Self.credentialKey(for: id),
-           available ?? AgentPeerCredentials.isAvailable(self, peers: peers) { return nil }
+           available { return nil }
         // Connect re-mints a key on this same contact only for a settings host;
         // any other route's key comes from that agent, through the person.
         let repairable = AgentPeerStore.hostRowID(endpoint).flatMap(AgentHostDirectory.row(named:))
@@ -316,16 +308,38 @@ public struct AgentPeerStore: Sendable {
 
     /// Saved contacts for turn orientation; reachability never removes a contact.
     package func contactSummaries() throws -> [String] {
+        let start = DispatchTime.now().uptimeNanoseconds
         let peers = try read()
         let health = AgentLocalHealth.read(fileURL.deletingLastPathComponent().deletingLastPathComponent())
-        return peers.map { peer in
+        // Availability checks each token against every configured contact.
+        // Read each key once for this summary, including missing/unreadable
+        // results; the next summary and every effect still read afresh.
+        var credentials: [String: Result<String?, any Error>] = [:]
+        func credential(_ id: String) throws -> String? {
+            if let kept = credentials[id] { return try kept.get() }
+            let result = Result { try AgentPeerCredentials.read(peerID: id) }
+            credentials[id] = result
+            return try result.get()
+        }
+        let summaries = peers.map { peer in
             let observed = health["peer:" + peer.id]
+            let available: Bool
+            switch AgentPeerCredentials.availability(peer, peers: peers, readCredential: credential) {
+            case .success(let value): available = value
+            case .failure(let failure):
+                return "\(peer.name) (reachability: unavailable; credential error: \(failure.localizedDescription); trusted: \(peer.elevationAllowed ? "on" : "off"))"
+            }
             let unavailable = peer.grokSetup == "disconnected" || peer.unavailableAt != nil
-                || !AgentPeerCredentials.isAvailable(peer, peers: peers)
+                || !available
             let reachability = unavailable ? "unavailable"
                 : observed?.current == true ? observed!.replyStatus.replacingOccurrences(of: "_", with: " ") : "not checked"
             return "\(peer.name) (reachability: \(reachability); trusted: \(peer.elevationAllowed ? "on" : "off"))"
         }.sorted()
+        TurnTraceBus.fireFromContext(kind: "context.contacts.summary", payload: .object([
+            "elapsedMs": .int(Int64((DispatchTime.now().uptimeNanoseconds &- start) / 1_000_000)),
+            "contactCount": .int(Int64(peers.count)), "credentialReads": .int(Int64(credentials.count))
+        ]))
+        return summaries
     }
 
     public func rename(_ agent: String, name: String) throws -> JSONValue {
@@ -340,7 +354,7 @@ public struct AgentPeerStore: Sendable {
                 throw ToolFailureError("Choose one saved agent from agent.contacts to rename.", argumentPath: "agent", effects: .none)
             }
             peers[index].name = name
-            try Self.validate(peers[index], allowRetiredHost: true)
+            try Self.validate(peers[index])
             try write(peers)
             return .object(["status": .string("renamed"), "agent": .string("peer:" + peers[index].id), "name": .string(name)])
         }
@@ -457,17 +471,26 @@ public struct AgentPeerStore: Sendable {
     /// THE ONLY WRITER OF PROOF. A round trip is recorded where it actually
     /// happens — an inbound request that carried this connection's key, an
     /// outbound message that really left — and nowhere else. Unknown ids and
-    /// unreadable configuration are silent: evidence that cannot be written is
-    /// never an error the caller can turn into a claim.
+    /// unreadable configuration retain an explicit evidence-persistence debt;
+    /// already completed work is never repeated to recreate a missing proof.
     public func recordProof(peerID: String, inbound: Bool = false, outbound: Bool = false,
                             message: String? = nil) {
         guard inbound || outbound, Self.validID(peerID) else { return }
-        let stamp = ISO8601DateFormatter().string(from: Date())
-        try? prepareDirectory()
-        try? CredentialFileLock.withLock(fileURL) {
+        let contactAt = Date()
+        let stamp = NativeTimestampFormat.fractionalZulu(contactAt)
+        retainEvidence(peerID: peerID, operation: "proof") {
             var peers = try read()
-            guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return }
-            if inbound { peers[index].provenInboundAt = stamp }
+            guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return false }
+            if inbound {
+                peers[index].provenInboundAt = stamp
+                if peers[index].transport != .acp && peers[index].transport != .desktop,
+                   peers[index].credentialKey == AgentPeerContact.credentialKey(for: peerID),
+                   let unavailable = peers[index].unavailableAt {
+                    if let marked = NativeTimestampFormat.parseISO8601FractionalFirst(unavailable), marked < contactAt {
+                        peers[index].unavailableAt = nil
+                    }
+                }
+            }
             if inbound, var probe = peers[index].connectionProbe,
                probe.receivedAt == nil, probe.expiresAt > Date(),
                probe.endpoint == peers[index].endpoint, probe.credentialKey == peers[index].credentialKey,
@@ -477,6 +500,7 @@ public struct AgentPeerStore: Sendable {
             }
             if outbound { peers[index].provenOutboundAt = stamp }
             try write(peers)
+            return true
         }
     }
 
@@ -498,8 +522,8 @@ public struct AgentPeerStore: Sendable {
 
     /// Consume this exact challenge once; unrelated, stale and replayed traffic cannot prove it.
     package func finishConnectionProbe(peerID: String, nonce: String, ran: Bool, workspace: String,
-                                       recipe: AgentRecipeStore.Recipe? = nil) -> Bool {
-        (try? CredentialFileLock.withLock(fileURL) {
+                                       recipe: AgentRecipeStore.Recipe? = nil) throws -> Bool {
+        try CredentialFileLock.withLock(fileURL) {
             var peers = try read()
             guard let index = peers.firstIndex(where: { $0.id == peerID }),
                   let probe = peers[index].connectionProbe, probe.nonce == nonce else { return false }
@@ -510,12 +534,12 @@ public struct AgentPeerStore: Sendable {
             if arrived, let at = probe.receivedAt {
                 peers[index].mcpReturnProof = AgentRoundTripProof(at: at, endpoint: peer.endpoint,
                     executable: nil, version: nil, workspace: workspace, credentialKey: peer.credentialKey)
-                peer.stampVersions(&peers[index].mcpReturnProof!, recipe: recipe)
+                try peer.stampVersions(&peers[index].mcpReturnProof!, recipe: recipe)
                 peers[index].unavailableAt = nil
             }
             try write(peers)
             return arrived
-        }) ?? false
+        }
     }
 
     /// Called only by a transport after a validated response to its request.
@@ -523,43 +547,63 @@ public struct AgentPeerStore: Sendable {
     /// one the send used, captured when it started; a route no recipe drives has none.
     public func recordRoundTrip(peerID: String, executable: String? = nil,
                                 version: String? = nil, workspace: String, recipe: AgentRecipeStore.Recipe? = nil) {
-        try? prepareDirectory()
-        try? CredentialFileLock.withLock(fileURL) {
+        retainEvidence(peerID: peerID, operation: "round-trip") {
             var peers = try read()
-            guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return }
+            guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return false }
             let peer = peers[index]
             var proof = AgentRoundTripProof(
-                at: ISO8601DateFormatter().string(from: Date()), endpoint: peer.endpoint,
+                at: NativeTimestampFormat.fractionalZulu(Date()), endpoint: peer.endpoint,
                 executable: executable, version: version, workspace: workspace, credentialKey: peer.credentialKey)
-            peer.stampVersions(&proof, recipe: recipe)
+            try peer.stampVersions(&proof, recipe: recipe)
             peers[index].roundTripProof = proof
             peers[index].unavailableAt = nil
             try write(peers)
+            return true
         }
     }
 
     /// Clear unavailable marks at or after `since`, retaining ambiguous same-second timestamps.
     public func clearUnavailable(peerID: String, since: Date) {
-        try? CredentialFileLock.withLock(fileURL) {
+        retainEvidence(peerID: peerID, operation: "clear-unavailable") {
             var peers = try read()
             guard let index = peers.firstIndex(where: { $0.id == peerID }),
-                  let stamp = peers[index].unavailableAt else { return }
+                  let stamp = peers[index].unavailableAt else { return false }
             let fractional = stamp.contains(".")
             guard let marked = NativeTimestampFormat.parseISO8601FractionalFirst(stamp), marked >= since,
-                  fractional || marked > since else { return }
+                  fractional || marked > since else { return false }
             peers[index].unavailableAt = nil
             try write(peers)
+            return true
         }
     }
 
     public func recordUnavailable(peerID: String) {
-        try? prepareDirectory()
-        try? CredentialFileLock.withLock(fileURL) {
+        retainEvidence(peerID: peerID, operation: "unavailable") {
             var peers = try read()
-            guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return }
+            guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return false }
             peers[index].unavailableAt = NativeTimestampFormat.fractionalZulu(Date())
             try write(peers)
+            return true
         }
+    }
+
+    private func retainEvidence(peerID: String, operation: String, _ mutation: () throws -> Bool) {
+        do {
+            try prepareDirectory()
+            if try CredentialFileLock.withLock(fileURL, mutation) {
+                RepairOwed.settle(fileURL.deletingLastPathComponent().deletingLastPathComponent(),
+                    operation: "agent.contact.evidence:" + peerID + ":" + operation,
+                    evidence: .init(source: fileURL.path, id: peerID))
+            }
+        } catch { recordEvidenceFailure(peerID: peerID, operation: operation, error: error) }
+    }
+
+    public func recordEvidenceFailure(peerID: String, operation: String, error: Error) {
+        RepairOwed.owe(fileURL.deletingLastPathComponent().deletingLastPathComponent(),
+            id: UUID().uuidString.lowercased(), kind: .act,
+            operation: "agent.contact.evidence:" + peerID + ":" + operation, owner: fileURL.path,
+            words: "Contact \(peerID) \(operation) evidence could not be retained: \(error.localizedDescription). Its completed work must not be resent to replace missing evidence.",
+            lever: "Repair the contact evidence store, then reconcile the original operation's receipt.")
     }
 
     /// Discovery cannot replace an existing identity or its credentials. Exact
@@ -602,12 +646,8 @@ public struct AgentPeerStore: Sendable {
             return AgentHostDirectory.rows.first { $0.route == .desktopChat && $0.bundleIDs.contains(bundle) }?.id
         }
         guard let host = endpoint.host, ["mcp://" + host, "acp://" + host, "grok://" + host].contains(endpoint.absoluteString) else { return nil }
-        // Preserve saved ACP identities from before the shared directory landed,
-        // while resolving them to its one canonical row.
-        let aliases = ["gemini": "gemini-cli", "cursor-agent": "cursor-cli"]
-        let id = endpoint.scheme == "acp" ? aliases[host] ?? host : host
-        guard AgentHostDirectory.rows.contains(where: { $0.id == id }) else { return nil }
-        return id
+        guard AgentHostDirectory.rows.contains(where: { $0.id == host }) else { return nil }
+        return host
     }
 
     public static func desktopBundleID(_ endpoint: URL) -> String? {
@@ -633,10 +673,6 @@ public struct AgentPeerStore: Sendable {
     }
 
     public static func validate(_ contact: AgentPeerContact) throws {
-        try validate(contact, allowRetiredHost: false)
-    }
-
-    private static func validate(_ contact: AgentPeerContact, allowRetiredHost: Bool) throws {
         guard validID(contact.id), !contact.name.isEmpty,
               contact.name.count <= maximumNameLength,
               contact.name.utf8.count <= maximumNameLength * 4,
@@ -682,10 +718,8 @@ public struct AgentPeerStore: Sendable {
                   host.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || $0 == 45 })
             else { throw AgentPeerStoreError.invalidEndpoint.failure() }
             let row = hostRowID(contact.endpoint).flatMap { id in AgentHostDirectory.rows.first { $0.id == id } }
-            // Saved retired identities remain checked and removable; upsert rejects them.
-            guard row != nil || allowRetiredHost,
-                  contact.transport != .acp || row == nil || row?.acp != nil else { throw AgentPeerStoreError.invalidEndpoint.failure() }
-            if row?.requiresWorkspace == true || (row == nil && contact.hostWorkspace != nil) {
+            guard let row, contact.transport != .acp || row.acp != nil else { throw AgentPeerStoreError.invalidEndpoint.failure() }
+            if row.requiresWorkspace {
                 guard let folder = contact.hostWorkspace, folder.hasPrefix("/"),
                       !folder.contains("\0"), folder.utf8.count <= 4096 else { throw AgentPeerStoreError.invalidEndpoint.failure() }
             } else if contact.hostWorkspace != nil { throw AgentPeerStoreError.invalidEndpoint.failure() }
@@ -747,7 +781,7 @@ public struct AgentPeerStore: Sendable {
             guard peers.count <= Self.maximumContacts, Set(peers.map(\.id)).count == peers.count else {
                 throw AgentPeerStoreError.invalidConfiguration.failure(file: fileURL)
             }
-            for peer in peers { try Self.validate(peer, allowRetiredHost: true) }
+            for peer in peers { try Self.validate(peer) }
             return peers
         } catch { throw AgentPeerStoreError.invalidConfiguration.failure(file: fileURL) }
     }
@@ -762,8 +796,11 @@ public struct AgentPeerStore: Sendable {
 }
 
 extension AgentContactIdentity {
-    public init(dataRoot: URL, peers: [AgentPeerContact]? = nil) {
-        let contacts = peers ?? (try? AgentPeerStore(dataRoot: dataRoot).read()) ?? []
+    public init(dataRoot: URL, peers: [AgentPeerContact]? = nil) throws {
+        let contacts = try peers ?? AgentPeerStore(dataRoot: dataRoot).read()
+        self.init(contacts: contacts)
+    }
+    public init(contacts: [AgentPeerContact]) {
         self.init(peers: contacts.map { peer in
             ["id": peer.id, "name": peer.name, "who": peer.who, "endpoint": peer.endpoint.absoluteString,
              "transport": peer.transport.rawValue].compactMapValues { $0 }

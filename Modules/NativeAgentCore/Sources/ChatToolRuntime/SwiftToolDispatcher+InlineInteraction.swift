@@ -56,6 +56,9 @@ extension SwiftToolDispatcher {
             case "missing_target":
                 path = "$.target"
                 accepted = "A canonical ID supported by the selected kind in request_interaction. Inspect its tool contract; do not invent an ID or widen permission."
+            case "invalid_mode":
+                path = "$.mode"
+                accepted = "read, write or read_write"
             default:
                 path = "$"
                 accepted = "A supported kind, target and additional targets with an available control in this app. Inspect request_interaction's tool contract."
@@ -115,6 +118,17 @@ extension SwiftToolDispatcher {
                 declineConsequence: declineConsequence
             )
         case .permission:
+            for key in ["mode", "access"] {
+                if let supplied = input[key], supplied != .null {
+                    guard case .string(let raw) = supplied else {
+                        return failed("invalid_mode", "Permission mode must be read, write or read_write.")
+                    }
+                    let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard value.isEmpty || InlineInteraction.AccessMode(rawValue: value) != nil else {
+                        return failed("invalid_mode", "Unknown permission mode: \(value). Use read, write or read_write.")
+                    }
+                }
+            }
             let access = text("mode", "access").flatMap { InlineInteraction.AccessMode(rawValue: $0) }
             // A chain she can predict is ONE ask. Extra capabilities are
             // canonical ids from the Mac list; anything the registry does not
@@ -166,17 +180,17 @@ extension SwiftToolDispatcher {
                 }
                 automation.append(permission)
             }
-            if integrationAllowed, !capabilities.isEmpty, capabilities.allSatisfy({
-                SystemPermissionPreflight.cardSettingsCapability($0) != nil
-                    && (!InlineInteractionRegistry.isMacControlCategory($0)
-                        || InlineInteractionRegistry.macControlCategoryAllowed($0, dataRoot: dataRoot))
+            do {
+            if integrationAllowed, !capabilities.isEmpty, try capabilities.allSatisfy({
+                guard SystemPermissionPreflight.cardSettingsCapability($0) != nil else { return false }
+                guard InlineInteractionRegistry.isMacControlCategory($0) else { return true }
+                return try InlineInteractionRegistry.macControlCategoryAllowed($0, dataRoot: dataRoot)
             }), await SystemPermissionPreflight.cardBlockReason(capabilities, mode: access) == nil {
                 return .object(["status": .string("ok"), "already_done": .bool(true), "effects": .string("none"),
                     "summary": .string("Permission is already allowed; no card is needed."), "automation": .array(automation)])
             }
-            // She may say which axis she needs; she cannot widen one. An
-            // unknown value reads as "both", which is what the card would have
-            // said before this field existed.
+            } catch { return ChatToolOutcome.failure(error: error, tool: InlineInteractionWire.toolName) }
+            // Omission requests both axes; every supplied mode was checked above.
             interaction = InlineInteractionRegistry.permission(
                 capabilities,
                 why: why,

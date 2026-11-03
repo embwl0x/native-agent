@@ -94,7 +94,7 @@ enum AgentWorkspaceActionReadback {
                 source = .record(tool: "recall_memory", input: ["memory_id": .string(id), "max_characters": .int(2000)], title: "Recorded memory")
             }
             if tool == "desk_add_item", let handle = string(owner["handle"]) {
-                source = .record(tool: "desk_read", input: ["handle": .string(handle), "structured": .bool(true)], title: "Created work")
+                source = .record(tool: "desk_read", input: ["handle": .string(handle)], title: "Created work")
             }
         }
         if let source, case .record(let reader, let arguments, _) = source {

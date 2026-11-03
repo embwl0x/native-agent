@@ -4,7 +4,7 @@ import Network
 import PersistenceCore
 import Security
 import NativeAgentShared
-// Blueprint: | `BrowserIPCServer.swift` | browser IPC routing with NativeLoopbackListener and BridgeCore HTTP parsing/writing; invalid response objects close the connection; browser_ipc.json alone publishes endpoint/token discovery and Doctor readiness events, with backup/export/phone exclusions and privacy coverage; no duplicate token file writer; connection retirement cancels its routed task; deadlines report unknown effect outcome |
+// Blueprint: | `BrowserIPCServer.swift` | browser IPC routing with NativeLoopbackListener and BridgeCore; checked private browser_ipc.json publication precedes port/readiness admission; failure stops the listener and retains its cause for Doctor; connection retirement cancels its task; deadlines report unknown effect outcome; discovery excluded from backup/export/phone |
 
 @MainActor
 public final class BrowserIPCServer: BridgeHTTPServer {
@@ -19,9 +19,17 @@ public final class BrowserIPCServer: BridgeHTTPServer {
     private var connectionOperations: [ObjectIdentifier: Task<Void, Never>] = [:]
     public private(set) var ipcToken: String = ""
     public private(set) var ipcPort: UInt16 = 0
+    public private(set) var discoveryFailure: String?
     private let dataRoot: URL
     private nonisolated let transport: NativeLoopbackListener
     private let effects: any BrowserIPCWindowEffects
+
+    /// Doctor reads listener and discovery admission in one actor turn.
+    public var listenerSnapshot: (failure: String?, boundPort: UInt16?, isActive: Bool, port: UInt16) {
+        let health = transport.health
+        let ready = ipcPort != 0 && health.isActive
+        return (discoveryFailure ?? health.failure, ready ? health.boundPort : nil, ready, health.port)
+    }
 
     /// Drop a connection that hasn't completed its request/response within this window
     /// so stalled/half-open peers can't accumulate in `connections` indefinitely.
@@ -33,8 +41,7 @@ public final class BrowserIPCServer: BridgeHTTPServer {
         dataRoot.appendingPathComponent("browser_ipc.json")
     }
 
-    private func writeDiscovery(token: String, port: UInt16) {
-        try? FileManager.default.createDirectory(at: dataRoot, withIntermediateDirectories: true)
+    private func writeDiscovery(token: String, port: UInt16) throws {
         let payload: [String: Any] = [
             "schemaVersion": 1,
             "host": "127.0.0.1",
@@ -44,13 +51,13 @@ public final class BrowserIPCServer: BridgeHTTPServer {
             "processIdentifier": ProcessInfo.processInfo.processIdentifier,
             "writtenAt": ISO8601DateFormatter().string(from: Date()),
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) {
-            _ = NativePrivateFile.write(data, to: descriptorFileURL)
-        }
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted])
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: descriptorFileURL)
     }
 
-    private func removeDiscoveryFile() {
-        try? FileManager.default.removeItem(at: descriptorFileURL)
+    private func removeDiscoveryFile() throws {
+        do { try FileManager.default.removeItem(at: descriptorFileURL) }
+        catch let error as CocoaError where error.code == .fileNoSuchFile { return }
     }
 
     // MARK: - IPC server
@@ -59,12 +66,19 @@ public final class BrowserIPCServer: BridgeHTTPServer {
         guard !transport.isActive, ipcToken.isEmpty else { return }
 
         guard let token = BridgeCore.generateToken() else {
+            discoveryFailure = "Browser IPC could not generate a secure discovery token."
             nativeLog("NativeAgent browser IPC failed to generate a secure token")
             return
         }
+        do { try removeDiscoveryFile() }
+        catch {
+            discoveryFailure = "Browser IPC could not retire its discovery descriptor: \(error.localizedDescription)"
+            nativeLog(discoveryFailure!)
+            return
+        }
+        discoveryFailure = nil
         ipcToken = token
         ipcPort = 0
-        removeDiscoveryFile()
         let started = transport.start(
             onReady: { [weak self] port in
                 Task { @MainActor in self?.handleIPCListenerReady(token: token, port: port) }
@@ -87,8 +101,15 @@ public final class BrowserIPCServer: BridgeHTTPServer {
 
     private func handleIPCListenerReady(token: String, port: UInt16) {
         guard ipcToken == token else { return }
+        do { try writeDiscovery(token: token, port: port) }
+        catch {
+            discoveryFailure = "Browser IPC discovery publication failed: \(error.localizedDescription)"
+            nativeLog(discoveryFailure!)
+            transport.stop()
+            handleIPCListenerTerminated(token: token)
+            return
+        }
         ipcPort = port
-        writeDiscovery(token: token, port: port)
         print("[BrowserIPC] listening on 127.0.0.1:\(port)")
     }
 
@@ -102,7 +123,12 @@ public final class BrowserIPCServer: BridgeHTTPServer {
         connectionTimeouts.removeAll()
         for operation in connectionOperations.values { operation.cancel() }
         connectionOperations.removeAll()
-        removeDiscoveryFile()
+        do { try removeDiscoveryFile() }
+        catch {
+            let detail = "Browser IPC could not remove its discovery descriptor: \(error.localizedDescription)"
+            discoveryFailure = discoveryFailure.map { $0 + " " + detail } ?? detail
+            nativeLog(detail)
+        }
     }
 
     public func stop() {

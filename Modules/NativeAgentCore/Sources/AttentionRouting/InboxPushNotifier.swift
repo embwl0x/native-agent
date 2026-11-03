@@ -3,7 +3,11 @@ import Privacy
 import Foundation
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `InboxPushNotifier.swift` | `AttentionRouter.notifyIfAttentionWorthy`: severity and live-root notification routing |
+import NotificationInbox
+import ChatTurnRuntime
+import ChatTurnContracts
+import Transcripts
+// Blueprint: | `InboxPushNotifier.swift` | Qualifying background knocks retain a current canonical-card intent before admission; severity and live-root gates preserve eligibility |
 
 extension AttentionRouter {
     public func notifyIfAttentionWorthy(
@@ -24,20 +28,19 @@ extension AttentionRouter {
         guard ProcessInfo.processInfo.environment["NATIVE_AGENT_DISABLE_INBOX_PUSH"] != "1" else { return }
 
         do {
+            let title = String(NativeAppSecretRedactor.redactText(title).prefix(160))
+            let body = String(NativeAppSecretRedactor.redactText(summary).prefix(500))
+            let reason = "\(severity)|\(body)"
+            let info = ["screen": "inbox", "source": source, "itemId": itemId, "severity": severity]
+            let ownWork = try SessionConversation.checkedKind(ChatToolSessionContext.verifiedSessionId, dataRoot: dataRoot)?.isOwnWork == true
+            let revision = try await LiveNotificationInbox.live(dataRoot: dataRoot).retainAttentionIntent(id: itemId,
+                title: title, body: body, reason: reason, importance: (importance ?? severityImportance).rawValue, userInfo: info,
+                honorsQuietHours: ownWork || Self.honorsQuietHours(importance ?? severityImportance))
             // The router decides whether this reaches User's phone, Telegram or neither.
             try await route(
                 eventId: "inbox:\(itemId)",
                 importance: importance ?? severityImportance,
-                title: String(NativeAppSecretRedactor.redactText(title).prefix(160)),
-                body: String(NativeAppSecretRedactor.redactText(summary).prefix(500)),
-                reason: "\(severity)|\(summary.prefix(500))",
-                userInfo: [
-                    "screen": "inbox",
-                    "source": source,
-                    "itemId": itemId,
-                    "severity": severity,
-                    // AttentionRouter.wakesTheDevice owns urgency, separately from eligibility.
-                ]
+                title: title, body: body, reason: reason, userInfo: info, sourceRevision: revision
             )
         } catch {
             nativeLog("[InboxPushNotifier] push failed item=%@ source=%@: %@", itemId, source, error.localizedDescription)

@@ -193,7 +193,7 @@ extension PhoneTurnActivity {
                     }.map { $0.attributes.workID })
                     payload["observedWorkIds"] = String(decoding: try JSONEncoder().encode(ids.sorted()), as: UTF8.self)
                 }
-                let response = try iCloudSyncEngine.shared.requireSuccessfulActionResponse(await iCloudSyncEngine.shared.sendActionWithSignatureRetry(
+                let response = try iCloudSyncEngine.shared.requireSuccessfulActionResponse(await iCloudSyncEngine.shared.sendActionAndWait(
                     InboxAction.make(action: "registerWorkActivity", payload: payload)))
                 if !enabled, response["ok"] == "true", !isEnabled, activityPairing == expectedPairing {
                     disableRegistrationPending = false

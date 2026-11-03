@@ -15,6 +15,8 @@ enum ProviderCredentialVerification: Equatable {
     case savedUnverified
     /// A saved credential without a live probe (`tested:false`) is unverified, not failed.
     case savedNoProbe
+    /// The attempt cannot attest the credential saved when it finished.
+    case unboundCheck
     /// Test Connection came back OK.
     case verified
     /// Test Connection ran and did not come back OK.
@@ -23,13 +25,14 @@ enum ProviderCredentialVerification: Equatable {
     /// Save only ever means "written to disk".
     static func afterSave() -> ProviderCredentialVerification { .savedUnverified }
 
-    /// Only a live probe can verify a key or report a probe failure.
-    static func afterTest(_ result: NativeAgentShared.ProviderTestResult, credentialReady: Bool) -> ProviderCredentialVerification {
+    /// Every failed attempt reports failure; verification needs a bound live probe.
+    static func afterTest(_ result: NativeAgentShared.ProviderTestResult, credentialReady: Bool, credentialMatches: Bool) -> ProviderCredentialVerification {
+        if result.status == "error" { return .verificationFailed }
         if result.tested {
+            guard credentialMatches else { return .unboundCheck }
             return result.status == "ok" ? .verified : .verificationFailed
         }
-        // Before probing, an error means missing credentials; no probe is otherwise unverified.
-        if result.status == "error" { return .verificationFailed }
+        // No probe is unverified; only a successful bound request can verify.
         return credentialReady ? .savedNoProbe : .disconnected
     }
 
@@ -48,6 +51,8 @@ enum ProviderCredentialVerification: Equatable {
             base = "Saved to this Mac. Not checked yet — press Test Connection to confirm it works."
         case .savedNoProbe:
             base = "Saved to this Mac. This sign-in method has no connection test — it is checked on your first real request."
+        case .unboundCheck:
+            base = "This check did not verify the current saved credential. Test the connection again."
         case .verified:
             base = "Saved and tested. This provider is working."
         case .verificationFailed:
@@ -64,6 +69,7 @@ enum ProviderCredentialVerification: Equatable {
         case .disconnected: return ("Disconnected", "warn")
         case .savedUnverified: return ("saved · not tested", "warn")
         case .savedNoProbe: return ("saved · no test available", "ok")
+        case .unboundCheck: return ("not verified", "warn")
         case .verified: return ("tested · working", "ok")
         case .verificationFailed: return ("test failed", "error")
         }
@@ -73,10 +79,12 @@ enum ProviderCredentialVerification: Equatable {
 /// Save provider defaults only while advertised; absent or stale choices stay visible for replacement.
 enum ProviderConfigModelPickerPresentation: Equatable {
     case noCatalog
+    case unresolved
     case selected
     case staleSelection(String)
 
     static func resolve(selectedModel: String, advertisedModelIDs: [String]) -> Self {
+        guard !selectedModel.isEmpty else { return .unresolved }
         guard !advertisedModelIDs.isEmpty else { return .noCatalog }
         return advertisedModelIDs.contains(selectedModel)
             ? .selected
@@ -90,6 +98,8 @@ enum ProviderConfigModelPickerPresentation: Equatable {
 
     var message: String? {
         switch self {
+        case .unresolved:
+            return "Choose a model to set a default."
         case .noCatalog:
             return "Model catalog unavailable. Any saved default remains unchanged until models can be loaded."
         case .selected:
@@ -129,14 +139,13 @@ struct ProviderConfigSheet: View {
     private var authModePickerState: ProvidersFacade.AuthModePickerState {
         ProvidersFacade.authModePickerState(
             advertisedModes: provider.auth_modes,
-            savedMode: provider.auth_mode,
-            providerIsReady: provider.auth_status.eligible
+            savedMode: provider.auth_mode
         )
     }
 
     private var savedModel: String {
         let model = provider.default_model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return model.isEmpty ? (provider.models.first?.id ?? "") : model
+        return model
     }
 
     private func clearDraft() {
@@ -193,13 +202,14 @@ struct ProviderConfigSheet: View {
                                 )
                             }
                         }
-                    } else if authModePickerState.supportedModes.count > 1 {
+                    } else {
                         AdvancedSection(title: "How to sign in", card: .bare) {
                             ProviderCard {
                                 Picker("Mode", selection: Binding(get: { authMode }, set: {
                                     authMode = $0
                                     invalidateTestFeedback()
                                 })) {
+                                    Text("Choose sign-in method").tag("")
                                     ForEach(authModePickerState.supportedModes, id: \.self) { mode in
                                         Text(authModeLabel(mode)).tag(mode)
                                     }
@@ -212,13 +222,13 @@ struct ProviderConfigSheet: View {
                         }
                     }
 
-                    if let repaired = authModePickerState.repairedSavedMode,
+                    if let unresolved = authModePickerState.unresolvedSavedMode,
                        !authModePickerState.supportedModes.isEmpty {
                         ProviderNote(
-                            text: "The saved sign-in method is no longer offered, so \(authModeLabel(authMode)) is being used instead.",
+                            text: "The saved sign-in method is no longer offered. Choose a current method before saving.",
                             color: NativeAgentShell.trouble
                         )
-                        .accessibilityLabel("The saved sign-in method \(repaired) is no longer offered.")
+                        .accessibilityLabel("The saved sign-in method \(unresolved) is no longer offered.")
                     }
 
                     // API Key input (shown when api_key mode or provider only supports api_key)
@@ -242,17 +252,7 @@ struct ProviderConfigSheet: View {
                         AdvancedSection(title: "Sign in", card: .bare) {
                             ProviderCard {
                                 VStack(alignment: .leading, spacing: 12) {
-                                    if provider.provider_id == "anthropic" {
-                                        Text("Use your Claude Pro or Max subscription through the Claude command-line tool instead of paying for credits.")
-                                            .font(ShellType.label)
-                                            .foregroundStyle(NativeAgentShell.text)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                        if let userInfo = provider.auth_status.user_info {
-                                            ProviderNote(text: userInfo["version"] ?? "claude command-line tool")
-                                        }
-                                    } else if provider.provider_id == "anthropic_mcp" {
-                                        AnthropicMCPStatusPanel(provider: provider, appModel: appModel)
-                                    } else if provider.provider_id == "anthropic_oauth_direct" {
+                                    if provider.provider_id == "anthropic_oauth_direct" {
                                         AnthropicOAuthDirectPanel()
                                     } else if provider.provider_id == "xai_oauth_direct" {
                                         Text("Sign in to xAI for Grok models.")
@@ -267,12 +267,14 @@ struct ProviderConfigSheet: View {
                     }
 
                     if !availableModels.isEmpty {
-                        AdvancedSection(title: "Model it falls back to", card: .bare) {
+                        AdvancedSection(title: "Default model", card: .bare) {
                             ProviderCard {
                                 VStack(alignment: .leading, spacing: 12) {
                                     Picker("Model", selection: appModel.editBinding("provider:\(provider.provider_id):model", seed: savedModel)) {
+                                        Text("Choose model").tag("")
                                         ForEach(availableModels) { model in
                                             Text(model.name).tag(model.id)
+                                                .disabled(model.supported_reasoning_efforts == nil)
                                         }
                                     }
                                     .pickerStyle(.menu)
@@ -283,6 +285,9 @@ struct ProviderConfigSheet: View {
                                         ProviderNote(text: message, color: NativeAgentShell.trouble)
                                     }
                                     if let model = availableModels.first(where: { $0.id == selectedModel }) {
+                                        if let note = model.controls_note {
+                                            ProviderNote(text: note, color: NativeAgentShell.trouble)
+                                        }
                                         HStack(spacing: 12) {
                                             capabilityPill("Streaming", ok: model.supports_streaming)
                                             capabilityPill("Vision", ok: model.supports_vision)
@@ -295,7 +300,7 @@ struct ProviderConfigSheet: View {
                         }
                     } else if !selectedModel.isEmpty,
                               let message = modelPickerPresentation.message {
-                        AdvancedSection(title: "Model it falls back to", card: .bare) {
+                        AdvancedSection(title: "Default model", card: .bare) {
                             ProviderCard {
                                 ProviderNote(text: message, color: NativeAgentShell.trouble)
                             }
@@ -313,14 +318,14 @@ struct ProviderConfigSheet: View {
                                                 .foregroundStyle(NativeAgentShell.text)
                                                 .fixedSize(horizontal: false, vertical: true)
                                         }
-                                        if let error = result.error {
-                                            ProviderNote(text: error, color: NativeAgentShell.trouble)
-                                        }
                                         if let model = result.model_used {
                                             ProviderNote(text: model)
                                         }
                                     } else {
                                         ProviderNote(text: result.detail ?? "The test did not run.")
+                                    }
+                                    if let error = result.error {
+                                        ProviderNote(text: error, color: NativeAgentShell.trouble)
                                     }
                                 }
                             }
@@ -337,7 +342,7 @@ struct ProviderConfigSheet: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .hazeTinted(.button)
-                        .disabled(isSaving || modelPickerPresentation.needsReplacement || !authModePickerState.canSave)
+                        .disabled(isSaving || modelPickerPresentation.needsReplacement || !authModePickerState.supportedModes.contains(authMode))
 
                         Button(isTesting ? "Testing…" : "Test the connection") {
                             Task { await runTest() }
@@ -451,9 +456,9 @@ struct ProviderConfigSheet: View {
                 }
             } else {
                 // Only Test Connection verifies saved credentials.
-                verification = .afterTest(result, credentialReady: credentialReady)
+                verification = .afterTest(result, credentialReady: credentialReady, credentialMatches: probe.credentialMatches)
                 statusText = verification.statusText(
-                    providerNote: result.tested ? "This tested the credential saved on this Mac." : result.detail
+                    providerNote: result.tested && probe.credentialMatches ? "This tested the credential saved on this Mac." : result.detail
                 )
             }
         } catch {

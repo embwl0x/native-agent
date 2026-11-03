@@ -99,7 +99,6 @@ public enum ProcedureTrajectoryRejectionReason: String, Codable, Sendable, Equat
     case tooManyTransitions = "too_many_transitions"
     case tooFewStateChanges = "too_few_state_changes"
     case tooFewActionEvidenceSteps = "too_few_action_evidence_steps"
-    case inconsistentContract = "inconsistent_contract"
     case invalidChronology = "invalid_chronology"
     case durationExceeded = "duration_exceeded"
     case invalidTerminal = "invalid_terminal"

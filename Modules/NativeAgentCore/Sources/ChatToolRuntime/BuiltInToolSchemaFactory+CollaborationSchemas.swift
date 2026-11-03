@@ -21,17 +21,16 @@ extension BuiltInToolSchemaFactory {
     func collaborationSchemas() -> [LLMToolSchema?] {
         [
             requestedSchema(name: "workshop_submit", toolClass: .write, capabilities: ["tool_call", "workshop_write"],
-                description: "Run a user-directed task from the Desk. For an exact workspace file copy, set operation=copy_workspace_file with source and destination. An active reviewed copy procedure runs directly; an unavailable or refused exact implementation reports failure without ordinary planning. Use procedure=local_file_copy_v1 only for explicit/manual compatibility. Every other objective follows normal planning and approval and creates a user-directed Desk task, unless desk_handle names an existing live Desk item to run — then the project keeps its own identity instead of gaining a second one. Returns Desk identity and execution status; use workshop.status to follow queued work.",
+                description: "Run a user-directed task from the Desk. For an exact workspace file copy, set operation=copy_workspace_file with source and destination. An active reviewed copy procedure runs directly; an unavailable or refused exact implementation reports failure without ordinary planning. Every other objective follows normal planning and approval and creates a user-directed Desk task, unless desk_handle names an existing live Desk item to run — then the project keeps its own identity instead of gaining a second one. Returns Desk identity and execution status; use workshop.status to follow queued work.",
                 parametersJSON: ToolSchema.params(
                     properties: [
                         ("text", ToolSchema.strSchema("The task objective — what the user wants done (required).")),
-                        ("expected_outputs", stringArraySchema("Optional exact phrases that must occur in completed text outputs, e.g. [\"12\"] for arithmetic synthesis. Ordinary tasks only: omit operation and procedure. This verifies text containment, not external effects; omit when no exact text criterion is known.")),
+                        ("expected_outputs", stringArraySchema("Optional exact phrases that must occur in completed text outputs, e.g. [\"12\"] for arithmetic synthesis. Ordinary tasks only: omit operation. This verifies text containment, not external effects; omit when no exact text criterion is known.")),
                         ("context", ToolSchema.strSchema("Optional short title/context. Defaults to a prefix of the objective.")),
                         ("desk_handle", ToolSchema.strSchema("Optional live Desk handle or visible alias to execute as — use it when this work is the next piece of a project already on the Desk (name the relevant child, not the whole project, so finishing it does not close everything). Omit to create a new Desk task.")),
                         ("operation", ToolSchema.enumStringSchema(["copy_workspace_file"], "Stable exact operation. Use copy_workspace_file only for an unambiguous byte-for-byte workspace file copy and also provide source and destination. The procedure store chooses an active reviewed implementation; omit for every other task.")),
-                        ("procedure", ToolSchema.enumStringSchema(["local_file_copy_v1"], "Optional native procedure. Use the only allowed value, local_file_copy_v1, for a byte-for-byte workspace file copy and also provide source and destination. Omit for every other task.")),
-                        ("source", ToolSchema.strSchema("Source path relative to NativeAgent's workspace, without a leading slash. Used only with the exact copy operation/procedure.")),
-                        ("destination", ToolSchema.strSchema("Destination path relative to NativeAgent's workspace, without a leading slash. Used only with the exact copy operation/procedure.")),
+                        ("source", ToolSchema.strSchema("Source path relative to NativeAgent's workspace, without a leading slash. Used only with the exact copy operation.")),
+                        ("destination", ToolSchema.strSchema("Destination path relative to NativeAgent's workspace, without a leading slash. Used only with the exact copy operation.")),
                     ],
                     required: ["text"]
                 )

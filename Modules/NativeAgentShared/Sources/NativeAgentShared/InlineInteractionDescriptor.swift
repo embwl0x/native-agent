@@ -67,7 +67,11 @@ public struct InlineInteractionDescriptor: Codable, Sendable, Equatable {
 
         public init(from decoder: any Decoder) throws {
             let raw = try decoder.singleValueContainer().decode(String.self)
-            self = Location(rawValue: raw) ?? .anywhere
+            guard let value = Location(rawValue: raw) else {
+                throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath,
+                    debugDescription: "Unknown Location: \(raw)"))
+            }
+            self = value
         }
     }
 

@@ -70,11 +70,8 @@ extension SwiftNativeResearchClient {
             .appendingPathComponent("config.json")
         do {
             let data = try Data(contentsOf: path)
-            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  object["searxng_base_url"] == nil || object["searxng_base_url"] is String else {
-                throw CocoaError(.propertyListReadCorrupt)
-            }
-            return (object["searxng_base_url"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let object = try Self.checkedSearchConfiguration(try JSONValue.parse(data))
+            return object["searxng_base_url"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch CocoaError.fileReadNoSuchFile {
             return nil
         } catch {
@@ -89,19 +86,9 @@ extension SwiftNativeResearchClient {
     // MARK: search
 
     public func search(query: String, categories: String? = nil, timeRange: String? = nil) async throws -> ResearchSearchResponse {
-        var base = trimTrailingSlash(try Self.checkedSearxngBaseURL(root: receiptsDir.deletingLastPathComponent()) ?? "")
-        // Nothing saved yet: find the local instance the way the Research page
-        // does (it saves what answers), so search works without a setup step.
-        if base.isEmpty {
-            let found = try await autodetectSearXNG()
-            if found.found {
-                guard let url = found.baseURL, !trimTrailingSlash(url).isEmpty else {
-                    throw ResearchClientError.malformedResponse("SearXNG discovery reported an instance without its URL")
-                }
-                base = trimTrailingSlash(url)
-            }
-        }
-        if base.isEmpty { throw ResearchClientError.notConfigured }
+        guard let configured = try Self.checkedSearxngBaseURL(root: receiptsDir.deletingLastPathComponent()),
+              !configured.isEmpty else { throw ResearchClientError.notConfigured }
+        let base = try Self.normalizedSearXNGBaseURL(configured)
 
         var parameters = [("q", query), ("format", "json")]
         if let categories, !categories.isEmpty { parameters.append(("categories", categories)) }
@@ -277,7 +264,7 @@ extension SwiftNativeResearchClient {
             "access": .string("Normal file permissions apply. This locator does not grant access."),
         ])
         let record = ResearchFetchRecord(
-            id: sourceID, url: url, text: text, createdAt: Self.isoTimestamp(Date()), verdict: verdict, coverage: coverage,
+            id: sourceID, url: url, text: text, createdAt: Self.isoTimestamp(Date()), verdict: verdict, retentionDirectory: receiptsDir, coverage: coverage,
             sourceReceipt: sourceReceipt
         )
         try Task.checkCancellation()

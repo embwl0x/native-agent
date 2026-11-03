@@ -312,7 +312,11 @@ struct MacToolsView: View {
                 notifTitle = ""
             }
         } catch {
-            notifResult = .failed(error.localizedDescription)
+            if case SyncError.responseUnconfirmed = error {
+                notifResult = .unconfirmed(error.localizedDescription)
+            } else {
+                notifResult = .failed(error.localizedDescription)
+            }
             updateRemoteAction(actionID, state: RemoteActionState.forError(error), detail: error.localizedDescription,
                                approvalID: (error as? SyncError)?.approvalID)
         }

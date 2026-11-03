@@ -240,7 +240,7 @@ struct ToolCallGroup: View {
     var messages: [ChatMessage]
     private struct Revision: Equatable, Sendable {
         let messages: [ChatMessage]
-        let exemptTitle: String?
+        let progressionTitle: String?
     }
     @State private var preparedRevision: Revision?
     @State private var partition = (receipts: [(id: String, outcome: String, meta: String)](), rest: [ChatMessage]())
@@ -255,12 +255,12 @@ struct ToolCallGroup: View {
         ChatCrossfadeStack(current: hasPendingApproval ? 0 : 1) {
             phaseBody
         }
-        .task(id: Revision(messages: messages, exemptTitle: appModel.firstConversationReceiptTitle)) {
+        .task(id: Revision(messages: messages, progressionTitle: appModel.firstConversationReceiptTitle)) {
             guard !hasPendingApproval else { return }
-            let revision = Revision(messages: messages, exemptTitle: appModel.firstConversationReceiptTitle)
+            let revision = Revision(messages: messages, progressionTitle: appModel.firstConversationReceiptTitle)
             let prepared = await Task.detached(priority: .userInitiated) {
                 revision.messages.reduce(into: (receipts: [(id: String, outcome: String, meta: String)](), rest: [ChatMessage]())) { result, message in
-                    if let receipt = PersonaWriteReceiptRow.receipt(for: message, exemptTitle: revision.exemptTitle) {
+                    if let receipt = PersonaWriteReceiptRow.receipt(for: message, progressionTitle: revision.progressionTitle) {
                         result.receipts.append((message.id, receipt.outcome, receipt.meta))
                     } else { result.rest.append(message) }
                 }
@@ -279,7 +279,7 @@ struct ToolCallGroup: View {
                 .transition(.identity)
         } else {
             // Fold tool traffic into one row; persona writes retain separate consequence receipts.
-            let current = preparedRevision == Revision(messages: messages, exemptTitle: appModel.firstConversationReceiptTitle)
+            let current = preparedRevision == Revision(messages: messages, progressionTitle: appModel.firstConversationReceiptTitle)
             let partition = current ? self.partition : (receipts: [], rest: [])
             VStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
                 if !partition.rest.isEmpty {

@@ -11,7 +11,7 @@ public enum LivingAttentionPolicy {
         let body = organism.bodySchema
         return !body.providersHealthy
             || !body.toolHandsAvailable
-            || !body.notificationPathHealthy
+            || body.notificationPathHealthy == false
             || !body.iPhoneReachable
             || !body.memoryHealthy
             || !body.dreamHealthy

@@ -35,8 +35,9 @@ public struct AgentBridgeCompletionRoute: Sendable, Equatable, Codable {
 
     public var hasRedeliveryOwner: Bool { self == .telegram || self == .slack || self == .ios }
     /// Its destination says when it holds a reply (Telegram's and Slack's
-    /// servers keep the conversation). The phone does not yet: CloudKit
-    /// accepting a push is transport only.
+    /// servers keep the conversation). The phone has redelivery, but no
+    /// authenticated per-reply receipt from durable phone storage back to
+    /// this owner. CloudKit acceptance alone cannot settle that obligation.
     public var acceptsDurably: Bool { self == .telegram || self == .slack }
   }
 

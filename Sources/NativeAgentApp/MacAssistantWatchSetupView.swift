@@ -135,21 +135,22 @@ struct MacAssistantWatchSetupView: View {
                     UserDefaults.standard.set("iphone", forKey: ShellRailTab.storageKey(.connectors))
                 })
         } else { nil }
-        let next = item.id == "local_mail" && ["failed", "needs_permission", "needs_setup"].contains(status)
-            ? item.nextStep : action != nil ? nil : item.nextStep.flatMap { $0.isEmpty ? nil : $0 }
+        let next = item.id == "local_mail" && ["ready", "failed", "unavailable", "needs_permission", "needs_setup"].contains(status)
+            ? item.nextStep.flatMap { $0.isEmpty ? nil : $0 }
+            : action != nil ? nil : item.nextStep.flatMap { $0.isEmpty ? nil : $0 }
         return statusRow(
             title: item.title,
             detail: item.detail,
-            nextStep: status == "ready" ? nil : next,
-            action: status == "ready" ? nil : action,
+            nextStep: item.id == "local_mail" ? next : status == "ready" ? nil : next,
+            action: status == "ready" && next == nil ? nil : action,
             status: status,
             word: isCheckingMail && item.id == "local_mail" ? "Checking…"
                 : item.id == "local_mail" && status == "failed" ? "Check failed" : Self.accessWord(item.status)
         )
     }
 
-    /// Reads one Inbox message's metadata through the same Mail read the
-    /// watches use. If macOS has not been asked yet, this is what asks.
+    /// Checks account coverage through the same Mail read the watches use.
+    /// Missing access stays visible through the read owner's permission remedy.
     private func checkMail() async {
         isCheckingMail = true
         defer { isCheckingMail = false }

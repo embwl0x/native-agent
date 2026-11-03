@@ -79,18 +79,18 @@ let products: [Product] =
 // support is common to every target; disk owners also depend on PersistenceCore.
 // Keep edges needed for extension visibility even without a direct source import.
 let extraDeps: [String: [String]] = [
-    "AgentConversations": ["Experiences", "AuthoredCapabilities", "AgentWorkspace", "MacControl", "Privacy", "PersistenceCore", "ApprovalInbox", "StandingBots", "AgentLinkTransport", "ProviderRouting", "TurnTrace", "ChatTurnContracts", "ChatToolParsing", "Desk", "TrustCenter"],
+    "AgentConversations": ["PersonaEngine", "Experiences", "AuthoredCapabilities", "AgentWorkspace", "MacControl", "Privacy", "PersistenceCore", "ApprovalInbox", "StandingBots", "AgentLinkTransport", "ProviderRouting", "TurnTrace", "ChatTurnContracts", "ChatToolParsing", "Desk", "TrustCenter"],
     "ChatTurnContracts": ["PersistenceCore", "ProviderRouting", "TurnTrace", "ApprovalInbox", "ChatToolParsing", "CognitiveSubstrate", "MacControl"],
     "ChatToolRuntime": ["Experiences", "AuthoredCapabilities", "Senses", "ChatTurnContracts", "AgentConversations", "AgentWorkspace", "ChatSessionWork", "ChatToolParsing", "Research", "StandingBots", "PersistenceCore", "PersonaEngine", "MemoryV2", "ProviderRouting", "TrustCenter", "DreamREMCycle", "ApprovalInbox", "Dispatcher", "MacControl", "Context", "SwarmRuns", "MacIntegration", "WorkshopExecution", "SystemOps", "CognitiveSubstrate", "ToolExecution", "ActivityWatch", "ToolRegistry", "Procedures", "Transcripts", "TurnTrace", "Studio", "Desk", "ChromeControl", "Privacy", "NotificationInbox"],
-    "AgentWorkspace": ["Experiences", "AuthoredCapabilities", "ChatToolParsing", "ChatSessionWork", "PersistenceCore", "ApprovalInbox", "MacControl", "MemoryV2", "ChromeControl", "Desk", "StandingBots", "WorkshopExecution", "MacIntegration", "Transcripts", "NotificationInbox", "Senses", "SwarmRuns", "Dispatcher"],
-    "ChatSessionWork": ["Experiences", "MemoryV2", "MacControl", "Context", "PersistenceCore", "Transcripts", "TurnTrace", "ProviderRouting", "ChatToolParsing"],
+    "AgentWorkspace": ["Experiences", "AuthoredCapabilities", "ChatToolParsing", "ChatSessionWork", "PersistenceCore", "ApprovalInbox", "MacControl", "MemoryV2", "ChromeControl", "Desk", "StandingBots", "WorkshopExecution", "MacIntegration", "Transcripts", "NotificationInbox", "Senses", "SwarmRuns", "Dispatcher", "TriggerScheduler"],
+    "ChatSessionWork": ["Experiences", "MemoryV2", "MacControl", "Context", "PersistenceCore", "Transcripts", "TurnTrace", "ProviderRouting", "ChatToolParsing", "PersonaEngine"],
     "ChatToolParsing": ["MacControl", "PersistenceCore", "TurnTrace"],
-    "AgentLinkTransport": ["PersistenceCore", "ProviderRouting"],
+    "AgentLinkTransport": ["Experiences", "PersistenceCore", "ProviderRouting"],
     "EngineRuntime": ["ActivityWatch", "Experiences", "AuthoredCapabilities", "AgentWorkspace", "ChatSessionWork", "TurnTrace", "Privacy", "Senses", "Agents", "AppToolRuntime", "ApprovalInbox", "ApprovalTransactions", "AttentionRouting", "BackgroundLoops", "BackgroundWork", "Browser", "ChromeControl", "Cognition", "CognitiveSubstrate", "Connectors", "Context", "ContextFlow", "Desk", "DeviceSync", "DoctorChecks", "DreamREMCycle", "MemoryV2", "MacIntegration", "MacControl", "NotificationInbox", "PersistenceCore", "PersonaEngine", "Procedures", "ProviderRouting", "Research", "SchedulerExecution", "SystemOps", "SlackBot", "StandingBots", "TelegramBot", "ToolExecution", "ToolRegistry", "Transcripts", "TriggerScheduler", "TrustCenter", "TrustPersistence", "WorkshopExecution", "Onboarding", "Dispatcher", "AgentConversations", "ChatToolParsing", "ChatToolRuntime", "ChatTurnContracts", "ChatTurnRuntime", "Studio", "SwarmRuns"],
     // Approval transactions compose canonical owners; host effects arrive through ports.
     "ApprovalTransactions": ["Experiences", "AuthoredCapabilities", "Procedures", "AgentWorkspace", "ApprovalInbox", "Browser", "Cognition", "Desk", "Dispatcher", "DreamREMCycle", "PersistenceCore", "MacControl", "MacIntegration", "MemoryV2", "PersonaEngine", "Privacy", "ProviderRouting", "Studio", "TelegramBot", "TrustCenter", "TurnTrace", "WorkshopExecution", "Transcripts", "AgentConversations", "ChatSessionWork", "ChatToolParsing", "ChatToolRuntime", "ChatTurnContracts", "ChatTurnRuntime", "NotificationInbox", "ToolRegistry"],
     // Tool policy composes the existing owners; UI and platform effects arrive through ports.
-    "AppToolRuntime": ["BackgroundLoops", "TurnTrace", "Transcripts", "AgentWorkspace", "Experiences", "AuthoredCapabilities", "MultimodalTTS", "Senses", "Agents", "ApprovalInbox", "ApprovalTransactions", "Desk", "ChromeControl", "Browser", "Cognition", "CognitiveSubstrate", "Context", "MacControl", "Research", "PersistenceCore", "TrustCenter", "WorkshopExecution", "StandingBots", "ToolRegistry", "ToolExecution", "Privacy", "AttentionRouting", "MacIntegration", "PersonaEngine", "ProviderRouting", "DeviceSync", "Dispatcher", "Studio", "DoctorChecks", "TrustPersistence", "MemoryV2", "AgentConversations", "ChatSessionWork", "ChatToolParsing", "ChatToolRuntime", "ChatTurnContracts", "ChatTurnRuntime", "NotificationInbox", "TelegramBot"],
+    "AppToolRuntime": ["TriggerScheduler", "BackgroundLoops", "TurnTrace", "Transcripts", "AgentWorkspace", "Experiences", "AuthoredCapabilities", "MultimodalTTS", "Senses", "Agents", "ApprovalInbox", "ApprovalTransactions", "Desk", "ChromeControl", "Browser", "Cognition", "CognitiveSubstrate", "Context", "MacControl", "Research", "PersistenceCore", "TrustCenter", "WorkshopExecution", "StandingBots", "ToolRegistry", "ToolExecution", "Privacy", "AttentionRouting", "MacIntegration", "PersonaEngine", "ProviderRouting", "DeviceSync", "Dispatcher", "Studio", "DoctorChecks", "TrustPersistence", "MemoryV2", "AgentConversations", "ChatSessionWork", "ChatToolParsing", "ChatToolRuntime", "ChatTurnContracts", "ChatTurnRuntime", "NotificationInbox", "TelegramBot"],
 
     // The stem's one record of what happened (docs/EXPERIENCE.md), a GRDB
     // store like memory's. It sits this low so every owner of a happening can write it.
@@ -98,7 +98,7 @@ let extraDeps: [String: [String]] = [
     "AuthoredCapabilities": ["Experiences", "PersistenceCore"],
     "Privacy": ["PersistenceCore"],
     "Desk": ["PersistenceCore", "TrustCenter", "Transcripts"],
-    "Studio": ["AuthoredCapabilities", "PersistenceCore"],
+    "Studio": ["Experiences", "AuthoredCapabilities", "PersistenceCore"],
     "Senses": ["AuthoredCapabilities", "PersistenceCore"],
     "TurnTrace": ["Experiences", "AuthoredCapabilities", "PersistenceCore"],
     "Transcripts": ["PersistenceCore"],
@@ -107,22 +107,22 @@ let extraDeps: [String: [String]] = [
     // TrustCenter supplies canonical origin-surface authority; Experiences records decisions owed to the person.
     "ApprovalInbox": ["AuthoredCapabilities", "ChatToolParsing", "PersistenceCore", "TrustCenter", "Procedures", "Experiences", "Transcripts"],
     "ToolRegistry": ["AuthoredCapabilities", "PersistenceCore", "TurnTrace"],
-    "PersonaEngine": ["PersistenceCore", "AuthoredCapabilities"],
+    "PersonaEngine": ["PersistenceCore", "AuthoredCapabilities", "Experiences"],
     // MemoryV2 supplies canonical memory/graph readers and the real embedder load and repair path.
-    "DoctorChecks": ["SwarmRuns", "Experiences", "AuthoredCapabilities", "PersistenceCore", "PersonaEngine", "MemoryV2", "TurnTrace", "ProviderRouting", "Desk", "DeviceSyncState", "Transcripts"],
+    "DoctorChecks": ["SwarmRuns", "Experiences", "AuthoredCapabilities", "PersistenceCore", "PersonaEngine", "MemoryV2", "TurnTrace", "ProviderRouting", "Desk", "DeviceSyncState", "Transcripts", "ChatSessionWork"],
     // Turn engine/client policy composes the lower chat owners. Platform
     // effects still arrive through their existing injected ports.
     "ChatTurnRuntime": ["Experiences", "AuthoredCapabilities", "Senses", "AgentConversations", "AgentWorkspace", "ApprovalInbox", "ChatSessionWork", "ChatToolParsing", "ChatToolRuntime", "ChatTurnContracts", "CognitiveSubstrate", "Context", "Desk", "Dispatcher", "DreamREMCycle", "MemoryV2", "MacControl", "MacIntegration", "PersistenceCore", "PersonaEngine", "Privacy", "ProviderRouting", "Research", "StandingBots", "Studio", "SwarmRuns", "SystemOps", "ToolRegistry", "Transcripts", "TrustCenter", "TurnTrace"],
 
-    "CognitiveSubstrate": ["Experiences", "PersistenceCore", "Studio", "Privacy", "Transcripts", "TurnTrace"],
+    "CognitiveSubstrate": ["Experiences", "PersistenceCore", "Studio", "Privacy", "Transcripts", "TurnTrace", "Context", "MacControl"],
     // Memory and dream policy gates read saved authority through TrustCenter's canonical shape/type validation.
-    "MemoryV2": ["Experiences", "PersistenceCore", "PersonaEngine", "ApprovalInbox", "TrustCenter", "Procedures", "CognitiveSubstrate", "Senses", "ChatTurnContracts", "TurnTrace", "NotificationInbox", "Studio", "Transcripts"],
+    "MemoryV2": ["Experiences", "PersistenceCore", "PersonaEngine", "ApprovalInbox", "TrustCenter", "Procedures", "CognitiveSubstrate", "Senses", "ChatTurnContracts", "TurnTrace", "NotificationInbox", "Studio", "Transcripts", "Desk"],
     "DreamREMCycle": ["Experiences", "PersistenceCore", "PersonaEngine", "ProviderRouting", "MemoryV2", "TrustCenter", "Transcripts", "SwarmRuns", "CognitiveSubstrate", "Studio"],
 
     "TrustCenter": ["Privacy", "AuthoredCapabilities", "PersistenceCore", "ToolRegistry", "PersonaEngine", "TurnTrace"],
     // Backup/recovery composes existing owners above TrustCenter: MemoryV2
     // and ApprovalInbox already depend on TrustCenter, so it cannot own them.
-    "TrustPersistence": ["PersistenceCore", "TrustCenter", "MemoryV2", "ApprovalInbox", "Transcripts", "TelegramBot", "AuthoredCapabilities", "ChatTurnRuntime", "Privacy", "SystemOps"],
+    "TrustPersistence": ["PersistenceCore", "TrustCenter", "MemoryV2", "ApprovalInbox", "Transcripts", "TelegramBot", "AuthoredCapabilities", "ChatTurnRuntime", "Privacy", "SystemOps", "TriggerScheduler"],
     "TelegramBot": ["ChatToolRuntime", "MemoryV2", "DeviceSync", "NotificationInbox", "Experiences", "AuthoredCapabilities", "MacControl", "PersistenceCore", "PersonaEngine", "BackgroundLoops", "ProviderRouting", "ApprovalInbox", "Transcripts", "TurnTrace", "ChatSessionWork", "TrustCenter", "ChatTurnContracts", "ChatTurnRuntime"],
     // Slack Socket Mode surface, with its tokens and its Web API calls.
     // ChatTurnRuntime / ChatTurnContracts for turn ingress;
@@ -137,7 +137,7 @@ let extraDeps: [String: [String]] = [
     // desktop and Grok routes, completion delivery and the reply/notice
     // continuation. Chat turns come through the engine root's clients; nothing
     // imports it back.
-    "Agents": ["Experiences", "AgentLinkTransport", "AgentWorkspace", "Cognition", "CognitiveSubstrate", "Context", "ContextFlow", "Procedures", "PersistenceCore", "ProviderRouting", "ApprovalInbox", "TrustCenter", "PersonaEngine", "StandingBots", "BackgroundLoops", "MacControl", "Privacy", "Transcripts", "ToolExecution", "AgentConversations", "ChatToolParsing", "ChatToolRuntime", "ChatTurnContracts", "ChatTurnRuntime", "Desk", "Senses", "ToolRegistry", "TurnTrace", "NotificationInbox"],
+    "Agents": ["Experiences", "AgentLinkTransport", "AgentWorkspace", "Cognition", "CognitiveSubstrate", "Context", "ContextFlow", "Procedures", "PersistenceCore", "ProviderRouting", "ApprovalInbox", "TrustCenter", "PersonaEngine", "StandingBots", "BackgroundLoops", "MacControl", "MacIntegration", "Privacy", "Transcripts", "ToolExecution", "AgentConversations", "ChatToolParsing", "ChatToolRuntime", "ChatTurnContracts", "ChatTurnRuntime", "Desk", "Senses", "ToolRegistry", "TurnTrace", "NotificationInbox"],
     // The resident mind's runtime: cognitive events and capsule, provider
     // lifecycle, organism posture, motor-outcome evidence, reflection, dream
     // pressure and the horizon. The engine root owns the instance and hands it
@@ -148,14 +148,14 @@ let extraDeps: [String: [String]] = [
     // phone's signed inbox actions, pairing and APNs. The engine root owns the
     // instance and hands it the root's mind; what it reads from the app's
     // mirrors comes through DeviceSyncHost. Nothing imports it back.
-    "DeviceSync": ["Experiences", "MacControl", "PersistenceCore", "CognitiveSubstrate", "Cognition", "MemoryV2", "ApprovalInbox", "NotificationInbox", "ProviderRouting", "MacIntegration", "TrustCenter", "WorkshopExecution", "PersonaEngine", "Transcripts", "Desk", "Privacy", "DeviceSyncState", "TriggerScheduler", "AgentConversations", "TurnTrace", "BackgroundLoops", "ChatSessionWork", "ChatToolParsing", "ChatTurnContracts", "ChatTurnRuntime", "ToolRegistry", "StandingBots"],
+    "DeviceSync": ["MultimodalTTS", "Experiences", "MacControl", "PersistenceCore", "CognitiveSubstrate", "Cognition", "MemoryV2", "ApprovalInbox", "NotificationInbox", "ProviderRouting", "MacIntegration", "TrustCenter", "WorkshopExecution", "PersonaEngine", "Transcripts", "Desk", "Privacy", "DeviceSyncState", "TriggerScheduler", "AgentConversations", "TurnTrace", "BackgroundLoops", "ChatSessionWork", "ChatToolParsing", "ChatTurnContracts", "ChatTurnRuntime", "ToolRegistry", "StandingBots"],
     "AttentionRouting": ["Experiences", "Privacy", "PersistenceCore", "DeviceSync", "TelegramBot", "Desk", "TriggerScheduler", "NotificationInbox", "ApprovalInbox", "StandingBots", "Transcripts", "AgentWorkspace", "ChatTurnContracts", "ChatTurnRuntime"],
     "ProviderRouting": ["Experiences", "PersistenceCore", "TurnTrace", "Privacy"],
     "BackgroundLoops": ["PersistenceCore"],
     // Cross-domain runner bodies sit above their domain owners; the scheduler
     // stays dependency-light and remains the only registration/single-flight owner.
     "BackgroundWork": ["ToolExecution", "Experiences", "SlackBot", "ActivityWatch", "AgentConversations", "AgentWorkspace", "ApprovalInbox", "AttentionRouting", "BackgroundLoops", "Cognition", "CognitiveSubstrate", "Context", "Desk", "DeviceSync", "DoctorChecks", "DreamREMCycle", "MemoryV2", "NotificationInbox", "PersistenceCore", "PersonaEngine", "Privacy", "ProviderRouting", "StandingBots", "TelegramBot", "ToolRegistry", "TriggerScheduler", "TrustCenter", "TurnTrace", "WorkshopExecution", "ChatSessionWork", "ChatToolRuntime", "ChatTurnContracts", "ChatTurnRuntime", "Transcripts"],
-    "ToolExecution": ["AuthoredCapabilities", "Senses", "PersonaEngine", "PersistenceCore", "TrustCenter", "ToolRegistry", "Desk", "MacControl", "ProviderRouting", "Privacy"],
+    "ToolExecution": ["Experiences", "AuthoredCapabilities", "Senses", "PersonaEngine", "PersistenceCore", "TrustCenter", "ToolRegistry", "Desk", "MacControl", "ProviderRouting", "Privacy"],
     "Research": ["PersistenceCore", "Privacy", "MacControl", "ProviderRouting", "TurnTrace"],
     "TriggerScheduler": ["Experiences", "PersistenceCore", "WorkshopExecution", "Desk", "ActivityWatch", "Privacy", "NotificationInbox", "TrustCenter"],
     // Due-job execution composes owners that already depend on TriggerScheduler.
@@ -214,6 +214,7 @@ let externalDeps: [String: [Target.Dependency]] = [
     "MemoryV2": [.product(name: "GRDB", package: "GRDB.swift")],
     "ActivityWatch": [.product(name: "GRDB", package: "GRDB.swift"), .product(name: "NativeAgentShared", package: "NativeAgentShared")],
     "AgentWorkspace": [.product(name: "NativeAgentShared", package: "NativeAgentShared")],
+    "Senses": [.product(name: "NativeAgentShared", package: "NativeAgentShared")],
     "AppToolRuntime": [.product(name: "NativeAgentShared", package: "NativeAgentShared")],
     "ApprovalInbox": [.product(name: "NativeAgentShared", package: "NativeAgentShared")],
     "ApprovalTransactions": [.product(name: "NativeAgentShared", package: "NativeAgentShared")],
@@ -280,7 +281,7 @@ let package = Package(
         .package(url: "https://github.com/grpc/grpc-swift-nio-transport.git", exact: "2.10.0"),
         .package(url: "https://github.com/grpc/grpc-swift-protobuf.git", exact: "2.4.1"),
         // END generated gRPC requirements
-        .package(url: "https://github.com/jpsim/Yams.git", exact: "5.1.3"),
+        .package(url: "https://github.com/jpsim/Yams.git", from: "6.2.2"),
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
         // Shared snapshot ordering and wire/rendering values for Mac and phone.
         .package(path: "../NativeAgentShared"),

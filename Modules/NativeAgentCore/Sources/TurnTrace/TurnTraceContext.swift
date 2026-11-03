@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 // Blueprint: | `TurnTraceContext.swift` | Request-scoped turn identity, origin, reply route and stable reply-row correlation |
 
 /// Task-local turn identity and reply correlation, inherited by tasks created
@@ -21,12 +22,21 @@ public enum TurnTraceContext {
     /// is the row that stays: nothing is swapped out when it lands.
     @TaskLocal public static var replyRow: ReplyRow?
 
+    /// One session's row for one turn. A writer adopts its id only for that
+    /// same turn in that same session: a helper called inside her turn writes
+    /// its own conversation, so it never takes her reply row's id.
     public struct ReplyRow: Sendable, Equatable {
         public let turnId: String
+        public let sessionId: String
         public let messageId: String
-        public init(turnId: String, messageId: String) {
+        public init(turnId: String, sessionId: String, messageId: String) {
             self.turnId = turnId
+            self.sessionId = sessionId
             self.messageId = messageId
+        }
+        public func messageId(turn: String?, session: String) -> String? {
+            let mine = NativeAgentChatSessionID.normalizedPathComponent(sessionId)
+            return turnId == turn && mine != nil && mine == NativeAgentChatSessionID.normalizedPathComponent(session) ? messageId : nil
         }
     }
 

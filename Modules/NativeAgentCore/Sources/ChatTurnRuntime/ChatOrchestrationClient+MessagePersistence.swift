@@ -15,7 +15,7 @@ import MacIntegration
 import CognitiveSubstrate
 import ChatToolRuntime
 import ToolRegistry
-// Blueprint: | `ChatOrchestrationClient+MessagePersistence.swift` | `SwiftNativeChatOrchestrationClient`: durable message append/replacement, partial/failure settlement, contact sends/imports and session-index publication; exact row identities and source keys from bound delivery identity |
+// Blueprint: | `ChatOrchestrationClient+MessagePersistence.swift` | `SwiftNativeChatOrchestrationClient`: durable message append/replacement, partial/failure settlement, contact sends/imports and session-index publication; locked user-row admission preserves one exact session/run/content row, including returned phone Steers; exact row identities and source keys from bound delivery identity |
 
 extension SwiftNativeChatOrchestrationClient {
     /// Log every transcript-write failure and notify through `onNotice` or `ToolNoticeBus.emit` when available.
@@ -42,6 +42,7 @@ extension SwiftNativeChatOrchestrationClient {
         failure: Error? = nil,
         source: String = "app",
         outcomeContext: TurnContext? = nil,
+        replyRowID: String?,
         onNotice: @escaping @Sendable (String, String) async -> Void
     ) async throws -> String? {
         guard !text.isEmpty || !attachments.isEmpty else { return nil }
@@ -56,11 +57,13 @@ extension SwiftNativeChatOrchestrationClient {
             visibleText = text
         }
         do {
+            // The partial is the reply's own row: the id the live bubble was born with.
             try await appendMessage(sessionId: sessionId, role: "assistant", content: visibleText,
                 runId: runId, attachments: attachments, source: source, outcomeContext: outcomeContext,
                 responseOutcomeStatus: cancelled ? "cancelled" : "partial",
                 responseFailure: cancelled ? nil : failure.map { ProviderFailure.report($0)?.personDescription ?? "The reply could not be completed." },
                 providerRefusal: refused,
+                messageId: replyRowID ?? UUID().uuidString,
                 onNotice: onNotice)
         } catch {
             await Self.reportTranscriptWriteFailure(label: "persistPartialIfNeeded",
@@ -136,7 +139,6 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     /// Import contact history by time without reordering existing rows; send/reply identities deduplicate it.
-    /// Older unkeyed bridge sends adopt their own row IDs.
     public func importAgentConversationHistory(sessionID: String, rows imported: [JSONValue]) async throws -> Int {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else {
             throw ChatOrchestrationError.underlying("invalid chat session id")
@@ -166,16 +168,6 @@ extension SwiftNativeChatOrchestrationClient {
                 rows = read
             }
             var count = 0
-            for index in rows.indices {
-                guard case .object(var row) = rows[index], row["role"] == .string("assistant"), row["runId"] == nil,
-                      row["source"] == .string("agent-bridge"), case .string(let id)? = row["id"] else { continue }
-                var metadata: [String: JSONValue] = if case .object(let value)? = row["metadata"] { value } else { [:] }
-                guard metadata["dotClientUserMessageID"] == nil else { continue }
-                metadata["dotClientUserMessageID"] = .string(id)
-                row["metadata"] = .object(metadata)
-                rows[index] = .object(row)
-                count += 1
-            }
             var present = Set(rows.compactMap(key))
             for row in imported.sorted(by: { (date($0) ?? .distantPast) < (date($1) ?? .distantPast) }) {
                 guard let rowKey = key(row), present.insert(rowKey).inserted, let at = date(row) else { continue }
@@ -579,7 +571,28 @@ extension SwiftNativeChatOrchestrationClient {
         ChatSessionIndexFile.beginTranscriptIndexSync(at: path)
         defer { ChatSessionIndexFile.endTranscriptIndexSync(at: path) }
         // The transcript lock makes the committed row count authoritative for index sync.
-        let (appended, replacedTurnTraceID): (Bool, String?) = try await SwiftNativePersistenceCore.withFileLock(path) {
+        let (appended, replacedTurnTraceID, existingUserOrigin): (Bool, String?, AfterTurnOrigin?) = try await SwiftNativePersistenceCore.withFileLock(path) {
+            if role == "user", let runId {
+                let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
+                guard report.isClean else {
+                    throw ChatOrchestrationError.underlying("User input cannot be admitted until its transcript is repaired")
+                }
+                let submitted = rows.filter { row in
+                    guard case .object(let object) = row else { return false }
+                    return object["role"] == .string("user")
+                        && object["sessionId"] == .string(sessionId)
+                        && object["runId"] == .string(runId)
+                }
+                if !submitted.isEmpty {
+                    guard submitted.count == 1, case .object(let row) = submitted[0], row["content"] == .string(content) else {
+                        throw ChatOrchestrationError.underlying("This input run already has a different or repeated saved user row; repair its transcript before resuming")
+                    }
+                    guard let origin = try Self.afterTurnOrigin(in: rows, sessionId: sessionId, runId: runId) else {
+                        throw ChatOrchestrationError.underlying("The saved input has no readable row identity; repair its transcript before resuming")
+                    }
+                    return (false, nil, origin)
+                }
+            }
             let bytes = try (expectedLastMessageID != nil || (answerFor != nil && FileManager.default.fileExists(atPath: path.path)))
                 ? Data(contentsOf: path) : nil
             if let answerFor, let bytes {
@@ -587,7 +600,7 @@ extension SwiftNativeChatOrchestrationClient {
                 if rows.contains(where: { row in
                     guard case .object(let object) = row, case .object(let metadata)? = object["metadata"] else { return false }
                     return metadata["answerFor"] == .string(answerFor)
-                }) { return (false, nil) }
+                }) { return (false, nil, nil) }
             }
             if let expectedLastMessageID, let bytes {
                 guard bytes.count <= 8 * 1024 * 1024,
@@ -653,9 +666,9 @@ extension SwiftNativeChatOrchestrationClient {
                 // emits one non-blank line per row, which is precisely what
                 // `countJSONLLines` counts.
                 ChatTranscriptLineCountCache.shared.record(count: replaced.count, at: path)
-                return (true, priorTurnTraceID)
+                return (true, priorTurnTraceID, nil)
             } else {
-                let priorCount = ChatTranscriptLineCountCache.shared.count(
+                let priorCount = try ChatTranscriptLineCountCache.shared.count(
                     at: path,
                     recount: Self.countJSONLLines(at:)
                 )
@@ -663,10 +676,10 @@ extension SwiftNativeChatOrchestrationClient {
                 try await ContactThread.append(messageRow, to: path)
                 // `appendJSONLDurable` writes exactly one serialized line plus "\n".
                 ChatTranscriptLineCountCache.shared.record(count: priorCount + 1, at: path)
-                return (true, nil)
+                return (true, nil, nil)
             }
         }
-        guard appended else { return nil }
+        guard appended else { return existingUserOrigin }
         ChatHistoryIndex.absorb(path, dataRoot: dataRoot)
         if role == "user" {
             do {
@@ -797,7 +810,7 @@ extension SwiftNativeChatOrchestrationClient {
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(safeSessionId).jsonl")
-        if let runId, !runId.isEmpty, await Self.completedAssistantRunIds(path: path).contains(runId) {
+        if let runId, !runId.isEmpty, try await Self.completedAssistantRunIds(path: path).contains(runId) {
             return
         }
         try await appendMessage(
@@ -845,15 +858,33 @@ extension SwiftNativeChatOrchestrationClient {
         return safe
     }
 
-    static func completedAssistantRunIds(path: URL) async -> Set<String> {
-        guard let data = try? Data(contentsOf: path),
-              let text = String(data: data, encoding: .utf8) else { return [] }
+    static func completedAssistantRunIds(path: URL) async throws -> Set<String> {
+        let data: Data
+        do { data = try Data(contentsOf: path) }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return [] }
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw ChatOrchestrationError.underlying("Completion evidence is not UTF-8: \(path.path). Repair the transcript before deciding whether this run already completed.")
+        }
         var completed = Set<String>()
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard let lineData = String(rawLine).data(using: .utf8),
-                  case .object(let row)? = try? JSONValue.parse(lineData),
-                  case .string(let runId)? = row["runId"], !runId.isEmpty,
+        for (index, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+            guard !rawLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            let value: JSONValue
+            do { value = try JSONValue.parse(Data(rawLine.utf8)) }
+            catch { throw ChatOrchestrationError.underlying("Completion evidence is unreadable at \(path.path):\(index + 1): \(error.localizedDescription). Repair this row before deduplication.") }
+            guard case .object(let row) = value, case .string? = row["role"] else {
+                throw ChatOrchestrationError.underlying("Completion evidence is damaged at \(path.path):\(index + 1); repair the transcript before deduplication.")
+            }
+            if let run = row["runId"], run.stringValue == nil {
+                throw ChatOrchestrationError.underlying("Completion evidence has an invalid runId at \(path.path):\(index + 1).")
+            }
+            if let cancelled = row["cancelled"], cancelled != .bool(true) && cancelled != .bool(false) {
+                throw ChatOrchestrationError.underlying("Completion evidence has invalid cancellation evidence at \(path.path):\(index + 1).")
+            }
+            guard case .string(let runId)? = row["runId"], !runId.isEmpty,
                   row["role"] == .string("assistant"), row["cancelled"] != .bool(true) else { continue }
+            if let metadata = row["metadata"], metadata.objectValue == nil {
+                throw ChatOrchestrationError.underlying("Completion evidence has invalid metadata at \(path.path):\(index + 1).")
+            }
             if case .object(let metadata)? = row["metadata"],
                metadata["partial"] == .bool(true) || metadata["cancelled"] == .bool(true) { continue }
             if case .string(let content)? = row["content"],
@@ -904,7 +935,7 @@ extension SwiftNativeChatOrchestrationClient {
             ownedSessionID: ChatPersistenceContext.ownedSessionID,
             timestamp: timestamp, syncedAt: NativeTimestampFormat.fractionalZulu(clock()), preview: preview, stamp: stamp,
             title: title, continuityParticipant: continuityParticipant, continuityScope: continuityScope,
-            dataRoot: dataRoot, messagesPath: messagesPath, countMessages: { ChatTranscriptLineCountCache.shared.count(at: $0, recount: Self.countJSONLLines(at:)) },
+            dataRoot: dataRoot, messagesPath: messagesPath, countMessages: { try ChatTranscriptLineCountCache.shared.count(at: $0, recount: Self.countJSONLLines(at:)) },
             clock: clock)
     }
 
@@ -919,13 +950,15 @@ extension SwiftNativeChatOrchestrationClient {
         }
     }
 
-    private nonisolated static func countJSONLLines(at path: URL) -> Int {
-        guard let handle = try? FileHandle(forReadingFrom: path) else { return 0 }
+    private nonisolated static func countJSONLLines(at path: URL) throws -> Int {
+        let handle: FileHandle
+        do { handle = try FileHandle(forReadingFrom: path) }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return 0 }
         defer { try? handle.close() }
         var count = 0
         var lineHasContent = false
         while true {
-            guard let chunk = try? handle.read(upToCount: 256 * 1024),
+            guard let chunk = try handle.read(upToCount: 256 * 1024),
                   !chunk.isEmpty else { break }
             for byte in chunk {
                 if byte == 0x0A {

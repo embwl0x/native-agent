@@ -13,6 +13,15 @@ Install XcodeGen before using the build scripts. Root `project.yml` and
 `Package.resolved` into their SwiftPM workspace directories. Release builds
 use `-onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates`.
 
+Root `Package.swift` owns Sparkle's minimum version, 2.9.6, which fixes
+[GHSA-3x7w-j75x-ppq5](https://github.com/sparkle-project/Sparkle/security/advisories/GHSA-3x7w-j75x-ppq5).
+`script/sync_build_declarations.rb` generates the matching XcodeGen requirement.
+The core manifest owns Yams (6.2.2 or newer within 6.x); Goose settings use
+its node/source-mark parser while preserving the original document text.
+After changing requirements, resolve packages in the root and in
+`Modules/NativeAgentCore`; root `Package.resolved` supplies the generated
+Xcode workspace lock copies.
+
 Prepare these private release inputs:
 
 | Variable | Input |
@@ -32,6 +41,48 @@ The GitHub wrapper can infer a sole Developer ID identity and its team.
 Without a notary profile, it accepts `NATIVEAGENT_APPLE_ID` and
 `NATIVEAGENT_NOTARIZATION_PASSWORD`. Keep credentials and keys outside source.
 
+Release/build configuration uses only `NATIVEAGENT_*`. `release.sh` accepts
+`NATIVEAGENT_ICLOUD_BUILD=personal`, `cloudkit` or `none`; numeric encodings
+and the second release environment namespace are removed.
+
+### Local signing and product selection
+
+`NATIVEAGENT_BUILD_CONFIG=release script/build_and_run.sh --build-only` remains
+the local optimized build invocation. The default `NATIVEAGENT_SIGNING_MODE`
+is `development`: one Apple Development identity (or an explicit
+`NATIVEAGENT_DEVELOPMENT_SIGN_IDENTITY`), matching host profile and local
+entitlements are required before compilation. Explicit `adhoc` mode disables
+iCloud; a missing prerequisite or signing failure never selects it.
+
+Both builders default to `NATIVEAGENT_PRODUCT=host`, the host app without a
+widget. Select `host-with-widget` deliberately to embed it. That product
+requires host and widget profiles granting their exact IDs, the same team and
+shared App Group before compilation. Release widget profiles must be Developer
+ID all-devices profiles; release rehearsals support the host product only.
+Missing provisioning never removes a selected feature. An explicitly ad-hoc
+local development product needs no Apple profiles; a distribution widget always
+does.
+
+The local installer issues one checked LaunchServices request and observes the
+process for at most 30 seconds, then authenticated source/chat readiness for at
+most 45 seconds. Failure retains the selected app and prior artifact, exits
+nonzero and requires a forward repair; it never launches an older executable.
+Retired Python installer flags and daemon cleanup are gone. Install symbol
+objects live once per UUID set under `~/Library/Logs/NativeAgent-dsyms/objects/`;
+revision manifests refer to those objects. The per-revision dSYM search is gone.
+
+The running app requires complete current identity stamps: version, build, full
+source revision, Boolean dirty flag, full source-content identity and matching
+`Resources/VERSION_SHA`. Incomplete/unreadable stamps report unavailable through
+About, introspection and the authenticated bridge; they cannot write a launch
+stamp or establish exact-source proof. Command-line processes carry no
+reconstructed app identity.
+
+The updater distinguishes an absent notice, a valid newer offer, known stale
+display state and unreadable evidence. It clears known stale state or a fresh
+Sparkle no-update/skip result; malformed bytes remain preserved with a Settings
+error until a fresh observed result replaces them.
+
 ### Device sync
 
 `release_github.sh` defaults to `NATIVEAGENT_PUBLIC_DEVICE_SYNC=cloudkit` and:
@@ -50,8 +101,11 @@ entitlements and retains Calendar authority.
 Set `NATIVEAGENT_PUBLIC_DEVICE_SYNC=none` only for a standalone Mac artifact.
 For companion distribution, check the exact Mac and iOS builds together using
 the same container. Signing/schema checks alone do not prove pairing or alerts.
-The notification contract is in [APNS push](apns-push.md); CloudKit subscriptions
-wake sync silently, and direct APNS credentials must never ship in the bundle.
+The notification contract is in [phone alerts](apns-push.md): ordinary alerts
+use CloudKit's keyless visible subscription, while chat/status/pairing wake
+silently. Direct APNS is optional, only wakes notification sync, and its private
+credentials must never ship in the bundle. Coordinate this subscription/Mac
+revision with TestFlight 38; build 37's local renderer would duplicate it.
 
 ### Bundled model (default)
 
@@ -88,10 +142,24 @@ which `EmbeddingModelDownload` consumes. Its schema is:
 Use the release-generated values instead of the example size and placeholders;
 `model` is the original `embedding.json` object. The app verifies the archive
 digest and installs its `embedding/` contents into `<dataRoot>/extras/coreml`.
-An existing installation without a valid `release.sha256` downloader ownership
-marker is preserved as a custom model, including incomplete installations.
-Only downloader-owned installations are eligible for replacement; release and
-install scripts do not mutate the user's model cache.
+The downloader checks `release.sha256` ownership independently of model manifest
+and artifact usability. Missing, unreadable or malformed ownership evidence is
+reported as unverified with unknown ownership and the installation is preserved;
+it is never labelled a custom usable model. Downloader and Doctor give the same
+remedy: preserve the whole installation under a sibling recovery name, then
+choose Check / resume to install the verified release; never invent a release
+marker. Only checked downloader-owned installations are eligible for replacement.
+Launch requests checked memory-epoch convergence for bundled and separate-download
+distributions alike, including a present model whose ownership is unverified.
+A target commit always requests memory-epoch convergence;
+staging cleanup failure remains a separate warning and cannot revoke the install.
+An already-current target reports no installation change, including when it
+arrives during a transfer; it does not release/reload the resident model.
+The engine's independent launch work still requests checked epoch convergence.
+Configured but unreadable/invalid descriptors leave embedding bring-up unavailable
+instead of selecting bundled mode. Only genuinely absent download parts start at
+zero; failed part reads retain their actual error. Release and install scripts
+do not mutate the user's model cache.
 
 To use the downloader in a development install, supply the release descriptor:
 
@@ -105,6 +173,16 @@ Replace the manifest path with the actual descriptor. Bundled development
 installs remain the default. Assembly finishes model resources, the optional
 descriptor and documentation before the builder signs; installation verifies
 and transfers that signed bundle.
+
+Bundled development builds require a complete model in `extras/embedding` or
+`NATIVEAGENT_EMBEDDING_MODEL_DIR` before compilation. A missing model is fetched;
+a failed acquisition or validation stops the build. No user-data cache
+substitutes for bundle resources. `fetch_embedding_model.sh` selects one
+`NATIVEAGENT_EMBEDDING_MODEL_REPO` and
+`NATIVEAGENT_EMBEDDING_FETCH_AUTH=anonymous` (default) or `github-cli` before
+requesting bytes. It verifies that source's expected SHA-256; failure never
+switches repository or authentication method. A present invalid model stays
+preserved and is reported. Release packaging never downloads a model.
 
 For delta updates in separate-download mode, retain the previous **shipped,
 signed** DMG locally outside the appcast output directory. Set
@@ -148,18 +226,19 @@ artifacts. From a private maintainer checkout, create the public export:
 ```
 
 The exporter archives tracked source, removes private material, scrubs
-identities, verifies resources and creates fresh single-commit history. Its
-`swift build` is the privacy gate compiling the **exported source** to prove
-the public tree builds and to check the linked executable for private identity
-strings. This is the release owner's check of the exported artifact, distinct
-from a lane's compile; lane build rules remain in [AGENTS.md](../AGENTS.md).
-The exporter does not push. Review the export before publishing its source
-commit.
+identities, verifies resources and creates fresh single-commit history. That
+directory is the reviewable source artifact; the exporter neither compiles nor
+pushes. Review and explicitly publish its source commit before releasing.
+The actual release executable passes the compiled identity/privacy gate in
+`release.sh`; there is one compile under [AGENTS.md](../AGENTS.md).
 
-A published-mirror checkout already contains the tracked
-`.nativeagent-public-source` marker. Do not copy that marker into a private
-checkout to bypass export. Public `release.sh` invocations without it create
-an export and rerun there.
+A published-mirror checkout contains the tracked `.nativeagent-public-source`
+marker. Never copy it into private source to bypass export. A nonpublishing
+public `release.sh` invocation from a private tree creates the source export
+and stops; `--publish-appcast` refuses private source before building. Release
+from the reviewed public checkout with a matching GitHub push remote and
+published HEAD. The publisher's `--preflight-source` checks that contract before
+compilation.
 
 ### Preflight and publish
 
@@ -190,7 +269,10 @@ Production releases write an artifact-only receipt with
 `ios_required: false` and `ios_result: "not_run"`. The compatibility filename
 still ends in `.test-receipt.json`; it does not claim tests ran. `--artifact-only`
 is an accepted spelling for this same path, with no separate release mode.
-Build, install and check the actual release app's requested behavior.
+Only after final DMG verification succeeds is the receipt atomically written
+beside that DMG. Its artifact name, SHA-256 and byte length must match in both
+the attestation and publisher. No completion record is minted in advance under
+`.runtime/`. Build, install and check the actual release app's requested behavior.
 
 ### Verify an existing artifact
 
@@ -208,8 +290,10 @@ read-only. Artifact verification does not establish installed behavior.
 ### Local packaging only
 
 `./script/release.sh --dry-run` builds, stages and signs, then stops before
-notarization and DMG creation. It uses the configured/available signing identity
-or an ad-hoc fallback. It does not create a production release receipt.
+notarization and DMG creation. The default `NATIVEAGENT_SIGNING_MODE=developer-id`
+requires `NATIVEAGENT_DEVELOPER_ID`; select `adhoc` explicitly for a host-only
+rehearsal. Missing prerequisites or failed signing stop the selected mode.
+Dry-run never creates a production release receipt.
 
 `--appcast` generates a local signed feed; `--publish-appcast` publishes it.
 Only the latter permits the release to claim a published update feed.

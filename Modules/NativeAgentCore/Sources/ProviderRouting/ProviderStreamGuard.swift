@@ -1,7 +1,8 @@
 import Foundation
-import Network
 import NativeAgentCore
-// Blueprint: | `ProviderStreamGuard.swift` | Configured idle/wall cuts on wire activity for every provider stream; the request registers its progress wake before reading and waits only for progress or its next deadline; terminal state closes activity admission before canceling forwarding/deadline tasks, retaining their handles through actual exit without joining the producer; typed no-reply failure and uncapped model URLSession; the learned first-output deadline bounds only a wire with nothing on it; `ProviderWire` opens every provider HTTP stream and owns delivery: until any of the answer arrives, a lost wire, an answerless idle or first-output cut, or a provider's busy reply (overloaded, 5xx, a rate limit with no wait or a wait up to 30 s) dials again, up to 10 dials with 0.5-8 s jittered backoff inside the call's wall, each redial first waiting for the Mac's network path (Stop and the wall end the wait); refusals, sign-in, context and long quota waits never redial, CLI wires never do, and the final failure says how many tries it took; wall-off streams forward without a deadline worker |
+import PersistenceCore
+import TurnTrace
+// Blueprint: | `ProviderStreamGuard.swift` | Configured idle/wall cuts on wire activity; progress and shared NetworkSense path edges wake deadlines without polling; terminal state closes admission and retires the network observation, retaining forwarding/deadline task handles through actual exit; whole-reply Stop cancels coordinator waits and redial admission while joining the independently stopped wire through exit/drain; typed no-reply/offline failures and uncapped model URLSession; learned first-output deadline bounds only a wire with nothing on it; `ProviderWire` opens every provider HTTP stream and owns up to 10 pre-answer dials for network/overload/short rate limits with 0.5-8 s jittered backoff inside the wall; every dial reads the shared path, waiting at most 30 s offline, and in-flight path loss has the same bound; offline, refusal, sign-in, context and long quota waits never redial, CLI wires never redial; wall-off streams park on events without an online deadline timer |
 
 public struct ProviderStreamGuardConfig: Sendable, Equatable {
     public var idleTimeout: TimeInterval
@@ -14,18 +15,12 @@ public struct ProviderStreamGuardConfig: Sendable, Equatable {
     /// Configured timeouts are finite and capped at one day for safe nanosecond conversion.
     public static let maximumTimeout: TimeInterval = 86_400
 
-    /// Clamp every input to finite, representable seconds; NaN takes the floor.
-    private static func bounded(_ value: TimeInterval, floor: TimeInterval) -> TimeInterval {
-        guard !value.isNaN else { return floor }
-        return Swift.min(Swift.max(floor, value), maximumTimeout)
-    }
-
     public init(
         idleTimeout: TimeInterval = 90,
         wallTimeout: TimeInterval = 600
     ) {
-        self.idleTimeout = Self.bounded(idleTimeout, floor: 0)
-        self.wallTimeout = Self.bounded(wallTimeout, floor: 0)
+        self.idleTimeout = idleTimeout
+        self.wallTimeout = wallTimeout
     }
 
     public static func fromEnvironment(
@@ -35,36 +30,36 @@ public struct ProviderStreamGuardConfig: Sendable, Equatable {
         return ProviderStreamGuardConfig(
             idleTimeout: seconds(
                 from: environment,
-                keys: [
-                    "NATIVE_AGENT_PROVIDER_STREAM_IDLE_TIMEOUT_SEC",
-                    "NATIVE_AGENT_PROVIDER_STREAM_IDLE_TIMEOUT",
-                ],
-                fallback: defaults.idleTimeout
+                key: "NATIVE_AGENT_PROVIDER_STREAM_IDLE_TIMEOUT_SEC",
+                absent: defaults.idleTimeout
             ),
             wallTimeout: seconds(
                 from: environment,
-                keys: [
-                    "NATIVE_AGENT_PROVIDER_STREAM_WALL_TIMEOUT_SEC",
-                    "NATIVE_AGENT_PROVIDER_STREAM_WALL_TIMEOUT",
-                ],
-                fallback: defaults.wallTimeout
+                key: "NATIVE_AGENT_PROVIDER_STREAM_WALL_TIMEOUT_SEC",
+                absent: defaults.wallTimeout
             )
         )
     }
 
     private static func seconds(
         from environment: [String: String],
-        keys: [String],
-        fallback: TimeInterval
+        key: String,
+        absent: TimeInterval
     ) -> TimeInterval {
-        for key in keys {
-            guard let raw = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !raw.isEmpty,
-                  let value = TimeInterval(raw)
-            else { continue }
-            return value
+        guard let raw = environment[key] else { return absent }
+        // Keep invalid configuration unavailable until validate(), rather than
+        // substituting a different deadline in this nonthrowing constructor.
+        return TimeInterval(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? .nan
+    }
+
+    public func validate() throws {
+        for (key, value) in [("NATIVE_AGENT_PROVIDER_STREAM_IDLE_TIMEOUT_SEC", idleTimeout),
+                             ("NATIVE_AGENT_PROVIDER_STREAM_WALL_TIMEOUT_SEC", wallTimeout)] {
+            guard value.isFinite, (0...Self.maximumTimeout).contains(value) else {
+                throw ProviderFailure.Diagnostic(cause: .routingUnavailable,
+                    detail: "Invalid \(key): supply finite seconds in 0...86400 (zero disables this deadline). Correct the environment setting and restart NativeAgent; no request was sent.")
+            }
         }
-        return fallback
     }
 }
 
@@ -72,15 +67,22 @@ public struct ProviderStreamGuardConfig: Sendable, Equatable {
 public enum ProviderWire {
     /// Dials per call, the first included.
     public static let maxAttempts = 10
+    static let networkReturnWait: TimeInterval = 30
 
     /// Send the request and wait for its response head. Only HTTP wires mark
     /// this send for pre-answer redial admission; a silent CLI child does not.
     public static func open(_ session: URLSession, _ request: URLRequest) async throws -> (URLSession.AsyncBytes, URLResponse) {
+        try await networkReturns()
         var request = request
         // The guard's idle and wall bound every stream; URLSession's own
         // timeout (60 s by default) would end a model still thinking first.
         request.timeoutInterval = .infinity
         ProviderStreamContext.sending?()
+        // Count-only evidence after body assembly and the offline wait, just
+        // before URLSession. This is a send attempt, never provider receipt.
+        TurnTraceBus.fireFromContext(kind: "provider.httpRequestStarted", surface: LLMCallContext.surface,
+            payload: .object(["requestBodyBytes": .int(Int64(request.httpBody?.count ?? 0))]))
+        OAuthProbeCredential.sending(request)
         let opened = try await session.bytes(for: request)
         if !ProviderStreamContext.stallOnly { ProviderStreamContext.activity?() }
         return opened
@@ -114,17 +116,11 @@ public enum ProviderWire {
         }
     }
 
-    /// Wait for the Mac's network path; return immediately if one exists.
-    /// Stop and the call's wall cancel the wait.
-    static func networkReturns() async {
-        let monitor = NWPathMonitor()
-        let waiter = ScopedWaiter()
-        monitor.pathUpdateHandler = { path in
-            if path.status == .satisfied { waiter.resume() }
-        }
-        monitor.start(queue: DispatchQueue(label: "provider.wire.path"))
-        await waiter.park()
-        monitor.cancel()
+    /// A short Wi-Fi blip may heal; an absent path never consumes the wall.
+    static func networkReturns() async throws {
+        try Task.checkCancellation()
+        guard !NetworkSense.isUp else { return }
+        guard try await NetworkSense.returns(within: networkReturnWait) else { throw ProviderFailure.offline }
     }
 
     /// The call's final failure, saying how many dials it took.
@@ -142,9 +138,9 @@ public enum ProviderWire {
 }
 
 public enum ProviderStreamGuard {
-    /// No URLSession request or resource cap: the guard's idle and wall bound
-    /// the call, and with the wall configured off nothing but transport
-    /// termination, provider completion or cancellation ends it.
+    /// No URLSession request or resource cap: the guard's idle/wall and shared
+    /// offline bound own the call. Wall-off leaves only the offline bound,
+    /// transport termination, provider completion or cancellation.
     public static let stallOnlySession: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = .infinity
@@ -165,7 +161,10 @@ public enum ProviderStreamGuard {
     ) -> AsyncThrowingStream<Element, Error> {
         let activity = ProviderStreamContext.activity
         return AsyncThrowingStream { continuation in
+            do { try config.validate() }
+            catch { continuation.finish(throwing: error); return }
             let state = ProviderStreamGuardState(startedAt: monotonicNow())
+            state.observeNetwork()
             let producer = Task {
                 defer { state.producerDidExit() }
                 do {
@@ -183,6 +182,7 @@ public enum ProviderStreamGuard {
                     // `ProviderWire.redialDelay` admits redials within this call's
                     // wall until answer output begins; then a cut ends the call.
                     while true {
+                        try await ProviderWire.networkReturns()
                         guard let attempt = state.beginAttempt(monotonicNow()) else { return }
                         let wire = Task {
                             var iterator = makeUpstream().makeAsyncIterator()
@@ -197,7 +197,11 @@ public enum ProviderStreamGuard {
                         state.own(attempt: wire)
                         var failure: (any Error)?
                         do {
-                            try await withTaskCancellationHandler { try await wire.value } onCancel: { wire.cancel() }
+                            // Whole-reply Stop cancels this coordinator's waits,
+                            // but the transport owns stopping its active work.
+                            // Await the uncancelled forwarder through exit/drain.
+                            // Iterator termination still cancels it via retire().
+                            try await wire.value
                         } catch { failure = error }
                         let (letGo, sent) = state.endAttempt()
                         try Task.checkCancellation()
@@ -208,8 +212,8 @@ public enum ProviderStreamGuard {
                                   letGo == nil ? ProviderFailure.classify(reason) : .network, attempt: attempt) else {
                             throw ProviderWire.settled(reason, tries: attempt, seconds: monotonicNow() - state.snapshot().startedAt)
                         }
-                        // No network on the Mac: wait for one, as long as the call's wall allows.
-                        await ProviderWire.networkReturns()
+                        // No path: allow a brief return, then end with the real cause.
+                        try await ProviderWire.networkReturns()
                         try await Task.sleep(for: .seconds(delay))
                     }
                     try Task.checkCancellation()
@@ -219,11 +223,15 @@ public enum ProviderStreamGuard {
                     }
                     }
                 } catch {
-                    state.finish(continuation, throwing: ProviderFailure.normalize(error, admitted: state.snapshot().admitted))
+                    let snapshot = state.snapshot()
+                    let failure = ProviderFailure.classify(error) == .offline
+                        ? ProviderWire.settled(error, tries: snapshot.attempt, seconds: monotonicNow() - snapshot.startedAt)
+                        : error
+                    state.finish(continuation, throwing: ProviderFailure.normalize(failure, admitted: snapshot.admitted))
                 }
             }
 
-            let watchdog = config.wallTimeout > 0 ? Task {
+            let watchdog = Task {
                 defer { state.deadlineDidExit() }
                 while !Task.isCancelled {
                     // Register under the state lock before reading: an update
@@ -242,7 +250,7 @@ public enum ProviderStreamGuard {
                         // wire yet: the wire is dead, not slow. Let it go; the
                         // producer dials again (or, if activity won the race,
                         // this reads again).
-                        if timeout != .wall, snapshot.sentAt != nil, !snapshot.yieldedAny,
+                        if timeout != .wall, timeout != .offline, snapshot.sentAt != nil, !snapshot.yieldedAny,
                            snapshot.attempt < ProviderWire.maxAttempts {
                             _ = state.abandon(error, ifUnchanged: snapshot)
                             continue
@@ -259,7 +267,11 @@ public enum ProviderStreamGuard {
                         continue // provider activity won the timeout race
                     }
 
-                    let delay = max(0.01, enabled.map { $0.remaining }.min() ?? config.wallTimeout)
+                    guard let remaining = enabled.map({ $0.remaining }).min() else {
+                        await wake.park()
+                        continue
+                    }
+                    let delay = max(0.01, remaining)
                     await withTaskGroup(of: Void.self) { group in
                         group.addTask { await wake.park() }
                         group.addTask { try? await Task.sleep(for: .seconds(delay)) }
@@ -267,8 +279,10 @@ public enum ProviderStreamGuard {
                         group.cancelAll()
                     }
                 }
-            } : nil
+            }
 
+            ProviderReplyWork.current?.own(producer)
+            ProviderReplyWork.current?.own(watchdog)
             state.own(producer: producer, deadline: watchdog)
             continuation.onTermination = { _ in state.retire() }
         }
@@ -279,7 +293,7 @@ public enum ProviderStreamGuard {
     }
 
     private enum TimeoutKind {
-        case idle, wall, firstOutput
+        case idle, wall, firstOutput, offline
 
         func error(providerLabel p: String, snapshot: ProviderStreamGuardState.Snapshot,
                    waited: TimeInterval, config: ProviderStreamGuardConfig) -> Error {
@@ -293,6 +307,10 @@ public enum ProviderStreamGuard {
                     + "for this request's \(deadline.requestBytes / 1024) KB its deadline was \(String(format: "%.0f", deadline.seconds ?? 0)) s."
             let account: String
             switch (self, snapshot.yieldedAny) {
+            case (.offline, _):
+                let progress = "Current dial: \(snapshot.sentAt == nil ? "no HTTP send attempt observed" : "HTTP send attempted"); provider response \(snapshot.admitted ? "began" : "not observed"); \(snapshot.eventCount) events received."
+                return ProviderFailure.Diagnostic(cause: .offline, detail: ProviderFailure.offline.localizedDescription + " " + progress,
+                    admitted: snapshot.admitted, tries: max(1, snapshot.attempt))
             case (.firstOutput, _): account = "No first output from \(p) in \(waited) s (\(arrived)); \(evidence)"
             case (.wall, false): account = "No first output from \(p) by the call's \(waited) s limit (\(arrived)); \(evidence)"
             case (.idle, false): account = "No first output from \(p), and nothing on the line for \(idle) s (\(arrived) in \(waited) s)."
@@ -305,7 +323,7 @@ public enum ProviderStreamGuard {
         }
     }
 
-    /// Precedence is wall, idle, first output; the earliest remaining deadline determines the wake.
+    /// Precedence is wall, offline, idle, first output; the earliest remaining deadline determines the wake.
     private static func deadlines(
         snapshot: ProviderStreamGuardState.Snapshot,
         now: TimeInterval,
@@ -315,8 +333,12 @@ public enum ProviderStreamGuard {
         if config.wallTimeout > 0 {
             enabled.append((.wall, config.wallTimeout - (now - snapshot.startedAt)))
         }
-        // Between attempts only the wall runs.
-        guard let attemptStartedAt = snapshot.attemptStartedAt else { return enabled }
+        if let down = snapshot.networkDownAt {
+            enabled.append((.offline, ProviderWire.networkReturnWait - (now - down)))
+        }
+        // Between attempts only wall/offline run. Wall-off keeps the existing
+        // transport-driven behavior, apart from the body's offline deadline.
+        guard config.wallTimeout > 0, let attemptStartedAt = snapshot.attemptStartedAt else { return enabled }
         if config.idleTimeout > 0, let lastActivityAt = snapshot.lastActivityAt {
             enabled.append((.idle, config.idleTimeout - (now - lastActivityAt)))
         }
@@ -349,6 +371,7 @@ private final class ProviderStreamGuardState: @unchecked Sendable {
         var attempt: Int
         var attemptStartedAt: TimeInterval?
         var sentAt: TimeInterval?
+        var networkDownAt: TimeInterval?
     }
 
     private let lock = NSLock()
@@ -371,10 +394,29 @@ private final class ProviderStreamGuardState: @unchecked Sendable {
     private var attemptTask: Task<Void, Error>?
     /// Why the watchdog let the current wire go, read once by the producer.
     private var letGo: (any Error)?
+    private var networkObservation: NSObjectProtocol?
+    private var networkDownAt: TimeInterval?
 
     init(startedAt: TimeInterval) {
         self.startedAt = startedAt
         self.lastActivityAt = nil
+    }
+
+    /// Subscribe before reading; callbacks reread the one owner so even a
+    /// concurrent return cannot publish an older path over the current one.
+    func observeNetwork() {
+        let observer = NotificationCenter.default.addObserver(forName: NetworkSense.pathChanged,
+            object: nil, queue: nil) { [weak self] _ in self?.networkChanged() }
+        lock.withLock { networkObservation = observer }
+        networkChanged()
+    }
+
+    private func networkChanged() {
+        lock.lock()
+        guard !finished else { lock.unlock(); return }
+        if NetworkSense.isUp { networkDownAt = nil }
+        else if networkDownAt == nil { networkDownAt = ProcessInfo.processInfo.systemUptime }
+        signalAndUnlock()
     }
 
     func admitProducer(_ now: TimeInterval) -> Bool {
@@ -507,7 +549,8 @@ private final class ProviderStreamGuardState: @unchecked Sendable {
             yieldedAny: yieldedAny,
             attempt: attempt,
             attemptStartedAt: attemptStartedAt,
-            sentAt: sentAt
+            sentAt: sentAt,
+            networkDownAt: networkDownAt
         )
     }
 
@@ -525,7 +568,10 @@ private final class ProviderStreamGuardState: @unchecked Sendable {
         let producer = self.producer
         let deadline = self.deadline
         let wire = attemptTask
+        let observer = networkObservation
+        networkObservation = nil
         signalAndUnlock()
+        if let observer { NotificationCenter.default.removeObserver(observer) }
         wire?.cancel()
         producer?.cancel()
         deadline?.cancel()
@@ -558,7 +604,8 @@ private final class ProviderStreamGuardState: @unchecked Sendable {
     ) -> Bool {
         lock.lock()
         guard !finished, snapshot == nil
-                || (snapshot?.lastActivityAt == lastActivityAt && snapshot?.yieldedAny == yieldedAny) else {
+                || (snapshot?.lastActivityAt == lastActivityAt && snapshot?.yieldedAny == yieldedAny
+                    && snapshot?.networkDownAt == networkDownAt) else {
             lock.unlock()
             return false
         }

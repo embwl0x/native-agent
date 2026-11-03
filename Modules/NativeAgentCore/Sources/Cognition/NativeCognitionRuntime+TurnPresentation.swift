@@ -74,6 +74,12 @@ extension NativeCognitionRuntime {
         request: CognitiveCapsuleRequest
     ) async {
         guard request.resolvedTurnKind == .live else { return }
+        // Clear shares this door, including the runtime's capsule/body-line mirror.
+        await enterDoor()
+        defer { leaveDoor() }
+        if request.mode == .inject, let presentationCommit = projection.capsulePresentationCommit {
+            guard await substrate.applyCapsulePresentationCommit(presentationCommit) else { return }
+        }
         if let capsule = projection.capsule {
             // Mirror live capsules; only populated injections consume the body-line window.
             lastInjectedCapsule = (capsule, request.userMessage)
@@ -84,9 +90,6 @@ extension NativeCognitionRuntime {
             }
         }
         guard request.mode == .inject else { return }
-        if let presentationCommit = projection.capsulePresentationCommit {
-            _ = await substrate.applyCapsulePresentationCommit(presentationCommit)
-        }
         // Empty delivered turns advance cadence with a token; populated ones flush even without one.
         if projection.capsule != nil || projection.capsulePresentationCommit != nil {
             await substrate.flushCommittedCapsulePresentation(at: projection.fixedAt)

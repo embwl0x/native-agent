@@ -6,7 +6,7 @@ import Network
 extension AgentContactA2AEndpoint {
     public enum RESTResponse: @unchecked Sendable {
         case json(Int, [String: Any], onSent: (@Sendable () async -> Void)? = nil)
-        case stream(AsyncStream<AgentContactEvent>)
+        case stream(AsyncStream<AgentContactEvent>, onSent: @Sendable (AgentContactEvent) async -> Void)
     }
 
     /// REST is a binding over the same parser, task owner and projections.
@@ -91,7 +91,7 @@ extension AgentContactA2AEndpoint {
             let request: [String: Any] = ["jsonrpc": "2.0", "id": "rest", "method": operation, "params": params]
             switch await handle(request, byteCount: try JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]).count,
                                 principal: principal, version: version ?? "1.0") {
-            case .stream(_, let events, _): return .stream(events)
+            case .stream(_, let events, _, let onSent): return .stream(events, onSent: onSent)
             case .json(let envelope, let onSent):
                 if let error = envelope["error"] as? [String: Any] {
                     return Self.restError(code: error["code"] as? Int ?? -32603, message: error["message"] as? String ?? "Request failed")

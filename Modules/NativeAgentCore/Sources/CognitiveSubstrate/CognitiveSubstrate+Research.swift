@@ -23,7 +23,7 @@ extension CognitiveSubstrate {
                 episodeCount: 0,
                 reflectionCount: 0,
                 affect: currentAffect,
-                ablations: ablations
+                ablations: read.ablations
             )
         }
         let nodeCount = read.snapshot.nodes.count
@@ -32,10 +32,10 @@ extension CognitiveSubstrate {
             generatedAt: now,
             nodeCount: nodeCount,
             workspaceCount: workspaceCount,
-            episodeCount: episodes.count,
-            reflectionCount: reflectionReceipts.count,
+            episodeCount: read.episodeCount,
+            reflectionCount: read.reflectionCount,
             affect: currentAffect,
-            ablations: ablations
+            ablations: read.ablations
         )
     }
 

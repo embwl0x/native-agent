@@ -244,7 +244,7 @@ extension FileSystemActions {
             "entries": .array(out),
             "items": .array(page.map { .object(["name": .string($0.name), "is_directory": .bool(!$0.isFile),
                 "allocated_bytes": sort == "size" ? .int($0.bytes) : .null,
-                "size_bytes": $0.length.map { .int($0) } ?? (sort == "size" && $0.isFile ? .int($0.bytes) : .null),
+                "size_bytes": $0.length.map { .int($0) } ?? .null,
                 "size_complete": sort == "size" ? .bool($0.complete) : .null,
                 "modified_at": $0.modified.map { .string(iso.string(from: $0)) } ?? .null,
                 "added_at": $0.added.map { .string(iso.string(from: $0)) } ?? .null]) }),

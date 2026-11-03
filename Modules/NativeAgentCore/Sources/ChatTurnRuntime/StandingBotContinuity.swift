@@ -21,7 +21,7 @@ public enum StandingBotContinuity {
     ) async throws -> T {
         let sessionID = try SwiftNativeChatOrchestrationClient.resolveSessionId(sessionID)
         guard currentBot == nil,
-              let contract = await BotChatContract.checked(sessionID, dataRoot: dataRoot) else {
+              let contract = try await BotChatContract.checked(sessionID, dataRoot: dataRoot) else {
             return try await operation()
         }
         if let problem = contract.modelChoiceProblem {
@@ -55,7 +55,8 @@ public enum StandingBotContinuity {
                 "threadKind": .string(ChatThreadKind.agent.rawValue),
                 "helperID": .string(bot.id.uuidString),
                 "createdAt": .string(ISO8601DateFormatter().string(from: bot.createdAt)),
-                "archived": .bool(false), "messageCount": .int(0)
+                "archived": .bool(false), "messageCount": .int(0),
+                ChatSessionIndexFile.transcriptGenerationKey: .int(0)
             ]
             rows.append(created)
             return created
@@ -84,15 +85,20 @@ public enum StandingBotContinuity {
                         progress: progress)
                 }
             }
-            return try await client.runStandingBot(bot, message: message, choice: choice,
+            // A direct native helper run owns its explicit origin; nested runs
+            // retain the authenticated turn that invoked them.
+            let origin = ChatToolSessionContext.envelope ?? .native("helper:" + bot.id.uuidString)
+            return try await ChatToolSessionContext.$envelope.withValue(origin) {
+            try await client.runStandingBot(bot, message: message, choice: choice,
                 attachments: attachments, fileAccess: fileAccess, runID: admitted ? ChatPersistenceContext.pinnedTurnRunID : nil,
                 progress: progress)
+            }
             }
             return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([bot.id])) {
                 if admitted {
                     return try await BotRunnerDeadline.settled(seconds: bot.budget.seconds, onDeadline: {}, body: run)
                 }
-                return try await TurnAdmission.shared.run(sessionID: bot.sessionID, operation: run)
+                return try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: bot.sessionID, operation: run)
             }
             }
         }
@@ -123,7 +129,7 @@ extension SwiftNativeChatOrchestrationClient {
     func importBotHistory(bot: BotDefinition, dataRoot: URL) async throws {
         _ = try await StandingBotContinuity.openSession(for: bot, dataRoot: dataRoot)
         let path = dataRoot.appendingPathComponent("chat/messages/" + bot.sessionID + ".jsonl")
-        var imported = await Self.completedAssistantRunIds(path: path)
+        var imported = try await Self.completedAssistantRunIds(path: path)
         for item in try ShelfStore(dataRoot: dataRoot).legacyHistory(bot: bot.id, dataRoot: dataRoot) {
             try Task.checkCancellation()
             guard !imported.contains(item.id) else { continue }

@@ -1,14 +1,27 @@
 import Transcripts
 import Foundation
 import PersistenceCore
+import NativeAgentCore
+import Experiences
 
-// Blueprint: | `TurnClockQuietHours.swift` | `TurnQuietHoursWindow`: local wall-clock quiet-hours membership, wraparound and exact end deadline shared by native reply admission |
+// Blueprint: | `TurnClockQuietHours.swift` | `TurnQuietHoursWindow`: checked preference owner with repair owed; local wall-clock membership, wraparound and exact end deadline shared by native reply admission |
 
 /// Declared quiet hours in local wall-clock time, shared by turn context and delivery admission.
 /// `start > end` wraps midnight.
 public struct TurnQuietHoursWindow: Sendable, Equatable {
     public static func holdsResidentWake(session: String?, dataRoot: URL, at date: Date = Date()) -> Bool {
-        SessionConversation.kind(session, dataRoot: dataRoot)?.isOwnWork == true && read(dataRoot: dataRoot)?.contains(hour: Calendar.current.component(.hour, from: date)) == true
+        do {
+            guard try SessionConversation.checkedKind(session, dataRoot: dataRoot)?.isOwnWork == true else { return false }
+        } catch {
+            reportUnavailable(error, dataRoot: dataRoot)
+            return true
+        }
+        do {
+            return try checkedRead(dataRoot: dataRoot)?.contains(hour: Calendar.current.component(.hour, from: date)) == true
+        } catch {
+            // checkedRead owns its repair receipt. The dependent wake stays held.
+            return true
+        }
     }
 
     public let startHour: Int
@@ -34,24 +47,52 @@ public struct TurnQuietHoursWindow: Sendable, Equatable {
         return Calendar.current.nextDate(after: date, matching: components, matchingPolicy: .nextTime)
     }
 
-    /// Reads `quiet_hours.{start,end}` from `user_prefs.json`; missing or invalid data means no window.
-    public static func read(dataRoot: URL) -> TurnQuietHoursWindow? {
-        let url = dataRoot.appendingPathComponent("user_prefs.json")
-        guard let data = try? Data(contentsOf: url),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let quiet = root["quiet_hours"] as? [String: Any] else {
-            return nil
+    /// Confirmed missing preferences or an absent window is unset; present damage is unavailable.
+    public static func checkedRead(dataRoot: URL) throws -> TurnQuietHoursWindow? {
+        do {
+            let window = try readPreferences(dataRoot: dataRoot)
+            if window != nil {
+                RepairOwed.settle(dataRoot, operation: "clock.quiet_hours", evidence: .init(source: "user_prefs.json", id: "quiet_hours"))
+            }
+            return window
+        } catch {
+            reportUnavailable(error, dataRoot: dataRoot)
+            throw error
         }
-        guard let start = intValue(quiet["start"]), let end = intValue(quiet["end"]) else {
-            return nil
-        }
-        return TurnQuietHoursWindow(startHour: start, endHour: end)
     }
 
-    private static func intValue(_ raw: Any?) -> Int? {
-        if let value = raw as? Int { return value }
-        if let value = raw as? Double { return Int(exactly: value.rounded(.towardZero)) }
-        if let value = raw as? String { return Int(value.trimmingCharacters(in: .whitespaces)) }
-        return nil
+    private static func readPreferences(dataRoot: URL) throws -> TurnQuietHoursWindow? {
+        let url = dataRoot.appendingPathComponent("user_prefs.json")
+        let data: Data
+        do { data = try Data(contentsOf: url) }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
+        catch { throw unavailable(error.localizedDescription) }
+        do {
+            guard case .object(let root) = try JSONValue.parse(data) else { throw unavailable("The preferences are not an object.") }
+            guard let value = root["quiet_hours"] else { return nil }
+            guard case .object(let quiet) = value,
+                  let start = intValue(quiet["start"]), let end = intValue(quiet["end"]),
+                  let window = TurnQuietHoursWindow(startHour: start, endHour: end) else {
+                throw unavailable("quiet_hours requires distinct integer start/end hours from 0 through 23.")
+            }
+            return window
+        } catch let error as ToolFailureError { throw error }
+        catch { throw unavailable(error.localizedDescription) }
+    }
+
+    private static func unavailable(_ reason: String) -> ToolFailureError {
+        ToolFailureError("Quiet hours are unavailable: \(reason) Repair user_prefs.json before releasing resident wake delivery.",
+            effects: .none, owner: "user_prefs.json", code: "quiet_hours_unavailable", recovery: .repair)
+    }
+
+    private static func reportUnavailable(_ error: Error, dataRoot: URL) {
+        RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "clock.quiet_hours",
+            owner: "user_prefs.json", words: error.localizedDescription,
+            nextCall: ToolFailureError.call("app", ["action": .string("files.read"), "args": .object(["path": .string(dataRoot.appendingPathComponent("user_prefs.json").path)])]))
+    }
+
+    private static func intValue(_ raw: JSONValue?) -> Int? {
+        guard case .int(let value)? = raw else { return nil }
+        return Int(exactly: value)
     }
 }

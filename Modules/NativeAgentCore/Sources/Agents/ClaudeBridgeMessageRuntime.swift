@@ -12,25 +12,26 @@ import PersistenceCore
 import Privacy
 import TurnTrace
 import Transcripts
-// Blueprint: | `ClaudeBridgeMessageRuntime.swift` | Bridge message admission/delivery and the retained chat client; replies omit working commentary at the turn's recorded boundary; an exact text reply records its durable receipt before publishing an inline answer, without starting another turn; event publication is a weak callback to the HTTP runtime |
+import Experiences
+// Blueprint: | `ClaudeBridgeMessageRuntime.swift` | Prepared builder turns run in AgentContactTasks with exact session/run bindings; HTTP deadlines end only the wait; canonical tasks retain output and transport metadata before the final reply; historical receipt reads remain for retained evidence; inline replies settle their existing conversation without a new turn |
 
 /// App selection, transport publication and existing delivery adapters used by
 /// the Core conversation owner. Authentication happens before this boundary.
 public protocol ClaudeBridgeMessagePort: Sendable {
-    func activeSessionID(dataRoot: URL) -> String?
-    func activePersona(dataRoot: URL) -> String?
+    func activeSessionID(dataRoot: URL) throws -> String?
+    func activePersona(dataRoot: URL) throws -> String?
     func chatClient() -> SwiftNativeChatOrchestrationClient
     func completionSender(dataRoot: URL) -> any AgentBridgeCompletionSending
     func publishChatTurnCompleted(sessionID: String?) async
 }
 
-/// Admission, enqueue, completion and durable return receipts for the existing
-/// bridge conversation. This owner has no Network connection or listener.
+/// Routing and formatting for the bridge conversation. AgentContactTasks owns
+/// admission, the accepted worker and durable return receipt.
 public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     public typealias Response = @Sendable (Int, [String: Any]) -> Void
     /// HTTP response deadline; accepted turns continue through durable settlement.
     public static let messageWorkDeadlineSeconds: Int = 600
-    /// Enqueue acknowledgement deadline; expiry cancels enqueue before turn admission.
+    /// Enqueue acknowledgement deadline; expiry ends only the HTTP wait.
     public static let enqueueAckDeadlineSeconds: Int = 30
     private let port: any ClaudeBridgeMessagePort
     private let tasks: AgentContactTasks
@@ -117,7 +118,9 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 }
             } catch { response(503, ["error": "life_id_unavailable", "detail": error.localizedDescription]); return }
         }
-        let owner = AgentContactIdentity(dataRoot: dataRoot).canonical("peer:" + principal.id)
+        let owner: String
+        do { owner = try AgentContactIdentity(dataRoot: dataRoot).canonical("peer:" + principal.id) }
+        catch { response(503, ["error": "contact_identity_unavailable", "detail": error.localizedDescription]); return }
         let threadOwner = owner.hasPrefix("peer:") ? String(owner.dropFirst(5)) : owner
         let requestedSessionId = json["sessionId"] as? String
         // Attach up to four local images, 8 MB each; report skipped images in the message.
@@ -133,11 +136,17 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             return defaultSender
         }()
         // Peers default to their own conversation; scripts use the active chat; completions require explicit routing.
+        let selectedSession: String?
+        do {
+            if isCodexCompletion || requestedSessionId != nil { selectedSession = nil }
+            else if sender == defaultSender { selectedSession = ContactThread.session(owner: threadOwner) }
+            else { selectedSession = try port.activeSessionID(dataRoot: dataRoot) }
+        } catch {
+            response(503, ["error": "active_session_unavailable", "detail": "The selected chat could not be read: \(error.localizedDescription). Repair the session index before retrying."]); return
+        }
         let sessionId = Self.bridgeMessageSessionID(
             requested: requestedSessionId,
-            active: isCodexCompletion ? nil
-                : sender == defaultSender ? ContactThread.session(owner: threadOwner)
-                : port.activeSessionID(dataRoot: PersistenceCore.defaultDataRoot())
+            active: selectedSession
         )
         if !isCodexCompletion, sessionId == nil {
             response(409, [
@@ -170,7 +179,9 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 sessionId: sessionId
             )
         }()
-        let claudeReplyID = Self.claudeReplyID(json, owner: owner)
+        let claudeReplyID: String?
+        do { claudeReplyID = try Self.claudeReplyID(json, owner: owner) }
+        catch { response(503, ["error": "reply_identity_unavailable", "detail": error.localizedDescription]); return }
         if let claudeReplyID, attachments.isEmpty {
             let from = principal.peerID.map { "peer:" + $0 } ?? "another agent"
             do {
@@ -187,17 +198,21 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 return
             }
         }
+        let selectedPersona: String?
+        do { selectedPersona = try port.activePersona(dataRoot: dataRoot) }
+        catch {
+            response(503, ["error": "active_persona_unavailable", "detail": "The selected persona could not be read: \(error.localizedDescription). Repair the persona selection before retrying."]); return
+        }
         let baseRequest: TurnRequest = {
             var request = principal.turnRequest(context: nil, plain: rawText, attachments: attachments, originID: claudeReplyID)
             request.sessionID = sessionId
             request.ownedSessionID = ContactThread.session(owner: threadOwner)
             request.verifiedSessionID = .some(sessionId)
-            request.persona = port.activePersona(dataRoot: dataRoot)
+            request.persona = selectedPersona
             request.message = Self.withImageSkipNote(request.message, imageSkips)
             return request
         }()
         let text = baseRequest.message
-        let client = chatClient()
         let started = Date()
         let requestID = UUID().uuidString
         // Publish: bridge received an inbound message (me → her).
@@ -207,248 +222,23 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             "textLen": text.count,
             "sessionId": sessionId ?? NSNull(),
         ])
-        // Enqueue acknowledges the durable row; enqueue_only starts no turn.
-        // Codex completions retain blocking claim/settled/conflict responses.
         let ackMode = (json["ackMode"] as? String)?.lowercased()
-        if !isCodexCompletion, ackMode == "enqueue" || ackMode == "enqueue_only" {
-            handleMessageAckOnEnqueue(
-                response: response,
-                client: client,
-                request: baseRequest,
-                principal: principal,
-                claudeReplyID: claudeReplyID,
-                claudeReplyText: rawText,
-                requestID: requestID,
-                started: started,
-                runTurn: ackMode != "enqueue_only"
-            )
-            return
-        }
-        // The work task and HTTP deadline share one response latch.
-        let progress = chatNoticeSink(requestID: requestID, sessionID: sessionId)
-        let workLatch = ClaudeBridgeRuntime.WorkLatch()
-        _ = Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self else { return }
-            var lifecycleClaimed = false
-            var responseCached = false
-            do {
-                let callerResultIsTool: Bool
-                if let completionRoute, completionRoute.surface == "caller-result" {
-                    callerResultIsTool = try await self.tasks.callerResultTarget(completionRoute).canonicalRunID == nil
-                } else {
-                    callerResultIsTool = false
-                }
-                let resp: ChatTurnRuntime.ChatResponse
-                var wasCached = false
-                if let deliveryId, let completionRequestDigest {
-                    let responseRunID = CausalTransitionEvidence.opaqueIdentity(deliveryId)
-                    switch try await CodexCompletionLifecycle.shared.claim(
-                        deliveryId: deliveryId,
-                        requestDigest: completionRequestDigest,
-                        sessionId: sessionId,
-                        responseRunId: responseRunID,
-                        route: completionRoute,
-                        principal: principal.id, source: defaultSender
-                    ) {
-                    case .cached(let cached):
-                        resp = cached
-                        responseCached = true
-                        wasCached = true
-                    case .settled(let delivery):
-                        guard workLatch.claim() else { return }
-                        var object: [String: Any] = [
-                            "status": "completion_already_settled",
-                            "deliveryId": deliveryId,
-                            "responseCached": false,
-                            "servedFromCache": true,
-                        ]
-                        if let delivery {
-                            object["completionDelivery"] = delivery.jsonObject
-                        }
-                        response(200, object)
-                        return
-                    case .start:
-                        lifecycleClaimed = true
-                        var request = baseRequest
-                        request.replyRoute = (completionRoute?.chatToolReplyRoute).map { Optional($0) }
-                        request.pinnedRunID = responseRunID
-                        request.codexCompletion = CodexCompletionTranscriptBinding(
-                                deliveryId: deliveryId,
-                                requestDigest: completionRequestDigest,
-                                // Canonical assistant persistence replaces
-                                // these placeholders with executed truth.
-                                model: "",
-                                reasoningEffort: nil
-                        )
-                        let generated: ChatTurnRuntime.ChatResponse
-                        if callerResultIsTool {
-                            generated = .init(runId: responseRunID, model: "", output: rawText,
-                                              sessionId: sessionId, attachments: attachments, providerCallCount: 0)
-                        } else {
-                            generated = try await TurnAdmission.admittedRun(dataRoot: PersistenceCore.defaultDataRoot(),
-                                sessionID: sessionId, runID: responseRunID) {
-                                try await request.chat(on: client, progress: progress)
-                            }
-                        }
-                        // Cache the response before external delivery so retries
-                        // never start another model turn.
-                        try await CodexCompletionLifecycle.shared.cacheResponse(
-                            generated,
-                            deliveryId: deliveryId,
-                            requestDigest: completionRequestDigest
-                        )
-                        responseCached = true
-                        resp = generated
-                    case .inProgress:
-                        guard workLatch.claim() else { return }
-                        response(202, [
-                            "status": "completion_in_progress",
-                            "deliveryId": deliveryId,
-                        ])
-                        return
-                    case .outcomeUnknown:
-                        guard workLatch.claim() else { return }
-                        response(409, [
-                            "status": "outcome_unknown",
-                            "error": "completion_claim_interrupted",
-                            "deliveryId": deliveryId,
-                        ])
-                        return
-                    case .conflict:
-                        guard workLatch.claim() else { return }
-                        response(409, [
-                            "status": "conflict",
-                            "error": "delivery_id_reused_for_different_completion",
-                            "deliveryId": deliveryId,
-                        ])
-                        return
-                    }
-                } else {
-                    var request = baseRequest
-                    request.pinnedRunID = requestID
-                    request.codexCompletion = CodexCompletionTranscriptBinding(
-                        deliveryId: "bridge-http." + requestID, requestDigest: requestID, model: "", reasoningEffort: nil)
-                    _ = try await CodexCompletionLifecycle.shared.claim(deliveryId: "bridge-http." + requestID,
-                        requestDigest: requestID, sessionId: sessionId, responseRunId: requestID, principal: principal.id)
-                    resp = try await TurnAdmission.admittedRun(dataRoot: PersistenceCore.defaultDataRoot(),
-                        sessionID: sessionId, runID: requestID) {
-                        try await request.chat(on: client, progress: progress)
-                    }
-                    try await CodexCompletionLifecycle.shared.cacheResponse(resp, deliveryId: "bridge-http." + requestID, requestDigest: requestID)
-                }
-                let responseObject = try await self.settleMessageReply(resp, request: baseRequest,
-                    principal: principal, owner: owner, claudeReplyID: claudeReplyID, replyText: rawText,
-                    requestID: requestID, started: started, sessionID: sessionId,
-                    callerResultIsTool: callerResultIsTool, responseCached: responseCached, wasCached: wasCached,
-                    completionRoute: completionRoute, deliveryID: deliveryId, completionDigest: completionRequestDigest)
-                // Settlement runs even when the HTTP deadline has already answered.
-                guard workLatch.claim() else { return }
-                response(200, responseObject)
-            } catch is TurnAdmission.Full {
-                // Queue capacity was refused before the chat closure ran. Keep
-                // exact completion identity but allow a later delivery retry.
-                var retryable = !lifecycleClaimed
-                if lifecycleClaimed, !responseCached, let deliveryId, let completionRequestDigest {
-                    do {
-                        try await CodexCompletionLifecycle.shared.markNotStarted(
-                            deliveryId: deliveryId, requestDigest: completionRequestDigest)
-                        retryable = true
-                    } catch { retryable = false }
-                }
-                guard workLatch.claim() else { return }
-                response(retryable ? 429 : 503, [
-                    "requestId": requestID, "status": "not_started", "retryable": retryable,
-                    "error": "bridge_chat_queue_full", "detail": "No model turn started; this chat's bridge queue is full.",
-                ])
-            } catch is CancellationError {
-                await self.port.publishChatTurnCompleted(sessionID: sessionId)
-                // Cancellation retains the persisted partial and releases the
-                // completion claim as unknown, without a duplicate failure row.
-                var cancelObject: [String: Any] = [
-                    "requestId": requestID,
-                    "status": "cancelled",
-                    "reply": "(turn cancelled)",
-                ]
-                if lifecycleClaimed, !responseCached,
-                   let deliveryId, let completionRequestDigest {
-                    do {
-                        try await CodexCompletionLifecycle.shared.markOutcomeUnknown(
-                            deliveryId: deliveryId,
-                            requestDigest: completionRequestDigest,
-                            detail: "work_deadline_cancelled:\(Self.messageWorkDeadlineSeconds)s"
-                        )
-                    } catch {
-                        cancelObject["detail"] =
-                            "outcome receipt failed: \(String(describing: error))"
-                    }
-                }
-                // Outcome settlement is unconditional; the response requires the latch.
-                guard workLatch.claim() else { return }
-                response(200, cancelObject)
-            } catch {
-                await self.port.publishChatTurnCompleted(sessionID: sessionId)
-                var failureStatus = "chat_failed"
-                var failureDetail = String(describing: error)
-                if lifecycleClaimed, !responseCached,
-                   let deliveryId, let completionRequestDigest {
-                    do {
-                        try await CodexCompletionLifecycle.shared.markOutcomeUnknown(
-                            deliveryId: deliveryId,
-                            requestDigest: completionRequestDigest,
-                            detail: "chat_or_cache_failed:\(failureDetail)"
-                        )
-                        failureStatus = "outcome_unknown"
-                    } catch {
-                        failureStatus = "lifecycle_unavailable"
-                        failureDetail += "; outcome receipt failed: \(String(describing: error))"
-                    }
-                } else if error is CodexCompletionLifecycle.LifecycleError {
-                    // No model/tool dispatch happened when the initial durable
-                    // claim failed. This is retryable lifecycle unavailability,
-                    // not an ambiguous cognitive outcome.
-                    failureStatus = "lifecycle_unavailable"
-                }
-                // Failure receipts retain the success envelope's timing context.
-                Self.persistMessageReply([
-                    "at": NativeTimestampFormat.plainZulu(Date()),
-                    "status": failureStatus,
-                    "sessionId": sessionId ?? NSNull(),
-                    "model": NSNull(),
-                    "runId": NSNull(),
-                    "durationMs": Int(Date().timeIntervalSince(started) * 1000),
-                    "reply": "",
-                    "detail": failureDetail,
-                    "deliveryId": deliveryId ?? NSNull(),
-                ], requestID: requestID, principal: principal.id)
-                self.eventPublisher("message_failed", [
-                    "requestId": requestID,
-                    "sessionId": sessionId ?? NSNull(),
-                    "detail": failureDetail,
-                    "status": failureStatus,
-                ])
-                guard workLatch.claim() else { return }
-                response(failureStatus == "outcome_unknown" ? 409 : 500, [
-                    "requestId": requestID,
-                    "status": failureStatus,
-                    "error": failureStatus,
-                    "detail": failureDetail,
-                    "deliveryId": deliveryId ?? NSNull(),
-                ])
+        let requestIdentity: String
+        if let deliveryId {
+            let hash = CausalTransitionEvidence.opaqueIdentity(deliveryId)
+            let value = Array(hash)
+            requestIdentity = String(value[0..<8]) + "-" + String(value[8..<12]) + "-" + String(value[12..<16])
+                + "-" + String(value[16..<20]) + "-" + String(value[20..<32])
+        } else if let supplied = json["request_id"] {
+            guard let value = supplied as? String, UUID(uuidString: value) != nil else {
+                response(400, ["error": "invalid_request_id"]); return
             }
-        }
-        // Reply receipts remain correlated by request identity after the HTTP wait ends.
-        workLatch.arm(afterSeconds: Self.messageWorkDeadlineSeconds) { [weak self] in
-            guard let self, workLatch.claim() else { return }
-            self.eventPublisher("message_deadline_released", [
-                "requestId": requestID,
-                "seconds": Self.messageWorkDeadlineSeconds,
-                "sessionId": sessionId ?? NSNull(),
-            ])
-            let pending = Self.pendingMessageReply(
-                requestID: requestID, sessionID: sessionId
-            )
-            response(202, pending)
-        }
+            requestIdentity = value
+        } else { requestIdentity = requestID }
+        handleRetainedMessage(response: response, request: baseRequest, principal: principal, owner: owner,
+            claudeReplyID: claudeReplyID, rawText: rawText, requestID: requestIdentity,
+            started: started, digest: AgentPeerReplayClaimStore.digest(body), ackMode: ackMode, source: defaultSender,
+            completionRoute: completionRoute, deliveryID: deliveryId, completionDigest: completionRequestDigest)
     }
 
     static func bridgeMessageSessionID(requested: String?, active: String?) -> String? {
@@ -557,14 +347,10 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         result["status"] = "ok"
         result.removeValue(forKey: "original_outcome")
         result["original_status"] = row["status"]
-        // Historical combined statuses describe delivery after a completed turn.
-        let historical = row["status"] as? String ?? ""
-        let turnStatus = row["runId"] is String
-            && (historical.hasPrefix("delivery_") || ["ok", "no_reply", "outcome_unknown", "owed", "sent_unconfirmed"].contains(historical))
-            ? "completed" : historical
-        result["execution_result_class"] = row["execution_result_class"]
-            ?? ChatToolOutcome.exactResultClass(.object(["status": .string(turnStatus)])).rawValue
-        result["execution_terminal"] = row["execution_terminal"] ?? true
+        // These retained rows predate the explicit contract. Their combined
+        // delivery words are evidence, never proof of execution or settlement.
+        result["execution_result_class"] = row["execution_result_class"] ?? "unknown"
+        result["execution_terminal"] = row["execution_terminal"] ?? NSNull()
         for key in ["attachments", "completionDelivery", "deliveryId"] { result[key] = row[key] }
         result["run_id"] = row["runId"] as? String ?? NSNull()
         result["reply"] = slice
@@ -572,25 +358,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         result["next_offset"] = offset + slice.count
         result["has_more"] = offset + slice.count < reply.count
         return finish("exact_receipt", complete: true)
-    }
-
-    static func pendingMessageReply(
-        requestID: String, sessionID: String?,
-        home: URL? = nil
-    ) -> [String: Any] {
-        [
-            "status": "still_working",
-            "requestId": requestID,
-            "seconds": messageWorkDeadlineSeconds,
-            "sessionId": sessionID ?? NSNull(),
-            "replyReceipt": [
-                "path": messageReplyURL(home: home).path,
-                "format": "jsonl",
-                "match": ["requestId": requestID],
-                "retention": "Best-effort local receipt; trims to the newest ~4 MB once the file passes 8 MB. No fixed availability guarantee. A missing row does not prove failure.",
-            ],
-            "detail": "The HTTP wait ended; the original turn was not cancelled. Inspect its eventual receipt by requestId or its transcript. Do not resend the work merely because the receipt is not present yet.",
-        ]
     }
 
     static func messageReplyRecord(_ payload: [String: Any], requestID: String) -> [String: Any] {
@@ -610,11 +377,9 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         completionDigest: String? = nil) async throws -> [String: Any] {
         let turnSession = resp.sessionId ?? sessionID
         if !callerResultIsTool { await port.publishChatTurnCompleted(sessionID: turnSession) }
-        if let claudeReplyID {
-            try Self.recordClaudeReply(to: claudeReplyID, text: replyText, sessionId: turnSession,
-                                       owner: owner, principal: principal, request: request)
-            await answerAskingChat(replyTo: claudeReplyID, response: resp, turnSession: turnSession, owner: owner)
-        }
+        try await Self.settleContactReply(resp, request: request, principal: principal, owner: owner,
+            replyID: claudeReplyID, replyText: replyText, session: turnSession, client: chatClient(),
+            sender: port.completionSender(dataRoot: portDataRoot))
         let durationMs = Int(Date().timeIntervalSince(started) * 1000)
         let reply = ChatResponse.answerOnly(resp.output, workingCommentaryCharacters: resp.workingCommentaryCharacters)
         let hasText = !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -641,14 +406,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         }
         if let deliveryID { result["deliveryId"] = deliveryID }
         if let completionDelivery { result["completionDelivery"] = completionDelivery.jsonObject }
-        var receipt = result
-        receipt["at"] = NativeTimestampFormat.plainZulu(Date())
-        let written = Self.persistMessageReply(receipt, requestID: requestID, principal: principal.id)
-        if deliveryID == nil, written {
-            try await CodexCompletionLifecycle.shared.recordDelivery(AgentBridgeCompletionDelivery(status: "completed",
-                surface: "bridge-http", delivery: "receipt", artifactCount: 1, attempts: 0, reason: nil),
-                deliveryId: "bridge-http." + requestID, requestDigest: requestID)
-        }
         var event: [String: Any] = ["requestId": requestID, "sessionId": (enqueued ? turnSession : resp.sessionId) ?? NSNull(),
             "model": resp.model, "runId": resp.runId, "replyLen": reply.count,
             "attachmentCount": attachments.count, "durationMs": durationMs, "status": status]
@@ -662,136 +419,274 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         return result
     }
 
-    /// Acknowledge the durable row before running its turn; replies use the shared receipt/event path.
-    /// `enqueue_failed` and `enqueue_timeout` leave enqueue unproven; resolve ambiguity in the session store.
-    private func handleMessageAckOnEnqueue(
-        response: @escaping Response,
-        client: SwiftNativeChatOrchestrationClient,
-        request: TurnRequest,
-        principal: AgentBridgePrincipal,
-        claudeReplyID: String?,
-        claudeReplyText: String,
-        requestID: String,
-        started: Date,
-        /// false delivers transcript history without starting a turn or loading tools.
-        runTurn: Bool = true
-    ) {
-        let enqueueLatch = ClaudeBridgeRuntime.WorkLatch()
-        let owner = AgentContactIdentity(dataRoot: PersistenceCore.defaultDataRoot()).canonical("peer:" + principal.id)
-        let sessionId = request.sessionID
-        let text = request.message
-        // The enqueued row is the turn's durable user message, including its images.
-        let workTask = Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self else { return }
-            let enqueued: EnqueuedUserMessage
+    /// Prepared bridge turns use the same retained task and worker as every
+    /// contact door. The response latch controls only the HTTP wait.
+    private func handleRetainedMessage(response: @escaping Response, request: TurnRequest,
+        principal: AgentBridgePrincipal, owner: String, claudeReplyID: String?, rawText: String,
+        requestID: String, started: Date, digest: String, ackMode: String?, source: String,
+        completionRoute: AgentBridgeCompletionRoute?, deliveryID: String?, completionDigest: String?) {
+        guard let session = request.sessionID,
+              NativeAgentChatSessionID.normalizedPathComponent(session) == session else {
+            response(409, ["error": "missing_reply_session", "detail": "An exact conversation is required; no work was admitted."])
+            return
+        }
+        let prefix = AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id)
+        let context = session.hasPrefix(prefix) ? String(session.dropFirst(prefix.count)) : session
+        let taskID = "na3.\(context).\(requestID)"
+        let enqueuedMode = deliveryID == nil && (ackMode == "enqueue" || ackMode == "enqueue_only")
+        let runTurn = ackMode != "enqueue_only"
+        let latch = ClaudeBridgeRuntime.WorkLatch()
+        let client = chatClient()
+        let tasks = self.tasks
+        let binding = deliveryID == nil ? AgentContactBridgeInput(principal: principal, persona: request.persona,
+            ownedSessionID: request.ownedSessionID, originID: claudeReplyID) : nil
+        Task.detached(priority: .userInitiated) { [self] in
+            var completionStarted = false
+            var canonicalWorkerAdmitted = false
             do {
-                enqueued = try await request.enqueue(
-                    on: client,
-                    // The protocol flag, never message text, identifies a transport notice.
-                    mechanicalRow: runTurn ? nil : .transportNotice,
-                    awaitingConsumption: runTurn
-                )
-            } catch {
-                guard enqueueLatch.claim() else { return }
-                self.eventPublisher("message_enqueue_failed", [
-                    "detail": String(describing: error),
-                    "sessionId": sessionId ?? NSNull(),
-                ])
-                response(500, [
-                    "status": "enqueue_failed",
-                    "error": "enqueue_failed",
-                    "detail": String(describing: error),
-                ])
-                return
-            }
-            guard enqueueLatch.claim() else {
-                // The deadline owns the acknowledgement; a possibly persisted row must not start a turn.
-                return
-            }
-            let receipt: [String: Any] = [
-                "status": "ok",
-                "requestId": requestID,
-                "ack": "enqueued",
-                "sessionId": enqueued.sessionId,
-                "enqueuedAt": NativeTimestampFormat.plainZulu(Date()),
-                "turn": runTurn ? "started" : "suppressed",
-            ]
-            response(200, receipt)
-            self.eventPublisher("message_enqueued", [
-                "requestId": requestID,
-                "runId": enqueued.runId,
-                "sessionId": enqueued.sessionId,
-                "textLen": text.count,
-                "turn": runTurn ? "started" : "suppressed",
-            ])
-            // The durable row proves notice delivery without starting a turn.
-            guard runTurn else {
-                // Publish the notice row to Mac and iOS transcripts.
-                await self.port.publishChatTurnCompleted(sessionID: enqueued.sessionId)
-                return
-            }
-            do {
-                // Reuse the enqueued run identity to exclude its user row from history and correlate the reply.
-                var turn = request.consuming(enqueued)
-                turn.codexCompletion = .some(.some(CodexCompletionTranscriptBinding(
-                    deliveryId: "bridge-http." + requestID, requestDigest: requestID, model: "", reasoningEffort: nil)))
-                _ = try await CodexCompletionLifecycle.shared.claim(deliveryId: "bridge-http." + requestID,
-                    requestDigest: requestID, sessionId: enqueued.sessionId, responseRunId: enqueued.runId, principal: principal.id)
-                let resp = try await TurnAdmission.admittedRun(dataRoot: PersistenceCore.defaultDataRoot(),
-                    sessionID: enqueued.sessionId, runID: enqueued.runId) {
-                    try await turn.chat(on: client, progress: self.chatNoticeSink(
-                        requestID: requestID,
-                        sessionID: enqueued.sessionId,
-                        runID: enqueued.runId
-                    ))
+                let completionAdmission: CodexCompletionLifecycle.ClaimAdmission?
+                if let deliveryID, let completionDigest {
+                    completionAdmission = try await CodexCompletionLifecycle.shared.claimAdmission(deliveryId: deliveryID,
+                        requestDigest: completionDigest, sessionId: session,
+                        responseRunId: CausalTransitionEvidence.opaqueIdentity(deliveryID),
+                        route: completionRoute, principal: principal.id, source: source)
+                } else { completionAdmission = nil }
+                let completionDecision = completionAdmission?.decision
+                switch completionDecision {
+                case .inProgress?:
+                    if latch.claim() { response(202, ["status": "completion_in_progress", "deliveryId": deliveryID ?? NSNull(),
+                        "requestId": requestID, "task_id": taskID, "execution_result_class": "unknown", "execution_terminal": false]) }
+                    return
+                case .outcomeUnknown?:
+                    if latch.claim() { response(409, ["status": "outcome_unknown", "deliveryId": deliveryID ?? NSNull(),
+                        "requestId": requestID, "task_id": taskID, "execution_result_class": "unknown",
+                        "detail": "The completion owner cannot yet establish its outcome. Repair the retained run; do not repeat the work."]) }
+                    return
+                case .conflict?:
+                    if latch.claim() { response(409, ["status": "conflict", "error": "delivery_id_reused_for_different_completion"]) }
+                    return
+                case .settled(let delivery)?:
+                    var value: [String: Any] = ["status": "completion_already_settled", "deliveryId": deliveryID ?? NSNull(),
+                        "responseCached": false, "servedFromCache": true, "execution_result_class": "unknown"]
+                    if let delivery { value["completionDelivery"] = delivery.jsonObject }
+                    if latch.claim() { response(200, value) }
+                    return
+                case .cached(_)?, .start?, nil: break
                 }
-                try await CodexCompletionLifecycle.shared.cacheResponse(resp, deliveryId: "bridge-http." + requestID, requestDigest: requestID)
-                _ = try await self.settleMessageReply(resp, request: request, principal: principal, owner: owner,
-                    claudeReplyID: claudeReplyID, replyText: claudeReplyText, requestID: requestID,
-                    started: started, sessionID: enqueued.sessionId, enqueued: true)
+                let ownsCompletionStart = completionDecision == .some(.start)
+                completionStarted = ownsCompletionStart
+                let accepted = try await tasks.sendBridge(context: context, request: requestID, principal: principal,
+                    digest: digest, binding: binding, completionAdmission: completionAdmission) { bindRun in
+                    var prepared = request
+                    let lifecycleClaimed = ownsCompletionStart
+                    var responseCached = false
+                    var executionBegan = false
+                    var produced: ChatTurnRuntime.ChatResponse?
+                    do {
+                        let reply: ChatTurnRuntime.ChatResponse
+                        var wasCached = false
+                        let callerResultIsTool: Bool
+                        if let completionRoute, completionRoute.surface == "caller-result" {
+                            callerResultIsTool = try await tasks.callerResultTarget(completionRoute).canonicalRunID == nil
+                        } else { callerResultIsTool = false }
+                        if let deliveryID, let completionDigest {
+                            let run = CausalTransitionEvidence.opaqueIdentity(deliveryID)
+                            guard let completionDecision else { throw CodexCompletionLifecycle.LifecycleError.claimMissing }
+                            switch completionDecision {
+                            case .cached(let cached):
+                                reply = cached; wasCached = true; responseCached = true
+                                try await bindRun(cached.sessionId ?? session, cached.runId)
+                            case .start:
+                                try await bindRun(session, run)
+                                prepared.pinnedRunID = run
+                                prepared.replyRoute = (completionRoute?.chatToolReplyRoute).map { Optional($0) }
+                                prepared.codexCompletion = CodexCompletionTranscriptBinding(deliveryId: deliveryID,
+                                    requestDigest: completionDigest, model: "", reasoningEffort: nil)
+                                if callerResultIsTool {
+                                    reply = .init(runId: run, model: "", output: rawText, sessionId: session,
+                                        attachments: request.attachments, providerCallCount: 0, terminalState: .completed)
+                                } else {
+                                    reply = try await TurnAdmission.admittedRun(dataRoot: self.portDataRoot,
+                                        sessionID: session, runID: run) {
+                                        executionBegan = true
+                                        return try await prepared.chat(on: client, progress: self.chatNoticeSink(requestID: requestID, sessionID: session, runID: run))
+                                    }
+                                }
+                                produced = reply
+                                try await CodexCompletionLifecycle.shared.cacheResponse(reply, deliveryId: deliveryID, requestDigest: completionDigest)
+                                responseCached = true
+                            case .inProgress, .outcomeUnknown, .conflict, .settled:
+                                throw CodexCompletionLifecycle.LifecycleError.claimMissing
+                            }
+                        } else {
+                            // The exact run is retained before enqueue can append the user row.
+                            try await bindRun(session, requestID)
+                            prepared.pinnedRunID = requestID
+                            prepared.replyRoute = ChatToolSessionContext.ReplyRoute(surface: "caller-result",
+                                destinationId: principal.id, threadId: context, correlationId: requestID)
+                            let enqueued = try await prepared.enqueue(on: client,
+                                    mechanicalRow: runTurn ? nil : .transportNotice, awaitingConsumption: runTurn)
+                                self.eventPublisher("message_enqueued", ["requestId": requestID, "task_id": taskID,
+                                    "runId": enqueued.runId, "sessionId": enqueued.sessionId,
+                                    "textLen": request.message.count, "turn": runTurn ? "started" : "suppressed"])
+                                if enqueuedMode, latch.claim() { response(200, ["status": "ok", "ack": "enqueued",
+                                    "requestId": requestID, "task_id": taskID, "sessionId": enqueued.sessionId,
+                                    "turn": runTurn ? "started" : "suppressed"]) }
+                                if !runTurn {
+                                    await self.port.publishChatTurnCompleted(sessionID: enqueued.sessionId)
+                                    return AgentContactOutcome(state: .completed, parts: [],
+                                        toolResult: .object(["status": .string("ok"), "ack": .string("enqueued"), "turn": .string("suppressed")]))
+                                }
+                            prepared = prepared.consuming(enqueued)
+                            reply = try await TurnAdmission.admittedRun(dataRoot: self.portDataRoot,
+                                sessionID: session, runID: requestID) {
+                                try await prepared.chat(on: client, progress: self.chatNoticeSink(requestID: requestID, sessionID: session, runID: requestID))
+                            }
+                        }
+                        produced = reply
+                        let result = try await self.settleMessageReply(reply, request: request, principal: principal,
+                            owner: owner, claudeReplyID: claudeReplyID, replyText: rawText,
+                            requestID: requestID, started: started, sessionID: session, enqueued: enqueuedMode,
+                            callerResultIsTool: callerResultIsTool, responseCached: responseCached, wasCached: wasCached,
+                            completionRoute: completionRoute, deliveryID: deliveryID, completionDigest: completionDigest)
+                        return Self.bridgeOutcome(reply, taskID: taskID, result: result)
+                    } catch {
+                        if lifecycleClaimed, !responseCached, let deliveryID, let completionDigest {
+                            do {
+                                if produced == nil, !executionBegan {
+                                    try await CodexCompletionLifecycle.shared.markNotStarted(deliveryId: deliveryID, requestDigest: completionDigest)
+                                } else {
+                                    try await CodexCompletionLifecycle.shared.markOutcomeUnknown(deliveryId: deliveryID,
+                                        requestDigest: completionDigest, detail: error.localizedDescription)
+                                }
+                            } catch {
+                                RepairOwed.owe(self.portDataRoot, id: deliveryID, kind: .message,
+                                    operation: "bridge.completion.settle:" + deliveryID, owner: taskID,
+                                    words: error.localizedDescription, lever: "Repair this exact completion receipt from its retained run; do not repeat the turn.")
+                            }
+                        }
+                        await self.port.publishChatTurnCompleted(sessionID: session)
+                        if let produced {
+                            // A routing/cache error cannot discard already produced words or files.
+                            let detail = "The turn returned, but bridge settlement needs repair: " + error.localizedDescription
+                            RepairOwed.owe(self.portDataRoot, id: requestID, kind: .message,
+                                operation: "bridge.reply.settle:" + requestID, owner: taskID,
+                                words: detail, lever: "Repair the exact bridge delivery from its retained task and run; do not repeat the turn.")
+                            return Self.bridgeOutcome(produced, taskID: taskID,
+                                result: ["status": produced.terminalState?.rawValue ?? "incomplete", "detail": detail])
+                        }
+                        throw error
+                    }
+                }
+                canonicalWorkerAdmitted = true
+                let task: AgentContactTask
+                if accepted.state.terminal { task = accepted }
+                else { task = try await tasks.settledBridge(accepted.id, owner: principal.id) }
+                self.eventPublisher("message_settled", ["requestId": requestID, "task_id": task.id,
+                    "sessionId": session, "state": task.state.rawValue])
+                guard latch.claim() else { return }
+                var result = task.toolResult?.foundationObject as? [String: Any]
+                    ?? AgentContactRoutes.contactReply(task, requestID: requestID, sessionID: session, offset: 0, maxChars: 8000)
+                result["requestId"] = requestID; result["sessionId"] = session; result["task_id"] = task.id
+                result["reply"] = task.text
+                result["runId"] = task.canonicalRunID ?? NSNull()
+                result["execution_terminal"] = task.state.terminal
+                result["execution_result_class"] = task.state == .completed ? "succeeded"
+                    : task.state == .failed ? "failed" : task.state.terminal ? "cancelled" : "unknown"
+                if let deliveryID, let completionDigest {
+                    result.removeValue(forKey: "completionDelivery")
+                    // A completion that was owed always answers with its verdict: a missing or
+                    // unreadable one is outcome_unknown, never silence the caller reads as delivered.
+                    do {
+                        if let delivery = try await CodexCompletionLifecycle.shared.savedDelivery(deliveryId: deliveryID, requestDigest: completionDigest) {
+                            result["completionDelivery"] = delivery.jsonObject
+                        } else {
+                            result["completionDelivery"] = ["status": "outcome_unknown",
+                                "detail": "No completion delivery record exists for this owed completion."]
+                        }
+                    } catch {
+                        result["retrieval_result_class"] = "failed"
+                        result["detail"] = "The turn's output is retained, but its current completion delivery could not be read: " + error.localizedDescription
+                        result["completionDelivery"] = ["status": "outcome_unknown",
+                            "detail": "The completion delivery record could not be read: " + error.localizedDescription]
+                    }
+                }
+                // contactReply's "ok" acknowledges a read, not successful work.
+                // This door's completion caller uses status as delivery evidence.
+                result["status"] = task.state == .completed ? "completed" : task.state.rawValue
+                if let recovery = task.replyRecovery {
+                    result["retrieval_result_class"] = "failed"
+                    result["detail"] = recovery.detail
+                }
+                response(task.state == .failed ? 409 : 200, result)
             } catch {
-                await self.port.publishChatTurnCompleted(sessionID: enqueued.sessionId)
-                let cancelled = error is CancellationError
-                let status = cancelled ? "cancelled" : "chat_failed"
-                let detail = cancelled ? "turn stopped before it finished" : String(describing: error)
-                // Cancellation retains the already-persisted partial; only a receipt is owed here.
-                Self.persistMessageReply([
-                    "at": NativeTimestampFormat.plainZulu(Date()),
-                    "status": status,
-                    "ack": "enqueued",
-                    "sessionId": enqueued.sessionId,
-                    "model": NSNull(),
-                    "runId": cancelled ? enqueued.runId as Any : NSNull(),
-                    "durationMs": Int(Date().timeIntervalSince(started) * 1000),
-                    "reply": "",
-                    "detail": detail,
-                ], requestID: requestID, principal: principal.id)
-                self.eventPublisher("message_failed", [
-                    "requestId": requestID,
-                    "runId": enqueued.runId,
-                    "detail": detail,
-                    "status": status,
-                    "sessionId": enqueued.sessionId,
-                ])
+                if completionStarted, !canonicalWorkerAdmitted, let deliveryID, let completionDigest {
+                    do {
+                        if error is AgentContactBridgeClaimConflict {
+                            try await CodexCompletionLifecycle.shared.markOutcomeUnknown(deliveryId: deliveryID,
+                                requestDigest: completionDigest, detail: error.localizedDescription)
+                        } else {
+                            try await CodexCompletionLifecycle.shared.markNotStarted(deliveryId: deliveryID, requestDigest: completionDigest)
+                        }
+                    }
+                    catch {
+                        RepairOwed.owe(self.portDataRoot, id: deliveryID, kind: .message,
+                            operation: "bridge.completion.admit:" + deliveryID, owner: taskID,
+                            words: error.localizedDescription, lever: "Repair this exact unstarted completion claim; do not repeat a started turn.")
+                    }
+                }
+                self.eventPublisher("message_failed", ["requestId": requestID, "task_id": taskID,
+                    "sessionId": session, "detail": error.localizedDescription])
+                guard latch.claim() else { return }
+                response(409, ["status": "unavailable", "requestId": requestID, "task_id": taskID,
+                    "sessionId": session, "detail": error.localizedDescription + ". Inspect this task before resending."])
             }
         }
-        enqueueLatch.arm(afterSeconds: Self.enqueueAckDeadlineSeconds) { [weak self] in
-            guard let self, enqueueLatch.claim() else { return }
-            // Owning the enqueue latch prevents turn admission after this timeout.
-            workTask.cancel()
-            self.eventPublisher("message_enqueue_timeout", [
-                "seconds": Self.enqueueAckDeadlineSeconds,
-                "sessionId": sessionId ?? NSNull(),
-            ])
-            response(504, [
-                "error": "enqueue_timeout",
-                "status": "enqueue_timeout",
-                "seconds": Self.enqueueAckDeadlineSeconds,
-            ])
+        latch.arm(afterSeconds: enqueuedMode ? Self.enqueueAckDeadlineSeconds : Self.messageWorkDeadlineSeconds) { [self] in
+            guard latch.claim() else { return }
+            self.eventPublisher("message_deadline_released", ["requestId": requestID, "task_id": taskID, "sessionId": session])
+            response(202, ["status": "still_working", "requestId": requestID, "task_id": taskID, "sessionId": session,
+                "detail": "Only the HTTP wait ended. Admission and execution remain owned by this retained task; do not resend the message."])
         }
     }
 
-    /// Serialize best-effort reply JSONL appends; persistence failures log without failing HTTP.
+    private var portDataRoot: URL { PersistenceCore.defaultDataRoot() }
+
+    static func bridgeOutcome(_ response: ChatTurnRuntime.ChatResponse, taskID: String,
+                                      result: [String: Any]) -> AgentContactOutcome {
+        let state: AgentContactTaskState
+        switch response.terminalState {
+        case .completed?: state = .completed
+        case .stopped?: state = .canceled
+        case .waiting?: state = .inputRequired
+        case .interrupted?, .failed?: state = .failed
+        case nil: state = .working
+        }
+        let answer = ChatResponse.answerOnly(response.output, workingCommentaryCharacters: response.workingCommentaryCharacters)
+        var parts: [AgentContactPart] = answer.isEmpty ? [] : [.text(answer)]
+        var failures: [String] = []
+        for (index, attachment) in (response.attachments ?? []).enumerated() {
+            do {
+                let part = try AgentContactPart.output(attachment, taskID: taskID)
+                guard try JSONSerialization.data(withJSONObject: (parts + [part]).map(\.wire03)).count <= AgentContactPart.maximumOutputBytes else {
+                    throw AgentContactFailure(code: -32603, message: "Produced files exceed the reply limit")
+                }
+                parts.append(part)
+            }
+            catch { failures.append("attachment[\(index)]: \(error.localizedDescription)") }
+        }
+        let recovery = failures.isEmpty ? nil : AgentContactReplyRecovery(source: "chat/messages/\(response.sessionId ?? "").jsonl",
+            detail: failures.joined(separator: "; ") + ". Repair the produced files and read this task again; do not repeat the turn.")
+        var metadata = result
+        // The onward-delivery verdict stays with the retained reply, so a later read has it.
+        for key in ["reply", "runId", "sessionId", "execution_result_class", "execution_terminal"] { metadata.removeValue(forKey: key) }
+        let detail = response.statusDetail ?? (response.terminalState == nil
+            ? "The turn returned without a terminal execution observation. Read its retained run; do not repeat the work." : nil)
+        return AgentContactOutcome(state: state, parts: parts, detail: detail,
+            replyRecovery: recovery, toolResult: JSONValue(fromFoundation: metadata))
+    }
+
+    /// Serialize reply receipts; failure preserves the turn and owes exact receipt repair.
     private static let messageReplyLock = NSLock()
 
     /// Return attachment metadata to a local bridge caller without embedding
@@ -887,24 +782,24 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     }
 
     /// An answer names an exact send owed to this who, through any of its doors.
-    static func validClaudeReplyID(_ messageID: String, owner: String) -> String? {
+    static func validClaudeReplyID(_ messageID: String, owner: String) throws -> String? {
         let root = PersistenceCore.defaultDataRoot()
-        let identity = AgentContactIdentity(dataRoot: root)
+        let identity = try AgentContactIdentity(dataRoot: root)
+        let records = try AgentConversationStore(dataRoot: root).records()
         guard !messageID.isEmpty, messageID.utf8.count <= 128,
-              let records = try? AgentConversationStore(dataRoot: root).records(),
               records.contains(where: { identity.canonical($0.agent) == owner && $0.readInput?["message_id"] == .string(messageID) }) else { return nil }
         return messageID
     }
 
     /// A message naming neither a send nor a conversation answers nothing.
-    static func claudeReplyID(_ json: [String: Any], owner: String) -> String? {
+    static func claudeReplyID(_ json: [String: Any], owner: String) throws -> String? {
         if let named = (json["reply_to"] ?? json["in_reply_to"]) as? String, !named.isEmpty {
-            return validClaudeReplyID(named, owner: owner)
+            return try validClaudeReplyID(named, owner: owner)
         }
         guard let conversation = json["conversation_id"] as? String, !conversation.isEmpty, conversation.utf8.count <= 512
         else { return nil }
-        return (try? AgentConversationStore(dataRoot: PersistenceCore.defaultDataRoot())
-            .waitingMessage(agent: owner, conversationID: conversation)).flatMap { validClaudeReplyID($0, owner: owner) }
+        return try AgentConversationStore(dataRoot: PersistenceCore.defaultDataRoot())
+            .waitingMessage(agent: owner, conversationID: conversation).flatMap { try validClaudeReplyID($0, owner: owner) }
     }
 
     /// After the reply is durably in the chat: the receipt the delegation
@@ -925,7 +820,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     /// Retrying a handoff after its exchange save failed must not append twice.
     private static func recordClaudeReplyReceipt(to messageID: String, text: String, sessionId: String?, owner: String) throws {
         let dataRoot = PersistenceCore.defaultDataRoot()
-        guard AgentContactIdentity(dataRoot: dataRoot).aliases["claude"] == owner else { return }
+        guard try AgentContactIdentity(dataRoot: dataRoot).aliases["claude"] == owner else { return }
         let dir = messageReplyURL().deletingLastPathComponent()
         // The answer as every job retains it, so an exact read returns it, not a preview.
         let row: [String: Any] = [
@@ -958,15 +853,29 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         _ = try enforceJSONLRetention(at: file, maxLines: 500, trimWhenBytesExceed: 1_048_576)
     }
 
+    /// Live and restart-recovered builder turns settle through the same owner.
+    static func settleContactReply(_ response: ChatTurnRuntime.ChatResponse, request: TurnRequest,
+        principal: AgentBridgePrincipal, owner: String, replyID: String?, replyText: String,
+        session: String?, client: SwiftNativeChatOrchestrationClient,
+        sender: any AgentBridgeCompletionSending) async throws {
+        guard let replyID else { return }
+        try recordClaudeReply(to: replyID, text: replyText, sessionId: session,
+            owner: owner, principal: principal, request: request)
+        try await answerAskingChat(replyTo: replyID, response: response, turnSession: session,
+            owner: owner, client: client, sender: sender)
+    }
+
     /// The answer goes back to the chat that asked, from this who's own conversation.
-    func answerAskingChat(replyTo messageID: String, response: ChatTurnRuntime.ChatResponse, turnSession: String?, owner: String) async {
+    private static func answerAskingChat(replyTo messageID: String, response: ChatTurnRuntime.ChatResponse,
+        turnSession: String?, owner: String, client: SwiftNativeChatOrchestrationClient,
+        sender: any AgentBridgeCompletionSending) async throws {
         let dataRoot = PersistenceCore.defaultDataRoot()
-        let identity = AgentContactIdentity(dataRoot: dataRoot)
+        let identity = try AgentContactIdentity(dataRoot: dataRoot)
         let threadOwner = owner.hasPrefix("peer:") ? String(owner.dropFirst(5)) : owner
         let answer = ChatResponse.answerOnly(response.output, workingCommentaryCharacters: response.workingCommentaryCharacters)
         guard let turnSession, turnSession == ContactThread.session(owner: threadOwner),
               !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !(response.attachments ?? []).isEmpty,
-              let row = try? AgentConversationStore(dataRoot: dataRoot).records().first(where: {
+              let row = try AgentConversationStore(dataRoot: dataRoot).records().first(where: {
                   identity.canonical($0.agent) == owner && $0.readInput?["message_id"] == .string(messageID)
               }), row.scopeSessionID != turnSession else { return }
         let deliveryId = owner + "-reply:" + messageID
@@ -974,18 +883,15 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         let digest = SHA256.hash(data: Data(answer.utf8)).map { String(format: "%02x", $0) }.joined()
         let lifecycle = CodexCompletionLifecycle.shared
         // Once per answer: a resent reply never answers the asking chat twice.
-        guard (try? await lifecycle.claim(deliveryId: deliveryId, requestDigest: digest, sessionId: turnSession,
-                                         responseRunId: response.runId, route: route)) == .start else { return }
-        do { try await lifecycle.cacheResponse(response, deliveryId: deliveryId, requestDigest: digest) } catch {
-            nativeLog("ClaudeBridgeMessageRuntime: answer to %@ not recorded: %@", messageID, error.localizedDescription)
-            return
-        }
+        guard try await lifecycle.claim(deliveryId: deliveryId, requestDigest: digest, sessionId: turnSession,
+                                         responseRunId: response.runId, route: route) == .start else { return }
+        try await lifecycle.cacheResponse(response, deliveryId: deliveryId, requestDigest: digest)
         let delivery = await AgentBridgeCompletionRouter.deliverAnswer(deliveryId: deliveryId, requestDigest: digest,
             text: answer, attachments: response.attachments ?? [],
-            route: route, client: chatClient(),
-            sender: port.completionSender(dataRoot: dataRoot), lifecycle: lifecycle, notifyRequestedResult: false)
+            route: route, client: client,
+            sender: sender, lifecycle: lifecycle, notifyRequestedResult: false)
         if delivery.status != "completed" {
-            nativeLog("ClaudeBridgeMessageRuntime: answer to %@ %@: %@", messageID, delivery.status, delivery.reason ?? "")
+            throw AgentContactFailure(code: -32603, message: "Answer to \(messageID) is \(delivery.status): \(delivery.reason ?? "delivery not confirmed")")
         }
     }
 
@@ -1018,12 +924,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         let dir = file.deletingLastPathComponent()
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            return try CredentialFileLock.withLock(file) {
-                guard JSONSerialization.isValidJSONObject(payload),
-                      let data = try? JSONSerialization.data(withJSONObject: payload) else {
-                    nativeLog("[ClaudeBridge] message-reply persist skipped: payload not JSON-serializable")
-                    return false
-                }
+            let written = try CredentialFileLock.withLock(file) {
+                let data = try JSONSerialization.data(withJSONObject: payload)
                 if FileManager.default.fileExists(atPath: file.path) {
                     let bytes = try Data(contentsOf: file)
                     guard bytes.isEmpty || bytes.last == 0x0A else { throw CocoaError(.fileReadCorruptFile) }
@@ -1056,8 +958,15 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 }
                 return true
             }
+            RepairOwed.settle(PersistenceCore.defaultDataRoot(), operation: "bridge.reply.receipt:" + requestID,
+                evidence: .init(source: file.path, id: requestID))
+            return written
         } catch {
-            nativeLog("[ClaudeBridge] message-reply persist failed: %@", String(describing: error))
+            let detail = "Bridge reply receipt \(requestID) could not be saved: \(error.localizedDescription). The actual turn must not be repeated; repair its receipt from the retained run."
+            nativeLog("[ClaudeBridge] %@", detail)
+            RepairOwed.owe(PersistenceCore.defaultDataRoot(), id: requestID + ":receipt", kind: .message,
+                operation: "bridge.reply.receipt:" + requestID, owner: file.path, words: detail,
+                lever: "Repair the exact receipt from its retained run and completion record.")
             return false
         }
     }
@@ -1110,7 +1019,7 @@ extension TurnAdmission {
             ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: session, runId: $0, turnId: turnID) } }
         defer { flag.map(ChatCancelFlag.finish) }
         return try await TurnTraceContext.$turnId.withValue(turnID) {
-            try await TurnAdmission.shared.run(sessionID: sessionID, runID: runID, waitForCapacity: waitForCapacity, operation: operation)
+            try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionID, runID: runID, waitForCapacity: waitForCapacity, operation: operation)
         }
     }
 }

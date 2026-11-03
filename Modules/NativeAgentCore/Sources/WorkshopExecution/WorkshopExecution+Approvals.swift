@@ -3,7 +3,7 @@ import PersistenceCore
 import NativeAgentCore
 import ApprovalInbox
 import NativeAgentShared
-// Blueprint: | `WorkshopExecution+Approvals.swift` | `WorkshopExecutorLoop` resolved-step approval evidence, resumption, rejection, annotation and blocked-step claim clearing through ExecutionRecordFile |
+// Blueprint: | `WorkshopExecution+Approvals.swift` | `WorkshopExecutorLoop` resolved-step evidence, resumption, rejection and returned approval outcomes; blocked-step claims clear through ExecutionRecordFile |
 
 extension WorkshopExecutorLoop {
     func resolvedStepApproval(_ execution: WorkshopExecutionRecord) async throws -> (approval: ApprovalRecord, step: WorkshopExecutionStep)? {
@@ -22,7 +22,7 @@ extension WorkshopExecutorLoop {
               case .object(let args)? = payload["args"] else { return nil }
         var approvedStep = planStep
         approvedStep.args = payload["source_args"] ?? .object(args)
-        let call = Self.resolvedStepCall(approvedStep, execution: execution, resolveReferences: false)
+        let call = try Self.resolvedStepCall(approvedStep, execution: execution, resolveReferences: false)
         guard call.tool == tool, call.args == .object(args) else { return nil }
         return (approval, approvedStep)
     }
@@ -64,9 +64,6 @@ extension WorkshopExecutorLoop {
             throw WorkshopExecutionError.invalidRequest("mission_step_not_waiting_on_approval")
         }
         if existingStatus == WorkshopStepOutcome.successStatus || existingStatus == "stubbed" {
-            if approved {
-                await annotateApprovedStep(execution, stepId: stepId, approvalId: approvalId)
-            }
             try await appendTimelineLocked(
                 .object([
                     "event": .string("approval_decision_ignored"),
@@ -115,7 +112,8 @@ extension WorkshopExecutorLoop {
                 rec.currentStepId = ""   // terminal — clear the step pointer
             }
             guard denyWrite.applied, let updated = denyWrite.record else {
-                return denyWrite.record ?? execution
+                if let record = denyWrite.record { return record }
+                return try await requiredApprovalExecutionRecord(executionId)
             }
             try await appendTimelineLocked(
                 .object([
@@ -167,27 +165,21 @@ extension WorkshopExecutorLoop {
             approvedOutcome = result
             if Task.isCancelled && result.status == "cancelled" {
                 await releaseClaimAfterInterruption(executionId, outcome: result)
-                return try await getRecord(executionId) ?? execution
+                return try await requiredApprovalExecutionRecord(executionId)
             }
             guard let saved = try await commitStepOutcome(executionId, outcome: result, approvedStep: approvedStep) else {
-                return try await getRecord(executionId) ?? execution
+                return try await requiredApprovalExecutionRecord(executionId)
             }
             guard saved.status == "running" else {
-                await annotateApprovedStep(saved, stepId: stepId, approvalId: approvalId)
                 return saved
             }
             try await runSteps(executionId: executionId)
-            let final = try await getRecord(executionId) ?? execution
-            await annotateApprovedStep(final, stepId: stepId, approvalId: approvalId)
+            let final = try await requiredApprovalExecutionRecord(executionId)
             return final
         } catch {
             let reason = Task.isCancelled || error is CancellationError
                 ? "parent_task_cancelled" : "approval_resume_failed"
             await releaseClaimAfterInterruption(executionId, reason: reason, outcome: approvedOutcome)
-            if approvedOutcome != nil {
-                await annotateApprovedStep((try? await getRecord(executionId)) ?? execution,
-                    stepId: stepId, approvalId: approvalId)
-            }
             throw error
         }
     }
@@ -203,17 +195,21 @@ extension WorkshopExecutorLoop {
         }
     }
 
-    private func annotateApprovedStep(_ record: WorkshopExecutionRecord, stepId: String, approvalId: String?) async {
-        guard let approvalId, !approvalId.isEmpty else { return }
-        try? await SwiftNativeApprovalInbox(root: root).annotateExecution(
-            approvalId,
-            executedAction: .object([
-                "op": .string("mission_step_resume"),
-                "missionId": .string(record.id),
-                "stepId": .string(stepId),
-                "missionStatus": .string(record.status),
-            ]),
-            detail: "Desk step approved — executed; Desk execution now \(record.status)")
+    /// The domain's actual returned record supplies one canonical receipt.
+    public nonisolated static func approvalOutcome(_ record: WorkshopExecutionRecord,
+        stepId: String, approved: Bool) -> ApprovalExecutionOwners.Settlement {
+        .init(action: .object([
+            "op": .string(approved ? "mission_step_resume" : "mission_step_reject"),
+            "executionId": .string(record.id), "stepId": .string(stepId),
+            "missionStatus": .string(record.status),
+        ]), detail: "Desk step \(approved ? "approved" : "denied"); Desk execution now \(record.status)")
+    }
+
+    private func requiredApprovalExecutionRecord(_ id: String) async throws -> WorkshopExecutionRecord {
+        guard let record = try await getRecord(id) else {
+            throw WorkshopExecutionError.invalidRequest("Desk execution \(id) is unavailable after its approved operation; inspect its owner before receipt settlement")
+        }
+        return record
     }
 
     /// Read approval preconditions under the execution record’s cross-process lock.

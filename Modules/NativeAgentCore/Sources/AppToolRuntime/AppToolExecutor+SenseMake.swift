@@ -47,11 +47,6 @@ extension AppToolExecutor {
         case "drop":
             do { record = try await registry.drop(id: id, version: current.version, preview: preview) }
             catch let refusal as SenseFailure where refusal.code == "owners_call" { return Self.failure(refusal.code, refusal.message) }
-        case "rollback":
-            guard let version = Int(Self.doorText(input["version"])) else {
-                return Self.failure("invalid_args", "Choose a retained version from sense.versions.")
-            }
-            record = try await registry.rollback(id: id, version: version, preview: preview)
         case "quarantine": record = try await registry.setStatus(id: id, version: current.version, status: .off, preview: preview)
         case "restore":
             do {

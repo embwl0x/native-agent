@@ -5,7 +5,7 @@ import CognitiveSubstrate
 import NativeAgentCore
 import TrustCenter
 import TurnTrace
-// Blueprint: | `TurnRequest.swift` | `TurnRequest`: shared turn binding; `TurnAdmission`: per-session serialization, bounded admission queues and release/cancellation capacity signals for durable arrivals |
+// Blueprint: | `TurnRequest.swift` | `TurnRequest`: shared turn binding; `TurnAdmission`: per-session serialization, root-scoped resident reload exclusion, bounded admission queues and release/cancellation capacity signals for durable arrivals |
 
 enum TurnRelevanceContext {
     @TaskLocal static var queryUserMessage: String?
@@ -35,6 +35,8 @@ public struct TurnRequest: Sendable {
     public var surface: String
     public var threadKind: ChatThreadKind?
     public var ownedSessionID: String?
+    /// Claimed care arrivals for this resident wake, cleared on other turns.
+    public var careWakes: [CognitiveCareWake]?
     public var suppressUserAppend: Bool
 
     /// `ChatToolSessionContext.envelope`: authoritative surface identity.
@@ -82,9 +84,11 @@ public struct TurnRequest: Sendable {
         serviceTier: String?? = nil,
         queryUserMessage: String?? = nil,
         threadKind: ChatThreadKind? = nil,
-        ownedSessionID: String? = nil
+        ownedSessionID: String? = nil,
+        careWakes: [CognitiveCareWake]? = nil
     ) {
         self.message = message
+        self.careWakes = careWakes
         self.queryUserMessage = queryUserMessage
         self.sessionID = sessionID
         self.model = model
@@ -157,20 +161,32 @@ public struct TurnRequest: Sendable {
 
     func bindContext<T>(isolation: isolated (any Actor)? = #isolation,
                         _ operation: () async throws -> T) async rethrows -> T {
-        try await Self.bound(ChatPersistenceContext.$threadKind, .some(threadKind)) {
+        // The request is the ingress owner. It supplies one current envelope
+        // from its explicit transport fields before any downstream reader runs.
+        // Nested work inherits its caller's bound envelope unless it explicitly replaces/clears it.
+        let requestEnvelope: TurnEnvelope?
+        if let envelope { requestEnvelope = envelope }
+        else if let inherited = ChatToolSessionContext.envelope { requestEnvelope = inherited }
+        else {
+            requestEnvelope = TurnEnvelope(surface: surface,
+                verifiedChatId: verifiedChatID ?? nil, verifiedUserId: verifiedUserID ?? nil,
+                deliveryRoute: replyRoute ?? nil)
+        }
+        return try await Self.bound(ChatPersistenceContext.$threadKind, .some(threadKind)) {
         try await Self.bound(ChatPersistenceContext.$ownedSessionID, .some(ownedSessionID)) {
-        try await Self.bound(ChatToolSessionContext.$envelope, envelope) {
+        try await AfterTurnSource.$careWakes.withValue(careWakes ?? []) {
+        try await Self.bound(ChatToolSessionContext.$envelope, .some(requestEnvelope)) {
             try await Self.bound(ChatToolSessionContext.$verifiedSessionId, verifiedSessionID) {
-                try await Self.bound(ChatToolSessionContext.$verifiedChatId, verifiedChatID) {
-                    try await Self.bound(ChatToolSessionContext.$verifiedUserId, verifiedUserID) {
+                try await Self.bound(ChatToolSessionContext.$verifiedChatId, .some(requestEnvelope?.verifiedChatId)) {
+                    try await Self.bound(ChatToolSessionContext.$verifiedUserId, .some(requestEnvelope?.verifiedUserId)) {
+                        try await Self.bound(ChatToolSessionContext.$commandSignatureVerified, .some(requestEnvelope?.commandSignatureVerified)) {
                         try await Self.bound(ChatPersistenceContext.$originProvenance, origin) {
                             try await Self.bound(ChatPersistenceContext.$pinnedTurnRunID, pinnedRunID) {
                                 try await Self.bound(ChatPersistenceContext.$codexCompletionBinding, codexCompletion) {
                                     try await Self.bound(ChatPersistenceContext.$replacementAssistantMessageID, replacementAssistantMessageID) {
                                         try await Self.bound(LLMCallContext.$serviceTier, serviceTier) {
                                             try await Self.bound(TurnRelevanceContext.$queryUserMessage, queryUserMessage) {
-                                                guard let replyRoute else { return try await operation() }
-                                                return try await ChatToolSessionContext.withReplyRoute(replyRoute, operation: operation)
+                                                return try await ChatToolSessionContext.withReplyRoute(replyRoute ?? requestEnvelope?.deliveryRoute, operation: operation)
                                             }
                                         }
                                     }
@@ -180,6 +196,8 @@ public struct TurnRequest: Sendable {
                     }
                 }
             }
+        }
+        }
         }
         }
         }
@@ -251,46 +269,120 @@ public actor TurnAdmission {
     private struct Waiter {
         let id: UUID
         let runID: String?
-        let continuation: CheckedContinuation<Void, Error>
+        let done: ScopedWaiter
     }
     private var active: [String: UUID] = [:]
     private var waiting: [String: [Waiter]] = [:]
-    private var capacityWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private var capacityWaiters: [UUID: ScopedWaiter] = [:]
     /// The runs a restart left in a session, in the order they were said:
     /// each is admitted before any other turn there, one after another.
     private var backlog: [String: [String]] = [:]
-    /// Until the launch recovery has put back what a restart left in contact
-    /// conversations (`restorationComplete`), a new turn in one waits here:
+    /// Until launch recovery has inventoried accepted contact/builder tasks
+    /// (`restorationComplete`), a new turn in a named session waits here:
     /// nothing new is admitted there ahead of what was already said.
     private var restoring = true
-    private var heldWhileRestoring: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private var restorationFailure: String?
+    private var sessionRestorationFailures: [String: String] = [:]
+    private var heldWhileRestoring: [UUID: ScopedWaiter] = [:]
+    private var executingRoots: [UUID: String] = [:]
+    private var residentTransitions: Set<String> = []
+    private var heldForResidentTransition: [String: [UUID: ScopedWaiter]] = [:]
+    private var pendingResidentRefreshes: [String: (URL, @MainActor @Sendable () async -> Void)] = [:]
+    private var inFlightObserver: NSObjectProtocol?
+
+    private nonisolated func rootKey(_ dataRoot: URL) -> String {
+        dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    /// Publication and reload are one transition, excluded from every door's
+    /// executing turn. Stop registrations also cover turns still entering admission.
+    /// A busy root retains the latest request until the real owners release it.
+    public func refreshResidentWhenIdle(
+        dataRoot: URL, operation: @escaping @MainActor @Sendable () async -> Void
+    ) async {
+        if inFlightObserver == nil {
+            inFlightObserver = NotificationCenter.default.addObserver(
+                forName: ChatCancelFlag.inFlightDidChange, object: nil, queue: nil
+            ) { [weak self] _ in
+                Task { await self?.drainResidentRefreshes() }
+            }
+        }
+        pendingResidentRefreshes[rootKey(dataRoot)] = (dataRoot, operation)
+        await drainResidentRefreshes()
+    }
+
+    private func drainResidentRefreshes() async {
+        for root in pendingResidentRefreshes.keys.sorted() {
+            while !residentTransitions.contains(root),
+                  !executingRoots.values.contains(root),
+                  let (dataRoot, operation) = pendingResidentRefreshes[root],
+                  ChatCancelFlag.inFlightTurns(dataRoot: dataRoot).isEmpty {
+                // No suspension between the idle check and closing admission.
+                residentTransitions.insert(root)
+                pendingResidentRefreshes.removeValue(forKey: root)
+                await operation()
+                residentTransitions.remove(root)
+                let held = heldForResidentTransition.removeValue(forKey: root) ?? [:]
+                for waiter in held.values { waiter.resume() }
+            }
+        }
+    }
+
+    private func enterRoot(_ root: String, id: UUID) async throws {
+        while residentTransitions.contains(root) {
+            let waiter = ScopedWaiter()
+            heldForResidentTransition[root, default: [:]][id] = waiter
+            await waiter.park()
+            heldForResidentTransition[root]?[id] = nil
+            try Task.checkCancellation()
+        }
+        try Task.checkCancellation()
+        executingRoots[id] = root
+    }
+
+    private func leaveRoot(id: UUID) async {
+        executingRoots.removeValue(forKey: id)
+        await drainResidentRefreshes()
+    }
 
     public struct Full: LocalizedError {
         public var errorDescription: String? { "This chat has too many waiting turns. No new turn was started." }
     }
+    public struct RestorationUnavailable: LocalizedError {
+        public let detail: String
+        public var errorDescription: String? { detail }
+    }
 
-    /// Nil session = a new chat nobody else can be in; runs at once.
+    /// Nil session = a new chat nobody else can be in; only root admission applies.
     /// Durable arrivals wait for queue capacity; unsaved requests still fail full.
     /// `runID` names the run, so a restored backlog admits it in its place.
-    public func run<T>(sessionID: String?, runID: String? = nil, waitForCapacity: Bool = false, isolation: isolated (any Actor)? = #isolation,
+    public func run<T>(dataRoot: URL, sessionID: String?, runID: String? = nil, waitForCapacity: Bool = false, isolation: isolated (any Actor)? = #isolation,
                        operation: () async throws -> T) async throws -> T {
-        guard let sessionID else { return try await operation() }
         let id = UUID()
-        do { try await acquire(sessionID, id: id, runID: runID, waitForCapacity: waitForCapacity) }
+        do {
+            if let sessionID { try await acquire(sessionID, id: id, runID: runID, waitForCapacity: waitForCapacity) }
+        }
         catch {
             // A restored run that will not be admitted gives up its place.
-            if let runID { await withdraw(sessionID: sessionID, runID: runID) }
+            if let sessionID, let runID { await withdraw(sessionID: sessionID, runID: runID) }
             throw error
         }
         do {
+            try await enterRoot(rootKey(dataRoot), id: id)
             try Task.checkCancellation()
-            let result = try await Self.$token.withValue(id, operation: operation)
-            await ChatTurnSteering.shared.closeTurn(sessionId: sessionID, token: id)
-            await release(sessionID, id: id)
+            // A new session is resolved inside the operation; its own runner
+            // closes steering. Only a named session delegates that close here.
+            let result: T
+            if sessionID != nil { result = try await Self.$token.withValue(id, operation: operation) }
+            else { result = try await operation() }
+            if let sessionID { await ChatTurnSteering.shared.closeTurn(sessionId: sessionID, token: id) }
+            if let sessionID { await release(sessionID, id: id) }
+            await leaveRoot(id: id)
             return result
         } catch {
-            await ChatTurnSteering.shared.closeTurn(sessionId: sessionID, token: id)
-            await release(sessionID, id: id)
+            if let sessionID { await ChatTurnSteering.shared.closeTurn(sessionId: sessionID, token: id) }
+            if let sessionID { await release(sessionID, id: id) }
+            await leaveRoot(id: id)
             throw error
         }
     }
@@ -298,6 +390,7 @@ public actor TurnAdmission {
     /// At launch, before anything new is admitted there: the runs a restart
     /// left queued or interrupted in this session, oldest first.
     public func restore(sessionID: String, runs: [String]) {
+        sessionRestorationFailures[sessionID] = nil
         let known = backlog[sessionID] ?? []
         let added = known + runs.filter { !known.contains($0) }
         backlog[sessionID] = added.isEmpty ? nil : added
@@ -306,6 +399,18 @@ public actor TurnAdmission {
     /// The launch recovery has restored every contact conversation's backlog.
     public func restorationComplete() {
         restoring = false
+        restorationFailure = nil
+        let held = heldWhileRestoring.values
+        heldWhileRestoring.removeAll()
+        for continuation in held { continuation.resume() }
+    }
+
+    /// Failure is an explicit refusal, never an endless restoration wait.
+    /// A conversation read failure affects only that conversation; a failed
+    /// task-store read prevents proving any contact backlog complete.
+    public func restorationFailed(_ detail: String, sessionID: String? = nil) {
+        if let sessionID { sessionRestorationFailures[sessionID] = detail }
+        else { restorationFailure = detail }
         let held = heldWhileRestoring.values
         heldWhileRestoring.removeAll()
         for continuation in held { continuation.resume() }
@@ -332,52 +437,43 @@ public actor TurnAdmission {
 
     private func acquire(_ key: String, id: UUID, runID: String?, waitForCapacity: Bool) async throws {
         try Task.checkCancellation()
-        while restoring, SessionConversation.kind(key)?.isPeerConversation == true, !(runID.map { backlog[key]?.contains($0) == true } ?? false) {
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    if Task.isCancelled { continuation.resume(throwing: CancellationError()) }
-                    else { heldWhileRestoring[id] = continuation }
-                }
-            } onCancel: {
-                Task { await self.cancel(key, id: id) }
-            }
+        if let detail = sessionRestorationFailures[key] { throw RestorationUnavailable(detail: detail) }
+        while restoring, !(runID.map { backlog[key]?.contains($0) == true } ?? false) {
+            if let detail = restorationFailure { throw RestorationUnavailable(detail: detail) }
+            if let detail = sessionRestorationFailures[key] { throw RestorationUnavailable(detail: detail) }
+            let done = ScopedWaiter()
+            heldWhileRestoring[id] = done
+            await done.park()
+            heldWhileRestoring.removeValue(forKey: id)
+            try Task.checkCancellation()
         }
+        if let detail = sessionRestorationFailures[key] { throw RestorationUnavailable(detail: detail) }
         try Task.checkCancellation()
         while active[key] != nil || !admissible(key, runID: runID) {
             let hasCapacity = (waiting[key]?.count ?? 0) < 8 && waiting.values.reduce(0, { $0 + $1.count }) < 32
             guard hasCapacity || waitForCapacity else { throw Full() }
             // Registration and the capacity check share this actor. A release
             // cannot slip between them; cancellation also wakes the subscriber.
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    if Task.isCancelled { continuation.resume(throwing: CancellationError()) }
-                    else if hasCapacity { waiting[key, default: []].append(Waiter(id: id, runID: runID, continuation: continuation)) }
-                    else { capacityWaiters[id] = continuation }
+            let done = ScopedWaiter()
+            if hasCapacity { waiting[key, default: []].append(Waiter(id: id, runID: runID, done: done)) }
+            else { capacityWaiters[id] = done }
+            await done.park()
+            if hasCapacity {
+                // A handoff owns the slot even if Stop raced it; run's
+                // cancellation check then releases that admitted slot.
+                if active[key] == id { return }
+                if let index = waiting[key]?.firstIndex(where: { $0.id == id }) {
+                    waiting[key]?.remove(at: index)
+                    if waiting[key]?.isEmpty == true { waiting[key] = nil }
+                    signalCapacity()
                 }
-            } onCancel: {
-                Task { await self.cancel(key, id: id) }
+                throw CancellationError()
             }
-            if hasCapacity { return }
+            capacityWaiters.removeValue(forKey: id)
             try Task.checkCancellation()
         }
         active[key] = id
         admitted(key, runID: runID)
-    }
-
-    private func cancel(_ key: String, id: UUID) {
-        if let continuation = heldWhileRestoring.removeValue(forKey: id) {
-            continuation.resume(throwing: CancellationError())
-            return
-        }
-        if let continuation = capacityWaiters.removeValue(forKey: id) {
-            continuation.resume(throwing: CancellationError())
-            return
-        }
-        guard let index = waiting[key]?.firstIndex(where: { $0.id == id }),
-              let waiter = waiting[key]?.remove(at: index) else { return }
-        if waiting[key]?.isEmpty == true { waiting.removeValue(forKey: key) }
-        waiter.continuation.resume(throwing: CancellationError())
-        signalCapacity()
     }
 
     private func release(_ key: String, id: UUID) {
@@ -400,7 +496,7 @@ public actor TurnAdmission {
         waiting[key] = queue.isEmpty ? nil : queue
         active[key] = next.id
         admitted(key, runID: next.runID)
-        next.continuation.resume()
+        next.done.resume()
     }
 
     private func signalCapacity() {

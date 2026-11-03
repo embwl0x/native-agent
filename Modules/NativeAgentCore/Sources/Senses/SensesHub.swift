@@ -5,18 +5,53 @@ import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SensesHub.swift` | Lock-protected sense installation, live-watch aggregation, exact-version view events and served/wrong-version provenance |
+import NativeAgentShared
+// Blueprint: | `SensesHub.swift` | Lock-protected sense installation; readiness reads the installation owner's exact task through a cancellation-aware ScopedWaiter bounded to four seconds or the earlier caller deadline, with unavailable reads leaving installation alive; installation success names one repair notification, live-watch aggregation, exact-version view events and served/wrong-version provenance |
 /// Process-wide wiring, set once at launch by the app, so Core call sites
 /// (the door and the readers) reach the senses without
 /// depending on the app. Every member is optional: nil = senses not wired.
 public final class SensesHub: @unchecked Sendable {
     public static let shared = SensesHub()
+    /// Installation's successful repair edge, not a second readiness snapshot.
+    public static let didBecomeReady = Notification.Name("NativeAgent.sensesReady")
     private let lock = NSLock()
     private var _registry: FileSenseRegistry?
     private var _runner: HelperSenseRunner?
     private var _source: SenseSourceProvider?
     private var _memoryProvenanceSink: (any SenseMemoryProvenanceSink)?
     private var _crossing: (any SenseCrossing)?
+    // The installation owner's exact task and completion, never a copied
+    // ready flag. A cancelled waiter leaves installation and siblings alone.
+    private var _installation: (task: Task<Void, Error>, finished: ScopedWaiter)?
+
+    public func installReadiness(_ task: Task<Void, Error>, finished: ScopedWaiter) {
+        lock.lock(); defer { lock.unlock() }
+        _installation = (task, finished)
+    }
+
+    private var installation: (task: Task<Void, Error>, finished: ScopedWaiter)? {
+        lock.lock(); defer { lock.unlock() }; return _installation
+    }
+
+    public func waitUntilReady() async throws {
+        guard let installation else {
+            throw SenseFailure(code: "source_unavailable", message: "Senses installation has not started.")
+        }
+        // Bound only this read's wait. Installation keeps its repair observation
+        // and every sibling retains its own parker. Never infer ready from expiry.
+        let ceiling = ContinuousClock.now.advanced(by: .seconds(4))
+        let deadline = TaskWaitDeadline.current.map { min($0, ceiling) } ?? ceiling
+        try await TaskWaitDeadline.$current.withValue(deadline) {
+            await installation.finished.park()
+            try Task.checkCancellation()
+            guard !TaskWaitDeadline.expired else {
+                throw SenseFailure(code: "source_unavailable", message: "Senses registration did not finish within this read's readiness wait. Inspect Doctor's Senses installation reading (launch.senses); if it names a failure, preserve and repair that source. A canonical repair change rechecks registration. This sense read did not run; other resident work continues.")
+            }
+        }
+        try Task.checkCancellation()
+        if TaskWaitDeadline.expired { throw TaskWaitDeadline.Exceeded() }
+        try await installation.task.value
+    }
     public func installCrossing(_ crossing: any SenseCrossing) {
         lock.lock(); defer { lock.unlock() }
         _crossing = crossing
@@ -30,7 +65,7 @@ public final class SensesHub: @unchecked Sendable {
     public func didServe(_ provenance: SenseProvenance) {
         SenseTurnReads.current?.record(provenance)
     }
-    /// Call for viewWrong and for the version being withdrawn on rollback.
+    /// Call for viewWrong on the version whose served view was wrong.
     public func markVersionWrong(senseID: String, version: Int) async throws {
         let sink = memoryProvenanceSink
         guard let sink else {

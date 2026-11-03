@@ -73,6 +73,8 @@ function formatCodexReplyForNativeAgent(job, turnResult) {
     lines.push(("NativeAgent did not automatically replay the request because the first turn may already have produced effects. Report the bridge failure to " + USER_NAME + "; retry only after an explicit decision."));
   } else if (turnResult.status === "aborted") {
     lines.push("Codex turn was aborted before a final reply landed.");
+  } else if (turnResult.status === "observation_unavailable") {
+    lines.push(`Codex completion evidence is unavailable: ${turnResult.errorMessage || "the liveness source could not be read"}. Its execution outcome is unknown. Repair the reported source, then inspect this same turn before deciding whether any work remains. NativeAgent did not stop or replay it.`);
   } else if (turnResult.status === "stalled") {
     const ev = turnResult.stallEvidence || {};
     const cause = !ev.serverReachable
@@ -263,6 +265,9 @@ async function postBridgeMessageWithRetry(post, options = {}) {
 //   "retain"   — retryable/unknown failure; leave it for the recovery scan.
 function replyJobDisposition(bridge) {
   if (!bridge) return "retain";
+  // A failed NativeAgent turn did not deliver this job's answer. Preserve
+  // the full input for repair even when the failure itself is terminal.
+  if (bridge.execution_result_class === "failed") return "preserve";
   if (bridge.replyPersisted === true || bridge.status === "delivered" || bridge.status === "dry_run") return "unlink";
   if (!isTerminalBridgeReply(bridge)) return "retain";
   return bridge.completionDelivery?.status === "outcome_unknown" || bridge.replyStatus === "outcome_unknown" || bridge.replyStatus === "conflict"
@@ -275,7 +280,8 @@ function replyJobDisposition(bridge) {
 // because the later NativeAgent handoff was ambiguous or temporarily failed.
 function persistReplyJobDeliveryState(jobPath, job, bridge) {
   const disposition = replyJobDisposition(bridge);
-  const outcome = bridge && (bridge.replyPersisted === true || bridge.status === "delivered" || bridge.status === "dry_run")
+  const outcome = disposition === "preserve" ? "unknown"
+    : bridge && (bridge.replyPersisted === true || bridge.status === "delivered" || bridge.status === "dry_run")
     ? "delivered"
     : ((bridge && bridge.status === "unknown") || disposition === "preserve" ? "unknown" : null);
   job.phase = outcome === "delivered"
@@ -305,34 +311,35 @@ function pruneUndeliveredReplyJobs(
   cap = UNDELIVERED_REPLY_JOBS_CAP,
   maxAgeMs = UNDELIVERED_REPLY_JOBS_MAX_AGE_MS
 ) {
+  const warnings = [];
   let entries;
-  try {
-    entries = fs.readdirSync(undeliveredDir).filter((name) => name.endsWith(".json"));
-  } catch {
-    return;
-  }
-  const stamped = entries.map((name) => {
-    let mtimeMs = 0;
-    try { mtimeMs = fs.statSync(path.join(undeliveredDir, name)).mtimeMs; } catch {}
-    return { name, mtimeMs };
+  try { entries = fs.readdirSync(undeliveredDir).filter((name) => name.endsWith(".json")); }
+  catch (error) { return { status: "incomplete", warnings: [`Undelivered-reply retention could not read ${undeliveredDir}: ${error.message}. Retained replies were left untouched.`] }; }
+  const stamped = entries.flatMap((name) => {
+    try { return [{ name, mtimeMs: fs.statSync(path.join(undeliveredDir, name)).mtimeMs }]; }
+    catch (error) {
+      warnings.push(`Retention left ${name} untouched: metadata unavailable (${error.message}). Repair its metadata before retention can order it.`);
+      return [];
+    }
   });
   stamped.sort((a, b) => a.mtimeMs - b.mtimeMs);
-  // Age out first, then enforce the count cap on whatever survived. A file
-  // whose stat failed carries mtimeMs 0 and would age out on every run, so it
-  // is left to the count cap instead of being deleted on an unread stat.
+  // Unknown-age files never enter a destructive ordering.
   const ageCutoff = maxAgeMs > 0 ? Date.now() - maxAgeMs : null;
   const survivors = [];
   for (const entry of stamped) {
     if (ageCutoff !== null && entry.mtimeMs > 0 && entry.mtimeMs < ageCutoff) {
-      try { fs.unlinkSync(path.join(undeliveredDir, entry.name)); } catch {}
+      try { fs.unlinkSync(path.join(undeliveredDir, entry.name)); }
+      catch (error) { warnings.push(`Retention could not remove ${entry.name}: ${error.message}`); survivors.push(entry); }
       continue;
     }
     survivors.push(entry);
   }
-  if (survivors.length <= cap) return;
+  if (survivors.length <= cap) return { status: warnings.length ? "incomplete" : "completed", warnings };
   for (const victim of survivors.slice(0, survivors.length - cap)) {
-    try { fs.unlinkSync(path.join(undeliveredDir, victim.name)); } catch {}
+    try { fs.unlinkSync(path.join(undeliveredDir, victim.name)); }
+    catch (error) { warnings.push(`Retention could not remove ${victim.name}: ${error.message}`); }
   }
+  return { status: warnings.length ? "incomplete" : "completed", warnings };
 }
 
 function preserveUndeliverableReplyJob(jobPath, bridge) {
@@ -347,10 +354,10 @@ function preserveUndeliverableReplyJob(jobPath, bridge) {
     // rename keeps the source file's mode; a legacy 0644 job must not land
     // world-readable with full reply text.
     try { fs.chmodSync(target, 0o600); } catch {}
-    pruneUndeliveredReplyJobs(undeliveredDir);
+    const retention = pruneUndeliveredReplyJobs(undeliveredDir);
     fsyncDirectorySync(path.dirname(jobPath));
     fsyncDirectorySync(undeliveredDir);
-    return { preserved: true, undeliveredPath: target };
+    return { preserved: true, undeliveredPath: target, retention };
   } catch (error) {
     return {
       preserved: false,

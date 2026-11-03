@@ -26,7 +26,11 @@ extension NativeCognitionRuntime {
         var unreadable: [String] = []
         for (name, day) in [("today", now), ("yesterday", Calendar.current.date(byAdding: .day, value: -1, to: now) ?? now)] {
             do {
-                events += try await reader.read(now: day).events.filter { $0.kind == "mind.why" || $0.kind == "turn.terminal" }
+                let snapshot = try await reader.read(now: day)
+                events += snapshot.events.filter { $0.kind == "mind.why" || $0.kind == "turn.terminal" }
+                if !snapshot.completeSequences {
+                    unreadable.append("\(name)'s turn trace has incomplete coverage (truncated: \(snapshot.truncated), malformed rows: \(snapshot.malformedRows), partial tail: \(snapshot.trailingPartialLine))")
+                }
             } catch {
                 unreadable.append("\(name)'s turn trace (\(error.localizedDescription))")
             }
@@ -83,7 +87,7 @@ extension NativeCognitionRuntime {
             }
         }
         var out: [String: JSONValue] = [
-            "status": .string(!rows.isEmpty ? "ok" : unread == nil ? "empty" : "unavailable"), "turn": .string(target)]
+            "status": .string(unread != nil ? (rows.isEmpty ? "unavailable" : "incomplete") : rows.isEmpty ? "empty" : "ok"), "turn": .string(target)]
         if rows.isEmpty {
             out["detail"] = .string(unread ?? (target == TurnTraceContext.turnId
                 ? "No why record is available for this turn yet. Its cue record lands at delivery; pass this turn explicitly after it finishes."

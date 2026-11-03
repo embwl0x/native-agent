@@ -9,65 +9,52 @@ import PersistenceCore
 // the remote/iOS sets. A second copy of them here would be a second answer to
 // "is this surface the person" — the thing that type exists to prevent.
 import TrustCenter
-// Blueprint: | `ApprovalContinuations.swift` | Locked continuation and card claims |
+// Blueprint: | `ApprovalContinuations.swift` | Locked shared reporting-turn and card claims; reporting answers belong to session delivery, with no approval-specific queued-answer fields |
 extension SwiftNativeApprovalInbox {
     public func annotateChatContinuation(
-        _ id: String, done: Bool, legacyStartedAt: String? = nil,
-        clearQueuedDelivery: Bool = false, settlement: String? = nil,
-        assistantDelivery: JSONValue? = nil
+        _ id: String, done: Bool, settlement: String? = nil
     ) async throws -> Bool {
         let now = Date()
         return try await updateChatContinuation(id) { record, state in
-            if let assistantDelivery {
-                guard state["done"] != .bool(true) else { return false }
-                state["assistantDelivery"] = assistantDelivery
-                return true
-            }
             if done {
                 guard state["done"] != .bool(true) else { return false }
                 state["done"] = .bool(true)
                 if let settlement { state["settlement"] = .string(settlement) }
-                state["delivery"] = nil
                 return true
             }
             guard Self.continuationIsPending(record, now: now),
                   state["done"] == nil, state["started"] == nil else { return false }
-            state["started"] = .string(legacyStartedAt ?? Self.isoTimestamp(now))
-            if clearQueuedDelivery { state["delivery"] = nil }
+            state["started"] = .string(Self.isoTimestamp(now))
             return true
-        } && (done || legacyStartedAt == nil)
+        }
     }
-    /// A queued delivery remains owed across downtime; age only bounds records
-    /// without that durable evidence. Started and completed claims never replay.
+    /// An unstarted reporting turn is eligible within its existing age window.
+    /// Started and completed claims never replay; session delivery owns answers.
     public nonisolated static func continuationIsPending(_ record: ApprovalRecord, now: Date = Date()) -> Bool {
         guard record.status == "resolved", record.decision != nil,
               hasChatReportingObligation(record) else { return false }
         if let saved = record.chatContinuation {
             guard case .object(let state) = saved,
                   state["started"] == nil, state["done"] == nil else { return false }
-            if case .object? = state["delivery"] { return true }
         }
         guard let date = record.resolvedAt.flatMap(NativeTimestampFormat.parseISO8601) else { return false }
         return (0...600).contains(now.timeIntervalSince(date))
     }
-    /// Only a conversation that actually asked, or retained delivery work,
+    /// Only a conversation that actually asked, or a retained reporting claim,
     /// owes a reporting turn. A mirrored card alone does not create one.
     nonisolated static func hasChatReportingObligation(_ record: ApprovalRecord) -> Bool {
         if case .object(let state)? = record.chatContinuation,
-           state["started"] != nil || state["delivery"] != nil || state["assistantDelivery"] != nil { return true }
+           state["started"] != nil { return true }
         guard case .object(let payload) = record.payload else { return false }
         let origin: [String: JSONValue] = if case .object(let value)? = payload["origin"] { value } else { [:] }
-        let telegram: [String: JSONValue] = if case .object(let value)? = payload["telegram"] { value } else { [:] }
         func readSession(_ value: JSONValue?) -> String? {
             guard case .string(let id)? = value else { return nil }
             return NativeAgentChatSessionID.normalizedPathComponent(id)
         }
-        guard let session = readSession(origin["sessionId"]) ?? readSession(telegram["sessionId"]) else { return false }
+        guard let session = readSession(origin["sessionId"]) else { return false }
         if payload["surface"] == .string("connector_action"), session.hasPrefix("ephemeral:connector_action:") { return false }
         return payload["kind"] == .string("chat_tool_approval")
-            || payload["kind"] == .string("telegram_tool_approval")
             || payload["kind"] == .string("agent_acp_live_approval")
-            || !telegram.isEmpty
     }
     /// Retain the destination before delivery, then mark it delivered only
     /// after its idempotent transcript write. An unfinished claim resumes at

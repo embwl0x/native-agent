@@ -102,7 +102,7 @@ public struct SystemPermissionSnapshot: Sendable, Equatable {
 
 public enum SystemPermissionPreflight {
     /// Posted by any permission source that learns of a change in-process (a Location answer); the card port re-checks its waiting cards on it.
-    public static let permissionDidChange = Notification.Name("NativeAgent.SystemPermissionPreflight.permissionDidChange")
+    public static let permissionDidChange = MacIntegrationPermissionStore.didChange
     private static let logger = Logger(subsystem: "com.nativeagent.app", category: "permission-preflight")
 
     public typealias SpeechAuthorizationRequest = @Sendable (
@@ -176,11 +176,7 @@ public enum SystemPermissionPreflight {
         let target = AppleScriptExecution.automationTarget(id).map { "applescript:" + $0 }
             ?? capability.rawValue
         let name = AppleScriptExecution.automationTarget(id).map { "Automation for " + $0 } ?? capability.displayName
-        var args: [String: JSONValue] = ["capability": .string(target), "why": .string("NativeAgent needs \(name) for this work. Allow?")]
-        if let mode { args["mode"] = .string(mode.rawValue) }
-        return Repair.remedy(owner: "macOS \(name) grant", nextCall: .object([
-            "tool": .string("app"), "input": .object(["action": .string("permissions.request"), "args": .object(args)]),
-        ]), tap: "Allow \(name) on the permission card in NativeAgent")
+        return MacFourVerbsReply.permissionRemedy(target, name: name, mode: mode)
     }
 
     // MARK: - Non-prompting reads
@@ -273,7 +269,6 @@ public enum SystemPermissionPreflight {
 
     private static func mapEKStatus(_ status: EKAuthorizationStatus) -> SystemPermissionStatus {
         switch status {
-        case .authorized: return .granted
         case .denied: return .denied
         case .restricted: return .restricted
         case .notDetermined: return .notDetermined
@@ -384,7 +379,7 @@ extension SystemPermissionPreflight {
     ) -> SystemPermissionStatus {
         guard gate == .calendars, mode == .write else { return status(gate) }
         switch EKEventStore.authorizationStatus(for: .event) {
-        case .writeOnly, .fullAccess, .authorized: return .granted
+        case .writeOnly, .fullAccess: return .granted
         case .notDetermined: return .notDetermined
         case .restricted: return .restricted
         default: return .denied

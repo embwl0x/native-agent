@@ -53,13 +53,6 @@ struct PersonalityDetailView: View {
                         AliveNote(detail)
                     }
                 }
-                AliveSection("Essence") {
-                    MorePassage(text: p.essence)
-                }
-                AliveSection("Voice") {
-                    MorePassage(text: p.voice)
-                }
-
                 AliveSection("Traits", footer: "Mirrored from the Mac. Edit in the Mac app's Personality view.") {
                     let traits: [(String, Double)] = [
                         ("Warmth", p.traits.warmth), ("Directness", p.traits.directness),
@@ -94,50 +87,23 @@ struct PersonalityDetailView: View {
     }
 }
 
-/// A paragraph inside a card, at reading size.
-private struct MorePassage: View {
-    let text: String
-
-    var body: some View {
-        Text(text)
-            .font(.body)
-            .lineSpacing(3)
-            .foregroundStyle(AlivePalette.text)
-            .fixedSize(horizontal: false, vertical: true)
-            .aliveRow()
-    }
-}
-
 struct TraitValuePresentation: Equatable {
-    let normalizedValue: Double
-    let wasClamped: Bool
+    let normalizedValue: Double?
     let percentageText: String
     let warningText: String?
 
     static func project(_ rawValue: Double) -> TraitValuePresentation {
-        guard rawValue.isFinite else {
+        guard rawValue.isFinite, (0...1).contains(rawValue) else {
             return .init(
-                normalizedValue: 0,
-                wasClamped: true,
-                percentageText: "0%",
-                warningText: "The Mac reported an invalid trait value; displaying 0%."
-            )
-        }
-
-        let normalizedValue = min(max(rawValue, 0), 1)
-        guard normalizedValue == rawValue else {
-            return .init(
-                normalizedValue: normalizedValue,
-                wasClamped: true,
-                percentageText: String(format: "%.0f%%", normalizedValue * 100),
-                warningText: "The Mac reported a trait value outside 0–100%; displaying a clamped value."
+                normalizedValue: nil,
+                percentageText: "Unavailable",
+                warningText: "The Mac reported \(rawValue); traits require a finite value from 0 to 1. Repair this trait in the Mac profile, then refresh."
             )
         }
 
         return .init(
-            normalizedValue: normalizedValue,
-            wasClamped: false,
-            percentageText: String(format: "%.0f%%", normalizedValue * 100),
+            normalizedValue: rawValue,
+            percentageText: String(format: "%.0f%%", rawValue * 100),
             warningText: nil
         )
     }
@@ -149,27 +115,32 @@ struct TraitRow: View {
 
     var body: some View {
         let projection = TraitValuePresentation.project(value)
-        MobileAdaptiveRow(spacing: 12) {
-            Text(label)
-                .foregroundStyle(AlivePalette.text)
-                .frame(minWidth: 96, alignment: .leading)
-                .fixedSize(horizontal: false, vertical: true)
-            // Neutral ink presents trait values without implying a health warning.
-            Capsule()
-                .fill(AlivePalette.divider)
-                .frame(height: 4)
-                .overlay(alignment: .leading) {
-                    GeometryReader { geo in
-                        Capsule()
-                            .fill(AlivePalette.secondary)
-                            .frame(width: geo.size.width * projection.normalizedValue)
-                    }
+        VStack(alignment: .leading, spacing: 6) {
+            MobileAdaptiveRow(spacing: 12) {
+                Text(label)
+                    .foregroundStyle(AlivePalette.text)
+                    .frame(minWidth: 96, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                // Neutral ink presents trait values without implying a health warning.
+                if let normalizedValue = projection.normalizedValue {
+                    Capsule()
+                        .fill(AlivePalette.divider)
+                        .frame(height: 4)
+                        .overlay(alignment: .leading) {
+                            GeometryReader { geo in
+                                Capsule()
+                                    .fill(AlivePalette.secondary)
+                                    .frame(width: geo.size.width * normalizedValue)
+                            }
+                        }
                 }
-            Text(projection.wasClamped ? "\(projection.percentageText) clamped" : projection.percentageText)
-                .font(.subheadline.monospacedDigit())
-                .foregroundStyle(AlivePalette.secondary)
-                .frame(minWidth: 40, alignment: .trailing)
-                .fixedSize(horizontal: true, vertical: true)
+                Text(projection.percentageText)
+                    .font(.subheadline.monospacedDigit())
+                    .foregroundStyle(AlivePalette.secondary)
+                    .frame(minWidth: 40, alignment: .trailing)
+                    .fixedSize(horizontal: true, vertical: true)
+            }
+            if let warning = projection.warningText { AliveNote(warning) }
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(

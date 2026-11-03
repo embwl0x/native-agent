@@ -158,13 +158,7 @@ enum ChatToolCatalogPresentation {
     private static func bucket(for tool: ChatCatalogTool, in catalog: ChatToolCatalogSnapshot) -> ChatToolCatalogBucket {
         if let rawBucket = tool.catalogBucket,
            let bucket = ChatToolCatalogBucket(rawValue: rawBucket) {
-            if bucket == .core, catalog.currentlyLoaded.contains(tool.name) {
-                return .alwaysOn
-            }
-            return bucket
-        }
-        if let bucket = SwiftToolDispatcher.catalogBucket(forRegisteredToolNamed: tool.name) {
-            if bucket == .core, catalog.currentlyLoaded.contains(tool.name) {
+            if bucket == .core, catalog.alwaysOnTools.contains(tool.name) {
                 return .alwaysOn
             }
             return bucket

@@ -2,7 +2,7 @@ import Foundation
 import PersistenceCore
 import Desk
 import WorkshopExecution
-// Blueprint: | `EngineWorkshopObservatory.swift` | `WorkshopPursuitRow`, `DeskPursuitVetoRationale`; Workshop read projections |
+// Blueprint: | `EngineWorkshopObservatory.swift` | `WorkshopPursuitRow`, `DeskPursuitVetoRationale`; checked Workshop receipt projection names damaged fields and makes incomplete history unavailable |
 
 // MARK: - Pure view-models (data-shaping, no SwiftUI)
 
@@ -22,8 +22,8 @@ public struct WorkshopPursuitRow: Identifiable, Equatable, Sendable {
     public let alias: String
     public let title: String
     public let privateName: String?
-    public let why: String
-    public let doneLooksLike: String
+    public let why: String?
+    public let doneLooksLike: String?
     public let status: String
     /// nil when the item is origin=agent but carries no decodable pursuit payload
     /// (a corrupt row) — shown as "score unavailable", never a misleading 0.
@@ -36,7 +36,7 @@ public struct WorkshopPursuitRow: Identifiable, Equatable, Sendable {
     /// first, bounded. Excludes the "chose:" rationale lines.
     public let workReceipts: [String]
     /// Evidence citation tokens (source-mix), for the veto rationale.
-    public let citations: [String]
+    public let citations: [String]?
 
     public var id: String { handle }
     public var displayName: String { (privateName?.isEmpty == false ? privateName : nil) ?? title }
@@ -76,15 +76,15 @@ public struct WorkshopPursuitRow: Identifiable, Equatable, Sendable {
             alias: item.alias,
             title: item.title,
             privateName: p?.privateName,
-            why: p?.why ?? "",
-            doneLooksLike: p?.doneLooksLike ?? "",
+            why: p?.why,
+            doneLooksLike: p?.doneLooksLike,
             status: item.status.rawValue,
             score: score,
             budget: budget,
             lastWorkedAt: p?.lastWorkedAt,
             latestChoiceRationale: latestChoice,
             workReceipts: Array(receipts),
-            citations: p?.evidence.citations.map(\.token) ?? []
+            citations: p?.evidence.citations.map(\.token)
         )
     }
 }
@@ -173,23 +173,31 @@ public struct WorkshopReceiptRow: Identifiable, Equatable, Sendable {
 
     public var id: String { "\(ts)|\(reservationId)" }
 
-    public static func fromJSON(_ value: JSONValue) -> WorkshopReceiptRow? {
-        guard case .object(let obj) = value,
-              case .string(let handle)? = obj["handle"],
-              case .string(let reservationId)? = obj["reservationId"],
-              case .string(let status)? = obj["status"] else { return nil }
-        let isDirectedTask = obj["kind"] == .string("directed_task")
-        let verificationStatus: String? = {
-            if case .string(let status)? = obj["verificationStatus"] { return status }
-            return nil
-        }()
-        let summary: String = { if case .string(let s)? = obj["summary"] { return s } else { return "" } }()
-        let model: String? = { if case .string(let m)? = obj["model"] { return m } else { return nil } }()
-        let artifactCount: Int = {
-            if case .int(let n)? = obj["artifactCount"] { return Int(n) }
-            return 0
-        }()
-        let ts: String = { if case .string(let t)? = obj["ts"] { return t } else { return "" } }()
+    public static func fromJSON(_ value: JSONValue) throws -> WorkshopReceiptRow {
+        let row = try JSONRow(value)
+        func identity(_ key: String) throws -> String {
+            let value = try row.string(key)
+            guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw JSONRow.Malformed.field(key)
+            }
+            return value
+        }
+        let handle = try identity("handle")
+        let reservationId = try identity("reservationId")
+        let status = try identity("status")
+        // The current session writer is untagged; the directed writer alone
+        // supplies kind. Absence is that live variant, not a repaired field.
+        let kind = try row.optionalString("kind")
+        guard kind == nil || kind == "directed_task" else { throw JSONRow.Malformed.field("kind") }
+        let isDirectedTask = kind == "directed_task"
+        let verificationStatus = try row.optionalString("verificationStatus")
+        let summary = try row.string("summary")
+        let model = try row.optionalString("model")
+        guard let artifactCount = try row.optionalInt("artifactCount"), artifactCount >= 0 else {
+            throw JSONRow.Malformed.field("artifactCount")
+        }
+        let ts = try row.string("ts")
+        guard DeskClock.parseISO(ts) != nil else { throw JSONRow.Malformed.field("ts") }
         return WorkshopReceiptRow(
             handle: handle, reservationId: reservationId, status: status,
             isDirectedTask: isDirectedTask, verificationStatus: verificationStatus,
@@ -218,13 +226,16 @@ public enum WorkshopReceiptsReader {
             let receipt = try await WorkshopReceiptLog.readRecent(
                 at: receiptsPath, limit: min(rowLimit, max(1, limit))
             )
-            let parsed = receipt.rows.compactMap(WorkshopReceiptRow.fromJSON)
+            guard receipt.malformedJSONRowCount == 0 else {
+                return .unavailable("The recent workshop history is unavailable (\(receipt.malformedJSONRowCount) damaged JSON rows). Repair the retained receipts before relying on a complete history.")
+            }
+            let parsed = try receipt.rows.map(WorkshopReceiptRow.fromJSON)
             if parsed.isEmpty, receipt.bytesRead > 0 {
                 return .unavailable("The recent workshop receipts could not be read.")
             }
             return .rows(Array(parsed.reversed().prefix(max(0, limit))))
         } catch {
-            return .unavailable(String("\(error)".prefix(maxErrorChars)))
+            return .unavailable(String("Workshop history unavailable: \(error.localizedDescription). Repair the retained receipts before relying on a complete history.".prefix(maxErrorChars)))
         }
     }
 }

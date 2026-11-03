@@ -19,12 +19,12 @@ import ToolRegistry
 import ActivityWatch
 import ChatTurnContracts
 import NativeAgentShared
-// Blueprint: | `SwiftToolDispatcher+MacVerbs.swift` | `SwiftToolDispatcher`: four-verb arguments and execution, screen-watch admission, clipboard, menu, document and input routes; implicit point acts use MacImageFrames' newest session image, acquiring the first through mac.look pixels:true before input; explicit unknown image references remain refused |
+// Blueprint: | `SwiftToolDispatcher+MacVerbs.swift` | Four-verb arguments under shared deadlines; handle steps inherit or supply their frame identity, point type retains text, targetless type accepts contextual frames and bare scroll selects content; points require an already observed session image; unknown images refuse |
 
 internal struct SwiftToolDispatcherMacControlPolicyProvider: MacControlPolicyProvider {
     let policy: MacControlPolicy
 
-    func currentPolicy() async -> MacControlPolicy? {
+    func currentPolicy() async throws -> MacControlPolicy {
         policy
     }
 }
@@ -36,7 +36,7 @@ extension SwiftToolDispatcher {
     /// asked again while it runs, to end it when screen control is turned off.
     public func openScreenWatch(_ request: MacScreenWatch.Request, hands: Bool, surface: String) async throws -> MacScreenWatch {
         let verbs: @Sendable () async throws -> MacFourVerbs = {
-            let access = await self.fullMacToolAccess(surface: surface)
+            let access = try await self.fullMacToolAccess(surface: surface)
             guard access.accessibilityAllowed else {
                 throw MacScreenWatch.Refusal(receipt: self.macControlCategoryNeedEnvelope(
                     categories: ["accessibility"], mode: hands ? .write : .read,
@@ -51,7 +51,7 @@ extension SwiftToolDispatcher {
         }
         do {
             return try await verbs().watch(request, dataRoot: dataRoot, hands: hands ? verbs : nil,
-                                           authority: { await self.fullMacToolAccess(surface: surface).accessibilityAllowed })
+                                           authority: { try await self.fullMacToolAccess(surface: surface).accessibilityAllowed })
         } catch {
             let failure = SenseFailure(error)
             if Experience.currentAct == nil, case .object(let remedy)? = failure.remedy,
@@ -68,27 +68,7 @@ extension SwiftToolDispatcher {
     /// text) is that exact selection: its handle and frame, or a supplemental
     /// surface's current target in its app.
     static func unwrappingScreenAddress(_ input: [String: JSONValue]) -> [String: JSONValue] {
-        let address: [String: JSONValue]
-        switch input["target"] {
-        case .object(let fields)?: address = fields
-        case .string(let text)? where text.hasPrefix("{"):
-            guard case .object(let fields)? = try? JSONValue.parse(Data(text.utf8)) else { return input }
-            address = fields
-        default: return input
-        }
-        var input = input
-        if case .string? = address["handle"], case .string? = address["frame_id"] {
-            input["target"] = nil
-            input["handle"] = address["handle"]
-            input["frame_id"] = address["frame_id"]
-        } else if case .string? = address["target"], case .string? = address["app"],
-                  case .string? = address["__sense_screen_frame"] {
-            input["target"] = address["target"]
-            input["app"] = address["app"]
-            input["__sense_native_surface"] = .bool(true)
-            input["__sense_native_label"] = address["label"]
-        }
-        return input
+        MacAppActGate.unwrappingScreenAddress(input)
     }
 
     /// Screen and wait request read authority; act and go request write
@@ -99,6 +79,15 @@ extension SwiftToolDispatcher {
         input: [String: JSONValue],
         surface: String
     ) async throws -> JSONValue {
+        if TaskWaitDeadline.current == nil, ["act", "screen"].contains(tool) {
+            do {
+                return try await TaskWaitDeadline.withDeadline(
+                    seconds: Double(SwiftNativeMacControl.operationTimeoutSeconds(action: tool, body: input))
+                ) { try await self.impl_mac_four_verbs_tool(tool: tool, input: input, surface: surface) }
+            } catch is TaskWaitDeadline.Exceeded {
+                return SwiftNativeMacControl.deadlineResult(action: tool).toJSON()
+            }
+        }
         if MacObservationMode.current != .passive,
            input["__sense_app_observation"] == .bool(true) || SensesHub.passiveObservation {
             return try await MacObservationMode.$current.withValue(.passive) {
@@ -115,7 +104,7 @@ extension SwiftToolDispatcher {
             return .object(["ok": .bool(false), "text": .string(refusal), "effects": .string("none"),
                 "detail": .object(["error": .string("continuation_unavailable")])])
         }
-        let access = await fullMacToolAccess(surface: surface)
+        let access = try await fullMacToolAccess(surface: surface)
         guard access.accessibilityAllowed else {
             if let need = macControlCategoryNeedEnvelope(
                 categories: ["accessibility"], mode: (tool == "screen" || tool == "wait") ? .read : .write,
@@ -238,6 +227,23 @@ extension SwiftToolDispatcher {
                 return MacFourVerbsReply(ok: true, text: seen.text + "\n" + line, detail: detail)
             } ?? seen : seen
         case "act":
+            for key in ["seconds", "interval"] where input[key] != nil && input[key] != .null {
+                guard let value = num(key), value.isFinite else {
+                    throw AutonomyGateError.toolDenied(reason: "act \(key) must be a finite number; nothing was run")
+                }
+            }
+            func gestureString(_ fields: [String: JSONValue], _ key: String) -> String? {
+                guard case .string(let raw)? = fields[key] else { return nil }
+                let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                return value.isEmpty ? nil : value
+            }
+            func mouseButton(_ fields: [String: JSONValue]) throws -> String? {
+                let button = gestureString(fields, "button")
+                if let raw = fields["button"], raw != .null, button == nil {
+                    throw AutonomyGateError.toolDenied(reason: "act button must be the string auto, left or right")
+                }
+                return button
+            }
             func typeMode(_ fields: [String: JSONValue]) throws -> MacTypeMode {
                 guard let raw = fields["mode"], raw != .null, raw != .string("") else { return .replace }
                 guard case .string(let value) = raw, let mode = MacTypeMode(rawValue: value),
@@ -280,45 +286,51 @@ extension SwiftToolDispatcher {
                     return MacActStep(verb: "press", target: name)
                 case .object(let rawStep):
                     let mode = try typeMode(rawStep)
+                    let holding = gestureString(rawStep, "holding")
+                    let button = try mouseButton(rawStep)
                     // "" is absent here too, so it never hides the field beside it.
                     let step = rawStep.filter { $0.value != .string("") && $0.value != .null }
                     // {verb:"key", text:"cmd+s"}: a key's chord may ride in text.
-                    guard case .string(var verb)? = step["verb"] else { break }
-                    // A step's own button:"right" is a right-click, not a silent left one.
-                    if verb == "click", step["button"] == .string("right") { verb = "right_click" }
+                    guard case .string(let verb)? = step["verb"] else { break }
                     let at = try imagePoint(step["at"] ?? step["from"])
                     var image = str("frame_id") ?? str("image")
                     if case .string(let id)? = step["frame_id"] ?? step["image"] { image = id }
+                    var text: String?
+                    if case .string(let value)? = step["text"] ?? step["value"], !value.isEmpty { text = value }
+                    if let rawHandle = step["handle"] {
+                        guard case .string(let handle) = rawHandle, !handle.isEmpty, let frameID = image,
+                              ["frame_id", "image"].allSatisfy({ step[$0] == nil || step[$0] == .string(frameID) }),
+                              MacFourVerbs.selectionVerbs.contains(verb),
+                              ["target", "at", "from", "to", "holding", "button"].allSatisfy({ step[$0] == nil }) else {
+                            throw AutonomyGateError.toolDenied(reason: "A handle step for \"\(verb)\" needs handle and frame_id together and no name, point or gesture options. Allowed verbs: \(MacFourVerbs.selectionVerbs.joined(separator: ", ")); nothing was run")
+                        }
+                        return MacActStep(verb: verb, target: "", text: text, mode: mode, handle: handle, frameID: frameID)
+                    }
                     guard ["frame_id", "image"].allSatisfy({ key in
                         step[key] == nil || at != nil && step[key] == image.map(JSONValue.string)
                     }) else {
                         throw AutonomyGateError.toolDenied(reason: "A screen reference requires a handle or an image point; nothing was run")
                     }
                     if let at {
-                        return MacActStep(verb: verb, target: "", place: MacImagePlace(image: image, at: at, to: try imagePoint(step["to"])))
+                        return MacActStep(verb: verb, target: "", text: text, mode: mode, place: MacImagePlace(image: image, at: at, to: try imagePoint(step["to"])),
+                                          holding: holding, button: button)
                     }
-                    var text: String?
-                    // `value` is the word the screen shows (`Save As text = …`).
-                    if case .string(let value)? = step["text"] ?? step["value"], !value.isEmpty { text = value }
                     // {verb:"type", text:…} with no target types into whatever has focus.
                     if step["target"] == nil, verb == "type", text != nil {
                         guard mode == .replace else {
                             throw AutonomyGateError.toolDenied(reason: "append requires a named text target; nothing was run")
                         }
-                        return MacActStep(verb: verb, target: "", text: text, mode: mode)
+                        return MacActStep(verb: verb, target: "", text: text, mode: mode, holding: holding, button: button)
                     }
-                    // A handle is one press on one frame: the frame changes under a
-                    // batch, so steps go by name and re-resolve on each fresh read.
-                    if step["handle"] != nil {
-                        throw AutonomyGateError.toolDenied(
-                            reason: "a step cannot carry a handle (handles are one act on one frame; the frame changes between steps): name each step as the screen shows it, like \"7\" or \"Clear\"; nothing was run")
+                    if step["target"] == nil, MacFourVerbs.isScrollVerb(verb) {
+                        return MacActStep(verb: verb, target: "", holding: holding, button: button)
                     }
                     guard case .string(let target)? = step["target"]
                             ?? (["key", "press"].contains(verb) ? step["text"] : nil),
                           !target.trimmingCharacters(in: .whitespaces).isEmpty else { break }
                     var to: String?
                     if case .string(let destination)? = step["to"] { to = destination }
-                    return MacActStep(verb: verb, target: target, text: text, mode: mode, to: to)
+                    return MacActStep(verb: verb, target: target, text: text, mode: mode, to: to, holding: holding, button: button)
                 default: break
                 }
                 throw AutonomyGateError.toolDenied(
@@ -333,8 +345,10 @@ extension SwiftToolDispatcher {
             }
             // Empty optional fields are absent; only parsed points or steps consume a reference.
             let absent: [JSONValue?] = [nil, .null, .string("")]
+            let focusType = str("verb") == "type" && str("target") == nil && str("handle") == nil
+                && place == nil && steps.isEmpty && str("text") != nil
             if !absent.contains(input["handle"]) || place == nil && steps.isEmpty
-                && ["frame_id", "image"].contains(where: { !absent.contains(input[$0]) }) {
+                && !focusType && ["frame_id", "image"].contains(where: { !absent.contains(input[$0]) }) {
                 guard let handle = str("handle"), let frame = str("frame_id") ?? str("image"), let verb = str("verb"),
                       ["frame_id", "image"].allSatisfy({ absent.contains(input[$0]) || str($0) == frame }),
                       ["at", "from", "steps", "to", "to_app", "seconds", "repeat", "interval", "holding", "button", "scroll_amount"].allSatisfy({ input[$0] == nil || input[$0] == .null }) else {
@@ -345,19 +359,18 @@ extension SwiftToolDispatcher {
                     mode: try typeMode(input), direction: str("direction"))
                 break
             }
-            let usedReferences = steps.isEmpty ? [place?.image].compactMap { $0 } : steps.compactMap { $0.place?.image }
+            let usedReferences = steps.isEmpty ? [place?.image].compactMap { $0 } : steps.compactMap { $0.place?.image ?? $0.frameID }
             // Name steps re-resolve on fresh reads; a frame_id beside them is the
             // read she acted from, carried along, not a reference left unused.
-            let nameSteps = !steps.isEmpty && steps.allSatisfy { $0.place == nil }
-            guard nameSteps || ["frame_id", "image"].allSatisfy({ key in
+            let nameSteps = !steps.isEmpty && steps.allSatisfy { $0.place == nil && $0.handle == nil }
+            guard nameSteps || focusType || ["frame_id", "image"].allSatisfy({ key in
                 absent.contains(input[key]) || str(key).map { usedReferences.contains($0) } == true
             }) else {
                 throw AutonomyGateError.toolDenied(reason: "A screen reference requires a handle or an image point; nothing was run")
             }
             let pointPlaces = steps.isEmpty ? (place.map { [$0] } ?? []) : steps.compactMap(\.place)
             if pointPlaces.contains(where: { $0.image == nil }), MacImageFrames.frame(nil) == nil {
-                let look = try await impl_mac_four_verbs_tool(tool: "screen", input: ["pixels": .bool(true)], surface: surface)
-                if MacImageFrames.frame(nil) == nil { return look }
+                throw AutonomyGateError.toolDenied(reason: "A point needs an image you have already seen. Read mac.look with pixels:true, then choose the point from that image; nothing was run.")
             }
 
             if !steps.isEmpty {
@@ -367,7 +380,9 @@ extension SwiftToolDispatcher {
             }
             // No target: a type goes into whatever has focus; a key's chord may ride in text.
             let focusTarget: (String) -> String? = { verb in
-                ["key", "press"].contains(verb) ? str("text") : verb == "type" && str("text") != nil ? "" : nil
+                if ["key", "press"].contains(verb) { return str("text") }
+                if verb == "type" && str("text") != nil || MacFourVerbs.isScrollVerb(verb) { return "" }
+                return nil
             }
             guard let verb = str("verb"), let target = place != nil ? "" : str("target") ?? focusTarget(verb) else {
                 throw AutonomyGateError.toolDenied(
@@ -383,9 +398,7 @@ extension SwiftToolDispatcher {
                     throw AutonomyGateError.toolDenied(reason: "scroll direction must be up, down, left or right")
                 }
             }
-            if let button = input["button"], button != .null, str("button") == nil {
-                throw AutonomyGateError.toolDenied(reason: "act button must be the string auto, left or right")
-            }
+            let button = try mouseButton(input)
             let scrollAmount: Int?
             if let amount = input["scroll_amount"], amount != .null {
                 guard let value = num("scroll_amount"), value.isFinite,
@@ -411,8 +424,8 @@ extension SwiftToolDispatcher {
                     return nil
                 },
                 interval: num("interval"),
-                holding: str("holding"),
-                button: str("button"),
+                holding: gestureString(input, "holding"),
+                button: button,
                 scrollAmount: scrollAmount,
                 // Act in that app's window in the back;
                 // `front: true` brings it forward briefly and puts it back.
@@ -421,7 +434,7 @@ extension SwiftToolDispatcher {
                 place: place
             )
         case "go":
-            guard let name = str("name") ?? str("target") else {
+            guard let name = str("name") else {
                 throw AutonomyGateError.toolDenied(
                     reason: "go needs `name` — an app, a file or folder path, or a URL"
                 )
@@ -450,10 +463,21 @@ extension SwiftToolDispatcher {
             await publish(MacScreenPreviewUpdate(image: nil, caption: settled, at: Date()))
         }
         // Acting claims a window; looking only refreshes a window already hers.
-        if let seen = sighted.last, tool == "act"
-            || (tool == "screen" && str("app") != nil
-                && HerScreen.touched(dataRoot: dataRoot, now: Date()).contains { $0.app == HerScreen.clip(seen.app, 40) }) {
-            HerScreen.touch(dataRoot: dataRoot, app: seen.app, kind: seen.kind, readouts: seen.readouts, before: seen.before)
+        do {
+            if let seen = sighted.last {
+                let lookedInOwnedWindow: Bool
+                if tool == "screen", str("app") != nil {
+                    lookedInOwnedWindow = try HerScreen.touched(dataRoot: dataRoot, now: Date()).contains { $0.app == HerScreen.clip(seen.app, 40) }
+                } else { lookedInOwnedWindow = false }
+                if tool == "act" || lookedInOwnedWindow {
+                    try HerScreen.touch(dataRoot: dataRoot, app: seen.app, kind: seen.kind, readouts: seen.readouts, before: seen.before)
+                }
+            }
+        } catch {
+            let owner = dataRoot.appendingPathComponent("her_screen/touched.json")
+            RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "mac.recorded_windows", owner: owner.path,
+                words: "The Mac operation returned, but its recorded-window update failed: \(error.localizedDescription). Do not repeat the operation to repair bookkeeping.",
+                tap: ToolFailureError.fileRepairInstruction(owner, shape: "Preserve the Touched array and restore read/write access."))
         }
         var payload: [String: JSONValue] = [
             "ok": .bool(reply.ok),
@@ -491,7 +515,7 @@ extension SwiftToolDispatcher {
         input: [String: JSONValue],
         surface: String
     ) async throws -> JSONValue {
-        let access = await fullMacToolAccess(surface: surface)
+        let access = try await fullMacToolAccess(surface: surface)
         guard access.accessibilityAllowed else {
             if let need = macControlCategoryNeedEnvelope(
                 categories: ["accessibility"], mode: Self.screenControlReadToolNames.contains(tool) ? .read : .write,
@@ -547,7 +571,7 @@ extension SwiftToolDispatcher {
             let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         }()
-        let access = await fullMacToolAccess(surface: surface)
+        let access = try await fullMacToolAccess(surface: surface)
         guard access.accessibilityAllowed, namedPath == nil || access.fileOpsAllowed else {
             if let need = macControlCategoryNeedEnvelope(
                 categories: ["accessibility"] + (namedPath == nil ? [] : ["file_ops"]), mode: .read,

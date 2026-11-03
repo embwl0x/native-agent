@@ -20,9 +20,7 @@ actor NeedsUserEdgeNotifier {
 
     private struct State: Codable {
         var seeded: Bool
-        // Missing in the old count-based format: existing incomplete state
-        // needs repair; only an absent store may seed a baseline.
-        var requests: [String: Wait]?
+        var requests: [String: Wait]
     }
 
     private let dataRoot: URL
@@ -60,27 +58,27 @@ actor NeedsUserEdgeNotifier {
         func fingerprint(_ item: DeskItem) -> String {
             Self.stableDigest(item.handle + "\n" + item.title + "\n" + (item.blockedReason ?? item.summary ?? ""))
         }
-        guard state.seeded, state.requests != nil else {
+        guard state.seeded else {
             persist(State(seeded: true, requests: Dictionary(items.map {
                 ($0.handle, Wait(fingerprint: fingerprint($0), episodeID: UUID().uuidString))
             }, uniquingKeysWith: { first, _ in first })))
             return
         }
         let handles = Set(items.map(\.handle))
-        let retained = state.requests?.filter { handles.contains($0.key) }
-        if retained?.count != state.requests?.count {
+        let retained = state.requests.filter { handles.contains($0.key) }
+        if retained.count != state.requests.count {
             state.requests = retained
             guard persist(state) else { return }
         }
         for item in items {
             let digest = fingerprint(item)
             var current = try load()
-            let previous = current.requests?[item.handle]
+            let previous = current.requests[item.handle]
             guard previous?.fingerprint != digest else { continue }
             let episode = previous?.episodeID ?? UUID().uuidString
             // Reserve the identity before sending; an empty fingerprint keeps
             // failed delivery eligible on the next pass with the same key.
-            current.requests?[item.handle] = Wait(fingerprint: previous?.fingerprint ?? "", episodeID: episode)
+            current.requests[item.handle] = Wait(fingerprint: previous?.fingerprint ?? "", episodeID: episode)
             guard persist(current) else { return }
             let reason = (item.blockedReason ?? item.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let body = reason.isEmpty ? item.title : "\(item.title) — \(reason)"
@@ -92,8 +90,8 @@ actor NeedsUserEdgeNotifier {
                      "dedupKey": "needs_user+\(episode)+\(digest)"]
                 )
                 current = try load()
-                guard current.requests?[item.handle]?.episodeID == episode else { continue }
-                current.requests?[item.handle] = Wait(fingerprint: digest, episodeID: episode)
+                guard current.requests[item.handle]?.episodeID == episode else { continue }
+                current.requests[item.handle] = Wait(fingerprint: digest, episodeID: episode)
                 guard persist(current) else { return }
             } catch {
                 nativeLog("needs_user_notify: push failed, will retry: \(error.localizedDescription)")
@@ -106,10 +104,10 @@ actor NeedsUserEdgeNotifier {
         let data: Data
         do { data = try Data(contentsOf: stateURL) }
         catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return State(seeded: false, requests: nil)
+            return State(seeded: false, requests: [:])
         }
         let state = try JSONDecoder().decode(State.self, from: data)
-        guard state.seeded, state.requests != nil else { throw CocoaError(.fileReadCorruptFile) }
+        guard state.seeded else { throw CocoaError(.fileReadCorruptFile) }
         cached = state
         return state
     }

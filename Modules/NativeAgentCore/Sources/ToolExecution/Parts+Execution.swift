@@ -9,7 +9,7 @@ import TrustCenter
 import ToolRegistry
 import CryptoKit
 import PersonaEngine
-// Blueprint: | `Parts+Execution.swift` | Parts pinned typed calls and pure faces, held runs and settlement; exact admission and dependency checks on every run |
+// Blueprint: | `Parts+Execution.swift` | Parts pinned typed calls and pure faces, held runs and settlement; exact admission and own-call fit checks on every run, with invocation-bound observed contracts settled into accounting |
 
 extension Parts {
     static func revisionFailure(_ code: String, _ detail: String, id: String, version: String? = nil) -> SenseFailure {
@@ -39,12 +39,32 @@ extension Parts {
     /// Called by source owners, never by a view's render. Faces have no host effects or notebook access; all their sources arrive in frozen
     /// input.
     public func face(id: String, input: JSONValue, version: String) async -> PartCallResult<PartFace> {
-        let result: PartCallResult<JSONValue> = await callValue(id: id, input: input, projection: true, pinned: version)
+        let result: PartCallResult<JSONValue> = await callValue(id: id, input: Self.maskedForFace(input), projection: true, pinned: version)
         switch result {
         case .failure(let error): return .failure(error)
         case .success(let value):
             do { return .success(try PartFace.decode(value)) }
             catch { return .failure(.init(code: "bad_face", message: error.localizedDescription)) }
+        }
+    }
+
+    /// A page draws what the app itself shows. A credential-shaped value in it
+    /// is masked exactly as the input guard below would flag it, so it never
+    /// enters the part and one note never takes the whole page down (10-31:
+    /// Today refused to draw over input.notes[4].job). Her own part calls
+    /// still refuse credentials outright.
+    static func maskedForFace(_ value: JSONValue) -> JSONValue {
+        switch value {
+        case .string(let text):
+            let redacted = NativeAgentSecretRedactor.redactText(text)
+            return .string(NativeAgentSecretRedactor.containsAuditSecret(redacted) ? "[REDACTED]" : redacted)
+        case .array(let list): return .array(list.map(maskedForFace))
+        case .object(let fields):
+            return .object(Dictionary(uniqueKeysWithValues: fields.map { key, field in
+                (key, NativeAgentSecretRedactor.isSecretName(key, use: .scriptInput) && field != .null
+                    ? JSONValue.string("[REDACTED]") : maskedForFace(field))
+            }))
+        default: return value
         }
     }
 
@@ -162,7 +182,12 @@ extension Parts {
             guard carrying || runs > 1 else { return receipt }
             if case .array(let rows)? = result["calls"] {
                 calls += rows.map { var row = Self.fields($0); row["run"] = .int(runs); return .object(row) }
-                ledgerBytes += (try? JSONValue.array(rows).serializedData(pretty: false).count) ?? 0
+                do { ledgerBytes += try JSONValue.array(rows).serializedData(pretty: false).count }
+                catch {
+                    throw ToolFailureError("Ability \(id)'s completed run returned a call ledger that could not be encoded: \(error.localizedDescription). The run already happened; no continuation was started. Inspect its reached actions before repeating the ability.",
+                        effects: .unknown, owner: "authored.\(id)", code: "call_ledger_encoding_failed",
+                        instruction: "Inspect the completed run and its reached actions before repeating any change; repair the value that the ledger could not encode.", recovery: .reconcile)
+                }
             }
             if case .array(let rows)? = result["changed"] {
                 changed += rows.map { if case .string(let call) = $0 { .string("run \(runs) " + call) } else { $0 } }
@@ -174,6 +199,9 @@ extension Parts {
                 result["calls"] = .array(calls)
                 result["changed"] = changed.isEmpty ? nil : .array(changed)
                 result["effects"] = .string(["unknown", "partial", "occurred"].first(where: effects.contains) ?? effects.last ?? "unknown")
+                // A later run's pre-entry refusal cannot say the whole ability
+                // never ran: an earlier completed run carried it this far.
+                result["execution"] = .string(result["status"] == .string("ok") ? "executed" : "attempted")
             }
             result["runs"] = .int(runs)
             guard carrying else { return .object(result) }
@@ -210,12 +238,9 @@ extension Parts {
         let candidate: OwnedProgramStore.Candidate
         do { candidate = try store.load(id: id, digest: digest) }
         catch { throw Self.revisionFailure("integrity", "Ability \(id) version \(digest) is unreadable: \(error.localizedDescription)", id: id, version: digest) }
-        if let why = OwnedProgram.asyncRefusal(candidate.program.source) {
-            throw SenseFailure(code: "async_code", message: why + " ability.save it so. Nothing ran.")
-        }
         let revision = try catalogRevision + host.dependencyRevision(candidate.program.dependencies)
         try await checkAdmission(candidate, row: row)
-        try checkDependencies(candidate)
+        let dependencySnapshot = try checkDependencies(candidate)
         let binding = OwnedProgramRunner.Binding(revision: revision)
         // A wake's run is given none of its input, so its params never refuse it.
         if !projection, OwnedProgramRunner.wake == nil, let problem = input.schemaProblem(schema: candidate.program.schema) {
@@ -241,9 +266,9 @@ extension Parts {
         let dataRoot = root
         let broker = program.isResident && !preview
             ? try await OwnedProgramRunner.holding(program, dataRoot: dataRoot,
-                make: { ToolPrimitiveBroker(permissions: Set(program.permissions), abilityID: id, held: AbilityStore(dataRoot: dataRoot)) },
+                make: { ToolPrimitiveBroker(permissions: Set(program.permissions), abilityID: id, dataRoot: dataRoot, held: AbilityStore(dataRoot: dataRoot)) },
                 end: { _ = await $0.close() })
-            : ToolPrimitiveBroker(permissions: Set(program.permissions), abilityID: id)
+            : ToolPrimitiveBroker(permissions: Set(program.permissions), abilityID: id, dataRoot: dataRoot)
         let profile = ToolHost(base: host, candidate: candidate, broker: broker, dataRoot: root, projection: projection, preview: preview,
             admission: {
                 try await binding.check(self.abilities.revision() + host.dependencyRevision(candidate.program.dependencies)) {
@@ -251,7 +276,9 @@ extension Parts {
                 }
             })
         await broker.begin()
-        var result = Self.fields(await OwnedProgramRunner(dataRoot: root).run(program, input: input, preview: preview, replay: replay, host: profile))
+        var result = Self.fields(await OwnedProgramInvocation.$dependencySnapshot.withValue(projection ? nil : (id: id, version: digest, shapes: dependencySnapshot)) {
+            await OwnedProgramRunner(dataRoot: root).run(program, input: input, preview: preview, replay: replay, host: profile)
+        })
         // A watch leaves one receipt for all its frames, however it ended.
         let watched = await settle { await broker.finish() }
         if !watched.isEmpty { result["watch"] = watched.count == 1 ? watched[0] : .array(watched) }
@@ -305,7 +332,7 @@ extension Parts {
     func dependencyShapes(_ actions: [String]) throws -> JSONValue {
         var shapes: [String: JSONValue] = [:]
         for action in actions {
-            guard let shape = OwnedProgramInvocation.host?.dependencyShape(action) else {
+            guard let shape = try OwnedProgramInvocation.host?.dependencyShape(action) else {
                 throw ToolFailureError("Dependency \(action) is unavailable in this app door.", argumentPath: "actions", accepted: "current app action ids", effects: .none,
                     nextCall: ToolFailureError.call("app", ["find": .string(action)]), code: "unknown_dependency", status: .refused,
                     instruction: "Find the current action, then correct this ability's call or actions declaration with ability.save.", recovery: .correctArguments)
@@ -315,25 +342,31 @@ extension Parts {
         return .object(shapes)
     }
 
-    func checkDependencies(_ candidate: OwnedProgramStore.Candidate) throws {
+    @discardableResult
+    public func checkDependencies(_ candidate: OwnedProgramStore.Candidate) throws -> JSONValue {
         if let action = Self.string(Self.fields(Self.fields(candidate.manifest)["face"] ?? .null), "action"),
-           let owner = OwnedProgramInvocation.host?.action(action), owner.partID != candidate.id {
+           let owner = try OwnedProgramInvocation.host?.action(action), owner.partID != candidate.id {
             throw Self.revisionFailure("face_action_collision", "Ability \(candidate.id) cannot own face.action \(action); it belongs to \(owner.partID ?? "the app"). Remove it or choose an unused action id.", id: candidate.id, version: candidate.digest)
         }
         // No door in this turn is not a changed dependency: say which it is.
         guard let host = OwnedProgramInvocation.host else {
             throw SenseFailure(code: "door_unavailable", message: "This run has no gated app door, so its app-action dependencies could not be checked. Use the app door of a conversation or wake run.")
         }
-        for action in candidate.program.dependencies where !host.dependencyMatches(action, Self.fields(candidate.dependencyShapes)[action]) {
-            let before = Self.fields(candidate.dependencyShapes)[action] ?? .null
-            let after = host.dependencyShape(action) ?? .null
-            let fields = JSONValue.differences(before, after).map { $0.isEmpty ? "contract" : $0 }.joined(separator: ", ")
-            let file = try AbilityStore.File(id: candidate.id, kind: .part, metadata: ["record": candidate.manifest],
-                body: candidate.program.source, pathExtension: "js")
-            throw ToolFailureError("Dependency \(action) changed at \(fields). Saved: \(try before.serialize(pretty: false)); current: \(try after.serialize(pretty: false)). Revise \(candidate.id) version \(candidate.digest) with ability.save against this contract, keep it, then repeat the failed operation.",
-                effects: .none, owner: "ability \(candidate.id) version \(candidate.digest) > candidate.dependencyShapes.\(action) > \(fields)",
+        let calls = OwnedProgram.calls(candidate.program.source)
+        let primitives = ToolPrimitiveBroker.operations.union(["apps.call", "part.call"])
+        for call in calls.literal where !(call.primitive && primitives.contains(call.spelling)) {
+            // No current evidence is unavailability, not evidence of removal or
+            // an incompatible schema. The actual call still owns its remedy.
+            guard let given = call.given, let problem = try host.callProblem(call.id, given: given,
+                schema: call.id == "authored." + candidate.id ? candidate.program.schema : nil) else { continue }
+            let file = try AbilityStore.File(id: candidate.id, kind: .part, metadata: ["record": candidate.manifest], body: candidate.program.source, pathExtension: "js")
+            throw ToolFailureError("Call \(call.id) at line \(call.line): \(problem). Revise \(candidate.id) with ability.save, keep the reviewed version, then repeat the failed operation.",
+                effects: .none, owner: "ability \(candidate.id) version \(candidate.digest) > line \(call.line) > \(problem)",
                 nextCall: try abilities.repairCall(file), code: "stale_dependency", status: .refused,
-                instruction: "Revise this ability against the reported current dependency contract, then keep the reviewed version. Do not replay observed effects.")
+                instruction: "Correct the named call and field against the live schema, then keep the reviewed version. Do not replay observed effects.")
         }
+        var shapes: [String: JSONValue] = [:]
+        for action in candidate.program.dependencies { shapes[action] = try host.dependencyShape(action) ?? .null }
+        return .object(shapes)
     }
 }

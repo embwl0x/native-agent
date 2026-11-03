@@ -6,7 +6,7 @@ import PersistenceCore
 import TurnTrace
 import Transcripts
 import ProviderRouting
-// Blueprint: | `ChatSessionAutocompactor.swift` | Aging at 85% folds oldest raw history toward 55% of the effective threshold, retaining earlier blocks and live cards; rare dream-safe rollups above 10% of the effective window; ContactThread owns verified-backup replacements and original-history bytes; config owns `effectiveWindowTokens` and `contextWindowReadout` |
+// Blueprint: | `ChatSessionAutocompactor.swift` | Shared actual-request-builder measurement; configured Compact at trigger and proportional aging/verified target; raw folds select visible dream-safe source before needed recollection rollups; ContactThread owns verified-backup replacement; config owns detected/Custom windows |
 public struct ChatSessionAutocompactor: Sendable {
     static let maximumCompactBackups = 5
     /// Only a needed compaction pass may roll up earlier blocks. The floor
@@ -16,13 +16,18 @@ public struct ChatSessionAutocompactor: Sendable {
     let dataRoot: URL
     let config: ChatSessionAutocompactionConfig
     let now: @Sendable () -> Date
+    /// Live turns supply their composed builder. Between turns, measurement
+    /// owns saved-plan replay or the explicitly labelled history estimate.
+    let requestBuilder: SessionContextRequest.Builder?
     public init(
         dataRoot: URL,
         config: ChatSessionAutocompactionConfig = .productionDefault(),
+        requestBuilder: SessionContextRequest.Builder? = nil,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.dataRoot = dataRoot
         self.config = config
+        self.requestBuilder = requestBuilder
         self.now = now
     }
     public func compactIfNeeded(
@@ -33,12 +38,13 @@ public struct ChatSessionAutocompactor: Sendable {
         providerID: String? = nil,
         trigger: String = "auto_threshold",
         force: Bool = false,
-        pendingOnly: Bool = false
+        pendingOnly: Bool = false,
+        towardTarget: Bool = false
     ) async throws -> ChatSessionCompactionOutcome {
         let pass: Pass
-        switch begin(
+        switch try await begin(
             rawSessionId: rawSessionId, model: model, providerID: providerID, trigger: trigger,
-            thresholdTokensOverride: nil, force: force
+            thresholdTokensOverride: towardTarget ? try await targetTokens(model: model, providerID: providerID) + 1 : nil, force: force
         ) {
         case .skip(let outcome): return outcome
         case .pass(let begun): pass = begun
@@ -51,12 +57,11 @@ public struct ChatSessionAutocompactor: Sendable {
                 )?.carrying(transcript)
             if let pending { return pending }
             if pendingOnly {
-                return skipped(sessionId: pass.sessionId, reason: "recollections ready", trigger: trigger).carrying(transcript)
+                return skipped(sessionId: pass.sessionId, reason: "recollections ready", trigger: trigger,
+                    thresholdTokens: pass.thresholdTokens, messagesBefore: rows.count, messagesAfter: rows.count,
+                    sourceBytesBefore: Int64(transcript.count)).carrying(transcript)
             }
-            if let below = belowFileThreshold(pass, trigger: trigger, force: force) {
-                return below.carrying(transcript)
-            }
-            switch try select(pass, rows: rows, trigger: trigger, force: force) {
+            switch try await select(pass, rows: rows, trigger: trigger, force: force) {
             case .skip(let outcome):
                 return outcome.carrying(transcript)
             case .fold(let fold):
@@ -76,12 +81,17 @@ public struct ChatSessionAutocompactor: Sendable {
     public struct AgingFold: Sendable {
         public let sessionId: String
         let thresholdTokens: Int
+        /// The exact admitted room used when this immutable fold was selected.
+        let windowTokens: Int
         /// Exactly what this block folds: ordinary passes exclude all earlier
         /// blocks and retained cards/results. Replacement verifies the whole prefix.
         public let source: [JSONValue]
         let replaced: [JSONValue]
-        let preservedCount: Int
+        let preservedRows: Set<JSONValue>
         let rollsUpRecollections: Bool
+        let model: String
+        let providerID: String?
+        let measuredTokensBefore: Int
     }
     public enum AgingStart: Sendable {
         /// Below the boundary, or nothing worth folding.
@@ -97,12 +107,13 @@ public struct ChatSessionAutocompactor: Sendable {
         model: String,
         providerID: String?,
         trigger: String,
-        thresholdTokens: Int
+        thresholdTokens: Int,
+        towardTarget: Bool = false
     ) async throws -> AgingStart {
         let pass: Pass
-        switch begin(
+        switch try await begin(
             rawSessionId: rawSessionId, model: model, providerID: providerID, trigger: trigger,
-            thresholdTokensOverride: thresholdTokens, force: false
+            thresholdTokensOverride: towardTarget ? try await targetTokens(model: model, providerID: providerID) + 1 : thresholdTokens, force: false
         ) {
         case .skip(let outcome): return .nothing(outcome)
         case .pass(let begun): pass = begun
@@ -115,20 +126,21 @@ public struct ChatSessionAutocompactor: Sendable {
             ) {
                 return .pending(pending)
             }
-            if let below = belowFileThreshold(pass, trigger: trigger, force: false) {
-                return .nothing(below)
-            }
-            switch try select(pass, rows: rows, trigger: trigger, force: false) {
+            switch try await select(pass, rows: rows, trigger: trigger, force: false) {
             case .skip(let outcome):
                 return .nothing(outcome)
             case .fold(let fold):
                 return .fold(AgingFold(
                     sessionId: pass.sessionId,
                     thresholdTokens: pass.thresholdTokens,
+                    windowTokens: pass.windowTokens,
                     source: fold.removableRows,
                     replaced: fold.replaced,
-                    preservedCount: fold.preservedCount,
-                    rollsUpRecollections: fold.rollsUpRecollections
+                    preservedRows: fold.preservedRows,
+                    rollsUpRecollections: fold.rollsUpRecollections,
+                    model: model, providerID: providerID,
+                    measuredTokensBefore: try await SessionContextMeasurement.read(rows: rows, sessionId: pass.sessionId,
+                        model: model, providerID: providerID, dataRoot: dataRoot, windowTokens: pass.windowTokens, requestBuilder: requestBuilder).tokens
                 ))
             }
         }
@@ -162,10 +174,10 @@ public struct ChatSessionAutocompactor: Sendable {
         let pass = Pass(
             sessionId: fold.sessionId,
             messagesPath: path,
-            sourceBytesBefore: Self.fileSize(path),
+            sourceBytesBefore: try Self.fileSize(path),
             thresholdTokens: fold.thresholdTokens,
-            windowTokens: config.effectiveThresholdTokens(forModel: model, dataRoot: dataRoot),
-            divisor: ContextBudgetPolicy.transcriptCharactersPerToken
+            windowTokens: fold.windowTokens,
+            model: fold.model, providerID: fold.providerID
         )
         return try await SwiftNativePersistenceCore.withFileLock(path) {
             let (rows, transcript) = try await readJSONLHonest(path)
@@ -181,7 +193,7 @@ public struct ChatSessionAutocompactor: Sendable {
                 )
             }
             return try await replace(
-                Fold(rows: rows, replaceCount: fold.replaced.count, preserving: fold.preservedCount,
+                Fold(rows: rows, replaceCount: fold.replaced.count, preserving: fold.preservedRows,
                      rollsUpRecollections: fold.rollsUpRecollections), in: pass, rows: rows, sourceBytes: transcript,
                 trigger: trigger, model: model, surface: surface, runId: runId,
                 recollection: (recollection, distillModel)
@@ -205,18 +217,51 @@ public struct ChatSessionAutocompactor: Sendable {
         let sourceBytesBefore: Int64
         let thresholdTokens: Int
         let windowTokens: Int
-        let divisor: Double
+        let model: String
+        let providerID: String?
     }
-    /// The file-size prefilter: well under the boundary, nothing to measure.
-    private func belowFileThreshold(_ pass: Pass, trigger: String, force: Bool) -> ChatSessionCompactionOutcome? {
-        guard !force, Double(pass.sourceBytesBefore) < Double(pass.thresholdTokens) * pass.divisor else { return nil }
-        return skipped(
-            sessionId: pass.sessionId,
-            reason: "below threshold by file size",
-            trigger: trigger,
-            thresholdTokens: pass.thresholdTokens,
-            sourceBytesBefore: pass.sourceBytesBefore
-        )
+    public func targetTokens(model: String, providerID: String?) async throws -> Int {
+        if let failure = config.configurationFailure { throw ProviderRoutingError.configurationFailed(failure) }
+        guard let window = config.effectiveWindowTokens(forModel: model, providerID: providerID, dataRoot: dataRoot) else {
+            throw ProviderRoutingError.configurationFailed("The selected model's context window is unavailable.")
+        }
+        let output = try await SessionContextMeasurement.outputAllowance(model: model, providerID: providerID, dataRoot: dataRoot)
+        return config.targetTokens(in: window, outputTokens: output)
+    }
+
+    /// The finished fold is judged by its actual rendered size. The ask in the
+    /// distiller is not an output guarantee; no-progress is an owned failure,
+    /// never another unbounded series of rewrites.
+    public func targetReached(sessionId: String, model: String, providerID: String?,
+                              previousTokens: Int? = nil) async throws -> Bool {
+        let target = try await targetTokens(model: model, providerID: providerID)
+        guard let window = config.effectiveWindowTokens(forModel: model, providerID: providerID, dataRoot: dataRoot) else {
+            throw ProviderRoutingError.configurationFailed("The selected model's context window is unavailable.")
+        }
+        let measurement = try await SessionContextMeasurement.read(sessionId: sessionId, model: model,
+            providerID: providerID, dataRoot: dataRoot, windowTokens: window, requestBuilder: requestBuilder)
+        guard measurement.messageCount > 0 else {
+            throw ProviderRoutingError.configurationFailed("The transcript is missing or empty after compaction; its target cannot be verified. Restore its retained source before compacting again.")
+        }
+        guard requestBuilder != nil || measurement.hasReceipt else {
+            // A manual fold with no request measured on this route yet: the fold stands and the
+            // next turn measures it (and folds again if it is still over the trigger).
+            await emitContextSizeTrace(kind: "context.compact.target", sessionId: sessionId,
+                payload: ["targetTokens": .int(Int64(target)), "windowTokens": .int(Int64(window)),
+                    "status": .string("measured_next_turn")])
+            return true
+        }
+        let reached = measurement.tokens <= target
+        let stalled = !reached && previousTokens.map { measurement.tokens >= $0 } == true
+        await emitContextSizeTrace(kind: "context.compact.target", sessionId: sessionId,
+            payload: ["inputTokens": .int(Int64(measurement.tokens)), "targetTokens": .int(Int64(target)),
+                "source": .string(measurement.source), "windowTokens": .int(Int64(window)),
+                "requestCharacters": .int(Int64(measurement.requestCharacters)),
+                "status": .string(reached ? "reached" : (stalled ? "no_progress" : "continuing"))])
+        if stalled {
+            throw ProviderRoutingError.configurationFailed("Compaction did not reduce the measured request toward its \(target)-token target (\(measurement.tokens) tokens remain). The recollection is retained; repair the fold before compacting again.")
+        }
+        return reached
     }
     enum Begin {
         case skip(ChatSessionCompactionOutcome)

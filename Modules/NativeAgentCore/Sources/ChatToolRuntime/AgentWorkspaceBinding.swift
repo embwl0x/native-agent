@@ -10,7 +10,7 @@ import Senses
 import ToolExecution
 import NativeAgentShared
 import AuthoredCapabilities
-// Blueprint: | `AgentWorkspaceBinding.swift` | `ChatWorkspaceBinding` enum; `pending`, `glance`; workspace tool port derives bounded built/recent ability names from canonical tool, skill and sense availability |
+// Blueprint: | `AgentWorkspaceBinding.swift` | `ChatWorkspaceBinding` enum; `pending`, `glance`, read-only elsewhere gathering and late disclosure/consumption bind owner ports; workspace tool port derives bounded built/recent ability names from canonical tool, skill and sense availability |
 
 package enum ChatWorkspaceBinding {
     package static let ports = AgentWorkspacePorts.Binding(conversations: Conversations(), tools: Tools())
@@ -30,15 +30,29 @@ package enum ChatWorkspaceBinding {
         await AgentWorkspaceNavigation.shared.currentPlace(dataRoot: dataRoot, scope: scope)
     }
 
-    package static func glance(dataRoot: URL, scope: String, turn: Date?, message: String) async -> String? {
+    package static func glance(dataRoot: URL, scope: String, turn: Date?, message: String) async -> PreparedWorkspaceGlance {
         await AgentWorkspacePorts.$binding.withValue(ports) {
             await HerScreen.glance(dataRoot: dataRoot, scope: scope, turn: turn, message: message)
         }
     }
 
+    package static func readElsewhere(dataRoot: URL, scope: String, turn: Date) -> HerScreen.ElsewhereReading? {
+        AgentWorkspacePorts.$binding.withValue(ports) {
+            HerScreen.readElsewhere(dataRoot: dataRoot, scope: scope, turn: turn)
+        }
+    }
+
+    package static func elsewhere(dataRoot: URL, scope: String, surface: String, peer: Bool, turn: Date?,
+                                  reading: HerScreen.ElsewhereReading?) async -> String? {
+        await AgentWorkspacePorts.$binding.withValue(ports) {
+            await HerScreen.elsewhere(dataRoot: dataRoot, scope: scope, surface: surface, peer: peer,
+                                      turn: turn, reading: reading)
+        }
+    }
+
     private struct Conversations: AgentWorkspaceConversationPort {
-        func liveHealth(dataRoot: URL) -> [String: AgentLocalHealth] {
-            AgentContactHealth.read(dataRoot: dataRoot)
+        func liveHealth(dataRoot: URL) throws -> [String: AgentLocalHealth] {
+            try AgentContactHealth.read(dataRoot: dataRoot)
         }
         func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord] {
             let store = AgentConversationStore(dataRoot: dataRoot)
@@ -52,9 +66,9 @@ package enum ChatWorkspaceBinding {
                 .init(id: $0.id, name: $0.name, elevationAllowed: $0.elevationAllowed, canAnswerBack: $0.canAnswerBack)
             }
         }
-        func identity(dataRoot: URL) -> AgentContactIdentity { AgentContactIdentity(dataRoot: dataRoot) }
-        func answeredRequests(dataRoot: URL) -> [(message: String?, run: String?, chat: String?, modified: Date)] {
-            GrokRequestStore(dataRoot: dataRoot).answeredRequests()
+        func identity(dataRoot: URL) throws -> AgentContactIdentity { try AgentContactIdentity(dataRoot: dataRoot) }
+        func answeredRequests(dataRoot: URL) throws -> [(message: String?, run: String?, chat: String?, modified: Date)] {
+            try GrokRequestStore(dataRoot: dataRoot).answeredRequests()
         }
         func openHuman(sessionID: String, limit: Int?, dataRoot: URL) async throws -> JSONValue {
             // The read consumed each message it shows under its own row's stamp.
@@ -65,12 +79,17 @@ package enum ChatWorkspaceBinding {
         }
         func liveHandOff(_ row: AgentConversationRecord) -> Bool { AgentConversationSession.liveHandOff(row) }
         func unsettledAttention(_ row: AgentConversationRecord) -> Bool { AgentConversationSession.unsettledAttention(row) }
-        func shown(answers: [String: String], peer: String, scope: String, dataRoot: URL) {
+        func shown(answers: [String: String], peer: String, scope: String, dataRoot: URL) throws {
             guard peer.hasPrefix("peer:") else { return }
             let store = GrokRequestStore(dataRoot: dataRoot), id = String(peer.dropFirst(5))
+            guard let contact = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == id }) else {
+                throw AgentConversationStore.Failure(message: "Contact \(peer) is unavailable; reopen its room from the current contacts.")
+            }
+            guard contact.transport == .grokBot else { return }
             // Its hand-over goes to the chat that asked; seen in another, it still goes.
-            for (answer, words) in answers where (try? store.read(answer, peer: id))?.conversationID == scope {
-                store.shown(answer, peer: id, by: "the room") { $0 == words }
+            for (answer, words) in answers {
+                guard try store.read(answer, peer: id).conversationID == scope else { continue }
+                try store.shown(answer, peer: id, by: "the room") { $0 == words }
             }
         }
     }
@@ -90,7 +109,7 @@ package enum ChatWorkspaceBinding {
             do {
                 async let senses = FileSenseRegistry(dataRoot: dataRoot).all()
                 let tools = try await SwiftNativeToolRegistry(root: dataRoot).listTools()
-                let callable = Set(SwiftToolDispatcher.authoredTools(records: tools).map { $0.schema.name })
+                let callable = Set(try SwiftToolDispatcher.authoredTools(records: tools).map { $0.schema.name })
                 let since = now.addingTimeInterval(-7 * 86_400)
                 var names: [(name: String, changed: Date, builtIn: Bool)] = []
                 for part in tools where callable.contains(part.id) {
@@ -127,9 +146,9 @@ package enum ChatWorkspaceBinding {
             }
         }
 
-        func usableAgentLanes(dataRoot: URL) -> Set<String> {
-            Set(["codex", "claude", "omp"].filter {
-                SwiftToolDispatcher.builtInAgentLaneUsable($0, dataRoot: dataRoot,
+        func usableAgentLanes(dataRoot: URL) throws -> Set<String> {
+            try Set(["codex", "claude", "omp"].filter {
+                try SwiftToolDispatcher.builtInAgentLaneUsable($0, dataRoot: dataRoot,
                     configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot))
             })
         }

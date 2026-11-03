@@ -8,7 +8,7 @@ import NativeAgentCore
 import PersistenceCore
 import Synchronization
 import NativeAgentShared
-// Blueprint: | `MemoryV2+SharedInstance.swift` | `SwiftNativeMemoryV2` directly owns canonical `MemoryStorage`; attachment readiness, engine-closed projection hooks and unavailable-storage admission; late canonical attachment never reopens stopped projections |
+// Blueprint: | `MemoryV2+SharedInstance.swift` | `SwiftNativeMemoryV2` directly owns canonical `MemoryStorage`; attachment readiness, engine-closed projection hooks and unavailable-storage admission; late canonical attachment never reopens stopped projections; preview reads refuse an unattached store rather than initializing it |
 
 // MARK: - SwiftNativeMemoryV2.shared
 
@@ -112,7 +112,7 @@ extension SwiftNativeMemoryV2 {
         let sqlitePath = underlying.path
         let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
         return try await indexer.rebuildMemoryDerivedGraphFromCanonicalStore(
-            producing: MemoryPolicyGate.knowledgeGraphEnabled(
+            producing: try MemoryPolicyGate.knowledgeGraphEnabled(
                 dataRoot: sqlitePath.deletingLastPathComponent().deletingLastPathComponent()
             )
         )
@@ -141,8 +141,7 @@ extension SwiftNativeMemoryV2 {
     /// `ManagedEmbeddingProvider` which loads CoreML bge-large-en-v1.5
     /// from the data root or Resources/embedding; if the model fails to load it
     /// **fails closed** (embed() throws) unless the user explicitly opted
-    /// into mock vectors via config (`config/embeddings.json::backend = "mock"`)
-    /// or the developer-test env var `NATIVE_AGENT_EMBEDDING_MOCK=1`.
+    /// into mock vectors via config (`config/embeddings.json::backend = "mock"`).
     /// Also installs a Spotlight indexing hook on the underlying
     /// MemoryStorage so insert/update/delete/acceptProposal all reflect into
     /// the system index.
@@ -151,6 +150,9 @@ extension SwiftNativeMemoryV2 {
     /// Retry attachment on the same actor and canonical path. Failed opens never
     /// install substitute storage; the next read or Doctor repair can retry.
     internal func ensureCanonicalAttachment() async throws {
+        // Reading for a mind preview cannot initialize storage, migrations or
+        // projection hooks. An already attached owner remains the one reader.
+        if LLMCallContext.preview, storage == nil { throw MemoryV2Error.storageUnavailable }
         if let ready = canonicalAttachmentReady {
             await ready.value
             return
@@ -213,7 +215,7 @@ extension SwiftNativeMemoryV2 {
                     if deleted {
                         try await indexer.remove(id: stored.id)
                     } else {
-                        try await indexer.indexRecord(id: stored.id, text: stored.content, kind: stored.status)
+                        try await indexer.indexRecord(id: stored.id, text: stored.content, kind: stored.status, validTo: stored.validTo)
                     }
                 } catch {
                     await SwiftNativeMemoryIndexer.recordProjectionFailure(
@@ -225,8 +227,8 @@ extension SwiftNativeMemoryV2 {
                 await storage.attachKnowledgeGraphHook { id in
                     // Read production policy per mutation; off retires the
                     // memory-derived graph, including rewritten or forgotten facts.
-                    let producing = MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot)
                     do {
+                        let producing = try MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot)
                         try await kgIndexer.reconcileProjectionIfNeeded(producing: producing)
                         graphProjectionFailureSlot.withLock { $0 = nil }
                         try await kgIndexer.indexMemory(id, producing: producing)
@@ -240,15 +242,15 @@ extension SwiftNativeMemoryV2 {
             await storage.enqueueKnowledgeGraphProjection {
                 // Settings ▸ "Knowledge graph": the startup backfill is graph
                 // production too — off means it does not run.
-                if MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) {
-                    do {
+                do {
+                    if try MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) {
                         try await kgIndexer.reconcileProjectionIfNeeded(producing: true)
                         graphProjectionFailureSlot.withLock { $0 = nil }
-                    } catch {
-                        await kgIndexer.markProjectionDirty()
-                        graphProjectionFailureSlot.withLock { $0 = String(describing: error) }
-                        nativeLog("[MemoryV2] Knowledge Graph startup reconciliation pending repair: %@", String(describing: error))
                     }
+                } catch {
+                    await kgIndexer.markProjectionDirty()
+                    graphProjectionFailureSlot.withLock { $0 = String(describing: error) }
+                    nativeLog("[MemoryV2] Knowledge Graph startup reconciliation pending repair: %@", String(describing: error))
                 }
             }
         }
@@ -305,7 +307,7 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
             surface: surface
         )
         let response = try await memory.recall(request, recordingUsage: false)
-        return await annotatedWithRelatedEntities(response, query: request)
+        return try await annotatedWithRelatedEntities(response, query: request)
     }
 
     /// Credit only the hits the accepted context delivered; report write failures.
@@ -324,14 +326,14 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
     /// Seed only records that classify and permit this surface/persona under `MemoryRecordDisclosurePolicy`.
     /// Recall's `extras["id"]` ties each hit to entities extracted from its own memory text.
     /// The prompt renderer presents entity names as one `related:` line.
-    /// Unavailable storage or graph enrichment failure leaves recall hits unchanged.
+    /// Enabled graph enrichment is part of the checked recall assembly.
     private func annotatedWithRelatedEntities(
         _ response: MemoryV2RecallResponse,
         query: MemoryV2RecallRequest
-    ) async -> [MemoryRecallHit] {
+    ) async throws -> [MemoryRecallHit] {
         // Settings ▸ "Knowledge graph": off means the graph is not USED either
         // — recall gets no one-hop entity enrichment. Read fresh per recall.
-        guard MemoryPolicyGate.knowledgeGraphEnabled() else { return response.hits }
+        guard try MemoryPolicyGate.knowledgeGraphEnabled() else { return response.hits }
         guard !response.hits.isEmpty else { return response.hits }
         let disclosedIDs: Set<String> = Set(
             response.scored.compactMap { scoredRecord in
@@ -344,17 +346,11 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
             }
         )
         guard !disclosedIDs.isEmpty else { return response.hits }
-        guard let storage = await memory.underlyingStorage() else { return response.hits }
+        guard let storage = await memory.underlyingStorage() else { throw MemoryV2Error.storageUnavailable }
         let related: [String: [String]]
-        do {
-            let sqlitePath = storage.path
-            let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
-            related = try await indexer.relatedEntityNames(
-                forMemoryIDs: Array(disclosedIDs)
-            )
-        } catch {
-            return response.hits
-        }
+        let sqlitePath = storage.path
+        let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
+        related = try await indexer.relatedEntityNames(forMemoryIDs: Array(disclosedIDs))
         guard !related.isEmpty else { return response.hits }
         return response.hits.map { hit in
             // Recall stamps the record id into `extras["id"]`; that is the only
@@ -436,14 +432,9 @@ public extension ProposalRecord {
 extension SwiftNativeMemoryV2 {
     /// Her prompt core for her own background work and reflection: the same
     /// core chat carries (read as chat sees it, since this is her own thinking,
-    /// not a door). A read failure degrades to the preamble only, as chat
-    /// does, and never fails the background job.
-    public static func userCoreForBackground(dataRoot: URL) async -> [String]? {
-        do {
-            return try await resolvedOwner(dataRoot: dataRoot).userPromptCore(surface: "chat")
-        } catch {
-            return []
-        }
+    /// not a door). An unavailable core fails the work that requires it.
+    public static func userCoreForBackground(dataRoot: URL) async throws -> [String]? {
+        try await resolvedOwner(dataRoot: dataRoot).userPromptCore(surface: "chat")
     }
 }
 
@@ -455,9 +446,9 @@ extension MemoryPatch {
         status = object["status"]?.stringValue
         lifecycle = object["lifecycle"]?.stringValue
         confidence = object["confidence"]?.numberValue(coercingStrings: false, finiteOnly: false)
-        validFrom = object["valid_from"]?.stringValue ?? object["validFrom"]?.stringValue
-        validTo = object["valid_to"]?.stringValue ?? object["validTo"]?.stringValue
-        observedAt = object["observed_at"]?.stringValue ?? object["observedAt"]?.stringValue
+        validFrom = object["valid_from"]?.stringValue
+        validTo = object["valid_to"]?.stringValue
+        observedAt = object["observed_at"]?.stringValue
         evidence = object["evidence"]
         let passthrough = object.filter { MemoryPatchContract.untypedPassthroughKeys.contains($0.key) }
         if !passthrough.isEmpty { metadataMerge = passthrough }

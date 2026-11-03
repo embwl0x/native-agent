@@ -3,7 +3,7 @@ import NativeAgentShared
 import AppKit
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `MacAppleScriptBridge+MessagesNotes.swift` | `MacAppleScriptBridge`: Messages list field projection and shared date/duration windows, `messagesSend`, `notesModify` (exact-note update or reversible deletion) |
+// Blueprint: | `MacAppleScriptBridge+MessagesNotes.swift` | `MacAppleScriptBridge`: Messages history-owned completion and partial thread evidence, shared date/duration windows and sends; Notes reads with per-note/container gaps and shared-channel failures, single resolved creation destination, unknown-folder replies list folder names directly, and exact-note mutations preserve failed readback |
 
 extension MacAppleScriptBridge {
     // MARK: MESSAGES
@@ -12,7 +12,7 @@ extension MacAppleScriptBridge {
     /// `query` matches people (name, number, email) or messages.
     /// An exact selected chat exposes a bounded local history page.
     public static func messagesRecentThreads(input: [String: JSONValue]) async throws -> JSONValue {
-        let limit = clampedInt(input["limit"], defaultValue: 10, min: 1, max: 30)
+        let limit = try clampedInt(input["limit"], defaultValue: 10, min: 1, max: 30)
         let threadID = input["thread_id"]?.scalarText
         guard input["unread_only"] == nil || input["unread_only"] == .bool(true) || input["unread_only"] == .bool(false),
               input["from_me"] == nil || input["from_me"] == .bool(true) || input["from_me"] == .bool(false),
@@ -49,7 +49,7 @@ extension MacAppleScriptBridge {
         guard threadID == nil || !(unreadOnly || oldestUnread) else {
             return failedEnvelope(integration: "messages", reason: "thread_filters_require_listing")
         }
-        let offset = threadID == nil ? clampedInt(input["offset"], defaultValue: 0, min: 0, max: 100_000) : 0
+        let offset = threadID == nil ? try clampedInt(input["offset"], defaultValue: 0, min: 0, max: 100_000) : 0
         let query = input["query"]?.scalarText.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
         let before: Int64?
         if let value = input["before_message_id"] {
@@ -131,6 +131,16 @@ extension MacAppleScriptBridge {
             }
             try Task.checkCancellation()
             result.merge(history) { _, new in new }
+            let available = history["history_status"] == .string("available")
+            result["status"] = .string(available ? "completed" : "failed")
+            result["integration"] = .string("messages")
+            result["effects"] = .string("none")
+            if !available {
+                result["partial"] = .bool(true)
+                result["note"] = .string("Only the selected thread's metadata was read; its requested history is unavailable.")
+                result["reason"] = history["history_reason"]
+                result["message"] = history["history_note"]
+            }
         }
         result = await MacContactsExecutor.naming(result)
         if let fields, case .array(let threads)? = result["threads"] {
@@ -242,13 +252,13 @@ extension MacAppleScriptBridge {
     /// List recent Apple Notes. Optional: "limit" (default 10, max 50).
     /// Returns the same bounded record shape as `notesSearch`.
     public static func notesListRecent(input: [String: JSONValue]) async throws -> JSONValue {
-        await notesRead(selection: "notes", limit: clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50), whole: false)
+        await notesRead(selection: "notes", limit: try clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50), whole: false)
     }
 
     /// Search Apple Notes by title/body; blank query lists recent notes, and
     /// `title` (exact) or `id` reads a body page. Continuation requires `id`.
     public static func notesSearch(input: [String: JSONValue]) async throws -> JSONValue {
-        let limit = clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50)
+        let limit = try clampedInt(input["limit"], defaultValue: 10, min: 1, max: 50)
         let id = input["id"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines)
         var offset = 0
         if let value = input["body_offset"] {
@@ -280,24 +290,51 @@ extension MacAppleScriptBridge {
         let source = """
         use framework "Foundation"
         use scripting additions
+        set gaps to current application's NSMutableArray's array()
         tell application "__NativeAgentApp__"
             if (count of accounts) is 0 then return "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
             if (count of folders) is 0 then return "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
             set hits to \(selection)
             -- A deleted note stays readable in Recently Deleted; it is not one of User's notes (10-08).
-            set deletedIDs to {}
-            repeat with f in folders
+            -- A note's folder comes from the folders' own note ids: Notes can't coerce
+            -- "name of container" of an account note (-1700), so that read was never a source.
+            set folderNames to {}
+            set folderNoteIDs to {}
+            repeat with fi from 1 to (count of folders)
                 try
-                    if (name of f) is "Recently Deleted" then set deletedIDs to deletedIDs & (id of notes of f)
+                    set f to folder fi
+                    set fName to (name of f) as string
+                    set fIDs to (id of notes of f)
+                    set end of folderNames to fName
+                    set end of folderNoteIDs to fIDs
+                on error errorText number errorNumber
+                    if errorNumber is in {-1743, -1744, -600, -609, -1712, -128} then error errorText number errorNumber
+                    gaps's addObject:("folders[" & fi & "]: " & errorText & " (" & errorNumber & ")")
                 end try
             end repeat
-            if (count of deletedIDs) > 0 then
-                set keptHits to {}
-                repeat with h in hits
-                    if deletedIDs does not contain ((id of h) as string) then set end of keptHits to contents of h
-                end repeat
-                set hits to keptHits
-            end if
+            set keptHits to {}
+            repeat with i from 1 to (count of hits)
+                try
+                    set h to item i of hits
+                    set hid to (id of h) as string
+                    set fd to missing value
+                    repeat with k from 1 to (count of folderNames)
+                        if (item k of folderNoteIDs) contains hid then
+                            set fd to item k of folderNames
+                            exit repeat
+                        end if
+                    end repeat
+                    if fd is missing value then
+                        gaps's addObject:("notes[" & i & "].folder: in no readable folder, so it can't be told apart from a deleted note")
+                    else if fd is not "Recently Deleted" then
+                        set end of keptHits to {contents of h, fd}
+                    end if
+                on error errorText number errorNumber
+                    if errorNumber is in {-1743, -1744, -600, -609, -1712, -128} then error errorText number errorNumber
+                    gaps's addObject:("notes[" & i & "]: " & errorText & " (" & errorNumber & ")")
+                end try
+            end repeat
+            set hits to keptHits
             set totalHits to count of hits
             set previewChars to 200
             if \(whole ? "true" : "false") or totalHits is 1 then set previewChars to 4000
@@ -307,48 +344,51 @@ extension MacAppleScriptBridge {
             set countNote to 0
             repeat with i from 1 to totalHits
                 if countNote ≥ \(limit) then exit repeat
-                set n to item i of hits
-                set nid to (id of n) as string
-                set nm to (name of n) as string
-                set md to (modification date of n) as string
-                set fd to ""
                 try
-                    set fd to (name of container of n) as string
-                end try
-                set fullBody to current application's NSString's stringWithString:((plaintext of n) as string)
-                set bodyTotal to (fullBody's |length|()) as integer
-                if \(offset) > bodyTotal then return "__NATIVEAGENT_NOTES_INVALID_OFFSET__"
-                set pageStart to \(offset)
-                set titleLineElided to false
-                if bodyTotal > 0 then
-                    set titleRange to fullBody's lineRangeForRange:{location:0, |length|:0}
-                    set trimSet to current application's NSCharacterSet's whitespaceAndNewlineCharacterSet()
-                    set firstLine to fullBody's substringWithRange:titleRange
-                    set firstLine to firstLine's stringByTrimmingCharactersInSet:trimSet
-                    set noteName to current application's NSString's stringWithString:nm
-                    set noteName to noteName's stringByTrimmingCharactersInSet:trimSet
-                    if (firstLine's isEqualToString:noteName) as boolean then
-                        if pageStart < (|length| of titleRange) then
-                            set pageStart to |length| of titleRange
-                            set titleLineElided to true
+                    set candidate to item i of hits
+                    set n to item 1 of candidate
+                    set fd to item 2 of candidate
+                    set nid to (id of n) as string
+                    set nm to (name of n) as string
+                    set md to (modification date of n) as string
+                    set fullBody to current application's NSString's stringWithString:((plaintext of n) as string)
+                    set bodyTotal to (fullBody's |length|()) as integer
+                    if \(offset) > bodyTotal then return "__NATIVEAGENT_NOTES_INVALID_OFFSET__"
+                    set pageStart to \(offset)
+                    set titleLineElided to false
+                    if bodyTotal > 0 then
+                        set titleRange to fullBody's lineRangeForRange:{location:0, |length|:0}
+                        set trimSet to current application's NSCharacterSet's whitespaceAndNewlineCharacterSet()
+                        set firstLine to fullBody's substringWithRange:titleRange
+                        set firstLine to firstLine's stringByTrimmingCharactersInSet:trimSet
+                        set noteName to current application's NSString's stringWithString:nm
+                        set noteName to noteName's stringByTrimmingCharactersInSet:trimSet
+                        if (firstLine's isEqualToString:noteName) as boolean then
+                            if pageStart < (|length| of titleRange) then
+                                set pageStart to |length| of titleRange
+                                set titleLineElided to true
+                            end if
                         end if
                     end if
-                end if
-                set pageLength to bodyTotal - pageStart
-                if pageLength > previewChars then set pageLength to previewChars
-                set pageRange to {location:pageStart, |length|:pageLength}
-                if pageLength > 0 then set pageRange to fullBody's rangeOfComposedCharacterSequencesForRange:pageRange
-                set bp to (fullBody's substringWithRange:pageRange) as string
-                set nextOffset to (location of pageRange) + (|length| of pageRange)
-                set row to current application's NSMutableDictionary's dictionaryWithObjects:{nm, bp, md, fd, nid, location of pageRange, bodyTotal} forKeys:{"name", bodyKey, "modified_at", "folder", "id", "body_offset", "body_total"}
-                row's setObject:(current application's NSNumber's numberWithBool:titleLineElided) forKey:"title_line_elided"
-                row's setObject:(current application's NSNumber's numberWithBool:(nextOffset < bodyTotal)) forKey:"truncated"
-                if nextOffset < bodyTotal then row's setObject:nextOffset forKey:"next_body_offset"
-                output's addObject:row
-                set countNote to countNote + 1
+                    set pageLength to bodyTotal - pageStart
+                    if pageLength > previewChars then set pageLength to previewChars
+                    set pageRange to {location:pageStart, |length|:pageLength}
+                    if pageLength > 0 then set pageRange to fullBody's rangeOfComposedCharacterSequencesForRange:pageRange
+                    set bp to (fullBody's substringWithRange:pageRange) as string
+                    set nextOffset to (location of pageRange) + (|length| of pageRange)
+                    set row to current application's NSMutableDictionary's dictionaryWithObjects:{nm, bp, md, fd, nid, location of pageRange, bodyTotal} forKeys:{"name", bodyKey, "modified_at", "folder", "id", "body_offset", "body_total"}
+                    row's setObject:(current application's NSNumber's numberWithBool:titleLineElided) forKey:"title_line_elided"
+                    row's setObject:(current application's NSNumber's numberWithBool:(nextOffset < bodyTotal)) forKey:"truncated"
+                    if nextOffset < bodyTotal then row's setObject:nextOffset forKey:"next_body_offset"
+                    output's addObject:row
+                    set countNote to countNote + 1
+                on error errorText number errorNumber
+                    if errorNumber is in {-1743, -1744, -600, -609, -1712, -128} then error errorText number errorNumber
+                    gaps's addObject:("kept_notes[" & i & "]: " & errorText & " (" & errorNumber & ")")
+                end try
             end repeat
         end tell
-        set payload to current application's NSDictionary's dictionaryWithObjects:{totalHits, output} forKeys:{"total", "notes"}
+        set payload to current application's NSDictionary's dictionaryWithObjects:{totalHits, output, gaps} forKeys:{"total", "notes", "gaps"}
         set jsonData to current application's NSJSONSerialization's dataWithJSONObject:payload options:0 |error|:(missing value)
         return (current application's NSString's alloc()'s initWithData:jsonData encoding:(current application's NSUTF8StringEncoding)) as string
         """
@@ -358,18 +398,20 @@ extension MacAppleScriptBridge {
             if raw == "__NATIVEAGENT_NOTES_INVALID_OFFSET__" {
                 return failedEnvelope(integration: "notes", reason: "invalid_note_body_offset")
             }
-            let (total, notes) = try parseNoteRecords(raw)
+            let (total, notes, gaps) = try parseNoteRecords(raw)
             var result: [String: JSONValue] = [
-                "status": .string("completed"), "source": .string("applescript"),
+                "status": .string(gaps.isEmpty ? "completed" : "partial"), "source": .string("applescript"),
                 "access": .object([
                     "automation": .string("confirmed"), "operation": .string("read"),
                     "note_records": .int(Int64(notes.count)),
                 ]),
                 "count": .int(Int64(notes.count)), "total": .int(total), "notes": .array(notes),
+                "gaps": .array(gaps.map(JSONValue.string)), "total_is_complete": .bool(gaps.isEmpty),
             ]
             if total > Int64(notes.count) { result["message"] = .string("Showing \(notes.count) of \(total); narrow with query, or read one with title.") }
             // Nothing by that title or id is an answer (count 0), not an error (drive wave 10-28).
-            if whole && notes.isEmpty { result["message"] = .string("No note has that title or id.") }
+            if whole && notes.isEmpty && gaps.isEmpty { result["message"] = .string("No note has that title or id.") }
+            if !gaps.isEmpty { result["message"] = .string("Readable notes returned with named gaps. Missing notes and the complete match total are unknown; repair the reported Notes reads.") }
             return .object(result)
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "notes", app: app)
@@ -379,7 +421,7 @@ extension MacAppleScriptBridge {
     }
 
     /// Create a new note. Required: "title", "body". Optional: "folder"
-    /// (defaults to "Notes" folder).
+    /// (defaults to Notes' default account's default folder).
     /// Returns: {status, action: "created", title}.
     public static func notesCreate(input: [String: JSONValue]) async throws -> JSONValue {
         guard let title = input["title"]?.scalarText, !title.isEmpty else {
@@ -388,49 +430,51 @@ extension MacAppleScriptBridge {
         guard let body = input["body"]?.scalarText else {
             return failedEnvelope(integration: "notes", reason: "missing_body")
         }
-        // Only an omitted folder uses the default; unresolved requests fail with available names.
+        // An omitted or blank folder uses Notes' default; unresolved named requests never do.
         let requestedFolder = input["folder"]?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let folder = (requestedFolder?.isEmpty == false) ? requestedFolder! : "Notes"
         let folderWasRequested = requestedFolder?.isEmpty == false
         let titleAS = escapeForAppleScript(title)
         let bodyAS = escapeForAppleScript(notesHTML(body))
-        let folderAS = escapeForAppleScript(folder)
-        let missingFolderBranch = folderWasRequested ? """
+        let destination: String
+        if let folder = requestedFolder, folderWasRequested {
+            destination = """
+            set matchingFolders to folders whose name is "\(escapeForAppleScript(folder))"
+            if (count of matchingFolders) is 0 then
                 set folderNames to ""
                 repeat with f in folders
                     set fName to (name of f as string)
                     if fName is not "Recently Deleted" then
-                        set holder to ""
-                        try
-                            set holder to " (" & (name of container of f as string) & ")"
-                        end try
-                        set folderNames to folderNames & fName & holder & "###"
+                        set folderNames to folderNames & fName & "###"
                     end if
                 end repeat
                 return "\(Self.notesFolderMissingSentinel)" & folderNames
-        """ : """
-                set newNote to make new note with properties {name:"\(titleAS)", body:"\(bodyAS)"}
-        """
+            end if
+            if (count of matchingFolders) is not 1 then error "Several Notes folders have that name; no note was created. Choose a unique folder name."
+            set targetFolder to item 1 of matchingFolders
+            """
+        } else {
+            destination = """
+            set targetAccount to default account
+            if targetAccount is missing value then error "Notes has no default account; choose its default account in Notes before creating a note."
+            set targetFolder to default folder of targetAccount
+            if targetFolder is missing value then error "The default Notes account has no default folder; make that destination available in Notes before creating a note."
+            """
+        }
         let source = """
         tell application "__NativeAgentApp__"
-            set targetFolder to missing value
-            try
-                set targetFolder to folder "\(folderAS)"
-            end try
-            if targetFolder is missing value then
-        \(missingFolderBranch)
-            else
-                tell targetFolder
-                    set newNote to make new note with properties {name:"\(titleAS)", body:"\(bodyAS)"}
-                end tell
-            end if
+            \(destination)
+            -- Resolve the destination before the single create command.
+            set destinationID to (id of targetFolder) as text
+            tell targetFolder
+                set newNote to make new note with properties {name:"\(titleAS)", body:"\(bodyAS)"}
+            end tell
             return "created|" & (id of newNote as string)
         end tell
         """
         do {
             let raw = try await runAppleScript(source, bundleID: "com.apple.Notes")
-            if raw.hasPrefix(Self.notesFolderMissingSentinel) {
+            if let requestedFolder, folderWasRequested, raw.hasPrefix(Self.notesFolderMissingSentinel) {
                 let names = raw.dropFirst(Self.notesFolderMissingSentinel.count)
                     .components(separatedBy: "###")
                     .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -441,19 +485,24 @@ extension MacAppleScriptBridge {
                     "effects": .string("none"),
                     "reason": .string("folder_not_found"),
                     "detail": .string("No Notes folder is named that, so nothing changed; use one of available_folders."),
-                    "requested_folder": .string(folder),
+                    "requested_folder": .string(requestedFolder),
                     "available_folders": .array(names.map { .string($0) }),
                 ])
             }
             // The new note's own id rides on the receipt: the next step reads
             // or changes exactly it, no search needed (drive wave 10-28).
-            let newID = raw.hasPrefix("created|") ? String(raw.dropFirst("created|".count)) : ""
-            var created: [String: JSONValue] = [
+            guard raw.hasPrefix("created|"), raw.count > "created|".count else {
+                return .object(["status": .string("outcome_unknown"), "integration": .string("notes"),
+                    "effects": .string("unknown"), "reason": .string("unexpected_note_create_result"),
+                    "message": .string("Notes returned an unrecognized creation result. Read the intended folder before trying again.")])
+            }
+            let newID = String(raw.dropFirst("created|".count))
+            let created: [String: JSONValue] = [
                 "status": .string("completed"),
                 "action": .string("created"),
                 "title": .string(title),
+                "id": .string(newID),
             ]
-            if !newID.isEmpty { created["id"] = .string(newID) }
             return .object(created)
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "notes", app: app)
@@ -531,47 +580,76 @@ extension MacAppleScriptBridge {
             renameStmt = ""
         }
         let source = """
+        use framework "Foundation"
+        use scripting additions
         tell application "__NativeAgentApp__"
             set hits to \(noteID.isEmpty ? "(notes whose name is \"\(titleAS)\")" : "(notes whose id is \"\(escapeForAppleScript(noteID))\")")
             if (count of hits) is 0 then return "0"
             if (count of hits) > 1 then return "-3|" & ((count of hits) as text)
             set targetNote to first item of hits
+            set targetID to (id of targetNote) as text
+            set receipt to current application's NSMutableDictionary's dictionaryWithObject:targetID forKey:"id"
             if \(deleting ? "true" : "false") then
                 set finalName to (name of targetNote) as text
                 delete targetNote
-                return "1|" & finalName
+                receipt's setObject:finalName forKey:"title"
+            else
+                \(bodyStmt)
+                \(renameStmt)
+                try
+                    set finalName to (name of targetNote) as text
+                    receipt's setObject:finalName forKey:"title"
+                on error errText number errNum
+                    set readback to current application's NSDictionary's dictionaryWithObjects:{"failed", errText, errNum} forKeys:{"status", "error", "error_code"}
+                    receipt's setObject:readback forKey:"readback"
+                end try
             end if
-            set finalName to ""
-            \(bodyStmt)
-            \(renameStmt)
-            try
-                set finalName to (name of targetNote) as string
-            end try
-            return "1|" & finalName
         end tell
+        set jsonData to current application's NSJSONSerialization's dataWithJSONObject:receipt options:0 |error|:(missing value)
+        return (current application's NSString's alloc()'s initWithData:jsonData encoding:(current application's NSUTF8StringEncoding)) as string
         """
         do {
             let raw = try await runAppleScript(source, bundleID: "com.apple.Notes").trimmingCharacters(in: .whitespacesAndNewlines)
             let parts = raw.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            if raw == "0" { return failedEnvelope(integration: "notes", reason: "no_matching_note") }
             // Ambiguous note titles leave all matches unchanged.
-            if parts.first == "-3" {
+            if parts.first == "-3", parts.count == 2, let count = Int(parts[1]), count > 1 {
                 return .object(["status": .string("failed"), "integration": .string("notes"), "reason": .string("several_notes_match"),
-                    "message": .string("\(parts.count > 1 ? parts[1] : "Several") notes are titled \"\(title)\", so nothing changed. Pass the id of one from notes_search.")])
+                    "message": .string("\(count) notes are titled \"\(title)\", so nothing changed. Pass the id of one from notes_search.")])
             }
-            guard parts.first == "1" else {
-                return failedEnvelope(integration: "notes", reason: "no_matching_note")
+            // This is after the effect. Malformed output cannot prove no match or no change.
+            let observed: JSONValue
+            do { observed = try JSONDecoder().decode(JSONValue.self, from: Data(raw.utf8)) }
+            catch { return notesMutationUnknown(input: input, deleting: deleting) }
+            guard case .object(var result) = observed, case .string(let id)? = result["id"], !id.isEmpty else {
+                return notesMutationUnknown(input: input, deleting: deleting)
             }
-            return .object([
-                "status": .string("completed"),
-                "action": .string(deleting ? "moved_to_recently_deleted" : "updated"),
-                "recovery": deleting ? .string("Restore the note from Recently Deleted in Notes.") : .null,
-                "title": .string(parts.count > 1 && !parts[1].isEmpty ? parts[1] : (newTitle?.isEmpty == false ? newTitle! : title)),
-            ])
+            if let readback = result["readback"] {
+                guard !deleting, case .object(let fields) = readback, fields["status"] == .string("failed"),
+                      case .string? = fields["error"], case .int? = fields["error_code"], result["title"] == nil else {
+                    return notesMutationUnknown(input: input, deleting: deleting)
+                }
+                result["message"] = .string("The note was updated, but Notes could not read its resulting title. Read this exact id before relying on its current metadata; do not repeat the update.")
+            } else if case .string? = result["title"] {
+                // The name came from Notes, including a legitimately empty name.
+            } else { return notesMutationUnknown(input: input, deleting: deleting) }
+            result["status"] = .string("completed")
+            result["action"] = .string(deleting ? "moved_to_recently_deleted" : "updated")
+            result["recovery"] = deleting ? .string("Restore the note from Recently Deleted in Notes.") : .null
+            return .object(result)
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "notes", app: app)
         } catch {
             return failedEnvelope(integration: "notes", error: error)
         }
+    }
+
+    private static func notesMutationUnknown(input: [String: JSONValue], deleting: Bool) -> JSONValue {
+        .object(["status": .string("outcome_unknown"), "integration": .string("notes"),
+            "effects": .string("unknown"), "reason": .string("unexpected_note_mutation_result"),
+            "requested_note": .object(input.filter { ["id", "title"].contains($0.key) }),
+            "action": .string(deleting ? "moved_to_recently_deleted" : "updated"),
+            "message": .string("Notes returned an unrecognized change result. Check the note\(deleting ? " and Recently Deleted" : "") before trying again.")])
     }
 
     private static func notesHTML(_ text: String) -> String {

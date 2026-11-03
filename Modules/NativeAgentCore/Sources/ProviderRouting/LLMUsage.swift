@@ -64,34 +64,22 @@ public struct LLMUsage: Sendable, Equatable {
     /// total and expose cached tokens only as a subset, so adding that subset
     /// would double-count it.
     public func logicalInputTokens(provider: String) -> Int? {
-        let hasAnyInput = inputTokens != nil
-            || cacheReadInputTokens != nil
-            || cacheCreationInputTokens != nil
-        guard hasAnyInput else { return nil }
-
+        guard let inputTokens, inputTokens >= 0 else { return nil }
         if additiveInputCounters {
-            // Nonnegative usage totals saturate at Int.max on overflow.
-            func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
-                let (sum, overflowed) = lhs.addingReportingOverflow(rhs)
-                return overflowed ? Int.max : sum
-            }
-            var total = max(0, inputTokens ?? 0)
-            total = saturatingAdd(total, max(0, cacheReadInputTokens ?? 0))
-            total = saturatingAdd(total, max(0, cacheCreationInputTokens ?? 0))
-            return total
+            guard let read = cacheReadInputTokens, read >= 0,
+                  let created = cacheCreationInputTokens, created >= 0 else { return nil }
+            let (subtotal, firstOverflow) = inputTokens.addingReportingOverflow(read)
+            guard !firstOverflow else { return nil }
+            let (total, overflow) = subtotal.addingReportingOverflow(created)
+            return overflow ? nil : total
         }
-        return max(0, inputTokens ?? 0)
+        return inputTokens
     }
 
-    /// Int/Double wire counts return nil or clamp for malformed values without trapping.
+    /// Counts remain unknown unless the provider gave an exact nonnegative integer.
     static func intValue(_ raw: Any?) -> Int? {
-        if let i = raw as? Int { return i }
-        if let d = raw as? Double {
-            guard d.isFinite else { return nil }
-            if d >= Double(Int.max) { return Int.max }
-            if d <= Double(Int.min) { return Int.min }
-            return Int(d)
-        }
+        if let i = raw as? Int, i >= 0 { return i }
+        if let d = raw as? Double, d.isFinite, d >= 0 { return Int(exactly: d) }
         return nil
     }
 

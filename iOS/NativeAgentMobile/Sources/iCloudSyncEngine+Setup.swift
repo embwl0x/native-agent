@@ -9,7 +9,7 @@ extension iCloudSyncEngine {
             throw DeviceSyncError.underlying(message: "invalid work overview capture time")
         }
         if FileManager.default.fileExists(atPath: url.path) {
-            let currentData = try Data(contentsOf: url)
+            let currentData = try VolumeIO.contents(of: url)
             if let current = try? JSONDecoder().decode(WorkOverview.self, from: currentData),
                let currentDate = DeskActivityState.movementDate(current.capturedAt),
                incomingDate <= currentDate { return }
@@ -79,7 +79,7 @@ extension iCloudSyncEngine {
     }
 
     /// Prune old terminal transactions and consumed responses off-main, at setup and at most daily.
-    /// Terminal msgId/id marks consumption; an unledgered response's terminal row has already been reaped.
+    /// Only a retained terminal response receipt proves consumption.
     /// Recheck file identity before removal; unreadable or changed files survive.
     /// Nonterminal transactions, snapshots and inbox files remain untouched.
     func pruneEphemeralDirectoriesIfDue(force: Bool = false) {
@@ -93,54 +93,62 @@ extension iCloudSyncEngine {
         defaults.set(now, forKey: Self.ephemeralPruneStampKey)
         let cutoff = Date(timeIntervalSince1970: now - Self.ephemeralRetentionSeconds)
         Task.detached(priority: .utility) {
-            // Read the ledger BEFORE deleting anything from it: a response is
-            // only prunable because some terminal row says it was answered.
-            var terminalTransactions: [URL] = []
-            var consumedResponseIDs = Set<String>()
-            var ledgeredResponseIDs = Set<String>()
-            if let transactions {
-                for file in Self.prunableFiles(in: transactions) {
-                    guard let data = try? Data(contentsOf: file),
-                          let record = try? JSONDecoder().decode(
-                              ICloudTransactionRecord.self, from: data
-                          ) else { continue }
-                    ledgeredResponseIDs.insert(record.msgId ?? record.id)
-                    ledgeredResponseIDs.insert(record.id)
-                    guard Self.isTerminalTransactionState(record.state) else { continue }
-                    terminalTransactions.append(file)
-                    consumedResponseIDs.insert(record.msgId ?? record.id)
-                    consumedResponseIDs.insert(record.id)
+            let result = await VolumeIO.result {
+                // Read the ledger BEFORE deleting anything from it: a response is
+                // only prunable because some terminal row says it was answered.
+                var terminalTransactions: [URL] = []
+                var consumedResponseIDs = Set<String>()
+                if let transactions {
+                    for file in try Self.prunableFiles(in: transactions) {
+                        let data = try VolumeIO.contents(of: file)
+                        let record = try JSONDecoder().decode(ICloudTransactionRecord.self, from: data)
+                        guard Self.isTerminalTransactionState(record.state),
+                              let receipt = record.response, let messageID = record.msgId,
+                              receipt["msgId"] == messageID, receipt["transactionId"] == record.id,
+                              receipt["action"] == record.action,
+                              InboxAction.responseTransactionState(receipt) == record.state else { continue }
+                        terminalTransactions.append(file)
+                        consumedResponseIDs.insert(messageID)
+                    }
+                }
+                if let responses {
+                    for file in try Self.prunableFiles(in: responses) {
+                        let id = file.deletingPathExtension().lastPathComponent
+                        guard consumedResponseIDs.contains(id) else { continue }
+                        try Self.removeIfUnchanged(file, olderThan: cutoff)
+                    }
+                }
+                for file in terminalTransactions {
+                    let record = try JSONDecoder().decode(ICloudTransactionRecord.self, from: VolumeIO.contents(of: file))
+                    // Keep the consumption proof while its response survives
+                    // (too young, changed, or not removed).
+                    guard let messageID = record.msgId else { continue }
+                    if let responses,
+                       try Self.readActionMailboxFile(at: responses.appendingPathComponent("\(messageID).json")) != nil {
+                        continue
+                    }
+                    try Self.removeIfUnchanged(file, olderThan: cutoff)
                 }
             }
-            if let responses {
-                for file in Self.prunableFiles(in: responses) {
-                    let id = file.deletingPathExtension().lastPathComponent
-                    // Consumed, or so old its terminal transaction was itself
-                    // reaped by an earlier pass — every send writes a `queued`
-                    // row before the response can exist, so a response with no
-                    // ledger row at all is one whose row has already gone.
-                    // Anything still ledgered non-terminally is left alone.
-                    guard consumedResponseIDs.contains(id)
-                            || !ledgeredResponseIDs.contains(id) else { continue }
-                    Self.removeIfUnchanged(file, olderThan: cutoff)
+            if case .failure(let error) = result {
+                NSLog("[iCloudSync] ledger retention did not finish: %@; unreadable evidence cannot authorize response deletion", error.localizedDescription)
+                await MainActor.run {
+                    self.syncError = "Action mailbox retention did not finish: \(error.localizedDescription). Unconsumed response evidence was retained."
                 }
-            }
-            for file in terminalTransactions {
-                Self.removeIfUnchanged(file, olderThan: cutoff)
             }
         }
     }
 
-    /// Every regular file directly inside `directory`. Never recurses, never
-    /// throws: an unreadable directory prunes nothing.
-    private nonisolated static func prunableFiles(in directory: URL) -> [URL] {
-        guard let files = try? FileManager.default.contentsOfDirectory(
+    /// Every non-directory entry directly inside `directory`. An unavailable
+    /// ledger aborts retention before any response deletion.
+    private nonisolated static func prunableFiles(in directory: URL) throws -> [URL] {
+        let files = try FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
-        ) else { return [] }
-        return files.filter { url in
-            (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory != true
+        )
+        return try files.filter { url in
+            try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory != true
         }
     }
 
@@ -156,11 +164,12 @@ extension iCloudSyncEngine {
     /// file it was when that was measured — same inode, same modification date,
     /// same size. A replacement written into the same name between the two
     /// stats survives.
-    private nonisolated static func removeIfUnchanged(_ url: URL, olderThan cutoff: Date) {
-        guard let before = Self.fileIdentity(url),
+    private nonisolated static func removeIfUnchanged(_ url: URL, olderThan cutoff: Date) throws {
+        let before = try Self.fileIdentity(url)
+        guard
               before.modified < cutoff,
-              Self.fileIdentity(url) == before else { return }
-        try? FileManager.default.removeItem(at: url)
+              try Self.fileIdentity(url) == before else { return }
+        try FileManager.default.removeItem(at: url)
     }
 
     private struct EphemeralFileIdentity: Equatable {
@@ -169,11 +178,13 @@ extension iCloudSyncEngine {
         let size: Int64
     }
 
-    private nonisolated static func fileIdentity(_ url: URL) -> EphemeralFileIdentity? {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
+    private nonisolated static func fileIdentity(_ url: URL) throws -> EphemeralFileIdentity {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
               let modified = attributes[.modificationDate] as? Date,
-              let size = (attributes[.size] as? NSNumber)?.int64Value else { return nil }
+              let size = (attributes[.size] as? NSNumber)?.int64Value else {
+            throw SyncError.persistence("Mailbox retention could not identify \(url.lastPathComponent); its evidence was retained.")
+        }
         return EphemeralFileIdentity(inode: inode, modified: modified, size: size)
     }
 
@@ -205,8 +216,8 @@ extension iCloudSyncEngine {
         isSetUp = false
         refreshInFlight = false
         refreshQueued = false
-        fullRefreshQueued = false
-        transportDeliveryQueued = false
+        cloudKitCatchUpIncomplete = false
+        cloudKitCatchUpFailed = false
         syncError = nil
     }
 
@@ -217,8 +228,6 @@ extension iCloudSyncEngine {
         lifecycleGeneration &+= 1
         refreshInFlight = false
         refreshQueued = false
-        fullRefreshQueued = false
-        transportDeliveryQueued = false
         prefersCloudKitSnapshotCache = true
         NotificationCenter.default.removeObserver(
             self,
@@ -244,20 +253,23 @@ extension iCloudSyncEngine {
         transactionDir = transactions
         isSetUp = true
         pruneEphemeralDirectoriesIfDue()
+        await settleUnobservedActionResponses()
     }
 
-    /// The transport claims a generation only after durable application; decode/write failures remain eligible.
-    /// Teardown after the write consumes the delivery because its engine has retired.
+    /// Claim a status generation only after durable application and a successful
+    /// current-lifecycle refresh; interrupted or failed reads remain eligible.
     @discardableResult
     func applyCloudKitSnapshotStatus(
         _ value: String,
         group: NAMobileSnapshotGroup,
+        originatingPairing: Data,
         writtenAt: Date? = nil
     ) async -> Bool {
         let generation = lifecycleGeneration
-        let deliveryPairing = pairingStore?.iCloudPairingSecret
+        let deliveryPairing = originatingPairing
         // Leave deliveries eligible for retry until pairing is installed.
-        guard AgentNameCache.fingerprint(deliveryPairing) != nil else { return false }
+        guard deliveryPairing.count == 32,
+              deliveryPairing == pairingStore?.iCloudPairingSecret else { return false }
         do {
             let directory = cloudKitSnapshotCacheDirectory(pairing: deliveryPairing)
             try await VolumeIO.run {
@@ -281,13 +293,14 @@ extension iCloudSyncEngine {
                 }
             }
             guard deliveryPairing == pairingStore?.iCloudPairingSecret else { return false }
-            guard generation == lifecycleGeneration else { return true }
+            guard generation == lifecycleGeneration else { return false }
             prefersCloudKitSnapshotCache = true
             snapshotDir = directory
-            // Only an explicitly successful group refresh renews its delivery clock; preserve its error otherwise.
+            // Only an explicitly successful group refresh accepts this status
+            // and renews its delivery clock; keep failed reads eligible for retry.
             let refreshed = await refreshSnapshotGroup(group)
             guard deliveryPairing == pairingStore?.iCloudPairingSecret else { return false }
-            guard generation == lifecycleGeneration else { return true }
+            guard generation == lifecycleGeneration else { return false }
             if refreshed {
                 if let writtenAt {
                     iCloudBridge.shared.recordMacConfirmation(at: writtenAt)
@@ -295,7 +308,7 @@ extension iCloudSyncEngine {
                 noteTransportDelivery(groups: [group])
                 noteRefreshSucceeded()
             }
-            return true
+            return refreshed
         } catch {
             guard generation == lifecycleGeneration else { return false }
             NSLog("[iCloudSyncEngine] %@ snapshot failed: %@", group.rawValue, error.localizedDescription)
@@ -327,17 +340,18 @@ extension iCloudSyncEngine {
     @objc private nonisolated func kvsDidChange(_ note: Notification) {
         let changed = note.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]
         Task { @MainActor in
-            if changed?.contains(where: { $0.hasPrefix("inbox_response_") }) == true {
-                await self.settleUnobservedActionResponses()
+            for key in changed ?? [] where key.hasPrefix("inbox_response_") {
+                do {
+                    _ = try await self.pollResponse(msgId: String(key.dropFirst("inbox_response_".count)))
+                } catch {
+                    NSLog("[iCloudSync] response arrival did not settle: %@", error.localizedDescription)
+                }
             }
             guard let changed, changed.contains(KVSKey.snapshotUpdated) else { return }
             let signal = self.kvs.string(forKey: KVSKey.snapshotUpdated)
             let writtenAt = signal?.components(separatedBy: "|").first.flatMap {
                 ISO8601DateFormatter().date(from: $0)
             }
-            // Old Mac builds published only an ISO timestamp. Treat that as an
-            // unknown group and do one targeted transcript read for continuity;
-            // current builds name changed groups and avoid unrelated reads.
             // The ping says the Mac published; only the group read that
             // actually landed is evidence THAT group's rows arrived, so each
             // group renews its own delivery clock on its own success.
@@ -351,11 +365,8 @@ extension iCloudSyncEngine {
                     }
                 }
             } else {
-                // Legacy timestamp-only publishers did not identify the
-                // changed group, so compatibility requires one complete read.
-                if await self.refreshSnapshots(recordTransportDelivery: true), let writtenAt {
-                    iCloudBridge.shared.recordMacConfirmation(at: writtenAt)
-                }
+                guard signal != nil else { return }
+                self.syncError = "The Mac's snapshot signal names no supported publication group. Refresh the Mac's phone snapshots to repair this signal."
             }
         }
     }
@@ -383,26 +394,15 @@ extension iCloudSyncEngine {
         case .work:
             return await refreshWorkActivitySnapshot()
         case .advanced:
-            // Summaries and runs must both land. Older Macs do not publish helpers;
-            // its views report their own refresh failures.
             let summaries = await refreshTurnSummariesSnapshot()
             let runs = await refreshRunsSnapshot().outcome == .refreshed
-            await refreshHelpersSnapshot()
-            await refreshKnowledgeGraphSnapshot()
-            return summaries && runs
+            let helpers = await refreshHelpersSnapshot()
+            let graph = await refreshKnowledgeGraphSnapshot()
+            return summaries && runs && helpers && graph
         }
     }
 
-    /// A snapshot signal names the groups whose files the Mac just published.
-    /// It is only a complete description of that publication when this build
-    /// understands every name in it. A Mac newer than this app can name a group
-    /// this enum does not have — a rename or an addition — and silently
-    /// dropping that name while refreshing the recognised siblings leaves the
-    /// unrecognised group's data stale behind a signal that claimed to cover
-    /// the whole write. That is how a phantom STALE badge survives a healthy
-    /// Mac publication. An incompletely understood signal is therefore no
-    /// signal: return nil so the caller performs the same complete read the
-    /// legacy timestamp-only publishers already get.
+    /// A publication names only current groups; malformed/unknown signals are refused.
     nonisolated static func snapshotSignalGroups(
         _ value: String?
     ) -> Set<NAMobileSnapshotGroup>? {

@@ -45,7 +45,7 @@ extension CapabilitiesView {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                         ForEach(traceState.traces.prefix(14)) { trace in
-                            CapabilityDetailRow(title: trace.title, detail: trace.kind, status: trace.status ?? "ok")
+                            CapabilityDetailRow(title: trace.title, detail: trace.kind, status: trace.status ?? "unknown")
                         }
                     }
                 }
@@ -198,9 +198,8 @@ struct SkillMemoryGraphPanel: View {
         AdvancedSection(title: "Skill memory graph") {
             if let snapshot = memory.graphSnapshot {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 16)], spacing: 16) {
-                    AdvancedStat(title: "Items", value: "\(snapshot.entities.count)", detail: "memories, runs, Desk tasks, capabilities")
-                    AdvancedStat(title: "Links", value: "\(snapshot.edges.count)", detail: "what produced and used what")
-                    AdvancedStat(title: "Capabilities", value: "0", detail: "listed in the graph")
+                    AdvancedStat(title: "Entities", value: "\(snapshot.entities.count)", detail: "knowledge entities")
+                    AdvancedStat(title: "Relationships", value: "\(snapshot.edges.count)", detail: "links between knowledge entities")
                 }
 
                 if let error = memory.graphLoadError {
@@ -227,7 +226,7 @@ struct SkillMemoryGraphPanel: View {
                 }
 
                 if snapshot.entities.isEmpty {
-                    Text("The graph is empty. New memories and linked capability activity show up here once they are added.")
+                    Text("The knowledge graph is empty. Indexed memories and Studio relationships appear here once they are added.")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -238,7 +237,7 @@ struct SkillMemoryGraphPanel: View {
                             CapabilityDetailRow(
                                 title: result.node.label ?? AdvancedStatusWords.label(result.id),
                                 detail: result.explanation ?? "Score \(String(format: "%.2f", result.score))",
-                                status: result.node.status ?? "ok"
+                                status: result.node.status ?? "unknown"
                             )
                         }
                 }
@@ -247,8 +246,8 @@ struct SkillMemoryGraphPanel: View {
                         ForEach(snapshot.entities.prefix(5)) { entity in
                             CapabilityDetailRow(
                                 title: entity.name,
-                                detail: "\(entity.mentions ?? 0) mentions · confidence \(String(format: "%.2f", entity.confidence ?? 0))",
-                                status: entity.kind ?? "ok"
+                                detail: "\(entity.mentions.map { "\($0) mentions" } ?? "Mentions unavailable") · \(entity.confidence.map { "confidence \(String(format: "%.2f", $0))" } ?? "Confidence unavailable")",
+                                status: entity.kind ?? "unknown"
                             )
                         }
                 }

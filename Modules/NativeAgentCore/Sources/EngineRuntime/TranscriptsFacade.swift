@@ -21,17 +21,30 @@ import MacControl
 import Darwin
 import ChatTurnContracts
 import ChatToolParsing
-// Blueprint: | `TranscriptsFacade.swift` | Root-scoped observable transcript/session publication, navigation and streaming cache; LatestRead preserves each read and committed clears |
+// Blueprint: | `TranscriptsFacade.swift` | Root-scoped observable transcript/session publication, navigation and streaming cache; active or consumer-held tail boxes keep their identity; LatestRead preserves each read and committed clears |
 @MainActor
 @Observable
 private final class ChatTranscriptSlot {
+    /// The projection views read: `saved` with the live turn over it.
     @ObservationIgnored var messages: [ChatMessage] = []
+    /// The last committed store read; only a read of the store writes it.
+    @ObservationIgnored var saved: [ChatMessage] = []
+    /// Rows the turn owns: optimistic, streaming or unsaved. A leading row is shown over its saved copy
+    /// (and over the saved rows it replaces); a settled row leaves the moment the store holds it.
+    @ObservationIgnored var live: [LiveRow] = []
     @ObservationIgnored lazy var cardReads = LatestRead()
     var groups = MessageGrouper.GroupedTranscript(base: [])
     @ObservationIgnored var preparation: Task<Void, Never>?
     @ObservationIgnored let groupReads = LatestRead()
     var structureVersion: UInt64 = 0
     var readStatus: TranscriptReadout.ReadStatus = .loading
+}
+struct LiveRow {
+    var message: ChatMessage
+    var leads = true
+    var replaces: Set<String> = []
+    /// The saved rows that existed when it appeared: an unsaved row leaves once a newer completed reply lands.
+    var seen: Set<String> = []
 }
 /// `NativeAgentEngine.transcripts`: the chat session index
 /// (`chat/sessions.json`) and the transcripts (`chat/messages/<id>.jsonl`) for
@@ -61,23 +74,45 @@ public final class TranscriptsFacade {
         return title
     }
     public var firstConversationPersonName: String {
-        NativeCognitionRuntime.resolveUserName(dataRoot: dataRoot)
+        get throws { try NativeCognitionRuntime.resolveUserName(dataRoot: dataRoot) }
     }
     @ObservationIgnored public lazy var sessionTransactions = MacChatSessionTransactions()
 
     /// The current index; any publication supersedes suspended presentation reads.
     private var sessionSnapshot: [NativeAgentShared.ChatSession] = []
+    public private(set) var sessionIndexError: String?
     public var sessions: [NativeAgentShared.ChatSession] {
         get { sessionSnapshot }
-        set { sessionTransactions.indexRead.write { sessionSnapshot = newValue } }
+        set { sessionTransactions.indexRead.write { sessionSnapshot = newValue; sessionIndexError = nil } }
     }
     /// Read publication keeps its original ticket. Treating it as a committed
     /// write would fence a newer read that is still running.
     public func publishSessionIndexRead(_ sessions: [NativeAgentShared.ChatSession]) {
         sessionSnapshot = sessions
+        sessionIndexError = nil
+    }
+    /// A failed refresh keeps the last displayed index with its unavailable cause.
+    @discardableResult
+    public func refreshSessionIndex() async -> Bool {
+        let result = await sessionTransactions.indexRead.read({
+            do { return Result<[NativeAgentShared.ChatSession], Error>.success(try await list()) }
+            catch { return .failure(error) }
+        }, publish: { result in
+            switch result {
+            case .success(let rows): publishSessionIndexRead(rows)
+            case .failure(let error): sessionIndexError = UserFacingError.cause(error, action: "refresh the conversation list")
+            }
+        })
+        if case .success = result { return true }
+        return false
     }
     public private(set) var pinnedSessionIDs: [String] = []
     public private(set) var conversationAnchor: ConversationAnchorPin?
+    public private(set) var navigationError: String?
+    public var navigationReadIssue: String? {
+        let issues = [sessionIndexError, navigationError].compactMap { $0 }
+        return issues.isEmpty ? nil : issues.joined(separator: "\n")
+    }
 
     public var navigation: ChatSessionNavigation { navigation(for: sessions) }
 
@@ -90,16 +125,22 @@ public final class TranscriptsFacade {
         return .init(rows: rows, pinnedSessionIDs: pinnedSessionIDs, anchor: conversationAnchor)
     }
     public func refreshNavigationIdentity() {
-        pinnedSessionIDs = ChatSessionRetention.load()
+        do {
+            pinnedSessionIDs = try ChatSessionRetention.load(dataRoot: dataRoot)
+            navigationError = nil
+        } catch {
+            navigationError = UserFacingError.cause(error, action: "read pinned conversations")
+        }
         conversationAnchor = ConversationAnchor.current(dataRoot: dataRoot)
     }
     public func watchNavigation() async {
-        await EventDeadlinePhysiology.refreshOnChanges(paths: [ConversationAnchor.path(dataRoot: dataRoot)],
-            notifications: [UserDefaults.didChangeNotification]) { self.refreshNavigationIdentity() }
+        await EventDeadlinePhysiology.refreshOnChanges(paths: [ConversationAnchor.path(dataRoot: dataRoot),
+            ChatSessionRetention.macPinnedSessionIdsPath(dataRoot: dataRoot)]) { self.refreshNavigationIdentity() }
     }
     public func savePinnedSessionIDs(_ ids: [String]) throws -> String {
         let encoded = try ChatSessionRetention.save(ids, dataRoot: dataRoot)
-        pinnedSessionIDs = ChatSessionRetention.decode(encoded)
+        pinnedSessionIDs = try ChatSessionRetention.decode(encoded)
+        navigationError = nil
         return encoded
     }
     public func pinSession(_ sessionID: String) throws -> (changed: Bool, shared: Bool) {
@@ -113,7 +154,7 @@ public final class TranscriptsFacade {
         return result
     }
     public func publishPins(_ encoded: String, includeTranscripts: Bool) -> Bool {
-        ChatSessionRetention.request(encodedPinnedIDs: encoded) { _ in
+        ChatSessionRetention.request(encodedPinnedIDs: encoded, dataRoot: dataRoot) { _ in
             NativeAgentEngine.liveDeviceSync.engine.requestChatSnapshotPublication(includeTranscripts: includeTranscripts)
         }
     }
@@ -194,6 +235,8 @@ public final class TranscriptsFacade {
         guard let session = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else { return }
         await EventDeadlinePhysiology.refreshOnChanges(
             paths: [dataRoot.appendingPathComponent("chat/messages/\(session).jsonl")],
+            // Card answers elsewhere change a mirror's rows without touching its file.
+            notifications: [.nativeAgentChatTranscriptDidChange],
             debounceDelay: .milliseconds(100), refresh: refresh
         )
     }
@@ -203,21 +246,43 @@ public final class TranscriptsFacade {
         storage[sessionId] = slot
         return slot
     }
+    /// A committed store read for this session (a loader's result); the live turn stays over it.
     public func setMessages(_ messages: [ChatMessage], for sessionId: String) {
-        publishMessages(retainingPublishedCards(messages, for: sessionId), for: sessionId)
+        slot(for: sessionId).saved = messages
+        reproject(sessionId)
     }
-    /// Message writes retain the cards published by the transcript reader.
-    private func retainingPublishedCards(_ messages: [ChatMessage], for sessionId: String) -> [ChatMessage] {
-        let cards = Dictionary(slot(for: sessionId).messages.map { ($0.id, $0.inlineCards) },
-                               uniquingKeysWith: { _, last in last })
-        var retained = messages.map { message in
-            var message = message
-            message.inlineCards = cards[message.id] ?? []
-            return message
+    /// The conversation on screen is the saved conversation with the live turn over it, never a hand-kept copy.
+    private func reproject(_ sessionId: String) {
+        let slot = slot(for: sessionId)
+        let savedIDs = Set(slot.saved.map(\.id))
+        slot.live.removeAll { row in
+            guard !row.leads else { return false }
+            if savedIDs.contains(row.message.id) { return true }
+            // A row the store never took (a failed request, its notice) gives way to a newer completed reply.
+            return slot.saved.contains { $0.role == "assistant" && !$0.macChatPartial && !$0.macChatCancelled && !row.seen.contains($0.id) }
         }
-        let rowIDs = Set(retained.map(\.id))
-        retained += slot(for: sessionId).messages.filter { !$0.inlineCards.isEmpty && !rowIDs.contains($0.id) }
-        return retained
+        let leading = Dictionary(slot.live.filter(\.leads).map { ($0.message.id, $0.message) }, uniquingKeysWith: { first, _ in first })
+        let replaced = slot.live.filter(\.leads).reduce(into: Set<String>()) { $0.formUnion($1.replaces) }
+        var rows: [ChatMessage] = slot.saved.compactMap { row in
+            guard !replaced.contains(row.id) else { return nil }
+            guard var over = leading[row.id] else { return row }
+            over.inlineCards = row.inlineCards
+            return over
+        }
+        rows += slot.live.map(\.message).filter { !savedIDs.contains($0.id) }
+        if rows != slot.messages || !loadedSessions.contains(sessionId) { publishMessages(rows, for: sessionId) }
+    }
+    /// The turn is over: its rows stop leading and leave as the store takes them.
+    public func settleLive(_ sessionId: String, only messageId: String? = nil) {
+        let slot = slot(for: sessionId)
+        for index in slot.live.indices where messageId == nil || slot.live[index].message.id == messageId { slot.live[index].leads = false }
+        reproject(sessionId)
+    }
+    /// A live row that supersedes saved rows while its turn leads (a resumed reply over its partials).
+    public func appendLive(_ message: ChatMessage, to sessionId: String, replacing: Set<String>) {
+        let slot = slot(for: sessionId)
+        slot.live.append(LiveRow(message: message, replaces: replacing, seen: Set(slot.saved.map(\.id))))
+        reproject(sessionId)
     }
     private func publishMessages(_ messages: [ChatMessage], for sessionId: String) {
         let slot = slot(for: sessionId)
@@ -233,7 +298,8 @@ public final class TranscriptsFacade {
         guard loadedSessions.remove(sessionId) != nil else { return nil }
         let slot = slot(for: sessionId)
         let messages = slot.messages
-        publishMessages(retainingPublishedCards([], for: sessionId), for: sessionId)
+        slot.saved = []; slot.live = []
+        publishMessages([], for: sessionId)
         loadedSessions.remove(sessionId)
         return messages
     }
@@ -241,23 +307,35 @@ public final class TranscriptsFacade {
         let current = slot(for: sessionId)
         current.cardReads.write {
             current.readStatus = .current
+            current.saved = []; current.live = []
             publishMessages([], for: sessionId)
         }
     }
     /// The box for `messageId`, created if this is the first ask. Cheap enough
     /// to call from a view body: one dictionary lookup, no observation.
     public func streamingTailBox(forMessage messageId: String) -> ChatStreamingTailBox {
-        if let existing = streamingTailBoxes[messageId] { return existing }
+        if let existing = streamingTailBoxes[messageId] {
+            pruneStreamingTailBoxes()
+            return existing
+        }
         let box = ChatStreamingTailBox()
         streamingTailBoxes[messageId] = box
         streamingTailBoxOrder.append(messageId)
-        // A handful of live tails at once (the main window, detached panels,
-        // parallel sessions) is the whole working set; older rows are settled
-        // and render from the transcript.
-        while streamingTailBoxOrder.count > 8 {
-            streamingTailBoxes.removeValue(forKey: streamingTailBoxOrder.removeFirst())
-        }
+        pruneStreamingTailBoxes()
         return box
+    }
+    /// Eight is a cache target, never a limit on concurrent replies.
+    /// Mounted leaf views retain their box, including between a turn's final
+    /// chunk and its structural publication. Only unheld, inactive boxes leave.
+    private func pruneStreamingTailBoxes() {
+        guard streamingTailBoxes.count > 8 else { return }
+        let active = Set(turns.streamingBubbleIds.values)
+        streamingTailBoxOrder.removeAll { id in
+            guard streamingTailBoxes.count > 8, !active.contains(id),
+                  isKnownUniquelyReferenced(&streamingTailBoxes[id]) else { return false }
+            streamingTailBoxes.removeValue(forKey: id)
+            return true
+        }
     }
     /// Mutate only the tail and its leaf box, without publishing structure.
     /// False leaves an interior rewrite to the caller's structural path.
@@ -266,16 +344,19 @@ public final class TranscriptsFacade {
               slot.messages.last?.id == messageId
         else { return false }
         slot.messages[slot.messages.count - 1].content = content
+        if let live = slot.live.firstIndex(where: { $0.message.id == messageId }) { slot.live[live].message.content = content }
         // The one publication a streamed chunk makes: the leaf bubble for this
         // exact row. Nothing else observes it, so the parent list keeps its
         // structural snapshot and its layout.
         streamingTailBox(forMessage: messageId).content = content
         return true
     }
-    public func appendMessage(_ message: ChatMessage, to sessionId: String) {
-        var messages = self.messages(for: sessionId)
-        messages.append(message)
-        setMessages(messages, for: sessionId)
+    /// A row shown before the store holds it. `leads` only for the running turn's own rows; a notice, a
+    /// local help row or an unsent request is settled from birth and gives way to a newer completed reply.
+    public func appendMessage(_ message: ChatMessage, to sessionId: String, leads: Bool = true) {
+        let slot = slot(for: sessionId)
+        slot.live.append(LiveRow(message: message, leads: leads, seen: Set(slot.saved.map(\.id))))
+        reproject(sessionId)
     }
     @discardableResult
     public func refreshMessages(sessionId: String, cached: Bool = true) async throws -> Bool {
@@ -283,23 +364,21 @@ public final class TranscriptsFacade {
         return try await readPublishedTranscript(safeSessionId: safeSessionId, cached: cached).applied
     }
     public func removeMessage(id messageId: String, from sessionId: String) {
-        guard hasCachedTranscript(for: sessionId) else { return }
-        var rows = messages(for: sessionId)
-        rows.removeAll { $0.id == messageId }
-        setMessages(rows, for: sessionId)
+        let slot = slot(for: sessionId)
+        guard slot.live.contains(where: { $0.message.id == messageId }) else { return }
+        slot.live.removeAll { $0.message.id == messageId }
+        reproject(sessionId)
     }
     public func updateMessageContent(id messageId: String, in sessionId: String, content: String) {
         if setTailMessageContent(content, id: messageId, in: sessionId) { return }
-        guard hasCachedTranscript(for: sessionId) else { return }
-        var rows = messages(for: sessionId)
-        guard let index = rows.firstIndex(where: { $0.id == messageId }) else { return }
-        rows[index].content = content
-        setMessages(rows, for: sessionId)
+        let slot = slot(for: sessionId)
+        guard let index = slot.live.firstIndex(where: { $0.message.id == messageId }) else { return }
+        slot.live[index].message.content = content
+        reproject(sessionId)
     }
     internal func readPublishedTranscript(safeSessionId: String, cached: Bool)
         async throws -> (projection: TranscriptReadout, applied: Bool) {
         let current = slot(for: safeSessionId)
-        let lifecycleAtStart = turns.lifecycle(for: safeSessionId)
         var applied = false
         let outcome: Result<TranscriptReadout, Error> = await current.cardReads.read {
             do { return .success(try await readTranscriptProjection(safeSessionId: safeSessionId, cached: cached)) }
@@ -307,42 +386,10 @@ public final class TranscriptsFacade {
         } publish: { read in
             switch read {
             case .success(let projection):
-                let lifecycle = turns.lifecycle(for: safeSessionId)
-                applied = lifecycle == nil || lifecycle == lifecycleAtStart
-                var messages = current.messages
-                if applied {
-                    let local = hasCachedTranscript(for: safeSessionId) ? messages : nil
-                    let live = turns.streamingSessions.contains(safeSessionId) || turns.activeTurnIDsBySession[safeSessionId] != nil
-                    if !live || local?.isEmpty != false {
-                        messages = retainingPublishedCards(MacChatRetrySnapshot.preservingSyntheticNotice(
-                            disk: projection.messages, local: local, sessionId: safeSessionId,
-                            syntheticErrorIDPrefix: MacChatTurnRuntime.syntheticErrorIDPrefix,
-                            isCompletedAssistant: MacChatTurnRuntime.isCompletedAssistant), for: safeSessionId)
-                    }
-                    if turns.streamingSessions.contains(safeSessionId) {
-                        for (id, role, text) in [
-                            (turns.streamingUserTurnIds[safeSessionId], "user", turns.streamingUserTurnTexts[safeSessionId]),
-                            (turns.streamingBubbleIds[safeSessionId], "assistant", turns.streamingTexts[safeSessionId])
-                        ] {
-                            guard let id, !messages.contains(where: { $0.id == id }) else { continue }
-                            var row = ChatMessage(id: id, sessionId: safeSessionId, role: role, content: text ?? "")
-                            if role == "assistant" {
-                                var metadata = ChatMessageMetadata(); metadata.turnTraceId = turns.activeTurnIDsBySession[safeSessionId]
-                                row.metadata = metadata
-                            }
-                            messages.append(row)
-                        }
-                    }
-                }
+                applied = true
                 current.readStatus = .current
-                let cards = projection.cardsByRow
-                // Keep live rows while admitting card rows raised since this session was loaded.
-                let loadedRowIDs = Set(messages.map(\.id))
-                messages += projection.messages.filter { !$0.inlineCards.isEmpty && !loadedRowIDs.contains($0.id) }
-                for index in messages.indices { messages[index].inlineCards = cards[messages[index].id] ?? [] }
-                if messages != current.messages || (applied && !hasCachedTranscript(for: safeSessionId)) {
-                    publishMessages(messages, for: safeSessionId)
-                }
+                current.saved = projection.messages
+                reproject(safeSessionId)
             case .failure(let error):
                 current.readStatus = .unavailable(error.localizedDescription)
             }
@@ -358,13 +405,13 @@ extension TranscriptsFacade: QuietChatTranscriptPort {}
 @MainActor
 extension TranscriptsFacade {
     public func setWorkingCommentary(_ characters: Int, id messageId: String, in sessionId: String) {
-        var arr = messages(for: sessionId)
-        guard let idx = arr.lastIndex(where: { $0.id == messageId }),
-              arr[idx].metadata?.workingCommentaryChars != characters
+        let slot = slot(for: sessionId)
+        guard let index = slot.live.lastIndex(where: { $0.message.id == messageId }),
+              slot.live[index].message.metadata?.workingCommentaryChars != characters
         else { return }
-        var metadata = arr[idx].metadata ?? ChatMessageMetadata()
+        var metadata = slot.live[index].message.metadata ?? ChatMessageMetadata()
         metadata.workingCommentaryChars = characters
-        arr[idx].metadata = metadata
-        setMessages(arr, for: sessionId)
+        slot.live[index].message.metadata = metadata
+        reproject(sessionId)
     }
 }

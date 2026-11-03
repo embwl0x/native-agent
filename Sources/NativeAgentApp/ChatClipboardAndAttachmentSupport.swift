@@ -129,9 +129,8 @@ extension NativeAgentShared.ChatAttachmentTypeResolver {
                 case .success(let attachment):
                     appendImage(attachment)
                     showToast("Image pasted from clipboard")
-                case .failure:
-                    showToast("Clipboard image could not be pasted; choose a file instead")
-                    pickFiles()
+                case .failure(let refusal):
+                    showToast(refusal.message)
                 }
             }
             return

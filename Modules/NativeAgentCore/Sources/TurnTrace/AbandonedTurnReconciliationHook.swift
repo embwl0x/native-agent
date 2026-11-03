@@ -2,7 +2,7 @@ import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AbandonedTurnReconciliationHook.swift` | `AbandonedTurnReconciliationHook` enum; `arm`, `disarm`; retains sweep/resume jobs through exit and removes its observer at engine termination; excludes active turns and claims checkpoint resumes; terminal settlement awaits the installed anchor-intent adapter |
+// Blueprint: | `AbandonedTurnReconciliationHook.swift` | `AbandonedTurnReconciliationHook` enum; `arm`, `disarm`; retains sweep/resume jobs through exit and removes its observer at engine termination; excludes active turns and claims checkpoint resumes; terminal settlement awaits the installed anchor-intent adapter; post-resume confirmation uses a cancellable five-second flush covering this turn's prior write failures and outstanding accepted trace entries |
 
 /// Resume unfinished turns at launch; reconcile legacy turns at settled boundaries.
 @MainActor
@@ -101,7 +101,7 @@ public enum AbandonedTurnReconciliationHook {
             guard let resume else { throw CocoaError(.featureUnsupported) }
             try await resume(checkpoint)
             try Task.checkCancellation()
-            await TurnTraceBus.shared.drainForProcessExit()
+            try await TurnTraceBus.shared.flush(turnId: turnId)
             try Task.checkCancellation()
             try confirmed(checkpoint, dataRoot: dataRoot)
             await RepairOwed.settle(dataRoot, operation: "turn.reconcile:" + turnId,

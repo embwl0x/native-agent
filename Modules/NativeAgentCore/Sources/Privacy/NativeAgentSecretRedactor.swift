@@ -63,9 +63,10 @@ public enum NativeAgentSecretRedactor {
         if trimmed.hasPrefix("sk-") && trimmed.count > 20 { return true }
         if trimmed.hasPrefix("ghp_") && trimmed.count > 20 { return true }
         if trimmed.hasPrefix("xoxb-") && trimmed.count > 20 { return true }
-        if trimmed.range(of: #"sk-[A-Za-z0-9_\-]{10,}"#, options: .regularExpression) != nil { return true }
-        if trimmed.range(of: #"ghp_[A-Za-z0-9_]{10,}"#, options: .regularExpression) != nil { return true }
-        if trimmed.range(of: #"xoxb-[A-Za-z0-9_\-]{10,}"#, options: .regularExpression) != nil { return true }
+        // A token starts a word: "desk-park-future-proof" holds no "sk-" key.
+        if trimmed.range(of: #"\bsk-[A-Za-z0-9_\-]{10,}"#, options: .regularExpression) != nil { return true }
+        if trimmed.range(of: #"\bghp_[A-Za-z0-9_]{10,}"#, options: .regularExpression) != nil { return true }
+        if trimmed.range(of: #"\bxoxb-[A-Za-z0-9_\-]{10,}"#, options: .regularExpression) != nil { return true }
         if containsValidJWT(in: trimmed) { return true }
         return false
     }

@@ -90,6 +90,32 @@ is `script/install_app.sh`: `build_and_run.sh --build-only` assembles and signs
 the finished bundle; the installer verifies and transfers it, launches and
 checks authenticated readiness against the stamped source content identity,
 including dirty edits. Builders capture it after generation and before compilation.
+Stamping, the source-moved gates and installed readiness share the exact Git tree
+identity selected by `script/build_inputs.txt`: sources, manifests, generators and
+bundled resources (including shipped documentation). Update that inventory with
+assembly changes. Unbundled repository notes do not change this identity; equality
+remains exact. Local signing/model overrides remain separate build settings.
+
+Builds consume the committed `TurnPart+ShippedBodies.swift` upgrade table, including
+in a one-commit public export. After committing turn-body edits, maintainers explicitly
+run `swift script/generate_turn_part_versions.swift` with complete history and commit
+the generated table; ordinary builds do not regenerate it.
+
+The pre-commit timer gate runs the single classifier on an immutable staged tree,
+including its staged Swift, policy, classifier and TSV. Swift changes, inventory or
+policy edits trigger it, including removals. For explicit working-tree review use
+`swift script/check_timer_inventory.swift --repo .`.
+Source persona hygiene reads only tracked templates and shipped guidance, checks
+exact retired mechanisms and Markdown structure, and never scans live identity or
+runtime-generated guidance. General task vocabulary such as Python or daemon is valid.
+
+Failed installation retains the selected app and previous artifact and exits
+nonzero. The installer issues one checked LaunchServices request followed by
+bounded process and authenticated source/readiness observation. It never
+restores or launches an earlier executable; repair the selected build forward.
+Signing mode and host/widget product are selected before compilation; see
+[release setup](docs/release_setup.md).
+
 Codex shells use this installed-app path because the builder refuses GUI launch:
 
 ```bash
@@ -136,3 +162,8 @@ material, generated context databases, or local receipts.
 
 The compatibility-named `test-receipt.json` records artifact-only release
 evidence; it does not attest automated tests or installed-app behavior.
+
+The release receipt is atomically written beside the verified final DMG after
+its gate succeeds, binding the artifact name, SHA-256 and byte length. Public
+export produces source only; the actual release compile supplies the executable
+for the privacy/identity gate.

@@ -64,9 +64,17 @@ public final class MacWorkContinuation: @unchecked Sendable, Equatable {
             return "Takeover continuation could not be rendered. Request a new takeover; do not guess another app, window, or selection."
         }
     }
+    /// A refusal's output: its words and, when a missing grant caused it, that
+    /// grant's remedy, so the card goes up like any other grant refusal.
+    public func refusalOutput(_ refusal: String) -> [String: JSONValue] {
+        var output: [String: JSONValue] = ["message": .string(refusal)]
+        if case .object(let fields) = evidence, let remedy = fields["remedy"], remedy != .null { output["remedy"] = remedy }
+        return output
+    }
     public static func unsupported(_ reason: String, taskReference: String) -> MacWorkContinuation {
         MacWorkContinuation(app: nil, window: nil, focusPath: nil, selectionRange: nil,
             evidence: .object(["status": .string("unsupported"), "reason": .string(reason),
+                               "remedy": MacFourVerbsReply.privacyRemedy(reason) ?? .null,
                                "task_reference": .string(taskReference)]), check: { reason })
     }
 }

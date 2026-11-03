@@ -7,7 +7,8 @@ import Experiences
 import PersistenceCore
 import ScreenCaptureKit
 import Synchronization
-// Blueprint: | `MacScreenWatch+Hands.swift` | `MacScreenWatch.hand`: frame-pixel input through four verbs on the watch binding, with current authority, exact front window, secret drag bounds and person takeover |
+import NativeAgentShared
+// Blueprint: | `MacScreenWatch+Hands.swift` | `MacScreenWatch.hand`: one inherited call deadline before admission; frame-pixel input through four verbs on the watch binding, with current authority, exact front window, secret drag bounds and person takeover |
 
 extension MacScreenWatch {
     /// One hand in frame pixels: click, double_click, right_click and move at
@@ -18,6 +19,16 @@ extension MacScreenWatch {
     /// password fields, the watched window its app's front window at every
     /// event, the person's input never overridden.
     public func hand(_ verb: String, _ args: [String: JSONValue]) async throws -> JSONValue {
+        if TaskWaitDeadline.current == nil {
+            do {
+                return try await TaskWaitDeadline.withDeadline(
+                    seconds: Double(SwiftNativeMacControl.operationTimeoutSeconds(action: "hand", body: args))
+                ) { try await self.hand(verb, args) }
+            } catch is TaskWaitDeadline.Exceeded {
+                throw SenseFailure(code: "timed_out", message: MacFourVerbs.interruptedActReply(TaskWaitDeadline.Exceeded()).text)
+            }
+        }
+        if let refusal = handRefusal { throw SenseFailure(code: refusal.code, message: refusal.message, remedy: refusal.fields["remedy"]) }
         guard admitOperation() else { throw over ?? CancellationError() }
         defer { finishOperation() }
         guard let verbs, let binding else {

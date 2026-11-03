@@ -44,19 +44,12 @@ extension ProvidersFacade {
             let facade = self
             var catalog: ModelCatalogResponse?
             var catalogError: String?
-            if refreshCatalog {
-                do { catalog = try await facade.modelCatalog(refresh: true) }
-                catch { catalogError = cause(error, "refresh the model list") }
-            }
+            do { catalog = try await facade.modelCatalog(refresh: refreshCatalog) }
+            catch { catalogError = cause(error, refreshCatalog ? "refresh the model list" : "load the model list") }
             let snapshot = try await facade.routing.checkedProviderSnapshot()
             let providers = try await Task.detached(priority: .userInitiated) {
                 try ProvidersFacade.connections(from: snapshot)
             }.value
-            if catalog == nil {
-                do {
-                    catalog = try await facade.modelCatalog(refresh: false)
-                } catch { catalogError = cause(error, "load the model list") }
-            }
             return .loaded(try settingsSnapshot(
                 routing: snapshot.routing,
                 providers: providers,
@@ -128,7 +121,7 @@ extension ProvidersFacade {
     public struct AuthModePickerState: Equatable {
         public let supportedModes: [String]
         public let selectedMode: String
-        public let repairedSavedMode: String?
+        public let unresolvedSavedMode: String?
 
         public var canSave: Bool { supportedModes.contains(selectedMode) }
     }
@@ -139,8 +132,7 @@ extension ProvidersFacade {
 
     public nonisolated static func authModePickerState(
         advertisedModes: [String],
-        savedMode: String?,
-        providerIsReady: Bool
+        savedMode: String?
     ) -> AuthModePickerState {
         var seen = Set<String>()
         let supportedModes = advertisedModes.compactMap { raw -> String? in
@@ -155,16 +147,13 @@ extension ProvidersFacade {
             return AuthModePickerState(
                 supportedModes: supportedModes,
                 selectedMode: normalizedSavedMode,
-                repairedSavedMode: nil
+                unresolvedSavedMode: nil
             )
         }
-        let selected = providerIsReady && supportedModes.contains("oauth")
-            ? "oauth"
-            : (supportedModes.first ?? "")
         return AuthModePickerState(
             supportedModes: supportedModes,
-            selectedMode: selected,
-            repairedSavedMode: normalizedSavedMode?.isEmpty == false ? normalizedSavedMode : nil
+            selectedMode: "",
+            unresolvedSavedMode: normalizedSavedMode?.isEmpty == false ? normalizedSavedMode : nil
         )
     }
 }
@@ -176,46 +165,36 @@ extension ProvidersFacade {
         public let name: String
         public let defaultReasoningEffort: String
         public let supportedReasoningEfforts: [String]
+        public let reasoningCapabilitiesKnown: Bool
         public let supportsFast: Bool
         public let isUnavailable: Bool
 
         public init(id: String, name: String, defaultReasoningEffort: String,
-                    supportedReasoningEfforts: [String], supportsFast: Bool, isUnavailable: Bool) {
+                    supportedReasoningEfforts: [String], supportsFast: Bool, isUnavailable: Bool,
+                    reasoningCapabilitiesKnown: Bool) {
             self.id = id
             self.name = name
             self.defaultReasoningEffort = defaultReasoningEffort
             self.supportedReasoningEfforts = supportedReasoningEfforts
+            self.reasoningCapabilitiesKnown = reasoningCapabilitiesKnown
             self.supportsFast = supportsFast
             self.isUnavailable = isUnavailable
         }
     }
 
-    private nonisolated static let fallbackReasoningEfforts = ["low", "medium", "high", "xhigh"]
-    public nonisolated static func modelsForProvider(_ providerId: String, providers: [ProviderInfo], catalogModels: [ModelCatalogItem]) -> [SurfaceModelChoice] {
-        // A failed fetched catalog stays empty with `models_note`; it never borrows the provider-neutral list.
-        if let prov = providers.first(where: { $0.provider_id == providerId }),
-           !prov.models.isEmpty || Self.dynamicCatalogProviders.contains(providerId) {
-            return prov.models.map {
-                SurfaceModelChoice(
-                    id: $0.id,
-                    name: $0.name,
-                    defaultReasoningEffort: $0.default_reasoning_effort ?? "high",
-                    supportedReasoningEfforts: $0.supported_reasoning_efforts
-                        ?? Self.fallbackReasoningEfforts,
-                    supportsFast: $0.supports_fast == true,
-                    isUnavailable: false
-                )
-            }
-        }
-        return catalogModels.map {
+    public nonisolated static func modelsForProvider(_ providerId: String, providers: [ProviderInfo]) -> [SurfaceModelChoice] {
+        // This account's descriptor is the capability owner. A missing
+        // account/catalog cannot borrow another transport's model contracts.
+        guard let provider = providers.first(where: { $0.provider_id == providerId }) else { return [] }
+        return provider.models.map {
             SurfaceModelChoice(
                 id: $0.id,
-                name: $0.displayName,
-                defaultReasoningEffort: $0.defaultReasoningEffort ?? "high",
-                supportedReasoningEfforts: $0.supportedReasoningEfforts
-                    ?? Self.fallbackReasoningEfforts,
-                supportsFast: $0.supportsFast == true,
-                isUnavailable: false
+                name: $0.name,
+                defaultReasoningEffort: $0.default_reasoning_effort ?? "",
+                supportedReasoningEfforts: $0.supported_reasoning_efforts ?? [],
+                supportsFast: $0.supports_fast == true,
+                isUnavailable: false,
+                reasoningCapabilitiesKnown: $0.supported_reasoning_efforts != nil
             )
         }
     }
@@ -246,20 +225,19 @@ extension ProvidersFacade {
 }
 
 extension ProvidersFacade {
-    public nonisolated static func reconciledBrainForProvider(providerId: String, model: String, reasoningEffort: String?, fastMode: Bool, providers: [ProviderInfo], catalogModels: [ModelCatalogItem]) -> ProviderTurnChoice? {
-        let choices = ProvidersFacade.modelsForProvider(providerId, providers: providers, catalogModels: catalogModels)
-        guard let first = choices.first else { return nil }
-        let current = model
-        let choice = choices.first(where: { $0.id == current }) ?? first
+    public nonisolated static func reconciledBrainForProvider(providerId: String, model: String, reasoningEffort: String?, fastMode: Bool, providers: [ProviderInfo]) -> ProviderTurnChoice? {
+        let choices = ProvidersFacade.modelsForProvider(providerId, providers: providers)
+        guard let choice = choices.first(where: { $0.id == model }),
+              choice.reasoningCapabilitiesKnown else { return nil }
         let effort = ProviderRouting.normalizedReasoningEffort(
-            options: choice.supportedReasoningEfforts, preferred: choice.defaultReasoningEffort,
+            preferred: choice.defaultReasoningEffort,
             selected: reasoningEffort ?? choice.defaultReasoningEffort
         )
         return ProviderTurnChoice(
             provider: providerId,
             model: choice.id,
             reasoningEffort: effort,
-            fast: choice.supportsFast && fastMode
+            fast: fastMode
         )
     }
 
@@ -312,12 +290,10 @@ extension ProvidersFacade {
 
 }
 extension ProvidersFacade {
-    public nonisolated static let chatComposerFallbackEfforts = ["low", "medium", "high", "xhigh"]
-
     public nonisolated static func reasoningOptions(
         from catalog: ModelCatalogResponse?, selectedModel: ModelCatalogItem?
     ) -> [ReasoningEffortOption] {
-        let supported = selectedModel?.supportedReasoningEfforts ?? chatComposerFallbackEfforts
+        guard let supported = selectedModel?.supportedReasoningEfforts else { return [] }
         let catalogOptions = Dictionary(
             (catalog?.reasoningEfforts ?? []).map { ($0.id, $0) },
             uniquingKeysWith: { first, _ in first })
@@ -330,22 +306,16 @@ extension ProvidersFacade {
         }
     }
 
-    public nonisolated static func modelOptions(from catalog: ModelCatalogResponse?, current: String, limit: Int = 80) -> [ModelCatalogItem] {
-        let fallbackModels = (
-            FirstPartyModelCatalog.publicOpenAIModels
-            + FirstPartyModelCatalog.anthropicModels
-            + FirstPartyModelCatalog.xAIModels
-        ).enumerated().map { index, model in
-            ModelCatalogItem(model, priority: index)
-        }
-        let sourceModels = catalog?.models ?? CodexSelectableModelCatalog.modelCatalogItems() + fallbackModels
+    public nonisolated static func modelOptions(providers: [ProviderInfo], providerID: String, current: String, limit: Int = 80) -> [ModelCatalogItem] {
+        let sourceModels = providerModels(providers: providers, providerID: providerID)
         var seen: Set<String> = []
         var models: [ModelCatalogItem] = []
 
         if let currentModel = sourceModels.first(where: { $0.id == current }), seen.insert(currentModel.id).inserted {
             models.append(currentModel)
         } else if !current.isEmpty, seen.insert(current).inserted {
-            models.append(ModelCatalogItem(id: current, displayName: current, description: "Custom model", defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"], supportsFast: nil, priority: 999))
+            models.append(ModelCatalogItem(id: current, displayName: current,
+                description: "Saved model; capabilities unavailable. Reload Providers to read them.", priority: 999))
         }
 
         for model in sourceModels {
@@ -356,14 +326,24 @@ extension ProvidersFacade {
         return models
     }
 
-    public nonisolated static func reasoningOptions(from catalog: ModelCatalogResponse?, model: String) -> [ReasoningEffortOption] {
-        NativeAgentShared.reasoningOptions(available: catalog?.reasoningEfforts ?? defaultReasoningEffortOptions,
-            supported: catalog?.models.first(where: { $0.id == model })?.supportedReasoningEfforts, id: { $0.id })
+    private nonisolated static func providerModels(providers: [ProviderInfo], providerID: String) -> [ModelCatalogItem] {
+        providers.first { $0.provider_id == providerID }?.models.map { item in
+            ModelCatalogItem(id: item.id, displayName: item.name, description: nil,
+                defaultReasoningEffort: item.default_reasoning_effort,
+                supportedReasoningEfforts: item.supported_reasoning_efforts,
+                supportsFast: item.supports_fast, priority: 0)
+        } ?? []
     }
 
-    public nonisolated static func normalizedReasoningEffort(from catalog: ModelCatalogResponse?, model: String, selected: String) -> String {
-        ProviderRouting.normalizedReasoningEffort(options: reasoningOptions(from: catalog, model: model).map(\.id),
-            preferred: catalog?.models.first(where: { $0.id == model })?.defaultReasoningEffort, selected: selected)
+    public nonisolated static func reasoningOptions(from catalog: ModelCatalogResponse?, providers: [ProviderInfo], providerID: String, model: String) -> [ReasoningEffortOption] {
+        reasoningOptions(from: catalog, selectedModel: providerModels(providers: providers, providerID: providerID).first { $0.id == model })
+    }
+
+    public nonisolated static func normalizedReasoningEffort(from catalog: ModelCatalogResponse?, providers: [ProviderInfo], providerID: String, model: String, selected: String) -> String {
+        let selectedModel = providerModels(providers: providers, providerID: providerID).first { $0.id == model }
+        guard selectedModel?.supportedReasoningEfforts != nil else { return selected }
+        return ProviderRouting.normalizedReasoningEffort(
+            preferred: selectedModel?.defaultReasoningEffort, selected: selected)
     }
 }
 
@@ -408,12 +388,9 @@ public struct ChatComposerModelGroup: Identifiable {
                         id: item.id,
                         displayName: item.name,
                         description: catalogModel?.description,
-                        defaultReasoningEffort: item.default_reasoning_effort
-                            ?? catalogModel?.defaultReasoningEffort ?? "high",
-                        supportedReasoningEfforts: item.supported_reasoning_efforts
-                            ?? catalogModel?.supportedReasoningEfforts
-                            ?? ProvidersFacade.chatComposerFallbackEfforts,
-                        supportsFast: item.supports_fast ?? catalogModel?.supportsFast,
+                        defaultReasoningEffort: item.default_reasoning_effort,
+                        supportedReasoningEfforts: item.supported_reasoning_efforts,
+                        supportsFast: item.supports_fast,
                         priority: catalogModel?.priority ?? 0
                     )
                 }

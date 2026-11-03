@@ -14,7 +14,7 @@ import MemoryV2
 import PersistenceCore
 import TurnTrace
 import ChatTurnRuntime
-// Blueprint: | `ChatMessageListView.swift` | Windowed transcript interleaves HerScreen other-room exchanges from the contact projection; rows open the sidebar's contact thread; paging, grouping and card placement stay on the transcript rows |
+// Blueprint: | `ChatMessageListView.swift` | Windowed transcript interleaves HerScreen other-room exchanges using the shared Mac/phone compact preview; live text follows the session owner's streaming row without caller busy-state gating; paging, grouping and card placement stay on the transcript rows |
 
 enum ChatTranscriptWindow {
     static func range(count: Int, start: Int? = nil) -> Range<Int> {
@@ -74,8 +74,6 @@ struct ChatMessageListView: View {
     // Detached panels pass their session identity for structural preparation
     // and the streaming bubble's current-session presentation.
     var sessionId: String = ""
-    /// This session's streaming state makes its final assistant row the live tail.
-    var isStreaming: Bool = false
     /// The current transcript-search result. Highlighting is projection-only;
     /// it never changes or filters canonical messages.
     var highlightedMessageID: String? = nil
@@ -174,8 +172,9 @@ struct ChatMessageListView: View {
                     UserDisplayFormatters.parseISOTimestamp(message.createdAt).map { (id: group.id, at: $0) }
                 }
             })
-        let tailId = messages.last.flatMap { $0.role == "assistant" ? $0.id : nil }
-        let liveTailId = isStreaming ? tailId : nil
+        // Delivery owns this row even when no Mac send reserved the session.
+        // Busy state and a previous turn's settled lifecycle cannot gate its box.
+        let liveTailId = appModel.engine.turns.streamingBubbleIds[sessionId]
         let cardMount = InlineCardMount.map(groups: groups, messages: messages,
             readStatus: appModel.engine.transcripts.transcriptReadStatus(for: sessionId))
         let relocatedRows = cardMount.relocated
@@ -274,10 +273,7 @@ struct ChatMessageListView: View {
             Button {
                 openedContact = appModel.engine.contactThreads.contacts.first { $0.id == exchange.contactID }
             } label: {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(exchange.title)
-                    Text(exchange.subtitle).foregroundStyle(.secondary)
-                }.font(.callout).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                OtherRoomExchangePreview(exchange: exchange)
             }
             .buttonStyle(.plain)
             .disabled(!appModel.engine.contactThreads.contacts.contains { $0.id == exchange.contactID })

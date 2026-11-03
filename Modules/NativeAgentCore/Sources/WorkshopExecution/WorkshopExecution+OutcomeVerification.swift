@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ChatToolParsing
-// Blueprint: | `WorkshopExecution+OutcomeVerification.swift` | `WorkshopExecutorLoop`: `unmetSuccessCriterion`, `verifyCompletedOutcome` |
+// Blueprint: | `WorkshopExecution+OutcomeVerification.swift` | `WorkshopExecutorLoop`: `unmetSuccessCriterion`, `verifyCompletedOutcome`; unreadable action contracts leave completed outcomes unverified with their cause, never reinterpret completed effects |
 
 extension WorkshopExecutorLoop {
     /// Explicit output phrases match produced content, excluding receipt metadata.
@@ -66,7 +66,12 @@ extension WorkshopExecutorLoop {
         var unsupportedAction = false
         var writes: [String: [WorkshopExecutionStep]] = [:]
         for step in record.plan {
-            let call = Self.resolvedStepCall(step, execution: record)
+            let call: (tool: String, args: JSONValue, sourceArgs: JSONValue, readOnly: Bool)
+            do { call = try Self.resolvedStepCall(step, execution: record) }
+            catch {
+                return WorkshopVerificationRecord(status: .unverified, checkedAt: checkedAt, methods: methods,
+                    detail: "Action-contract evidence is unavailable: \(error.localizedDescription). Completed operations retain their outcomes; repair the contract before verifying again.")
+            }
             let completed = record.stepsCompleted.last { $0.objectValue?["step_id"] == .string(step.id) }?.objectValue
             let output = completed?["output"] ?? .null
             if call.tool == "write_file" {
@@ -92,7 +97,13 @@ extension WorkshopExecutorLoop {
         }
         for path in writes.keys.sorted() {
             guard let steps = writes[path] else { continue }
-            switch verifyFileWrites(steps: steps, path: path, record: record, fileManager: fileManager) {
+            let verdict: FileVerificationVerdict
+            do { verdict = try verifyFileWrites(steps: steps, path: path, record: record, fileManager: fileManager) }
+            catch {
+                return WorkshopVerificationRecord(status: .unverified, checkedAt: checkedAt, methods: methods,
+                    detail: "File-write contract evidence is unavailable: \(error.localizedDescription). Completed writes retain their outcomes; repair the contract before verifying again.")
+            }
+            switch verdict {
             case .satisfied:
                 hasExactEvidence = true
                 if !methods.contains("file_bytes") { methods.append("file_bytes") }
@@ -135,11 +146,11 @@ extension WorkshopExecutorLoop {
     private static func verifyFileWrites(
         steps: [WorkshopExecutionStep], path: String,
         record: WorkshopExecutionRecord, fileManager: FileManager
-    ) -> FileVerificationVerdict {
+    ) throws -> FileVerificationVerdict {
         var expected = Data()
         var append = true
         for step in steps {
-            guard case .object(let args) = Self.resolvedStepCall(step, execution: record).args,
+            guard case .object(let args) = try Self.resolvedStepCall(step, execution: record).args,
                   case .string(let content)? = args["content"] else {
                 return .failed("write_file has no exact declared content")
             }

@@ -35,7 +35,7 @@ extension MacSyncEngine {
                     switch event.kind {
                     case .delta(let delta):
                         guard let flush = state.turns[run, default: ICloudTextDeltaCoalescer()].push(
-                                delta: delta, nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+                                delta: delta
                               ) else { return false }
                         text = flush.text
                         kind = "text_delta"
@@ -43,7 +43,7 @@ extension MacSyncEngine {
                     case .answered(let answer):
                         state.turns.removeValue(forKey: run)
                         text = answer
-                        kind = nil
+                        kind = "final"
                         sequence = nil
                     case .incomplete(let answer, _):
                         state.turns.removeValue(forKey: run)

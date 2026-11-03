@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id":"make-title","kind":"tool","version":1,
+{"id":"make-title","kind":"ability","version":1,
  "reach":{"capabilities":[]},"face":{"projection":true},
  "record":{"description":"The title of a Make preview, from its decoded HTML title, prompt or filename.","actions":[],"inputSchema":{"type":"object","required":["html","prompt","filename"]}}}
 */

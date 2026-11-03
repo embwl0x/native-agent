@@ -1,13 +1,16 @@
 import CognitiveSubstrate
 import Foundation
+import Experiences
 import PersistenceCore
 import NativeAgentShared
 
-// Blueprint: | `CaringReceiptLog.swift` | `CaringReceiptLog`: typed interpretation receipts, serialized amendments and dosing evidence |
+// Blueprint: | `CaringReceiptLog.swift` | `CaringReceiptLog`: runtime-root-bound checked interpretation receipts and serialized dosing amendments; failed serialization, reads, framing, matches or publication retain receipt-only repair debt at that root without replaying effects |
 
 /// One actor records typed interpretations and serializes their dosing amendments.
 actor CaringReceiptLog {
-    static let shared = CaringReceiptLog()
+    private let dataRoot: URL
+
+    init(dataRoot: URL) { self.dataRoot = dataRoot }
 
     /// Record one metadata/verdict receipt per appraisal, never the message text.
     func record(
@@ -31,9 +34,10 @@ actor CaringReceiptLog {
             row["outcome"] = "unparseable"
             row["rawPrefix"] = "{}"
         }
-        guard let data = try? JSONSerialization.data(withJSONObject: row),
-              let line = String(data: data, encoding: .utf8) else { return }
-        append(line)
+        do {
+            let data = try JSONSerialization.data(withJSONObject: row)
+            try append(String(decoding: data, as: UTF8.self))
+        } catch { retainFailure(error, session: receiptSessionKey(request.session), turn: request.turn) }
     }
 
     /// The session key the receipt carries. The row stores a prefix, so the sink
@@ -43,7 +47,7 @@ actor CaringReceiptLog {
     }
 
     private var url: URL {
-        PersistenceCore.defaultDataRoot()
+        dataRoot
             .appendingPathComponent("cognition", isDirectory: true)
             .appendingPathComponent("caring_appraisals.jsonl")
     }
@@ -109,24 +113,34 @@ actor CaringReceiptLog {
     }
 
     /// Retain the newest 2,000 lines only after the log exceeds 1,000,000 bytes.
-    private func append(_ line: String) {
-        let url = self.url
-        do {
-            try SwiftNativePersistenceCore.appendLines(Data((line + "\n").utf8), to: url)
-            try enforceJSONLRetention(at: url, maxLines: 2000, trimWhenBytesExceed: 1_000_001)
-        } catch {
-            nativeLog("caring: receipt append/retention failed at %@: %@", url.path, error.localizedDescription)
-        }
+    private func append(_ line: String) throws {
+        try SwiftNativePersistenceCore.appendLines(Data((line + "\n").utf8), to: url)
+        try enforceJSONLRetention(at: url, maxLines: 2000, trimWhenBytesExceed: 1_000_001)
+    }
+
+    private func retainFailure(_ error: Error, session: String, turn: String) {
+        RepairOwed.owe(dataRoot, id: "caring-receipt:" + session + ":" + turn,
+            kind: .run, operation: "cognition.caring.receipt:" + session + ":" + turn,
+            owner: url.path,
+            words: "The caring receipt is not settled: " + error.localizedDescription,
+            tap: "Repair cognition/caring_appraisals.jsonl while preserving its bytes; settle the receipt only, without repeating the feeling or dose.")
     }
 
     /// Find the last row for this session+turn that has no dosing yet, put the
     /// outcome on it, and leave every other byte alone. A row that cannot be
-    /// found (log rotated, receipt write failed) gets nothing — a stray orphan
-    /// line would be worse than a missing field.
+    /// found (log rotated, receipt write failed) remains an explicit repair
+    /// obligation; no orphan line invents an appraisal that was not recorded.
     private func amend(session: String, turn: String, dosing: Dosing) {
+        do { try amendChecked(session: session, turn: turn, dosing: dosing) }
+        catch { retainFailure(error, session: session, turn: turn) }
+    }
+
+    private func amendChecked(session: String, turn: String, dosing: Dosing) throws {
         let url = self.url
-        guard let blob = try? Data(contentsOf: url),
-              let text = String(data: blob, encoding: .utf8) else { return }
+        let blob = try Data(contentsOf: url)
+        guard let text = String(data: blob, encoding: .utf8) else {
+            throw PersistenceCoreError.ioFailure("Caring receipts are not valid UTF-8.")
+        }
         // Keep the exact byte layout: split on newlines, remember the trailing
         // one, and only the matched line changes.
         var lines = text.components(separatedBy: "\n")
@@ -134,23 +148,25 @@ actor CaringReceiptLog {
         if endedWithNewline { lines.removeLast() }
         var match: (Int, [String: Any])?
         for index in lines.indices.reversed() {
-            guard let row = (try? JSONSerialization.jsonObject(with: Data(lines[index].utf8))) as? [String: Any],
-                  row["session"] as? String == session, row["turn"] as? String == turn,
+            guard let row = try JSONSerialization.jsonObject(with: Data(lines[index].utf8)) as? [String: Any] else {
+                throw PersistenceCoreError.ioFailure("Caring receipt row " + String(index + 1) + " is not an object.")
+            }
+            guard row["session"] as? String == session, row["turn"] as? String == turn,
                   row["dosing"] == nil else { continue }
             match = (index, row)
             break
         }
-        guard let (index, object) = match else { return }
+        guard let (index, object) = match else {
+            throw PersistenceCoreError.ioFailure("The undosed caring receipt for " + session + ":" + turn + " was not found; preserve the log and reconcile the missing settlement.")
+        }
         var row = object
         row["dosing"] = dosing.label
         if let why = dosing.why { row["dosingWhy"] = why }
         row["tendernessAfter"] = dosing.tendernessAfter
-        guard let amended = try? JSONSerialization.data(withJSONObject: row),
-              let line = String(data: amended, encoding: .utf8) else { return }
-        lines[index] = line
+        let amended = try JSONSerialization.data(withJSONObject: row)
+        lines[index] = String(decoding: amended, as: UTF8.self)
         var out = lines.joined(separator: "\n")
         if endedWithNewline { out += "\n" }
-        do { try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(out.utf8), to: url) }
-        catch { nativeLog("caring: receipt not amended at %@: %@", url.path, error.localizedDescription) }
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(out.utf8), to: url)
     }
 }

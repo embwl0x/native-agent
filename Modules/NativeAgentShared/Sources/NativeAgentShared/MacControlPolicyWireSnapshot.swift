@@ -2,7 +2,7 @@ import Foundation
 
 // Blueprint: | `MacControlPolicyWireSnapshot.swift` | `MacControlPolicyWireSnapshot`: shared Codable/Hashable policy snapshot, decoding/defaults; TrustCenter retains policy authority |
 
-/// Shared policy fields and compatibility defaults; TrustCenter retains authority.
+/// Shared policy fields and shipped values for unset settings; TrustCenter retains authority.
 public struct MacControlPolicyWireSnapshot: Codable, Hashable, Sendable {
     public var enabled: Bool
     public var applesScriptAllowed: Bool

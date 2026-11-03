@@ -3,7 +3,7 @@ import PersistenceCore
 #if canImport(CoreSpotlight)
 import CoreSpotlight
 import NativeAgentShared
-// Blueprint: | `MemoryV2+Spotlight.swift` | Canonical generation-proven rebuild shared by launch and repair, serialized with incremental Spotlight projections before taking its snapshot; isolated roots never alter system Spotlight |
+// Blueprint: | `MemoryV2+Spotlight.swift` | Canonical generation-proven rebuild shared by launch and repair, serialized with incremental Spotlight projections; native searchable-item expiration follows canonical valid_to without a timer; isolated roots never alter system Spotlight |
 #endif
 
 // MARK: - Core Spotlight indexer for memory records.
@@ -25,19 +25,22 @@ public struct SpotlightItem: Sendable, Codable, Equatable {
     public let contentDescription: String
     public let keywords: [String]
     public let domainIdentifier: String
+    public let expirationDate: Date?
 
     public init(
         id: String,
         title: String,
         contentDescription: String,
         keywords: [String],
-        domainIdentifier: String
+        domainIdentifier: String,
+        expirationDate: Date?
     ) {
         self.id = id
         self.title = title
         self.contentDescription = contentDescription
         self.keywords = keywords
         self.domainIdentifier = domainIdentifier
+        self.expirationDate = expirationDate
     }
 }
 
@@ -59,11 +62,13 @@ public final class SystemSpotlightIndexClient: SpotlightIndexClient, @unchecked 
             attrs.title = item.title
             attrs.contentDescription = item.contentDescription
             attrs.keywords = item.keywords
-            return CSSearchableItem(
+            let searchable = CSSearchableItem(
                 uniqueIdentifier: item.id,
                 domainIdentifier: item.domainIdentifier,
                 attributeSet: attrs
             )
+            if let expiry = item.expirationDate { searchable.expirationDate = expiry }
+            return searchable
         }
         try await CSSearchableIndex.default().indexSearchableItems(mapped)
     }
@@ -102,8 +107,15 @@ public actor SwiftNativeMemoryIndexer {
         self.domain = domain
     }
 
-    public func indexRecord(id: String, text: String, kind: String?) async throws {
-        let item = Self.makeItem(id: id, text: text, kind: kind, domain: domain)
+    public func indexRecord(id: String, text: String, kind: String?, validTo: String?) async throws {
+        // The canonical readback supplies the interval, not the hook's wake hint.
+        try MemoryStorage.validateTemporalEvidence(id: id, validFrom: nil, validTo: validTo, observedAt: nil)
+        guard MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: validTo, at: Date()) else {
+            try await remove(id: id)
+            return
+        }
+        let item = Self.makeItem(id: id, text: text, kind: kind,
+                                 expirationDate: validTo.flatMap(MemoryRecallScoring.parseTimestamp), domain: domain)
         try await client.index([item])
     }
 
@@ -111,7 +123,7 @@ public actor SwiftNativeMemoryIndexer {
         try await client.delete(ids: [id])
     }
 
-    static func makeItem(id: String, text: String, kind: String?, domain: String = defaultDomain) -> SpotlightItem {
+    static func makeItem(id: String, text: String, kind: String?, expirationDate: Date?, domain: String = defaultDomain) -> SpotlightItem {
         let title = String(text.prefix(80))
         let keywords: [String] = kind.map { [$0] } ?? []
         return SpotlightItem(
@@ -119,7 +131,8 @@ public actor SwiftNativeMemoryIndexer {
             title: title,
             contentDescription: text,
             keywords: keywords,
-            domainIdentifier: domain
+            domainIdentifier: domain,
+            expirationDate: expirationDate
         )
     }
 }

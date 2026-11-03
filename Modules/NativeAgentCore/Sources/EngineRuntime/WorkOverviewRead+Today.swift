@@ -17,7 +17,9 @@ import ToolExecution
 import Senses
 import AgentConversations
 import TrustCenter
-// Blueprint: | `WorkOverviewRead+Today.swift` | `TodayReadout` freezes checked sources and provenance, feeds the pure `today-readout.js` faces through L0's version/epoch cache, binds source IDs to native dates and note links, and publishes through `LatestRead`; waiting counts share a pure face too. `TodayDreamDigest` reads the latest dream through `DreamNight`; native input supplies its title, mood and timestamp, never diary Markdown for JS to parse. Narration, grouping, due words and ordering live in the part. Unbound rows are omitted individually with native reasons; other activity, Ahead, earlier notes and note links remain. Native unavailable evidence, localization and live clock gutters remain. Mac and quiet reads consume the same prepared rows |
+import AgentWorkspace
+import TurnTrace
+// Blueprint: | `WorkOverviewRead+Today.swift` | `TodayReadout` freezes checked sources and provenance, including bounded trace counts for thinking and open MY QUEUE intentions' next clock moments within seven days, feeds the pure `today-readout.js` faces through L0's version/epoch cache, binds source IDs to native dates and note links, and publishes through `LatestRead`; waiting counts share a pure face too. `TodayDreamDigest` reads the latest dream through `DreamNight`; native input supplies its title, mood and timestamp, never diary Markdown for JS to parse. Narration, grouping, due words and ordering live in the part. Unbound rows are omitted individually with native reasons; other activity, Ahead, earlier notes and note links remain. Native unavailable evidence, localization and live clock gutters remain. Mac and quiet reads consume the same prepared rows |
 
 /// One line of her day. Payload-free by construction: a title, one plain
 /// sentence, and when it happened (or is due). `details` is non-empty only on
@@ -403,10 +405,18 @@ private struct TodayDecision: Sendable {
             return "Today row \(section.id.dropFirst("omitted:".count)) omitted: " + reason
         }
         func rows(_ prefix: String) -> [Row] {
-            face.sections.filter { $0.id.hasPrefix(prefix) }.map { section in
+            face.sections.filter { $0.id.hasPrefix(prefix) }.compactMap { section in
                 let id=String(section.id.dropFirst(prefix.count))
+                guard let title = section.title else {
+                    omissions.append("Today row \(id) unavailable: missing title.")
+                    return nil
+                }
+                guard let first = section.rows.first else {
+                    omissions.append("Today row \(id) unavailable: missing source rows.")
+                    return nil
+                }
                 let details=face.sections.first { $0.id == "details:"+id }?.rows.map(\.title) ?? []
-                return Row(id:id,title:section.title ?? "",line:section.rows.first?.title ?? "",
+                return Row(id:id,title:title,line:first.title,
                     sources:section.rows.map(\.id),details:details)
             }
         }
@@ -469,6 +479,18 @@ private struct TodaySource: Sendable {
             source.unavailable.append("Notes source has not been read.")
         } else { notesState = engine.inbox.items.isEmpty ? "empty" : "available" }
         source.input["sourceStates"] = .object(["conversations": .string(sessionState), "notes": .string(notesState)])
+        do {
+            let thinking = try await TurnTraceThinkingReader.shared.read(dataRoot: engine.dataRoot, now: now)
+            func counts(_ value: TurnTraceThinkingReader.Counts) -> JSONValue {
+                .object(["calls": .int(Int64(value.calls)), "turns": .int(Int64(value.turns))])
+            }
+            source.facts["thinking"] = .init(at: now)
+            source.input["thinking"] = .object(["state": .string("available"), "at": .double(now.timeIntervalSince1970),
+                "today": counts(thinking.today), "week": counts(thinking.week)])
+        } catch {
+            source.unavailable.append("Thinking source unavailable: " + error.localizedDescription)
+            source.input["thinking"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)])
+        }
         var moments: [JSONValue] = []
         do {
             let kept = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: engine.dataRoot).listMemory(kind: MemoryMoments.kind)
@@ -516,7 +538,8 @@ private struct TodaySource: Sendable {
             source.dreamUnavailable = true
             source.input["dream"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)])
         }
-        let dreamEnabled = await engine.cognitionView.dreamEnabled()
+        do {
+        let dreamEnabled = try await engine.cognitionView.dreamEnabled()
         var next: Date?
         var scheduleUnavailable = false
         if dreamEnabled {
@@ -534,6 +557,11 @@ private struct TodaySource: Sendable {
         }
         if let next { source.facts["nextDream"] = .init(at: next) }
         source.input["nextDream"] = .object(["state":.string(next != nil ? "available" : scheduleUnavailable ? "unavailable" : "empty"),"enabled":.bool(dreamEnabled),"at":next.map { .double($0.timeIntervalSince1970) } ?? .null])
+        } catch {
+            source.dreamUnavailable = true
+            source.unavailable.append(error.localizedDescription)
+            source.input["nextDream"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)])
+        }
         if let toward = await engine.cognitionView.towardRead() {
             source.facts["facing"] = .init(at: toward.dueAt, horizon: !today(toward.dueAt))
             let weekday=toward.dueAt.formatted(Date.FormatStyle(calendar:calendar,timeZone:calendar.timeZone).weekday(.wide))
@@ -542,6 +570,31 @@ private struct TodaySource: Sendable {
                 "today":.bool(today(toward.dueAt)),"tomorrow":.bool(calendar.isDateInTomorrow(toward.dueAt)),
                 "weekday":.string(weekday),"at":.double(toward.dueAt.timeIntervalSince1970)])
         } else { source.input["toward"] = .object(["state":.string(engine.cognition == nil ? "unavailable" : "empty")]) }
+        do {
+            let state = try await engine.desk.store.liveState()
+            let horizon = now.addingTimeInterval(7 * 86_400)
+            let intentions = MyQueue.entries(state).compactMap { entry -> JSONValue? in
+                guard MyQueue.migrationReady(entry.step, dataRoot: engine.dataRoot),
+                      entry.step.status != "stopped", !MyQueue.isOver(entry, at: now) else { return nil }
+                let next: Date?
+                guard let condition = MyQueue.when(entry) else { return nil }
+                switch condition {
+                case .at(let at): next = at
+                case .every: next = IntentionClock.next(entry.step, after: now)
+                default: next = nil
+                }
+                guard let next, next >= now, next <= horizon,
+                      MyQueue.until(entry).endsAt.map({ next < $0 }) ?? true else { return nil }
+                let key = "intention:" + entry.item.handle
+                source.facts[key] = .init(at: next)
+                return .object(["key": .string(key), "at": .double(next.timeIntervalSince1970),
+                    "time": .string(ResidentWake.shown(next)), "words": .string(entry.step.words)])
+            }
+            source.input["intentions"] = .object(["state": .string("available"), "rows": .array(intentions)])
+        } catch {
+            source.unavailable.append("Intentions source unavailable: " + error.localizedDescription)
+            source.input["intentions"] = .object(["state": .string("unavailable"), "reason": .string(error.localizedDescription)])
+        }
         var recollections: [JSONValue] = [], builders: [JSONValue] = []
         var loaded: [String: [ChatMessage]] = [:]
         for id in WorkOverviewRead.todaySessionIDs(sessions) {
@@ -571,8 +624,8 @@ private struct TodaySource: Sendable {
                     let turns = (loaded[session.id] ?? []).compactMap { message -> (Date, Bool)? in
                         if let at = TodayWords.parseTimestamp(message.createdAt), today(at) {
                             let human = message.role == "user" && SessionMessageProvenance.make(role: message.role,
-                                source: message.source, hasOrigin: message.metadata?.origin != nil,
-                                surface: message.metadata?.origin?.surface, agent: message.metadata?.origin?.agent)?.isAutomated != true
+                                source: message.source, hasEnvelope: message.metadata?.envelope != nil,
+                                surface: message.metadata?.envelope?.surface, agent: message.metadata?.envelope?.agent)?.isAutomated != true
                             return (at,human)
                         }
                         return nil
@@ -616,8 +669,7 @@ private struct TodaySource: Sendable {
                 let key = "inbox:" + item.id
                 source.facts[key] = .init(at: at, note: item)
                 // Only the native owner's job identity is allowed to bind a fold.
-                let slug = item.title.split(separator: ":", maxSplits: 1).dropFirst().first.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                let job = item.relatedWorkshopExecutionId?.isEmpty == false ? item.relatedWorkshopExecutionId : slug
+                let job = item.relatedDelegationID.flatMap { $0.isEmpty ? nil : $0 }
                 return .object(["key": .string(key), "at": .double(at.timeIntervalSince1970), "today": .bool(today(at)),
                     "source": .string(item.source), "title": .string(TodayWords.withoutIDs(TodayWords.line(item.title,limit:90))),
                     "summary": .string(TodayWords.withoutIDs(TodayWords.firstSentence(item.summary))), "job": job.map(JSONValue.string) ?? .null])
@@ -743,10 +795,13 @@ public final class TodayReadout {
                 root.appendingPathComponent("memory/memory.sqlite-wal"),
                 root.appendingPathComponent("trust/policy.json"),
                 root.appendingPathComponent("scheduler/jobs.json"),
+                root.appendingPathComponent("desk/desk_ops.jsonl"),
+                root.appendingPathComponent("desk/desk_ops_base.json"),
                 root.appendingPathComponent("dream_diary", isDirectory: true),
                 root.appendingPathComponent("chat/sessions.json"),
                 root.appendingPathComponent("chat/messages", isDirectory: true),
-            ] + transcripts, notifications: [.NSSystemTimeZoneDidChange, .NSCalendarDayChanged, AbilityStore.didChange]) {
+            ] + transcripts, notifications: [.NSSystemTimeZoneDidChange, .NSCalendarDayChanged,
+                .turnTraceTerminalPersisted, AbilityStore.didChange]) {
                 await refreshQueues()
                 await publishWorkStatus()
                 if let engine { await self?.refresh(engine, activeSessionID: activeSessionID()) }

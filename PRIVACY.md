@@ -74,6 +74,26 @@ records are associated with the user's Apple account and are governed by
 Apple's terms and privacy policy. NativeAgent does not use a public CloudKit
 database for personal agent data.
 
+Optional phone senses start off in Settings → Places and Phone senses.
+Their switches explicitly permit enabled place names/transition times, motion
+estimates and confidence, Focus status, charging/night clues, battery percentage,
+app audio-route category, network type, Music playback/title/artist, or a count
+of visible photos dated today to travel through paired iCloud to the Mac and
+its selected AI provider. Coordinates, audio, images and network/device names
+are not shared by these senses. Limited Photos access yields a labelled partial
+count, including zero; synced/imported photos may count. Setup state (switch,
+required/current permission, saved/enabled place counts and missing steps) is
+shared so an agent can guide setup even when an observation switch is off.
+Turning a sense off retires unsent observations and shares disabled; accepted
+history remains, bounded to 64 place events and 64 sense/setup events on the Mac.
+Pairing replacement turns senses off and retires the old pairing's outbox.
+No HealthKit sleep/workouts, pedometer fitness totals or WeatherKit data use
+this route. See [phone senses](docs/mobile_companion.md#where-the-person-is).
+
+iPhone composer voice input sends recognized text to the Mac, without an audio
+recording. The [mobile voice-input contract](docs/mobile_companion.md#voice-notes)
+describes on-device recognition and when Apple's speech service may process input.
+
 Apple Push Notification service may process a device token and bounded
 notification payload so the iPhone or iPad can be notified of new activity.
 Notification previews can reveal content on a locked device according to the
@@ -88,8 +108,12 @@ without those entitlements cannot provide mobile pairing or continuity.
 NativeAgent requests access only when a corresponding feature needs it.
 Permissions can include:
 
-- microphone and speech recognition for push-to-talk dictation;
-- photo-library access for user-selected chat attachments;
+- microphone and speech recognition for dictation and voice notes;
+- photo-library access for user-selected chat attachments or the opt-in,
+  count-only Photos today sense (Limited Access is enough);
+- phone location for saved Places, Motion & Fitness for opted-in activity
+  estimates, Focus Status, and Media & Apple Music for opted-in now-playing
+  metadata;
 - notifications for alerts and background delivery;
 - Calendar, Reminders, Contacts, Mail, Messages, Notes, Music, Accessibility,
   Screen Recording, or Automation on the Mac when the user enables the

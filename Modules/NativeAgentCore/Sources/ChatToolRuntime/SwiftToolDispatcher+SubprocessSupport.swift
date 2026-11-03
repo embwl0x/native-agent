@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `SwiftToolDispatcher+SubprocessSupport.swift` | `SubprocessWork` owns launch admission, verified process tree, timeout and physical exit; Stop freezes and kills the effect tree immediately, then `settle` releases descendants and runs the adapter's one output/audit settlement; shared bounded invoke/image pipe capture with adapter-specific limits and decoding |
+import NativeAgentShared
+// Blueprint: | `SwiftToolDispatcher+SubprocessSupport.swift` | `SubprocessWork` owns launch admission, the exact before-exec process group, execution timeout and checked terminal observation; retained observation ends only its wait, while explicit abort addresses the exact audit-path owner; `settle` retains captured output/audit and releases resources once; shared bounded invoke/image pipe capture |
 
 extension SwiftToolDispatcher {
     /// Bounded pipe capture shared by builder and image subprocess adapters.
@@ -12,12 +13,14 @@ extension SwiftToolDispatcher {
         private let stderrDrain: ProcessPipeDrain
         private let stdout: Pipe
         private let stderr: Pipe
+        private let process: ManagedProcess
 
-        init(process: Process, stdoutCap: Int = 512 * 1024, stderrCap: Int = 128 * 1024,
+        init(process: ManagedProcess, stdoutCap: Int = 512 * 1024, stderrCap: Int = 128 * 1024,
              onStdoutLine: (@Sendable (String) -> Void)? = nil) throws {
             let stdout = Pipe(), stderr = Pipe()
             self.stdout = stdout
             self.stderr = stderr
+            self.process = process
             let stdoutBuffer = BoundedBuffer(cap: stdoutCap, onLine: onStdoutLine)
             let stderrBuffer = BoundedBuffer(cap: stderrCap)
             self.stdoutBuffer = stdoutBuffer
@@ -54,6 +57,7 @@ extension SwiftToolDispatcher {
                 : { String(decoding: $0, as: UTF8.self) }
             var stdoutText = decode(stdoutBuffer.data)
             var stderrText = decode(stderrBuffer.data)
+            if let failure = process.terminationError { stderrText += "\n" + failure }
             if appendTruncationNotes, stdoutBuffer.truncated {
                 stdoutText += "\n[stdout truncated]"
             }
@@ -68,14 +72,60 @@ extension SwiftToolDispatcher {
     /// Stop freezes the tree before killing it, leaving no grace in which it
     /// can fork work. Only physical exit releases the waiter to settlement.
     final class SubprocessWork: @unchecked Sendable {
+        private final class Retained: @unchecked Sendable {
+            let lock = NSLock()
+            var owners: [String: SubprocessWork] = [:]
+        }
+        private static let retention = Retained()
+
+        /// Only live owners are retained; terminal evidence belongs to the
+        /// adapter's audit. The key is its exact per-root audit path.
+        static func retained(at key: String) -> SubprocessWork? {
+            retention.lock.withLock { retention.owners[key] }
+        }
+
+        private final class ObservedResult<T: Sendable>: @unchecked Sendable {
+            private let lock = NSLock()
+            private var result: T?
+            let done = ScopedWaiter()
+            func finish(_ value: T) {
+                lock.withLock { result = value }
+                done.resume()
+            }
+            var value: T? { lock.withLock { result } }
+        }
+
+        /// Admission outlives this observer. Expiry, inherited call deadline
+        /// and caller cancellation release only the wait. Explicit abort uses
+        /// this retained owner's stop(); execution keeps its own ceiling.
+        func observe<T: Sendable>(key: String, waitSeconds: Int, executionTimeoutSeconds: Int,
+                                  pending: T, settlement: @escaping @Sendable (Exit) async -> T) async -> T {
+            let observed = ObservedResult<T>()
+            if Task.isCancelled { stop() }
+            Self.retention.lock.withLock { Self.retention.owners[key] = self }
+            Task {
+                let result = await self.run(timeoutSeconds: executionTimeoutSeconds, settlement: settlement)
+                observed.finish(result)
+                _ = Self.retention.lock.withLock { Self.retention.owners.removeValue(forKey: key) }
+            }
+            let wait = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+            wait.schedule(deadline: .now() + .seconds(waitSeconds))
+            wait.setEventHandler { observed.done.resume() }
+            wait.resume()
+            defer { wait.cancel() }
+            await observed.done.park()
+            return observed.value ?? pending
+        }
+
         struct Exit: Sendable {
             let code: Int32
             let stopped: Bool
             let timedOut: Bool
             let launchError: String?
+            let terminationError: String?
             let launched: Bool
         }
-        private let process: Process
+        private let process: ManagedProcess
         private let lock = NSLock()
         private var tree: ProcessTreeSnapshot?
         private var deadline: DispatchSourceTimer?
@@ -83,7 +133,7 @@ extension SwiftToolDispatcher {
         private var timedOut = false
         private var exited = false
 
-        init(_ process: Process) { self.process = process }
+        init(_ process: ManagedProcess) { self.process = process }
 
         func stop(timedOut: Bool = false) {
             lock.lock(); defer { lock.unlock() }
@@ -118,8 +168,8 @@ extension SwiftToolDispatcher {
                         continuation.resume(returning: nil)
                     }
                     do {
+                        process.reapDescendantsOnExit = reapDescendantsOnExit
                         try process.run()
-                        ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(process.processIdentifier)
                         tree = ProcessTreeReaper.snapshot(rootPID: process.processIdentifier)
                         if let timeoutSeconds {
                             let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
@@ -136,14 +186,12 @@ extension SwiftToolDispatcher {
                 return await settle { [self] in
                     // The effect has exited; its owner alone now holds the
                     // immutable tree, output and terminal record.
-                    if let tree, reapDescendantsOnExit || stopped {
-                        ProcessTreeReaper.quiesceAndKill(
-                            ProcessTreeReaper.snapshot(rootPID: tree.rootPID, retaining: tree))
-                    }
                     process.terminationHandler = nil
                     return await settlement(Exit(
                         code: tree == nil ? 127 : process.terminationStatus,
-                        stopped: stopped, timedOut: timedOut, launchError: error, launched: tree != nil))
+                        stopped: stopped && process.terminationError == nil,
+                        timedOut: timedOut, launchError: error,
+                        terminationError: process.terminationError, launched: tree != nil))
                 }
             } onCancel: { self.stop() }
         }

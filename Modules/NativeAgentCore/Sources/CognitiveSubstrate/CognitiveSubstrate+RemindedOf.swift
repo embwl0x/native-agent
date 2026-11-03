@@ -172,7 +172,8 @@ extension CognitiveSubstrate {
         for request: CognitiveCapsuleRequest,
         from read: CognitiveFrozenRead,
         among reachable: [CognitiveCare],
-        felt: inout (signals: FeltSignals, fingerprint: FeltLineRender?)?
+        felt: inout (signals: FeltSignals, fingerprint: FeltLineRender?)?,
+        unreadable: inout [String]
     ) async -> CognitiveRecalledMoment? {
         guard read.configuration.enabled,
               read.configuration.capsuleInjectionEnabled,
@@ -182,10 +183,10 @@ extension CognitiveSubstrate {
 
         let items = read.workspace.items.filter { capsuleEligibleWorkspaceNode($0.node) }
         let dyn = read.personalityDynamics
-        let signals = feltSignalsForCapsule(
+        guard let signals = feltSignalsForCapsule(
             from: items,
             request: request,
-            frozenRead: read)
+            frozenRead: read) else { return nil }
         let fingerprint = feltFingerprintLine(
             signals: signals,
             workspaceItems: items,
@@ -206,7 +207,11 @@ extension CognitiveSubstrate {
 
         // Query the felt line against the turn's reachable cares; only a care
         // that stands out for that feeling supplies a moment.
-        guard let cosines = await careCosines(to: fingerprint.text, among: reachable) else { return nil }
+        let cosines: [UUID: Double]
+        do {
+            guard let scores = try await careCosines(to: fingerprint.text, among: reachable) else { return nil }
+            cosines = scores
+        } catch { unreadable.append("recalled care meaning (" + error.localizedDescription + ")"); oweCareEmbedding(error); return nil }
         let moments = Self.caresStandingOut(cosines, among: reachable).compactMap { touched -> CognitiveRecalledMoment? in
             guard let newest = touched.care.story.last(where: { $0.moved != 0 && !$0.note.isEmpty }) else { return nil }
             return CognitiveRecalledMoment(careID: touched.care.id, text: newest.note, valence: newest.moved,

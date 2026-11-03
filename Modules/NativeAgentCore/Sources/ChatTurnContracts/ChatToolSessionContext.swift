@@ -55,7 +55,7 @@ public enum ChatToolSessionContext {
         /// carries its real destination only here.
         public var rendersInlineCards: Bool {
             switch surface.lowercased() {
-            case "chat", "mac", "app", "ios", "iphone", "ipad", "icloud": true
+            case "chat", "app", "ios": true
             default: false
             }
         }
@@ -92,9 +92,7 @@ public enum ChatToolSessionContext {
     /// value a new surface adapter fills in, and every field below is its
     /// projection. Bound by the transport around its `chat()` call.
     ///
-    /// Nil for turns whose surface predates the envelope; the individual
-    /// task-locals below remain the authority in that case, so an adapter can
-    /// migrate without a flag day.
+    /// Ingress binds this explicitly. An absent envelope carries no authenticated identity.
     @TaskLocal public static var envelope: TurnEnvelope?
 
     @TaskLocal public static var verifiedSessionId: String?
@@ -144,12 +142,15 @@ public enum ChatToolSessionContext {
         isolation: isolated (any Actor)? = #isolation,
         operation: () async throws -> T
     ) async rethrows -> T {
+        let origin = envelope.map { $0.withDeliveryRoute(route) }
+        return try await $envelope.withValue(origin) {
         try await $replyRoute.withValue(route) {
             try await TurnTraceContext.$destinationId.withValue(route?.destinationId) {
                 try await TurnTraceContext.$threadId.withValue(route?.threadId) {
                     try await operation()
                 }
             }
+        }
         }
     }
 }
@@ -269,6 +270,13 @@ public struct TurnEnvelope: Sendable, Equatable {
             answerExperienceID: answerExperienceID)
     }
 
+    public func withDeliveryRoute(_ route: DeliveryRoute?) -> TurnEnvelope {
+        TurnEnvelope(surface: surface, agent: agent, verifiedChatId: verifiedChatId,
+            verifiedUserId: verifiedUserId, commandSignatureVerified: commandSignatureVerified,
+            deliveryRoute: route, declaredRemote: declaredRemote, macContinuation: macContinuation,
+            workIdentity: workIdentity, answerExperienceID: answerExperienceID)
+    }
+
     /// The delivery route carries the envelope's surface when no explicit route is bound.
     public var replyRoute: DeliveryRoute {
         deliveryRoute ?? DeliveryRoute(surface: surface)
@@ -328,17 +336,15 @@ public struct TurnEnvelope: Sendable, Equatable {
         )
     }
 
-    /// Uses the bound envelope or composes the current turn's identity from its task-locals.
+    /// Only the bound ingress envelope supplies identity. Missing provenance is unbound,
+    /// never authenticated or local merely because a caller supplied a surface spelling.
     public static func current(surface: String) -> TurnEnvelope {
         if let bound = ChatToolSessionContext.envelope {
             return bound
         }
         return TurnEnvelope(
             surface: surface,
-            verifiedChatId: ChatToolSessionContext.verifiedChatId,
-            verifiedUserId: ChatToolSessionContext.verifiedUserId,
-            commandSignatureVerified: ChatToolSessionContext.commandSignatureVerified,
-            deliveryRoute: ChatToolSessionContext.replyRoute
+            declaredRemote: true
         )
     }
 

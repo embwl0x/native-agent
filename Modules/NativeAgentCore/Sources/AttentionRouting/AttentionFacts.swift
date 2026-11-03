@@ -9,7 +9,7 @@ import PersistenceCore
 import TelegramBot
 import Experiences
 import Transcripts
-// Blueprint: | `AttentionFacts.swift` | Attention importance, origin, surface, delivery and outcome values with transport-derived delivery projection |
+// Blueprint: | `AttentionFacts.swift` | Attention importance, origin and delivery projections derive from the common transport verdict; queued and absent evidence never mean accepted |
 
 /// What KIND of fact a notification carries. This, not the sending subsystem,
 /// decides whether User is interrupted.
@@ -124,13 +124,13 @@ public struct AttentionOutcome: Sendable {
     public let delivery: AttentionDelivery
     /// The phone receipt, when a phone push actually went out.
     public let receipt: MobileNotificationDeliveryReceipt?
-    /// True when the routing said knock but the ledger had already delivered
-    /// this exact event for this exact reason.
-    public let suppressed: Bool
-    /// True when the routing said knock and the user's declared quiet hours
-    /// said not now. A DISTINCT fact from `suppressed`, and observable rather
-    /// than merely documented: the ledger was left UNTOUCHED, so the same fact
-    /// can still reach him once the window closes.
+    public let transportOutcome: NotificationDeliveryOutcome?
+    public let destinationOutcomes: [String: NotificationDeliveryOutcome]
+    public var suppressed: Bool {
+        if case .suppressed? = transportOutcome { return true }
+        return false
+    }
+    /// Quiet hours retain the immutable intent without admitting its effect.
     public let deferredForQuietHours: Bool
     /// Her resident wake's knock in quiet hours: kept in the inbox, sent when they end.
     public var heldForResidentWake = false
@@ -141,32 +141,29 @@ public struct AttentionOutcome: Sendable {
     init(
         delivery: AttentionDelivery,
         receipt: MobileNotificationDeliveryReceipt?,
-        suppressed: Bool,
-        deferredForQuietHours: Bool = false
+        deferredForQuietHours: Bool = false,
+        transportOutcome: NotificationDeliveryOutcome? = nil,
+        destinationOutcomes: [String: NotificationDeliveryOutcome] = [:]
     ) {
         self.delivery = delivery
         self.receipt = receipt
-        self.suppressed = suppressed
         self.deferredForQuietHours = deferredForQuietHours
+        self.transportOutcome = transportOutcome
+        self.destinationOutcomes = destinationOutcomes
     }
 
-    static let routineSuccess = AttentionOutcome(delivery: .none, receipt: nil, suppressed: false)
+    static let routineSuccess = AttentionOutcome(delivery: .none, receipt: nil)
 
-    /// The routing said knock, but the user's declared quiet hours say not now.
-    /// Distinct from `routineSuccess` (the class never knocks) and from
-    /// `suppressed` (the ledger already delivered this). Which classes see it
-    /// is `AttentionRouter.honorsQuietHours` — the class decides, not the site.
+    /// The intent remains pending in its ledger through quiet hours.
     static let quietHours = AttentionOutcome(
-        delivery: .none, receipt: nil, suppressed: false, deferredForQuietHours: true)
+        delivery: .none, receipt: nil, deferredForQuietHours: true)
 
     /// One projection of the transport outcome; saving the card is a separate fact.
     public enum Delivery: String, Sendable, Equatable {
         /// The routing table chose no channel: nothing was attempted.
         case noChannel = "no_channel"
-        /// Quiet hours. The ledger is untouched, so the fact can still land.
+        /// Quiet hours. The intent is retained; no send was admitted.
         case deferred
-        /// The ledger had already delivered this exact fact for this reason.
-        case previouslyHandled = "previously_handled"
         /// Handed to a transport that has not confirmed it reached the device.
         case queued
         /// A transport accepted it.
@@ -175,29 +172,40 @@ public struct AttentionOutcome: Sendable {
         case failed
 
         /// True only when a transport took the knock. "Not failed" is not this.
-        public var reachedAChannel: Bool { self == .accepted || self == .queued }
+        public var reachedAChannel: Bool { self == .accepted }
     }
 
     public var deliveryProjection: Delivery {
         if deferredForQuietHours { return .deferred }
-        if suppressed { return .previouslyHandled }
+        if let transportOutcome {
+            switch transportOutcome {
+            case .delivered: return .accepted
+            case .suppressed: return .noChannel
+            case .notDelivered: return .failed
+            case .unknown: return .queued
+            }
+        }
         guard delivery != .none else { return .noChannel }
-        guard let receipt else {
-            // Telegram: the send returned without throwing and there is no
-            // per-device receipt to read. That is acceptance by the transport.
-            return .accepted
-        }
-        switch receipt.status {
-        case "accepted": return .accepted
-        case "queued": return .queued
-        default: return .failed
-        }
+        return .failed // No checked transport verdict is never acceptance.
     }
 
-    /// For the phone-pinned tool sites, whose caller contract IS an APNS
-    /// receipt. Fails loud rather than fabricating one — a receipt must record
+    /// Phone-pinned callers receive signed bridge acceptance and APNS transport
+    /// evidence. Fails loud rather than fabricating it — a receipt must record
     /// something that actually ran (NORTHSTAR clause 2).
     public func requireReceipt() throws -> MobileNotificationDeliveryReceipt {
+        if case .suppressed(let preference)? = transportOutcome {
+            throw ToolFailureError("Not sent: this notification channel is off (" + preference + ").", effects: .none,
+                owner: preference, code: "notification_suppressed")
+        }
+        if receipt == nil, case .unknown(_, let reason)? = transportOutcome {
+            throw ToolFailureError("Phone notification outcome is unknown: " + reason, effects: .unknown,
+                owner: "notify/deliveries.json", code: "notification_unconfirmed",
+                instruction: "Reconcile the retained occurrence before requesting another notification.", recovery: .reconcile)
+        }
+        if case .notDelivered(let reason)? = transportOutcome {
+            throw ToolFailureError("Phone notification was not delivered: " + reason, effects: .none,
+                owner: "notify/deliveries.json", code: "notification_not_delivered")
+        }
         if heldForResidentWake {
             throw NSError(domain: "AttentionRouter", code: -503, userInfo: [NSLocalizedDescriptionKey:
                 "Held, not sent: the person's quiet hours are on. It waits in the inbox and goes to his phone when they end."])

@@ -33,7 +33,19 @@ extension ClaudeBridgeRuntime {
             return
         }
         messageRuntime().handleMessage(response: { [weak self] status, object in
-            self?.writeJSON(conn, status: status, obj: object)
+            let taskID = object["task_id"] as? String
+            let carriesReply = AgentContactRoutes.carriesReply(object)
+            self?.writeJSON(conn, status: status, obj: object, onSent: { [weak self] in
+                // Failed work can still return produced words/files. The
+                // successful write acknowledges those bytes, not execution success.
+                guard carriesReply, let taskID, let self else { return }
+                Task {
+                    do {
+                        let task = try await self.tasks.get(taskID, owner: principal.id)
+                        await self.tasks.recordReplyFetch(task)
+                    } catch { nativeLog("Bridge transmitted reply acknowledgment unavailable for %@: %@", taskID, error.localizedDescription) }
+                }
+            })
         }, body: body, defaultSender: defaultSender, principal: principal)
     }
 
@@ -72,7 +84,15 @@ extension ClaudeBridgeRuntime {
                 return
             }
         }
-        let inputRaw = (json["input"] as? [String: Any]) ?? [:]
+        let inputRaw: [String: Any]
+        if let supplied = json["input"] {
+            guard let object = supplied as? [String: Any] else {
+                writeJSON(conn, status: 400, obj: ["error": "invalid_input",
+                    "detail": "Tool input must be an object; no work was queued."])
+                return
+            }
+            inputRaw = object
+        } else { inputRaw = [:] }
         let inputJV = inputRaw.mapValues { JSONValue(fromFoundation: $0) }
 
         let tasks = self.tasks
@@ -91,10 +111,10 @@ extension ClaudeBridgeRuntime {
                     let retained = try await tasks.beginTool(context: context, request: request, principal: principal, digest: requestDigest)
                     guard retained.execute else {
                         guard workLatch.claim() else { return }
-                        self.writeJSON(conn, status: 200, obj: AgentContactRoutes.contactReply(retained.task, requestID: request,
-                                                                              sessionID: context, offset: 0, maxChars: 8000), onSent: {
-                            if !retained.task.text.isEmpty { Task { await tasks.recordReplyFetch(retained.task) } }
-                        })
+                        let receipt = AgentContactRoutes.contactReply(retained.task, requestID: request,
+                            sessionID: context, offset: 0, maxChars: 8000)
+                        self.writeJSON(conn, status: 200, obj: receipt,
+                            onSent: AgentContactRoutes.fetched(receipt, task: retained.task, tasks: tasks))
                         return
                     }
                     admitted = true

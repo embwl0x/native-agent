@@ -9,14 +9,14 @@ import CryptoKit
 import NativeAgentShared
 import PersonaEngine
 import Privacy
-// Blueprint: | `Parts+Keeping.swift` | Parts keep eligibility and lifecycle mutations; one prepareKeep decision, sealed admission, owner-off authority, enable/disable/drop/rollback and locked registry mutation |
+// Blueprint: | `Parts+Keeping.swift` | Parts keep eligibility and lifecycle mutations; one prepareKeep decision distinguishes absent proof from failed evidence, sealed admission, owner-off authority, enable/disable/drop and locked registry mutation |
 
 extension Parts {
     /// One part's record, changed under the store's lock.
     func mutate(_ id: String, ownerAuthorized: Bool = false, enabling: Bool = false,
                 _ change: ([String: JSONValue]?) throws -> [String: JSONValue]) throws {
         try AbilityStore.withLock {
-            var rows = try self.rows()
+            var rows = try self.storedRows()
             let index = rows.firstIndex { $0["id"] == .string(id) }
             let row = try change(index.map { rows[$0] })
             if let index { rows[index] = row } else { rows.append(row) }
@@ -81,7 +81,8 @@ extension Parts {
 
         func preview(ownerAuthorized: Bool) -> Outcome {
             switch self {
-            case .stopped(let outcome): return outcome
+            case .stopped(let outcome):
+                return (outcome.ok, outcome.text, outcome.fields.merging(["effects": .string("none")]) { $1 })
             case .guidance(_, let name, let fields):
                 return (true, "Would turn \(name) back on.", fields.merging(["would_status": .string("active")]) { $1 })
             case .code(_, let name, _, _, let proved, let fields):
@@ -100,7 +101,7 @@ extension Parts {
             // Guidance (a Markdown ability) has no code: back on is its status alone, by the same authority (the store keeps the owner's
             // off his).
             guard version == nil, status == "disabled", try abilities.read(id: id)?.pathExtension == "md" else {
-                let failure = Self.revisionFailure("no_ability_code", "\(id) has no code to keep. Save synchronous JavaScript defining run(input) with ability.save.", id: id)
+                let failure = Self.revisionFailure("no_ability_code", "\(id) has no code to keep. Save JavaScript defining run(input) with ability.save.", id: id)
                 return .stopped((false, failure.message, fields.merging(["reason": .string(failure.code), "effects": .string("none"), "remedy": failure.remedy ?? .null]) { $1 }))
             }
             if !ownerAuthorized, let why = CapabilityLifecycle.requiresOwnerToEnable(row) ? "The owner switched \(name) off, so turning it back on is theirs"
@@ -125,13 +126,10 @@ extension Parts {
             return .stopped((false, error.localizedDescription, fields.merging(["reason": .string("owners_call"), "remedy": error.remedy()]) { $1 }))
         }
         let candidate = try store.load(id: id, digest: digest)
-        if let why = OwnedProgram.asyncRefusal(candidate.program.source) {
-            return .stopped((false, why + " ability.save it so, then enable it. Nothing changed.", fields))
-        }
         let key: Data?
         do { key = try SwiftNativeManifestSigner(dataRoot: root).existingSigningKey() }
         catch { throw ManifestSigningError.keyUnavailable(error.localizedDescription) }
-        let proof = key.flatMap { try? store.proof(candidate, key: $0) }
+        let proof = try store.existingProof(candidate, key: key)
         let proved = proof != nil
         let origin = Self.merged([Self.fields(candidate.manifest)["origin"]] + Self.recorded(row))
         fields["candidate_digest"] = .string(digest)
@@ -203,7 +201,9 @@ extension Parts {
             }
             if preview { return plan.preview(ownerAuthorized: ownerAuthorized) }
             switch plan {
-            case .stopped(let outcome): return outcome
+            case .stopped(let outcome):
+                // This plan stopped before any mutation was attempted.
+                return (outcome.ok, outcome.text, outcome.fields.merging(["effects": .string("none")]) { $1 })
             case .guidance(_, let name, let fields):
                 return (true, "\(name) is on: it is guidance, read with ability.read.", fields)
             case .code(let id, let name, let digest, let candidate, let proved, let fields):
@@ -229,7 +229,9 @@ extension Parts {
             guard let row = try row(named), let id = Self.string(row, "id") else { return try unknown(named) }
             let name = Self.string(row, "name") ?? id
             let fields: [String: JSONValue] = ["id": .string(id), "name": .string(name), "state_before": row["status"] ?? .null]
-            if let refusal = Self.overrideRefusal(row, name: name, fullMac: fullMac, ownerAuthorized: ownerAuthorized) { return (false, refusal, fields) }
+            if let refusal = Self.overrideRefusal(row, name: name, fullMac: fullMac, ownerAuthorized: ownerAuthorized) {
+                return (false, refusal, fields.merging(["effects": .string("none")]) { $1 })
+            }
             let untrusted = steer.filter { !CapabilityLifecycle.ownerTrusts($0) }
             let by = ownerAuthorized ? "owner" : untrusted.isEmpty ? "hers" : "peer"
             // His switch on what is already off makes it his; nothing else changes an off.
@@ -277,69 +279,6 @@ extension Parts {
             return (true, preview ? "Would delete \(name), its versions and its run state permanently."
                 : "Dropped \(name) permanently: its ability files and run state are removed.", fields)
         } catch { return Self.mutationFailure(error, named: named, operation: "drop", attempted: attempted) }
-    }
-
-    /// `ability.rollback`: swaps its current and previous versions. A version whose admission still verifies keeps the status; one without
-    /// waits as a draft.
-    public func rollback(_ named: String, version: String?, fullMac: Bool, ownerAuthorized: Bool, preview: Bool) async -> Outcome {
-        var attempted = false
-        do {
-            let selection = try AbilityStore.withLock { () -> ([String: JSONValue], AbilityStore.File?)? in
-                guard let row = try row(named), let id = Self.string(row, "id") else { return nil }
-                return (row, try abilities.read(id: id))
-            }
-            guard let (row, current) = selection, let id = Self.string(row, "id") else { return try unknown(named) }
-            let name = Self.string(row, "name") ?? id
-            var fields: [String: JSONValue] = ["id": .string(id), "name": .string(name)]
-            if let refusal = Self.overrideRefusal(row, name: name, fullMac: fullMac, ownerAuthorized: ownerAuthorized) { return (false, refusal, fields) }
-            guard let previous = try abilities.read(id: id, slot: .previous) else {
-                return (false, "\(name) has no earlier version to select; nothing changed.", fields.merging([
-                    "reason": .string("no_previous_version"), "effects": .string("none"),
-                    "remedy": Repair.terminal(instruction: "No retained prior version exists; revise with ability.save if a change is needed.")]) { $1 })
-            }
-            var selected = previous.record
-            guard let digest = Self.string(selected, "codeFingerprint") ?? Self.string(Self.fields(Self.fields(previous.metadata["candidate"] ?? .null)["program"] ?? .null), "version") else {
-                let source = try abilities.path(id: id, slot: .previous, pathExtension: previous.pathExtension)
-                let failure = abilities.repairFailure(source: source, detail: "The retained prior version has no code digest.")
-                return (false, failure.message, fields.merging(["reason": .string("prior_version_unreadable"), "effects": .string("none"),
-                    "remedy": failure.remedy()]) { $1 })
-            }
-            guard version == nil || version == digest else { return (false, "Only \(id)'s previous version, \(digest), can be selected.", fields.merging([
-                "reason": .string("wrong_previous_version"), "effects": .string("none"),
-                "remedy": Repair.reconcile(instruction: "Read the retained versions before selecting the exact previous digest.", nextCall: Self.readCall(id))]) { $1 }) }
-            let target = try store.load(id: id, digest: digest)
-            selected["activePath"] = .string(try store.fileURL(id: id, digest: digest).path)
-            let admitted: Bool
-            do { try await checkAdmission(target, row: selected); admitted = true }
-            catch let failure as SenseFailure where failure.code == "integrity" { admitted = false }
-            let status = Self.string(row, "status") == "disabled" ? "disabled" : admitted ? Self.string(row, "status") ?? "draft" : "draft"
-            fields["would_land_on"] = .string(String(digest.prefix(12))); fields["would_status"] = .string(status)
-            if preview {
-                return (true, "Would swap \(name)'s current and previous versions, selecting \(digest.prefix(12)); it would be \(status)"
-                    + (status == "draft" ? ": ability.enable keeps it." : "."), fields)
-            }
-            try AbilityStore.withLock {
-                guard try abilities.read(id: id, slot: .previous) == previous, try abilities.read(id: id) == current else {
-                    throw PartError.invalid("\(name) changed during rollback; read it again.")
-                }
-                for key in ["status", "disabledBy", "disabledReason"] { selected[key] = row[key] }
-                selected["status"] = .string(status)
-                // Selected, it lives in the current file.
-                if admitted { selected["activePath"] = .string(try abilities.path(id: id).path) }
-                else { for key in ["admission", "activePath"] { selected.removeValue(forKey: key) } }
-                for key in ["phase", "manifestSignature", "signedAt", "signatureVersion"] { selected.removeValue(forKey: key) }
-                // What restricts it survives the swap: an untrusted agent's or a pack's origin ratchets, and a built-in's own version stays
-                // one.
-                selected["origin"] = Self.merged(Self.recorded(selected) + Self.recorded(row))
-                if row["overrides"] == .string("built_in") { selected["overrides"] = .string("built_in") }
-                selected["updatedAt"] = .string(Self.now())
-                attempted = true
-                try abilities.swap(id: id, record: selected)
-            }
-            return (true, "Rolled \(name) back to its previous version (\(digest.prefix(12))). "
-                + (status == "draft" ? "It is a draft: ability.enable keeps it." : status == "disabled" ? "It stays off." : "It is on under its admission."),
-                fields.merging(["state": .string(status)]) { $1 })
-        } catch { return Self.mutationFailure(error, named: named, operation: "rollback", attempted: attempted) }
     }
 
     static func mutationFailure(_ error: Error, named: String, operation: String, attempted: Bool) -> Outcome {

@@ -118,7 +118,7 @@ OUT_DIR="${OUT_DIR:-$ROOT/dist/appcast}"
 # 1. Signing key — checked FIRST, before any tool lookup or staging, so that a
 #    missing key always produces the same loud, actionable failure.
 # ---------------------------------------------------------------------------
-PRIV_KEY="${NATIVE_AGENT_SPARKLE_ED_PRIV_KEY:-${NATIVEAGENT_SPARKLE_ED_PRIV_KEY:-}}"
+PRIV_KEY="${NATIVEAGENT_SPARKLE_ED_PRIV_KEY:-}"
 if [[ -z "$PRIV_KEY" ]]; then
   echo "" >&2
   echo "ERROR: NATIVEAGENT_SPARKLE_ED_PRIV_KEY is not set — refusing to emit an" >&2
@@ -146,9 +146,9 @@ fi
 # 2. URLs — a wrong enclosure URL produces a feed that offers an update it can
 #    never download, so these are required rather than guessed.
 # ---------------------------------------------------------------------------
-APPCAST_URL="${NATIVE_AGENT_APPCAST_URL:-${NATIVEAGENT_APPCAST_URL:-}}"
-DOWNLOAD_URL="${NATIVE_AGENT_DMG_DOWNLOAD_URL:-${NATIVEAGENT_DMG_DOWNLOAD_URL:-}}"
-RELEASE_PAGE_URL="${NATIVE_AGENT_RELEASE_PAGE_URL:-${NATIVEAGENT_RELEASE_PAGE_URL:-}}"
+APPCAST_URL="${NATIVEAGENT_APPCAST_URL:-}"
+DOWNLOAD_URL="${NATIVEAGENT_DMG_DOWNLOAD_URL:-}"
+RELEASE_PAGE_URL="${NATIVEAGENT_RELEASE_PAGE_URL:-}"
 
 [[ -n "$APPCAST_URL" ]] || fail "NATIVEAGENT_APPCAST_URL is not set (the URL the feed is served from)."
 [[ -n "$DOWNLOAD_URL" ]] || fail "NATIVEAGENT_DMG_DOWNLOAD_URL is not set (the URL the DMG is downloaded from).
@@ -551,7 +551,7 @@ if [[ "$PUBLISH" != "true" ]]; then
   exit 0
 fi
 
-PUBLISH_CMD="${NATIVE_AGENT_APPCAST_PUBLISH_CMD:-${NATIVEAGENT_APPCAST_PUBLISH_CMD:-}}"
+PUBLISH_CMD="${NATIVEAGENT_APPCAST_PUBLISH_CMD:-}"
 [[ -n "$PUBLISH_CMD" ]] || fail "--publish requires NATIVEAGENT_APPCAST_PUBLISH_CMD.
        It receives NATIVEAGENT_PUBLISH_APPCAST, NATIVEAGENT_PUBLISH_DMG,
        NATIVEAGENT_PUBLISH_TEST_RECEIPT, NATIVEAGENT_PUBLISH_ATTESTATION and

@@ -15,7 +15,7 @@ import ScreenCaptureKit
 #endif
 #if canImport(AppKit)
 import AppKit
-// Blueprint: | `MacScreenView.swift` | `MacScreenShot`, `MacScreenViewGeometry`; `MacScreenViewTextRedaction` owns field/prose secret-label vocabulary with distinct matching rules and shared AX/OCR caption geometry with caller-unit proximity; session-scoped `MacImageFrames` holds delivered pixel geometry under the semantic observation's reference (desktop images mint their own) |
+// Blueprint: | `MacScreenView.swift` | `MacScreenShot`, `MacScreenViewGeometry`; `MacScreenViewTextRedaction` owns field/prose secret-label vocabulary with distinct matching rules and shared AX/OCR caption geometry with caller-unit proximity; session-scoped `MacImageFrames` holds delivered pixel geometry and immutable `MacImageCapture` window/time and AX hit-region evidence under the observation reference; desktop composition retains each rendered layer's evidence |
 #endif
 //
 // Normal computer use is: screenshot → the model guesses a coordinate → hope.
@@ -26,7 +26,7 @@ import AppKit
 //   • the STRUCTURE (the AX tree the read organ already walks) — what each
 //     thing IS, where it really is, and what it can do.
 //
-// Every actionable element gets a NUMBERED MARKER drawn on the picture at its
+// Selected actionable elements get NUMBERED MARKERS drawn on the picture at their
 // real frame, and the same number appears in a legend bound to that element's
 // REAL AX path. She then acts by REFERENCE — `mac_click{mark: 2, view: …}` —
 // and the exact pixel/element comes from the AX frame this organ captured,
@@ -50,14 +50,14 @@ import AppKit
 public enum MacScreenCaptureScope: String, Sendable, Equatable {
     /// The frontmost window's own rect (the default — "look at what I'm using").
     case focusedWindow = "focused_window"
-    /// The whole main display.
-    case fullScreen = "full_screen"
 }
 /// One frozen picture. `bounds` is the captured rect in SCREEN POINTS in the
 /// same global, top-left-origin space AX reports element frames in — that
 /// shared space is what makes the translation in `MacScreenViewGeometry`
 /// exact rather than approximate.
 public struct MacScreenShot: @unchecked Sendable {
+    /// Immutable window-server evidence taken before the capture, never at delivery.
+    public let capture: MacImageCapture?
     public let bounds: MacAXFrame
     public let pixelWidth: Int
     public let pixelHeight: Int
@@ -65,14 +65,16 @@ public struct MacScreenShot: @unchecked Sendable {
     /// The pixels. Optional so a test can drive the whole pipeline (geometry,
     /// caps, legend, store) with no window server and no image at all.
     public let cgImage: CGImage?
-    public init(bounds: MacAXFrame, pixelWidth: Int, pixelHeight: Int, cgImage: CGImage? = nil) {
+    public init(bounds: MacAXFrame, pixelWidth: Int, pixelHeight: Int, cgImage: CGImage? = nil, capture: MacImageCapture? = nil) {
+        self.capture = capture
         self.bounds = bounds
         self.pixelWidth = pixelWidth
         self.pixelHeight = pixelHeight
         self.cgImage = cgImage
     }
     #else
-    public init(bounds: MacAXFrame, pixelWidth: Int, pixelHeight: Int) {
+    public init(bounds: MacAXFrame, pixelWidth: Int, pixelHeight: Int, capture: MacImageCapture? = nil) {
+        self.capture = capture
         self.bounds = bounds
         self.pixelWidth = pixelWidth
         self.pixelHeight = pixelHeight
@@ -111,9 +113,7 @@ public enum MacScreenCaptureFailure: Sendable, Equatable, Error, LocalizedError 
         let args: [String: JSONValue] = app.map { ["app": .string($0)] } ?? [:]
         switch self {
         case .screenRecordingNotTrusted:
-            return Repair.why(owner: "macOS Screen Recording grant",
-                tap: "System Settings > Privacy & Security > Screen Recording > NativeAgent",
-                instruction: "Ask the owner to enable NativeAgent's Screen Recording grant, then follow macOS's restart instruction if shown.")
+            return MacFourVerbsReply.permissionRemedy("screenRecording", name: "Screen Recording")
         case .noDisplay:
             return Repair.why(owner: "Mac display availability", tap: "Mac > connected display",
                 instruction: "Connect or wake a display before requesting pixels; no display was available to capture.")
@@ -199,21 +199,19 @@ public struct MacScreenViewMark: Sendable, Equatable {
     public let subrole: String?
     public let label: String?
     /// Where `label` came from: `title` (the app said so), `value` (the control
-    /// shows its own content, e.g. a popup button), `nearby_text` (INFERRED
-    /// from the static text sitting immediately left of / above it, the way a
-    /// human reads a form), or `none`. Named rather than hidden because an
-    /// inferred label is a guess and the caller deserves to know which rows are
-    /// guesses — an unlabeled control is a real thing and pretending otherwise
-    /// is how "the third button" becomes the wrong button.
+    /// shows its own content), `descendant_text` (its owned caption),
+    /// `unreadable` (the caption read failed), or `none` (no observed name).
     public let labelSource: String
     public let value: String?
     /// True when this element is a password/secure field. Its value NEVER
     /// leaves in the clear — see `toJSON()`.
     public let secret: Bool
-    public let enabled: Bool
+    public let enabled: Bool?
     public let frame: MacAXFrame
     public let path: [Int]
     public let actions: [String]
+    public let actionsUnreadable: String?
+    public let attributeGaps: [String]
     public let settableAttributes: [String]
     /// Secret-naming ancestor groups, resolved from the complete window node set at capture time.
     public let enclosingCaption: MacScreenViewTextRedaction.EnclosingCaptionKinds
@@ -228,10 +226,12 @@ public struct MacScreenViewMark: Sendable, Equatable {
         labelSource: String = "title",
         value: String? = nil,
         secret: Bool = false,
-        enabled: Bool = true,
+        enabled: Bool? = nil,
         frame: MacAXFrame,
         path: [Int],
         actions: [String] = [],
+        actionsUnreadable: String? = nil,
+        attributeGaps: [String] = [],
         settableAttributes: [String] = [],
         enclosingCaption: MacScreenViewTextRedaction.EnclosingCaptionKinds = .none,
         labelRedaction: JSONValue? = nil,
@@ -248,6 +248,8 @@ public struct MacScreenViewMark: Sendable, Equatable {
         self.frame = frame
         self.path = path
         self.actions = actions
+        self.actionsUnreadable = actionsUnreadable
+        self.attributeGaps = attributeGaps
         self.settableAttributes = settableAttributes
         self.enclosingCaption = enclosingCaption
         self.labelRedaction = labelRedaction
@@ -265,12 +267,19 @@ public struct MacScreenViewMark: Sendable, Equatable {
         var object: [String: JSONValue] = [
             "mark": .int(Int64(mark)),
             "role": .string(role),
-            "enabled": .bool(enabled),
+            "enabled": enabled.map(JSONValue.bool) ?? .null,
             "frame": frame.toJSON(),
             "path": .array(path.map { .int(Int64($0)) }),
-            "actions": .array(actions.map { .string($0) }),
             "settable_attributes": .array(settableAttributes.map { .string($0) }),
         ]
+        if !attributeGaps.isEmpty {
+            object["attribute_gaps"] = .array(attributeGaps.map(JSONValue.string))
+        }
+        if let actionsUnreadable {
+            object["actions_unreadable"] = .string(actionsUnreadable)
+        } else {
+            object["actions"] = .array(actions.map { .string($0) })
+        }
         if let subrole { object["subrole"] = .string(subrole) }
         if let label {
             // Titles and inferred names use the same secret-shape checks as prose.
@@ -282,7 +291,7 @@ public struct MacScreenViewMark: Sendable, Equatable {
             )
             if labelSource != "title" { object["label_source"] = .string(labelSource) }
         } else {
-            object["label_source"] = .string("none")
+            object["label_source"] = .string(labelSource == "unreadable" ? "unreadable" : "none")
         }
         if let value {
             object["value"] = secret
@@ -344,10 +353,9 @@ public struct MacScreenViewSnapshot: Sendable, Equatable {
 /// around by holding several tokens.
 ///
 /// IT GRANTS NO AUTHORITY. Resolution returns an element path and frame. The
-/// injection gates (accessibility category, ACTIVE Full Mac window, and a
-/// body-bound single-use `MacInjectionCapability` minted only after a resolved
-/// human approval) all sit UPSTREAM of the handler that consults this store, so
-/// a mark can only ever redirect an already-approved act at a better target.
+/// ordinary dispatch policy, macOS grants, app switches and driver admission
+/// remain authoritative. Explicit approval replays additionally validate their
+/// body-bound single-use capability before reaching the handler.
 @MainActor
 public final class MacScreenViewStore {
     public nonisolated static let shared = MacScreenViewStore()
@@ -444,16 +452,18 @@ struct MacSnapshotUnavailable: Error {
 /// is unusual but it is not impossible, and assuming it away is how a marker
 /// ends up half a button low.
 public struct MacScreenViewGeometry: Sendable, Equatable {
+    public let capture: MacImageCapture?
     public let bounds: MacAXFrame
     public let pixelWidth: Int
     public let pixelHeight: Int
-    public init(bounds: MacAXFrame, pixelWidth: Int, pixelHeight: Int) {
+    public init(bounds: MacAXFrame, pixelWidth: Int, pixelHeight: Int, capture: MacImageCapture? = nil) {
+        self.capture = capture
         self.bounds = bounds
         self.pixelWidth = pixelWidth
         self.pixelHeight = pixelHeight
     }
     public init(shot: MacScreenShot) {
-        self.init(bounds: shot.bounds, pixelWidth: shot.pixelWidth, pixelHeight: shot.pixelHeight)
+        self.init(bounds: shot.bounds, pixelWidth: shot.pixelWidth, pixelHeight: shot.pixelHeight, capture: shot.capture)
     }
     public var scaleX: Double {
         bounds.w > 0 ? Double(pixelWidth) / bounds.w : 0
@@ -495,7 +505,8 @@ public struct MacScreenViewGeometry: Sendable, Equatable {
     /// Image pixels → global screen points: `placement` run backwards, on the
     /// same two measured scales. Nil off the image.
     public func screenPoint(imageX x: Double, imageY y: Double) -> MacPointerPosition? {
-        guard scaleX > 0, scaleY > 0, (0...Double(pixelWidth)).contains(x), (0...Double(pixelHeight)).contains(y) else { return nil }
+        guard scaleX > 0, scaleY > 0,
+              x >= 0, x < Double(pixelWidth), y >= 0, y < Double(pixelHeight) else { return nil }
         return MacPointerPosition(x: bounds.x + x / scaleX, y: bounds.y + y / scaleY)
     }
     /// Global screen points to image pixels, without clipping or rounding.
@@ -509,12 +520,74 @@ public struct MacScreenViewGeometry: Sendable, Equatable {
             w: rect.w / scaleX, h: rect.h / scaleY)
     }
 }
+/// A capture's immutable provenance, shared by window and desktop images.
+/// It is evidence of where the picture came from, never a second live window inventory.
+public struct MacImageCapture: Sendable, Equatable, Codable {
+    struct Window: Sendable, Equatable, Codable {
+        let number: Int
+        let pid: Int32
+        let layer: Int
+        let alpha: Double
+        let x: Double, y: Double, w: Double, h: Double
+        var frame: MacAXFrame { MacAXFrame(x: x, y: y, w: w, h: h) }
+    }
+    /// Historical AX regions, including regions whose hit could not be read.
+    /// An unavailable inner region must never inherit an outer control's identity.
+    public struct PointTarget: Sendable, Equatable, Codable {
+        let pid: Int32
+        let role: String?
+        let labelDigest: String?
+        let x: Double, y: Double, w: Double, h: Double
+        let path: [Int]
+        var windowNumber: Int? = nil
+        var frame: MacAXFrame { MacAXFrame(x: x, y: y, w: w, h: h) }
+    }
+    let capturedAt: Date
+    let windows: [Window]
+    let targets: [PointTarget]?
+
+    public func recordingTargets(_ targets: [PointTarget]) -> Self {
+        // These are the AX owner's pixels, even for a display-region shot.
+        // Other input owners are checked live, rather than letting an unrelated
+        // input-transparent backing become the captured target window.
+        let owners = Set(targets.map(\.pid))
+        let recorded = targets.map { target in
+            var target = target
+            target.windowNumber = windows.first { window in
+                window.pid == target.pid && MacPointerPosition(x: target.x + target.w / 2, y: target.y + target.h / 2)
+                    .map { $0.isInside(window.frame) } == true
+            }?.number
+            return target
+        }
+        return Self(capturedAt: capturedAt, windows: windows.filter { owners.contains($0.pid) }, targets: recorded)
+    }
+
+    /// Desktop pixels are a front-to-back composition of independently
+    /// captured windows. Masked layers carry no control evidence.
+    public func composing(_ layers: [(number: Int, capture: MacImageCapture?)]) -> Self {
+        Self(capturedAt: layers.compactMap { $0.capture?.capturedAt }.min() ?? capturedAt,
+             windows: layers.compactMap { layer in windows.first { $0.number == layer.number } },
+             targets: layers.flatMap { $0.capture?.targets ?? [] })
+    }
+
+    /// Private transport between the capture owner and the delivered image.
+    public var json: JSONValue? {
+        guard let data = try? JSONEncoder().encode(self) else { return nil }
+        return try? JSONValue.parse(data)
+    }
+    public static func from(_ json: JSONValue?) -> Self? {
+        guard let json, let data = try? json.serializedData(pretty: false) else { return nil }
+        return try? JSONDecoder().decode(Self.self, from: data)
+    }
+}
 /// Every image she is handed is a frame: the pixels delivered and the global
 /// screen rect they cover, so a point she reads off the picture is a place
 /// her hand can go, by the picture's own measured scale and never an assumed
 /// Retina factor. Ids are random, so an old id is refused rather than meaning
 /// another picture. Each chat session holds its own last 16; an id or "the
-/// latest" is looked up only among the asking session's.
+/// latest" is looked up only among the asking session's. Geometry carries the
+/// capture-start time, window identities and AX hit regions; the hand rechecks
+/// window and control identity before input.
 public enum MacImageFrames {
     private static let lock = NSLock()
     private nonisolated(unsafe) static var held: [(id: String, session: String, geometry: MacScreenViewGeometry)] = []
@@ -528,10 +601,12 @@ public enum MacImageFrames {
         }
         let b = geometry.bounds, w = geometry.pixelWidth, h = geometry.pixelHeight
         func n(_ v: Double) -> String { v == v.rounded() ? String(Int(v)) : String(format: "%.2f", v) }
-        return (.object([
+        var fields: [String: JSONValue] = [
             "id": .string(id), "width": .int(Int64(w)), "height": .int(Int64(h)),
             "screen": .object(["x": .double(b.x), "y": .double(b.y), "w": .double(b.w), "h": .double(b.h)]),
-        ]), "Image \(id) is \(w)×\(h) px covering screen points (\(n(b.x)), \(n(b.y))) \(n(b.w))×\(n(b.h)): "
+        ]
+        fields["captured_at"] = geometry.capture.map { .string(NativeTimestampFormat.plainZulu($0.capturedAt)) }
+        return (.object(fields), "Image \(id) is \(w)×\(h) px covering screen points (\(n(b.x)), \(n(b.y))) \(n(b.w))×\(n(b.h)): "
             + "a point (ix, iy) in this image is screen point (\(n(b.x)) + ix*\(n(b.w))/\(w), \(n(b.y)) + iy*\(n(b.h))/\(h)); "
             + "no Retina factor to apply. act at:{x,y} takes this image's pixels as they are.")
     }

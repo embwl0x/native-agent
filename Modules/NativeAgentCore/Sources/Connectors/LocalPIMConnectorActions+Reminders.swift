@@ -7,7 +7,13 @@ import PersistenceCore
 import Privacy
 import MacIntegration
 import ToolExecution
-// Blueprint: | `LocalPIMConnectorActions+Reminders.swift` | Reminder CRUD, due-date splitting and paging on the existing LocalPIMStore |
+// Blueprint: | `LocalPIMConnectorActions+Reminders.swift` | Reminder CRUD, checked query flags, due-date splitting and paging on LocalPIMStore; notes redacted before preview bounds; failed list saves retain unknown effects and exact identity; exact identifiers never select by title after a miss; nil EventKit callbacks remain unavailable rather than zero counts |
+
+@MainActor
+private final class ReminderReadResult<Value: Sendable> {
+    let done = ScopedWaiter()
+    var value: Value?
+}
 
 extension LocalPIMConnectorActions {
     /// The requesting root's part owns the local-day view; the query below remains the native permission, EventKit confinement and serialization boundary.
@@ -22,12 +28,22 @@ extension LocalPIMConnectorActions {
         }
     }
 
+    static func remindersQueryFlags(input: [String: JSONValue]) throws(CalendarArgumentError) -> (undatedOnly: Bool, includeCompleted: Bool) {
+        try (
+            inputBool(input, key: "undated_only", defaultValue: false, action: "mac.reminders_query"),
+            inputBool(input, key: "include_completed", defaultValue: false, action: "mac.reminders_query")
+        )
+    }
+
     public static func remindersQuery(input: [String: JSONValue]) async throws -> JSONValue {
         let actionId = "mac.reminders_query"
+        let flags: (undatedOnly: Bool, includeCompleted: Bool)
+        do { flags = try remindersQueryFlags(input: input) }
+        catch { return error.result }
         let start = parseInputDate(input["due_start"])
         let end = parseInputDate(input["due_end"])
         let split = parseInputDate(input["split_due_at"])
-        let undatedOnly = inputBool(input["undated_only"], defaultValue: false)
+        let undatedOnly = flags.undatedOnly
         guard (input["due_start"] == nil || start != nil),
               (input["due_end"] == nil || end != nil),
               (input["split_due_at"] == nil || split != nil),
@@ -40,72 +56,82 @@ extension LocalPIMConnectorActions {
         guard try await store.requestReminderAccess() else {
             return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
         }
-        let includeCompleted = inputBool(input["include_completed"], defaultValue: false)
+        let includeCompleted = flags.includeCompleted
         let query = input["query"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let listName = input["list_name"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines)
         let calendars = filteredCalendars(store.calendars(for: .reminder), matching: listName)
-        let offset = MacAppleScriptBridge.clampedInt(input["offset"], defaultValue: 0, min: 0, max: Int.max)
-        let limit = MacAppleScriptBridge.clampedInt(input["limit"], defaultValue: 20, min: 1, max: 200)
+        let offset = try MacAppleScriptBridge.clampedInt(input["offset"], defaultValue: 0, min: 0, max: Int.max)
+        let limit = try MacAppleScriptBridge.clampedInt(input["limit"], defaultValue: 20, min: 1, max: 200)
         let access = reminderAuthorizationState()
         let timeZone = TimeZone.current.identifier
-        return await withCheckedContinuation { continuation in
-            // Completed reminders are fetched too, so a query that only matches finished ones says so instead of reading as "nothing".
-            store.fetchReminders(in: calendars, incompleteOnly: false) { reminders in
-                guard let reminders else {
-                    continuation.resume(returning: .object(["status": .string("failed"), "effects": .string("none"), "actionId": .string(actionId),
-                        "reason": .string("Reminders read is unavailable.")]))
-                    return
-                }
-                let matchingAny = reminders.filter { reminder in
-                    if let listName, !listName.isEmpty, !reminder.calendar.title.localizedCaseInsensitiveContains(listName) { return false }
-                    if !query.isEmpty && !(reminder.title ?? "").localizedCaseInsensitiveContains(query)
-                        && !(reminder.notes ?? "").localizedCaseInsensitiveContains(query) { return false }
-                    let due = reminder.dueDateComponents?.date
-                    if undatedOnly { return due == nil }
-                    if start != nil || end != nil {
-                        guard let due else { return false }
-                        if let start, due < start { return false }
-                        if let end, due >= end { return false }
-                    }
-                    return true
-                }.sorted {
-                    let left = $0.dueDateComponents?.date ?? .distantFuture
-                    let right = $1.dueDateComponents?.date ?? .distantFuture
-                    return left == right ? $0.calendarItemIdentifier < $1.calendarItemIdentifier : left < right
-                }
-                let matching = includeCompleted ? matchingAny : matchingAny.filter { !$0.isCompleted }
-                let completedHidden = matchingAny.count - matching.count
-                func page(_ reminders: [EKReminder]) -> [String: JSONValue] {
-                    let rows = reminders.dropFirst(offset).prefix(limit).map { Self.reminderJSON($0) }
-                    let next = offset + rows.count
-                    return ["count": .int(Int64(rows.count)), "total": .int(Int64(reminders.count)),
-                        "offset": .int(Int64(offset)), "next_offset": next < reminders.count ? .int(Int64(next)) : .null,
-                        "reminders": .array(rows)]
-                }
-                var result = page(matching)
-                result.merge([
-                    "status": .string("completed"), "actionId": .string(actionId), "source": .string("eventkit"),
-                    "access": .string(access), "timeZone": .string(timeZone),
-                    "includeCompleted": .bool(includeCompleted),
-                ]) { _, value in value }
-                if completedHidden > 0 {
-                    result["completed_hidden"] = .int(Int64(completedHidden))
-                    result["hint"] = .string("\(completedHidden) completed reminder\(completedHidden == 1 ? "" : "s") also match\(completedHidden == 1 ? "es" : ""); include_completed:true shows them.")
-                }
-                if let split {
-                    // Both pages are slices of this fetch, never offsets from fresh reads.
-                    result["before"] = .object(page(matching.filter {
-                        guard let due = $0.dueDateComponents?.date else { return false }
-                        return due < split
-                    }))
-                    result["on_or_after"] = .object(page(matching.filter {
-                        guard let due = $0.dueDateComponents?.date else { return false }
-                        return due >= split
-                    }))
-                }
-                continuation.resume(returning: .object(result))
-            }
+        let response = ReminderReadResult<JSONValue>()
+        let finish: @Sendable (JSONValue) -> Void = { value in
+            Task { @MainActor in response.value = value; response.done.resume() }
         }
+        // Completed reminders are fetched too, so a query that only matches finished ones says so instead of reading as "nothing".
+        store.fetchReminders(in: calendars, incompleteOnly: false) { reminders in
+            guard let reminders else {
+                finish(.object(["status": .string("failed"), "effects": .string("none"), "actionId": .string(actionId),
+                    "reason": .string("Reminders read is unavailable.")]))
+                return
+            }
+            let matchingAny = reminders.filter { reminder in
+                if let listName, !listName.isEmpty, !reminder.calendar.title.localizedCaseInsensitiveContains(listName) { return false }
+                if !query.isEmpty && !(reminder.title ?? "").localizedCaseInsensitiveContains(query)
+                    && !(reminder.notes ?? "").localizedCaseInsensitiveContains(query) { return false }
+                let due = reminder.dueDateComponents?.date
+                if undatedOnly { return due == nil }
+                if start != nil || end != nil {
+                    guard let due else { return false }
+                    if let start, due < start { return false }
+                    if let end, due >= end { return false }
+                }
+                return true
+            }.sorted {
+                let left = $0.dueDateComponents?.date ?? .distantFuture
+                let right = $1.dueDateComponents?.date ?? .distantFuture
+                return left == right ? $0.calendarItemIdentifier < $1.calendarItemIdentifier : left < right
+            }
+            let matching = includeCompleted ? matchingAny : matchingAny.filter { !$0.isCompleted }
+            let completedHidden = matchingAny.count - matching.count
+            func page(_ reminders: [EKReminder]) -> [String: JSONValue] {
+                let rows = reminders.dropFirst(offset).prefix(limit).map { Self.reminderJSON($0) }
+                let next = offset + rows.count
+                return ["count": .int(Int64(rows.count)), "total": .int(Int64(reminders.count)),
+                    "offset": .int(Int64(offset)), "next_offset": next < reminders.count ? .int(Int64(next)) : .null,
+                    "reminders": .array(rows)]
+            }
+            var result = page(matching)
+            result.merge([
+                "status": .string("completed"), "actionId": .string(actionId), "source": .string("eventkit"),
+                "access": .string(access), "timeZone": .string(timeZone),
+                "includeCompleted": .bool(includeCompleted),
+            ]) { _, value in value }
+            if completedHidden > 0 {
+                result["completed_hidden"] = .int(Int64(completedHidden))
+                result["hint"] = .string("\(completedHidden) completed reminder\(completedHidden == 1 ? "" : "s") also match\(completedHidden == 1 ? "es" : ""); include_completed:true shows them.")
+            }
+            if let split {
+                // Both pages are slices of this fetch, never offsets from fresh reads.
+                result["before"] = .object(page(matching.filter {
+                    guard let due = $0.dueDateComponents?.date else { return false }
+                    return due < split
+                }))
+                result["on_or_after"] = .object(page(matching.filter {
+                    guard let due = $0.dueDateComponents?.date else { return false }
+                    return due >= split
+                }))
+            }
+            finish(.object(result))
+        }
+        let done = response.done
+        await done.park()
+        try Task.checkCancellation()
+        guard let value = response.value else {
+            return .object(["status": .string("failed"), "effects": .string("none"), "actionId": .string(actionId),
+                "reason": .string("Reminders supplied no reading before the wait ended. Open Reminders and read again; no empty result was established.")])
+        }
+        return value
     }
 
     /// Every reminder list with its open count: "which list has the most left" is one read, not an inference from each reminder's `list`.
@@ -116,12 +142,23 @@ extension LocalPIMConnectorActions {
             return permissionEnvelope(actionId: actionId, source: "reminders", status: reminderAuthorizationState())
         }
         let lists = store.calendars(for: .reminder)
-        let open: [String: Int] = await withCheckedContinuation { continuation in
-            store.fetchReminders(in: lists, incompleteOnly: true) { reminders in
-                var counts: [String: Int] = [:]
-                for reminder in reminders ?? [] { counts[reminder.calendar.calendarIdentifier, default: 0] += 1 }
-                continuation.resume(returning: counts)
+        let response = ReminderReadResult<[String: Int]>()
+        store.fetchReminders(in: lists, incompleteOnly: true) { reminders in
+            guard let reminders else {
+                Task { @MainActor in response.done.resume() }
+                return
             }
+            var counts: [String: Int] = [:]
+            for reminder in reminders { counts[reminder.calendar.calendarIdentifier, default: 0] += 1 }
+            let value = counts
+            Task { @MainActor in response.value = value; response.done.resume() }
+        }
+        let done = response.done
+        await done.park()
+        try Task.checkCancellation()
+        guard let open = response.value else {
+            return .object(["status": .string("failed"), "actionId": .string(actionId), "effects": .string("none"),
+                "reason": .string("Reminders read is unavailable. Open Reminders and retry the list read.")])
         }
         return .object(["status": .string("completed"), "actionId": .string(actionId), "source": .string("eventkit"),
             "count": .int(Int64(lists.count)),
@@ -294,7 +331,15 @@ extension LocalPIMConnectorActions {
         list.title = name
         try Task.checkCancellation()
         do { try store.save(list) }
-        catch { return failed(error.localizedDescription) }
+        catch {
+            var result: [String: JSONValue] = ["status": .string("failed"), "actionId": .string(actionId),
+                "effects": .string("unknown"), "source": .string("eventkit"),
+                "list_id": .string(list.calendarIdentifier), "name": .string(name),
+                "reason": .string(error.localizedDescription),
+                "remedy": .string("Read reminder lists and reconcile this list_id before repeating the write; the save may have taken effect.")]
+            if let previousName { result["previous_name"] = .string(previousName) }
+            return .object(result)
+        }
         guard let saved = store.calendars(for: .reminder).first(where: { $0.calendarIdentifier == list.calendarIdentifier }),
               saved.title == name else {
             return .object(["status": .string("unverified"), "actionId": .string(actionId),
@@ -329,7 +374,7 @@ extension LocalPIMConnectorActions {
             ])
         }
         let notes = input["notes"]?.scalarText
-        let dueDateField = input["due_date"] ?? input["dueDate"]
+        let dueDateField = input["due_date"]
         let dueDate = parseInputDate(dueDateField)
         guard dueDateField == nil || dueDate != nil else {
             return .object([
@@ -339,7 +384,7 @@ extension LocalPIMConnectorActions {
                 "reason": .string("due_date could not be parsed. Supply a valid date or omit due_date for an undated reminder."),
             ])
         }
-        let listNameField = input["list_name"] ?? input["listName"]
+        let listNameField = input["list_name"]
         let listName = listNameField?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         // Supplied list names must be nonempty.
@@ -454,14 +499,15 @@ extension LocalPIMConnectorActions {
         func failed(_ reason: String) -> JSONValue {
             .object(["status": .string("failed"), "actionId": .string("mac.reminders_complete"), "effects": .string("none"), "reason": .string(reason)])
         }
+        if input["id"] != nil, id.isEmpty { return failed("The supplied reminder id is empty or invalid. Refresh the reminder and use its exact id.") }
         guard !id.isEmpty || !title.isEmpty else {
             return failed("Give the reminder's title (or its id from mac_reminders_list_due_today).")
         }
         var found = id.isEmpty ? nil : store.reminder(withIdentifier: id)
-        if found == nil {
+        if id.isEmpty {
             // By title among open reminders: exactly one exact match, never a containing one ("pay bill" must not complete "Do not pay bill").
-            let wanted = (title.isEmpty ? id : title).lowercased()
-            let open = await openReminderTitles(store: store)
+            let wanted = title.lowercased()
+            let open = try await openReminderTitles(store: store)
             let exact = open.filter { $0.title.lowercased() == wanted }
             guard exact.count == 1 else {
                 let near = exact.isEmpty ? open.filter { $0.title.lowercased().contains(wanted) } : exact
@@ -472,7 +518,7 @@ extension LocalPIMConnectorActions {
             }
             found = store.reminder(withIdentifier: exact[0].id)
         }
-        guard let reminder = found else { return failed("That reminder is gone; mac_reminders_list_due_today shows the current ones.") }
+        guard let reminder = found else { return failed("That exact reminder could not be resolved. Read reminders again and use its current id; no reminder was completed.") }
 
         let completedAt = Date()
         reminder.isCompleted = true
@@ -535,12 +581,24 @@ extension LocalPIMConnectorActions {
     }
 
     /// Open reminders' ids and titles, made Sendable on EventKit's queue.
-    private static func openReminderTitles(store: LocalPIMStore) async -> [(id: String, title: String)] {
-        return await withCheckedContinuation { continuation in
-            store.fetchReminders(in: nil, incompleteOnly: true) { reminders in
-                continuation.resume(returning: (reminders ?? []).map { ($0.calendarItemIdentifier, $0.title ?? "") })
+    private static func openReminderTitles(store: LocalPIMStore) async throws -> [(id: String, title: String)] {
+        let response = ReminderReadResult<[(id: String, title: String)]>()
+        store.fetchReminders(in: nil, incompleteOnly: true) { reminders in
+            guard let reminders else {
+                Task { @MainActor in response.done.resume() }
+                return
             }
+            let value = reminders.map { (id: $0.calendarItemIdentifier, title: $0.title ?? "") }
+            Task { @MainActor in response.value = value; response.done.resume() }
         }
+        let done = response.done
+        await done.park()
+        try Task.checkCancellation()
+        guard let value = response.value else {
+            throw NSError(domain: "NativeAgentReminders", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Reminders read is unavailable. Open Reminders and retry before completing a reminder."])
+        }
+        return value
     }
 
     nonisolated private static func reminderJSON(_ reminder: EKReminder) -> JSONValue {
@@ -559,7 +617,7 @@ extension LocalPIMConnectorActions {
             obj["completedAt"] = .string(iso(completedAt))
         }
         if let notes = reminder.notes, !notes.isEmpty {
-            obj["notesPreview"] = .string(NativeAppSecretRedactor.redactText(String(notes.prefix(300))))
+            obj["notesPreview"] = .string(String(NativeAppSecretRedactor.redactText(notes).prefix(300)))
         }
         return .object(obj)
     }

@@ -7,47 +7,48 @@ import Foundation
 import CloudKit
 import CryptoKit
 import OSLog
-// Blueprint: | `CloudKitDeviceTransport+Messages.swift` | Signed message delivery, serialized drains and delivery cursor admission |
+// Blueprint: | `CloudKitDeviceTransport+Messages.swift` | Asset-sized send waits that never cancel the upload (CloudKit's own limit reports the real result), exact server replay proof and signed delivery; serialized drains apply iOS chat before notifications and admit the cursor after both record families |
 
 extension CloudKitDeviceTransport {
     // MARK: send
+
+    /// How long the caller waits before calling a send's outcome unknown:
+    /// CloudKit's own upload limit plus ten seconds. The wait never cancels
+    /// the upload; CloudKit's limit decides it and reports the real result.
+    public static func sendTimeoutSeconds(for message: BridgeMessage) throws -> TimeInterval {
+        let fields = try NAChatMessageCodec.encode(message)
+        return sendTimeoutSeconds(assetBytes: NAChatMessageCodec.usesAsset(fields) ? fields.payloadJSON.utf8.count + 28 : 0)
+    }
+
+    private static func sendTimeoutSeconds(assetBytes: Int) -> TimeInterval {
+        uploadSeconds(assetBytes: assetBytes) + 10
+    }
+
+    /// Cellular-sized: fifteen seconds for the record, plus one second per
+    /// started 50,000 encrypted asset bytes, capped at two minutes.
+    private static func uploadSeconds(assetBytes: Int) -> TimeInterval {
+        min(120, 15 + ceil(Double(assetBytes) / 50_000))
+    }
 
     public func send(_ message: BridgeMessage) async throws {
         try await send(message, beforeDispatch: {})
     }
 
     public func send(_ message: BridgeMessage, beforeDispatch: @Sendable () async throws -> Void) async throws {
-        try refuseWhilePairedElsewhere()
+        try refuseUnlessHoldingPairing()
         let fields = try NAChatMessageCodec.encode(message)
-        let recordType = Self.recordType(for: fields)
+        let recordType = Self.recordType(for: message)
         let usesAsset = NAChatMessageCodec.usesAsset(fields)
         var assetURL: URL?
-        var legacyFields: NAChatMessageFields?
+        var assetBytes = 0
         if usesAsset {
             guard let secret = await loadAssetSecretProvider()?(), secret.count == 32 else {
                 throw DeviceSyncError.underlying(message: "Pairing is required to encrypt this attachment.")
             }
-            // 0.5.1 reads only payloadJSON, then claims the record. Give that
-            // phone a signed reading copy while newer peers decrypt the asset.
-            if fields.direction == NAChatDirection.mac2ios.rawValue {
-                var text = message.text
-                while true {
-                    let notice = "\n\nThe image is on the Mac."
-                        + (text == message.text ? "" : "\nThe rest of the reply is on the Mac.")
-                    let preview = try BridgeMessage.make(id: message.id, sender: message.sender,
-                        text: text + notice, sessionID: message.sessionID, correlationID: message.correlationID,
-                        metadata: message.metadata, timestamp: message.timestamp).signed(with: secret)
-                    do {
-                        legacyFields = try NAChatMessageCodec.encode(preview)
-                        break
-                    } catch DeviceSyncError.payloadTooLarge(_, _) where !text.isEmpty {
-                        text = String(text.prefix(text.count / 2))
-                    }
-                }
-            }
             let box = try AES.GCM.seal(Data(fields.payloadJSON.utf8), using: Self.assetKey(secret),
                 authenticating: Self.assetContext(recordName: fields.recordName, direction: fields.direction))
             guard let bytes = box.combined else { throw DeviceSyncError.underlying(message: "Attachment encryption failed.") }
+            assetBytes = bytes.count
             let url = FileManager.default.temporaryDirectory.appendingPathComponent("nativeagent-chat-\(UUID().uuidString).sealed")
             do {
                 try bytes.write(to: url, options: .atomic)
@@ -59,16 +60,17 @@ extension CloudKitDeviceTransport {
             assetURL = url
         }
         let preparedAssetURL = assetURL
-        let preparedLegacyFields = legacyFields
+        let sendTimeout = Self.sendTimeoutSeconds(assetBytes: assetBytes)
+        let uploadTimeout = Self.uploadSeconds(assetBytes: assetBytes)
         do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.send", onFailure: accountFailureReporter,
+            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.send", seconds: sendTimeout, onFailure: accountFailureReporter,
                                                   beforeDispatch: {
                 do { try await beforeDispatch() }
                 catch {
                     if let preparedAssetURL { try? FileManager.default.removeItem(at: preparedAssetURL) }
                     throw error
                 }
-            }) {
+            }, cancelWorkOnTimeout: false) {
                 defer { if let preparedAssetURL { try? FileManager.default.removeItem(at: preparedAssetURL) } }
                 let ck = CKRecord(
                     recordType: recordType,
@@ -76,10 +78,9 @@ extension CloudKitDeviceTransport {
                 )
                 ck["direction"] = fields.direction as CKRecordValue
                 if let s = fields.sessionId { ck["sessionId"] = s as CKRecordValue }
-                ck["text"] = (preparedLegacyFields?.text ?? fields.text) as CKRecordValue
+                ck["text"] = fields.text as CKRecordValue
                 if let preparedAssetURL { ck["payloadAsset"] = CKAsset(fileURL: preparedAssetURL) }
-                if let preparedLegacyFields { ck["payloadJSON"] = preparedLegacyFields.payloadJSON as CKRecordValue }
-                else if preparedAssetURL == nil { ck["payloadJSON"] = fields.payloadJSON as CKRecordValue }
+                if preparedAssetURL == nil { ck["payloadJSON"] = fields.payloadJSON as CKRecordValue }
                 ck["createdAt"] = fields.createdAt as CKRecordValue
                 ck["senderDevice"] = fields.senderDevice as CKRecordValue
                 if let k = fields.kind { ck["kind"] = k as CKRecordValue }
@@ -96,9 +97,12 @@ extension CloudKitDeviceTransport {
                 let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
                 op.savePolicy = .ifServerRecordUnchanged
                 op.qualityOfService = .userInitiated
-                do { try await self.performModifyRecords(op) }
+                do { try await self.performModifyRecords(op, resourceTimeout: uploadTimeout) }
                 catch let error as DeviceSyncError {
-                    if case .conflict = error, await self.existingMessageRecordMatches(fields) {
+                    // Reconcile exact accepted bytes, including an existing
+                    // requested result whose record predates the family split.
+                    // A rejected record-type change can be an underlying CK error.
+                    if Self.canReconcileSend(error), await self.existingMessageRecordMatches(fields) {
                         do { try await self.resignalMessage(named: fields.recordName) }
                         catch { throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription) }
                         return
@@ -147,15 +151,32 @@ extension CloudKitDeviceTransport {
     /// Resolves timeout-after-commit and stable-id retries without weakening
     /// conflict handling. Only exact payloadJSON + direction equality converts
     /// the ambiguous write into success.
-    static func recordType(for fields: NAChatMessageFields) -> String {
-        fields.kind == "notification"
+    private static func canReconcileSend(_ error: DeviceSyncError) -> Bool {
+        switch error {
+        case .conflict, .underlying: true
+        default: false
+        }
+    }
+
+    /// Event kind chooses the renderer before any transport runs. Keep the
+    /// signed envelope unchanged; both record families reach the same reader.
+    static func recordType(for message: BridgeMessage) -> String {
+        message.metadata?["kind"] == "notification"
+            && message.metadata?["userInfo.source"] != "requested_result"
             ? NADeviceSyncRecordType.notification
             : NADeviceSyncRecordType.chatMessage
     }
 
-    private func existingMessageRecordMatches(_ fields: NAChatMessageFields) async -> Bool {
+    /// A missing/unreadable record is no proof of rejection. Callers retain
+    /// the unknown outcome and may check again within their own bounded window.
+    public func messageRecordMatches(_ message: BridgeMessage, timeoutSeconds: TimeInterval = 5) async -> Bool {
+        guard let fields = try? NAChatMessageCodec.encode(message) else { return false }
+        return await existingMessageRecordMatches(fields, timeoutSeconds: timeoutSeconds)
+    }
+
+    private func existingMessageRecordMatches(_ fields: NAChatMessageFields, timeoutSeconds: TimeInterval = 5) async -> Bool {
         let secret = await loadAssetSecretProvider()?()
-        return await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayProof", onFailure: accountFailureReporter) {
+        return await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayProof", seconds: timeoutSeconds, onFailure: accountFailureReporter) {
             let record = try await self.database.record(
                 for: CKRecord.ID(recordName: fields.recordName)
             )
@@ -177,27 +198,40 @@ extension CloudKitDeviceTransport {
     }
 
     public func ensurePushSubscriptions() async -> Bool {
+        // Each family owns its registration and failure. A rejected alert
+        // subscription cannot prevent chat wakes from being registered.
+        // The return value describes chat wakes, as observeIncoming's caller
+        // uses it to assess incoming chat push availability.
+        let chatReady: Bool
         do {
-            try await subscribeToChanges()
-            return true
+            try await subscribeToChatChanges()
+            chatReady = true
         } catch {
-            // Fail loud (no-silent-fallbacks): a failed subscription means no
-            // live push wakeups — the drain still works when polled, but callers
-            // must not describe the visual route as eligible.
-            devicePushLog.error("Chat subscription failed (no live push) role=\(self.role.rawValue, privacy: .public): \(String(describing: error), privacy: .private)")
-            return false
+            devicePushLog.error("Chat subscription failed id=\(DeviceCloudKitSubscriptionID.chat, privacy: .public) role=\(self.role.rawValue, privacy: .public): \(String(describing: error), privacy: .private)")
+            chatReady = false
         }
+        do {
+            try await subscribeToVisibleNotifications()
+        } catch {
+            devicePushLog.error("Visible notification subscription failed id=\(DeviceCloudKitSubscriptionID.visibleNotifications, privacy: .public) role=\(self.role.rawValue, privacy: .public): \(String(describing: error), privacy: .private)")
+        }
+        return chatReady
     }
 
     /// Pull incoming messages since the last cursor, decode, dispatch to the
     /// registered handler, and advance the cursor with a clock-skew overlap
     /// window. Idempotent per message id. Failed queries never report an empty success.
+    /// Periodic callers use queueIfBusy: false: a busy owner already covers
+    /// their wake, and repeated timer ticks must not keep that owner running.
     @discardableResult
-    public func drainIncoming() async -> DeviceSyncDrainResult {
+    public func drainIncoming(queueIfBusy: Bool = true) async -> DeviceSyncDrainResult {
         guard NADeviceSyncRecoveryBudget.hasTime else { return .skipped(0) }
-        guard !pairingHeldElsewhere else { return .skipped(0) }
+        guard holdsPairing else { return .skipped(0) }
         // Acquire the single drain slot under a synchronous lock, never across an await.
-        guard beginDrainOrCoalesce() else { return .skipped(await drainIncomingControls()) }
+        guard beginDrainOrCoalesce(queueIfBusy: queueIfBusy) else {
+            if !queueIfBusy { return .skipped(0) }
+            return .skipped(await drainIncomingControls())
+        }
         var total = 0
         var outcome: DeviceSyncDrainResult = .skipped(0)
         while true {
@@ -212,10 +246,13 @@ extension CloudKitDeviceTransport {
     }
 
     /// Acquire the single drain slot. Returns true if acquired; false if a drain
-    /// is already running (then flags a re-run so the active loop services us).
-    private func beginDrainOrCoalesce() -> Bool {
+    /// is already running (queues a re-run only for callers requesting one).
+    private func beginDrainOrCoalesce(queueIfBusy: Bool) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        if drainInFlight { drainAgain = true; return false }
+        if drainInFlight {
+            if queueIfBusy { drainAgain = true }
+            return false
+        }
         drainInFlight = true
         return true
     }
@@ -238,6 +275,7 @@ extension CloudKitDeviceTransport {
 
         let inbound = role.inboundDirection.rawValue
         let fetched: DeviceCKPullResult
+        var earlyDispatched = 0
         do {
             var records = try await pull(
                 recordType: NADeviceSyncRecordType.chatMessage,
@@ -245,6 +283,11 @@ extension CloudKitDeviceTransport {
                 inboundDirection: inbound
             )
             if role == .ios {
+                // Show words as soon as chat is fetched. The notification read
+                // may be slow or fail; it must not hold already-fetched words.
+                // Keep the shared cursor pinned until both families were read.
+                earlyDispatched = await deliverIncoming(records.records, since: since, queryStartedAt: queryStartedAt,
+                                                        advanceCursor: false)
                 let notifications = try await pull(
                     recordType: NADeviceSyncRecordType.notification,
                     since: since,
@@ -256,11 +299,12 @@ extension CloudKitDeviceTransport {
             fetched = records
         } catch {
             nativeLog("[ck-device] drainIncoming pull failed: \(error)")
-            return .failure(Self.mapError(error))
+            return .failure(Self.mapError(error), dispatched: earlyDispatched)
         }
 
-        let dispatched = await deliverIncoming(fetched.records, since: since, queryStartedAt: queryStartedAt,
-                                               advanceCursor: fetched.payloadError == nil)
+        let remainingDispatched = await deliverIncoming(fetched.records, since: since, queryStartedAt: queryStartedAt,
+                                                        advanceCursor: fetched.payloadError == nil)
+        let dispatched = earlyDispatched + remainingDispatched
         if let error = fetched.payloadError { return .failure(error, dispatched: dispatched) }
         return .success(dispatched)
     }
@@ -350,7 +394,7 @@ extension CloudKitDeviceTransport {
 
     @discardableResult
     public func drainIncomingControls() async -> Int {
-        guard role == .mac, NADeviceSyncRecoveryBudget.hasTime, !pairingHeldElsewhere,
+        guard role == .mac, NADeviceSyncRecoveryBudget.hasTime, holdsPairing,
               loadControlAdmission() != nil, beginControlDrain() else { return 0 }
         defer { endControlDrain() }
         let (_, since) = loadHandlerAndCursor()

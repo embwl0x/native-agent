@@ -90,16 +90,14 @@ public actor WorkshopExecutorLoop {
         self.now = now
     }
 
-    /// Shared active capacity; NATIVE_AGENT_MAX_ACTIVE_MISSIONS retains precedence over NATIVE_AGENT_MAX_ACTIVE_EXECUTIONS.
+    /// Shared active capacity from NATIVE_AGENT_MAX_ACTIVE_EXECUTIONS.
     static func defaultMaxActive() -> Int {
         let raw = ExecutionEnvVocabulary.value(canonical: "NATIVE_AGENT_MAX_ACTIVE_EXECUTIONS")
         return max(1, Int(raw ?? "") ?? 3)
     }
 
     /// Default per-step hard deadline in SECONDS. Reads
-    /// `NATIVE_AGENT_EXECUTION_STEP_TIMEOUT_SECONDS` (>=0) if set — or the
-    /// deprecated `NATIVE_AGENT_MISSION_STEP_TIMEOUT_SECONDS`, which wins when
-    /// both are set — else 1500s.
+    /// `NATIVE_AGENT_EXECUTION_STEP_TIMEOUT_SECONDS` (>=0) if set, else 1500s.
     /// Stays below the WorkshopExecutorDrainRunner pass-timeout (1800s,
     /// BackgroundLoopsAssembly) so a genuinely wedged step records a clean
     /// timeout failure instead of repeatedly releasing the pass claim.
@@ -116,9 +114,7 @@ public actor WorkshopExecutorLoop {
     }
 
     /// Default approval-wait deadline in SECONDS. Reads
-    /// `NATIVE_AGENT_EXECUTION_APPROVAL_TIMEOUT_SECONDS` (>=0) if set — or the
-    /// deprecated `NATIVE_AGENT_MISSION_APPROVAL_TIMEOUT_SECONDS`, which wins
-    /// when both are set — else 0
+    /// `NATIVE_AGENT_EXECUTION_APPROVAL_TIMEOUT_SECONDS` (>=0) if set, else 0
     /// (DISABLED). Off by default: an interactive Workshop execution waiting on the user to
     /// click an approval is correct behaviour, not a stall, so auto-failing it
     /// would destroy legitimate pending work. Headless/unattended runs that

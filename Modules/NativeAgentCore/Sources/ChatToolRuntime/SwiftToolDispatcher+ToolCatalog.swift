@@ -90,7 +90,7 @@ extension SwiftToolDispatcher {
     ///     presses, types and activates nothing, so it must not carry the
     ///     injection list's approval capability.
     ///
-    /// The separate list also keeps it OUT of `legacyMacModelToolNames`: `read`
+    /// The separate list also keeps it OUT of `internalMacToolNames`: `read`
     /// is a NEW organ for the four-verb surface to reach for, not a legacy
     /// `mac_*` organ being retired.
     ///
@@ -130,28 +130,26 @@ extension SwiftToolDispatcher {
     /// the cutover boundary; prompt filters, same-turn loading, and stale-call
     /// rejection all consult it instead of maintaining parallel exclusion
     /// lists.
-    package static let legacyMacModelToolNames: Set<String> = Set(fullMacAccessibilityReadToolNames
+    package static let internalMacToolNames: Set<String> = Set(fullMacAccessibilityReadToolNames
             + fullMacAccessibilityInjectionToolNames)
             .subtracting(fourVerbToolNames)
 
-    /// Internal Mac, folded, merged and retired names excluded from model catalogs.
-    package static let modelHiddenToolNames: Set<String> = legacyMacModelToolNames.union(ToolNameAliases.foldedTools.keys).union(ToolNameAliases.mergedTools)
-            .union(ToolNameAliases.retiredAppTools)
-
+    /// Ordinary turns carry the fixed app door. Internal executor names are
+    /// never made visible by the absence of a retired-name exclusion.
     package static func isModelHidden(_ name: String) -> Bool {
-        modelHiddenToolNames.contains(name)
+        !alwaysOnCoreNames.contains(name)
     }
 
     /// Keep the retained UI and studio tools out of the conversational catalog.
     public static func modelVisibleCatalogToolNames(
         _ availableToolNames: Set<String>
     ) -> Set<String> {
-        availableToolNames.filter { !isModelHidden($0) }
+        availableToolNames.intersection(alwaysOnCoreNames)
     }
 
     /// Add the fixed app floor and exclude internal names from active tools.
     package static func normalModelToolNames(activeTools: Set<String>) -> Set<String> {
-        alwaysOnCoreNames.union(activeTools.filter { !isModelHidden($0) })
+        alwaysOnCoreNames
     }
 
     /// The advertised tool contract for one turn, split into the part that can

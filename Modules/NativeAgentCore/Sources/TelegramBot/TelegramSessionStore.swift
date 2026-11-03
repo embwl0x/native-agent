@@ -80,7 +80,7 @@ public struct TelegramSessionStore: Sendable {
     public func activeSessionId(destination: TelegramDestination) async throws -> String {
         let activityAt = Date()
         let chatKey = Self.chatKey(destination)
-        if isOwnerDestination(destination) {
+        if try isOwnerDestination(destination) {
             // The map records the session used for delivery recovery; only the
             // shared anchor selects the owner's ordinary direct conversation.
             let resolved = try await patchChatMap(chatKey: chatKey) { entry -> (id: String, resolution: SessionIdentityTrace.Resolution) in
@@ -109,19 +109,19 @@ public struct TelegramSessionStore: Sendable {
             }
             try await ensureSessionRow(id: resolved.id, destination: destination, title: Self.sessionTitle(destination))
             if ConversationAnchor.currentSessionId(dataRoot: dataRoot) == nil {
-                try? await publishAnchor(sessionId: resolved.id, destination: destination, activityAt: activityAt)
+                try await publishAnchor(sessionId: resolved.id, destination: destination, activityAt: activityAt)
             }
             emitIdentityTrace(sessionId: resolved.id, destination: destination, resolvedBy: resolved.resolution)
             return resolved.id
         }
         if let mapped = try await mappedSessionId(chatKey: chatKey), !mapped.isEmpty {
             try await ensureSessionRow(id: mapped, destination: destination, title: Self.sessionTitle(destination))
-            try? await publishAnchor(sessionId: mapped, destination: destination, activityAt: activityAt)
+            try await publishAnchor(sessionId: mapped, destination: destination, activityAt: activityAt)
             emitIdentityTrace(sessionId: mapped, destination: destination, resolvedBy: .mapped)
             return mapped
         }
         // Mint or adopt the session inside the chat-map lock so concurrent first messages agree.
-        let legacy = Self.legacySessionId(destination)
+        let initialSessionID = Self.sourceKey(destination)
         // The closure runs inside the flock on another executor, so it reports
         // BOTH facts through its return value rather than mutating a capture.
         let outcome = try await patchChatMap(chatKey: chatKey) { entry -> (id: String, adopted: Bool) in
@@ -131,15 +131,15 @@ public struct TelegramSessionStore: Sendable {
             }
             let now = Self.nowString()
             if entry["createdAt"] == nil { entry["createdAt"] = .string(now) }
-            entry["activeSessionId"] = .string(legacy)
+            entry["activeSessionId"] = .string(initialSessionID)
             entry["updatedAt"] = .string(now)
-            return (legacy, false)
+            return (initialSessionID, false)
         }
         let resolved = outcome.id
         let adopted = outcome.adopted
         // Create the row for the session selected under the lock.
         try await ensureSessionRow(id: resolved, destination: destination, title: Self.sessionTitle(destination))
-        try? await publishAnchor(sessionId: resolved, destination: destination, activityAt: activityAt)
+        try await publishAnchor(sessionId: resolved, destination: destination, activityAt: activityAt)
         emitIdentityTrace(
             sessionId: resolved,
             destination: destination,
@@ -149,6 +149,8 @@ public struct TelegramSessionStore: Sendable {
     }
 
     public func startNewSession(destination: TelegramDestination) async throws -> String {
+        // Resolve ownership before any transcript or binding write.
+        _ = try isOwnerDestination(destination)
         let activityAt = Date()
         let sessionId = UUID().uuidString
         try await ensureSessionRow(id: sessionId, destination: destination, title: Self.sessionTitle(destination)) {
@@ -173,9 +175,8 @@ public struct TelegramSessionStore: Sendable {
 
     private func publishAnchor(sessionId: String, destination: TelegramDestination, activityAt: Date) async throws {
         // Only the authenticated owner's private chat may move the anchor.
-        guard isOwnerDestination(destination) else { return }
-        // Explicit selections require this owner's committed outcome. Ordinary
-        // message admission may proceed if its activity publication fails.
+        guard try isOwnerDestination(destination) else { return }
+        // Resolve the owner's anchor before admitting a message into its turn.
         let outcome = try await ConversationAnchor.publish(
             sessionId: sessionId,
             source: Self.anchorSource,
@@ -193,7 +194,7 @@ public struct TelegramSessionStore: Sendable {
         resolvedBy: SessionIdentityTrace.Resolution
     ) {
         SessionIdentityTrace.emit(
-            threadKey: Self.legacySessionId(destination),
+            threadKey: Self.sourceKey(destination),
             sessionId: sessionId,
             surface: Self.anchorSource,
             mintSite: .telegramSessionStore,
@@ -205,9 +206,9 @@ public struct TelegramSessionStore: Sendable {
     /// branch on this value — see `ConversationAnchor`.
     private static let anchorSource = "telegram"
 
-    private func isOwnerDestination(_ destination: TelegramDestination) -> Bool {
+    private func isOwnerDestination(_ destination: TelegramDestination) throws -> Bool {
         guard destination.chatId > 0, destination.threadId == nil,
-              let owner = TelegramConfig.loadFromDisk(dataRoot: dataRoot)?.ownerUserId else { return false }
+              let owner = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: false)?.ownerUserId else { return false }
         return owner == Int64(destination.chatId)
     }
 
@@ -217,7 +218,7 @@ public struct TelegramSessionStore: Sendable {
 
     public func setPersona(destination: TelegramDestination, persona: String) async throws -> String {
         let trimmed = persona.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, isOwnerDestination(destination) else {
+        guard !trimmed.isEmpty, try isOwnerDestination(destination) else {
             throw TelegramBotError.invalidRequest
         }
         PersonaSelection.select(trimmed)
@@ -231,7 +232,7 @@ public struct TelegramSessionStore: Sendable {
 
     private func status(destination: TelegramDestination, sessionId: String) async throws -> TelegramSessionStatus {
         let persona = try await persona(destination: destination) ?? "NativeAgent"
-        let messages = (try? await SwiftNativePersistenceCore.readJSONL(messagesPath(sessionId: sessionId))) ?? []
+        let messages = try await SwiftNativePersistenceCore.readJSONL(messagesPath(sessionId: sessionId))
         return TelegramSessionStatus(
             chatId: destination.chatId,
             sessionId: sessionId,
@@ -244,7 +245,7 @@ public struct TelegramSessionStore: Sendable {
         if ownerAccess { return true }
         guard case .object(let row) = value,
               row["source"] == .string("telegram"),
-              row["sourceKey"] == .string(Self.legacySessionId(destination)) else { return false }
+              row["sourceKey"] == .string(Self.sourceKey(destination)) else { return false }
         return true
     }
 
@@ -260,7 +261,7 @@ public struct TelegramSessionStore: Sendable {
         let cappedLimit = max(1, min(limit, 25))
         let rows = try await SwiftNativePersistenceCore.readJSON(sessionsPath, ifMissing: .array([]))
         guard case .array(let array) = rows else { return [] }
-        let ownerDestination = isOwnerDestination(destination)
+        let ownerDestination = try isOwnerDestination(destination)
         let ownerAccess = fromUserId == destination.chatId && ownerDestination
         let sessions = array
             .filter { isResumableSession($0, destination: destination, ownerAccess: ownerAccess, ownerDestination: ownerDestination) }
@@ -280,7 +281,7 @@ public struct TelegramSessionStore: Sendable {
         let activityAt = Date()
         let sessionId = try await resolveExistingSessionId(rawSessionId, destination: destination, fromUserId: fromUserId)
         try await ChatSessionIndexFile.mutate(at: sessionsPath) { rows in
-            let ownerDestination = isOwnerDestination(destination)
+            let ownerDestination = try isOwnerDestination(destination)
             guard let row = rows.first(where: { $0["id"] == .string(sessionId) }),
                   isResumableSession(.object(row), destination: destination,
                     ownerAccess: fromUserId == destination.chatId && ownerDestination, ownerDestination: ownerDestination) else {
@@ -312,11 +313,11 @@ public struct TelegramSessionStore: Sendable {
     }
 
     /// The conversation a private chat is in now, or nil.
-    public func boundSessionId(chatId: Int) async -> String? {
-        if isOwnerDestination(.chat(chatId)) {
+    public func boundSessionId(chatId: Int) async throws -> String? {
+        if try isOwnerDestination(.chat(chatId)) {
             return ConversationAnchor.currentSessionId(dataRoot: dataRoot)
         }
-        return try? await mappedSessionId(chatKey: String(chatId))
+        return try await mappedSessionId(chatKey: String(chatId))
     }
 
     public func outboundDestination(sessionId: String) async throws -> TelegramDestination? {
@@ -432,7 +433,7 @@ public struct TelegramSessionStore: Sendable {
         commitBinding: @Sendable () async throws -> Void = {}
     ) async throws {
         try await ChatSessionIndexFile.ensureSession(
-            id: id, title: title, source: "telegram", sourceKey: Self.legacySessionId(destination),
+            id: id, title: title, source: "telegram", sourceKey: Self.sourceKey(destination),
             kind: destination.chatId > 0 && destination.threadId == nil ? .direct : .channel,
             dataRoot: dataRoot, context: "TelegramSessionStore.ensureSessionRow", commitBinding: commitBinding
         )
@@ -447,7 +448,7 @@ public struct TelegramSessionStore: Sendable {
         guard case .array(let array) = rows else {
             throw TelegramSessionStoreError.sessionNotFound(requested)
         }
-        let ownerAccess = fromUserId == destination.chatId && isOwnerDestination(destination)
+        let ownerAccess = try fromUserId == destination.chatId && isOwnerDestination(destination)
         let ids = array.filter { isAccessibleSession($0, destination: destination, ownerAccess: ownerAccess) }.compactMap { value -> String? in
             guard case .object(let obj) = value,
                   case .string(let id)? = obj["id"] else {
@@ -492,14 +493,14 @@ public struct TelegramSessionStore: Sendable {
         return "\(destination.chatId):\(threadId)"
     }
 
-    public static func legacySessionId(_ chatId: Int) -> String {
+    public static func sourceKey(_ chatId: Int) -> String {
         "telegram:\(chatId)"
     }
 
     /// Source keys are `telegram:<chatId>` or `telegram:<chatId>:<threadId>` for forum topics.
-    public static func legacySessionId(_ destination: TelegramDestination) -> String {
+    public static func sourceKey(_ destination: TelegramDestination) -> String {
         guard let threadId = destination.threadId else {
-            return legacySessionId(destination.chatId)
+            return sourceKey(destination.chatId)
         }
         return "telegram:\(destination.chatId):\(threadId)"
     }

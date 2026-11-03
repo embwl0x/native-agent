@@ -30,7 +30,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     /// Empty history omits the signal; unavailable evidence fails the pass.
     private let workshopOutcomes: @Sendable () async throws -> String
     /// Previous-card outcomes, lesson misses and standing corrections; the default learns nothing.
-    private let learning: @Sendable (_ previousCards: [String]?) async -> SelfImprovementLearning
+    private let learning: @Sendable (_ previousCards: [String]?) async throws -> SelfImprovementLearning
     /// Stages the standing lessons the analyst wrote (memory id → GROWTH line)
     /// as REM cards and returns their REM proposal ids. Throws like `stageProposal`.
     private let stageStandingLessons: @Sendable ([String: String]) async throws -> [String]
@@ -44,7 +44,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
         stageProposal: @escaping @Sendable (SelfImprovementProposal) async throws -> String,
         fileCodeFinding: (@Sendable (SelfImprovementProposal) async throws -> Void)? = nil,
         workshopOutcomes: @escaping @Sendable () async throws -> String,
-        learning: @escaping @Sendable (_ previousCards: [String]?) async -> SelfImprovementLearning = { _ in SelfImprovementLearning() },
+        learning: @escaping @Sendable (_ previousCards: [String]?) async throws -> SelfImprovementLearning = { _ in SelfImprovementLearning() },
         stageStandingLessons: @escaping @Sendable ([String: String]) async throws -> [String] = { _ in [] }
     ) {
         self.interval = interval
@@ -141,7 +141,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
             let outcomes = try await workshopOutcomes()
             try Task.checkCancellation()
             if !outcomes.isEmpty { signals += "\n\n" + outcomes }
-            let learned = await learning(previousPassCards())
+            let learned = try await learning(previousPassCards())
             try Task.checkCancellation()
             if !learned.signals.isEmpty { signals += "\n\n" + learned.signals }
             if !learned.standing.isEmpty {
@@ -344,12 +344,14 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
 
     /// The cards the newest digest already written recorded — the previous
     /// pass's. Nil when there is no earlier digest.
-    private func previousPassCards() -> [String]? {
+    private func previousPassCards() throws -> [String]? {
         let dir = dataRoot.appendingPathComponent("self_improvement", isDirectory: true)
             .appendingPathComponent("digests", isDirectory: true)
-        guard let newest = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
-                .filter({ $0.hasSuffix(".md") }).max(),
-              let text = try? String(contentsOf: dir.appendingPathComponent(newest), encoding: .utf8) else { return nil }
+        let names: [String]
+        do { names = try FileManager.default.contentsOfDirectory(atPath: dir.path) }
+        catch CocoaError.fileReadNoSuchFile { return nil }
+        guard let newest = names.filter({ $0.hasSuffix(".md") }).max() else { return nil }
+        let text = try String(contentsOf: dir.appendingPathComponent(newest), encoding: .utf8)
         return text.split(separator: "\n").filter { $0.hasPrefix("- card ") }.map { String($0.dropFirst("- card ".count)) }
     }
 

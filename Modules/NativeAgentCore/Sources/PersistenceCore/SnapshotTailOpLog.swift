@@ -159,9 +159,15 @@ public enum SnapshotTailOpLog {
             case .ok:
                 return "\(feed): ok — \(physicalRowCount) row(s), \(kib) KiB"
             case .warn:
+                var warnings: [String] = []
+                if physicalRowCount >= compactionThreshold * Self.growthWarnMultiple {
+                    warnings.append("at least \(Self.growthWarnMultiple)× the \(compactionThreshold)-row compaction threshold")
+                }
+                if integrity.trailingPartialLine {
+                    warnings.append("last line torn — an append may be in flight")
+                }
                 return "\(feed): \(physicalRowCount) row(s), \(kib) KiB — "
-                    + "over \(Self.growthWarnMultiple)× the \(compactionThreshold)-row compaction threshold"
-                    + (integrity.trailingPartialLine ? " (last line torn — an append may be in flight)" : "")
+                    + warnings.joined(separator: "; ")
             case .blocked:
                 return "\(feed): COMPACTION BLOCKED — \(integrity.unusableRowCount) unusable row(s) "
                     + "(\(integrity.summary)); feed is \(physicalRowCount) row(s), \(kib) KiB and cannot shrink"
@@ -170,9 +176,14 @@ public enum SnapshotTailOpLog {
 
         /// Bytes + physical rows of a feed file, for a store assembling its own
         /// health value. A missing file is a genesis feed, not an error.
-        public static func fileSize(_ path: URL) -> Int {
-            guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else { return 0 }
-            return (attrs[.size] as? NSNumber)?.intValue ?? 0
+        public static func fileSize(_ path: URL) throws -> Int {
+            let attrs: [FileAttributeKey: Any]
+            do { attrs = try FileManager.default.attributesOfItem(atPath: path.path) }
+            catch CocoaError.fileReadNoSuchFile { return 0 }
+            guard let bytes = attrs[.size] as? NSNumber else {
+                throw PersistenceCoreError.ioFailure("File size is unavailable at \(path.path). Repair access before grading feed health.")
+            }
+            return bytes.intValue
         }
     }
 

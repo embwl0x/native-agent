@@ -106,11 +106,15 @@ extension CognitiveSQLiteStore {
             db,
             sql: """
             SELECT id, payload_json FROM cognitive_artifacts
-            WHERE kind LIKE ?
+            WHERE kind LIKE ? AND (
+                (kind = 'reflection_receipt' AND status = 'owed') OR id IN (
+                    SELECT id FROM cognitive_artifacts WHERE kind LIKE ?
+                    ORDER BY updated_at DESC, id ASC LIMIT ?
+                )
+            )
             ORDER BY updated_at DESC, id ASC
-            LIMIT ?
             """,
-            arguments: [whole ? kindPrefix : "\(kindPrefix)%", bounded]
+            arguments: [whole ? kindPrefix : "\(kindPrefix)%", whole ? kindPrefix : "\(kindPrefix)%", bounded]
         )
         return try rows.map { row in
             let id: String = try row.decode(forColumn: "id") ?? "<unknown>"

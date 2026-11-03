@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `ProviderCatalogWireModels.swift` | Shared provider connections with compatible decoding, model capabilities, typed check results, reasoning-choice values/table/filter and surface-group vocabulary; callers own their default reasoning policies |
+// Blueprint: | `ProviderCatalogWireModels.swift` | Shared checked provider connections, model capabilities, typed check results, reasoning-choice values/table/filter and surface-group vocabulary; callers own their default reasoning policies |
 
 public struct ReasoningEffortOption: Identifiable, Codable, Hashable, Sendable {
     public var id: String
@@ -16,17 +16,19 @@ public struct ReasoningEffortOption: Identifiable, Codable, Hashable, Sendable {
 public var defaultReasoningEffortOptions: [ReasoningEffortOption] {
     [
         ReasoningEffortOption(id: "none", label: "None", description: nil),
+        ReasoningEffortOption(id: "minimal", label: "Minimal", description: nil),
         ReasoningEffortOption(id: "low", label: "Low", description: nil),
         ReasoningEffortOption(id: "medium", label: "Medium", description: nil),
         ReasoningEffortOption(id: "high", label: "High", description: nil),
         ReasoningEffortOption(id: "xhigh", label: "XHigh", description: nil),
         ReasoningEffortOption(id: "max", label: "Max", description: nil),
-        ReasoningEffortOption(id: "ultra", label: "Ultra", description: nil)
+        ReasoningEffortOption(id: "ultra", label: "Ultra", description: nil),
+        ReasoningEffortOption(id: "default", label: "Default", description: "Use the provider's default reasoning control.")
     ]
 }
 
 public func reasoningOptions<Option>(available: [Option], supported: [String]?, id: (Option) -> String) -> [Option] {
-    guard let supported, !supported.isEmpty else { return available }
+    guard let supported else { return [] }
     return available.filter { supported.contains(id($0)) }
 }
 
@@ -44,6 +46,8 @@ public struct ProviderModelInfo: Codable, Hashable, Identifiable, Sendable {
     public var default_reasoning_effort: String? = nil
     public var supported_reasoning_efforts: [String]? = nil
     public var supports_fast: Bool? = nil
+    /// Why this row's controls cannot yet be selected; nil when declared.
+    public var controls_note: String? = nil
 
     public init(
         id: String,
@@ -57,7 +61,8 @@ public struct ProviderModelInfo: Codable, Hashable, Identifiable, Sendable {
         cost_per_1k_out: Double? = nil,
         default_reasoning_effort: String? = nil,
         supported_reasoning_efforts: [String]? = nil,
-        supports_fast: Bool? = nil
+        supports_fast: Bool? = nil,
+        controls_note: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -71,6 +76,7 @@ public struct ProviderModelInfo: Codable, Hashable, Identifiable, Sendable {
         self.default_reasoning_effort = default_reasoning_effort
         self.supported_reasoning_efforts = supported_reasoning_efforts
         self.supports_fast = supports_fast
+        self.controls_note = controls_note
     }
 }
 
@@ -116,9 +122,9 @@ extension ProviderInfo {
         auth_modes = try c.decode([String].self, forKey: .auth_modes)
         auth_status = try c.decode(ProviderAuthStatus.self, forKey: .auth_status)
         models = try c.decode([ProviderModelInfo].self, forKey: .models)
-        auth_mode = try? c.decode(String.self, forKey: .auth_mode)
-        default_model = try? c.decode(String.self, forKey: .default_model)
-        models_note = try? c.decode(String.self, forKey: .models_note)
+        auth_mode = try c.decodeIfPresent(String.self, forKey: .auth_mode)
+        default_model = try c.decodeIfPresent(String.self, forKey: .default_model)
+        models_note = try c.decodeIfPresent(String.self, forKey: .models_note)
     }
 }
 
@@ -130,7 +136,7 @@ public struct ProviderTestResult: Codable, Hashable, Sendable {
     public var model_used: String?
     public var detail: String?
     public var error: String?
-    /// The failed check's typed cause, encoded by the provider router; nil from older peers.
+    /// The failed check's typed cause, encoded by the provider router; absent on success.
     public var cause: String? = nil
     /// Short hash of the exact key the check sent, taken before it was sent.
     public var credential: String? = nil

@@ -12,7 +12,7 @@ import PersistenceCore
 import ProviderRouting
 import AppKit
 import AppToolRuntime
-// Blueprint: | `SimpleThreadPresentation.swift` | Shared thread column, header and transcript text render the chat's typography and retained inline parsing |
+// Blueprint: | `SimpleThreadPresentation.swift` | Shared thread column, header and transcript text render the chat's typography and shared inline outcomes; missing recorded times display Time unavailable; pending preparation is explicit |
 
 extension View {
     /// Threads share the chat transcript's width, gutter and anchor.
@@ -58,7 +58,7 @@ struct SimpleThreadHeader<Mark: View>: View {
 struct SimpleTranscriptEntry: View, Equatable {
     let speaker: String
     let text: String
-    let at: Date
+    let at: Date?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -66,7 +66,7 @@ struct SimpleTranscriptEntry: View, Equatable {
                 Text(speaker)
                     .font(ShellType.labelSemibold)
                     .foregroundStyle(NativeAgentShell.text)
-                Text(BotsShelfRecord.shortDate(at))
+                Text(at.map(BotsShelfRecord.shortDate) ?? "Time unavailable")
                     .font(ShellType.caption)
                     .foregroundStyle(NativeAgentShell.tertiary)
             }
@@ -83,8 +83,7 @@ struct SimpleTranscriptEntry: View, Equatable {
 
     /// Bold, italics and code as the chat shows them; line breaks kept.
     nonisolated static func inline(_ text: String) -> AttributedString {
-        (try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
-            ?? AttributedString(text)
+        ChatMarkdownCache.inline(text).presentation
     }
 }
 
@@ -94,14 +93,20 @@ struct SimpleLiveText: View {
     @State private var renderedSource: String?
 
     var body: some View {
-        Text(renderedSource == text ? (rendered ?? AttributedString(text)) : AttributedString(text))
-            .task(id: text) {
-                let parsed = await Task.detached(priority: .userInitiated) { [text] in
-                    SimpleTranscriptEntry.inline(text)
-                }.value
-                guard !Task.isCancelled else { return }
-                rendered = parsed
-                renderedSource = text
+        Group {
+            if renderedSource == text, let rendered {
+                Text(rendered)
+            } else {
+                Text("Formatting message…")
             }
+        }
+        .task(id: text) {
+            let parsed = await Task.detached(priority: .userInitiated) { [text] in
+                SimpleTranscriptEntry.inline(text)
+            }.value
+            guard !Task.isCancelled else { return }
+            rendered = parsed
+            renderedSource = text
+        }
     }
 }

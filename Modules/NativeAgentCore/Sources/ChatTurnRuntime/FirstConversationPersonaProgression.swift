@@ -2,8 +2,10 @@ import Foundation
 import PersistenceCore
 import PersonaEngine
 import NativeAgentShared
+import NativeAgentCore
+import Experiences
 
-// Blueprint: | `FirstConversationPersonaProgression.swift` | `FirstConversationPersonaProgression`: exact-session one-shot progression tokens and pending voice step; Trust authorizes writes; atomic spending prevents reuse |
+// Blueprint: | `FirstConversationPersonaProgression.swift` | `FirstConversationPersonaProgression`: shared dialogue and exact-session progression; successful authorized writes settle tokens and the durable voice step under one lock |
 
 // The first conversation progresses from SOUL.md to VOICE.md by spending
 // exact-session, exact-title one-shot tokens. Trust authorizes every write.
@@ -43,10 +45,46 @@ public enum FirstConversationPersonaProgression {
     /// model cannot widen it by changing the suffix.
     public static func roleSectionTitle(personName: String) -> String {
         let trimmed = personName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "\(roleSectionPrefix)them" : "\(roleSectionPrefix)\(trimmed)"
+        return "\(roleSectionPrefix)\(trimmed)"
     }
 
     // MARK: - The token
+
+    static let voiceQuestion = """
+    Ask how they would like you to sound with them, close to: "And how would you like me \
+    to sound? Energetic, calm, serious, playful, joking, sarcastic, warm, blunt — or name \
+    someone you'd like me to sound like."
+    """
+
+    static func roleAnswerInstruction(title: String) -> String {
+        """
+        When they answer what they want you to be, repeat it back in THEIR words — no praise, \
+        no label — and write ONE line with app {action:"persona.append",args:{kind:"soul",title:"\(title)",content}}. \
+        Use that exact title and a single first-person sentence on one line, based only on \
+        what they actually said. A one-word answer gets a one-clause line. You may say once \
+        you are writing it as who you are rather than as a setting. Then, in the same reply: \
+        \(voiceQuestion) If they skip or ask something else, answer them, write nothing and \
+        never raise either question again.
+        """
+    }
+
+    static let voiceAnswerInstruction = """
+    Use the exact voice title supplied by this step and one first-person sentence on one \
+    line, based only on their words. A named person's style means cadence, humor, warmth, \
+    vocabulary and energy, never their identity; SOUL.md remains who you are. Say once the \
+    voice can change any time. If they skip or ask something else, answer them, keep your \
+    default voice, write nothing and never ask again.
+    """
+
+    static let handBackInstruction = """
+    Hand the floor back in one turn: the rest you will pick up from working with them. \
+    Say "If there's anything you'd rather I never do, tell me whenever it comes to mind." \
+    and ask "What are you working on?"
+    """
+
+    static func nextTurnDirective(title: String) -> String {
+        "[First conversation. You have just asked this person what they want you to be. \(roleAnswerInstruction(title: title)) Never mention this note.]"
+    }
 
     public struct WriteToken: Sendable, Equatable {
         public let sessionID: String
@@ -58,33 +96,45 @@ public enum FirstConversationPersonaProgression {
     /// How long the token stays live after the opener lands.
     public static let writeTokenLifetime: TimeInterval = 3600
 
-    /// Arm a step once per persona; a live or spent token prevents re-arming.
-    @discardableResult
+    /// Create once, or verify the exact already-committed intent during settlement repair.
     public static func armWriteToken(
         dataRoot: URL,
         sessionID: String,
         title: String,
         token: String, spent spentName: String,
         fileManager: FileManager = .default
-    ) -> Bool {
+    ) throws {
         let session = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         let sectionTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !session.isEmpty, !sectionTitle.isEmpty,
-              !sectionTitle.contains("\n") else { return false }
+              !sectionTitle.contains("\n"), !sectionTitle.contains("\r") else {
+            throw ToolFailureError("First-conversation progression needs an exact session and single-line title.", effects: .none)
+        }
 
         let root = PersonaRootResolver.resolveIsolated(dataRoot: dataRoot)
         let live = root.appendingPathComponent(token)
         let spent = root.appendingPathComponent(spentName)
-        guard !fileManager.fileExists(atPath: live.path),
-              !fileManager.fileExists(atPath: spent.path) else { return false }
+        var alreadyArmed = false
+        for path in [spent, live] {
+            if let saved = try decodeToken(at: path) {
+                guard saved.sessionID == session, saved.title == sectionTitle else {
+                    throw ToolFailureError("First-conversation progression at \(path.path) belongs to another session or title. Preserve it and reconcile before continuing.", effects: .none)
+                }
+                alreadyArmed = true
+            }
+        }
+        if alreadyArmed { return }
 
         let payload: [String: Any] = [
             "session_id": session,
             "title": sectionTitle,
             "armed_at": Date().timeIntervalSince1970,
         ]
-        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return false }
-        return NativePrivateFile.write(data, to: live)
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: live)
+        guard let saved = try decodeToken(at: live), saved.sessionID == session, saved.title == sectionTitle else {
+            throw ToolFailureError("The first-conversation token did not read back at \(live.path). Repair the retained progression before continuing.", effects: .unknown)
+        }
     }
 
     /// The title the matching write used, live or spent — what the receipt row
@@ -94,47 +144,47 @@ public enum FirstConversationPersonaProgression {
         fileManager: FileManager = .default
     ) -> String? {
         let root = PersonaRootResolver.resolveIsolated(dataRoot: dataRoot)
-        return decodeToken(at: root.appendingPathComponent(writeTokenFilename))?.title
-            ?? decodeToken(at: root.appendingPathComponent(spentTokenFilename))?.title
+        do {
+            return try decodeToken(at: root.appendingPathComponent(writeTokenFilename))?.title
+                ?? decodeToken(at: root.appendingPathComponent(spentTokenFilename))?.title
+        } catch {
+            RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "first_conversation.token",
+                owner: root.path, words: "The first-conversation token is unavailable: \(error.localizedDescription). Repair its retained file; no spent-token title was substituted.")
+            return nil
+        }
     }
 
-    private static func decodeToken(at url: URL) -> WriteToken? {
-        guard let data = try? Data(contentsOf: url),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+    private static func decodeToken(at url: URL) throws -> WriteToken? {
+        let data: Data
+        do { data = try Data(contentsOf: url) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let session = object["session_id"] as? String,
               let title = object["title"] as? String,
-              !session.isEmpty, !title.isEmpty else { return nil }
-        // A token written before `armed_at` existed carries no lifetime, so it
-        // reads as armed at the epoch — already expired. That fails closed:
-        // the person's write meets the ordinary confirm card instead.
-        let armedAt = Date(
-            timeIntervalSince1970: object["armed_at"] as? TimeInterval ?? 0
-        )
+              !session.isEmpty, !title.isEmpty,
+              let seconds = object["armed_at"] as? TimeInterval, seconds.isFinite else {
+            throw ToolFailureError("The first-conversation token is malformed: \(url.path). Repair its retained session, title and armed_at before advancing the conversation.", effects: .none, owner: url.path, recovery: .repair)
+        }
+        let armedAt = Date(timeIntervalSince1970: seconds)
         return WriteToken(sessionID: session, title: title, armedAt: armedAt)
+    }
+
+    private static func exists(_ url: URL) throws -> Bool {
+        do { _ = try FileManager.default.attributesOfItem(atPath: url.path); return true }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile { return false }
     }
 
     // MARK: - The decision
 
-    /// Match the persona writer's NFKC, whitespace and case normalization.
-    private static func canonicalKind(_ value: String?) -> String {
-        (value ?? "")
-            .precomposedStringWithCompatibilityMapping
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-    }
-
-    /// True — and the token is SPENT — only when this exact dispatch is the one
-    /// write the first conversation exists to make.
-    ///
-    /// Side-effecting on purpose: the rename is the exactly-once bound, and it
-    /// happens last, after every check, so a refused dispatch never burns it.
-    public static func advanceIfMatching(
+    /// Called only after a successful authorized persona append. This bookkeeping
+    /// cannot authorize a write, and failed/preview/admission-only calls never enter it.
+    public static func settleSuccessfulWrite(
         tool: String,
         input: [String: JSONValue],
         dataRoot: URL?,
         sessionID: String?,
         fileManager: FileManager = .default
-    ) -> Bool {
+    ) async throws -> Bool {
         guard tool == writeTool, let dataRoot else { return false }
         let session = (sessionID ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !session.isEmpty else { return false }
@@ -144,7 +194,7 @@ public enum FirstConversationPersonaProgression {
               case .string(let rawContent)? = input["content"] else { return false }
 
         // Kind: soul, or the voice step it arms, and nothing else.
-        let kind = canonicalKind(rawKind)
+        let kind = SwiftNativePersonaEngine.canonicalizeKind(rawKind)
         guard kind == "soul" || kind == "voice" else { return false }
 
         // Both title and body are single lines, so neither can introduce another section.
@@ -155,64 +205,31 @@ public enum FirstConversationPersonaProgression {
               !content.contains("\n"), !content.contains("\r") else { return false }
 
         let root = PersonaRootResolver.resolveIsolated(dataRoot: dataRoot)
-        if kind == "voice" {
-            return consume(
-                root: root, token: voiceTokenFilename, spent: voiceSpentTokenFilename,
-                document: voiceDocument, sectionPrefix: voiceSectionPrefix,
-                documentMayBeAbsent: true, session: session, title: title,
-                fileManager: fileManager
-            )
-        }
-        guard consume(
-            root: root, token: writeTokenFilename, spent: spentTokenFilename,
-            document: soulDocument, sectionPrefix: roleSectionPrefix,
-            documentMayBeAbsent: false, session: session, title: title,
-            fileManager: fileManager
-        ) else { return false }
-        if title.hasPrefix(roleSectionPrefix) {
-            _ = armWriteToken(dataRoot: dataRoot, sessionID: session,
-                title: voiceSectionPrefix + title.dropFirst(roleSectionPrefix.count),
-                token: voiceTokenFilename, spent: voiceSpentTokenFilename, fileManager: fileManager)
-        }
-        return true
-    }
-
-    /// One token's checks and its atomic consume.
-    private static func consume(
-        root: URL, token tokenName: String, spent spentName: String,
-        document: String, sectionPrefix: String, documentMayBeAbsent: Bool,
-        session: String, title: String, fileManager: FileManager
-    ) -> Bool {
-        let live = root.appendingPathComponent(tokenName)
-
-        // Spending requires the exact armed session and title.
-        guard let token = decodeToken(at: live) else { return false }
-        // An expired step is removed and cannot be spent.
-        guard Date().timeIntervalSince(token.armedAt) < writeTokenLifetime else {
-            try? fileManager.removeItem(at: live)
-            return false
-        }
-        guard token.sessionID == session, token.title == title else { return false }
-
-        // The document must still be innocent of this section, however it is
-        // titled. Belt to the token's braces.
-        let url = root.appendingPathComponent(document)
-        let body: String
-        if let read = try? String(contentsOf: url, encoding: .utf8) {
-            body = read
-        } else if documentMayBeAbsent, !fileManager.fileExists(atPath: url.path) {
-            body = ""
-        } else {
-            return false
-        }
-        guard !bodyHasSection(body, prefix: sectionPrefix) else { return false }
-
-        // LAST: atomic consume. Exactly one caller can win this rename.
-        do {
-            try fileManager.moveItem(at: live, to: root.appendingPathComponent(spentName))
+        let live = root.appendingPathComponent(kind == "voice" ? voiceTokenFilename : writeTokenFilename)
+        nonisolated(unsafe) let fileManager = fileManager
+        return try await SwiftNativePersistenceCore.withFileLock(live) {
+            guard let token = try decodeToken(at: live), token.sessionID == session, token.title == title,
+                  Date().timeIntervalSince(token.armedAt) < writeTokenLifetime else { return false }
+            let document = root.appendingPathComponent(kind == "voice" ? voiceDocument : soulDocument)
+            let body = try String(contentsOf: document, encoding: .utf8)
+            // The writer appends the trimmed title and unmodified content. A success
+            // response alone cannot stand in for these committed persona bytes.
+            guard body.contains("\n\n## \(title)\n\(rawContent)") else {
+                throw ToolFailureError("The successful persona append could not be verified at \(document.path). Read it before repeating the write; progression remains owed.", effects: .unknown)
+            }
+            if kind == "soul" {
+                guard title.hasPrefix(roleSectionPrefix) else { return false }
+                try armWriteToken(dataRoot: dataRoot, sessionID: session,
+                    title: voiceSectionPrefix + title.dropFirst(roleSectionPrefix.count),
+                    token: voiceTokenFilename, spent: voiceSpentTokenFilename, fileManager: fileManager)
+            }
+            // Commit the next step first. A failed settlement keeps the source token
+            // and exact intent for repair, never inviting another persona append.
+            let spent = root.appendingPathComponent(kind == "voice" ? voiceSpentTokenFilename : spentTokenFilename)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(contentsOf: live), to: spent)
+            try fileManager.removeItem(at: live)
+            try SwiftNativePersistenceCore.syncDirectory(root)
             return true
-        } catch {
-            return false
         }
     }
 
@@ -222,32 +239,25 @@ public enum FirstConversationPersonaProgression {
         dataRoot: URL?,
         sessionID: String?,
         fileManager: FileManager = .default
-    ) -> String? {
+    ) throws -> String? {
         guard let dataRoot, let sessionID, !sessionID.isEmpty else { return nil }
         let root = PersonaRootResolver.resolveIsolated(dataRoot: dataRoot)
-        guard !fileManager.fileExists(atPath: root.appendingPathComponent(voiceDeliveredFilename).path) else { return nil }
+        guard try !exists(root.appendingPathComponent(voiceDeliveredFilename)) else { return nil }
         let live = root.appendingPathComponent(voiceTokenFilename)
-        guard fileManager.fileExists(atPath: live.path),
-              let token = decodeToken(at: live),
+        guard let token = try decodeToken(at: live),
               token.sessionID == sessionID,
               Date().timeIntervalSince(token.armedAt) < writeTokenLifetime else { return nil }
         return """
-        [First conversation: after writing who you are to them, ask once how they want you \
-        to sound. On their answer, use app {action:"persona.append",args:{kind:"voice",title:"\(token.title)",content}} \
-        with that exact title and one first-person sentence on one line, based only on their words. \
-        A named person's style means cadence, humor, warmth, vocabulary and energy, never their identity; \
-        SOUL.md remains who you are. Say once the voice can change any time. In the same reply say \
-        "If there's anything you'd rather I never do, tell me whenever it comes to mind." \
-        and ask "What are you working on?" If they skip the voice question or ask something else, \
-        answer them, keep your default voice, write nothing and never ask again. Do not mention this note.]
+        [First conversation: after writing who you are to them: \(voiceQuestion) \
+        On their answer, use app {action:"persona.append",args:{kind:"voice",title:"\(token.title)",content}}. \
+        \(voiceAnswerInstruction) \(handBackInstruction) Do not mention this note.]
         """
     }
 
-    public static func markVoiceDirectiveDelivered(dataRoot: URL, sessionID: String, expectedDirective: String) {
-        guard pendingVoiceDirective(dataRoot: dataRoot, sessionID: sessionID) == expectedDirective else { return }
+    public static func markVoiceDirectiveDelivered(dataRoot: URL, sessionID: String, expectedDirective: String) throws {
+        guard try pendingVoiceDirective(dataRoot: dataRoot, sessionID: sessionID) == expectedDirective else { return }
         let path = PersonaRootResolver.resolveIsolated(dataRoot: dataRoot).appendingPathComponent(voiceDeliveredFilename)
-        do { try Data().write(to: path, options: .withoutOverwriting) }
-        catch { nativeLog("Voice instruction delivery could not be recorded: \(error)") }
+        try Data().write(to: path, options: .withoutOverwriting)
     }
 
     public static func bodyHasRoleSection(_ body: String) -> Bool {

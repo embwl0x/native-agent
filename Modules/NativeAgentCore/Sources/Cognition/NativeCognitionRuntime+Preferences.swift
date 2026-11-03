@@ -20,12 +20,12 @@ import Transcripts
 
 extension NativeCognitionRuntime {
     /// Read the configured user name from `<dataRoot>/memory/profile.json`
-    /// (`userName`, written at onboarding). Tolerant of a missing/malformed file.
-    public nonisolated static func resolveUserName(dataRoot: URL) -> String {
+    /// (`userName`, written at onboarding). An unreadable existing profile throws.
+    public nonisolated static func resolveUserName(dataRoot: URL) throws -> String {
         let path = dataRoot
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("profile.json")
-        return SwiftNativeKnowledgeGraphIndexer.profileNames(profileURL: path).user ?? ""
+        return try SwiftNativeKnowledgeGraphIndexer.profileNames(profileURL: path).user ?? ""
     }
 
     var reachEnabled: Bool {
@@ -76,7 +76,7 @@ extension NativeCognitionRuntime {
             await AdaptiveMemoryPromoter.shared.configureInterpretation(
                 isIdle: { [weak self] in
                     guard let self else { return false }
-                    return await self.liveTurnLatchCount() == 0
+                    return await !self.liveTurnInFlight
                 },
                 finish: { [weak self] context, interpretation, momentID in
                     // True when the mind's and body's shares both landed.
@@ -90,7 +90,7 @@ extension NativeCognitionRuntime {
         // appraisal row from here, with the same fields a body outcome writes.
         await substrate.setCaringRefusalRecorder { [weak self] session, turn, why in
             guard let self else { return }
-            await CaringReceiptLog.shared.amendReceiptRefused(
+            await self.caringReceiptLog.amendReceiptRefused(
                 session: session,
                 turn: turn,
                 why: why,
@@ -159,8 +159,7 @@ extension NativeCognitionRuntime {
         if enabled {
             if alreadyBootstrapped {
                 // A launch with the inner life off read none of her substrate;
-                // waking reads it once (seeding and migrating her cares) and
-                // reads her recent life if that is still owed. A substrate
+                // waking reads it once (seeding and migrating her cares). A substrate
                 // already read keeps its resident state (restore runs once),
                 // and the body, restored dormant at the opening, is never
                 // reloaded over.
@@ -168,6 +167,9 @@ extension NativeCognitionRuntime {
                 await enterDoor()
                 defer { leaveDoor() }
                 do {
+                    if let cognitiveStoreOpeningFailure {
+                        throw PersistenceCoreError.ioFailure(cognitiveStoreOpeningFailure)
+                    }
                     try await substrate.restorePersistentState()
                     bootstrapFailure = nil
                 } catch {
@@ -176,12 +178,6 @@ extension NativeCognitionRuntime {
                         kind: "lifecycle.restore_failed",
                         payload: .object(["error": .string(String(describing: error))])
                     )
-                }
-                if !isFlushedForTermination, recentLifeTask == nil {
-                    recentLifeTask = Task {
-                        await self.readRecentLifeIntoCaresIfOwed()
-                        self.recentLifeTask = nil
-                    }
                 }
                 await refreshOrganismBodySchema(reason: "subconscious enabled")
                 await persistOrganismContinuity(reason: "subconscious enabled")
@@ -290,7 +286,6 @@ extension NativeCognitionRuntime {
         dataRoot: URL,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         storedEnabled: Bool? = nil,
-        storedSubconsciousEnabled: Bool? = nil,
         defaults: UserDefaults = .standard
     ) -> OrganismConfiguration {
         if NativeAgentPublicSafety.shouldForceNeutralOrganism(dataRoot: dataRoot, environment: environment) {
@@ -298,9 +293,7 @@ extension NativeCognitionRuntime {
         }
         let explicitOrganism = storedEnabled
             ?? (defaults.object(forKey: organismKernelEnabledKey) as? Bool)
-        let subconsciousMaster = storedSubconsciousEnabled
-            ?? (defaults.object(forKey: enabledKey) as? Bool)
-        let enabled = (explicitOrganism ?? subconsciousMaster ?? false)
+        let enabled = (explicitOrganism ?? false)
             || environment["NATIVE_AGENT_ORGANISM_KERNEL_ENABLED"] == "1"
         return OrganismConfiguration(enabled: enabled)
     }
@@ -309,45 +302,9 @@ extension NativeCognitionRuntime {
         dataRoot: URL,
         defaults: UserDefaults = .standard
     ) -> OrganismConfiguration {
-        reconcileOrganismPreferenceForLaunch(dataRoot: dataRoot, defaults: defaults)
+        organismConfigurationForLaunch(dataRoot: dataRoot, defaults: defaults)
     }
 
-    /// Existing installs can predate the organism preference while already
-    /// having the Subconscious master enabled. Inherit that master exactly
-    /// once. An explicit organism choice always wins, and public clean-room
-    /// safety remains authoritative before onboarding.
-    nonisolated static func reconcileOrganismPreferenceForLaunch(
-        dataRoot: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        defaults: UserDefaults = .standard
-    ) -> OrganismConfiguration {
-        let storedOrganism = defaults.object(forKey: organismKernelEnabledKey) as? Bool
-        let storedMaster = defaults.object(forKey: enabledKey) as? Bool
-        let configuration = organismConfigurationForLaunch(
-            dataRoot: dataRoot,
-            environment: environment,
-            storedEnabled: storedOrganism,
-            storedSubconsciousEnabled: storedMaster,
-            defaults: defaults
-        )
-        if storedOrganism == nil,
-           storedMaster == true,
-           configuration.enabled,
-           !NativeAgentPublicSafety.shouldForceNeutralOrganism(
-               dataRoot: dataRoot,
-               environment: environment
-           ) {
-            defaults.set(true, forKey: organismKernelEnabledKey)
-        }
-        return configuration
-    }
-
-
-    static func configurationWithoutPersistence(_ configuration: CognitiveConfiguration) -> CognitiveConfiguration {
-        var copy = configuration
-        copy.persistenceEnabled = false
-        return copy
-    }
 
 
 

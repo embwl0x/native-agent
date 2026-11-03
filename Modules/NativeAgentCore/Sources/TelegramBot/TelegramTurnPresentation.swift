@@ -109,7 +109,7 @@ public enum TelegramTurnPresentationReducer {
 
     private static func delegateName(forTool name: String) -> String? {
         switch name.lowercased() {
-        case "claude_message", "invoke_claude", "codex_message", "invoke_codex", "omp_message", "agent_swarm": return "Background work"
+        case "claude_message", "codex_message", "invoke_codex", "omp_message", "agent_swarm": return "Background work"
         default: return nil
         }
     }

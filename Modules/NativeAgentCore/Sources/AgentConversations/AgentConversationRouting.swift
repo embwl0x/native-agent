@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import StandingBots
 // Blueprint: | `AgentConversationRouting.swift` | `AgentConversationRouting` enum; `route`, `wrap` |
@@ -6,6 +7,38 @@ import StandingBots
 /// Argument translation only. Callers must dispatch through the original tool's
 /// admission and execution owners; this type grants no authority or tool access.
 public enum AgentConversationRouting {
+    /// Security reads the same checked contact and recipe owners as dispatch.
+    public static func messagesHostByCommand(_ raw: String, dataRoot: URL) throws -> Bool {
+        let input: [String: JSONValue] = ["agent": .string(raw)]
+        if HelperContact.matches(input) { return false }
+        let named = try namingSavedContact("agent_message", input, dataRoot: dataRoot)
+        guard let agent = named["agent"]?.stringValue, !agent.isEmpty else { throw invalid("Name the contact to classify its effects.") }
+        if agent.hasPrefix("bot:") {
+            guard let id = UUID(uuidString: String(agent.dropFirst(4))),
+                  try BotDefinitionStore(dataRoot: dataRoot).list().contains(where: { $0.id == id }) else {
+                throw invalid("The addressed helper could not be read. Refresh Helpers before sending.")
+            }
+            return false
+        }
+        let peers = try AgentPeerStore(dataRoot: dataRoot).list()
+        let matches = peers.filter { peer in
+            agent == "peer:" + peer.id || agent.lowercased() == peer.id
+                || peer.name.caseInsensitiveCompare(agent) == .orderedSame
+                || (peer.handles ?? []).contains { $0.caseInsensitiveCompare(agent) == .orderedSame }
+        }
+        guard matches.count == 1, let peer = matches.first else {
+            throw invalid("The addressed contact is missing or ambiguous. Choose its exact contact before sending.")
+        }
+        guard peer.transport == .acp || peer.transport == .mcpHost else { return false }
+        guard let host = peer.endpoint.host, !host.isEmpty else { throw invalid("The contact's host recipe identity is missing.") }
+        let launch = try AgentRecipeStore.launch(host, dataRoot: dataRoot)
+        if peer.transport == .acp {
+            guard launch.acp != nil else { throw invalid("The addressed ACP recipe has no ACP launch declaration. Repair agents/recipes/\(host).json before sending.") }
+            return true
+        }
+        return launch.commandLine != nil
+    }
+
     public struct Route: Sendable {
         public let tool: String
         public let input: [String: JSONValue]
@@ -28,8 +61,7 @@ public enum AgentConversationRouting {
         guard ["agent_message", "agent_read", "agent_cancel"].contains(tool), let dataRoot,
               case .string(let raw)? = input["agent"], !raw.contains(":") else { return input }
         let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // An unreadable address book resolves no name; the literal handle still reaches its own door.
-        guard let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return input }
+        let peers = try AgentPeerStore(dataRoot: dataRoot).list()
         var matches = Set(peers.filter {
             $0.id == name.lowercased() || $0.name.caseInsensitiveCompare(name) == .orderedSame
                 || ($0.handles ?? []).contains { $0.caseInsensitiveCompare(name) == .orderedSame }
@@ -57,7 +89,7 @@ public enum AgentConversationRouting {
             : ["agent", "conversation_id", "message_id", "limit", "offset", "session_id", "__session_id"]
         let raw = try string(input["agent"], field: "agent", maximum: 180)
         let agent = raw
-        let door = dataRoot.flatMap { AgentConversationDelivery.door(for: agent, dataRoot: $0) }
+        let door = try dataRoot.flatMap { try AgentConversationDelivery.door(for: agent, dataRoot: $0) }
         if door != nil, AgentRecipeStore.dryRun { return nil }
         if agent.hasPrefix("peer:") {
             guard UUID(uuidString: String(agent.dropFirst(5))) != nil else { throw invalid("peer reference must contain a UUID.") }
@@ -103,7 +135,9 @@ public enum AgentConversationRouting {
             args["conversation_mode"] = .string(conversation == nil ? "new" : "resume")
             if let conversation { args["conversation_id"] = .string(conversation) }
             if let message { args["message_id"] = .string(message) }
-            args["agent"] = .string(door.handle)
+            // Only a live inbox reader selects its door from this field;
+            // command inbox executors already own their recipient.
+            if door.liveReader { args["agent"] = .string(door.handle) }
             if door.liveReader, let expects = input["expects_reply"], case .bool = expects { args["expects_reply"] = expects }
             return Route(tool: door.tool, input: args, agent: canonical)
         }

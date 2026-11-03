@@ -17,7 +17,6 @@ public protocol BrowserRouteEffects: Sendable {
     @MainActor func finishNavigation(runID: String, token: UUID)
     func cancelNavigation(runID: String) async
     func observeMotorAction(_ model: MotorActionReadModel) async
-    func annotateApprovalExecution(id: String, executedAction: JSONValue, detail: String, dataRoot: URL) async throws
     func showProducedImage(at path: URL, name: String) -> (shown: Bool, note: String)
     func appendNativeActionReceipt(action: NativeActionRecord, status: String, dryRun: Bool, output: JSONValue,
                                    dataRoot: URL) async throws -> NativeActionReceipt

@@ -141,11 +141,12 @@ extension MemoryStorage {
 
     /// The exact exported Spotlight items and their ID-ordered fingerprint.
     public func spotlightSnapshot() async throws -> (items: [SpotlightItem], fingerprint: String) {
-        try await dbPool.read { db in
+        let now = Date()
+        return try await dbPool.read { db in
             var hasher = SHA256()
             var items: [SpotlightItem] = []
             let rows = try Row.fetchCursor(db, sql: """
-                SELECT id, content, status FROM memories
+                SELECT id, content, status, valid_from, valid_to FROM memories
                 WHERE status = 'active' AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
                     AND json_extract(metadata_json, '$.\(Self.pendingAdmissionKey)') IS NOT 1
                 ORDER BY id
@@ -153,10 +154,16 @@ extension MemoryStorage {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             while let row = try rows.next() {
+                let id: String = try row.decode(forColumn: "id")
+                let validFrom: String? = try row.decode(forColumn: "valid_from")
+                let validTo: String? = try row.decode(forColumn: "valid_to")
+                try Self.validateTemporalEvidence(id: id, validFrom: validFrom, validTo: validTo, observedAt: nil)
+                guard MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: validTo, at: now) else { continue }
                 let item = SwiftNativeMemoryIndexer.makeItem(
-                    id: try row.decode(forColumn: "id"),
+                    id: id,
                     text: try row.decode(forColumn: "content"),
-                    kind: try row.decode(forColumn: "status"))
+                    kind: try row.decode(forColumn: "status"),
+                    expirationDate: validTo.flatMap(MemoryRecallScoring.parseTimestamp))
                 hasher.update(data: try encoder.encode(item))
                 items.append(item)
             }

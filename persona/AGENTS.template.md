@@ -46,7 +46,10 @@ follow it with existing actions.
 
 Save with `app {action:"ability.save", args:{id:"<id>",
 description:"<when it helps>", code:"function run(input) { return {}; }"}}`.
-Synchronous JavaScript defines `run(input)` and returns plain JSON.
+JavaScript defines `run(input)` (optionally async) and returns JSON. Both
+`app({action,args})` and `app.<page>.<action>(args)` work. App and host calls
+answer synchronously and may be awaited; a returned Promise must settle in the
+helper's microtask drain.
 Call `app.<page>.<action>(...)`; declare inputs in `params`, capabilities in `reach`.
 Revise by id with changed `code`/`edits`, description or declarations;
 omissions keep their latest values.

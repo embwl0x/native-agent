@@ -63,11 +63,11 @@ unknown or modified download.
    to the waiting device on the Mac and choose **Pair** there, then tap
    **Connect** on the phone again. Keep both apps open until the Mac confirms.
 6. If waiting, tap **Check for Mac** on the phone. Keep the Mac app open and
-   allow the pairing details to arrive. Manual paste cannot bypass this wait.
-7. If the saved key needs correction, expand **Pairing hasn't connected?** on
-   the Mac and **Copy** the key. On the phone, **Correct pairing key manually**
-   becomes available after a successful check: use **Paste pairing key**, then
-   **Save Pairing Key**. Treat the key as a secret; do not share it.
+   allow the pairing details to arrive.
+7. If delivery needs attention, follow the **Connection** facts on the Mac
+   pairing page, fix the reported iCloud or Keychain cause, then choose
+   **Check iCloud delivery**. Check for Mac again on the phone. Pairing material
+   arrives through iCloud; there is no manual key-transfer recovery route.
 
 If the mobile app remains unpaired, verify that the Mac build supports
 production iCloud/CloudKit continuity. The standalone public Mac lane without

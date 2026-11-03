@@ -13,21 +13,9 @@ import Research
 import AgentConversations
 import TelegramBot
 import Synchronization
-// Blueprint: | `EngineDoctorRepairs.swift` | EngineDoctorRuntime selects and executes owner repairs, persists compatible receipts and retains the search-backend absence marker |
+// Blueprint: | `EngineDoctorRepairs.swift` | EngineDoctorRuntime selects and executes owner repairs and persists receipts; search repair checks/starts only the configured endpoint, never discovers or saves a replacement |
 
 extension EngineDoctorRuntime {
-    /// An absent backend keeps Docker Desktop closed until the URL changes or Repair is pressed.
-    private var searchBackendAbsentPath: URL {
-        dataRoot
-            .appendingPathComponent("doctor/search_backend_absent.json")
-    }
-
-    public func doctorSearchBackendAbsent(base: String) -> Bool {
-        guard let data = try? Data(contentsOf: searchBackendAbsentPath),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-        return object["base"] as? String == base
-    }
-
     public func doctorRecordRepair(checkID: String, receipt: String, status: String) async throws {
         let path = dataRoot
             .appendingPathComponent("doctor/repair_receipts.jsonl")
@@ -97,41 +85,57 @@ extension EngineDoctorRuntime {
         case DoctorEmbeddingDownloadCheck.id:
             return await DoctorEmbeddingDownloadCheck.repair(dataRoot: requestedRoot, scope: scope)
         case "live.search":
-            guard let base = (try? await doctorSearchURL())?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !base.isEmpty else { return nil }
-            let mayOpenDockerDesktop = scope == .button || !doctorSearchBackendAbsent(base: base)
-            let absentPath = searchBackendAbsentPath
+            let mayOpenDockerDesktop = scope == .button
             return DoctorExecutableRepair(checkID: check.id) {
                 let research = SwiftNativeResearchClient(dataRoot: requestedRoot)
-                // A SearXNG already answering (common port or running
-                // container) becomes the search URL.
-                let found = try await research.autodetectSearXNG()
-                if found.found, let url = found.baseURL {
-                    try? FileManager.default.removeItem(at: absentPath)
-                    return .completed("Completed: SearXNG answers at \(url); search now uses it.")
+                guard let base = try await doctorSearchURL(), !base.isEmpty else {
+                    return .unverified("Search is not configured. Use Research setup to select a SearXNG address.")
+                }
+                do {
+                    if try await research.checkSearXNG(base: base, answering: true) {
+                        guard try await doctorSearchURL() == base else {
+                            return .unverified("The previous search server at \(base) answers, but the configured address changed; its new address was kept.")
+                        }
+                        return .completed("Completed: the configured SearXNG answers at \(base).")
+                    }
+                } catch where Task.isCancelled || error is CancellationError { throw CancellationError() }
+                catch {
+                    return .unverified("The configured search at \(base) could not be checked: \(error.localizedDescription)")
                 }
                 // Otherwise start the stopped local container behind the configured URL.
+                guard try await doctorSearchURL() == base else {
+                    return .unverified("Repair skipped: the configured search address changed.")
+                }
                 let container: String
                 do {
                     container = try await SystemDockerPSExecutor()
                         .startLocalSearXNG(base: base, mayOpenDockerDesktop: mayOpenDockerDesktop)
-                } catch let error as SearXNGStartError where error.noBackend {
-                    try await SwiftNativePersistenceCore.writeJSON(.object([
-                        "base": .string(base), "at": .string(ISO8601DateFormatter().string(from: Date())),
-                    ]), to: absentPath)
-                    return .unverified("No search backend: nothing answers at \(base). \(error.message)")
-                } catch {
+                } catch where Task.isCancelled || error is CancellationError || error is ProcessRunCancellation { throw CancellationError() }
+                catch {
                     return .unverified("Web search is down: nothing answers at \(base). \(error.localizedDescription)")
                 }
-                try? FileManager.default.removeItem(at: absentPath)
                 let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+                var lastFailure = "Connection refused."
                 repeat {
                     try await Task.sleep(for: .seconds(2))
-                    if await research.checkSearXNG(base: base) {
-                        return .completed("Completed: started the local SearXNG container \(container.prefix(12)); search answers at \(base).")
+                    guard try await doctorSearchURL() == base else {
+                        return .unverified("Started container \(container.prefix(12)) for \(base), but the search setting changed; its new address was kept.")
                     }
+                    let remaining = ContinuousClock.now.duration(to: deadline).components
+                    let timeout = min(16, Double(remaining.seconds) + Double(remaining.attoseconds) / 1e18)
+                    guard timeout > 0 else { break }
+                    do {
+                        if try await research.checkSearXNG(base: base, answering: true, timeout: timeout) {
+                            guard try await doctorSearchURL() == base else {
+                                return .unverified("Started container \(container.prefix(12)) for \(base), but the search setting changed; its new address was kept.")
+                            }
+                            return .completed("Completed: started the local SearXNG container \(container.prefix(12)); search answers at its configured address \(base).")
+                        }
+                        lastFailure = "Connection refused."
+                    } catch where Task.isCancelled || error is CancellationError { throw CancellationError() }
+                    catch { lastFailure = error.localizedDescription }
                 } while ContinuousClock.now < deadline
-                return .unverified("Started the local SearXNG container \(container.prefix(12)), but \(base) did not answer within 30 seconds.")
+                return .unverified("Started the local SearXNG container \(container.prefix(12)), but \(base) did not answer within the readiness window: \(lastFailure)")
             }
         case "live.telegram":
             guard let state = try? await doctorTelegramSnapshot(), state.enabled,

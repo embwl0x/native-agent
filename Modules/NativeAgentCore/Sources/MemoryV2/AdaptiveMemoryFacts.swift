@@ -7,12 +7,12 @@ import CognitiveSubstrate
 import ChatTurnContracts
 import TurnTrace
 import NativeAgentShared
-// Blueprint: | `AdaptiveMemoryFacts.swift` | Fact-lane memory interpretation and supersession |
+// Blueprint: | `AdaptiveMemoryFacts.swift` | Shared live/batch interpretation application, reply promises and fact-lane supersession; care-bearing wake replies admit only their named-care reading, other own work stays excluded; meaning stays unsettled until promises and facts persist and the mind/body fold lands; User's own conversation keeps live judgment unless a complete-no-op claim stands, other recorded turns stay owed for a batch |
 extension AdaptiveMemoryPromoter {
     // MARK: - The fact lane: the memory manager
-    /// Predict before judging and label each judgment. A complete-no-op claim
-    /// with standing defers a recorded turn, leaving it owed for batch judgment
-    /// (docs/COGNITION_WIRING.md, "Deferral").
+    /// Predict before judging and label each judgment. Only User's own turns
+    /// judge now unless a complete-no-op claim stands; every other recorded
+    /// turn stays owed for a batch (docs/COGNITION_WIRING.md, "Deferral").
     func runMemoryManager(
         speaker: String? = nil, memory: SwiftNativeMemoryV2,
         userMessage: String, assistantMessage: String, sessionId: String, surface: String,
@@ -35,16 +35,22 @@ extension AdaptiveMemoryPromoter {
         let check = await predictTurn(user: origin?.userMessage ?? userMessage, reply: assistantMessage,
             took: origin?.took, agent: standingAgent ? (speaker ?? "standing agent") : "resident",
             memory: memory, dataRoot: root, turn: turnKey)
-        if check.standing == true {
+        let isHisConversation = await conversationKind(sessionId)?.isHisConversation == true
+        let isHisTurn = speaker == nil && !standingAgent && isHisConversation
+        if !isHisTurn || check.standing == true {
+            // Not being User's turn does not predict a no-op. Keep the actual
+            // verdict, claim and calibration used by ledger trial counting.
+            let deferredCheck = isHisTurn ? check : check.deferringBecause("not his turn")
             var outcome = AdaptiveMemoryObservation(proposals: [],
                 extraction: AdaptiveExtractionReport(candidates: [], semanticStatus: .deferred))
             outcome.surprise = await AfterTurnSurpriseLedger.shared.record(
                 dataRoot: root, session: sessionId, turn: turnKey, surface: surface,
-                recovery: false, deferred: true, check: check, channels: nil,
+                recovery: false, deferred: true, check: deferredCheck, channels: nil,
                 providerSeconds: 0, failure: nil, judgedBy: nil)
             Self.whyInterpretation(turn: turnKey, session: sessionId, surface: surface,
                 route: TurnEnvelope.current(surface: surface).replyRoute,
-                outcome: "deferred: predicted a complete no-op; left owed for a batch", check: check)
+                outcome: isHisTurn ? "deferred: predicted a complete no-op; left owed for a batch"
+                    : "deferred: not his turn; left owed for a batch", check: deferredCheck)
             return outcome
         }
         var result = await interpretMemoryManager(speaker: speaker, memory: memory,
@@ -94,7 +100,9 @@ extension AdaptiveMemoryPromoter {
               moment.state != .lived, moment.state != .refused else { return empty(.unavailable) }
         func settleWhole(_ reason: String) async { await momentDoor.refuse(momentID, reason) }
         guard let memoryManager else { return empty(.unavailable) }
-        guard await conversationKind(sessionId)?.isOwnWork != true else {
+        let careWake = moment.input?.turn?.isCareWake == true
+        let ownWork = await conversationKind(sessionId)?.isOwnWork == true
+        guard !ownWork || careWake else {
             await settleWhole("her own work is not a moment")
             return empty(.skipped)
         }
@@ -116,16 +124,28 @@ extension AdaptiveMemoryPromoter {
             }
             context = prepared
         }
-        let author = MemoryMoments.author(surface: surface,
+        let author = MemoryDataProvenance.author(surface: surface,
             peer: speaker != nil || context?.event.sourceClass == .imported)
         let isPeer = author != "user"
-        let originalHumanName = personName?()
+        let originalHumanName: String?
+        do { originalHumanName = try personName?() }
+        catch {
+            let failure = AfterTurnMemoryFailure(reason: .provider,
+                recovery: "The person's saved profile could not be read: \(error.localizedDescription). Repair memory/profile.json; this turn stays owed until it can be read.",
+                model: nil, surface: surface)
+            return AdaptiveMemoryObservation(proposals: [], extraction: .init(candidates: [],
+                semanticStatus: .failed, failure: failure))
+        }
         // Who stands behind the incoming words. An app-authored prompt has no
         // one behind it: only what her reply said is hers to keep.
-        let fromReply = author == "app"
+        let fromReply = author == "app" || careWake
         let incoming = fromReply ? (key: "self", trusted: false)
             : Self.incomingSpeaker(isPeer: isPeer, speaker: speaker, sessionId: sessionId, dataRoot: momentDoor.dataRoot)
-        let factsEnabled = !assistant.isEmpty && (adaptivePromotionEnabled?() ?? true)
+        var factsEnabled = false
+        if !careWake, !assistant.isEmpty {
+            do { factsEnabled = try await promotionPolicyEnabled() }
+            catch { return await unavailablePromotionPolicy(error, surface: surface) }
+        }
         guard factsEnabled || context != nil else {
             await settleWhole("nothing to interpret")
             return empty(.skipped)
@@ -189,8 +209,8 @@ extension AdaptiveMemoryPromoter {
             existing: existing,
             pendingTargets: pendingRows.map { MemoryManagerExistingMemory(id: $0.id, content: $0.content) },
             forgotten: forgotten,
-            personName: author == "app" ? "NativeAgent" : speaker ?? originalHumanName,
-            standingAgent: standingAgent, appAuthored: author == "app", took: origin?.took,
+            personName: fromReply ? "NativeAgent" : speaker ?? originalHumanName,
+            standingAgent: standingAgent, appAuthored: fromReply, took: origin?.took,
             occurredAt: origin?.occurredAt
         )
         // A batch takes the request as this turn would be judged alone, and
@@ -266,7 +286,17 @@ extension AdaptiveMemoryPromoter {
             return AdaptiveMemoryObservation(proposals: [], extraction: .init(candidates: [],
                 semanticStatus: .failed, failure: failure))
         }
-        let factsProcessed = factsEnabled && factsReadable && (adaptivePromotionEnabled?() ?? true)
+        let promisesSettled: Bool
+        if careWake { promisesSettled = true }
+        else {
+            promisesSettled = await applyPromises(interpretation, turn: moment.input?.turn,
+                                                momentID: momentID, dataRoot: momentDoor.dataRoot)
+        }
+        var factsProcessed = false
+        if factsEnabled, factsReadable {
+            do { factsProcessed = try await promotionPolicyEnabled() }
+            catch { return await unavailablePromotionPolicy(error, surface: surface) }
+        }
         let decisions = factsProcessed ? interpretation.memories : []
         var staged: [ProposalRecord] = []
         var accepted: [AdaptiveCandidate] = []
@@ -331,11 +361,7 @@ extension AdaptiveMemoryPromoter {
                 rejected += 1
                 continue
             }
-            // Saved judgments predate attributed grounding. Absence in a
-            // recorded meaning keeps its original eligibility rule; live parsing
-            // requires the field for every add/update before meaning is saved.
-            let legacyGrounding = storedMeaning != nil && decision.grounding == nil
-            guard decision.grounding != nil || legacyGrounding else {
+            guard decision.grounding != nil else {
                 stagingFailed = true
                 nativeLog("MemoryV2: decision in moment %@ has no attributed grounding; left meant", momentID)
                 continue
@@ -350,7 +376,7 @@ extension AdaptiveMemoryPromoter {
                     continue
                 }
                 let keepsIt = fromReply
-                    ? legacyGrounding || MemoryManagerLane.statementRejectionReason(decision, userMessage: "", assistantMessage: assistant) == nil
+                    ? MemoryManagerLane.statementRejectionReason(decision, userMessage: "", assistantMessage: assistant) == nil
                     : incoming.trusted && (!isCorrection || incoming.key == CognitiveCare.ownerKey)
                 if prior.status == "pending", keepsIt {
                     do {
@@ -388,7 +414,7 @@ extension AdaptiveMemoryPromoter {
                     continue
                 }
             }
-            let refusal = legacyGrounding ? nil : isCorrection
+            let refusal = isCorrection
                 ? MemoryManagerLane.correctionRejectionReason(decision, userMessage: user,
                     isPeer: isPeer, personName: originalHumanName)
                 : MemoryManagerLane.statementRejectionReason(decision, userMessage: fromReply ? "" : user,
@@ -401,14 +427,11 @@ extension AdaptiveMemoryPromoter {
                 $0.correctionSubject == decision.correctionSubject
                     && MemoryManagerLane.contentFingerprint($0.content) == MemoryManagerLane.contentFingerprint(decision.statement)
             }) {
-                // The same correction given again: its row keeps this turn as a
-                // repeat, the way a collapsed commit does, so the miss counts.
+                // Keep the repeat's full turn identity in the canonical write;
+                // the bounded provenance preview is only presentation.
                 do {
-                    if let row = try await memory.authorityRecord(id: kept.id) {
-                        _ = try await memory.updateMemory(id: kept.id, update: .object(SwiftNativeMemoryV2.duplicateProvenancePatch(
-                            existing: row, newSource: "standing-correction:\(sessionId)",
-                            newMetadata: .object(MemoryMoments.turnMetadata(turnId: turnId, origin: origin)))))
-                    }
+                    try await memory.repeatCorrection(id: kept.id, source: "standing-correction:\(sessionId)",
+                        turnMetadata: MemoryDataProvenance.turnMetadata(turnId: turnId, origin: origin))
                 } catch {
                     stagingFailed = true
                     nativeLog("MemoryV2: repeated standing correction's turn not kept: \(error)")
@@ -434,7 +457,7 @@ extension AdaptiveMemoryPromoter {
                 }
                 // A standing rule is kept only from the owner's own words.
                 let keep = fromReply
-                    ? legacyGrounding || MemoryManagerLane.statementRejectionReason(decision, userMessage: "", assistantMessage: assistant) == nil
+                    ? MemoryManagerLane.statementRejectionReason(decision, userMessage: "", assistantMessage: assistant) == nil
                     : incoming.trusted && (!isCorrection || incoming.key == CognitiveCare.ownerKey)
                 let proposal = try await memory.propose(
                     content: decision.statement,
@@ -446,8 +469,8 @@ extension AdaptiveMemoryPromoter {
                     extraMetadata: MemoryManagerLane.metadata(
                         for: decision, sessionId: sessionId, surface: surface,
                         observedAt: origin?.occurredAt
-                    ).merging(MemoryMoments.turnMetadata(turnId: turnId, origin: origin)) { current, _ in current }
-                        .merging(MemoryMoments.sourceMetadata(sessionId: origin?.sessionId ?? sessionId,
+                    ).merging(MemoryDataProvenance.turnMetadata(turnId: turnId, origin: origin)) { current, _ in current }
+                        .merging(MemoryDataProvenance.sourceMetadata(sessionId: origin?.sessionId ?? sessionId,
                             messageId: origin?.messageId, turnId: turnId, at: origin?.occurredAt ?? Date(),
                             speaker: decision.grounding?.source == .reply ? "self" : incoming.key,
                             words: decision.grounding?.evidence)) { current, _ in current }
@@ -488,11 +511,12 @@ extension AdaptiveMemoryPromoter {
             }
         }
         // LIVED once the attempt reaches its end: the fold landed, and every
-        // fact decision staged (or none was asked). Otherwise the row stays
+        // promise filed (or skipped at the inferred cap), and every fact
+        // decision staged (or none was asked). Otherwise the row stays
         // meant and is lived again from its meaning: each piece that landed
         // skips by its stamp, each fact by its operation identity.
         let factsSettled = factsProcessed ? !stagingFailed : !(factsEnabled && !factsReadable)
-        if folded, factsSettled, !Task.isCancelled { await momentDoor.lived(momentID) }
+        if folded, factsSettled, promisesSettled, !Task.isCancelled { await momentDoor.lived(momentID) }
         var outcome = AdaptiveMemoryObservation(
             proposals: staged,
             extraction: AdaptiveExtractionReport(
@@ -504,7 +528,7 @@ extension AdaptiveMemoryPromoter {
             savedCorrectionCount: savedCorrections,
             pendingCorrectionCount: pendingCorrections,
             failedCorrectionCount: failedCorrections,
-            stagingFailed: stagingFailed || !factsReadable
+            stagingFailed: stagingFailed || !factsReadable || !promisesSettled
         )
         // The label this judgment gives the record (a refold labels nothing).
         if storedMeaning == nil {
@@ -543,7 +567,7 @@ extension AdaptiveMemoryPromoter {
         memory: SwiftNativeMemoryV2
     ) async throws -> Int? {
         guard !others.isEmpty else { return nil }
-        let fold: (String) -> String = { MemoryMoments.wordFold($0) }
+        let fold: (String) -> String = { MemoryDataProvenance.wordFold($0) }
         let needle = fold(statement)
         if let exact = others.firstIndex(where: {
             fold($0) == needle && MemoryStorage.sameQuantityAndNegation(statement, $0)

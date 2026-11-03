@@ -126,7 +126,7 @@ struct ShotgunView: View {
                             StreamingTailBubble(
                                 message: message,
                                 isLastAssistant: message.id == lastAssistantId,
-                                isLive: running
+                                isLive: appModel.engine.turns.streamingBubbleIds[sessionId] == message.id
                             )
                         } else {
                             MessageBubble(message: message, isLastAssistant: message.id == lastAssistantId)
@@ -236,12 +236,13 @@ struct ShotgunView: View {
                     .foregroundStyle(NativeAgentShell.secondary)
             }
             Spacer(minLength: 4)
+            // The refusal can finish its turn before he hands the Mac back.
+            if !ShotgunController.shared.driverAllowed,
+               ShotgunController.shared.selectedSessionID != nil {
+                word("Resume", emphasis: true) { ShotgunController.shared.resume() }
+                    .help("Hand the Mac back and ask me to continue")
+            }
             if running {
-                // The person holds the Mac (they used it while she drove).
-                if preview?.isShowable == true, !ShotgunController.shared.driverAllowed {
-                    word("Resume", emphasis: true) { ShotgunController.shared.resume() }
-                        .help("Hand the Mac back to me")
-                }
                 if preview?.isShowable == true {
                     word(watching ? "Hide" : "Watch") { watching.toggle() }
                         .help(watching ? "Hide what I am looking at" : "Watch what I am looking at")

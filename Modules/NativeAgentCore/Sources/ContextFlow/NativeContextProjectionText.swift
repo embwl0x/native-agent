@@ -1,9 +1,17 @@
 import Foundation
 import Context
+import NativeAgentShared
 // Blueprint: | `NativeContextProjectionText.swift` | `NativeContextProjectionText` enum; `clean`, `bounded`; projection triggers delegate to ContextMarkdownCompiler |
 
 /// Shared text rules for rebuildable context projections.
 enum NativeContextProjectionText {
+    static func requiredDate(_ raw: String?, owner: String) throws -> Date {
+        guard let raw, let date = NativeTimestampFormat.parseISO8601FractionalFirst(raw) else {
+            throw ContextFlowStoreError.malformedStoredValue("\(owner): required source date is unavailable or invalid")
+        }
+        return date
+    }
+
     static func clean(_ value: String) -> String {
         value.replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")

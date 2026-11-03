@@ -9,29 +9,14 @@ import PersistenceCore
 struct AgentWorkspaceFileRevision: Sendable {
     let path: String
     let title: String
-    private let version: String?
+    private let version: String
     private let selectedHash: String?
 
-    init?(input: [String: JSONValue], title: String, result original: JSONValue) {
-        // The installed action readback wraps a complete legacy string beside
-        // its receipt. Preserve the same revision action after a successful save.
-        let result: JSONValue = {
-            if case .object(let row) = original, Set(row.keys).isSubset(of: ["content", "action_receipt"]),
-               row["action_receipt"] != nil, case .string(let content)? = row["content"] { return .string(content) }
-            return original
-        }()
+    init?(input: [String: JSONValue], title: String, result: JSONValue) {
         guard case .string(let path)? = input["path"], !path.isEmpty, path.count <= 8192,
               !path.contains("\0") else { return nil }
         self.title = title
-        if case .string(let content) = result {
-            // The legacy plain-text reader omits its resolved target. A relative
-            // read may mean the development repo while writes mean workspace.
-            guard path.hasPrefix("/"), input["offset"] == nil || input["offset"] == .int(0),
-                  Self.isEditable(content) else { return nil }
-            self.path = path
-            version = nil
-            selectedHash = Self.hash(content)
-        } else if case .object(let row) = result,
+        if case .object(let row) = result,
                   row["ok"] == .bool(true), row["error"] == nil, row["error_code"] == nil,
                   case .string(let content)? = row["content"], Self.isEditable(content),
                   case .string(let version)? = row["version"], !version.isEmpty,
@@ -43,8 +28,7 @@ struct AgentWorkspaceFileRevision: Sendable {
     }
 
     func prepare(catalog: AgentWorkspace.Catalog, perform: AgentWorkspace.Perform) async throws -> AgentWorkspaceForm {
-        var input: [String: JSONValue] = ["path": .string(path), "offset": .int(0), "max_bytes": .int(65_536)]
-        if let version { input["version"] = .string(version) }
+        let input: [String: JSONValue] = ["path": .string(path), "offset": .int(0), "max_bytes": .int(65_536), "version": .string(version)]
         let fresh = try await perform("read_file", input)
         guard let content = Self.completeContent(fresh) else {
             throw AgentWorkspaceForm.Failure(message: "This file could not be read completely as editable text within 64 KiB. Reopen the source to check its current state; no replacement draft was created.")
@@ -61,7 +45,6 @@ struct AgentWorkspaceFileRevision: Sendable {
     }
 
     private static func completeContent(_ result: JSONValue) -> String? {
-        if case .string(let content) = result { return isEditable(content) ? content : nil }
         guard case .object(let row) = result, row["ok"] == .bool(true),
               row["error"] == nil, row["error_code"] == nil,
               row["offset"] == .int(0), row["truncated"] == .bool(false), row["has_more"] == .bool(false),

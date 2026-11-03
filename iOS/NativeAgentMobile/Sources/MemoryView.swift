@@ -1,5 +1,4 @@
 import SwiftUI
-import CloudKit
 import NativeAgentShared
 // Blueprint: | `MemoryView.swift` | Memory page and proposal rows read the shared sync projection; composes mutation and local search owners |
 
@@ -10,8 +9,7 @@ struct MemoryView: View {
     private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var showsConnection = false
-    @State private var hasNoCloudAccount = false
-    @Environment(\.scenePhase) private var scenePhase
+    @ObservedObject private var bridge = iCloudBridge.shared
     @State private var segment: MemorySegment
     /// Search filters only the memory snapshot already synced to this phone.
     @State private var searchQuery = ""
@@ -81,11 +79,6 @@ struct MemoryView: View {
         }
         .refreshable { await store.refresh() }
         .onAppear { Task { await store.refresh() } }
-        .task(id: scenePhase) {
-            guard scenePhase == .active,
-                  DeviceCloudKitPreflight.entitlementGrantsContainer(NativeAgentICloudBridgeConstants.containerID) else { return }
-            hasNoCloudAccount = (try? await CKContainer(identifier: NativeAgentICloudBridgeConstants.containerID).accountStatus()) == .noAccount
-        }
     }
 
     private var headerLine: String {
@@ -94,6 +87,7 @@ struct MemoryView: View {
         case .memories:
             return MemoryWords.memoriesLine(sample ? MemorySamples.memories.count : store.memories.count)
         case .proposals:
+            guard sample || sync.memoryProposalsSnapshotLoaded else { return "Memory proposals have not arrived from the Mac yet." }
             let count = sample && store.memoryProposals.isEmpty ? MemorySamples.proposals.count : store.memoryProposals.count
             return MemoryWords.proposalsLine(count)
         }
@@ -149,7 +143,8 @@ struct MemoryView: View {
             let unpaired = sample == nil && !pairingStore.usesICloudTransport
             // A paired phone that lost its Apple Account: no snapshot can
             // arrive, so the age alone would not say why or how to fix it.
-            let noAccount = sample == "noAccount" || (sample == nil && hasNoCloudAccount)
+            let accountFailure = sample == nil ? bridge.accountFailure : nil
+            let noAccount = sample == "noAccount" || accountFailure != nil
             let attention = sharedError != nil || reason != nil || StatusConnectionPresentation.needsAttention(state)
             if unpaired {
                 AliveNoteAction(title: "Pair with Mac", hint: "Connects this iPhone to your Mac") {
@@ -160,7 +155,8 @@ struct MemoryView: View {
             } else if noAccount {
                 AliveStatusNote(
                     systemImage: "icloud.slash",
-                    text: AliveConnection.noICloud + ". Sign in to iCloud in Settings and my memories will arrive here.",
+                    text: accountFailure.map { DeviceSyncAccountFailure.phoneMessage + ": " + $0.detail }
+                        ?? (AliveConnection.noICloud + ". Sign in to iCloud in Settings and my memories will arrive here."),
                     actionTitle: "Open Settings",
                     actionHint: "Sign in to Apple Account in Settings, then return to refresh memories."
                 ) {
@@ -231,7 +227,10 @@ enum MemoryWords {
     }
 
     static func evidence(_ proposal: MemoryProposalRecord) -> String {
-        let times = proposal.recurrenceCount <= 1 ? "once" : proposal.recurrenceCount == 2 ? "twice" : "\(AliveWords.spelled(proposal.recurrenceCount, capitalized: false)) times"
+        guard proposal.evidenceError == nil, let count = proposal.recurrenceCount, count > 0 else {
+            return proposal.evidenceSummary
+        }
+        let times = count == 1 ? "once" : count == 2 ? "twice" : "\(AliveWords.spelled(count, capitalized: false)) times"
         let sessions = proposal.supportingSessionIds.count
         guard sessions > 1 else { return "noticed \(times)" }
         return "noticed \(times) across \(AliveWords.spelled(sessions, capitalized: false)) conversations"
@@ -259,8 +258,8 @@ enum MemorySamples {
 
     static let proposals: [MemoryProposalRecord] = decode("""
     [
-      {"id":"sample-p1","text":"Prefers a short summary first, with the details after.","layer":"semantic","importance":0.85,"supporting_session_ids":["a","b"],"recurrence_count":3},
-      {"id":"sample-p2","text":"Likes to finish the week with a walk outside.","layer":"episodic","importance":0.5,"supporting_session_ids":[],"recurrence_count":1}
+      {"proposal_id":"sample-p1","fact_text":"Prefers a short summary first, with the details after.","status":"pending","createdAt":"2026-09-07","supporting_session_ids":["a","b"],"recurrence_count":3},
+      {"proposal_id":"sample-p2","fact_text":"Likes to finish the week with a walk outside.","status":"pending","createdAt":"2026-09-07","supporting_session_ids":[],"recurrence_count":1}
     ]
     """)
 
@@ -324,7 +323,10 @@ struct ProposalsListView: View {
     var body: some View {
         List {
             header.aliveListRow(top: 0, bottom: 10)
-            if proposals.isEmpty {
+            if proposals.isEmpty && !iCloudSyncEngine.shared.memoryProposalsSnapshotLoaded && !isSample {
+                AliveCalmState(title: "Proposals unavailable", line: "The Mac proposal snapshot has not arrived. Keep NativeAgent open on the paired Mac and refresh after reconnecting.")
+                    .aliveListRow()
+            } else if proposals.isEmpty {
                 AliveCalmState(
                     title: "Nothing to decide.",
                     line: "When something seems worth keeping, I\u{2019}ll ask you here first."

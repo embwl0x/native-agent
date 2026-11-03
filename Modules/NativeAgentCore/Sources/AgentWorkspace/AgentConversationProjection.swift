@@ -6,7 +6,7 @@ import NativeAgentShared
 import os
 import PersistenceCore
 import Transcripts
-// Blueprint: | `AgentConversationProjection.swift` | `AgentConversationRecord`: `sendEvidence`, `sendStatus`, `sendFailed` and `sendReceipt` project one send outcome from its receipt, with failed dispatch above stale executor progress; reply expectation defaults true; `nextReadAt` schedules reads/delivery, not reply lifetime. Associated-door history projects through Transcripts' `ContactThread.project`; resumable work retains DataRootLife; other-life work reads stopped/restored. Selected history read and UTF-8 failures propagate as unavailable. |
+// Blueprint: | `AgentConversationProjection.swift` | `AgentConversationRecord`: `sendEvidence`, `sendStatus`, `sendFailed` and `sendReceipt` project one send outcome from its receipt, with failed dispatch above stale executor progress; `AgentConversationExchange.messageID` binds the protocol's string to its operation UUID; reply expectation defaults true; `nextReadAt` schedules reads/delivery, not reply lifetime. Associated-door history projects through Transcripts' `ContactThread.project`; resumable work retains DataRootLife; other-life work reads stopped/restored. Selected history read and UTF-8 failures propagate as unavailable. |
 
 /// App-owned routing bookmarks, not another transcript or authority store.
 /// The last receipt is a bounded cache; the adapter remains the evidence owner.
@@ -51,11 +51,13 @@ public struct AgentConversationRecord: Codable, Sendable {
 
     private static func failedSend(_ fields: [String: JSONValue]) -> Bool {
         let status = fields["status"]?.stringValue ?? ""
+        if fields["run_status"] == .string("observation_unavailable")
+            || status == "observation_unavailable" { return false }
         // An approval or a held message has not failed dispatch.
         if ["held", "delivering"].contains(status) || approvalWaits(status) { return false }
         return fields["sent"] == .bool(false) || [.failed, .refused].contains(ChatToolOutcome.exactResultClass(.object(fields.filter { $0.key != "result" })))
             || fields["execution_error"]?.stringValue?.isEmpty == false
-            || ["invalid_arguments", "no_reply_expired"].contains(status)
+            || status == "invalid_arguments"
             || ["failed", "error"].contains(fields["run_status"]?.stringValue ?? "")
     }
 
@@ -199,7 +201,7 @@ public struct AgentConversationNotice: Codable, Sendable, Equatable {
 
 /// A message waiting on its thread behind the reply in progress (09-25: a
 /// second message used to be refused). Never dropped: it goes, or it stays
-/// here `held` with the reason, and is never resent by itself after that.
+/// here `held` with the reason. A pre-Return Mac hold alone releases on free input.
 public struct AgentConversationQueued: Codable, Sendable, Equatable {
     public var lifeID: String?
     public var id: String
@@ -208,6 +210,8 @@ public struct AgentConversationQueued: Codable, Sendable, Equatable {
     public var byPerson: Bool?
     public var arguments: [String: JSONValue]?
     public var held: String?
+    /// No Return was emitted. The conversation's release drain can unhold this send.
+    public var waitingForMac: Bool?
     package init(id: String,
                  text: String,
                  queuedAt: Date,
@@ -248,10 +252,14 @@ public struct AgentConversationStop: Codable, Sendable, Equatable {
 
 
 /// Bounded display history inside the routing bookmark. Never provider context,
-/// replay input, settlement authority, or a replacement for the reply's owner.
+/// replay input or a replacement for the reply's owner. Experience settlement
+/// reads its retained reply/status as evidence; eviction supplies no acceptance.
 public struct AgentConversationExchange: Codable, Sendable {
     public var lifeID: String?
     public var id: String
+    /// The outbound protocol's message identity, bound to this operation once.
+    /// A peer's string identity is independent of our internal UUID.
+    public var messageID: String?
     public var sentAt: Date
     public var prompt: String?
     public var reply: String?
@@ -349,15 +357,20 @@ extension ContactThread {
         let paths = plan.map(\.1) + [ContactReplyReads.url(dataRoot)]
         let stamp = paths.map { fileStamp($0.path) }
         if !stamp.contains(nil), let hit = cache.withLock({ $0[key] }), hit.paths == paths, hit.stamp == stamp { return hit.lines }
-        let fetched = ContactReplyReads.read(dataRoot)
+        let fetched = try ContactReplyReads.read(dataRoot)
         var rows: [Line] = []
         for (session, file) in plan {
             let text = try read(file, tailBytes: tailBytes)
             for raw in text.split(separator: "\n") {
-                guard case .object(let object)? = try? JSONValue.parse(Data(raw.utf8)),
-                      case .string? = object["id"], case .string? = object["content"],
-                      case .string(let role)? = object["role"], role == "user" || role == "assistant" else { continue }
+                guard case .object(let object) = try JSONValue.parse(Data(raw.utf8)) else {
+                    throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: file.path])
+                }
+                guard case .string(let role)? = object["role"], role == "user" || role == "assistant" else { continue }
+                guard case .string? = object["id"], case .string? = object["content"] else {
+                    throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: file.path])
+                }
                 var line = Line(object, role: role)
+                guard line.date != nil else { throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: file.path]) }
                 line.fetched = line.mine && fetched.contains { $0.session == session && $0.run == line.run }
                 rows.append(line)
             }
@@ -379,17 +392,19 @@ extension ContactThread {
 
     /// Unreadable or undecodable selected history is unavailable, never empty.
     private static func read(_ file: URL, tailBytes: Int?) throws -> String {
-        guard let tailBytes else { return try String(contentsOf: file, encoding: .utf8) }
-        guard tailBytes > 0 else {
+        guard tailBytes.map({ $0 > 0 }) ?? true else {
             throw CocoaError(.fileReadInvalidFileName, userInfo: [NSFilePathErrorKey: file.path])
         }
         let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
         let size = try handle.seekToEnd()
-        try handle.seek(toOffset: size > UInt64(tailBytes) ? size - UInt64(tailBytes) : 0)
+        let offset = tailBytes.map { size > UInt64($0) ? size - UInt64($0) : 0 } ?? 0
+        try handle.seek(toOffset: offset)
         var data = try handle.readToEnd() ?? Data()
         // The first line of a cut window is partial.
-        if size > UInt64(tailBytes), let end = data.firstIndex(of: 0x0A) { data = data[data.index(after: end)...] }
+        if offset > 0, let end = data.firstIndex(of: 0x0A) { data = data[data.index(after: end)...] }
+        if let end = data.lastIndex(of: 0x0A) { data = data[..<data.index(after: end)] }
+        else { data = Data() } // The writer has not completed a physical row yet.
         guard let text = String(data: data, encoding: .utf8) else {
             throw CocoaError(.fileReadInapplicableStringEncoding, userInfo: [NSFilePathErrorKey: file.path])
         }

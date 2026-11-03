@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersonaEngine
-// Blueprint: | `ContextMarkdownCompiler.swift` | `ContextMarkdownCompiler`: bounded Markdown atom compilation and exact unchanged-source reuse; `triggerTokens` owns ordered trigger extraction with source-specific tokenization/filter/bound parameters; persona GROWTH uses the PersonaEngine episodic-log filter before hashing and parsing |
+// Blueprint: | `ContextMarkdownCompiler.swift` | `ContextMarkdownCompiler`: bounded Markdown atom compilation and exact unchanged-source reuse; `triggerTokens` owns ordered trigger extraction with source-specific tokenization/filter/bound parameters; canonical source bytes are hashed and parsed unchanged |
 
 // Preserve the Context module's public policy name while readers/helpers use
 // the same owner before composing source fragments into derived text.
@@ -78,7 +78,7 @@ public struct ContextMarkdownCompiler: Sendable {
     }
 
     /// Bump when identical input produces different atoms; `sourceHash` includes this version.
-    static let compilerFormatVersion = "4"
+    static let compilerFormatVersion = "5"
 
     /// Autogen marker comments are structural delimiters and never become atoms.
     static func isAutogenMarkerBlock(_ body: String) -> Bool {
@@ -109,12 +109,9 @@ public struct ContextMarkdownCompiler: Sendable {
         guard let rawSource = String(data: sourceData, encoding: .utf8) else {
             throw ContextMarkdownCompilerError.malformedUTF8
         }
-        let source = descriptor.kind == .persona && descriptor.canonicalLocator.hasSuffix("/GROWTH.md")
-            ? SwiftNativePersonaEngine.filterEpisodicGrowthLines(rawSource) : rawSource
+        let source = rawSource
         let contextData = Data(source.utf8)
-        // A document consisting only of legacy log lines must replace its
-        // previous atoms with an empty set, rather than retain them on failure.
-        guard source != rawSource || !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ContextMarkdownCompilerError.emptySource
         }
         guard !Self.isForbiddenLocator(descriptor.canonicalLocator) else {

@@ -9,7 +9,7 @@ import PersistenceCore
 // Pure, deterministic projection; state is authoritative and `now` controls age.
 // Top-level rows show status (kind for watch), project, title, summary and the
 // most-actionable child (now before next). Multiple children or an unhighlighted
-// lone child render below. Latest blocked/flagged notes and drift notes render.
+// lone child render below. Latest blocked/flagged notes render as ordinary text.
 // Caps: 25 top-level items, including up to 3 newest terminal items.
 // Compact rows show refs:N from three refs; exact records retain every ref.
 
@@ -162,9 +162,6 @@ public enum DeskPage {
         if item.refs.count >= 3 {
             segs.append("refs:\(item.refs.count)")
         }
-        if let drift = driftSegment(item) {
-            segs.append(drift)
-        }
         if let stale = staleSegment(item, now: now) {
             segs.append(stale)
         }
@@ -191,25 +188,10 @@ public enum DeskPage {
         return nil
     }
 
-    /// `⚑ drift:<kind>` when the LAST thing that happened to this item was the
-    /// observation lane noticing reality disagreed with the board.
-    ///
-    /// Drift derives only from the latest note's prefix; any newer note clears or replaces it.
-    static func driftSegment(_ item: DeskItem) -> String? {
-        // Only a recognized drift prefix renders; phrase and evidence remain in the note.
-        guard let last = item.notes.last,
-              let kind = DeskObservationEvaluator.driftKind(inNote: last.text) else { return nil }
-        return "\(DeskObservationEvaluator.driftMarker):\(kind.rawValue)"
-    }
-
-    /// One high-signal note line: a blocked/flagged item's latest note, or — for
-    /// an item of ANY status — a drift flag the desk just raised. Drift is the
-    /// desk contradicting itself out loud; hiding it behind a status filter would
-    /// make the loudest thing it can say the quietest thing it renders.
+    /// One high-signal note line: a blocked/flagged item's latest note.
     static func noteLine(_ item: DeskItem) -> String? {
         guard let last = item.notes.last else { return nil }
-        let isDrift = DeskObservationEvaluator.driftKind(inNote: last.text) != nil
-        guard item.status == .blocked || item.status == .flag || isDrift else { return nil }
+        guard item.status == .blocked || item.status == .flag else { return nil }
         return "  note: \(last.text)"
     }
 
@@ -376,7 +358,7 @@ public extension DeskPage {
             return "note \(text)"
         case let .step(step):
             return "queued \(step.when)" + (step.card.map { " \($0)" } ?? "") + ": \(step.words)"
-                + (step.action.map { " · then \($0)" } ?? "")
+                + (step.actionText.map { " · habit \($0)" } ?? "")
                 + (step.source.map { " · inferred from \"\($0)\"" } ?? "")
                 + (step.peers + step.elevated).map { " · from \($0)'s turn" }.joined()
         }

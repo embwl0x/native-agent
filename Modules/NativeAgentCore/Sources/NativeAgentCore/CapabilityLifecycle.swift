@@ -8,9 +8,10 @@ import os
 /// wrote. One folder holds current, previous and proposed files.
 /// - Use: a part's run or `ability.read` (a recall pointer's one act is that
 ///   read). Turning one on restarts the clock.
-/// - Drop removes an ability; rollback swaps current and previous.
+/// - Drop removes an ability. Previous bytes remain history; repair goes forward.
+///   Only the throwing turn program may recover its previous version.
 public enum CapabilityLifecycle {
-    public enum Action: Sendable { case change, enable, restore, rollback, drop }
+    public enum Action: Sendable { case change, enable, restore, drop }
 
     public enum Store: String, CaseIterable, Sendable {
         case skills, tools, senses

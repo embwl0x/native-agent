@@ -197,15 +197,13 @@ extension SwiftNativeTurnEngine {
     // MARK: - Recalled-memory prompt block
 
     /// Rows and provenance actually rendered, shared by prompt rendering and delivered-memory credit.
-    /// ContextBudgetPolicy owns row/count/block bounds; nil selects its floor regime.
+    /// ContextBudgetPolicy owns row/count/block bounds from the admitted model.
     nonisolated static func deliveredRecalledMemoryRows(
         _ recalled: [MemoryRecallHit],
-        budget: ContextBudgetPolicy.Resolved? = nil
+        budget: ContextBudgetPolicy.Resolved
     ) -> [(hit: MemoryRecallHit, line: String)] {
         guard !recalled.isEmpty else { return [] }
-        let resolved = budget ?? ContextBudgetPolicy.resolve(
-            windowTokens: nil
-        )
+        let resolved = budget
         var used = 0
         var rows: [(hit: MemoryRecallHit, line: String)] = []
         // Empty hits consume no recall slots.

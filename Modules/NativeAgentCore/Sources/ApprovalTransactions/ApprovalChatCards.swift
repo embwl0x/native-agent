@@ -87,9 +87,9 @@ public enum ApprovalChatCards {
     /// the signed phone's authority. A script install gets a line there,
     /// never a button: Telegram cannot show the whole script.
     private static func promptTelegram(_ record: ApprovalRecord, telegram: TelegramApprovalFiler, dataRoot: URL) async {
-        guard !telegramPrompted(record), let owner = ownerDM(dataRoot: dataRoot) else { return }
-        guard !Task.isCancelled else { return }
         do {
+            guard !telegramPrompted(record), let owner = try ownerDM(dataRoot: dataRoot) else { return }
+            guard !Task.isCancelled else { return }
             try await telegram.promptChatCard(redactedForTelegram(record), chatId: owner,
                                               payload: NativeAppSecretRedactor.redactArguments(decisionPayload(record)))
         } catch {
@@ -125,16 +125,17 @@ public enum ApprovalChatCards {
     }
 
     /// The bot's owner DM, when it is the conversation User is in.
-    public static func ownerDM(boundTo anchor: String, dataRoot: URL) async -> Int? {
-        guard let owner = ownerDM(dataRoot: dataRoot),
-              await TelegramSessionStore(dataRoot: dataRoot).boundSessionId(chatId: owner) == anchor
+    public static func ownerDM(boundTo anchor: String, dataRoot: URL) async throws -> Int? {
+        guard let owner = try ownerDM(dataRoot: dataRoot),
+              try await TelegramSessionStore(dataRoot: dataRoot).boundSessionId(chatId: owner) == anchor
         else { return nil }
         return owner
     }
 
     /// The bot's single configured owner, whose private chat id is his user id.
-    static func ownerDM(dataRoot: URL) -> Int? {
-        guard let owner = TelegramConfig.loadFromDisk(dataRoot: dataRoot)?.ownerUserId.flatMap({ Int(exactly: $0) })
+    static func ownerDM(dataRoot: URL) throws -> Int? {
+        guard let config = try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: false), config.tokenConfigured,
+              let owner = config.ownerUserId.flatMap({ Int(exactly: $0) })
         else { return nil }
         return owner
     }

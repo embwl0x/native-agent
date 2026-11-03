@@ -2,12 +2,16 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `ChatOrchestrationClient+ToolReceipts.swift` | `SwiftNativeChatOrchestrationClient`: `persistToolReceipt` |
+// Blueprint: | `ChatOrchestrationClient+ToolReceipts.swift` | `ToolReceipt` carries exact invocation identity through progress and `SwiftNativeChatOrchestrationClient.persistToolReceipt` |
 
 /// A complete value-form receipt, redacted before leaving dispatch.
 struct ToolReceipt: Sendable {
     /// Carries the exact dispatch through progress to its awaited receipt write.
     @TaskLocal static var dispatched: ToolReceipt?
+    /// Bound only while emitting this invocation's start; results carry the
+    /// same value on their receipt, across parallel dispatch and actor hops.
+    @TaskLocal static var currentInvocationID: String?
+    let invocationID: String
     let toolName: String
     let input: JSONValue
     let ranCall: (tool: String, input: [String: JSONValue])?
@@ -41,6 +45,7 @@ extension SwiftNativeChatOrchestrationClient {
                 sessionId: writer.sessionId,
                 runId: writer.runId,
                 toolName: receipt.toolName,
+                invocationID: receipt.invocationID,
                 input: receipt.input,
                 ranCall: receipt.ranCall,
                 result: receipt.output,

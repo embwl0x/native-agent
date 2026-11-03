@@ -68,13 +68,15 @@ public struct ArchiveRecord: Sendable, Equatable {
               let openedAt = obj["openedAt"]?.stringValue,
               let closedAt = obj["closedAt"]?.stringValue,
               let summary = obj["summary"]?.stringValue else { return nil }
-        var refs: [DeskRef] = []
-        if case .array(let arr)? = obj["refs"] { refs = arr.compactMap { DeskRef.fromJSON($0) } }
+        guard let refs = deskStoredCollection(obj["refs"], decode: DeskRef.fromJSON),
+              let decisions = DeskJSON.strings(obj["decisions"]),
+              let artifacts = DeskJSON.strings(obj["artifacts"]),
+              DeskJSON.optionalStringsAreValid(obj, keys: ["supersededBy", "findingKey"]) else { return nil }
         return ArchiveRecord(
             handle: handle, title: title, project: project, finalStatus: finalStatus,
             openedAt: openedAt, closedAt: closedAt, summary: summary, refs: refs,
-            decisions: (obj["decisions"]?.arrayValue?.compactMap(\.stringValue) ?? []),
-            artifacts: (obj["artifacts"]?.arrayValue?.compactMap(\.stringValue) ?? []),
+            decisions: decisions,
+            artifacts: artifacts,
             supersededBy: obj["supersededBy"]?.stringValue, findingKey: obj["findingKey"]?.stringValue
         )
     }
@@ -107,6 +109,15 @@ public struct DeskState: Sendable, Equatable {
         guard let slots = workSlotsByDay[day] else { return 0 }
         if let handle { return slots[handle]?.count ?? 0 }
         return slots.values.reduce(0) { $0 + $1.count }
+    }
+
+    /// Presentation counts the requested calendar day and only pursuit-lane
+    /// charges. Retired receipts retain their day; unstarted attempts are free.
+    public func pursuitWorkSessions(on day: String, handle: String) -> Int? {
+        guard let item = items.first(where: { $0.handle == handle }) else { return nil }
+        return (item.pursuit?.retiredSessionsByDay[day] ?? 0)
+            + item.workAttempts.filter { $0.lane == .pursuit && $0.day == day && $0.disposition != .unstarted
+                && hasWorkSlot(handle: handle, day: day, id: $0.attemptId) }.count
     }
 
     public func hasWorkSlot(handle: String, day: String, id: String) -> Bool {
@@ -158,14 +169,14 @@ public struct DeskState: Sendable, Equatable {
     /// the caller must fail loud instead of folding from a partial base.
     public static func fromJSON(_ value: JSONValue) -> DeskState? {
         guard case .object(let obj) = value,
-              case .int(let version)? = obj["version"], version == 1 || version == 2,
+              case .int(2)? = obj["version"],
               case .string(let generatedTs)? = obj["generatedTs"],
               case .array(let rows)? = obj["items"] else { return nil }
-        if version == 2, obj["workSlotsByDay"] == nil { return nil }
+        guard obj["workSlotsByDay"] != nil else { return nil }
         var items: [DeskItem] = []
         items.reserveCapacity(rows.count)
         for row in rows {
-            guard let item = DeskItem.fromJSON(row, strictCollections: true) else { return nil }
+            guard let item = DeskItem.fromJSON(row) else { return nil }
             items.append(item)
         }
         var workSlotsByDay: [String: [String: [String]]]? = nil

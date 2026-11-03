@@ -10,21 +10,19 @@ extension iCloudSyncEngine {
     @discardableResult
     func createDeskItem(
         kind: String, project: String, title: String, summary: String?,
-        submission: InboxAction? = nil, intentionalNewRequest: Bool = false,
-        onReplacement: ((InboxAction) async throws -> Void)? = nil
+        submission: InboxAction? = nil, intentionalNewRequest: Bool = false
     ) async throws -> [String: String] {
         var payload = ["kind": kind, "project": project, "title": title]
         if let summary, !summary.isEmpty { payload["summary"] = summary }
-        return try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+        return try requireSuccessfulActionResponse(await sendActionAndWait(
             submission ?? .make(action: "createDeskItem", payload: payload),
-            intentionalNewRequest: intentionalNewRequest || submission == nil,
-            onReplacement: onReplacement
+            intentionalNewRequest: intentionalNewRequest || submission == nil
         ))
     }
 
     @discardableResult
     func setDeskItemStatus(handle: String, status: String) async throws -> [String: String] {
-        try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+        try requireSuccessfulActionResponse(await sendActionAndWait(
             .make(action: "setDeskItemStatus", payload: ["handle": handle, "status": status])
         ))
     }
@@ -37,45 +35,33 @@ extension iCloudSyncEngine {
         handle: String,
         text: String,
         submission: InboxAction? = nil,
-        intentionalNewRequest: Bool = false,
-        onReplacement: ((InboxAction) async throws -> Void)? = nil
+        intentionalNewRequest: Bool = false
     ) async throws -> [String: String] {
         let action = submission
             ?? .make(action: "appendDeskItemNote", payload: ["handle": handle, "text": text])
-        return try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+        return try requireSuccessfulActionResponse(await sendActionAndWait(
             action,
-            intentionalNewRequest: intentionalNewRequest || submission == nil,
-            onReplacement: onReplacement
+            intentionalNewRequest: intentionalNewRequest || submission == nil
         ))
     }
 
-    // Route Workshop submission through signature retry so a
-    // signature_required rejection auto-retries with a fresh signature.
+    // Workshop waits on its original identity; a refusal never submits another task.
     @discardableResult
     func submitWorkshopTask(
         title: String, objective: String,
         submission: InboxAction? = nil,
         intentionalNewRequest: Bool = false,
-        onReplacement: ((InboxAction) async throws -> Void)? = nil,
         onRefusal: (() -> Void)? = nil
     ) async throws -> String {
         let action = submission ?? InboxAction.make(action: "submitWorkshopTask", payload: [
             "title": title, "objective": objective
         ])
         // Fresh submissions bypass payload recovery; retained retries do not.
-        var currentSubmission = action
-        let response = try await sendActionWithSignatureRetry(
-            action, intentionalNewRequest: intentionalNewRequest || submission == nil,
-            onReplacement: {
-                currentSubmission = $0
-                try await onReplacement?($0)
-            }
+        let response = try await sendActionAndWait(
+            action, intentionalNewRequest: intentionalNewRequest || submission == nil
         )
-        // A refusal for an earlier signature attempt cannot unlock a replacement
-        // whose delivery is still uncertain. Generic failures may follow execution.
-        if response["msgId"] == currentSubmission.msgId,
-           response["applied"] == "false" || response["status"] == "orphaned"
-            || ["signature_required", "signature_invalid", "device_not_verified",
+        if response["applied"] == "false" || response["status"] == "orphaned"
+            || ["device_not_verified",
                 "expired_before_execution", "timestamp_invalid", "invalid_action"].contains(response["code"] ?? "") {
             onRefusal?()
         }
@@ -83,33 +69,32 @@ extension iCloudSyncEngine {
         return result["result"] ?? result["status"] ?? "submitted"
     }
 
-    // Approval sends retry a verified pre-execution signature refusal once.
+    // Approval decisions await the original signed request.
 
     @discardableResult
     func decideWorkshopStep(executionId: String, stepId: String, approve: Bool) async throws -> [String: String] {
         let action = InboxAction.make(action: approve ? "approveStep" : "rejectStep", payload: [
-            // Compatibility wire key; the Mac maps it to the Workshop execution.
-            "missionId": executionId, "stepId": stepId
+            "executionId": executionId, "stepId": stepId
         ])
-        return try requireSuccessfulActionResponse(await sendDecisionActionWithSignatureRetry(action))
+        return try requireSuccessfulActionResponse(await sendDecisionActionAndWait(action))
     }
 
     @discardableResult
     func approveApproval(id: String) async throws -> [String: String] {
         let action = InboxAction.make(action: "approveApproval", payload: ["approvalId": id])
-        return try adoptApprovalResponse(await sendDecisionActionWithSignatureRetry(action))
+        return try adoptApprovalResponse(await sendDecisionActionAndWait(action))
     }
 
     @discardableResult
     func rejectApproval(id: String) async throws -> [String: String] {
         let action = InboxAction.make(action: "rejectApproval", payload: ["approvalId": id])
-        return try adoptApprovalResponse(await sendDecisionActionWithSignatureRetry(action))
+        return try adoptApprovalResponse(await sendDecisionActionAndWait(action))
     }
 
     @discardableResult
     func cancelApproval(id: String) async throws -> [String: String] {
         let action = InboxAction.make(action: "cancelApproval", payload: ["approvalId": id])
-        return try adoptApprovalResponse(await sendDecisionActionWithSignatureRetry(action))
+        return try adoptApprovalResponse(await sendDecisionActionAndWait(action))
     }
 
     private func adoptApprovalResponse(_ response: [String: String]) throws -> [String: String] {
@@ -129,19 +114,19 @@ extension iCloudSyncEngine {
     @discardableResult
     func approveMemoryProposal(proposalId: String) async throws -> [String: String] {
         let action = InboxAction.make(action: "approveMemoryProposal", payload: ["proposalId": proposalId])
-        return try adoptMemoryResponse(await sendDecisionActionWithSignatureRetry(action))
+        return try adoptMemoryResponse(await sendDecisionActionAndWait(action))
     }
 
     @discardableResult
     func rejectMemoryProposal(proposalId: String) async throws -> [String: String] {
         let action = InboxAction.make(action: "rejectMemoryProposal", payload: ["proposalId": proposalId])
-        return try adoptMemoryResponse(await sendDecisionActionWithSignatureRetry(action))
+        return try adoptMemoryResponse(await sendDecisionActionAndWait(action))
     }
 
     @discardableResult
     func deleteMemory(id: String) async throws -> [String: String] {
         let action = InboxAction.make(action: "deleteMemory", payload: ["memoryId": id])
-        return try adoptMemoryResponse(await sendActionWithSignatureRetry(action))
+        return try adoptMemoryResponse(await sendActionAndWait(action))
     }
 
     private func adoptMemoryResponse(_ response: [String: String]) throws -> [String: String] {
@@ -168,7 +153,7 @@ extension iCloudSyncEngine {
             "itemId": itemId,
             "actionId": actionId,
         ])
-        let response = try await sendActionWithSignatureRetry(action)
+        let response = try await sendActionAndWait(action)
         if let id = response["inboxItemId"], let json = response["inboxItemJSON"],
            let revision = response["inboxReadbackRevision"].flatMap(Double.init) {
             let row = try JSONDecoder().decode(InboxItemRecord?.self, from: Data(json.utf8))
@@ -195,13 +180,13 @@ extension iCloudSyncEngine {
             "bundleId": bundleId,
             "deviceId": deviceId,
         ])
-        return try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action, pollTimeoutSeconds: 45))
+        return try requireSuccessfulActionResponse(await sendActionAndWait(action, pollTimeoutSeconds: 45))
     }
 
     // MARK: - Mac Control (iOS → Mac remote actions)
     // The Mac enforces control authority; these actions use the signed retry boundary.
     private func macControlResult(_ action: InboxAction, pollTimeoutSeconds: Double = 120) async throws -> String {
-        let raw = try await sendActionWithSignatureRetry(action, pollTimeoutSeconds: pollTimeoutSeconds)
+        let raw = try await sendActionAndWait(action, pollTimeoutSeconds: pollTimeoutSeconds)
         let result = try requireSuccessfulActionResponse(
             raw
         )
@@ -242,7 +227,7 @@ extension iCloudSyncEngine {
     func disconnectTelegram() async throws -> MobileTelegramSnapshot {
         let lifecycle = lifecycleGeneration
         let action = InboxAction.make(action: "disconnect_telegram", payload: ["confirmed": "true"])
-        let response = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
+        let response = try requireSuccessfulActionResponse(await sendActionAndWait(action))
         guard let json = response["telegram"],
               let recovered = try? JSONDecoder().decode(MobileTelegramSnapshot.self, from: Data(json.utf8)) else {
             throw SyncError.unsupported("The Mac did not return readable Telegram settings. Refresh before trying again.")
@@ -265,34 +250,36 @@ extension iCloudSyncEngine {
         fields["action"] = actionName
         action.payload = [SecretActionEnvelope.field: try SecretActionEnvelope.seal(fields, secret: secret,
             actionID: action.msgId, actionName: action.action)]
-        return try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action,
+        return try requireSuccessfulActionResponse(await sendActionAndWait(action,
             intentionalNewRequest: true, pollTimeoutSeconds: 90))
     }
 
     /// Encrypt before any transport persistence. Only the Mac credential owner
     /// receives plaintext; replies contain verified state, never provider output.
     @discardableResult
-    func configureProvider(providerId: String, apiKey: String) async throws -> String {
+    func configureProvider(providerId: String, apiKey: String) async throws -> ProviderActionFeedback {
         guard let secret = pairingStore?.iCloudPairingSecret else { throw SyncError.notSigned }
         var action = InboxAction.make(action: "configure_provider_secret", payload: [:])
         action.payload = [SecretActionEnvelope.field: try SecretActionEnvelope.seal(
             ["providerId": providerId, "api_key": apiKey], secret: secret,
             actionID: action.msgId, actionName: action.action
         )]
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+        let result = try requireSuccessfulActionResponse(await sendActionAndWait(
             action, intentionalNewRequest: true, pollTimeoutSeconds: 90
         ))
         guard result["provider_id"] == providerId,
               ["verified", "unverified"].contains(result["connection_state"] ?? "") else {
             throw SyncError.persistence("The Mac did not return a verified provider receipt.")
         }
-        return result["message"] ?? "Connection not verified."
+        let verified = result["connection_state"] == "verified"
+        return ProviderActionFeedback(text: result["message"] ?? (verified ? "Connection verified on Mac." : "Connection not verified."),
+                                      failed: !verified)
     }
 
     /// The short start receipt identifies the exact flow to observe in snapshots.
     func startProviderSignIn(providerId: String) async throws -> String {
         let action = InboxAction.make(action: "start_provider_sign_in", payload: ["providerId": providerId])
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
+        let result = try requireSuccessfulActionResponse(await sendActionAndWait(action))
         guard result["provider_id"] == providerId, result["connection_state"] == "pending",
               let requestID = result["request_id"], UUID(uuidString: requestID) != nil else {
             throw SyncError.persistence("The Mac did not confirm the sign-in request.")
@@ -304,7 +291,7 @@ extension iCloudSyncEngine {
     @discardableResult
     func testProvider(providerId: String) async throws -> String {
         let action = InboxAction.make(action: "test_provider", payload: ["providerId": providerId])
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
+        let result = try requireSuccessfulActionResponse(await sendActionAndWait(action))
         return result["result"] ?? result["status"] ?? ""
     }
 
@@ -325,7 +312,7 @@ extension iCloudSyncEngine {
             "reasoning_effort": reasoningEffort,
             "service_tier": serviceTier,
         ])
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
+        let result = try requireSuccessfulActionResponse(await sendActionAndWait(action))
         guard lifecycle == lifecycleGeneration else { throw CancellationError() }
         func required(_ key: String) throws -> String {
             guard let value = result[key], !value.isEmpty,
@@ -341,7 +328,7 @@ extension iCloudSyncEngine {
             providerID: try required("provider_id"), model: try required("model"),
             reasoningEffort: try required("reasoning_effort"), serviceTier: try required("service_tier")
         )
-        guard confirmed == (expected == "missions" ? "workshop" : expected), surfaces.contains(confirmed),
+        guard confirmed == expected, surfaces.contains(confirmed),
               preference.serviceTier == "default" || preference.serviceTier == "priority" else {
             throw SyncError.persistence("Mac selection response did not confirm the requested surface's canonical tuple")
         }
@@ -366,7 +353,7 @@ extension iCloudSyncEngine {
         let lifecycle = lifecycleGeneration
         var payload = ["id": id]
         if let enabled { payload["enabled"] = String(enabled) }
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+        let result = try requireSuccessfulActionResponse(await sendActionAndWait(
             InboxAction.make(action: action, payload: payload)
         ))
         guard let json = result["connector"],
@@ -387,8 +374,9 @@ extension iCloudSyncEngine {
         guard MobileTrustAction(payload: request.payload) != nil else {
             throw SyncError.unsupported("Invalid or unconfirmed trust change.")
         }
+        let lifecycle = lifecycleGeneration
         let action = InboxAction.make(action: "set_trust_policy", payload: request.payload)
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(action))
+        let result = try requireSuccessfulActionResponse(await sendActionAndWait(action))
         guard let raw = result["policy"],
               let recovered = try? JSONDecoder().decode(TrustPolicy.self, from: Data(raw.utf8)),
               recovered.permissionLevel != nil, recovered.autonomyDefault != nil,
@@ -396,7 +384,8 @@ extension iCloudSyncEngine {
               recovered.developerMode != nil else {
             throw SyncError.persistence("Mac did not return the saved trust policy. Refresh Trust before trying again.")
         }
-        trustPolicy = recovered
+        guard lifecycle == lifecycleGeneration else { throw CancellationError() }
+        trustRead.write { trustPolicy = recovered }
         return recovered
     }
 
@@ -408,7 +397,7 @@ extension iCloudSyncEngine {
         let lifecycle = lifecycleGeneration
         do {
             _ = try await appSettingsRead.read({
-                let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+                let result = try requireSuccessfulActionResponse(await sendActionAndWait(
                     .make(action: "app_settings", payload: [:])))
                 guard let raw = result["settings"] else { throw SyncError.persistence("The Mac did not return its settings.") }
                 guard lifecycle == lifecycleGeneration else { throw CancellationError() }
@@ -419,24 +408,25 @@ extension iCloudSyncEngine {
 
     /// One setting, set through the Mac page's own control; adopts its read-back.
     func setAppSetting(_ setting: MobileAppSetting, to value: String) async {
-        guard !appSettingsSaving.contains(setting.id), value != setting.value else { return }
+        guard setting.writable, setting.unavailableReason == nil, let currentValue = setting.value,
+              !appSettingsSaving.contains(setting.id), value != currentValue else { return }
         appSettingsRead.write { appSettingsSaving.insert(setting.id) }
         defer { appSettingsSaving.remove(setting.id) }
         let lifecycle = lifecycleGeneration
         do {
-            let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+            let result = try requireSuccessfulActionResponse(await sendActionAndWait(
                 .make(action: "app_setting_set", payload: ["id": setting.id, "value": value])))
             guard let raw = result["setting"] else { throw SyncError.persistence("The Mac did not return the saved setting.") }
             guard lifecycle == lifecycleGeneration else { throw CancellationError() }
             let row = try JSONDecoder().decode(MobileAppSetting.self, from: Data(raw.utf8))
             if let index = appSettingRows.firstIndex(where: { $0.id == row.id }) { appSettingsRead.write { appSettingRows[index] = row } }
             appSettingsFailure = nil
-        } catch { if lifecycle == lifecycleGeneration { appSettingsFailure = "\(setting.label) was not changed: \(error.localizedDescription)" } }
+        } catch { if lifecycle == lifecycleGeneration { appSettingsFailure = "\(setting.label) could not be confirmed: \(error.localizedDescription)" } }
     }
 
     func helperAction(_ name: String, payload: [String: String]) async throws -> (MobileHelperEdit, [String: String]) {
         let lifecycle = lifecycleGeneration
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(.make(action: name, payload: payload)))
+        let result = try requireSuccessfulActionResponse(await sendActionAndWait(.make(action: name, payload: payload)))
         guard lifecycle == lifecycleGeneration else { throw CancellationError() }
         guard let raw = result["helper"] else { throw SyncError.persistence("The Mac did not return the saved helper.") }
         let helper = try JSONDecoder().decode(MobileHelperEdit.self, from: Data(raw.utf8))
@@ -464,7 +454,7 @@ extension iCloudSyncEngine {
             }
             payload["text"] = text; payload["session_id"] = session
         }
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+        let result = try requireSuccessfulActionResponse(await sendActionAndWait(
             .make(action: text == nil ? "get_agent_thread" : "send_agent_message", payload: payload), pollTimeoutSeconds: text == nil ? 30 : 120))
         guard lifecycle == lifecycleGeneration else { throw CancellationError() }
         guard let raw = result["thread"] else { throw SyncError.persistence("The Mac did not return the agent thread.") }
@@ -484,7 +474,7 @@ extension iCloudSyncEngine {
     @discardableResult
     func changeSchedulerJob(action: String, payload: [String: String]) async throws -> MobileSchedulerJob {
         let lifecycle = lifecycleGeneration
-        let result = try requireSuccessfulActionResponse(await sendActionWithSignatureRetry(
+        let result = try requireSuccessfulActionResponse(await sendActionAndWait(
             InboxAction.make(action: action, payload: payload)
         ))
         guard lifecycle == lifecycleGeneration,

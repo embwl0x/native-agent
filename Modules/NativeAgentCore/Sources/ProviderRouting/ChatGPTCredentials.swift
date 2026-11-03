@@ -13,7 +13,7 @@ extension ChatGPTTransport {
         CodexAccountModelCatalog.matchingModels(
             providerID: "openai_oauth_direct",
             oauthAuthURL: resolveAuthPath(),
-            fallbackCacheURL: CodexAccountModelCatalog.cacheCandidate()
+            dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot()
         ).first { $0.id == model }
     }
     func resolveAuthPath() -> URL {
@@ -36,6 +36,10 @@ extension ChatGPTTransport {
         return TimeInterval(expiry) > Date().timeIntervalSince1970 + TimeInterval(buffer)
     }
     /// The adapter's read verdict; CLI rotation remains owned by the CLI.
+    public static func credentialStatus(at path: URL) throws -> (usable: Bool, detail: String, health: OAuthCredentialHealth) {
+        credentialStatus(try loadAuthBlob(at: path), path: path)
+    }
+
     public static func credentialStatus(_ auth: [String: Any]?, path: URL) -> (usable: Bool, detail: String, health: OAuthCredentialHealth) {
         if let auth, OAuthRefreshBinding.hasInvalidExpiry(auth, provider: "openai_oauth_direct") {
             return (false, "Saved expires_at is invalid — repair the credential or sign in again",
@@ -63,7 +67,7 @@ extension ChatGPTTransport {
     ) throws -> String {
         // A bound helper must recheck consent before reading the shared file.
         guard resolveAuthPath().standardizedFileURL == path.standardizedFileURL,
-              let blob = Self.loadAuthBlob(at: path) else {
+              let blob = try Self.loadAuthBlob(at: path) else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
         try requestAccount.check(blob, provider: "openai_oauth_direct", allowUnboundIdentity: true)
@@ -82,10 +86,11 @@ extension ChatGPTTransport {
         staleToken: String? = nil,
         requestAccount: OAuthRequestAccount = OAuthRequestAccount()
     ) async throws -> String {
+        try OAuthProductionSession.validate(session)
         // Fast path OUTSIDE the lock — check disk; return if still fresh.
         let path = resolveAuthPath()
         let isCLI = Self.isUserCodexPath(path)
-        guard let blob0 = Self.loadAuthBlob(at: path) else {
+        guard let blob0 = try Self.loadAuthBlob(at: path) else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
         try requestAccount.check(blob0, provider: "openai_oauth_direct", rejectedToken: staleToken,
@@ -114,11 +119,13 @@ extension ChatGPTTransport {
         return try await Self.sharedRefreshActor(for: path).run {
             // Re-load INSIDE the critical section: another waiter may have
             // already refreshed while we were queued.
-            guard self.resolveAuthPath().standardizedFileURL == path.standardizedFileURL,
-                  let baseline = try? Data(contentsOf: path),
-                  let blob = try? JSONSerialization.jsonObject(with: baseline) as? [String: Any] else {
+            guard self.resolveAuthPath().standardizedFileURL == path.standardizedFileURL else {
+                throw OAuthRequestAccount.changed("openai_oauth_direct")
+            }
+            guard let baseline = try ProviderStateValidation.dataIfPresent(at: path) else {
                 throw LLMError.notConfigured(provider: "openai_oauth_direct")
             }
+            let blob = try ProviderStateValidation.credential(data: baseline)
             try requestAccount.check(blob, provider: "openai_oauth_direct")
             let tokens = (blob["tokens"] as? [String: Any]) ?? [:]
             guard let access = tokens["access_token"] as? String, !access.isEmpty else {
@@ -144,14 +151,14 @@ extension ChatGPTTransport {
     /// renew through the normal refresh queue and sync their access-only copy;
     /// CLI-owned sessions remain read-only. Never resolve a second path here.
     public static func prepareCodexChildHome(_ codexHome: URL, authPath: URL) async throws {
-        guard credentialStatus(loadAuthBlob(at: authPath), path: authPath).usable else {
+        guard credentialStatus(try loadAuthBlob(at: authPath), path: authPath).usable else {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
         guard let childHome = codexChildHome(mirroring: authPath) else { return }
         guard childHome.standardizedFileURL == codexHome.standardizedFileURL else {
             throw LLMError.underlying(message: "Codex child home does not match the selected credential.")
         }
-        if let blob = loadAuthBlob(at: authPath),
+        if let blob = try loadAuthBlob(at: authPath),
            let access = (blob["tokens"] as? [String: Any])?["access_token"] as? String,
            !access.isEmpty,
            !accessTokenIsFresh(effectiveExpiry(access, blob: blob), buffer: codexChildRefreshBufferSec) {
@@ -207,18 +214,20 @@ extension ChatGPTTransport {
             throw LLMError.authRejected(
                 provider: "openai_oauth_direct", detail: providerErrorDetail(data))
         }
-        guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw LLMError.underlying(message: "refresh: unparseable response")
-        }
+        let answer = try OAuthGrantOperations.validateTokenResponse(data, requiringRefreshToken: false)
+        let payload = answer.fields
+        let newAccess = answer.accessToken
         try OAuthRefreshBinding.requireSameAccount(payload, original: blob, provider: "openai_oauth_direct")
 
         // Preserve account_id and other fields the refresh response doesn't return.
         var newBlob = blob
         var merged = tokens
-        for key in ["access_token", "refresh_token", "id_token"] {
-            if let v = payload[key] as? String, !v.isEmpty {
-                merged[key] = v
-            }
+        merged.removeValue(forKey: "expires_at")
+        merged.removeValue(forKey: "expires_in")
+        merged["access_token"] = newAccess
+        if let refresh = answer.refreshToken { merged["refresh_token"] = refresh }
+        if let idToken = payload["id_token"] as? String, !idToken.isEmpty {
+            merged["id_token"] = idToken
         }
         // Re-extract account_id if the new access token has one and we
         // don't already have it persisted (fresh sign-in path).
@@ -228,20 +237,12 @@ extension ChatGPTTransport {
                 merged["account_id"] = acct
             }
         }
-        newBlob["tokens"] = merged
         newBlob["last_refresh"] = NativeTimestampFormat.plainZulu(Date())
-        // Also write a top-level expires_at so the OAuth status UI (and the
-        // ensureFreshAccessToken persisted-exp fast path) doesn't need to
-        // decode the JWT just to know when the next refresh fires. Prefer
-        // payload.expires_in (server-authoritative); fall back to the JWT.
-        if let exp_in = payload["expires_in"] as? Int {
-            let d = Date().addingTimeInterval(TimeInterval(exp_in))
-            newBlob["expires_at"] = NativeTimestampFormat.plainZulu(d)
-        } else if let access = merged["access_token"] as? String,
-                  let exp = Self.tokenExpiresAt(access) {
-            let d = Date(timeIntervalSince1970: TimeInterval(exp))
-            newBlob["expires_at"] = NativeTimestampFormat.plainZulu(d)
-        }
+        newBlob["tokens"] = merged
+        // The new token owns its expiry. Never retain the preceding token's date.
+        newBlob.removeValue(forKey: "expires_at")
+        newBlob.removeValue(forKey: "expires_in")
+        newBlob["expires_at"] = answer.expiresIn.map { NativeTimestampFormat.plainZulu(Date().addingTimeInterval($0)) }
         // Compare original bytes and write under the sign-in/sign-out credential
         // lock. Changed/deleted credentials must not be overwritten or resurrected;
         // any replacement token must still match the request's original account.
@@ -255,7 +256,7 @@ extension ChatGPTTransport {
                 options: [.prettyPrinted, .sortedKeys]
             )
             outcome = try CredentialFileLock.withLock(path) { () -> RefreshWrite in
-                guard let current = try? Data(contentsOf: path) else { return .supersededAndGone }
+                guard let current = try ProviderStateValidation.dataIfPresent(at: path) else { return .supersededAndGone }
                 guard current == baseline else { return .superseded(current) }
                 try Self.writeAuthBytesAtomically(bytes, to: path)
                 // The rotation is already on disk, so a failed child copy must
@@ -281,9 +282,7 @@ extension ChatGPTTransport {
         }
         switch outcome {
         case .superseded(let current):
-            guard let object = try JSONSerialization.jsonObject(with: current) as? [String: Any] else {
-                throw LLMError.notConfigured(provider: "openai_oauth_direct")
-            }
+            let object = try ProviderStateValidation.credential(data: current)
             try requestAccount.check(object, provider: "openai_oauth_direct")
             guard let access = OAuthRefreshBinding.string(OAuthRefreshBinding.tokenSet(object, provider: "openai_oauth_direct")["access_token"]) else {
                 throw LLMError.notConfigured(provider: "openai_oauth_direct")
@@ -293,9 +292,6 @@ extension ChatGPTTransport {
             throw LLMError.notConfigured(provider: "openai_oauth_direct")
         case .wrote:
             break
-        }
-        guard let newAccess = merged["access_token"] as? String, !newAccess.isEmpty else {
-            throw LLMError.notConfigured(provider: "openai_oauth_direct")
         }
         return newAccess
     }

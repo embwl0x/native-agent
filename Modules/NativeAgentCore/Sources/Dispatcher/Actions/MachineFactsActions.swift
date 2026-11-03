@@ -7,10 +7,11 @@ import PersistenceCore
 import TrustCenter
 import CoreWLAN
 import SystemConfiguration
+import IOKit.ps
 #if canImport(Darwin)
 import Darwin
 #endif
-// Blueprint: | `MachineFactsActions.swift` | `FileSystemActions.systemInfo`: machine and application facts, disk capacity, memory, processes, network, boot, presence and battery; existing bounded process reads |
+// Blueprint: | `MachineFactsActions.swift` | `FileSystemActions.systemInfo`: OS-owned physical memory and power snapshot, checked VM counters and bounded process reads; unavailable measurements retain per-field partial coverage |
 
 extension FileSystemActions {
     // MARK: - system_info
@@ -87,33 +88,27 @@ extension FileSystemActions {
             }
         }
 
-        // Memory: vm_stat output → pages × page_size → MB.
-        if let vmOut = runCommand("/usr/bin/vm_stat", []) , vmOut.status == 0 {
+        // Physical total and the VM counters are different OS measurements.
+        var memory: [String: JSONValue] = [
+            "total_mb": .int(Int64(ProcessInfo.processInfo.physicalMemory / 1_048_576)),
+            "source": .string("ProcessInfo.physicalMemory; vm_stat page counters"),
+        ]
+        if let vmOut = runCommand("/usr/bin/vm_stat", []), vmOut.status == 0 {
             let text = vmOut.stdout
-            var pageSize = 4096
-            if let ps = firstCapturedInt(in: text, pattern: #"page size of (\d+) bytes"#) {
-                pageSize = ps
-            }
-            func pages(_ label: String) -> Int {
-                firstCapturedInt(in: text, pattern: "\(NSRegularExpression.escapedPattern(for: label)):\\s+([\\d.]+)") ?? 0
-            }
-            let free = pages("Pages free")
-            let active = pages("Pages active")
-            let inactive = pages("Pages inactive")
-            let wired = pages("Pages wired down")
-            let speculative = pages("Pages speculative")
-            func toMB(_ p: Int) -> Int64 { Int64((Double(p) * Double(pageSize) / (1024.0 * 1024.0)).rounded()) }
-            let totalPages = free + active + inactive + wired + speculative
-            fields["memory"] = .object([
-                "free_mb": .int(toMB(free)),
-                "active_mb": .int(toMB(active)),
-                "inactive_mb": .int(toMB(inactive)),
-                "wired_mb": .int(toMB(wired)),
-                "total_mb": .int(toMB(totalPages)),
-            ])
-        } else {
-            failures.append("memory: vm_stat failed")
-        }
+            if let pageSize = firstCapturedInt(in: text, pattern: #"page size of (\d+) bytes"#), pageSize > 0 {
+                memory["page_size_bytes"] = .int(Int64(pageSize))
+                for (key, label) in [("free_mb", "Pages free"), ("active_mb", "Pages active"),
+                                     ("inactive_mb", "Pages inactive"), ("wired_mb", "Pages wired down"),
+                                     ("speculative_mb", "Pages speculative"), ("compressor_mb", "Pages occupied by compressor")] {
+                    let pattern = "(?m)^\(NSRegularExpression.escapedPattern(for: label)):\\s+([0-9]+)\\.\\s*$"
+                    if let pages = firstCapturedInt(in: text, pattern: pattern), pages >= 0,
+                       let mb = Int64(exactly: (Double(pages) * Double(pageSize) / 1_048_576).rounded()) {
+                        memory[key] = .int(mb)
+                    } else { failures.append("memory.\(key): vm_stat counter unavailable") }
+                }
+            } else { failures.append("memory: vm_stat page size unavailable; VM counters were not measured") }
+        } else { failures.append("memory: complete vm_stat output unavailable; VM counters were not measured") }
+        fields["memory"] = .object(memory)
 
         let processes = runProcess("/bin/ps", ["-axo", "pid=,pcpu=,rss=,comm="],
             timeout: 5, captureByteLimit: 256 * 1024)
@@ -135,7 +130,7 @@ extension FileSystemActions {
 
         // Network: ping 8.8.8.8 → reachable bool.
         var network: [String: JSONValue] = ["local_ip": .null, "vpn": .null]
-        if let ping = runCommand("/sbin/ping", ["-c", "1", "-W", "1000", "8.8.8.8"]) {
+        if let ping = runCommand("/sbin/ping", ["-c", "1", "-W", "1000", "8.8.8.8"]), [0, 2].contains(ping.status) {
             network["reachable"] = .bool(ping.status == 0)
         } else {
             failures.append("network: ping failed")
@@ -201,39 +196,7 @@ extension FileSystemActions {
         fields["screen_lock"] = .object(["locked": .bool(MacScreenLock.isLocked())])
         fields["person"] = MacPersonInput.presenceDetail
 
-        // Battery: pmset -g batt → percent/charging/source.
-        if let batt = runCommand("/usr/bin/pmset", ["-g", "batt"]), batt.status == 0 {
-            let out = batt.stdout
-            let source: JSONValue = firstCapturedString(in: out, pattern: #"Now drawing from '([^']+)'"#)
-                .map { .string($0) } ?? .null
-            let percent: JSONValue = firstCapturedInt(in: out, pattern: #"(\d+)%;"#)
-                .map { .int(Int64($0)) } ?? .null
-            var charging: JSONValue = .null
-            let lower = out.lowercased()
-            if lower.contains("charging") {
-                charging = .bool(!lower.contains("discharging"))
-            }
-            fields["battery"] = .object([
-                "percent": percent,
-                "charging": charging,
-                "source": source,
-            ])
-        } else {
-            // Desktop Mac — no battery.
-            fields["battery"] = .object([
-                "percent": .null,
-                "charging": .null,
-                "source": .string("AC Power"),
-            ])
-        }
-
-        if !failures.isEmpty && fields.isEmpty {
-            return .object([
-                "ok": .bool(false),
-                "error": .string(failures.joined(separator: "; ")),
-                "error_code": .string("system_info_partial"),
-            ])
-        }
+        fields["battery"] = powerSnapshot(failures: &failures)
         var result: [String: JSONValue] = ["ok": .bool(true), "status": .string(failures.isEmpty ? "ok" : "partial")]
         for (k, v) in fields { result[k] = v }
         if !failures.isEmpty {
@@ -251,7 +214,8 @@ private struct CommandResult { let status: Int32; let stdout: String }
 
 private func runCommand(_ launchPath: String, _ args: [String], timeout: TimeInterval = 5) -> CommandResult? {
     let result = runProcess(launchPath, args, timeout: timeout)
-    guard result.launched, !result.timedOut, !result.captureReadFailed else { return nil }
+    guard result.launched, !result.timedOut, !result.captureReadFailed,
+          !result.stdoutTruncated, !result.stderrTruncated else { return nil }
     return CommandResult(status: result.status, stdout: result.stdout)
 }
 
@@ -266,8 +230,48 @@ private func firstCapturedString(in text: String, pattern: String) -> String? {
 
 private func firstCapturedInt(in text: String, pattern: String) -> Int? {
     guard let s = firstCapturedString(in: text, pattern: pattern) else { return nil }
-    // Page counts tolerate a decimal point.
-    if let i = Int(s) { return i }
-    if let d = Double(s) { return Int(d) }
-    return nil
+    return Int(s)
+}
+
+/// One IOKit snapshot owns both the supplying source and internal battery facts.
+private func powerSnapshot(failures: inout [String]) -> JSONValue {
+    var battery: [String: JSONValue] = ["source": .null, "present": .null, "percent": .null, "charging": .null]
+    guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue() else {
+        failures.append("battery: IOKit power-source snapshot unavailable")
+        return .object(battery)
+    }
+    if let source = IOPSGetProvidingPowerSourceType(snapshot)?.takeUnretainedValue() {
+        battery["source"] = .string(source as String)
+    } else { failures.append("battery.source: IOKit supplying source unavailable") }
+    guard let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef] else {
+        failures.append("battery: IOKit power-source list unavailable")
+        return .object(battery)
+    }
+    var complete = true
+    for source in sources {
+        guard let info = IOPSGetPowerSourceDescription(snapshot, source)?.takeUnretainedValue() as? [String: Any],
+              let type = info[kIOPSTypeKey] as? String else {
+            complete = false
+            failures.append("battery: IOKit power-source description unavailable")
+            continue
+        }
+        guard type == kIOPSInternalBatteryType else { continue }
+        guard let present = info[kIOPSIsPresentKey] as? Bool else {
+            failures.append("battery.present: IOKit presence unavailable")
+            return .object(battery)
+        }
+        battery["present"] = .bool(present)
+        guard present else { return .object(battery) }
+        if let current = info[kIOPSCurrentCapacityKey] as? Int,
+           let maximum = info[kIOPSMaxCapacityKey] as? Int,
+           maximum > 0, current >= 0, current <= maximum {
+            battery["percent"] = .int(Int64((Double(current) / Double(maximum) * 100).rounded()))
+        } else { failures.append("battery.percent: IOKit capacity unavailable") }
+        if let charging = info[kIOPSIsChargingKey] as? Bool { battery["charging"] = .bool(charging) }
+        else { failures.append("battery.charging: IOKit charging state unavailable") }
+        return .object(battery)
+    }
+    // Only a completely read list establishes that there is no internal battery.
+    if complete { battery["present"] = .bool(false) }
+    return .object(battery)
 }

@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 import NativeAgentShared
-// Blueprint: | `RunsLogView.swift` | Run history, rows and complete run detail |
+// Blueprint: | `RunsLogView.swift` | Run history and detail show readable prompt summaries; captured raw prompts remain behind a disclosure with copy |
 
 // MARK: - Runs log
 
@@ -14,7 +14,7 @@ struct RunsLogView: View {
             AlivePageHeader(title: "Runs Log", line: "What I've run on the Mac lately.", style: .pushed)
                 .padding(.horizontal, 4)
                 .aliveListRow(top: 4, bottom: 6)
-            switch RunsLogPresentation.state(runs: sync.runs, error: store.runsLoadError) {
+            switch RunsLogPresentation.state(runs: sync.runs, hasLoaded: sync.runsSnapshotLoaded, error: store.runsLoadError) {
             case .unavailable(let error):
                 AliveCalmState(title: "Runs are not available", line: error)
                     .aliveListRow()
@@ -60,7 +60,7 @@ private struct RunRowView: View {
                     Spacer()
                     StatusBadge(status: run.status)
                 }
-                if let prompt = run.prompt, !prompt.isEmpty {
+                if let prompt = RunDetailPromptPresentation.summary(run.prompt) {
                     Text(prompt)
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -148,7 +148,18 @@ struct RunDetailView: View {
             }
 
             if let prompt = RunDetailPromptPresentation.copyablePrompt(run.prompt) {
-                runTextSection("Prompt", systemImage: "text.bubble", text: prompt)
+                Section {
+                    Text(RunDetailPromptPresentation.summary(prompt) ?? RunDetailPromptPresentation.unavailableDescription)
+                    DisclosureGroup("Raw prompt") {
+                        Text(prompt)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                        Button("Copy raw prompt", systemImage: "doc.on.doc") {
+                            UIPasteboard.general.string = prompt
+                            SystemToastCenter.shared.push(success: RunDetailCopyPresentation.successMessage(for: "Prompt"))
+                        }
+                    }
+                } header: { AliveEyebrow("Request") }
             } else {
                 Section {
                     Text(RunDetailPromptPresentation.unavailableDescription)

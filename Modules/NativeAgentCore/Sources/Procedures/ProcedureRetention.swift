@@ -62,8 +62,7 @@ extension ProcedureArtifactStore {
     public static func startRetention(dataRoot: URL) async { await retention.start(retentionKey(dataRoot)) }
     public static func stopRetention(dataRoot: URL) async { await retention.stop(retentionKey(dataRoot)) }
 
-    /// Retention keeps installed artifacts below the admission ceiling.
-    static let maxInstalledArtifacts = 1_024
+    /// Retention frees unreferenced capacity; installation enforces the ceiling.
     static let artifactRetentionTarget = 768
     /// Unreferenced artifacts become sweep-eligible after this file age.
     static let artifactRetentionAge: TimeInterval = 30 * 24 * 60 * 60
@@ -160,7 +159,6 @@ extension ProcedureArtifactStore {
                   values.isRegularFile == true,
                   values.isSymbolicLink != true,
                   let artifact = try? await load(id),
-                  !artifact.requiresLegacyRevalidation || legacyRevalidationMatches(artifact),
                   artifact.id == id else { continue }
             candidates.append(Candidate(
                 url: url, modified: values.contentModificationDate ?? now

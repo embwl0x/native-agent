@@ -63,10 +63,15 @@ extension WorkshopExecutorLoop {
             do {
                 if record.status == "blocked_on_approval" {
                     guard let approval = try await resolvedStepApproval(record) else { continue }
-                    _ = try await resumeAfterApproval(
-                        executionId: record.id, stepId: record.currentStepId,
-                        approved: true, approvalId: approval.approval.id)
-                    pass.ran += 1
+                    let settled = await ApprovalExecutionOwners.perform(approval.approval, dataRoot: root) {
+                        do {
+                            let outcome = try await self.resumeAfterApproval(
+                                executionId: record.id, stepId: record.currentStepId,
+                                approved: true, approvalId: approval.approval.id)
+                            return Self.approvalOutcome(outcome, stepId: record.currentStepId, approved: true)
+                        } catch WorkshopExecutionError.approvalDeferred { return nil }
+                    }
+                    if settled { pass.ran += 1 }
                     continue
                 }
                 guard let claimed = try await claim(record.id) else { continue }

@@ -6,8 +6,9 @@ import NotificationInbox
 import PersistenceCore
 import PersonaEngine
 import AgentConversations
+import ChatToolParsing
 
-// Blueprint: | `HarnessDecidedRow.swift` | `HarnessDecidedRow`: rolling per-requester/tool decision visibility without push; info writes stay off the tool gate's path |
+// Blueprint: | `HarnessDecidedRow.swift` | Rolling per-requester/tool decision visibility without push; checked contact lookup retains exact requester and explicit lookup failure when unavailable, while info writes stay off the tool gate's path |
 
 /// One rolling info row per requester/tool shows her decision without a push.
 /// The detail names the session; the write stays off the tool gate's path.
@@ -32,9 +33,20 @@ public enum HarnessDecidedRow {
         guard requester.hasPrefix("house.") && envelope.agent == "self"
             || (!PeerDataTaint.trustedTurn && !PeerDataTaint.ownerTrusts(requester)) else { return nil }
         let peerID = requester.hasPrefix("peer:") ? String(requester.dropFirst(5)) : envelope.verifiedUserId
-        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
-        let peer = peers.first { $0.id == peerID || $0.name.caseInsensitiveCompare(requester) == .orderedSame }
-        let displayName = peer?.name ?? (requester.hasPrefix("peer:") || requester == "a remote peer" ? "another agent" : requester)
+        let contactRead: Result<[AgentPeerContact], any Error> = Result { try AgentPeerStore(dataRoot: dataRoot).list() }
+        let peer: AgentPeerContact?
+        let displayName: String
+        let contactFailure: JSONValue?
+        switch contactRead {
+        case .success(let peers):
+            peer = peers.first { $0.id == peerID || $0.name.caseInsensitiveCompare(requester) == .orderedSame }
+            displayName = peer?.name ?? requester
+            contactFailure = nil
+        case .failure(let error):
+            peer = nil
+            displayName = requester
+            contactFailure = ChatToolOutcome.failure(error: error)
+        }
         let key = "harness_decided.\(requester).\(tool)"
         let title = "\(PersonaCompiler.agentDisplayName(dataRoot: dataRoot)) \(ran ? "ran" : "allowed"): \(displayName) → \(tool)"
         let id = key + "." + UUID().uuidString.prefix(8).lowercased()
@@ -47,7 +59,9 @@ public enum HarnessDecidedRow {
             "summary": .string(""),
             "detail": .string(sessionID ?? ""),
             "principal": .object(["peerID": peer.map { .string($0.id) } ?? peerID.map(JSONValue.string) ?? .null,
-                                   "displayName": .string(displayName)]),
+                                   "displayName": .string(displayName),
+                                   "contact_lookup": .string(contactFailure == nil ? "read" : "unavailable"),
+                                   "contact_failure": contactFailure ?? .null]),
             "actions": .array([]),
             "status": .string("unread"),
         ])

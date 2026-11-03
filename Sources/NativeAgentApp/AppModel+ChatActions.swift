@@ -118,13 +118,9 @@ extension AppModel {
             target: message, sessionId: sessionId,
             syntheticPrefix: Self.syntheticErrorIDPrefix,
             client: macChatClient,
-            serviceTier: { NativeChatTurnOptions.current(surface: "chat").serviceTier },
             presentFailure: { [self] in setFailureStatus($0, action: "try that again") },
             didComplete: {
-                NotificationCenter.default.post(
-                    name: .chatTurnCompleted, object: sessionId,
-                    userInfo: ["messagesAlreadyRefreshed": true]
-                )
+                NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionId)
             }
         )
     }

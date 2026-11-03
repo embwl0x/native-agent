@@ -92,13 +92,13 @@ public actor SwiftNativeWorkshopRunner {
     /// Shared policy: truthy developerMode allows; absent block/enabled allows; malformed blocks deny; otherwise use enabled's truthiness.
     public static func workshopPolicyAllows(_ policy: [String: JSONValue]) -> Bool {
         if policy["developerMode"]?.isTruthy == true { return true }
-        // Read both workshopPolicy and the persisted missionPolicy spelling through the shared vocabulary.
+        // Read the current workshopPolicy block shared with the phone.
         let mpRaw = WorkshopPolicyBlockVocabulary.block(policy)
         if mpRaw == nil {
-            return true   // missionPolicy absent → merged default enabled=true
+            return true   // workshopPolicy absent → merged default enabled=true
         }
         guard case .object(let mp)? = mpRaw else {
-            return false  // missionPolicy present but malformed → deny
+            return false  // workshopPolicy present but malformed → deny
         }
         guard let enabled = mp["enabled"] else {
             return true   // enabled key absent → merged default enabled=true
@@ -108,7 +108,6 @@ public actor SwiftNativeWorkshopRunner {
 
     /// Admission capacity is max-active + max-pending (defaults 3 + 32), counting queued, running and approval-blocked work.
     private static func workshopExecutionSlotsCap() throws -> Int {
-        // Persisted ..._MISSIONS environment names retain precedence over ..._EXECUTIONS through ExecutionEnvVocabulary.
         let active = WorkshopExecutorLoop.defaultMaxActive()
         let pending = max(0, Int(
             ExecutionEnvVocabulary.value(canonical: "NATIVE_AGENT_MAX_PENDING_EXECUTIONS") ?? ""

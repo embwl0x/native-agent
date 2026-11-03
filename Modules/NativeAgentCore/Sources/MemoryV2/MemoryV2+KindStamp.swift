@@ -31,6 +31,9 @@ public enum MemoryKindStamp {
         "relationship", "goal", "skill", "fact", "correction",
     ]
 
+    /// Explicit saves additionally name agreements and unclassified notes.
+    public static let commitKinds = writerKinds + ["instruction", genericCommitKind]
+
     /// The person picture and pinned core admit these person kinds, including persisted labels.
     /// Other kinds remain fully recallable outside the picture.
     public static let personKinds: Set<String> = [

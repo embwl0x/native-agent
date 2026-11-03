@@ -6,16 +6,12 @@ import NativeAgentShared
 
 /// Bounded, durable replay-filter state shared by bridge lifecycles.
 enum ICloudSeenIDDefaultsStore {
-    static func load(defaults: UserDefaults, key: String, cap: Int) -> [String] {
-        guard let stored = defaults.array(forKey: key) as? [String] else { return [] }
-        let normalized = cappedUnique(stored, cap: cap)
-        // This is the same durable replay filter the bridge restores into
-        // memory. Heal duplicate or oversized legacy bytes now so a restart
-        // cannot see a different filter from the currently running bridge.
-        if normalized != stored {
-            defaults.set(normalized, forKey: key)
+    static func load(defaults: UserDefaults, key: String, cap: Int) throws -> [String] {
+        guard let value = defaults.object(forKey: key) else { return [] }
+        guard let stored = value as? [String], stored == cappedUnique(stored, cap: cap) else {
+            throw CocoaError(.fileReadCorruptFile)
         }
-        return normalized
+        return stored
     }
 
     static func save(_ ids: [String], defaults: UserDefaults, key: String, cap: Int) {

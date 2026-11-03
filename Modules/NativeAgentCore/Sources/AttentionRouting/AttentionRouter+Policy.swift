@@ -9,43 +9,9 @@ import TelegramBot
 import DeviceSync
 import Experiences
 import Transcripts
-// Blueprint: | `AttentionRouter+Policy.swift` | `AttentionRouter` class/origin routing policy, channel switches, urgency and shared quiet-hour window |
+// Blueprint: | `AttentionRouter+Policy.swift` | Pure class/origin route selection, urgency and checked quiet-hour policy; delivery preferences settle at ledger admission |
 
 extension AttentionRouter {
-    public static func delivery(
-        importance: AttentionImportance,
-        origin: AttentionOrigin? = nil
-    ) -> AttentionDelivery {
-        allowed(policy(importance: importance, origin: origin))
-    }
-
-    /// The person's channel switches, applied to whatever the table chose.
-    ///
-    /// A channel that is switched off is NOT quietly re-routed to another one:
-    /// being told on the phone instead of Telegram is a different thing from
-    /// being told, and silently upgrading the interruption is exactly what this
-    /// router exists to prevent. Off means this way out is not used; the
-    /// durable card in the app is still written either way.
-    public static func allowed(
-        _ delivery: AttentionDelivery,
-        origin: AttentionOrigin? = nil,
-        defaults: UserDefaults = .standard
-    ) -> AttentionDelivery {
-        switch delivery {
-        case .none: return .none
-        case .phone: return NotificationChannelPreference.push(in: defaults) ? .phone : .none
-        case .telegram: return NotificationChannelPreference.telegram(in: defaults) ? .telegram : .none
-        case .conversation:
-            // Returning a follow-up to the conversation the PERSON opened is
-            // not a new way in, so it is not gated by a new switch. The one
-            // switch that already exists still means what it says: "don't knock
-            // me on Telegram" closes the Telegram route, origin or not.
-            return origin?.surface == .telegram
-                && !NotificationChannelPreference.telegram(in: defaults)
-                ? .none : .conversation
-        }
-    }
-
     /// The whole table, untouched by the switches — kept separate so the
     /// routing rule stays a pure function of importance and origin.
     public static func policy(
@@ -75,23 +41,29 @@ extension AttentionRouter {
         }
     }
 
-    /// Only adverse facts wake the device through Focus.
-    public static func wakesTheDevice(_ importance: AttentionImportance) -> Bool {
+    /// Adverse facts bypass our quiet-hours hold. Phone Focus still governs
+    /// ordinary CloudKit alert presentation.
+    public static func bypassesQuietHours(_ importance: AttentionImportance) -> Bool {
         importance == .adverse
     }
 
-    /// Non-waking classes wait through quiet hours; accepted destinations clear on release.
+    /// Other classes wait through quiet hours; accepted destinations clear on release.
     public static func honorsQuietHours(_ importance: AttentionImportance) -> Bool {
-        !wakesTheDevice(importance)
+        !bypassesQuietHours(importance)
     }
 
-    /// The declared TurnQuietHoursWindow is shared with the turn clock; absent means no hold.
+    /// Confirmed absence releases delivery; unavailable preferences keep it held with repair owed.
     public static func inQuietHours(
         at date: Date,
         dataRoot: URL,
         calendar: Calendar = .current
     ) -> Bool {
-        guard let window = TurnQuietHoursWindow.read(dataRoot: dataRoot) else { return false }
-        return window.contains(hour: calendar.component(.hour, from: date))
+        do {
+            guard let window = try TurnQuietHoursWindow.checkedRead(dataRoot: dataRoot) else { return false }
+            return window.contains(hour: calendar.component(.hour, from: date))
+        } catch {
+            // checkedRead records the owner failure; no interruption is admitted on unknown preferences.
+            return true
+        }
     }
 }

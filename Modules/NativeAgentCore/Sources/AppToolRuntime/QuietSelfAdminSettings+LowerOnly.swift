@@ -3,6 +3,7 @@ import ChatToolRuntime
 import Cognition
 import Foundation
 import MacIntegration
+import MacControl
 import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
@@ -15,9 +16,10 @@ extension QuietProviderAccount {
         self.init(id: providerID, authState: authState, eligible: eligible, models: models.map {
             QuietProviderModel(
                 id: $0.id,
-                defaultEffort: $0.default_reasoning_effort ?? "high",
-                efforts: $0.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"],
-                supportsFast: $0.supports_fast == true)
+                defaultEffort: $0.default_reasoning_effort ?? "",
+                efforts: $0.supported_reasoning_efforts ?? [],
+                supportsFast: $0.supports_fast == true,
+                reasoningCapabilitiesKnown: $0.supported_reasoning_efforts != nil)
         })
     }
 }
@@ -35,8 +37,8 @@ extension QuietCognitionLane {
 
 @MainActor public protocol QuietLowerOnlySettingsHost: QuietSettingsHost {
     var statusForAgent: String { get }
-    var activityCaptureEnabled: Bool { get }
-    var activityModelAccessEnabled: Bool { get }
+    var activityCaptureEnabled: Bool { get async throws }
+    var activityModelAccessEnabled: Bool { get async throws }
     var restartQuietTelegram: @Sendable () async -> Void { get }
     var restartQuietSlack: @Sendable () async -> Void { get }
     func saveChromeControlEnabled(_ enabled: Bool) async
@@ -45,7 +47,7 @@ extension QuietCognitionLane {
     func setActivityModelAccessEnabled(_ enabled: Bool) async
     func configureQuietTelegram(chats: [String], users: [String], mention: Bool, enabled: Bool) async throws
     func refreshQuietTelegram() async
-    func slackIsEnabled() async -> Bool
+    func slackIsEnabled() async throws -> Bool
     func slackIngressPolicy(dataRoot: URL) throws -> (allowedChannelIds: Set<String>, allowedUserIds: Set<String>, requireMention: Bool)
     func afterCurrentSlackHandling(_ operation: @escaping @Sendable () async -> Void) async -> Bool
     func saveSlackIngress(channels: Set<String>, users: Set<String>, mention: Bool, dataRoot: URL) async -> (ok: Bool, error: String?)
@@ -55,6 +57,7 @@ extension QuietCognitionLane {
 /// Lower-only rows use their page's setters and Core's `lowerOnly` / `narrowOnly` direction rules.
 extension QuietLowerOnlySettingsHost {
     public var lowerOnlyRows: [QuietSetting] {
+        get throws {
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         var rows: [QuietSetting] = []
 
@@ -63,14 +66,17 @@ extension QuietLowerOnlySettingsHost {
             id: "trust.chrome_control", page: "trust", label: "Chrome control",
             whereUserDoesIt: "Trust → Mac → Chrome control",
             note: "Full Mac allows Chrome whatever this says; there, lowering trust.preset is what stops it.",
-            read: { _ in self.trustPolicy?.chromeControlPolicy?.enabled ?? false },
+            read: { _ in
+                guard let policy = self.trustPolicy else { throw QuietSettingError.unavailable("Trust policy is unavailable. Read Trust and repair its saved policy before changing Chrome control.") }
+                return policy.chromeControlPolicy?.enabled ?? false
+            },
             write: { _, enabled in await self.saveChromeControlEnabled(enabled) }
         ).onTab("mac"))
         rows.append(QuietSettings.lowerOnly(
             id: "trust.pause_everything", page: "trust", label: "Pause everything", safe: true,
             whereUserDoesIt: "Trust → Access → Security → Pause everything",
             note: "On, every action stops until the owner lifts it.",
-            read: { _ in (try? await SwiftNativeSecurityCenter().status(limit: 1))?.killSwitchEnabled ?? false },
+            read: { _ in try await SwiftNativeSecurityCenter(dataRoot: root).status(limit: 1).killSwitchEnabled },
             write: { _, enabled in
                 guard await self.saveKillSwitchEnabled(enabled) else {
                     throw QuietSettingError.unavailable(
@@ -82,7 +88,7 @@ extension QuietLowerOnlySettingsHost {
             id: "trust.activity_capture", page: "trust", label: "Activity capture",
             whereUserDoesIt: "Trust → Features → Activity capture",
             note: "Off stops recording which app and window are in front. What was recorded stays.",
-            read: { _ in self.activityCaptureEnabled },
+            read: { _ in try await self.activityCaptureEnabled },
             write: { _, enabled in await self.setActivityCaptureEnabled(enabled) }
         ).onTab("features"))
         rows.append(QuietSettings.lowerOnly(
@@ -91,7 +97,8 @@ extension QuietLowerOnlySettingsHost {
             note: "Full Mac allows trusted activity queries even when the saved switch is off. Lower trust.preset to stop that override.",
             read: { _ in
                 let fullMac = (await AppToolExecutor.freshQuietPosture(dataRoot: root))?.name == AppToolExecutor.fullMacModeName
-                return self.activityModelAccessEnabled || fullMac
+                let modelAccess = try await self.activityModelAccessEnabled
+                return modelAccess || fullMac
             },
             write: { _, enabled in
                 if !enabled,
@@ -103,12 +110,17 @@ extension QuietLowerOnlySettingsHost {
             }
         ).onTab("features"))
         let peers = AgentPeerStore(dataRoot: root)
-        for peer in (try? peers.list()) ?? [] {
+        for peer in try peers.list() {
             rows.append(QuietSettings.lowerOnly(
                 id: "trust.agent_elevation_\(peer.id)", page: "trust",
                 label: "\(peer.name) may use your permissions",
                 whereUserDoesIt: "Trust → Access → Connected agents → \(peer.name)",
-                read: { _ in (try? peers.list())?.first { $0.id == peer.id }?.elevationAllowed ?? false },
+                read: { _ in
+                    guard let current = try peers.list().first(where: { $0.id == peer.id }) else {
+                        throw QuietSettingError.unavailable("\(peer.name) is no longer in the checked contact list. Read connected agents again.")
+                    }
+                    return current.elevationAllowed ?? false
+                },
                 write: { _, allowed in
                     guard try peers.setElevation(peerID: peer.id, allowed: allowed) != nil else {
                         throw QuietSettingError.unavailable(
@@ -119,16 +131,17 @@ extension QuietLowerOnlySettingsHost {
         }
 
         // ── Mac Integration: off, read, write or both, per app ─────────────
-        let store = MacIntegrationPermissionStore.shared
+        let store = MacIntegrationPermissionStore(dataRoot: root)
         for integration in MacIntegrationID.all {
             let name = MacIntegrationID.displayName(for: integration)
             let axes = (MacIntegrationID.supportsRead(integration) ? ["read"] : [])
                 + (MacIntegrationID.supportsWrite(integration) ? ["write"] : [])
             let choices = ["off"] + axes + (axes.count == 2 ? ["read_write"] : [])
-            let current: @MainActor @Sendable () async -> Set<String> = {
+            let current: @MainActor @Sendable () async throws -> Set<String> = {
+                let snapshot = try await store.snapshotChecked()
                 var on = Set<String>()
-                if await store.allows(integration, mode: .read) { on.insert("read") }
-                if await store.allows(integration, mode: .write) { on.insert("write") }
+                if snapshot.allows(integration, mode: .read) { on.insert("read") }
+                if snapshot.allows(integration, mode: .write) { on.insert("write") }
                 return on
             }
             // The axes a value asks for, or nil when it is not one of choices.
@@ -151,7 +164,7 @@ extension QuietLowerOnlySettingsHost {
                 note: "You may take access away; giving any back is the owner's below Full Mac. Under Full Mac an app left "
                     + "untouched is allowed anyway; setting it here records an off that Full Mac respects.",
                 read: { _ in
-                    let on = await current()
+                    let on = try await current()
                     return .string(on.isEmpty ? "off" : on.count == 2 ? "read_write" : on.first!)
                 },
                 write: { _, value in
@@ -182,22 +195,23 @@ extension QuietLowerOnlySettingsHost {
                     guard let want = wants(value) else {
                         return .badValue("\(name) access takes one of: \(choices.joined(separator: ", ")).")
                     }
-                    return users(want, await current())
+                    do { return users(want, try await current()) }
+                    catch { return .unavailable(error.localizedDescription) }
                 }
             ))
         }
 
         // ── Telegram: saved through the page's own save, one field changed ─
-        let telegram: @Sendable () -> TelegramBot.TelegramConfig? = {
-            TelegramBot.TelegramConfig.loadFromDisk(dataRoot: root)
+        let telegram: @Sendable () throws -> TelegramBot.TelegramConfig = {
+            guard let saved = try TelegramBot.TelegramConfig.loadSavedConfiguration(dataRoot: root, resolveCredential: false) else {
+                throw QuietSettingError.unavailable("Telegram has no saved settings. Open Connectors → Telegram and save its configuration before reading or changing these controls.")
+            }
+            return saved
         }
         let saveTelegram: @MainActor @Sendable (
             _ change: (inout Bool, inout Bool, inout [String], inout [String]) -> Void
         ) async throws -> Void = { change in
-            guard let saved = telegram() else {
-                throw QuietSettingError.unavailable(
-                    "Telegram has no readable saved settings, so nothing was changed. Read app {page:\"telegram\"}.")
-            }
+            let saved = try telegram()
             var enabled = saved.enabled, mention = saved.requireMention
             var chats = saved.allowedChatIds.sorted().map(String.init)
             var users = saved.allowedUserIds.sorted().map(String.init)
@@ -233,38 +247,38 @@ extension QuietLowerOnlySettingsHost {
             id: "telegram.enabled", page: "telegram", label: "Telegram is on",
             whereUserDoesIt: "Connectors → Telegram → Telegram is on, then Save",
             note: "Off stops the bot answering; the token stays saved.",
-            read: { _ in telegram()?.enabled ?? false },
+            read: { _ in try telegram().enabled },
             write: { _, on in try await saveTelegram { enabled, _, _, _ in enabled = on } }
         ))
         rows.append(QuietSettings.lowerOnly(
             id: "telegram.require_mention", page: "telegram", label: "Only answer when mentioned in a group",
             safe: true, whereUserDoesIt: "Connectors → Telegram, then Save",
-            read: { _ in telegram()?.requireMention ?? false },
+            read: { _ in try telegram().requireMention },
             write: { _, on in try await saveTelegram { _, mention, _, _ in mention = on } }
         ))
         rows.append(QuietSettings.narrowOnly(
             id: "telegram.allowed_chat_ids", page: "telegram", label: "Allowed chat IDs",
             whereUserDoesIt: "Connectors → Telegram → Allowed chat IDs, then Save",
             note: "With both lists empty nobody reaches the bot.",
-            read: { _ in telegram()?.allowedChatIds.sorted().map(String.init) ?? [] },
+            read: { _ in try telegram().allowedChatIds.sorted().map(String.init) },
             write: { _, ids in try await saveTelegram { _, _, chats, _ in chats = ids } }
         ))
         rows.append(QuietSettings.narrowOnly(
             id: "telegram.allowed_user_ids", page: "telegram", label: "Allowed user IDs",
             whereUserDoesIt: "Connectors → Telegram → Allowed user IDs, then Save",
             note: "With both lists empty nobody reaches the bot.",
-            read: { _ in telegram()?.allowedUserIds.sorted().map(String.init) ?? [] },
+            read: { _ in try telegram().allowedUserIds.sorted().map(String.init) },
             write: { _, ids in try await saveTelegram { _, _, _, users in users = ids } }
         ))
 
         // ── Slack: the connector wizard's save, with the saved tokens ─────
-        // A write reads the saved policy and refuses when it is unreadable; a
-        // read of an unreadable policy shows the fail-closed state (nobody, @mention on).
+        // Reads and writes share the checked policy; an unavailable policy
+        // never appears as an empty saved allowlist.
         let slack = { try self.slackIngressPolicy(dataRoot: root) }
         let saveSlack: @MainActor @Sendable (Set<String>, Set<String>, Bool) async throws -> Void = { channels, users, mention in
             // The wizard's save also marks Slack on, so it may only run while
             // Slack is on already.
-            guard await self.slackIsEnabled() else {
+            guard try await self.slackIsEnabled() else {
                 throw QuietSettingError.unavailable(
                     "Slack is off, so it reaches nobody and there is nothing to narrow. Turning it on is the owner's.")
             }
@@ -286,7 +300,7 @@ extension QuietLowerOnlySettingsHost {
         rows.append(QuietSettings.lowerOnly(
             id: "slack.require_mention", page: "connectors", label: "Slack: require an @mention in channels",
             safe: true, whereUserDoesIt: "Connectors → Slack → Who can message your agent",
-            read: { _ in (try? slack())?.requireMention ?? true },
+            read: { _ in try slack().requireMention },
             write: { _, on in
                 let policy = try slack()
                 try await saveSlack(policy.allowedChannelIds, policy.allowedUserIds, on)
@@ -295,7 +309,7 @@ extension QuietLowerOnlySettingsHost {
         rows.append(QuietSettings.narrowOnly(
             id: "slack.allowed_channel_ids", page: "connectors", label: "Slack allowed channel IDs",
             whereUserDoesIt: "Connectors → Slack → Who can message your agent",
-            read: { _ in (try? slack())?.allowedChannelIds.sorted() ?? [] },
+            read: { _ in try slack().allowedChannelIds.sorted() },
             write: { _, ids in
                 let policy = try slack()
                 try await saveSlack(Set(ids), policy.allowedUserIds, policy.requireMention)
@@ -304,12 +318,13 @@ extension QuietLowerOnlySettingsHost {
         rows.append(QuietSettings.narrowOnly(
             id: "slack.allowed_user_ids", page: "connectors", label: "Slack allowed user IDs",
             whereUserDoesIt: "Connectors → Slack → Who can message your agent",
-            read: { _ in (try? slack())?.allowedUserIds.sorted() ?? [] },
+            read: { _ in try slack().allowedUserIds.sorted() },
             write: { _, ids in
                 let policy = try slack()
                 try await saveSlack(policy.allowedChannelIds, Set(ids), policy.requireMention)
             }
         ))
         return rows
+        }
     }
 }

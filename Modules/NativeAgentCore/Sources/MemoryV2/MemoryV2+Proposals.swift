@@ -18,6 +18,15 @@ extension SwiftNativeMemoryV2 {
         // Caller metadata is subordinate to typed fields when staging a new proposal.
         extraMetadata: [String: JSONValue] = [:]
     ) async throws -> ProposalRecord {
+        guard ["confidence", "recurrence_count", "supporting_session_ids"].allSatisfy({ extraMetadata[$0] == nil }) else {
+            throw MemoryV2Error.underlying("proposal confidence, recurrence and supporting sessions must use the typed arguments")
+        }
+        if let confidence, !confidence.isFinite || !(0...1).contains(confidence) {
+            throw MemoryV2Error.underlying("proposal confidence must be a finite number in 0...1")
+        }
+        if let recurrenceCount, recurrenceCount <= 0 {
+            throw MemoryV2Error.underlying("proposal recurrence_count must be a positive integer")
+        }
         let content = MemoryTextClip.memoryDisplayText(content, kind: kind)
         guard !content.isEmpty else { throw MemoryV2Error.invalidQuery }
         if let reason = MemoryCandidateQuality.rejectionReason(text: content, source: source, kind: kind) {
@@ -35,6 +44,9 @@ extension SwiftNativeMemoryV2 {
         }
         // Merge sessions, recurrence and maximum confidence under the pending-proposal write lock.
         let mergedMetadata: @Sendable (StoredProposal) throws -> JSONValue? = { existing in
+            if let error = MemoryProposalEvidence(metadata: existing.metadata).error {
+                throw MemoryV2Error.underlying("stage proposal: saved evidence is malformed: \(error)")
+            }
             var merged: [String: JSONValue]
             if case .object(let m)? = existing.metadata { merged = m } else { merged = [:] }
             // Corrections merge only for the same subject and a nonolder originating turn.
@@ -59,50 +71,29 @@ extension SwiftNativeMemoryV2 {
             if !sessionSet.isEmpty {
                 merged["supporting_session_ids"] = .array(sessionSet.sorted().prefix(32).map(JSONValue.string))
             }
-            func intMeta(_ object: [String: JSONValue], _ key: String) throws -> Int64? {
-                switch object[key] {
-                case .int(let i)?: return i
-                case .double(let d)?:
-                    guard let count = Int64(exactly: d.rounded(.towardZero)) else {
-                        throw MemoryStorageError.databaseUnavailable("stage proposal: recurrence_count is outside Int64 range")
-                    }
-                    return count
-                case .string(let s)?:
-                    // Malformed saved evidence is not absence.
-                    guard let count = Int64(s.trimmingCharacters(in: .whitespaces)) else {
-                        nativeLog("MemoryV2: refusing proposal merge with invalid recurrence_count; saved evidence retained")
-                        throw MemoryStorageError.databaseUnavailable("stage proposal: recurrence_count is not a valid Int64")
-                    }
-                    return count
-                case nil: return nil
-                default:
-                    nativeLog("MemoryV2: refusing proposal merge with invalid recurrence_count type; saved evidence retained")
-                    throw MemoryStorageError.databaseUnavailable("stage proposal: recurrence_count has an invalid type")
+            // A merge cannot recover an unrecorded observation count.
+            if let prior = try MemoryProposalEvidence.recurrence(in: merged), let recurrenceCount {
+                let (next, overflow) = prior.addingReportingOverflow(recurrenceCount)
+                guard !overflow else {
+                    throw MemoryV2Error.underlying("stage proposal: recurrence_count overflow")
                 }
+                merged["recurrence_count"] = .int(Int64(next))
+            } else {
+                merged.removeValue(forKey: "recurrence_count")
             }
-            // Reject counter overflow before staging writes.
-            let priorRecurrence = try intMeta(merged, "recurrence_count") ?? 1
-            let incomingRecurrence = Int64(max(1, recurrenceCount ?? 1))
-            let (nextRecurrence, overflow) = priorRecurrence.addingReportingOverflow(incomingRecurrence)
-            guard !overflow else {
-                throw MemoryStorageError.databaseUnavailable("stage proposal: recurrence_count overflow")
-            }
-            merged["recurrence_count"] = .int(nextRecurrence)
             if let confidence {
-                let prior: Double? = {
-                    switch merged["confidence"] {
-                    case .double(let d)?: return d
-                    case .int(let i)?: return Double(i)
-                    default: return nil
+                if let recorded = merged["confidence"] {
+                    guard let prior = recorded.numberValue(coercingStrings: false, finiteOnly: true),
+                          (0...1).contains(prior) else {
+                        throw MemoryV2Error.underlying("stage proposal: saved confidence is malformed")
                     }
-                }()
-                merged["confidence"] = .double(max(confidence, prior ?? 0))
+                    merged["confidence"] = .double(max(confidence, prior))
+                } else { merged["confidence"] = .double(confidence) }
             }
             if merged["kind"] == nil, let kind, !kind.isEmpty {
                 merged["kind"] = .string(kind)
             }
-            // A re-staged moment refreshes its lane fields on the surviving
-            // row: the newest telling is the one she will read.
+            // Refresh descriptive fields; typed evidence above owns its keys.
             for (key, value) in extraMetadata where key != "kind" && key != "sense_versions" {
                 merged[key] = value
             }
@@ -115,7 +106,7 @@ extension SwiftNativeMemoryV2 {
             meta["supporting_session_ids"] = .array(sessions.map(JSONValue.string))
         }
         if let recurrenceCount {
-            meta["recurrence_count"] = .int(Int64(max(1, recurrenceCount)))
+            meta["recurrence_count"] = .int(Int64(recurrenceCount))
         }
         var proposal = StoredProposal(
             id: UUID().uuidString,
@@ -154,6 +145,7 @@ extension SwiftNativeMemoryV2 {
         guard let proposal = try await storage.getProposal(id: id) else {
             throw MemoryV2Error.recordNotFound
         }
+        _ = try MemoryProposalEvidence.confidence(in: proposal.metadata)
         if let reason = MemoryCandidateQuality.rejectionReason(
             text: proposal.content,
             source: proposal.source,

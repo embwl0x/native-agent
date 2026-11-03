@@ -13,7 +13,7 @@ import TurnTrace
 import Transcripts
 import ProviderRouting
 import Context
-// Blueprint: | `ChatOrchestration+ToolDispatch.swift` | Shared per-iteration tool dispatch and refusal of unoffered folded calls; retains the actual tool body inside its deadline scope, cancels the effect and joins its settlement before closing the dispatch checkpoint |
+// Blueprint: | `ChatOrchestration+ToolDispatch.swift` | Shared offered-descriptor admission and per-iteration dispatch; a response deadline ends only the wait; the original tool retains actual outcome/checkpoint settlement and emits tool.dispatch.settled with its invocation ID; Stop requests cancellation without inventing effect evidence |
 
 extension SwiftNativeTurnEngine {
     // MARK: - Per-iteration dispatch shared by both loops
@@ -23,6 +23,7 @@ extension SwiftNativeTurnEngine {
     /// Sendable `tools` / `progress` references) — never the conversation
     /// array or any actor state.
     struct PreparedToolCall: Sendable {
+        let invocationID = UUID().uuidString
         let pairedId: String
         /// The spelling the model called, handed to the chain as-is so its
         /// canonicalizer resolves the same tool she named.
@@ -83,13 +84,11 @@ extension SwiftNativeTurnEngine {
                     dispatchInput: input,
                     ranCall: ToolNameAliases.ranCall(internalName, input: input)
                 )
-                // A folded, merged or retired tool is app's now: called by
-                // name where this request never declared it, it runs nothing
-                // (`notOfferedToolResult`). The door's own re-entry (home runs
-                // as `workspace`) never passes here, so it still runs.
-                let folded = ToolNameAliases.isAppDoorName(internalName)
-                    && providerTools.providerName(forInternalName: internalName) == nil
-                return (prepared, call.undeclaredKeys.isEmpty && !folded, call.input, call.undeclaredKeys)
+                // Every model call requires an offered descriptor. Internal app re-entry
+                // has its own checked gate and never passes through this provider layer.
+                let refusal = Self.modelCallRefusal(name: internalName, input: call.input,
+                    undeclaredKeys: call.undeclaredKeys, providerTools: providerTools)
+                return (prepared, refusal == nil, call.input, call.undeclaredKeys)
             }
         // One execution claim per effect: a call this turn put on an approval
         // card is that card's to run while it is undecided; after the decision
@@ -164,10 +163,13 @@ extension SwiftNativeTurnEngine {
             progress: progress,
             cancelFlagPath: cancelFlagPath,
             onToolUse: { p in
-                await progress?(.toolUse(name: p.internalName, input: .object(p.dispatchInput)))
+                await ToolReceipt.$currentInvocationID.withValue(p.invocationID) {
+                    await progress?(.toolUse(name: p.internalName, input: .object(p.dispatchInput)))
+                }
             },
             onOutcome: { p, result in
                 await ToolReceipt.$dispatched.withValue(ToolReceipt(
+                    invocationID: p.invocationID,
                     toolName: p.internalName,
                     input: ChatSecretRedactor.redactValue(.object(p.dispatchInput)),
                     ranCall: p.ranCall,
@@ -204,7 +206,7 @@ extension SwiftNativeTurnEngine {
                 images.append(contentsOf: slot.images)
                 out = await Self.makeSlotOutputs(
                     prepared: slot.prepared,
-                    result: Self.webReadRecovery(slot.result, prepared: slot.prepared, history: priorDispatches + records),
+                    result: slot.result,
                     isError: slot.isError,
                     sessionId: sessionId,
                     neutralizingText: neutralizingTextResults,
@@ -282,6 +284,19 @@ extension SwiftNativeTurnEngine {
         if let turn = TurnTraceContext.turnId { args["turn_id"] = .string(turn) }
         return .object(["tool": .string("app"), "input": .object([
             "action": .string("trace.recent"), "args": .object(args)])])
+    }
+
+    /// Resident and helper model calls enter the same offered-descriptor
+    /// admission before any canonical dispatcher or policy gate can run them.
+    nonisolated static func modelCallRefusal(
+        name: String, input: [String: JSONValue], undeclaredKeys: [String] = [],
+        providerTools: ProviderToolNameMap
+    ) -> JSONValue? {
+        if !undeclaredKeys.isEmpty { return undeclaredFieldsResult(name, keys: undeclaredKeys) }
+        guard providerTools.providerName(forInternalName: name) != nil else {
+            return notOfferedToolResult(name, input: input)
+        }
+        return nil
     }
 
     /// The refusal a declared-but-not-offered `tool_use` gets back. Shaped
@@ -502,35 +517,6 @@ extension SwiftNativeTurnEngine {
         return slots
     }
 
-    nonisolated private static func webReadRecovery(
-        _ result: JSONValue, prepared: PreparedToolCall, history: [TurnEngineResult.ToolDispatchRecord]
-    ) -> JSONValue {
-        guard prepared.ranCall.tool == "read_page",
-              case .object(var failure) = result, failure["status"] == .string("failed"),
-              [.int(402), .int(403)].contains(failure["http_status"] ?? .null),
-              case .string(let url)? = failure["url"] else { return result }
-        for call in history.reversed() where call.ranCall.tool == "web_search" {
-            guard case .object(let envelope) = call.result, envelope["status"] == .string("ok"),
-                  case .object(let search)? = envelope["result"], case .array(let rows)? = search["results"] else { continue }
-            let urls = rows.compactMap { row -> String? in
-                guard case .object(let fields) = row, case .string(let value)? = fields["url"] else { return nil }
-                return value
-            }
-            guard let index = urls.firstIndex(of: url), let next = urls.dropFirst(index + 1).first(where: {
-                guard let parsed = URL(string: $0) else { return false }
-                return ["http", "https"].contains(parsed.scheme?.lowercased() ?? "") && parsed.host != nil && $0 != url
-            }) else { continue }
-            let nextCall: JSONValue = .object(["tool": .string("app"), "input": .object([
-                "action": .string("web.read"), "args": .object(["url": .string(next)])])])
-            failure["next_call"] = nextCall
-            failure["remedy"] = .object(["kind": .string("read_next_search_result"),
-                "instruction": .string("This source refused the public read. Read the next search result URL with next_call."),
-                "next_call": nextCall])
-            return .object(failure)
-        }
-        return result
-    }
-
     /// Pure slot finalization redacts tool results before provider delivery without mutable cross-task captures.
     nonisolated static func makeSlotOutputs(
         prepared: PreparedToolCall,
@@ -543,15 +529,10 @@ extension SwiftNativeTurnEngine {
         // A next call named by a folded tool reaches her as its app call,
         // whichever tool's result names it (work_context's desk_read), when
         // this request offers app.
-        let result = appDoor ? ToolNameAliases.appCallPointers(result) : result
-        let record = TurnEngineResult.ToolDispatchRecord(
-            id: prepared.pairedId,
-            name: prepared.internalName,
-            input: prepared.dispatchInput,
-            ranCall: prepared.ranCall,
-            result: result
-        )
-        let resultStr: String = {
+        var result = appDoor ? ToolNameAliases.appCallPointers(result) : result
+        let resultStr: String
+        do {
+            resultStr = try {
             // Persist the complete card above; the model only needs the skip.
             if let card = InlineInteractionNeed.interaction(in: result),
                !InlineInteractionNeed.blocksTurn(card),
@@ -560,8 +541,20 @@ extension SwiftNativeTurnEngine {
                 return neutralizingText ? UntrustedText.neutralized(detail) : detail
             }
             if case .string(let s) = result { return neutralizingText ? UntrustedText.neutralized(s) : s }
-            return (try? result.serialize(pretty: false)) ?? "null"
-        }()
+            return try result.serialize(pretty: false)
+            }()
+        } catch {
+            let effects: ToolFailureError.Effects
+            if case .object(let body) = result, case .string(let raw)? = body["effects"], let known = ToolFailureError.Effects(rawValue: raw) { effects = known }
+            else { effects = .unknown }
+            let failure = ToolFailureError("\(prepared.internalName) returned a receipt that cannot be encoded: \(error.localizedDescription). Inspect its effect before repeating it and repair its result producer.",
+                effects: effects, owner: prepared.ranCall.tool, code: "tool_result_encoding_failed", recovery: .reconcile)
+            result = ChatToolOutcome.failure(error: failure, tool: prepared.internalName)
+            // The failure envelope contains only checked strings and the owner's effect evidence.
+            resultStr = failure.message
+        }
+        let record = TurnEngineResult.ToolDispatchRecord(id: prepared.pairedId, name: prepared.internalName,
+            input: prepared.dispatchInput, ranCall: prepared.ranCall, result: result)
         let redactedResultStr = ChatSecretRedactor.redactText(resultStr)
         let providerResultStr = await ProviderToolResultPage.project(
             toolName: prepared.ranCall.tool,
@@ -572,7 +565,7 @@ extension SwiftNativeTurnEngine {
             appDoor: appDoor
         )
         let block = LLMContentBlock.toolResult(
-            toolUseId: prepared.pairedId, content: providerResultStr, isError: isError
+            toolUseId: prepared.pairedId, content: providerResultStr, isError: isError || ChatToolOutcome.carriesFailureEvidence(result)
         )
         return (record, block)
     }
@@ -588,10 +581,104 @@ extension SwiftNativeTurnEngine {
         imageSink: LocalToolImage.Sink? = nil,
         cancelFlagPath: URL? = nil
     ) async -> (PreparedToolCall, JSONValue, Bool) {
+        if Self.dispatchCancelSignalled(cancelFlagPath) {
+            return (prepared, Self.cancelledToolResult(Self.spokenName(prepared)), true)
+        }
+        let nanos = ToolDispatchDeadline.timeoutNanos(toolName: prepared.ranCall.tool,
+            input: prepared.ranCall.input, surface: surface)
+        let seconds = Double(nanos) / 1_000_000_000
+        let outcomes = ContinuationOnce<Result<(PreparedToolCall, JSONValue, Bool), Error>>()
+        let body = TurnBodyLifetime<(PreparedToolCall, JSONValue, Bool)>()
+        // This subscription belongs to the actual body, not its response.
+        // A Stop after timeout must still reach the original work.
+        let watcher = cancelFlagPath.map { flag in
+            FileChangeWatcher(paths: [flag]) { _ in
+                if ChatCancelFlag.isRaised(flag) {
+                    body.cancel()
+                    outcomes.resume(.failure(CancellationError()))
+                }
+            }
+        }
+        // The deadline owns only the response. Its child retains the actual
+        // tool and journal until they settle, even after this waiter returns.
+        let dispatch = Task {
+            let work: @Sendable () async throws -> (PreparedToolCall, JSONValue, Bool) = {
+                do {
+                    return try await body.run {
+                        defer { watcher?.cancel() }
+                        let actual = await Self.runSettlingDispatch(prepared: prepared, modelId: modelId, surface: surface,
+                            personaID: personaID, fluidContextTurn: fluidContextTurn, tools: tools, progress: progress,
+                            imageSink: imageSink, cancelFlagPath: cancelFlagPath)
+                        TurnTraceBus.fireFromContext(kind: "tool.dispatch.settled", surface: surface, payload: .object([
+                            "invocationID": .string(prepared.invocationID), "callID": .string(prepared.pairedId),
+                            "tool": .string(actual.0.ranCall.tool),
+                            "receipt": ChatSecretRedactor.redactValue(actual.1),
+                        ]))
+                        return actual
+                    }
+                } catch {
+                    watcher?.cancel()
+                    throw error
+                }
+            }
+            do {
+                let actual: (PreparedToolCall, JSONValue, Bool)
+                if nanos > 0 {
+                    actual = try await TurnDeadline.withThrowingDeadline(seconds: seconds, cancelWorkOnExpiry: false, work)
+                } else { actual = try await work() }
+                outcomes.resume(.success(actual))
+            } catch is TurnDeadline.DeadlineExceeded {
+                outcomes.resume(.failure(ToolDispatchDeadline.timeoutError(tool: Self.spokenName(prepared), seconds: seconds)))
+            } catch { outcomes.resume(.failure(error)) }
+        }
+        if Self.dispatchCancelSignalled(cancelFlagPath) {
+            body.cancel()
+            outcomes.resume(.failure(CancellationError())) { dispatch.cancel() }
+        }
+        let result = await withTaskCancellationHandler {
+            await outcomes.wait()
+        } onCancel: {
+            body.cancel()
+            outcomes.resume(.failure(CancellationError())) { dispatch.cancel() }
+        }
+        switch result {
+        case .success(let actual): return actual
+        case .failure(let error) where error is CancellationError:
+            return (prepared, Self.interruptedToolResult(Self.spokenName(prepared)), true)
+        case .failure(let error):
+            var result = ChatToolOutcome.failure(error: error, tool: prepared.internalName)
+            if case .object(var fields) = result {
+                fields["invocationID"] = .string(prepared.invocationID)
+                fields["callID"] = .string(prepared.pairedId)
+                result = .object(fields)
+            }
+            return (prepared, result, true)
+        }
+    }
+
+    /// Only the actual body closes its checkpoint. A caller timeout never
+    /// supplies a fabricated terminal receipt to this owner.
+    nonisolated private static func runSettlingDispatch(
+        prepared: PreparedToolCall,
+        modelId: String,
+        surface: String,
+        personaID: String? = nil,
+        fluidContextTurn: ContextPreparedTurn? = nil,
+        tools: any ToolDispatchClient,
+        progress: TurnEventSink?,
+        imageSink: LocalToolImage.Sink? = nil,
+        cancelFlagPath: URL? = nil
+    ) async -> (PreparedToolCall, JSONValue, Bool) {
         var prepared = prepared
         prepared.ranCall = ToolNameAliases.ranCall(prepared.internalName, input: prepared.dispatchInput)
         let journal = DeskContinuationScope.current
-        var step = Self.checkpointStep(prepared)
+        var step: DeskContinuation.Step
+        do { step = try Self.checkpointStep(prepared) }
+        catch {
+            return (prepared, ChatToolOutcome.failure(error: ToolFailureError(
+                "The action's input cannot be encoded for its continuation: \(error.localizedDescription). Correct its producing call before execution.", effects: .none,
+                owner: prepared.ranCall.tool, code: "tool_input_encoding_failed", recovery: .repair), tool: prepared.internalName), true)
+        }
         do {
             step = try await journal?.begin(step, peerSources: PeerDataTaint.current?.checkpointSources ?? []) ?? step
         } catch {
@@ -623,13 +710,19 @@ extension SwiftNativeTurnEngine {
             || (owner == nil && !ChatToolOutcome.isWaitingOnPerson(outcome.0)
                 && !DeskContinuation.receiptIsUnresolved(outcome.0)
                 && ![.running, .timedOut, .effectUnconfirmed].contains(MacControlReceiptOutcome.projecting(envelope: outcome.0)))
-        let json = (try? outcome.0.serialize(pretty: false)) ?? ""
         do {
-            try await journal.settle(step,
-                result: String(SwiftNativeChatOrchestrationClient.redactedPersistedToolResult(
-                    tool: ran, json: json).prefix(512)),
-                settled: settled, owner: owner, ownerID: text("id"), requestID: text("requestId"),
-                peerSources: PeerDataTaint.current?.checkpointSources ?? [])
+            let json = try outcome.0.serialize(pretty: false)
+            let savedResult = String(SwiftNativeChatOrchestrationClient.redactedPersistedToolResult(tool: ran, json: json).prefix(512))
+            let savedStep = step, ownerID = text("id"), requestID = text("requestId")
+            let peerSources = PeerDataTaint.current?.checkpointSources ?? []
+            let saved = await settle { () -> Result<Void, Error> in
+                do {
+                    try await journal.settle(savedStep, result: savedResult, settled: settled,
+                        owner: owner, ownerID: ownerID, requestID: requestID, peerSources: peerSources)
+                    return .success(())
+                } catch { return .failure(error) }
+            }
+            try saved.get()
         } catch {
             return (prepared, .object(["status": .string("failed"),
                 "effects": object["effects"] ?? .string(ChatToolOutcome.neverRan(outcome.0) ? "none" : "unknown"),
@@ -646,8 +739,8 @@ extension SwiftNativeTurnEngine {
     /// keeps, bounded, plus only the reference a domain verifier needs: a
     /// whole-file write is checked by path and content digest, never content.
     /// `effect` digests the exact call, so a re-proposed one is the same step.
-    nonisolated private static func checkpointStep(_ prepared: PreparedToolCall) -> DeskContinuation.Step {
-        let json = (try? JSONValue.object(prepared.dispatchInput).serialize(pretty: false)) ?? ""
+    nonisolated private static func checkpointStep(_ prepared: PreparedToolCall) throws -> DeskContinuation.Step {
+        let json = try JSONValue.object(prepared.dispatchInput).serialize(pretty: false)
         let input = String(SwiftNativeChatOrchestrationClient.redactedPersistedToolInput(
             tool: prepared.internalName, json: json).prefix(512))
         // app files.write is write_file: its verifier checks the file it wrote.
@@ -660,7 +753,7 @@ extension SwiftNativeTurnEngine {
             reference = ["path": .string(path), "bytes": .int(Int64(content.utf8.count)),
                          "sha256": .string(SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined())]
         }
-        let exact = (try? JSONValue.object(ranInput).serialize(pretty: false)) ?? json
+        let exact = try JSONValue.object(ranInput).serialize(pretty: false)
         return DeskContinuation.Step(id: UUID().uuidString, tool: ran, input: input, reference: reference,
             effect: SHA256.hash(data: Data((ran + "\n" + exact).utf8)).map { String(format: "%02x", $0) }.joined())
     }
@@ -674,12 +767,6 @@ extension SwiftNativeTurnEngine {
         if Self.dispatchCancelSignalled(cancelFlagPath) {
             return (Self.cancelledToolResult(Self.spokenName(prepared)), true)
         }
-        // A folded app action waits as long as the tool it runs.
-        let deadlineNanos = ToolDispatchDeadline.timeoutNanos(
-            toolName: prepared.ranCall.tool,
-            input: prepared.ranCall.input,
-            surface: surface
-        )
         do {
             let result = try await LocalToolImage.$sink.withValue(imageSink) {
             try await FluidContextToolScope.$current.withValue(fluidContextTurn) {
@@ -694,72 +781,10 @@ extension SwiftNativeTurnEngine {
                 try await ToolNoticeBus.$emit.withValue({ kind, text in
                     await progress?(.notice(kind: kind, text: text))
                 }) {
-                    // The deadline chooses the terminal outcome and cancels
-                    // the effect. The dispatch still owns the real body until
-                    // its save and trace settlement finishes (docs/STOP.md).
-                    let seconds = Double(deadlineNanos) / 1_000_000_000
-                    // Keep the first terminal outcome, including Stop, even if
-                    // the tool ignores cancellation and returns a late value.
-                    let outcomes = ContinuationOnce<Result<JSONValue, Error>>()
-                    let dispatch = Task {
-                        let body = TurnBodyLifetime<Result<JSONValue, Error>>()
-                        let work: @Sendable () async -> Result<JSONValue, Error> = {
-                            do {
-                                try Task.checkCancellation()
-                                if Self.dispatchCancelSignalled(cancelFlagPath) { throw CancellationError() }
-                                return .success(try await tools.dispatch(
-                                    tool: prepared.requestedName,
-                                    input: prepared.dispatchInput,
-                                    surface: surface
-                                ))
-                            } catch {
-                                return .failure(error)
-                            }
-                        }
-                        let result: Result<JSONValue, Error>
-                        do {
-                            if deadlineNanos > 0 {
-                                result = try await TurnDeadline.withThrowingDeadline(seconds: seconds) { try await body.run(work) }
-                            } else {
-                                result = try await body.run(work)
-                            }
-                        } catch is TurnDeadline.DeadlineExceeded {
-                            if Task.isCancelled {
-                                result = .failure(CancellationError())
-                            } else {
-                                result = .failure(ToolDispatchDeadline.ToolDispatchTimedOut(
-                                    tool: Self.spokenName(prepared), seconds: seconds
-                                ))
-                            }
-                        } catch {
-                            result = .failure(error)
-                        }
-                        await body.finish()
-                        outcomes.resume(result)
-                    }
-                    let watcher = cancelFlagPath.map { flag in
-                        FileChangeWatcher(paths: [URL(fileURLWithPath: flag.path)]) { _ in
-                            if ChatCancelFlag.isRaised(flag) {
-                                outcomes.resume(.failure(CancellationError())) { dispatch.cancel() }
-                            }
-                        }
-                    }
-                    defer {
-                        watcher?.cancel()
-                        dispatch.cancel()
-                    }
-                    // Close the registration race using the run-tagged URL.
-                    if Self.dispatchCancelSignalled(cancelFlagPath) {
-                        outcomes.resume(.failure(CancellationError())) { dispatch.cancel() }
-                    }
-                    let raced = await withTaskCancellationHandler {
-                        await outcomes.wait()
-                    } onCancel: {
-                        outcomes.resume(.failure(CancellationError())) { dispatch.cancel() }
-                    }
-                    dispatch.cancel()
-                    await settle { await dispatch.value }
-                    return try raced.get()
+                    try Task.checkCancellation()
+                    if Self.dispatchCancelSignalled(cancelFlagPath) { throw CancellationError() }
+                    return try await tools.dispatch(tool: prepared.requestedName,
+                        input: prepared.dispatchInput, surface: surface)
                 }
             }
             }

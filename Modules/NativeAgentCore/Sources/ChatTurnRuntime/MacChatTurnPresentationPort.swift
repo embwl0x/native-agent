@@ -22,7 +22,6 @@ public protocol MacChatTurnPresentationPort: AnyObject, Sendable {
     func presentMacChatTurn(_ event: MacChatTurnPresentationEvent)
     func recordMacControlHandoff(text: String, reply: String, sessionId: String) async throws
     func cancelICloudChatTurnForControlHandoff(sessionId: String)
-    func refreshChatMessagesAfterTurn(sessionId: String, messagesAlreadyRefreshed: Bool) async
     func runMacChatTurnBody(
         _ text: String, attachments: [NativeAgentShared.MultimodalAttachment],
         sessionId: String, generation: Int,

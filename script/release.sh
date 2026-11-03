@@ -2,7 +2,7 @@
 # Production release script for NativeAgent.
 # Usage:
 #   ./script/release.sh               — full notarized release
-#   ./script/release.sh --dry-run     — sign only (ad-hoc fallback), skip notarization
+#   ./script/release.sh --dry-run     — sign the selected mode, skip notarization
 #   ./script/release.sh --artifact-only — accepted spelling for the release receipt path
 #   ./script/release.sh --appcast          — also generate+sign the Sparkle appcast
 #                                            locally (uploads nothing)
@@ -21,13 +21,12 @@
 #   ./script/release.sh --print-env-surface — print the values-free external
 #                                            release configuration interface.
 #
-# Public releases (NATIVEAGENT_ICLOUD_BUILD other than personal|1) build only
-# from a scrubbed export; this script creates it and re-runs there with private
-# signing inputs supplied by absolute path.
+# Public releases (NATIVEAGENT_ICLOUD_BUILD other than personal) build only
+# from reviewed public source. A private invocation prepares a source export
+# and stops; --publish-appcast requires already published public source.
 #   NATIVEAGENT_PUBLIC_EXPORT_DIR   — where to put the export (default: mktemp)
-#   NATIVEAGENT_REUSE_PUBLIC_EXPORT — 1 reuses an existing export; --dry-run only
-# For ad-hoc local proof (no Developer ID signing), explicitly set both aliases:
-#   NATIVEAGENT_DEVELOPER_ID=- NATIVE_AGENT_DEVELOPER_ID=- ./script/release.sh --dry-run
+# For ad-hoc local proof (no Developer ID signing), select it explicitly:
+#   NATIVEAGENT_SIGNING_MODE=adhoc ./script/release.sh --dry-run
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -42,6 +41,7 @@ source "$ROOT/script/lib/release_bundle_gates.sh"
 # shellcheck source=lib/release_symbols.sh
 source "$ROOT/script/lib/release_symbols.sh"
 source "$ROOT/script/lib/build_source_inventory.sh"
+source "$ROOT/script/lib/embedding_model_contract.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 DRY_RUN=false
@@ -58,15 +58,7 @@ release_prepare_embedding() { # bundle, output directory, version
   local source="${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}"
   local mode="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}"
   case "$mode" in separate-download|bundled) ;; *) echo "ERROR: embedding distribution must be separate-download or bundled" >&2; return 1 ;; esac
-  [[ -f "$source/embedding.json" && -d "$source/embedding.mlpackage" && -s "$source/vocab.txt" ]] \
-    || { echo "ERROR: supply a complete local NATIVEAGENT_EMBEDDING_MODEL_DIR; release packaging never fetches it." >&2; return 1; }
-  jq -e '.model == "embedding.mlpackage" and .vocab == "vocab.txt"
-    and .model_id == "bge-large-en-v1.5"
-    and .dimensions == 1024' \
-    "$source/embedding.json" >/dev/null || return 1
-  # Package only the runtime resources, never arbitrary extras from the source.
-  [[ -z "$(find "$source/embedding.mlpackage" -type l -print -quit)" && ! -L "$source/embedding.mlpackage" && ! -L "$source/embedding.json" && ! -L "$source/vocab.txt" ]] \
-    || { echo "ERROR: embedding resources must not be symlinks" >&2; return 1; }
+  nativeagent_require_embedding_model "$source" || return 1
   mkdir -p "$out" "$bundle/Contents/Resources"
   asset="NativeAgent-$version.embedding.zip"
   work="$(mktemp -d "$out/.embedding.XXXXXX")"
@@ -86,7 +78,7 @@ release_prepare_embedding() { # bundle, output directory, version
   mv -f "$work/$asset" "$out/$asset"
   digest="$(shasum -a 256 "$out/$asset" | awk '{print $1}')"
   bytes="$(wc -c < "$out/$asset" | tr -d '[:space:]')"
-  url="${NATIVEAGENT_DMG_DOWNLOAD_URL:-${NATIVE_AGENT_DMG_DOWNLOAD_URL:-}}"
+  url="${NATIVEAGENT_DMG_DOWNLOAD_URL:-}"
   [[ "$url" == https://*/* ]] || { rm -rf "$work"; echo "ERROR: model asset requires the release DMG HTTPS URL" >&2; return 1; }
   url="${url%/*}/$asset"
   jq -n --arg name "$asset" --arg sha256 "$digest" --argjson byte_length "$bytes" \
@@ -108,20 +100,6 @@ if [[ "${1:-}" == --prepare-embedding ]]; then
   release_prepare_embedding "$2" "$3" "$4"
   exit 0
 fi
-
-# Normalize both credential spellings before child scripts read them; conflicts fail.
-release_normalize_env_pair() { # canonical legacy
-  local canonical="$1" legacy="$2"
-  local canonical_value="${!canonical:-}" legacy_value="${!legacy:-}"
-  if [[ -n "$canonical_value" && -n "$legacy_value" && "$canonical_value" != "$legacy_value" ]]; then
-    echo "ERROR: conflicting release environment values for $canonical and $legacy." >&2
-    return 1
-  fi
-  local resolved="${legacy_value:-$canonical_value}"
-  printf -v "$canonical" '%s' "$resolved"
-  printf -v "$legacy" '%s' "$resolved"
-  export "$canonical" "$legacy"
-}
 
 # Values are intentionally never printed. This is the stable, inspectable
 # external configuration surface for automation and release preflights.
@@ -148,9 +126,10 @@ RELEASE_ENV_SURFACE=(
   NATIVEAGENT_INTERNAL_BUILD_STAMP
   NATIVEAGENT_RELEASE_ENTITLEMENTS
   NATIVEAGENT_PUBLIC_EXPORT_DIR
-  NATIVEAGENT_REUSE_PUBLIC_EXPORT
   NATIVEAGENT_PRIVACY_DENYLIST_FILE
   NATIVEAGENT_RELEASE_SYMBOL_ARCHIVE_DIR
+  NATIVEAGENT_PRODUCT
+  NATIVEAGENT_SIGNING_MODE
   NATIVEAGENT_SKIP_DMG_SIGN
   NATIVEAGENT_EMBEDDING_DISTRIBUTION
   NATIVEAGENT_EMBEDDING_MODEL_DIR
@@ -201,16 +180,11 @@ if [[ "$_expect_self_test_target" == "true" ]]; then
   exit 1
 fi
 
-release_normalize_env_pair NATIVEAGENT_DEVELOPER_ID NATIVE_AGENT_DEVELOPER_ID || exit 1
-release_normalize_env_pair NATIVEAGENT_TEAM_ID NATIVE_AGENT_TEAM_ID || exit 1
-release_normalize_env_pair NATIVEAGENT_APPLE_ID NATIVE_AGENT_APPLE_ID || exit 1
-release_normalize_env_pair NATIVEAGENT_NOTARIZATION_PASSWORD NATIVE_AGENT_NOTARIZATION_PASSWORD || exit 1
-release_normalize_env_pair NATIVEAGENT_SPARKLE_ED_PRIV_KEY NATIVE_AGENT_SPARKLE_ED_PRIV_KEY || exit 1
-release_normalize_env_pair NATIVEAGENT_SPARKLE_PUBLIC_KEY NATIVE_AGENT_SPARKLE_PUBLIC_KEY || exit 1
-release_normalize_env_pair NATIVEAGENT_PROVISIONING_PROFILE NATIVE_AGENT_PROVISIONING_PROFILE || exit 1
-release_normalize_env_pair NATIVEAGENT_APPCAST_URL NATIVE_AGENT_APPCAST_URL || exit 1
-release_normalize_env_pair NATIVEAGENT_DMG_DOWNLOAD_URL NATIVE_AGENT_DMG_DOWNLOAD_URL || exit 1
-release_normalize_env_pair NATIVEAGENT_RELEASE_PAGE_URL NATIVE_AGENT_RELEASE_PAGE_URL || exit 1
+# One current environment namespace, also passed to child owners.
+for release_var in "${RELEASE_ENV_SURFACE[@]}"; do
+  printf -v "$release_var" '%s' "${!release_var:-}"
+  export "${release_var?}"
+done
 
 if [[ "$PRINT_ENV_SURFACE" == "true" ]]; then
   release_print_env_surface
@@ -293,8 +267,7 @@ NATIVEAGENT_ICLOUD_CONTAINER_ID="${NATIVEAGENT_ICLOUD_CONTAINER_ID:-iCloud.io.gi
 NATIVEAGENT_MOBILE_SOURCE_KEY="${NATIVEAGENT_MOBILE_SOURCE_KEY:-mobile_app}"
 NATIVEAGENT_BACKGROUND_TASK_PREFIX="${NATIVEAGENT_BACKGROUND_TASK_PREFIX:-io.github.embwl0x.nativeagent}"
 NATIVEAGENT_RELEASE_PAGE_URL="${NATIVEAGENT_RELEASE_PAGE_URL:-https://github.com/embwl0x/native-agent/releases}"
-NATIVE_AGENT_RELEASE_PAGE_URL="$NATIVEAGENT_RELEASE_PAGE_URL"
-export NATIVEAGENT_RELEASE_PAGE_URL NATIVE_AGENT_RELEASE_PAGE_URL
+export NATIVEAGENT_RELEASE_PAGE_URL
 
 # Stamp SUFeedURL and the updater claim only for publication in this run; never synthesize a URL.
 if [[ "$PUBLISH_APPCAST" == "true" ]]; then
@@ -319,21 +292,21 @@ export NATIVEAGENT_ICLOUD_CONTAINER_ID
 export NATIVEAGENT_MOBILE_SOURCE_KEY
 export NATIVEAGENT_BACKGROUND_TASK_PREFIX
 
-# Distribution transport modes. The legacy 1/0 values remain accepted:
-#   personal | 1  — development/personal KVS + Drive + CloudKit profile
+# Distribution transport modes:
+#   personal      — development/personal KVS + Drive + CloudKit profile
 #   cloudkit      — public Developer ID build with production CloudKit only
-#   none     | 0  — public standalone build with no Apple device transport
+#   none          — public standalone build with no Apple device transport
 #
 # The official Mac+iPhone release uses `cloudkit`; KVS/CloudDocuments are not
 # part of the public Developer ID contract. Every public mode starts from the
 # scrubbed, marker-bearing export.
-NATIVEAGENT_ICLOUD_BUILD="${NATIVEAGENT_ICLOUD_BUILD:-1}"
+NATIVEAGENT_ICLOUD_BUILD="${NATIVEAGENT_ICLOUD_BUILD:-personal}"
 case "$NATIVEAGENT_ICLOUD_BUILD" in
-  1|personal) NATIVEAGENT_RELEASE_SYNC_MODE="personal" ;;
+  personal) NATIVEAGENT_RELEASE_SYNC_MODE="personal" ;;
   cloudkit) NATIVEAGENT_RELEASE_SYNC_MODE="cloudkit" ;;
-  0|none) NATIVEAGENT_RELEASE_SYNC_MODE="none" ;;
+  none) NATIVEAGENT_RELEASE_SYNC_MODE="none" ;;
   *)
-    echo "ERROR: NATIVEAGENT_ICLOUD_BUILD must be personal|1, cloudkit, or none|0." >&2
+    echo "ERROR: NATIVEAGENT_ICLOUD_BUILD must be personal, cloudkit, or none." >&2
     exit 1
     ;;
 esac
@@ -372,16 +345,27 @@ NATIVEAGENT_NEEDS_PUBLIC_SCRUB=false
 if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" != "personal" ]]; then
   if [[ -f "$ROOT/.nativeagent-public-source" ]]; then
     "$ROOT/script/check_public_release_source.sh" "$ROOT"
-  elif [[ "${NATIVEAGENT_PUBLIC_SCRUB_CHILD:-0}" == "1" ]]; then
-    # Recursion guard: a child must never re-enter the orchestrator. If it got
-    # here the export it was pointed at is not a valid scrubbed tree.
-    echo "ERROR: scrubbed-export child started in a tree with no public-source marker." >&2
-    echo "       Refusing to recurse; inspect the export at $ROOT." >&2
-    exit 1
   else
     NATIVEAGENT_NEEDS_PUBLIC_SCRUB=true
   fi
 fi
+# A private tree prepares a concrete source artifact for review and stops.
+# Publication starts only from the reviewed commit already in the public repo.
+if [[ "$NATIVEAGENT_NEEDS_PUBLIC_SCRUB" == true ]]; then
+  if [[ "$PUBLISH_APPCAST" == true ]]; then
+    echo 'ERROR: publication requires a reviewed, published public checkout before building.' >&2
+    echo 'Run script/make_public_export.sh DIR; review and publish that source, then run script/release_github.sh there.' >&2
+    exit 1
+  fi
+  PUBLIC_EXPORT_DIR="${NATIVEAGENT_PUBLIC_EXPORT_DIR:-$ROOT/.runtime/public-release-export}"
+  "$ROOT/script/make_public_export.sh" "$PUBLIC_EXPORT_DIR"
+  echo "==> Source export ready for review: $PUBLIC_EXPORT_DIR (no build or publication performed)"
+  exit 0
+fi
+if [[ "$PUBLISH_APPCAST" == true ]]; then
+  "$ROOT/script/publish_github_release.sh" --preflight-source
+fi
+
 # Notarize via a stored keychain profile (xcrun notarytool store-credentials)
 # instead of an app-specific password in the environment — keeps the secret out
 # of env/logs. When set, APPLE_ID/NOTARIZATION_PASSWORD are not required.
@@ -404,12 +388,8 @@ cleanup_generated_release_entitlements() {
 trap cleanup_generated_release_entitlements EXIT
 if [[ -z "$NATIVEAGENT_RELEASE_ENTITLEMENTS" ]]; then
   if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" == "personal" ]]; then
-    # Local entitlements carry the real identities; template placeholders cannot match a real profile.
-    if [[ -f "$ROOT/local/NativeAgent.entitlements" ]]; then
-      NATIVEAGENT_RELEASE_ENTITLEMENTS="$ROOT/local/NativeAgent.entitlements"
-    else
-      NATIVEAGENT_RELEASE_ENTITLEMENTS="$ROOT/NativeAgent.entitlements"
-    fi
+    # The selected personal product requires its own local identity contract.
+    NATIVEAGENT_RELEASE_ENTITLEMENTS="$ROOT/local/NativeAgent.entitlements"
   elif [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" == "cloudkit" ]]; then
     if [[ -f "$ROOT/local/NativeAgent.cloudkit.public.entitlements" ]]; then
       NATIVEAGENT_RELEASE_ENTITLEMENTS="$ROOT/local/NativeAgent.cloudkit.public.entitlements"
@@ -422,136 +402,6 @@ if [[ -z "$NATIVEAGENT_RELEASE_ENTITLEMENTS" ]]; then
   else
     NATIVEAGENT_RELEASE_ENTITLEMENTS="$ROOT/NativeAgent.public.entitlements"
   fi
-fi
-
-# Resolve private entitlements before export; validation and build run once in the child.
-if [[ "$NATIVEAGENT_NEEDS_PUBLIC_SCRUB" == "true" ]]; then
-  _abs_release_path() {
-    # Absolutize a path from the private tree so it still resolves after the
-    # child chdir's into the export. Empty stays empty.
-    local p="$1"
-    [[ -n "$p" ]] || { printf '%s' ""; return 0; }
-    case "$p" in
-      /*) printf '%s' "$p" ;;
-      *) printf '%s' "$ROOT/$p" ;;
-    esac
-  }
-
-  [[ -x "$ROOT/script/make_public_export.sh" ]] \
-    || { echo "ERROR: script/make_public_export.sh missing or not executable; cannot cut a public release." >&2; exit 1; }
-
-  PUBLIC_EXPORT_DIR="${NATIVEAGENT_PUBLIC_EXPORT_DIR:-}"
-  if [[ -z "$PUBLIC_EXPORT_DIR" ]]; then
-    PUBLIC_EXPORT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-public-release.XXXXXX")/export"
-  fi
-
-  # Re-using an existing export skips the scrub, so it is allowed ONLY for
-  # --dry-run iteration. A notarized artifact always gets a fresh scrub.
-  _reuse_export=false
-  if [[ "${NATIVEAGENT_REUSE_PUBLIC_EXPORT:-0}" == "1" ]]; then
-    if [[ "$DRY_RUN" != "true" ]]; then
-      echo "ERROR: NATIVEAGENT_REUSE_PUBLIC_EXPORT=1 is only permitted with --dry-run." >&2
-      echo "       A notarized public DMG must be cut from a freshly scrubbed export." >&2
-      exit 1
-    fi
-    if [[ -f "$PUBLIC_EXPORT_DIR/.nativeagent-public-source" ]]; then
-      _reuse_export=true
-    fi
-  fi
-
-  echo "==> A1.1: public release requested (sync mode: $NATIVEAGENT_RELEASE_SYNC_MODE) from the private tree."
-  if [[ "$_reuse_export" == "true" ]]; then
-    echo "==> Re-using existing scrubbed export (dry-run only): $PUBLIC_EXPORT_DIR"
-  else
-    echo "==> Producing the scrubbed public export at: $PUBLIC_EXPORT_DIR"
-    echo "    (identity scrub + gitleaks + identity guard + build verification;"
-    echo "     this is the only source a public DMG is ever built from)"
-    "$ROOT/script/make_public_export.sh" "$PUBLIC_EXPORT_DIR"
-  fi
-  "$ROOT/script/check_public_release_source.sh" "$PUBLIC_EXPORT_DIR"
-
-  CHILD_ENTITLEMENTS="$(_abs_release_path "$NATIVEAGENT_RELEASE_ENTITLEMENTS")"
-  CHILD_PROFILE="$(_abs_release_path "$NATIVEAGENT_PROVISIONING_PROFILE")"
-  CHILD_SPARKLE_KEY="$(_abs_release_path "$NATIVEAGENT_SPARKLE_ED_PRIV_KEY")"
-  # The denylist lives under the private local/ dir, which the export does not
-  # carry; point the child back at the private copy so its personal-data leak
-  # guard keeps the same rules instead of silently degrading to no rules.
-  CHILD_PRIVACY_DENYLIST="$(_abs_release_path "${NATIVEAGENT_PRIVACY_DENYLIST_FILE:-local/privacy_denylist.regex}")"
-  if [[ -n "$CHILD_ENTITLEMENTS" && ! -r "$CHILD_ENTITLEMENTS" ]]; then
-    echo "ERROR: release entitlements not readable from the private tree: $CHILD_ENTITLEMENTS" >&2
-    exit 1
-  fi
-
-  echo "==> A1.1: re-running release.sh inside the scrubbed export"
-  set +e
-  (
-    cd "$PUBLIC_EXPORT_DIR" || exit 1
-    NATIVEAGENT_PUBLIC_SCRUB_CHILD=1 \
-    NATIVEAGENT_RELEASE_ENTITLEMENTS="$CHILD_ENTITLEMENTS" \
-    NATIVEAGENT_PROVISIONING_PROFILE="$CHILD_PROFILE" \
-    NATIVEAGENT_WIDGET_PROVISIONING_PROFILE="$(_abs_release_path "$NATIVEAGENT_WIDGET_PROVISIONING_PROFILE")" \
-    NATIVEAGENT_SPARKLE_ED_PRIV_KEY="$CHILD_SPARKLE_KEY" \
-    NATIVEAGENT_PRIVACY_DENYLIST_FILE="$CHILD_PRIVACY_DENYLIST" \
-    NATIVEAGENT_EMBEDDING_MODEL_DIR="$(_abs_release_path "${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}")" \
-    NATIVEAGENT_SPARKLE_PREVIOUS_DMG="$(_abs_release_path "${NATIVEAGENT_SPARKLE_PREVIOUS_DMG:-}")" \
-    NATIVEAGENT_RELEASE_SYMBOL_ARCHIVE_DIR="$ROOT/.runtime/release-symbols/$VERSION/$NATIVEAGENT_SOURCE_REVISION" \
-      "$PUBLIC_EXPORT_DIR/script/release.sh" "$@"
-  )
-  CHILD_RC=$?
-  set -e
-  if [[ "$CHILD_RC" -ne 0 ]]; then
-    echo "" >&2
-    echo "ERROR: the scrubbed public release failed (exit $CHILD_RC)." >&2
-    echo "       Export preserved for inspection: $PUBLIC_EXPORT_DIR" >&2
-    exit "$CHILD_RC"
-  fi
-
-  # Copy the finished public artifacts back into the private tree's dist/ so the
-  # maintainer picks them up where every other release lands. The export is left
-  # in place as the provenance record for the artifacts.
-  mkdir -p "$ROOT/dist"
-  _copied=()
-  for _artifact in "$APP_NAME.app" "$APP_NAME.app.zip" "$APP_NAME-$VERSION.dmg" "$APP_NAME-$VERSION.dmg.zip" "$APP_NAME-$VERSION.test-receipt.json" "$APP_NAME-$VERSION.release-attestation.json" "$APP_NAME-$VERSION.embedding.zip" "$APP_NAME-$VERSION.embedding.json"; do
-    if [[ -e "$PUBLIC_EXPORT_DIR/dist/$_artifact" ]]; then
-      rm -rf "${ROOT:?}/dist/$_artifact"
-      cp -R "$PUBLIC_EXPORT_DIR/dist/$_artifact" "$ROOT/dist/$_artifact"
-      _copied+=("dist/$_artifact")
-    fi
-  done
-  if [[ -d "$PUBLIC_EXPORT_DIR/dist/appcast" ]]; then
-    rm -rf "$ROOT/dist/appcast"
-    cp -R "$PUBLIC_EXPORT_DIR/dist/appcast" "$ROOT/dist/appcast"
-    _copied+=("dist/appcast")
-  fi
-  echo ""
-  echo "==> Public release v$VERSION built from SCRUBBED source."
-  echo "    scrubbed export : $PUBLIC_EXPORT_DIR"
-  if [[ ${#_copied[@]} -gt 0 ]]; then
-    echo "    copied back     : ${_copied[*]}"
-  else
-    echo "    WARNING: no artifacts found under $PUBLIC_EXPORT_DIR/dist to copy back." >&2
-  fi
-  exit 0
-fi
-
-# Dry-run remains the fast package rehearsal and intentionally does not mint a
-# release receipt. There is no test gate (the repo has no test suite): every
-# production release takes the artifact-only receipt path.
-RELEASE_TEST_RECEIPT=""
-if [[ "$DRY_RUN" == "false" ]]; then
-  RELEASE_TEST_RECEIPT="$ROOT/.runtime/release-test-receipts/$NATIVEAGENT_SOURCE_REVISION.json"
-  [[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]] \
-    || { echo "ERROR: artifact-only release still requires clean source." >&2; exit 1; }
-  mkdir -p "$(dirname "$RELEASE_TEST_RECEIPT")"
-  completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  receipt_tmp="$RELEASE_TEST_RECEIPT.tmp.$$"
-  printf '{\n  "schema_version": 1,\n  "source_revision": "%s",\n  "source_dirty": false,\n  "canonical_gate": "script/release.sh --artifact-only",\n  "ios_required": false,\n  "ios_result": "not_run",\n  "completed_at": "%s"\n}\n' \
-    "$NATIVEAGENT_SOURCE_REVISION" "$completed_at" > "$receipt_tmp"
-  mv -f "$receipt_tmp" "$RELEASE_TEST_RECEIPT"
-  chmod 0644 "$RELEASE_TEST_RECEIPT"
-  [[ -s "$RELEASE_TEST_RECEIPT" ]] \
-    || { echo "ERROR: release proof returned without a receipt." >&2; exit 1; }
-  assert_full_release_source_unchanged
 fi
 
 # Validate actual entitlement contents before building; profile-less builds cannot carry iCloud grants.
@@ -730,8 +580,63 @@ if [[ "$DRY_RUN" == "false" ]]; then
   fi
 fi
 
-# Verify assembly-declared resources before the build. bge assets are validated by
-# release_prepare_embedding when packaging the release.
+# Signing/product choices are fixed before the compile. The host product is
+# explicit and does not require widget provisioning on a maintainer's Mac.
+NATIVEAGENT_PRODUCT="${NATIVEAGENT_PRODUCT:-host}"
+case "$NATIVEAGENT_PRODUCT" in host|host-with-widget) ;; *) echo 'ERROR: NATIVEAGENT_PRODUCT must be host or host-with-widget' >&2; exit 2 ;; esac
+NATIVEAGENT_SIGNING_MODE="${NATIVEAGENT_SIGNING_MODE:-developer-id}"
+case "$NATIVEAGENT_SIGNING_MODE" in
+  adhoc)
+    [[ "$DRY_RUN" == true && "$NATIVEAGENT_PRODUCT" == host ]] || { echo 'ERROR: adhoc release rehearsal requires --dry-run and the host product' >&2; exit 2; }
+    NATIVEAGENT_SELECTED_SIGN_IDENTITY=-
+    NATIVEAGENT_RELEASE_ENTITLEMENTS="$ROOT/NativeAgent.adhoc.entitlements"
+    ;;
+  developer-id)
+    NATIVEAGENT_SELECTED_SIGN_IDENTITY="$NATIVEAGENT_DEVELOPER_ID"
+    [[ -n "$NATIVEAGENT_SELECTED_SIGN_IDENTITY" && "$NATIVEAGENT_SELECTED_SIGN_IDENTITY" != - ]] || { echo 'ERROR: configure NATIVEAGENT_DEVELOPER_ID for the selected developer-id mode' >&2; exit 1; }
+    identities="$(security find-identity -v -p codesigning)"
+    awk -F '"' -v identity="$NATIVEAGENT_SELECTED_SIGN_IDENTITY" '$2 == identity && /Developer ID Application/ {found=1} END {exit !found}' <<<"$identities" || { echo 'ERROR: selected Developer ID Application certificate is unavailable' >&2; exit 1; }
+    # Local rehearsal has no distribution profile or iCloud grants.
+    if [[ "$DRY_RUN" == true ]]; then NATIVEAGENT_RELEASE_ENTITLEMENTS="$ROOT/NativeAgent.public.entitlements"; fi
+    ;;
+  *) echo 'ERROR: NATIVEAGENT_SIGNING_MODE must be developer-id or adhoc for release.sh' >&2; exit 2 ;;
+esac
+[[ -r "$NATIVEAGENT_RELEASE_ENTITLEMENTS" ]] || { echo 'ERROR: selected signing entitlements are unreadable' >&2; exit 1; }
+plutil -lint "$NATIVEAGENT_RELEASE_ENTITLEMENTS" >/dev/null
+mkdir -p "$ROOT/.runtime"
+RELEASE_WIDGET_WORK="$(mktemp -d "$ROOT/.runtime/release-product.XXXXXX")"
+cp "$NATIVEAGENT_RELEASE_ENTITLEMENTS" "$RELEASE_WIDGET_WORK/base.entitlements"
+NATIVEAGENT_RELEASE_ENTITLEMENTS="$RELEASE_WIDGET_WORK/base.entitlements"
+/usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' "$NATIVEAGENT_RELEASE_ENTITLEMENTS" >/dev/null 2>&1 || true
+if [[ "$NATIVEAGENT_PRODUCT" == host-with-widget ]]; then
+  [[ "$DRY_RUN" == false ]] || { echo 'ERROR: widget release requires distribution provisioning (no dry-run widget product)' >&2; exit 1; }
+  for product in host widget; do
+    if [[ "$product" == host ]]; then
+      profile="$RELEASE_WIDGET_HOST_PROFILE"; bundle_id="$NATIVEAGENT_MAC_BUNDLE_ID"
+    else
+      profile="$NATIVEAGENT_WIDGET_PROVISIONING_PROFILE"; bundle_id="$NATIVEAGENT_MAC_WIDGET_BUNDLE_ID"
+    fi
+    plist="$RELEASE_WIDGET_WORK/$product.plist"
+    decode_provisioning_profile "$profile" "$plist" "$RELEASE_WIDGET_WORK/$product.provisionprofile"
+    verify_profile_identity_contract "$plist" "$bundle_id"
+    [[ "$(provisioning_profile_value "$plist" TeamIdentifier:0)" == "$NATIVEAGENT_TEAM_ID" ]] || { echo 'ERROR: widget product profiles must match the release team' >&2; exit 1; }
+    [[ "$(provisioning_profile_value "$plist" ProvisionsAllDevices)" == true ]] || { echo 'ERROR: widget product requires all-devices Developer ID profiles' >&2; exit 1; }
+    if /usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices' "$plist" >/dev/null 2>&1; then echo 'ERROR: widget profile is device-bound' >&2; exit 1; fi
+    provisioning_profile_array_contains "$plist" 'Entitlements:com.apple.security.application-groups' "$NATIVEAGENT_MAC_APP_GROUP_ID" || { echo 'ERROR: widget product requires the shared App Group in both profiles' >&2; exit 1; }
+  done
+  prepare_profile_signing_entitlements "$NATIVEAGENT_RELEASE_ENTITLEMENTS" "$RELEASE_WIDGET_WORK/host.plist" "$RELEASE_WIDGET_WORK/host.entitlements"
+  prepare_profile_signing_entitlements "$ROOT/Config/NativeAgentWidget.entitlements" "$RELEASE_WIDGET_WORK/widget.plist" "$RELEASE_WIDGET_WORK/widget.entitlements"
+  for plist in "$RELEASE_WIDGET_WORK/host.entitlements" "$RELEASE_WIDGET_WORK/widget.entitlements"; do
+    /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' "$plist" >/dev/null 2>&1 || true
+    /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups array' -c "Add :com.apple.security.application-groups:0 string $NATIVEAGENT_MAC_APP_GROUP_ID" "$plist"
+  done
+  NATIVEAGENT_RELEASE_ENTITLEMENTS="$RELEASE_WIDGET_WORK/host.entitlements"
+  NATIVEAGENT_PROVISIONING_PROFILE="$RELEASE_WIDGET_WORK/host.provisionprofile"
+fi
+
+# Required model resources are checked before the compile and again when staged.
+nativeagent_require_embedding_model "${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}"
+# Verify assembly-declared resources before the build.
 echo "==> Verifying assembly-declared source resources..."
 "$ROOT/script/verify_release_artifact.sh" --verify-resource-source "$ROOT"
 
@@ -776,6 +681,7 @@ BUILT_APP="$DERIVED_DATA/Build/Products/Release/$APP_NAME.app"
 # Publishing artifacts start in quarantine so interruption needs no cleanup to keep them unshippable.
 # Ship-ready names stay absent until generate_appcast.sh verifies the live feed and DMG.
 STAGE_DIR="$ROOT/dist"
+mkdir -p "$STAGE_DIR"
 QUARANTINE_DIR="$ROOT/dist/.pending-publish"
 if [[ "$PUBLISH_APPCAST" == "true" ]]; then
   echo "==> --publish-appcast: building into $QUARANTINE_DIR until the feed is verified live"
@@ -811,67 +717,16 @@ ditto "$BUILT_APP" "$BUNDLE"
 [[ -s "$BUNDLE/Contents/Resources/Metadata.appintents/extract.actionsdata" ]] \
   || { echo "ERROR: Xcode did not produce Metadata.appintents." >&2; exit 1; }
 
-# The widget is optional, but both the host and extension must have Developer
-# ID profiles granting their exact identity and shared App Group. Dry-run uses
-# the existing local-signing contract, which carries no distribution profile.
-release_prepare_widget() {
-  local widget="$BUNDLE/Contents/PlugIns/NativeAgentWidget.appex" profile plist bundle_id
-  RELEASE_WIDGET_WORK="$(mktemp -d "$STAGE_DIR/.widget-sign.XXXXXX")"
-  if [[ "$DRY_RUN" == true ]]; then
-    cp "$ROOT/NativeAgent.adhoc.entitlements" "$RELEASE_WIDGET_WORK/base.entitlements"
-  else
-    cp "$NATIVEAGENT_RELEASE_ENTITLEMENTS" "$RELEASE_WIDGET_WORK/base.entitlements"
-  fi
-  # Only a provisioned widget may activate the host's shared container.
-  /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' "$RELEASE_WIDGET_WORK/base.entitlements" >/dev/null 2>&1 || true
-  /usr/libexec/PlistBuddy -c 'Delete :NativeAgentMacAppGroupID' "$BUNDLE/Contents/Info.plist" >/dev/null 2>&1 || true
-  NATIVEAGENT_RELEASE_ENTITLEMENTS="$RELEASE_WIDGET_WORK/base.entitlements"
-  if [[ "$DRY_RUN" == true || ! -f "$RELEASE_WIDGET_HOST_PROFILE" || ! -f "$NATIVEAGENT_WIDGET_PROVISIONING_PROFILE" ]]; then
-    rm -rf "$widget"
-    echo "[release] widget not embedded: requires Developer ID host/widget profiles and App Group $NATIVEAGENT_MAC_APP_GROUP_ID (dry-run omits provisioning)." >&2
-    return
-  fi
-  for profile in "$RELEASE_WIDGET_HOST_PROFILE" "$NATIVEAGENT_WIDGET_PROVISIONING_PROFILE"; do
-    if [[ "$profile" == "$RELEASE_WIDGET_HOST_PROFILE" ]]; then
-      plist="$RELEASE_WIDGET_WORK/host.plist"
-      bundle_id="$NATIVEAGENT_MAC_BUNDLE_ID"
-    else
-      plist="$RELEASE_WIDGET_WORK/widget.plist"
-      bundle_id="$NATIVEAGENT_MAC_WIDGET_BUNDLE_ID"
-    fi
-    decode_provisioning_profile "$profile" "$plist"
-    verify_profile_identity_contract "$plist" "$bundle_id"
-    [[ "$(provisioning_profile_value "$plist" TeamIdentifier:0)" == "$NATIVEAGENT_TEAM_ID" ]] \
-      || { echo "ERROR: widget profile team does not match the release team." >&2; return 1; }
-    if [[ "$(provisioning_profile_value "$plist" ProvisionsAllDevices)" != true ]] \
-      || /usr/libexec/PlistBuddy -c "Print :ProvisionedDevices" "$plist" >/dev/null 2>&1; then
-      rm -rf "$widget"
-      echo "[release] widget not embedded: host/widget profiles must be Developer ID all-devices distribution profiles." >&2
-      return
-    fi
-    if ! provisioning_profile_array_contains "$plist" 'Entitlements:com.apple.security.application-groups' "$NATIVEAGENT_MAC_APP_GROUP_ID"; then
-      rm -rf "$widget"
-      echo "[release] widget not embedded: both Developer ID profiles must grant App Group $NATIVEAGENT_MAC_APP_GROUP_ID." >&2
-      return
-    fi
-  done
-  [[ -d "$widget" ]] || { echo "ERROR: Xcode did not embed the provisioned widget." >&2; return 1; }
-  cp "$NATIVEAGENT_WIDGET_PROVISIONING_PROFILE" "$widget/Contents/embedded.provisionprofile"
+# Apply only the product selected and preflighted before compilation.
+if [[ "$NATIVEAGENT_PRODUCT" == host ]]; then
+  rm -rf "$BUNDLE/Contents/PlugIns/NativeAgentWidget.appex"
+  /usr/libexec/PlistBuddy -c 'Delete :NativeAgentMacAppGroupID' "$BUNDLE/Contents/Info.plist"
+else
+  widget="$BUNDLE/Contents/PlugIns/NativeAgentWidget.appex"
+  [[ -d "$widget" ]] || { echo 'ERROR: selected widget is missing from the built app' >&2; exit 1; }
+  cp "$RELEASE_WIDGET_WORK/widget.provisionprofile" "$widget/Contents/embedded.provisionprofile"
   chmod 0644 "$widget/Contents/embedded.provisionprofile"
-  prepare_profile_signing_entitlements "$NATIVEAGENT_RELEASE_ENTITLEMENTS" \
-    "$RELEASE_WIDGET_WORK/host.plist" "$RELEASE_WIDGET_WORK/host.entitlements"
-  prepare_profile_signing_entitlements "$ROOT/Config/NativeAgentWidget.entitlements" \
-    "$RELEASE_WIDGET_WORK/widget.plist" "$RELEASE_WIDGET_WORK/widget.entitlements"
-  for plist in "$RELEASE_WIDGET_WORK/host.entitlements" "$RELEASE_WIDGET_WORK/widget.entitlements"; do
-    /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.application-groups' "$plist" >/dev/null 2>&1 || true
-    /usr/libexec/PlistBuddy -c 'Add :com.apple.security.application-groups array' \
-      -c "Add :com.apple.security.application-groups:0 string $NATIVEAGENT_MAC_APP_GROUP_ID" "$plist"
-  done
-  NATIVEAGENT_RELEASE_ENTITLEMENTS="$RELEASE_WIDGET_WORK/host.entitlements"
-  /usr/libexec/PlistBuddy -c "Add :NativeAgentMacAppGroupID string $NATIVEAGENT_MAC_APP_GROUP_ID" "$BUNDLE/Contents/Info.plist"
-  echo "[release] widget provisioned: $NATIVEAGENT_MAC_WIDGET_BUNDLE_ID ($NATIVEAGENT_MAC_APP_GROUP_ID)"
-}
-release_prepare_widget
+fi
 
 release_prepare_embedding "$BUNDLE" "$STAGE_DIR" "$VERSION"
 export NATIVEAGENT_PUBLISH_MODEL_ASSET=""
@@ -992,25 +847,8 @@ sign_nested_plain() {
   fi
 }
 if [[ "$DRY_RUN" == "true" ]]; then
-  SIGN_ID="${NATIVEAGENT_DEVELOPER_ID:-}"
+  SIGN_ID="$NATIVEAGENT_SELECTED_SIGN_IDENTITY"
   DRY_RUN_ENTITLEMENTS="$NATIVEAGENT_RELEASE_ENTITLEMENTS"
-  if [[ -z "$SIGN_ID" ]]; then
-    # A stable Apple code identity gives TCC a responsible application to
-    # register. Prefer a transferable Developer ID identity for local-test
-    # DMGs, then Apple Development. Keep ad-hoc as the final build-only
-    # fallback for contributors without either certificate.
-    SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/Developer ID Application/ {print $2; exit}')"
-    if [[ -z "$SIGN_ID" ]]; then
-      SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/Apple Development/ {print $2; exit}')"
-    fi
-    if [[ -n "$SIGN_ID" ]]; then
-      echo "  (dry-run) Using an available stable Apple signing identity so macOS TCC can register the app."
-    else
-      echo "  (dry-run) No Apple signing identity available — using ad-hoc sign."
-      echo "  WARNING: ad-hoc local-test apps may not appear in macOS Privacy & Security permission lists."
-      SIGN_ID="-"
-    fi
-  fi
   if [[ ! -f "$DRY_RUN_ENTITLEMENTS" ]]; then
     echo "ERROR: $DRY_RUN_ENTITLEMENTS not found; dry-run signing must use ad-hoc entitlements." >&2
     exit 1
@@ -1105,17 +943,27 @@ else
     --require-sparkle-key
 fi
 
-# Bind the exact final DMG bytes to the clean-source canonical test receipt and
-# the notarization/stapling gates that just passed. The publisher uploads and
-# reads this file back byte-for-byte with the appcast and DMG.
+# The named artifact gate has passed on the final bytes. Its only completion
+# record is published atomically beside that artifact, never before the gate.
+assert_full_release_source_unchanged
 STAGED_TEST_RECEIPT="$STAGE_DIR/$APP_NAME-$VERSION.test-receipt.json"
-cp -f "$RELEASE_TEST_RECEIPT" "$STAGED_TEST_RECEIPT"
+receipt_tmp="$STAGED_TEST_RECEIPT.tmp.$$"
+jq -n --arg revision "$NATIVEAGENT_SOURCE_REVISION" \
+  --arg completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg name "$(basename "$DMG_PATH")" \
+  --arg sha256 "$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')" \
+  --argjson bytes "$(stat -f %z "$DMG_PATH")" \
+  '{schema_version:1, source_revision:$revision, source_dirty:false,
+    canonical_gate:"script/release.sh --artifact-only", ios_required:false,
+    ios_result:"not_run", completed_at:$completed_at,
+    artifact:{name:$name, sha256:$sha256, byte_length:$bytes}}' > "$receipt_tmp"
 if [[ -n "$NATIVEAGENT_PUBLISH_MODEL_ASSET" ]]; then
   jq --slurpfile model "$STAGE_DIR/$APP_NAME-$VERSION.embedding.json" \
-    '. + {model_asset:$model[0]}' "$STAGED_TEST_RECEIPT" > "$STAGED_TEST_RECEIPT.tmp"
-  mv -f "$STAGED_TEST_RECEIPT.tmp" "$STAGED_TEST_RECEIPT"
+    '. + {model_asset:$model[0]}' "$receipt_tmp" > "$receipt_tmp.model"
+  mv "$receipt_tmp.model" "$receipt_tmp"
 fi
-chmod 0644 "$STAGED_TEST_RECEIPT"
+chmod 0644 "$receipt_tmp"
+mv -f "$receipt_tmp" "$STAGED_TEST_RECEIPT"
 RELEASE_ATTESTATION="$STAGE_DIR/$APP_NAME-$VERSION.release-attestation.json"
 if [[ "${NATIVEAGENT_SKIP_DMG_SIGN:-0}" == "1" ]]; then
   DMG_SIGNATURE_REQUIRED=false
@@ -1190,16 +1038,7 @@ else
   echo "    WARNING: could not write $SHARED_DMG (release itself still succeeded)." >&2
 fi
 
-if [[ -n "$RELEASE_TEST_RECEIPT" ]]; then
-  PUBLIC_TEST_RECEIPT="$ROOT/dist/$APP_NAME-$VERSION.test-receipt.json"
-  # The staged receipt binds the model asset; do not overwrite it with the
-  # pre-packaging test receipt (promotion already moved it on publish).
-  if [[ "$STAGED_TEST_RECEIPT" != "$PUBLIC_TEST_RECEIPT" && -f "$STAGED_TEST_RECEIPT" ]]; then
-    cp -f "$STAGED_TEST_RECEIPT" "$PUBLIC_TEST_RECEIPT"
-  fi
-  chmod 0644 "$PUBLIC_TEST_RECEIPT"
-  echo "==> Exact-commit test receipt: $PUBLIC_TEST_RECEIPT"
-fi
+echo "==> Exact-commit artifact receipt: $ROOT/dist/$APP_NAME-$VERSION.test-receipt.json"
 
 echo ""
 echo "==> Release v$VERSION complete!"

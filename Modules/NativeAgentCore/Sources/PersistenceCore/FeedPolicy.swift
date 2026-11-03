@@ -58,8 +58,9 @@ public enum JSONLLineCaps {
     /// `<dataRoot>/desk/desk_archive.jsonl` — display/idempotency receipts; base+tail owns truth.
     public static let deskArchive = 5000
 
-    /// LiveNotificationInbox owns the live notification feed's 500-row cap and
-    /// 30-day finished-card cutoff, archiving every eviction before removal.
+    /// LiveNotificationInbox owns the live feed's 500-unheld-row target and
+    /// 30-day finished-card cutoff, converging by at most 200 evictions per write.
+    /// Outstanding held deliveries are exempt; every eviction is archived first.
     /// It must never use destructive JSONL tail retention.
     /// `<dataRoot>/studio/journal/journal.jsonl` — append-only life record; cap is a runaway backstop.
     public static let studioJournal = 100_000

@@ -41,10 +41,12 @@ public struct ApprovalInboxInjectionApprovalVerifier: Sendable {
         tool: String,
         surface: String,
         input: [String: JSONValue]
-    ) async -> InjectionApprovalVerification {
+    ) async throws -> InjectionApprovalVerification {
         let id = approvalID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return .recordNotFound }
-        guard let record = try? await inbox.get(id) else { return .recordNotFound }
+        let record: ApprovalRecord
+        do { record = try await inbox.get(id) }
+        catch ApprovalInboxError.notFound { return .recordNotFound }
 
         guard record.status.lowercased() == "resolved",
               record.decision?.lowercased() == "approved" else {

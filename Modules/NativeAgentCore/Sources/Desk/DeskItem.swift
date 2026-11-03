@@ -197,8 +197,9 @@ public struct DeskItem: Sendable, Equatable {
         return .object(obj)
     }
 
-    /// Default reads skip unknown refs and malformed collection rows for forward compatibility. Compaction-base reads require `strictCollections` so the sole surviving snapshot loses no ledger rows.
-    public static func fromJSON(_ value: JSONValue, strictCollections: Bool = false) -> DeskItem? {
+    /// Every stored item is current-form and complete; collections never lose
+    /// a reference, note, blocker or work identity during decoding.
+    public static func fromJSON(_ value: JSONValue) -> DeskItem? {
         guard case .object(let obj) = value,
               let handle = obj["handle"]?.stringValue,
               let alias = obj["alias"]?.stringValue,
@@ -207,32 +208,17 @@ public struct DeskItem: Sendable, Equatable {
               let project = obj["project"]?.stringValue,
               let title = obj["title"]?.stringValue,
               let openedAt = obj["openedAt"]?.stringValue,
-              let updatedAt = obj["updatedAt"]?.stringValue else { return nil }
-        var refs: [DeskRef] = []
-        if case .array(let arr)? = obj["refs"] {
-            refs = arr.compactMap { DeskRef.fromJSON($0) }
-            if strictCollections, refs.count != arr.count { return nil }
-        } else if strictCollections, obj["refs"] != nil {
-            return nil   // present but not an array — corrupt, never "empty"
-        }
-        var notes: [DeskNote] = []
-        if case .array(let arr)? = obj["notes"] {
-            notes = arr.compactMap { DeskNote.fromJSON($0) }
-            if strictCollections, notes.count != arr.count { return nil }
-        } else if strictCollections, obj["notes"] != nil {
-            return nil   // present but not an array — corrupt, never "empty"
-        }
-        // blockedOn: same strict rule as refs/notes/reservations. In the compaction base this snapshot is the ONLY copy — a silently-dropped blocker edge would vanish a dependency FOREVER, and the item would read as ready when it is not.
-        var blockedOn: [String] = []
-        if case .array(let arr)? = obj["blockedOn"] {
-            blockedOn = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
-            if strictCollections, blockedOn.count != arr.count { return nil }
-        } else if strictCollections, obj["blockedOn"] != nil {
-            return nil   // present but not an array — corrupt, never "empty"
-        }
+              let updatedAt = obj["updatedAt"]?.stringValue,
+              case .bool(let pinned)? = obj["pinned"],
+              let cadenceValue = obj["cadence"], let cadence = Cadence.fromJSON(cadenceValue),
+              let notifyValue = obj["notify"], let notify = NotifyPolicy.fromJSON(notifyValue),
+              DeskJSON.optionalStringsAreValid(obj, keys: ["parent", "summary", "assignee", "laneOf", "closedAt", "blockedReason", "waitingOn", "origin", "deferUntil", "findingKey"]),
+              let refs = deskStoredCollection(obj["refs"], decode: DeskRef.fromJSON),
+              let notes = deskStoredCollection(obj["notes"], decode: DeskNote.fromJSON),
+              let blockedOn = DeskJSON.strings(obj["blockedOn"]) else { return nil }
         guard let workAttempts = DeskWorkAttempt.readAttempts(obj) else { return nil }
         let pursuit = obj["pursuit"].flatMap(Pursuit.fromJSON)
-        if strictCollections, let pursuitValue = obj["pursuit"] {
+        if let pursuitValue = obj["pursuit"] {
             // A present pursuit must be an OBJECT, and every nested ledger collection that is present must be a fully-decodable array — a wrong-typed value decoding to empty/default would silently shrink the reservation cap ledger or the
             // dossier.
             guard case .object(let pursuitObj) = pursuitValue else { return nil }
@@ -249,23 +235,31 @@ public struct DeskItem: Sendable, Equatable {
            pursuit.retiredSessions.addingReportingOverflow(workAttempts.count).overflow { return nil }
         let continuation = obj["continuation"].flatMap(DeskContinuation.fromJSON)
         if obj["continuation"] != nil && continuation == nil { return nil }
+        let progress = obj["progress"].flatMap(DeskProgress.fromJSON)
+        if obj["progress"] != nil && progress == nil { return nil }
+        let origin: DeskOrigin
+        if let raw = obj["origin"]?.stringValue {
+            guard let decoded = DeskOrigin(rawValue: raw) else { return nil }
+            origin = decoded
+        } else { origin = .owner } // current writer omits owner origin
+        if let until = obj["deferUntil"]?.stringValue, DeskSequencing.parseDeferStamp(until) == nil { return nil }
         return DeskItem(
             handle: handle, alias: alias, parent: obj["parent"]?.stringValue,
             kind: kind, status: status, project: project, title: title,
             summary: obj["summary"]?.stringValue,
             assignee: obj["assignee"]?.stringValue,
             laneOf: obj["laneOf"]?.stringValue,
-            progress: obj["progress"].flatMap { DeskProgress.fromJSON($0) },
+            progress: progress,
             refs: refs,
-            cadence: obj["cadence"].map { Cadence.fromJSON($0) } ?? Cadence(),
-            notify: obj["notify"].map { NotifyPolicy.fromJSON($0) } ?? NotifyPolicy(),
+            cadence: cadence,
+            notify: notify,
             notes: notes, openedAt: openedAt, updatedAt: updatedAt,
             closedAt: obj["closedAt"]?.stringValue,
-            pinned: obj["pinned"]?.boolValue ?? false,
+            pinned: pinned,
             blockedReason: obj["blockedReason"]?.stringValue,
             waitingOn: obj["waitingOn"]?.stringValue,
             // Origin defaults to .owner; pursuit is optional.
-            origin: obj["origin"]?.stringValue.flatMap(DeskOrigin.decodePersisted) ?? .owner,
+            origin: origin,
             pursuit: pursuit,
             blockedOn: blockedOn,
             deferUntil: obj["deferUntil"]?.stringValue,

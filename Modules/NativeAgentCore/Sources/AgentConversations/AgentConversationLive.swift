@@ -1,6 +1,7 @@
 import AgentWorkspace
 import Privacy
 import Foundation
+import Experiences
 import PersistenceCore
 // Blueprint: | `AgentConversationLive.swift` | `AgentConversationLive` struct; `projection`; the live hub flushes pending text when the resident owner stops, and already accepted sends publish later text immediately until they settle; flush identities reject superseded coalescing tasks |
 
@@ -150,10 +151,16 @@ public actor AgentConversationLiveHub {
     private func edit(_ target: AgentConversationLiveTarget, now: Bool = false, activity: Bool = false,
                       _ change: (inout AgentConversationLive) -> Void) {
         if let entry = entries[target.key], entry.live.operationID != target.operationID { return }
-        if entries[target.key] == nil,
-           let saved = AgentConversationLiveStore(dataRoot: target.dataRoot).all()[target.key] {
-            guard saved.operationID == target.operationID else { return }
-            entries[target.key] = (saved, target.dataRoot)
+        if entries[target.key] == nil {
+            do {
+                if let saved = try AgentConversationLiveStore(dataRoot: target.dataRoot).all()[target.key] {
+                    guard saved.operationID == target.operationID else { return }
+                    entries[target.key] = (saved, target.dataRoot)
+                }
+            } catch {
+                report(error, root: target.dataRoot)
+                return
+            }
         }
         if entries[target.key] == nil { begin(target, lane: target.agent) }
         guard var entry = entries[target.key] else { return }
@@ -198,16 +205,27 @@ public actor AgentConversationLiveHub {
             return entry
         }
         for (root, group) in Dictionary(grouping: changed, by: { $0.root }) {
-            if let saved = try? AgentConversationLiveStore(dataRoot: root).merge(group.map(\.live)) {
+            do {
+                let saved = try AgentConversationLiveStore(dataRoot: root).merge(group.map(\.live))
                 for entry in group {
                     if let live = saved[entry.live.key] { publisher?(live) }
                     if saved[entry.live.key]?.state == "finished" { entries.removeValue(forKey: entry.live.key) }
                 }
+            } catch {
+                dirty.formUnion(group.map { $0.live.key })
+                report(error, root: root)
             }
         }
         // Settled (finished or handed off to wait) entries live on disk;
         // memory keeps only what is still moving.
-        for key in keys where entries[key]?.live.state != "working" { entries.removeValue(forKey: key) }
+        for key in keys where !dirty.contains(key) && entries[key]?.live.state != "working" { entries.removeValue(forKey: key) }
+    }
+
+    private func report(_ error: Error, root: URL) {
+        RepairOwed.owe(root, id: UUID().uuidString.lowercased(), kind: .act,
+            operation: "agent.conversation.live", owner: root.appendingPathComponent("agents/conversation-live.json").path,
+            words: "Live conversation evidence is unavailable: " + error.localizedDescription,
+            lever: "Repair agents/conversation-live.json; existing bytes and pending live updates are preserved.")
     }
 }
 
@@ -219,19 +237,24 @@ public struct AgentConversationLiveStore: Sendable {
         fileURL = dataRoot.appendingPathComponent("agents/conversation-live.json")
     }
 
-    /// Unlocked read for display; a file caught mid-write reads as empty.
-    public func all() -> [String: AgentConversationLive] {
-        guard let data = try? Data(contentsOf: fileURL), data.count <= 4 * 1024 * 1024 else { return [:] }
+    /// Missing storage is empty; a failed or malformed read stays unavailable.
+    public func all() throws -> [String: AgentConversationLive] {
+        let data: Data
+        do { data = try Data(contentsOf: fileURL) }
+        catch CocoaError.fileReadNoSuchFile { return [:] }
+        guard data.count <= 4 * 1024 * 1024 else {
+            throw AgentConversationStore.Failure(message: "Live conversation evidence exceeds its 4 MiB bound; repair \(fileURL.path). Existing bytes were preserved.")
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return (try? decoder.decode([String: AgentConversationLive].self, from: data)) ?? [:]
+        return try decoder.decode([String: AgentConversationLive].self, from: data)
     }
 
     /// This record's current send, if its agent is still on it. The wake
     /// helper's entry (by message id) is the closer view, so it wins.
-    public func current(for row: AgentConversationRecord) -> AgentConversationLive? {
+    public func current(for row: AgentConversationRecord) throws -> AgentConversationLive? {
         guard ["sending", "waiting"].contains(row.phase) else { return nil }
-        return Self.current(for: row, in: all())
+        return try Self.current(for: row, in: all())
     }
 
     public static func current(for row: AgentConversationRecord, in rows: [String: AgentConversationLive]) -> AgentConversationLive? {
@@ -248,12 +271,18 @@ public struct AgentConversationLiveStore: Sendable {
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true,
                                                attributes: [.posixPermissions: 0o700])
         return try CredentialFileLock.withLock(fileURL) {
-            var rows = all()
+            var rows = try all()
             let before = rows
             // Reconciliation holds the record lock. Progress flushes read inside
             // the live-file lock so a late write cannot undo settlement.
             let store = AgentConversationStore(dataRoot: dataRoot)
-            let records = try checkedRecords.map(store.reconcilingExpiredReplies) ?? store.recordsUnlocked()
+            let records: [AgentConversationRecord]
+            if let checkedRecords {
+                let peers = try AgentPeerStore(dataRoot: dataRoot).list()
+                records = try store.reconcilingExpiredReplies(checkedRecords, peers: peers)
+            } else {
+                records = try store.recordsUnlocked()
+            }
             for live in changed {
                 if let id = live.recordID {
                     guard let row = records.first(where: { $0.id == id }), row.operationID == live.operationID else { continue }

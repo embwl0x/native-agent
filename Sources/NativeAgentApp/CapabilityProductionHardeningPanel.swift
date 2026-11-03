@@ -15,9 +15,9 @@ enum CapabilityProductionExportButtonsPresentation {
         case .verified(let export):
             let kind = export.kind?.trimmingCharacters(in: .whitespacesAndNewlines)
             let label = kind?.isEmpty == false ? kind!.capitalized : "Export"
-            let bytes = export.sizeBytes ?? 0
+            let size = export.sizeBytes.map { "\($0) bytes" } ?? "size unavailable"
             return Notice(
-                detail: "\(label) created and verified: \(export.path) (\(bytes) bytes).",
+                detail: "\(label) created and verified: \(export.path) (\(size)).",
                 status: "ok"
             )
         case .failed(let support, let detail):
@@ -80,7 +80,7 @@ struct CapabilityProductionHardeningPanel: View {
                 if let latest = appModel.engine.doctor.productionExports.first {
                     CapabilityDetailRow(
                         title: (latest.kind ?? "export").capitalized,
-                        detail: "\(latest.path) · \(latest.sizeBytes ?? 0) bytes",
+                        detail: "\(latest.path) · \(latest.sizeBytes.map { "\($0) bytes" } ?? "Size unavailable")",
                         status: "ok"
                     )
                 }

@@ -1,8 +1,8 @@
 /* NativeAgent ability
 {
   "id": "notice",
-  "kind": "tool",
-  "version": 3,
+  "kind": "ability",
+  "version": 4,
   "reach": {"capabilities": ["app_data_read", "app_data_write"], "readPaths": [], "hosts": [], "apps": []},
   "wake": ["app.installed"],
   "face": {"page": "agents"},
@@ -26,7 +26,10 @@ function run(given) {
     if (typeof input.bundle_id !== "string" || !input.bundle_id || typeof input.version !== "string")
         throw new Error("A bundle id and version are required.");
     const path = "notice-state.json";
-    const exists = host.files.list({root: "app_data", path: "."}).some(name => name.endsWith("/" + path));
+    let page = host.files.list({root: "app_data", path: ".", name_contains: path, case_sensitive: true});
+    while (!page.entries.includes(path) && page.has_more)
+        page = host.files.list(page.next);
+    const exists = page.entries.includes(path);
     let state = {};
     if (exists) {
         const saved = host.files.read({root: "app_data", path});

@@ -63,18 +63,13 @@ extension CodexImageGenerationRequest {
         func clean(_ raw: String?) -> String { raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "" }
         var result = self
         switch clean(quality ?? "auto") {
-        case "", "medium", "gpt-image-2", "gpt-image-2-medium": result.quality = "medium"
-        case "low", "gpt-image-2-low": result.quality = "low"
-        case "high", "gpt-image-2-high": result.quality = "high"
+        case "medium": result.quality = "medium"
+        case "low": result.quality = "low"
+        case "high": result.quality = "high"
         case "auto": result.quality = "auto"
         default: throw ImageGenerationToolError.unsupportedControl("Codex quality must be low, medium, high or auto; Flare/Sunburst, xhigh and max are not subscription selectors.")
         }
-        switch clean(outputFormat) {
-        case "", "png": result.outputFormat = "png"
-        case "jpg", "jpeg": result.outputFormat = "jpeg"
-        case "webp": result.outputFormat = "webp"
-        default: throw ImageGenerationToolError.unsupportedControl("output_format must be png, jpeg or webp.")
-        }
+        result.outputFormat = try ImageGenerationOutputFormat.decode(outputFormat)
         result.action = clean(action).isEmpty ? "auto" : clean(action)
         guard ["auto", "generate", "edit"].contains(result.action),
               result.action != "edit" || !references.isEmpty else {

@@ -2,12 +2,15 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryStorage+Tombstones.swift` | `MemoryStorage`: `upsertTombstone`; same-epoch owed tombstone vectors land on exact hash/content; semantic consumers require complete forgotten-claim vectors; near-verbatim gate and `nearestTombstones` for the memory manager |
+// Blueprint: | `MemoryStorage+Tombstones.swift` | `MemoryStorage`: forgetting preserves existing vectors; owed vectors land on exact hash/content; semantic consumers name and exclude proven unembeddable claims, await unresolved vectors and retain exact-hash suppression; near-verbatim gate and `nearestTombstones` |
 
 extension MemoryStorage {
     // MARK: - Tombstones
 
-    /// The single tombstone writer preserves an existing embedding when the new write carries none.
+    /// Forgetting copies an existing record's vector without admitting new
+    /// semantics. It must commit even when the model or epoch is unavailable;
+    /// convergence owns any needed vector replacement.
+    /// Preserve an existing embedding when the new write carries none.
     static func upsertTombstone(
         db: Database,
         content: String,
@@ -38,13 +41,16 @@ extension MemoryStorage {
         }
     }
 
-    func tombstonesOwingVectors(limit: Int) async throws -> [(hash: String, content: String)] {
+    func tombstonesOwingVectors(limit: Int, epoch: MemoryEmbeddingEpoch) async throws -> [(hash: String, content: String)] {
         try await dbPool.read { db in
             try Row.fetchAll(db, sql: """
                 SELECT content_hash, content FROM tombstones
                 WHERE embedding IS NULL AND TRIM(COALESCE(content, '')) <> ''
+                  AND NOT EXISTS (SELECT 1 FROM memory_embedding_failures f
+                    WHERE f.kind = 'tombstone' AND f.row_id = tombstones.content_hash
+                      AND f.content = CAST(tombstones.content AS BLOB) AND f.epoch = ?)
                 ORDER BY rowid LIMIT ?
-                """, arguments: [max(1, limit)]).map { row -> (hash: String, content: String) in
+                """, arguments: [epoch.rawValue, max(1, limit)]).map { row -> (hash: String, content: String) in
                     (try row.decode(forColumn: "content_hash"), try row.decode(forColumn: "content"))
                 }
         }
@@ -57,17 +63,34 @@ extension MemoryStorage {
                 UPDATE tombstones SET embedding = ?, embedding_epoch = ?
                 WHERE content_hash = ? AND content = ? AND embedding IS NULL
                 """, arguments: [Self.encodeEmbedding(vector), epoch.rawValue, hash, content])
-            return db.changesCount > 0
+            let landed = db.changesCount > 0
+            if landed { try Self.clearEmbeddingFailure(in: db, kind: .tombstone, id: hash) }
+            return landed
         }
     }
 
     /// Absence of a vector is not evidence that the claim was not forgotten.
-    /// The canonical convergence flight fills it; consumers cannot return a
-    /// misleading empty semantic answer or admit a restatement meanwhile.
+    /// The canonical convergence flight fills it. A proven per-text failure
+    /// is a named semantic gap, not a global admission failure; unresolved
+    /// vectors still await convergence. Exact hash suppression always applies.
     static func requireTombstoneVectors(in db: Database) throws {
+        for failed in try Row.fetchAll(db, sql: """
+            SELECT f.row_id, f.reason FROM memory_embedding_failures f
+            JOIN tombstones t ON f.row_id = t.content_hash AND f.content = CAST(t.content AS BLOB)
+            JOIN memory_embedding_state s ON s.id = 1 AND s.active_epoch = f.epoch
+            WHERE f.kind = 'tombstone' AND t.embedding IS NULL ORDER BY f.row_id
+            """) {
+            let id: String = try failed.decode(forColumn: "row_id")
+            let reason: String = try failed.decode(forColumn: "reason")
+            nativeLog("[memory-tombstone] semantic gap %@: %@; exact-hash suppression remains active", id, reason)
+        }
         if try Bool.fetchOne(db, sql: """
             SELECT EXISTS(SELECT 1 FROM tombstones
-                WHERE embedding IS NULL AND TRIM(COALESCE(content, '')) <> '')
+                WHERE embedding IS NULL AND TRIM(COALESCE(content, '')) <> ''
+                  AND NOT EXISTS (SELECT 1 FROM memory_embedding_failures f
+                    JOIN memory_embedding_state s ON s.id = 1 AND s.active_epoch = f.epoch
+                    WHERE f.kind = 'tombstone' AND f.row_id = tombstones.content_hash
+                      AND f.content = CAST(tombstones.content AS BLOB)))
             """) == true {
             throw MemoryStorageError.searchFailure("Forgotten claims are awaiting their search vectors.",
                 code: "memory_search_index_updating", instruction: "Allow memory search convergence to finish before comparing forgotten claims again.")
@@ -82,8 +105,7 @@ extension MemoryStorage {
         if exactMatch { throw MemoryStorageError.tombstoned(memory.id) }
         if let embedding = memory.embedding,
            try tombstoneMatch(
-               db: db, query: embedding, queryEpoch: memory.embeddingEpoch,
-               threshold: memoryNearVerbatimSimilarity
+               db: db, content: memory.content, query: embedding, queryEpoch: memory.embeddingEpoch
            ) {
             throw MemoryStorageError.tombstoned(memory.id)
         }
@@ -91,18 +113,18 @@ extension MemoryStorage {
 
     /// Semantic admission blocks paraphrases at a high cosine threshold while admitting contradictions.
     /// Scan the tombstone set only on writes (store/accept).
-    /// Vector-pending tombstones keep semantic admission unavailable until filled.
+    /// Unresolved vectors await convergence; proven unembeddable rows are named gaps.
     public func matchesTombstone(
+        content: String,
         embedding query: [Float],
-        embeddingEpoch queryEpoch: MemoryEmbeddingEpoch? = nil,
-        threshold: Double = memoryNearVerbatimSimilarity
+        embeddingEpoch queryEpoch: MemoryEmbeddingEpoch? = nil
     ) async throws -> Bool {
         try await dbPool.read { db in
             try Self.tombstoneMatch(
                 db: db,
+                content: content,
                 query: query,
-                queryEpoch: queryEpoch?.rawValue,
-                threshold: threshold
+                queryEpoch: queryEpoch?.rawValue
             )
         }
     }
@@ -130,7 +152,9 @@ extension MemoryStorage {
             }
             var scored: [(content: String, cosine: Double)] = []
             for row in try Row.fetchAll(db, sql: sql, arguments: arguments) {
-                guard let e = Self.decodeEmbedding(try row.decode(forColumn: "embedding")), e.count == query.count else { continue }
+                guard let e = try Self.decodeEmbedding(row.decode(forColumn: "embedding")), e.count == query.count else {
+                    throw MemoryStorageError.databaseUnavailable("Rejection vector dimensions do not match the active memory model; repair the tombstone before semantic admission.")
+                }
                 guard let content: String = try row.decode(forColumn: "content") else { continue }
                 scored.append((content: content, cosine: VectorMath.cosine(query, e)))
             }
@@ -142,9 +166,9 @@ extension MemoryStorage {
     /// (acceptProposal gates in the same txn — nesting pool calls would hang).
     static func tombstoneMatch(
         db: Database,
+        content: String,
         query: [Float],
-        queryEpoch: String?,
-        threshold: Double
+        queryEpoch: String?
     ) throws -> Bool {
         guard !query.isEmpty else { return false }
         try requireTombstoneVectors(in: db)
@@ -152,7 +176,7 @@ extension MemoryStorage {
         if let activeEpoch, queryEpoch != activeEpoch {
             throw MemoryStorageError.embeddingEpochMismatch(expected: activeEpoch, actual: queryEpoch)
         }
-        var sql = "SELECT embedding FROM tombstones WHERE embedding IS NOT NULL"
+        var sql = "SELECT content, embedding FROM tombstones WHERE embedding IS NOT NULL"
         var arguments: StatementArguments = []
         if let activeEpoch {
             sql += " AND embedding_epoch = ?"
@@ -160,8 +184,11 @@ extension MemoryStorage {
         }
         let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
         for row in rows {
-            guard let e = decodeEmbedding(try row.decode(forColumn: "embedding")), e.count == query.count else { continue }
-            if VectorMath.cosine(query, e) >= threshold { return true }
+            guard let e = try decodeEmbedding(row.decode(forColumn: "embedding")), e.count == query.count else {
+                throw MemoryStorageError.databaseUnavailable("Rejection vector dimensions do not match the active memory model; repair the tombstone before semantic admission.")
+            }
+            let forgotten: String = try row.decode(forColumn: "content")
+            if semanticDuplicate(content, forgotten, similarity: VectorMath.cosine(query, e)) { return true }
         }
         return false
     }

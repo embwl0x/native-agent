@@ -80,20 +80,13 @@ public enum ChromeHostIdentity {
     /// inappropriate API flags"), which refused every real Chrome launch.
     private static var validationFlags: SecCSFlags { [] }
 
-    /// The signing identifier of the running Chromium-family browser, or nil
-    /// when the executable is not one: unsigned, re-signed by somebody who is
-    /// not the vendor, tampered with since it was signed, an identifier this
-    /// build does not list, or simply a different program.
+    /// The failed running-code check and its original Security status.
     public struct SigningFailure: Error, LocalizedError, Sendable {
         public let check: String
         public let status: OSStatus
         public var errorDescription: String? {
             "\(check) failed (OSStatus \(status)): \(SecCopyErrorMessageString(status, nil) as String? ?? "unknown Security error")."
         }
-    }
-
-    public static func browserSigningIdentifier(forProcess pid: pid_t) -> String? {
-        try? checkedBrowserSigningIdentifier(forProcess: pid)
     }
 
     /// Both launch preflight and the relay use this exact running-code check.
@@ -130,10 +123,6 @@ public enum ChromeHostIdentity {
         let read = withUnsafeMutablePointer(to: &info) { proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, $0, expected) }
         guard read == expected else { return nil }
         return info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
-    }
-
-    public static func isBrowserProcess(_ pid: pid_t) -> Bool {
-        browserSigningIdentifier(forProcess: pid) != nil
     }
 
     /// Chrome passes the calling extension's origin as an argument (alongside

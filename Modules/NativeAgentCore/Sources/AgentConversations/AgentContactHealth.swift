@@ -1,12 +1,13 @@
 import AgentWorkspace
 import Desk
 import Foundation
+import Experiences
 import NativeAgentShared
 import MacControl
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
-// Blueprint: | `AgentContactHealth.swift` | Shared reply-path health from the newest receipt's `no_reply_expired`, delivery failures and round trips; an app, program or recipe change since the proof is unverified, named ("Unverified since Muse updated to 7.0", "…since Hermes updated to 0.22.0", "…since the recipe changed"), with no repair; the next send or `agent.verify` re-proves. `repair` is the one repair: the contact's own send run dry (`AgentRecipeStore.dryRun`), for a send that sent nothing (`heal`: one retry of the same operation, or a harness item), and `agent.verify`, never the background check, which reads the last send's repair (an A2A contact's runs its dry run, `AgentPeerDiscovery.a2aCheck`); a desktop chat whose log changed shape after Return is filed, never retried, and a send that lands closes the contact's bridge items. Detached refreshes share one projection. Durable verification claims bound background checks to once per episode and once per contact per hour, without resend or a new poller. |
+// Blueprint: | `AgentContactHealth.swift` | Checked saved health and contact presence; refresh classifies receipt evidence at its owner, excluding definite unsent failures from broken reply paths and deadlines. Read failures remain unavailable with repair owed, and malformed Codex auth is never called signed out. `not_reached` preserves definite unsent evidence; round trips prove replies, while changed programs/recipes are unverified. `repair` runs the contact's own send dry only for explicit `agent.verify`; desktop uncertainty is filed, never retried. Durable claims bound background checks to once per episode/contact/hour. |
 
 /// Single flight per root. Saved exchanges own reply health; readiness never proves
 /// a reply. The existing continuation and contact reads refresh it without resends.
@@ -21,16 +22,16 @@ public actor AgentContactHealth {
     private var cardsRead: Set<String> = []
 
     /// Presence is read at presentation, independently of saved reply-path evidence.
-    public nonisolated static func read(dataRoot: URL) -> [String: AgentLocalHealth] {
-        var health = AgentLocalHealth.read(dataRoot).mapValues {
+    public nonisolated static func read(dataRoot: URL) throws -> [String: AgentLocalHealth] {
+        var health = try AgentLocalHealth.checkedRead(dataRoot).mapValues {
             var evidence = $0
             evidence.retainReplyEvidence()
             return evidence
         }
-        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
+        let peers = try AgentPeerStore(dataRoot: dataRoot).list()
         for peer in peers {
             let key = "peer:" + peer.id
-            guard let door = AgentConversationDelivery.door(for: key, dataRoot: dataRoot), door.liveReader else { continue }
+            guard let door = try AgentConversationDelivery.door(for: key, dataRoot: dataRoot, peers: peers), door.liveReader else { continue }
             let bridge = claudePresence(inbox: door.inbox)
             if health[key] == nil { health[key] = AgentLocalHealth(status: "unchecked", detail: "", checkedAt: .distantPast, authenticated: false) }
             health[key]?.present(bridge)
@@ -51,12 +52,17 @@ public actor AgentContactHealth {
     public nonisolated static func checkIn(_ peer: AgentPeerContact) -> AgentLocalHealth? {
         guard peer.transport == .mcpHost, !ChatGPTDotIPCTransport.owns(peer),
               AgentPeerStore.hostRowID(peer.endpoint).flatMap(AgentHostDirectory.row(named:))?.commandLine == nil else { return nil }
-        let at = peer.provenInboundAt.flatMap { ISO8601DateFormatter().date(from: $0) }
+        let at = peer.provenInboundAt.flatMap(NativeTimestampFormat.parseISO8601)
+        if peer.provenInboundAt != nil, at == nil {
+            return AgentLocalHealth(status: "unknown",
+                detail: "\(peer.name)'s saved check-in timestamp is unreadable. Repair its provenInboundAt in agents/peers.json before judging its presence.",
+                checkedAt: .distantPast, authenticated: false)
+        }
         let clock = DateFormatter()
         clock.dateFormat = "HH:mm"
         guard let at, Date().timeIntervalSince(at) < 1800 else {
             return AgentLocalHealth(status: "waiting", detail: "Messages wait for \(peer.name)'s next check-in"
-                + (at.map { " (last call \(ISO8601DateFormatter().string(from: $0)))" } ?? " (it has not called in yet)")
+                + (at.map { " (last call \(NativeTimestampFormat.plainZulu($0)))" } ?? " (it has not called in yet)")
                 + "; they go out in the result of its next call.", checkedAt: at ?? .distantPast, authenticated: false)
         }
         return AgentLocalHealth(status: "live", detail: "Live: \(peer.name) called in at \(clock.string(from: at)); a message goes out in the result of its next call.",
@@ -99,8 +105,9 @@ public actor AgentContactHealth {
     /// chain it always takes (`AgentRecipeStore.dryRun`). Its program is
     /// re-resolved and its handshake run with no prompt (ACP), its window's
     /// controls found without typing or coming forward (desktop chat), its
-    /// executable and args checked without launching (command line). Findings
-    /// are written to its recipe; a pass closes the bridge items it exercised.
+    /// executable and args checked without launching (command line). Protocol
+    /// checks may learn their own evidence; desktop labels are never guessed.
+    /// A pass closes the bridge items it exercised.
     package static func repair(_ agent: String, dataRoot: URL, workspace: String? = nil, perform: AgentConversationSession.Dispatch) async throws -> JSONValue {
         let store = AgentPeerStore(dataRoot: dataRoot)
         let peer = try store.list().first { "peer:" + $0.id == agent }
@@ -125,57 +132,23 @@ public actor AgentContactHealth {
         return found
     }
 
-    /// ONE RETRY, BOUND TO THE SEND THAT FAILED: a receipt saying nothing was
-    /// sent because the route and the agent disagree (`protocol_mismatch`,
-    /// `recipe_mismatch`) or it timed out starting runs `repair`. When that
-    /// passes, the same operation goes once more and stops there, saying what
-    /// healed. When it fails, the receipt (still not sent) keeps the dry run's
-    /// findings, and one harness item asks her to fix the recipe and send again.
-    /// A desktop chat whose log changed shape after Return (the message may
-    /// have gone out) is never retried, only filed. A send that lands closes
-    /// the contact's items: her fix worked.
-    package static func heal(_ receipt: JSONValue, row: AgentConversationRecord, dataRoot: URL,
-                             again: () async throws -> JSONValue, dispatch: AgentConversationSession.Dispatch) async throws -> JSONValue {
+    /// Keep the first exact send outcome. Repair is a separate explicit
+    /// operation; a failure never authorizes another outbound attempt.
+    package static func heal(_ receipt: JSONValue, row: AgentConversationRecord, dataRoot: URL) async -> JSONValue {
         guard row.agent.hasPrefix("peer:"), case .object(var failed) = receipt else { return receipt }
         if failed["completed"] == .bool(true) {
             await resolve(row.agent, [""], note: "A message reached it.", dataRoot: dataRoot)
             return receipt
         }
-        guard let reason = text(failed["reason"]) else { return receipt }
-        if failed["sent"] != .bool(false) {
-            guard ["recipe_mismatch", "not_confirmed"].contains(reason) else { return receipt }
-            failed["harness_item"] = await file(failed, reason: reason, row: row, dataRoot: dataRoot,
-                then: "The message may have gone out, so nothing was retried. Read its recipe with agent.recipe and fix it with agent.recipe_write; the next message that lands closes this.").map(JSONValue.string)
-            return .object(failed)
-        }
-        guard ["protocol_mismatch", "recipe_mismatch", "connection_startup_timeout"].contains(reason) else { return receipt }
-        // A dry run that cannot run leaves the send as it was: not sent.
-        let checked: JSONValue
-        do { checked = try await repair(row.agent, dataRoot: dataRoot, perform: dispatch) }
-        catch { checked = .object(["status": .string("failed"), "detail": .string("The dry run could not run: \(error.localizedDescription)")]) }
-        let found: [String: JSONValue] = if case .object(let fields) = checked { fields } else { [:] }
-        guard passed(checked) else {
-            failed["repair"] = checked
-            failed["harness_item"] = await file(failed, reason: reason, row: row, dataRoot: dataRoot,
-                then: "Dry run: " + (text(found["detail"]) ?? "did not pass.")
-                    + "\nRead its recipe with agent.recipe, fix it with agent.recipe_write, then agent.verify or send again.").map(JSONValue.string)
-            return .object(failed)
-        }
-        guard case .object(var resent) = try await again() else { return receipt }
-        resent["repair"] = checked
-        if resent["sent"] == .bool(true) {
-            resent["healed"] = .string((text(found["healed"]) ?? "\(row.name): the dry run passed") + ", message sent")
-        }
-        if resent["completed"] == .bool(true) { await resolve(row.agent, [""], note: "A message reached it.", dataRoot: dataRoot) }
-        if resent["sent"] != .bool(true) {
-            // The one retry did not go through: the same item, with the repair that passed.
-            let basis = text(resent["reason"]) == nil ? failed.merging(["detail": resent["detail"] ?? .null]) { $1 } : resent
-            resent["harness_item"] = await file(basis, reason: text(basis["reason"]) ?? reason, row: row, dataRoot: dataRoot,
-                then: "Dry run: " + (text(found["detail"]) ?? "passed.") + (resent["sent"] == .bool(false)
-                    ? "\nThe one retry was not sent either. Read its recipe with agent.recipe, fix it with agent.recipe_write, then agent.verify or send again."
-                    : "\nThe one retry may have gone out, so nothing more was retried. Read its recipe with agent.recipe and fix it with agent.recipe_write; the next message that lands closes this.")).map(JSONValue.string)
-        }
-        return .object(resent)
+        guard let reason = text(failed["reason"]),
+              ["protocol_mismatch", "recipe_mismatch", "connection_startup_timeout", "not_confirmed"].contains(reason) else { return receipt }
+        failed["automatic_resend"] = .bool(false)
+        failed["remedy"] = Repair.reconcile(instruction: "Inspect and repair this contact's authored connection with agent.verify; the failed message is never resent automatically.",
+            nextCall: .object(["tool": .string("app"), "input": .object([
+                "action": .string("agent.verify"), "args": .object(["agent": .string(row.agent)])])]))
+        failed["harness_item"] = await file(failed, reason: reason, row: row, dataRoot: dataRoot,
+            then: "Inspect the retained send before any new send. Read agent.recipe, correct it with agent.recipe_write, then explicitly verify or send.").map(JSONValue.string)
+        return .object(failed)
     }
 
     /// One harness item per contact, class and selector or method, ref the exchange; its handle.
@@ -214,6 +187,96 @@ public actor AgentContactHealth {
         version.range(of: #"\d+(\.\d+)+"#, options: .regularExpression).map { String(version[$0]) } ?? String(version.prefix { $0 != "\n" })
     }
 
+    /// The route's fields, never its prose, establish whether anything left.
+    /// Preserve positive or uncertain effects even in a contradictory receipt.
+    private nonisolated static func sentNothing(_ receipt: [String: JSONValue]) -> Bool {
+        // The route's own `sent` is the wire's evidence; a generic envelope's
+        // effects ("unknown" stamped on a failure, as Muse's 10-20 receipt was)
+        // speaks only when the route said nothing.
+        if case .bool(let sent)? = receipt["sent"] { return !sent }
+        if ["occurred", "partial", "unknown"].contains(text(receipt["effects"]) ?? "") { return false }
+        return receipt["effects"] == .string("none") || receipt["execution"] == .string("not_run")
+    }
+
+    private struct ReplyEvidence {
+        var good: Date?
+        var newest: AgentConversationRecord?
+        var expired: Date?
+        var failure: AgentConversationRecord?
+        var unsent: AgentConversationRecord?
+        var interrupted: Date?
+        var stalled: Date?
+    }
+
+    /// Shared by refresh and presentation so old persisted health obeys the
+    /// same law immediately: only a send with possible delivery can be broken.
+    private nonisolated static func replyEvidence(_ history: [AgentConversationRecord], peer: AgentPeerContact?) -> ReplyEvidence {
+        let pullReplyProof = peer.flatMap(Self.checkIn) == nil ? nil : peer?.provenOutboundAt
+        let good = (history.flatMap { $0.exchanges ?? [] }.filter { $0.reply != nil }.map { $0.settledAt ?? $0.sentAt }
+            + [peer?.roundTripProof?.at, peer?.mcpReturnProof?.at,
+               pullReplyProof].compactMap { $0.flatMap(NativeTimestampFormat.parseISO8601) }).max()
+        let newest = history.max { $0.updatedAt < $1.updatedAt }
+        let expired = newest.flatMap { row -> Date? in
+            guard row.stop == nil, !sentNothing(row.sendEvidence), case .object(let receipt)? = row.receipt,
+                  receipt["reply_state"] == .string("no_reply_expired"),
+                  case .string(let stamp)? = receipt["reply_deadline"], let deadline = NativeTimestampFormat.parseISO8601(stamp),
+                  (good ?? .distantPast) < deadline else { return nil }
+            return deadline
+        }
+        let failed = history.filter { row in
+            row.stop == nil && row.phase == "attention" && !AgentConversationSession.awaitingApproval(row)
+                && (row.sendFailed || sentNothing(row.sendEvidence)) && (good ?? .distantPast) < row.updatedAt
+        }
+        let failure = failed.filter { !sentNothing($0.sendEvidence)
+            && $0.sendEvidence["status"] != .string("no_reply_expired") }.min { $0.updatedAt < $1.updatedAt }
+        let unsent = failed.filter { sentNothing($0.sendEvidence) }.max { $0.updatedAt < $1.updatedAt }
+        // Our relaunch cut the send off: not a broken reply path.
+        let interrupted = newest.flatMap { row -> Date? in
+            guard row.stop == nil, row.phase == "attention", !sentNothing(row.sendEvidence),
+                  row.sendEvidence["status"] == .string("interrupted"), (good ?? .distantPast) < row.updatedAt else { return nil }
+            return row.updatedAt
+        }
+        let stalled = newest.flatMap { row -> Date? in
+            guard row.stop == nil, row.phase == "attention", !sentNothing(row.sendEvidence),
+                  row.sendEvidence["status"] == .string("outcome_unknown") else { return nil }
+            let at = row.exchanges?.last { $0.id == row.operationID }?.settledAt ?? row.updatedAt
+            return (good ?? .distantPast) < at ? at : nil
+        }
+        return ReplyEvidence(good: good, newest: newest, expired: expired, failure: failure,
+                             unsent: unsent, interrupted: interrupted, stalled: stalled)
+    }
+
+    private nonisolated static func brokenDetail(since: Date, good: Date?, name: String) -> String {
+        return "Reply path broken since \(NativeTimestampFormat.plainZulu(since)); last good \(good.map(NativeTimestampFormat.plainZulu) ?? "never"). Run agent.verify for \(name); do not resend the message."
+    }
+
+    private nonisolated static func notReached(_ row: AgentConversationRecord, peer: AgentPeerContact?, good: Date?) -> AgentLocalHealth {
+        let receipt = row.sendEvidence
+        let reason = text(receipt["detail"]) ?? text(receipt["error"]) ?? text(receipt["execution_error"])
+            ?? text(receipt["reason"]) ?? "The send did not run."
+        var detail = "Not reached yet: \(reason) (\(NativeTimestampFormat.plainZulu(row.updatedAt)))."
+        let code = text(receipt["reason"])
+        if peer?.transport == .desktopChat {
+            let trusted = SystemMacAXElementSource().isTrusted()
+            let installed = peer?.appBundleIDs.contains { AgentHostRow.applicationURL($0) != nil } == true
+            // Old desktop receipts have sent=false but no blocker code. State
+            // today's readable prerequisites without inferring a cause from prose.
+            if trusted && installed && (code == nil || code == "accessibility_permission_missing") {
+                detail += code == nil
+                    ? " Accessibility is granted and the app is installed now; the next send may try."
+                    : " Accessibility is granted now; that cause is gone and the next send may try."
+            } else if !trusted {
+                detail += " Accessibility is off now."
+            } else if !installed {
+                detail += " The app is not installed now."
+            }
+        }
+        var observed = AgentLocalHealth(status: "not_reached", detail: detail, checkedAt: Date(), authenticated: false)
+        observed.failureOperation = row.operationID
+        observed.lastGoodAt = good
+        return observed
+    }
+
     public func refresh(dataRoot: URL) async {
         let key = dataRoot.standardizedFileURL.path
         guard running.insert(key).inserted else { pending.insert(key); return }
@@ -221,13 +284,21 @@ public actor AgentContactHealth {
             running.remove(key)
             if pending.remove(key) != nil { Task { await refresh(dataRoot: dataRoot) } }
         }
-        guard let peers = try? AgentPeerStore(dataRoot: dataRoot).list(),
-              let records = try? AgentConversationStore(dataRoot: dataRoot).recordsUnlocked() else { return }
-        guard var previous = try? AgentLocalHealth.checkedRead(dataRoot) else { return }
-        let iso = ISO8601DateFormatter()
+        let peers: [AgentPeerContact], records: [AgentConversationRecord]
+        var previous: [String: AgentLocalHealth]
+        do {
+            (peers, records, previous) = try RepairOwed.attempt(dataRoot, operation: "agent.health.read",
+                owner: "Contact health source storage",
+                lever: "Repair the named contact, conversation or health file; saved health is preserved.",
+                words: { "Contact health cannot be refreshed: " + $0.localizedDescription }) {
+                (try AgentPeerStore(dataRoot: dataRoot).list(),
+                 try AgentConversationStore(dataRoot: dataRoot).recordsUnlocked(),
+                 try AgentLocalHealth.checkedRead(dataRoot))
+            }
+        } catch { return }
         let probes: [(String, Probe)] = peers.map { peer in
             let key = "peer:" + peer.id
-            if let door = AgentConversationDelivery.door(for: key, dataRoot: dataRoot), door.liveReader {
+            if let door = AgentConversationDelivery.door(for: key, dataRoot: dataRoot, contacts: peers), door.liveReader {
                 return (key, .bridge(live: Self.claudePresence(inbox: door.inbox).status == "recent_activity"))
             }
             return (key, probe(peer))
@@ -238,44 +309,28 @@ public actor AgentContactHealth {
         for (agent, probe) in probes {
             let history = records.filter { $0.agent == agent }
             let peer = peers.first { "peer:" + $0.id == agent }
-            let pullReplyProof = peer.flatMap(Self.checkIn) == nil ? nil : peer?.provenOutboundAt
-            let good = (history.flatMap { $0.exchanges ?? [] }.filter { $0.reply != nil }.map { $0.settledAt ?? $0.sentAt }
-                + [peer?.roundTripProof?.at, peer?.mcpReturnProof?.at,
-                   pullReplyProof].compactMap { $0.flatMap(iso.date) }).max()
-            let newest = history.max { $0.updatedAt < $1.updatedAt }
-            let expired = newest.flatMap { row -> Date? in
-                guard row.stop == nil, case .object(let receipt)? = row.receipt,
-                      receipt["reply_state"] == .string("no_reply_expired"),
-                      case .string(let stamp)? = receipt["reply_deadline"], let deadline = iso.date(from: stamp),
-                      (good ?? .distantPast) < deadline else { return nil }
-                return deadline
-            }
-            let failure = history.compactMap { row -> (AgentConversationRecord, Date)? in
-                guard row.stop == nil else { return nil }
-                guard row.phase == "attention", !AgentConversationSession.awaitingApproval(row) else { return nil }
-                let receipt = row.sendEvidence
-                return row.sendFailed && receipt["status"] != .string("no_reply_expired") ? (row, row.updatedAt) : nil
-            }.filter { (good ?? .distantPast) < $0.1 }.min { $0.1 < $1.1 }
-            // Our own relaunch cut the last send off: not broken, nothing to repair.
-            let interrupted = newest.flatMap { row -> Date? in
-                guard row.stop == nil, row.phase == "attention", case .object(let receipt)? = row.receipt,
-                      receipt["status"] == .string("interrupted"), (good ?? .distantPast) < row.updatedAt else { return nil }
-                return row.updatedAt
-            }
-            // A sent message whose reply ended unknown stalled; its send path did not fail.
-            let stalled = newest.flatMap { row -> Date? in
-                guard row.stop == nil, row.phase == "attention", case .object(let receipt)? = row.receipt,
-                      receipt["status"] == .string("outcome_unknown"), receipt["sent"] != .bool(false) else { return nil }
-                let at = row.exchanges?.last { $0.id == row.operationID }?.settledAt ?? row.updatedAt
-                return (good ?? .distantPast) < at ? at : nil
-            }
-            let operation = failure?.0.operationID ?? (expired == nil ? nil : newest?.operationID)
+            let evidence = Self.replyEvidence(history, peer: peer)
+            let good = evidence.good, expired = evidence.expired, failure = evidence.failure
+            let interrupted = evidence.interrupted, stalled = evidence.stalled
+            let operation = failure?.operationID ?? (expired == nil ? nil : evidence.newest?.operationID)
             // An inbound-only contact has no send path to be unavailable: a send
             // it refused is not a broken reply path (the transport lifts an older mark).
             let inboundOnly = peer.map { ChatGPTDotIPCTransport.owns($0) && ChatGPTDotIPCTransport.inboundOnly } == true
-            let unavailable = inboundOnly ? nil : peer?.unavailableAt.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
-            let broken = inboundOnly ? nil : ([failure?.1, unavailable]
-                .compactMap { $0 }.filter { (good ?? .distantPast) < $0 }).min()
+            // A bare unavailable mark says nothing about delivery (it can be
+            // recorded before launch). The send receipt alone owns reply health.
+            let broken = inboundOnly ? nil : failure?.updatedAt
+            if !inboundOnly, broken == nil, expired == nil, interrupted == nil, stalled == nil,
+               let unsent = evidence.unsent {
+                let observed = Self.notReached(unsent, peer: peer, good: good)
+                if observed.replyStatus != previous[agent]?.replyStatus || observed.detail != previous[agent]?.detail
+                    || observed.failureOperation != previous[agent]?.failureOperation || observed.lastGoodAt != previous[agent]?.lastGoodAt
+                    || previous[agent]?.brokenSince != nil || previous[agent]?.repairFor != nil || previous[agent]?.repairDetail != nil
+                    || previous[agent]?.repairAttemptedAt != nil {
+                    previous[agent] = observed
+                    changed = true
+                }
+                continue
+            }
             let proof = peer?.roundTripProof ?? peer?.mcpReturnProof
             let appVersion = peer?.appBundleIDs.compactMap(AgentHostRow.applicationURL).first
                 .flatMap { AgentPeerContact.appVersion(at: $0.path) }
@@ -290,8 +345,19 @@ public actor AgentContactHealth {
                     catch { nativeLog("AgentContactHealth: %@'s card was not checked: %@", peer.name, error.localizedDescription) }
                 }
             }
+            let recipeDigest: String?
+            do { recipeDigest = try recipe?.hostDigest }
+            catch {
+                var observed = previous[agent] ?? AgentLocalHealth(status: "unavailable", detail: "", checkedAt: Date(), authenticated: false)
+                observed.status = "unavailable"
+                observed.detail = "The recipe's identity cannot be read: \(error.localizedDescription). Repair its recipe file before verifying this contact."
+                observed.checkedAt = Date()
+                previous[agent] = observed
+                changed = true
+                continue
+            }
             let recipeChanged = (proof?.recipeVersion != nil || proof?.recipeDigest != nil)
-                && (proof?.recipeVersion != recipe?.recipeVersion || proof?.recipeDigest != recipe?.hostDigest)
+                && (proof?.recipeVersion != recipe?.recipeVersion || proof?.recipeDigest != recipeDigest)
             // A program's version as its approved receipt reported it (a Full Mac
             // launch follows an update and records the new one), against the proof's.
             let programVersion = peer?.acpExecutable?.version
@@ -312,12 +378,12 @@ public actor AgentContactHealth {
                 // which way is broken: a send that cannot be delivered is not a reply path.
                 let dotWords: String? = if let peer, ChatGPTDotIPCTransport.owns(peer), !ChatGPTDotIPCTransport.available,
                     case .object(let state) = ChatGPTDotIPCTransport.readiness, let why = Self.text(state["detail"]), !why.isEmpty {
-                    "Sends to \(peer.name) cannot be delivered: \(why) He can still reach her by running the local message command on this Mac (nativeagent-link message, with his contact file); a reply typed in his own chat no longer arrives. Last good send \(good.map(iso.string) ?? "never")."
+                    "Sends to \(peer.name) cannot be delivered: \(why) He can still reach her by running the local message command on this Mac (nativeagent-link message, with his contact file); a reply typed in his own chat no longer arrives. Last good send \(good.map(NativeTimestampFormat.plainZulu) ?? "never")."
                 } else { nil }
                 observed.detail = dotWords ?? broken.map {
-                    "Reply path broken since \(iso.string(from: $0)); last good \(good.map(iso.string) ?? "never"). Run agent.verify for \(peer?.name ?? agent); do not resend the message."
+                    Self.brokenDetail(since: $0, good: good, name: peer?.name ?? agent)
                 } ?? expired.map {
-                    "No reply by the deadline \(iso.string(from: $0)); last good \(good.map(iso.string) ?? "never"). Run agent.verify for \(peer?.name ?? agent); do not resend the message."
+                    "No reply by the deadline \(NativeTimestampFormat.plainZulu($0)); last good \(good.map(NativeTimestampFormat.plainZulu) ?? "never"). Run agent.verify for \(peer?.name ?? agent); do not resend the message."
                 } ?? (interrupted ?? stalled).map { at in
                     let clock = DateFormatter()
                     clock.dateFormat = "HH:mm"
@@ -330,13 +396,13 @@ public actor AgentContactHealth {
                 if ["interrupted", "stalled", "unverified"].contains(observed.status) {
                     observed.repairFor = nil
                     observed.repairDetail = nil
-                } else if let reason = operation ?? broken.map(iso.string), observed.repairFor != reason,
+                } else if let reason = operation ?? broken.map(NativeTimestampFormat.plainZulu), observed.repairFor != reason,
                    Date().timeIntervalSince(observed.repairAttemptedAt ?? .distantPast) >= 3600,
                    peer?.transport != .grokBot || grokVerifiers[key] != nil {
                     observed.repairFor = reason
                     observed.repairAttemptedAt = Date()
                     // The send already ran the repair: what it found, not a second run.
-                    if case .object(let receipt)? = failure?.0.receipt, case .object(let repair)? = receipt["repair"],
+                    if case .object(let repair)? = failure?.sendEvidence["repair"],
                        let found = Self.text(repair["detail"]) {
                         observed.repairDetail = found
                     } else {
@@ -383,7 +449,8 @@ public actor AgentContactHealth {
         let active = Set(probes.map(\.0))
         previous = previous.filter { active.contains($0.key) }
         guard let savedHealth = try? AgentLocalHealth.checkedRead(dataRoot) else { return }
-        for (agent, saved) in savedHealth where saved.repairFor == previous[agent]?.repairFor {
+        for (agent, saved) in savedHealth where previous[agent]?.replyStatus != "not_reached"
+            && saved.repairFor == previous[agent]?.repairFor {
             previous[agent]?.repairDetail = saved.repairDetail
         }
         do { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(previous), to: AgentLocalHealth.url(dataRoot)) }
@@ -406,7 +473,7 @@ public actor AgentContactHealth {
                     ? " An actual reply is still unproven; run agent.verify for \(name)."
                     : " Fix its recipe with agent.recipe_write, or ask \(name)'s owner to restore its card, then run agent.verify.")
             } else if let peer, peer.transport == .nativeAgent {
-                let result = try await AgentPeerDiscovery.resolve(peer.endpoint, bearerToken: AgentPeerCredentials.read(peerID: peer.id))
+                let result = try await AgentPeerDiscovery.resolve(peer.endpoint.appendingPathComponent("agent/card"), bearerToken: AgentPeerCredentials.read(peerID: peer.id))
                 detail = result.transport == peer.transport
                     ? "Connection check passed; an actual reply is still unproven. Run agent.verify for \(name)."
                     : "Connection check failed. Ask \(name)'s owner to restore its advertised reply endpoint, then run agent.verify."
@@ -536,8 +603,15 @@ public actor AgentContactHealth {
                 if case .string(let text)? = value { return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                 return false
             }
-            guard let data = try? Data(contentsOf: authPath),
-                  case .object(let auth)? = try? JSONValue.parse(data) else { return result("signed_out", "Signed out — run codex login") }
+            let auth: [String: JSONValue]
+            do {
+                let data = try Data(contentsOf: authPath)
+                guard case .object(let fields) = try JSONValue.parse(data) else {
+                    return result("unknown", "Codex authentication file is malformed; repair " + authPath.path)
+                }
+                auth = fields
+            } catch CocoaError.fileReadNoSuchFile { return result("signed_out", "Signed out — run codex login") }
+            catch { return result("unknown", "Codex authentication could not be read: " + error.localizedDescription + ". Repair " + authPath.path) }
             var tokens: [String: JSONValue] = [:]
             if case .object(let saved)? = auth["tokens"] { tokens = saved }
             return present(tokens["access_token"]) || present(tokens["refresh_token"]) || present(auth["OPENAI_API_KEY"])

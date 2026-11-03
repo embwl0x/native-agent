@@ -84,11 +84,14 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         let body = organism.bodySchema
         if !body.macAwake { return "resting" }
         if !body.providersHealthy || !body.toolHandsAvailable { return "provider/tool brittle" }
-        if !body.iPhoneReachable || !body.notificationPathHealthy { return "phone path stale" }
+        if !body.iPhoneReachable { return "phone reachability unconfirmed" }
+        if body.notificationPathHealthy == false { return "phone delivery failed" }
         if !body.memoryHealthy { return "memory brittle" }
         if !body.dreamHealthy { return "dreams need attention" }
         if !body.approvalChannelsOpen { return "approval path closed" }
         if body.resourcePressure != .nominal { return "resource tight" }
+        // Unknown is not a fault: it never hides one.
+        if body.notificationPathHealthy == nil { return "phone delivery unconfirmed" }
         return "body steady"
     }
 
@@ -123,11 +126,13 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         guard organism.enabled else { return "No body line appears while the organism kernel is off." }
         let body = organism.bodySchema
         if !body.providersHealthy || !body.toolHandsAvailable { return "Provider or tool path is brittle, so completion claims tighten." }
-        if !body.notificationPathHealthy || !body.iPhoneReachable { return "Phone path is stale, so delivery needs receipts." }
+        if !body.iPhoneReachable { return "Phone reachability is unconfirmed; notification delivery needs its own receipts." }
+        if body.notificationPathHealthy == false { return "Phone delivery failed, so delivery needs receipts." }
         if body.resourcePressure != .nominal { return "Resource pressure is present in her body state." }
         if !body.memoryHealthy || !body.dreamHealthy || !body.approvalChannelsOpen {
             return "A local body path needs \(agentDisplayName)'s attention, but no user action is requested."
         }
+        if body.notificationPathHealthy == nil { return "Phone delivery is unconfirmed; reachability alone does not prove delivery." }
         if blockedDeskCount > 0 { return "Desk has blocked work, but it is not waiting on your decision." }
         if organism.projectedBodyLine == nil { return "No Body line appears because the body state is steady enough to stay quiet." }
         return "Body line is active because the current state is shaping the turn."

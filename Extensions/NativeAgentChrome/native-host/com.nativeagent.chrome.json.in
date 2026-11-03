@@ -2,6 +2,7 @@
   "name": "com.nativeagent.chrome",
   "description": "NativeAgent Chrome transport relay",
   "path": "__ABSOLUTE_NATIVEAGENT_CHROME_RELAY_PATH__",
+  "nativeagent_bundle_id": "__NATIVEAGENT_APP_BUNDLE_IDENTIFIER__",
   "type": "stdio",
   "allowed_origins": [
     "chrome-extension://egdbijiogeeggnmjheomgnnkhmlepfcn/"

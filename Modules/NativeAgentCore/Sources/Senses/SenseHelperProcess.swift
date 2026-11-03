@@ -4,7 +4,7 @@ import CryptoKit
 import Darwin
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `SenseHelperProcess.swift` | Request and observation supervision over OwnedProgramProcess; pending work joins settlement before release |
+// Blueprint: | `SenseHelperProcess.swift` | Request and observation supervision over OwnedProgramProcess; pending work joins settlement before release, folds every returned action on success/interruption, and throws rejected news from the worker without self-joining termination; cancellation remains cancellation, checked file absence stays news, and app baseline/event comparison excludes frame and observer-coverage metadata |
 
 actor SenseHelperProcess {
     private struct Pending {
@@ -36,6 +36,7 @@ actor SenseHelperProcess {
         }
     }
     private var lastAppObservation: JSONValue?
+    private var sourceUnavailable = false
     private var newsGeneration = 0
     private var sourceAddress: String?
     private var sourceFile: String?
@@ -44,7 +45,7 @@ actor SenseHelperProcess {
     private var pendingChange: SenseMaterial?
     private var observedSource: (any SenseSourceProvider)?
     private var observationGeneration = UUID()
-    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var pendingDone = ScopedWaiter()
     private var reader: Task<Void, Never>?
     private var termination: Task<Void, Never>?
     private var idleHolds = 0
@@ -94,15 +95,8 @@ actor SenseHelperProcess {
             }
         }
         while !stopped, pending != nil, !Task.isCancelled {
-            let waiterID = UUID()
-            await withTaskCancellationHandler {
-                await withCheckedContinuation { continuation in
-                    if Task.isCancelled { continuation.resume() }
-                    else { waiters[waiterID] = continuation }
-                }
-            } onCancel: {
-                Task { await self.cancelWaiter(waiterID) }
-            }
+            let done = pendingDone
+            await done.park()
         }
         guard !stopped, !Task.isCancelled else {
             return .failed(SenseFailure(code: stopped ? "crashed" : "busy", message: "Sense helper is unavailable or already answering."))
@@ -218,7 +212,7 @@ actor SenseHelperProcess {
                             case "notify":
                                 let news = try decodeNews(fields["news"])
                                 try transport.renewProgress(id)
-                                await postNews(news)
+                                try await postNews(news)
                             case "source_read", "source_watch", "state_get", "state_set", "app_read":
                                 let waitStarted = try transport.suspend(id)
                                 do {
@@ -322,20 +316,29 @@ actor SenseHelperProcess {
         await terminate(failure: nil, interruption: SenseFailure(code: "cancelled", message: "Sense request cancelled."))
     }
 
-    private func cancelWaiter(_ id: UUID) {
-        // Removal is the single continuation claim shared with finish/stop.
-        waiters.removeValue(forKey: id)?.resume()
-    }
-
     /// Called only by the joined worker's cancellation-independent settlement. A returned door receipt survives an interrupted sense without claiming that the helper finished interpreting it.
     private func finish(_ id: Int, _ outcome: SenseOutcome) -> SenseOutcome {
         guard let current = pending, current.id == id else { return outcome }
         pending = nil
         var outcome = current.interruption.map(SenseOutcome.failed) ?? outcome
-        if case .failed(let failure) = outcome, !current.returnedActions.isEmpty {
-            outcome = .acted(.object(failure.failureEvidence().merging([
-                "effects": .string("unknown"), "returned_actions": .array(current.returnedActions),
-            ]) { _, owned in owned }), SenseProvenance(record: record))
+        if !current.returnedActions.isEmpty {
+            var fields: [String: JSONValue]
+            switch outcome {
+            case .failed(let failure):
+                fields = failure.failureEvidence()
+                // An interrupted helper may have dispatched a call that never answered.
+                fields["effects"] = .string("unknown")
+            case .acted(let result, _):
+                fields = if case .object(let value) = result { value } else { ["result": result] }
+            case .page: fields = ["status": .string("ok"), "read": .bool(true)]
+            }
+            let effects = current.returnedActions.map { action -> JSONValue in
+                guard case .object(let value) = action else { return .string("unknown") }
+                return OwnedProgramRunner.effects(value) ?? .string("unknown")
+            } + (fields["effects"].map { [$0] } ?? [])
+            fields["effects"] = [JSONValue.string("unknown"), .string("partial"), .string("occurred")].first(where: effects.contains) ?? .string("none")
+            fields["returned_actions"] = .array(current.returnedActions)
+            outcome = .acted(.object(fields), SenseProvenance(record: record))
         }
         let receipt: JSONValue
         switch outcome {
@@ -358,8 +361,8 @@ actor SenseHelperProcess {
             }
         }
         current.events.finish(); transport.end(id)
-        let waiting = waiters; waiters.removeAll()
-        for waiter in waiting.values { waiter.resume() }
+        pendingDone.resume()
+        pendingDone = ScopedWaiter()
         Task { await onSettled() }
         if !stopped, watching, pendingChange != nil {
             onSourceChange()
@@ -390,8 +393,8 @@ actor SenseHelperProcess {
             pending = current
         }
         reader?.cancel(); observation?.cancel()
-        let waiting = waiters; waiters.removeAll()
-        for waiter in waiting.values { waiter.resume() }
+        pendingDone.resume()
+        pendingDone = ScopedWaiter()
         transport.stop()
         let termination = Task { [onExit] in
             await settle {
@@ -511,9 +514,9 @@ actor SenseHelperProcess {
                 observationGeneration = generation
                 // Following outlives this read and inherits no turn's authority.
                 observation = Task.detached(priority: .utility) { [weak self] in
-                    for await material in changes {
+                    for await change in changes {
                         guard !Task.isCancelled else { break }
-                        await self?.receiveChange(material, generation: generation)
+                        await self?.receiveChange(change, generation: generation)
                     }
                     await self?.observationEnded(generation)
                 }
@@ -529,8 +532,45 @@ actor SenseHelperProcess {
         observedSource = nil; pendingChange = nil; watching = false
     }
 
-    private func receiveChange(_ material: SenseMaterial, generation: UUID) async {
+    private func receiveChange(_ change: SenseSourceChange, generation: UUID) async {
         guard !stopped, !Task.isCancelled, generation == observationGeneration else { return }
+        if case .absent = change {
+            // There are no bytes to hand the helper. Keep the source watch
+            // alive and report the checked absence on this sense's news.
+            do {
+                try await postNews(SenseNews(senseID: record.id, version: record.version,
+                    address: sourceAddress ?? record.corner.key,
+                    summary: "Watched path is absent.", at: Date()))
+                pendingChange = nil
+                sourceUnavailable = false
+            } catch {
+                await terminate(failure: HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record)))
+            }
+            return
+        }
+        guard case .changed(let material, _) = change else {
+            if case .unavailable(let failure) = change {
+                sourceUnavailable = true
+                do {
+                    try await postNews(SenseNews(senseID: record.id, version: record.version,
+                        address: sourceAddress ?? record.corner.key,
+                        summary: "Source observation unavailable: " + failure.message, at: Date()))
+                } catch {
+                    await terminate(failure: HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record)))
+                }
+            }
+            return
+        }
+        if sourceUnavailable {
+            do {
+                try await postNews(SenseNews(senseID: record.id, version: record.version,
+                    address: sourceAddress ?? record.corner.key, summary: "Source observation available again.", at: Date()))
+                sourceUnavailable = false
+            } catch {
+                await terminate(failure: HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record)))
+                return
+            }
+        }
         if case .app = record.corner, let content = Self.appObservation(material) {
             guard content != lastAppObservation else { return }
             lastAppObservation = content
@@ -548,9 +588,13 @@ actor SenseHelperProcess {
         case .app: summary = "Stopped following this corner because its source events ended."
         case .fileKind, .stream, .need: summary = "Stopped following this file because its source events ended."
         }
-        await postNews(SenseNews(senseID: record.id, version: record.version,
-            address: sourceAddress ?? record.corner.key,
-            summary: summary, at: Date()))
+        do {
+            try await postNews(SenseNews(senseID: record.id, version: record.version,
+                address: sourceAddress ?? record.corner.key, summary: summary, at: Date()))
+        } catch {
+            await terminate(failure: HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record)))
+            return
+        }
         guard generation == observationGeneration, !stopped, !Task.isCancelled else { return }
         await terminate(failure: nil)
     }
@@ -559,6 +603,9 @@ actor SenseHelperProcess {
         guard case .accessibility(.object(var fields)) = material else { return nil }
         // A new selection frame is bookkeeping, not news from the world.
         fields.removeValue(forKey: "frame_id")
+        // Subscription coverage describes the observer, not app content. Both
+        // the initial read and event material compare the same content fields.
+        fields.removeValue(forKey: "ax_watch_coverage")
         return .object(fields)
     }
 
@@ -581,11 +628,11 @@ actor SenseHelperProcess {
             }
             guard !stopped, !Task.isCancelled, observationGeneration == generation else { return }
             if case .failed(let failure) = outcome {
-                await postNews(SenseNews(senseID: record.id, version: record.version,
+                try await postNews(SenseNews(senseID: record.id, version: record.version,
                     address: sourceAddress ?? record.corner.key,
                     summary: "Live change could not be read: \(ContextSecretContentPolicy.redactedFragment(failure.code)): \(ContextSecretContentPolicy.redactedFragment(failure.message))", at: Date()))
             } else if case .app = record.corner, newsGeneration == previousNews {
-                await postNews(SenseNews(senseID: record.id, version: record.version,
+                try await postNews(SenseNews(senseID: record.id, version: record.version,
                     address: sourceAddress ?? record.corner.key, summary: "App view changed.", at: Date()))
             }
         } catch {
@@ -619,16 +666,20 @@ actor SenseHelperProcess {
         return try SenseWire.news(value, senseID: record.id, version: record.version)
     }
 
-    private func postNews(_ news: SenseNews) async {
-        do {
-            guard record.status == .on, let registry = SensesHub.shared.registry,
-                  let current = try await registry.sense(for: record.corner), current.status == .on,
-                  current.id == record.id, current.version == record.version else { return }
-            var news = news
-            news.observationID = isSite ? sourceTab : sourceFile
-            await SenseNewsBoard.shared.post(news)
-            newsGeneration &+= 1
-        } catch { await terminate(failure: HelperSenseRunner.failure(error, provenance: SenseProvenance(record: record))) }
+    private func postNews(_ news: SenseNews) async throws {
+        guard let registry = SensesHub.shared.registry else {
+            throw SenseFailure(code: "source_unavailable", message: "Sense news registry is not installed.")
+        }
+        guard record.status == .on,
+              let current = try await registry.sense(for: record.corner), current.status == .on,
+              current.id == record.id, current.version == record.version else { return }
+        var news = news
+        news.observationID = isSite ? sourceTab : sourceFile
+        guard await SenseNewsBoard.shared.post(news) else {
+            try Task.checkCancellation()
+            throw SenseFailure(code: "news_not_kept", message: "Sense news was not accepted by private news storage.")
+        }
+        newsGeneration &+= 1
     }
 
     private func send(_ message: JSONValue) throws {

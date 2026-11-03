@@ -23,10 +23,13 @@ public struct NativeAgentWidgetSnapshot: Codable, Equatable, Sendable {
     }
 
     public static func fileURL() throws -> URL {
-        guard let group = Bundle.main.object(forInfoDictionaryKey: "NativeAgentMacAppGroupID") as? String,
-              !group.isEmpty,
-              let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) else {
-            throw CocoaError(.fileNoSuchFile)
+        guard let group = Bundle.main.object(forInfoDictionaryKey: "NativeAgentMacAppGroupID") as? String, !group.isEmpty else {
+            throw NSError(domain: "NativeAgent.Widget", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                "The widget's NativeAgentMacAppGroupID configuration is missing"])
+        }
+        guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) else {
+            throw NSError(domain: "NativeAgent.Widget", code: 2, userInfo: [NSLocalizedDescriptionKey:
+                "The widget cannot access its configured app-group container (\(group))"])
         }
         return container.appendingPathComponent(filename)
     }

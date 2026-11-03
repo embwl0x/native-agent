@@ -23,7 +23,7 @@ public enum BotRunConversation {
         }
         guard case .object(let fields) = result, fields["automatic_return"] == .bool(true),
               case .string(let raw)? = fields["requestId"], let requestID = UUID(uuidString: raw) else {
-            throw StandingBotsError.invalidValue("The requested check has no confirmed return address. Inspect its saved work before requesting it again.")
+            throw ToolFailureError("The requested check has no confirmed return address. Retained outcome: \(result). Inspect that operation before requesting it again.", effects: .unknown)
         }
         return requestID
     }
@@ -33,7 +33,7 @@ public enum BotRunConversation {
         let definitions = BotDefinitionStore(dataRoot: dataRoot)
         let bot: BotDefinition
         do {
-            let allowed: Set<String> = ["id", "bot_id", "bot", "name", "question", "session_id", "__session_id"]
+            let allowed: Set<String> = ["id", "question", "session_id", "__session_id"]
             let unknown = Set(input.keys).subtracting(allowed)
             guard unknown.isEmpty else {
                 throw StandingBotsError.invalidValue("Unknown fields: " + unknown.sorted().joined(separator: ", "))
@@ -84,19 +84,27 @@ public enum BotRunConversation {
         let result: JSONValue
         do { result = try await perform("bot_run_once", input) }
         catch {
-            _ = try? store.update(id: row.id, operationID: row.operationID) {
-                $0.phase = "attention"; $0.deliveryState = "interrupted"
-                $0.receipt = .object(["status": .string("interrupted"),
-                    "detail": .string("The check did not return a confirmed queue receipt. It was not retried.")])
+            let underlying = error
+            do {
+                _ = try store.update(id: row.id, operationID: row.operationID) {
+                    $0.phase = "attention"; $0.deliveryState = "interrupted"
+                    $0.receipt = .object(["status": .string("interrupted"),
+                        "detail": .string(ChatToolOutcome.errorMessage(underlying))])
+                }
+            } catch {
+                throw bookkeepingFailure(rowID: row.id, operationID: row.operationID,
+                    outcome: ChatToolOutcome.failure(error: underlying, tool: "bot_run_once"), error: error)
             }
-            throw error
+            throw underlying
         }
         guard case .object(var fields) = result, [JSONValue.string("queued"), .string("joined")].contains(fields["status"] ?? .null),
               case .string(let returnedBot)? = fields["id"], UUID(uuidString: returnedBot) == bot.id,
               case .string(let request)? = fields["requestId"], let requestID = UUID(uuidString: request) else {
-            _ = try? store.update(id: row.id, operationID: row.operationID) {
-                $0.phase = "attention"; $0.deliveryState = "not_registered"; $0.receipt = AgentConversationStore.cacheReceipt(result)
-            }
+            do {
+                _ = try store.update(id: row.id, operationID: row.operationID) {
+                    $0.phase = "attention"; $0.deliveryState = "not_registered"; $0.receipt = AgentConversationStore.cacheReceipt(result)
+                }
+            } catch { throw bookkeepingFailure(rowID: row.id, operationID: row.operationID, outcome: result, error: error) }
             return result
         }
         do {
@@ -113,8 +121,15 @@ public enum BotRunConversation {
             fields["detail"] = .string("\(fields["status"] == .string("joined") ? "Joined" : "Queued") run \(requestID.uuidString). Its result will return to conversation \(scope) and be saved on the helper's shelf; you can keep talking in the meantime.")
         } catch {
             fields["automatic_return"] = .bool(false)
+            fields["conversation_id"] = .string(row.id)
+            fields["operation_id"] = .string(row.operationID)
+            fields["bookkeeping_error"] = .string(ChatToolOutcome.errorMessage(error))
             fields["detail"] = .string("The run was accepted, but its return address could not be saved. Read the exact saved result later; do not queue the check again.")
         }
         return .object(fields)
+    }
+
+    private static func bookkeepingFailure(rowID: String, operationID: String, outcome: JSONValue, error: Error) -> ToolFailureError {
+        ToolFailureError("Helper outcome: \(outcome). Conversation \(rowID), operation \(operationID) remains unsettled: \(ChatToolOutcome.errorMessage(error)). Inspect that operation; do not queue it again.", effects: .unknown)
     }
 }

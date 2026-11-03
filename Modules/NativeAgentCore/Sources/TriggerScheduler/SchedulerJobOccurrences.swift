@@ -10,7 +10,7 @@ import WorkshopExecution
 import Experiences
 import NotificationInbox
 import Darwin
-// Blueprint: | `SchedulerJobOccurrences.swift` | SwiftNativeTriggerScheduler life-stamped job occurrence claims, settlement, pruning and default-cycle row updates |
+// Blueprint: | `SchedulerJobOccurrences.swift` | SwiftNativeTriggerScheduler life-stamped job occurrence claims, settlement, pruning and default-cycle row updates; claim preparation leaves retired intention evidence untouched |
 
 extension SwiftNativeTriggerScheduler {
     public struct DueJob: Sendable {
@@ -40,7 +40,7 @@ extension SwiftNativeTriggerScheduler {
             self.payload = payload
             self.row = row
             self.dueEpoch = dueEpoch
-            let civil: String? = if case .object(let object) = row, object["retryPendingUntilEpoch"] == nil {
+            let civil: String? = if case .object(let object) = row {
                 SchedulerJobRuntime.wallClockOccurrence(for: object, epoch: dueEpoch)
             } else { nil }
             self.occurrenceKey = try occurrenceKey ?? Self.makeOccurrenceKey(jobId: id, dueEpoch: dueEpoch, civil: civil)
@@ -118,12 +118,10 @@ extension SwiftNativeTriggerScheduler {
             let life = try DataRootLife.current(in: root)
             for index in rows.indices {
                 guard case .object(var object) = rows[index] else { continue }
-                var rowChanged = Self.rearmFutureOneShot(&object, now: now, life: life)
-                if object["nextWallClockOccurrence"] == nil,
-                   let occurrence = SchedulerJobRuntime.nextWallClockOccurrence(for: object) {
-                    object["nextWallClockOccurrence"] = .string(occurrence)
-                    rowChanged = true
-                }
+                // Retired intention definitions keep their saved occurrence
+                // evidence for the stopped-record notice, never claim preparation.
+                guard !["notify", "turn", "workshop"].contains(SchedulerJobRuntime.string(object["kind"])?.lowercased() ?? "notify") else { continue }
+                let rowChanged = Self.rearmFutureOneShot(&object, now: now, life: life)
                 guard rowChanged else { continue }
                 rows[index] = .object(object)
             }
@@ -219,7 +217,6 @@ extension SwiftNativeTriggerScheduler {
                 ?? SchedulerJobRuntime.epoch(from: object["nextRunAtEpoch"]),
               due > now.timeIntervalSince1970 else { return false }
         object.removeValue(forKey: "activeOccurrence")
-        clearRetryState(&object)
         return true
     }
 
@@ -269,10 +266,7 @@ extension SwiftNativeTriggerScheduler {
                 object["enabled"] = .bool(false)
                 object["disabledReason"] = .string("unknown outcome and next run could not be computed")
             }
-            // Unknown means "do not automatically replay." Any prior retry
-            // floor/counter would contradict that settlement and could re-arm
-            // the same occurrence through catch-up logic.
-            Self.clearRetryState(&object)
+            // Unknown means do not automatically replay this occurrence.
             rows[index] = .object(object)
         }
     }
@@ -316,16 +310,13 @@ extension SwiftNativeTriggerScheduler {
                         obj["pausedAt"] = .string(Self.isoTimestamp(runDate))
                         obj["disabledReason"] = .string("occurrence was not completed; review its retained result before resuming")
                     }
-                    Self.clearRetryState(&obj)
                 } else if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(
                     for: .object(obj), beyond: SchedulerJobRuntime.epoch(from: active["dueEpoch"]), now: { runDate }
                 ) {
                     try Self.stampNextRun(&obj, epoch: next)
-                    Self.clearRetryState(&obj)
                 } else {
                     obj["enabled"] = .bool(false)
                     obj["disabledReason"] = .string("could not compute next scheduled run")
-                    Self.clearRetryState(&obj)
                 }
                 obj["lastOccurrenceKey"] = .string(occurrenceKey)
                 // A watch keeps the rows its read saw on its own row, for the next read to compare.
@@ -362,35 +353,11 @@ extension SwiftNativeTriggerScheduler {
         }
     }
 
-    public func markDefaultCycleJobRun(id: String, detail: String, at runDate: Date) async throws {
-        try await updateJobRows { rows in
-            for idx in rows.indices {
-                guard case .object(var obj) = rows[idx],
-                      (SchedulerJobRuntime.string(obj["id"]) ?? "") == id else {
-                    continue
-                }
-                obj["lastRunAt"] = .string(Self.isoTimestamp(runDate))
-                obj["lastRunStatus"] = .string("completed")
-                obj["lastRunDetail"] = .string(detail)
-                obj.removeValue(forKey: "lastRunError")
-                // A completion clears retry backoff.
-                Self.clearRetryState(&obj)
-                if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(for: .object(obj), now: { runDate }) {
-                    try Self.stampNextRun(&obj, epoch: next)
-                }
-                rows[idx] = .object(obj)
-                break
-            }
-        }
-    }
-
     public nonisolated static func upsertDefaultCycleJob(
         rows: inout [JSONValue],
         id: String,
-        legacyNames: Set<String>,
         name: String,
         kind: String,
-        intervalSeconds: Int,
         schedule: [String: JSONValue],
         objective: String,
         extraPayload: [String: JSONValue],
@@ -402,9 +369,7 @@ extension SwiftNativeTriggerScheduler {
             guard case .object(let obj) = row else { return false }
             let rowID = SchedulerJobRuntime.string(obj["id"]) ?? ""
             if rowID == id { return true }
-            let rowKind = (SchedulerJobRuntime.string(obj["kind"]) ?? "").lowercased()
-            let rowName = (SchedulerJobRuntime.string(obj["name"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return rowKind == kind && legacyNames.contains(rowName)
+            return false
         }
 
         var existing: [String: JSONValue] = [:]
@@ -418,7 +383,9 @@ extension SwiftNativeTriggerScheduler {
         // Pauses survive bootstrap; only setJobEnabled resumes them.
         let isPaused = existing["pausedAt"] != nil
             && existing["enabled"] == .bool(false)
-        if isPaused || (isCancelledTombstone && !reactivateCancelled) {
+        let isDisabledWithCause = existing["enabled"] == .bool(false)
+            && existing["disabledReason"] != nil && !isCancelledTombstone
+        if isPaused || isDisabledWithCause || (isCancelledTombstone && !reactivateCancelled) {
             return (false, .object(existing))
         }
 
@@ -431,8 +398,6 @@ extension SwiftNativeTriggerScheduler {
         next["id"] = existing["id"] ?? .string(id)
         next["name"] = existing["name"] ?? .string(name)
         next["kind"] = existing["kind"] ?? .string(kind)
-        // Legacy interval metadata; recurrence uses `schedule` whenever present.
-        next["intervalSeconds"] = existing["intervalSeconds"] ?? .int(Int64(intervalSeconds))
         next["enabled"] = next["enabled"] ?? .bool(true)
         next["oneShot"] = existing["oneShot"] ?? .bool(false)
         next["schedule"] = existing["schedule"] ?? .object(schedule)
@@ -444,12 +409,6 @@ extension SwiftNativeTriggerScheduler {
         if existing["nextRunAt"] == nil && existing["nextRunAtEpoch"] == nil {
             let nextRunEpoch = try nextRunEpoch()
             try stampNextRun(&next, epoch: nextRunEpoch)
-            if existing["schedule"] == nil, nextRunEpoch <= now.timeIntervalSince1970 {
-                var firstSchedule = schedule
-                firstSchedule["firstRunAt"] = .string(isoTimestamp(Date(timeIntervalSince1970: nextRunEpoch)))
-                next["schedule"] = .object(firstSchedule)
-                next.removeValue(forKey: "nextWallClockOccurrence")
-            }
         }
         if existing["lastRunAt"] == nil { next["lastRunAt"] = .null }
 
@@ -468,16 +427,8 @@ extension SwiftNativeTriggerScheduler {
         let seconds = try SchedulerJobNormalizer.checkedEpoch(epoch)
         obj["nextRunAt"] = .string(SchedulerJobRuntime.floatString(epoch))
         obj["nextRunAtEpoch"] = .int(seconds)
-        obj["nextRunAtISO"] = .string(SchedulerJobRuntime.decorationISO(epoch: epoch))
         obj["nextWallClockOccurrence"] = SchedulerJobRuntime.wallClockOccurrence(for: obj, epoch: epoch).map(JSONValue.string)
     }
 
-    /// Settlement clears legacy retry/park markers and rearms ordinary recurrence.
-    static func clearRetryState(_ obj: inout [String: JSONValue]) {
-        obj.removeValue(forKey: "retryCount")
-        obj.removeValue(forKey: "retryDayKey")
-        obj.removeValue(forKey: "retryPendingUntilEpoch")
-        obj.removeValue(forKey: "retryParkedDateKey")
-    }
 
 }

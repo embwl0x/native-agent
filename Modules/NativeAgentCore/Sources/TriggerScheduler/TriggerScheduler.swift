@@ -8,7 +8,7 @@ import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 import WorkshopExecution
-// Blueprint: | `TriggerScheduler.swift` | SwiftNativeTriggerScheduler actor, trigger configuration and consent, legacy-file import and Workshop submission |
+// Blueprint: | `TriggerScheduler.swift` | SwiftNativeTriggerScheduler actor, trigger configuration and consent in the canonical triggers directory and Workshop submission |
 
 /// Owns trigger eligibility, locked durable occurrence claims, job state and inbox acceptance; host delivery follows acceptance.
 /// BackgroundLoopLifetimes owns wake lifecycle; SchedulerDueJobRunner executes jobs and Workshop owns execution admission/draining.
@@ -55,7 +55,7 @@ public actor SwiftNativeTriggerScheduler: Sendable {
         self.morningBriefPart = morningBriefPart
     }
 
-    /// Canonical trigger configuration; absent files import legacy inbox bytes before access.
+    /// Canonical trigger configuration; an absent file receives fresh defaults.
     public nonisolated var inboxPath: URL {
         root
             .appendingPathComponent("triggers", isDirectory: true)
@@ -72,7 +72,7 @@ public actor SwiftNativeTriggerScheduler: Sendable {
     //
     // Each surface keeps its own last-fired stamp and life-stamped unfinished
     // claims, separate from configuration; inbox/workshop names can collide.
-    /// Canonical inbox occurrence state, imported with configuration before access.
+    /// Canonical inbox occurrence state.
     public nonisolated var inboxStatePath: URL {
         root
             .appendingPathComponent("triggers", isDirectory: true)
@@ -98,52 +98,10 @@ public actor SwiftNativeTriggerScheduler: Sendable {
 
     internal static let logger = Logger(subsystem: "com.nativeagent.core", category: "trigger-scheduler")
 
-    // MARK: legacy-file import
-
-    /// Set once BOTH inbox-surface files are settled at their new home (either
-    /// migrated, already present, or fresh-install absent), so steady state pays
-    /// one boolean check per access instead of file stats.
-    private var legacyInboxTriggerMigrationDone = false
-
-    /// Under each destination lock, copy absent config/state files byte-for-byte from inbox/ to triggers/ before access.
-    /// Leave legacy files and their folder untouched; import failure throws before defaults or mutations can replace saved decisions.
-    internal func migrateLegacyInboxTriggerFilesIfNeeded() async throws {
-        if legacyInboxTriggerMigrationDone { return }
-        let legacyDir = root.appendingPathComponent("inbox", isDirectory: true)
-        let pairs: [(legacy: URL, new: URL)] = [
-            (legacyDir.appendingPathComponent("trigger_config.json"), inboxPath),
-            (legacyDir.appendingPathComponent("trigger_state.json"), inboxStatePath),
-        ]
-        for (legacy, new) in pairs {
-            if FileManager.default.fileExists(atPath: new.path) { continue }
-            guard FileManager.default.fileExists(atPath: legacy.path) else { continue }
-            do {
-                try FileManager.default.createDirectory(
-                    at: new.deletingLastPathComponent(), withIntermediateDirectories: true
-                )
-                try await SwiftNativePersistenceCore.withFileLock(new) {
-                    if !FileManager.default.fileExists(atPath: new.path) {
-                        try FileManager.default.copyItem(at: legacy, to: new)
-                    }
-                }
-                Self.logger.notice("migrated legacy \(legacy.lastPathComponent, privacy: .public) from inbox/ to triggers/")
-            } catch {
-                Self.logger.error("FAILED to migrate legacy \(legacy.lastPathComponent, privacy: .public) from inbox/ to triggers/: \(String(describing: error), privacy: .public) — inbox trigger surface stays DORMANT until repaired; will retry on next access")
-                throw TriggerSchedulerError.persistenceFailure(
-                    "legacy trigger-file migration failed for \(legacy.lastPathComponent): \(String(describing: error))"
-                )
-            }
-        }
-        legacyInboxTriggerMigrationDone = true
-    }
-
     // MARK: list
 
-    private static let supportedInboxKinds: Set<String> = ["time"]
-
     public func listInboxTriggers() async throws -> [TriggerConfig] {
-        try await migrateLegacyInboxTriggerFilesIfNeeded()
-        return try await Self._readList(path: inboxPath, defaultValue: try await defaults().inbox, inbox: true)
+        return try await Self._readList(path: inboxPath, defaultValue: try await defaults().inbox)
     }
 
     public func listWorkshopTriggers() async throws -> [TriggerConfig] {
@@ -152,12 +110,19 @@ public actor SwiftNativeTriggerScheduler: Sendable {
 
     internal static func _readList(
         path: URL,
-        defaultValue: @autoclosure @Sendable () async throws -> [JSONValue], inbox: Bool = false
+        defaultValue: @autoclosure @Sendable () async throws -> [JSONValue]
     ) async throws -> [TriggerConfig] {
         let items = try await loadConfigs(path: path, defaultValue: try await defaultValue())
-        // Old inbox rows stay on disk; only kinds with a current owner are exposed.
-        return items.compactMap(TriggerConfig.init(json:)).filter { cfg in
-            !inbox || cfg.kind.map(supportedInboxKinds.contains) == true
+        var names: Set<String> = []
+        return try items.enumerated().map { index, item in
+            guard case .object(let fields) = item,
+                  case .bool? = fields["enabled"],
+                  let cfg = TriggerConfig(json: item),
+                  names.insert(cfg.name).inserted,
+                  cfg.kind == "time", Self.dailySchedule(cfg) != nil else {
+                throw TriggerSchedulerError.persistenceFailure("\(path.path) row \(index) is not a supported time trigger with Boolean enabled and a valid clock; bytes preserved.")
+            }
+            return cfg
         }
     }
 
@@ -174,7 +139,6 @@ public actor SwiftNativeTriggerScheduler: Sendable {
     private func _setEnabledInbox(name: String, enabled: Bool) async throws -> TriggerStatus {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { throw TriggerSchedulerError.invalidRequest("empty name") }
-        try await migrateLegacyInboxTriggerFilesIfNeeded()
         let seed: [JSONValue] = if case .missing = Self.readConfigsRaw(inboxPath) { try await defaults().inbox } else { [] }
         let work: @Sendable () async throws -> TriggerStatus = { [inboxPath] in
             try await Self._setEnabledImpl(
@@ -194,10 +158,10 @@ public actor SwiftNativeTriggerScheduler: Sendable {
     ) async throws -> TriggerStatus {
         // Corrupt saved configuration keeps its bytes and throws; only a missing file receives defaults.
         var items = try await Self.loadConfigs(path: path, defaultValue: defaultValue)
+        _ = try await Self._readList(path: path, defaultValue: defaultValue)
         var found = false
         for (idx, item) in items.enumerated() {
             guard case .object(var obj) = item,
-                  TriggerConfig(json: item)?.kind.map(supportedInboxKinds.contains) == true,
                   case .string(let nm) = obj["name"] ?? .null,
                   ExecutionEventVocabulary.matches(nm, name) else { continue }
             obj["enabled"] = .bool(enabled)

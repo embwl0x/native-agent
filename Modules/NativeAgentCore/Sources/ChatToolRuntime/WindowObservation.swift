@@ -44,6 +44,10 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
     func rejected() { pixels?.discard(); SenseAppReadCapture.current?.discardWindowText() }
 
     func observe(app requestedApp: String?) async -> MacFourVerbsSupplement? {
+        func unavailable(_ code: String, _ message: String) -> MacFourVerbsSupplement {
+            MacFourVerbsSupplement(diagnostics: ["error": .string(code), "message": .string(message),
+                "remedy": MacScreenCaptureFailure.operationFailed(code, message).remedy(app: requestedApp, part: pixels?.part)])
+        }
         let observationStartedNs = DispatchTime.now().uptimeNanoseconds
         let result: MacControlResult
         do {
@@ -61,10 +65,13 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             if let requestedApp { body["app"] = .string(requestedApp) }
             result = try await host.dispatch(action: "view", body: body)
         } catch {
-            return nil
+            return unavailable("capture_failed", "The requested window observation failed: \(error.localizedDescription)")
         }
         let captureFinishedNs = DispatchTime.now().uptimeNanoseconds
-        if !result.ok, case .object(let output) = result.output, var remedy = output["remedy"] {
+        if !result.ok, case .object(let output) = result.output {
+            var remedy = output["remedy"] ?? MacScreenCaptureFailure.operationFailed(
+                result.error ?? "capture_failed", output["message"]?.stringValue ?? "The requested screen capture failed."
+            ).remedy(app: requestedApp, part: pixels?.part)
             if case .object(let fields) = remedy, fields["kind"] == .string("inspect") {
                 remedy = MacScreenCaptureFailure.operationFailed(result.error ?? "capture_failed",
                     output["message"]?.stringValue ?? "The requested screen capture failed.").remedy(app: requestedApp, part: pixels?.part)
@@ -73,7 +80,9 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 "message": output["message"] ?? .string("The requested screen capture failed."), "remedy": remedy])
         }
         guard result.ok, case .object(let output) = result.output,
-              let frameID = output["frame_id"]?.stringValue else { return nil }
+              let frameID = output["frame_id"]?.stringValue, !frameID.isEmpty else {
+            return unavailable(result.error ?? "capture_identity_unavailable", "The requested window observation did not return a usable frame identity. Observe the window again after repairing the capture failure.")
+        }
 
         let viewId = output["view"]?.stringValue
         let marks = (output["marks"]?.arrayValue ?? [])
@@ -132,6 +141,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             let windowFrame = visibleFrame.map { "\(Int($0.x)),\(Int($0.y)),\(Int($0.w))x\(Int($0.h))" } ?? ""
             pixels.record(
                 frameID: frameID,
+                capture: MacImageCapture.from(output["image_capture"]),
                 reason: thinReason,
                 screenRecording: output["screen_recording_trusted"]?.boolValue ?? false,
                 png: png, image: image,
@@ -149,14 +159,14 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             }
         }
         // The view decides whether this window needs pixel perception.
-        guard output["recognize_pixels"] == .bool(true),
-              let image,
+        guard output["recognize_pixels"] == .bool(true) else { return structural }
+        guard let image,
               let originX = (imageOriginObject["x"] ?? originObject["x"])?.numberValue(coercingStrings: false, finiteOnly: true),
               let originY = (imageOriginObject["y"] ?? originObject["y"])?.numberValue(coercingStrings: false, finiteOnly: true),
               let logicalW = (imageLogicalObject["w"] ?? logicalObject["w"])?.numberValue(coercingStrings: false, finiteOnly: true),
               let logicalH = (imageLogicalObject["h"] ?? logicalObject["h"])?.numberValue(coercingStrings: false, finiteOnly: true),
               logicalW > 0, logicalH > 0 else {
-            return structural
+            return unavailable("visual_observation_unavailable", "The requested visual observation has missing or undecodable pixels or invalid capture geometry. Repair the capture before interpreting its visual contents." + (output["image_unavailable_reason"]?.stringValue.map { " Capture: \($0)" } ?? ""))
         }
 
         #if canImport(Vision)
@@ -176,7 +186,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             let sceneKey = [bundleIdentifier, appName, title]
                 .compactMap { $0 }
                 .joined(separator: "|")
-            let capturedAt = Self.captureDate(from: output, fallback: Date())
+            let capturedAt = try Self.captureDate(from: output)
             let sceneSnapshot = await liveScene.identify(
                 rows: percept.rows,
                 frameSize: percept.frameSize,
@@ -291,24 +301,22 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                     "visual_world_obstruction_coverage": obstruction.map { .double($0.coverage) } ?? .null,
                 ] as [String: JSONValue]).merging(timings) { _, timing in timing }
             )
+        } catch let failure as ToolFailureError {
+            return unavailable(failure.code ?? "visual_observation_failed", failure.message)
         } catch {
-            return structural
+            return unavailable("visual_observation_failed", "The requested visual observation could not be interpreted: \(error.localizedDescription)")
         }
         #else
-        return structural
+        return unavailable("visual_observation_unsupported", "Visual recognition is unavailable in this build. Use a build with Vision support for this requested observation.")
         #endif
     }
 
-    static func captureDate(from output: [String: JSONValue], fallback: Date) -> Date {
-        let epoch: Double?
-        switch output["captured_at_epoch_seconds"] {
-        case .double(let value): epoch = value
-        case .int(let value): epoch = Double(value)
-        default: epoch = nil
+    static func captureDate(from output: [String: JSONValue]) throws -> Date {
+        guard let epoch = output["captured_at_epoch_seconds"]?.numberValue(coercingStrings: false, finiteOnly: true) else {
+            throw ToolFailureError("The captured frame has no valid capture timestamp; its age and motion cannot be established. Repair the window capture before interpreting motion.",
+                effects: .none, code: "capture_timestamp_unavailable")
         }
-        if let epoch, epoch.isFinite { return Date(timeIntervalSince1970: epoch) }
-        guard case .string(let text) = output["captured_at"] else { return fallback }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(text) ?? fallback
+        return Date(timeIntervalSince1970: epoch)
     }
 
     private func structuralSupplement(

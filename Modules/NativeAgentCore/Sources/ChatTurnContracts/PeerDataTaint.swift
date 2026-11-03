@@ -2,7 +2,7 @@ import Foundation
 import os
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `PeerDataTaint.swift` | `PeerDataTaint` class; `withScope`, `mark` (latches any sender the owner does not trust, recognized or not, but their own `self` and bots), `markConsumed` (latches nothing: a read steers nothing), `elevate` (the person answered the run's card); one restore initializer retains provenance and answers without a read-latch marker; ability write refusal reads current origin principal and live/carried peer steering |
+// Blueprint: | `PeerDataTaint.swift` | `PeerDataTaint` class; `withScope`, `mark` (untrusted initiating sender), `markConsumed` (a read steers nothing), `elevate` (the person's answer); `steer` strictly validates complete carried provenance before restoration; ability write refusal reads current origin principal and live/carried peer steering |
 
 /// Task-local origin steering and the person's answer for one run.
 /// Only a turn an untrusted agent starts is steered; reading words latches
@@ -38,8 +38,7 @@ public final class PeerDataTaint: @unchecked Sendable {
         return (sources, current?.elevatedSources ?? [])
     }
 
-    /// `carried` as a card keeps it in its payload, empty lists included: a
-    /// card with no record at all predates this and restores `unrecorded`.
+    /// `carried` as a card keeps it in its payload, empty lists included.
     public static func carriedRecord(peerBridge: Bool, peerID: String?) -> JSONValue {
         let steer = carried(peerBridge: peerBridge, peerID: peerID)
         return .object(["sources": .array(steer.sources.map(JSONValue.string)),
@@ -50,14 +49,25 @@ public final class PeerDataTaint: @unchecked Sendable {
     /// unknown, so its follow-up is held to the peer floor.
     public static let unrecorded = "an agent (this card predates its record of who steered it)"
 
-    /// The sources and elevated peers a `carriedRecord` holds; no record at all is `unrecorded`.
-    public static func steer(in record: JSONValue?) -> (sources: [String], elevated: [String]) {
-        guard case .object(let fields)? = record else { return ([unrecorded], []) }
-        func list(_ key: String) -> [String] {
-            guard case .array(let items)? = fields[key] else { return [] }
-            return items.compactMap { if case .string(let text) = $0 { text } else { nil } }
+    /// Restore only the complete current record. Missing provenance is not an
+    /// unsteered run and cannot be repaired by inventing a principal.
+    public static func steer(in record: JSONValue?) throws -> (sources: [String], elevated: [String]) {
+        func invalid(_ detail: String) -> ToolFailureError {
+            ToolFailureError("Carried steering is unavailable: \(detail). The continuation was not restored.", effects: .none,
+                owner: "Carried run provenance", code: "steering_record_invalid",
+                instruction: "Preserve the saved request and repair its recorded provenance before continuing.")
         }
-        return (list("sources"), list("elevated"))
+        guard case .object(let fields)? = record else { throw invalid("missing or non-object record") }
+        func list(_ key: String) throws -> [String] {
+            guard case .array(let items)? = fields[key] else { throw invalid("\(key) must be an array") }
+            return try items.map { item in
+                guard case .string(let text) = item, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw invalid("\(key) must contain nonempty principal strings")
+                }
+                return text
+            }
+        }
+        return (try list("sources"), try list("elevated"))
     }
 
     @TaskLocal public static var current: PeerDataTaint?

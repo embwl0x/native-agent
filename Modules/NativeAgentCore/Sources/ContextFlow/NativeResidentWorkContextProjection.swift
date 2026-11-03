@@ -55,6 +55,7 @@ struct ResidentWorkContext: ContextCompiledProjectionProvider, Sendable {
 
     var projectionIdentifier: String { Self.owner }
     var invalidationNamespaces: Set<String> { ["resident-work"] }
+    var invalidationSourceURL: URL? { nil }
 
     private let desk: SwiftNativeDeskStore
     private let runner: SwiftNativeWorkshopRunner
@@ -72,18 +73,21 @@ struct ResidentWorkContext: ContextCompiledProjectionProvider, Sendable {
     func compiledProjection(
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult {
-        let prepared: [ContextCompiledSource]
+        let read: (sources: [ContextCompiledSource], failures: [ContextSourceID: String])
         do {
-            prepared = try await readPrepared()
+            read = try await readPrepared()
         } catch is CancellationError { throw CancellationError() }
         catch {
-            // Keep rebuild inputs without blocking independent projections.
-            // Verification below withholds these atoms with unavailable receipts.
-            nativeLog("%@", "[context-resident-work] owners unavailable: \(error.localizedDescription)")
-            return ContextCompiledProjectionResult(changedSources: [])
+            let reason = "Resident work inventory unavailable: \(error.localizedDescription)"
+            nativeLog("%@", "[context-resident-work] \(reason)")
+            let owned = Set(previousSources.values.filter { $0.descriptor.owner == Self.owner }.map(\.descriptor.id))
+            let ids: Set<ContextSourceID> = owned.isEmpty ? [ContextStableID.source(owner: Self.owner, locator: "inventory")] : owned
+            return ContextCompiledProjectionResult(changedSources: [],
+                sourceFailures: Dictionary(uniqueKeysWithValues: ids.map { ($0, reason) }))
         }
         return ContextCompiledProjectionResult(
-            owner: Self.owner, currentSources: prepared, previousSources: previousSources
+            owner: Self.owner, currentSources: read.sources, previousSources: previousSources,
+            sourceFailures: read.failures, verifiedSources: read.sources
         )
     }
 
@@ -95,12 +99,14 @@ struct ResidentWorkContext: ContextCompiledProjectionProvider, Sendable {
         do {
             // Share the checked read, not the incremental rebuild's retention
             // result: unavailable owners must produce a receipt, not stale truth.
-            let prepared = try await readPrepared()
-            let hashes = Dictionary(prepared.map { ($0.descriptor.id, $0.sourceHash) },
+            let read = try await readPrepared()
+            let hashes = Dictionary(read.sources.map { ($0.descriptor.id, $0.sourceHash) },
                                     uniquingKeysWith: { first, _ in first })
             return ContextTurnExclusion(atomIDs: Set(atoms.filter {
                 !Self.surfaces.contains(surface) || hashes[$0.draft.sourceID] != $0.draft.sourceHash
-            }.map(\.draft.id)))
+            }.map(\.draft.id)), unverified: read.failures.compactMap { id, reason in
+                atoms.contains { $0.draft.sourceID == id } ? ContextDegradedSourceNotice(sourceID: id, reason: reason) : nil
+            })
         } catch {
             return ContextTurnExclusion(atomIDs: Set(atoms.map(\.draft.id)), unverified:
                 Set(atoms.map(\.draft.sourceID)).map { ContextDegradedSourceNotice(
@@ -110,7 +116,7 @@ struct ResidentWorkContext: ContextCompiledProjectionProvider, Sendable {
 }
 
 private extension ResidentWorkContext {
-    func readPrepared() async throws -> [ContextCompiledSource] {
+    func readPrepared() async throws -> (sources: [ContextCompiledSource], failures: [ContextSourceID: String]) {
         async let deskLoad = desk.liveState()
         async let executionLoad = runner.listAll()
         let state = try await deskLoad
@@ -119,7 +125,7 @@ private extension ResidentWorkContext {
         guard !executions.contains(where: { ["corrupt", "unavailable"].contains($0.status) }) else {
             throw CocoaError(.fileReadCorruptFile)
         }
-        let names = MemoryRecallQueryExpansion.names(storeDirectory: dataRoot.appendingPathComponent("memory"))
+        let names = try MemoryRecallQueryExpansion.names(storeDirectory: dataRoot.appendingPathComponent("memory"))
         let identityTerms = Set([names.agent, names.user].compactMap { $0 }.flatMap {
             NativeContextProjectionText.triggers($0, minimumLength: 3)
         })
@@ -140,16 +146,27 @@ private extension ResidentWorkContext {
             if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
             return lhs.handle < rhs.handle
         }
-        return Array(orderedItems.prefix(Self.maximumItems)).compactMap { item in
-            Self.prepare(item: item, execution: latestExecutionByHandle[item.handle], identityTerms: identityTerms)
+        var sources: [ContextCompiledSource] = []
+        var failures: [ContextSourceID: String] = [:]
+        for item in orderedItems.prefix(Self.maximumItems) {
+            do {
+                if let source = try Self.prepare(item: item, execution: latestExecutionByHandle[item.handle], identityTerms: identityTerms) {
+                    sources.append(source)
+                }
+            } catch {
+                let locator = "desk/items/\(ContextStableID.digest(parts: [item.handle]))"
+                failures[ContextStableID.source(owner: Self.owner, locator: locator)] =
+                    "Resident work item unavailable: \(error.localizedDescription)"
+            }
         }
+        return (sources, failures)
     }
 
     static func prepare(
         item: DeskItem,
         execution: WorkshopExecution.WorkshopExecutionRecord?,
         identityTerms: Set<String>
-    ) -> ContextCompiledSource? {
+    ) throws -> ContextCompiledSource? {
         let title = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(item.title), to: 160)
         let project = NativeContextProjectionText.bounded(NativeContextProjectionText.clean(item.project), to: 120)
         guard !item.handle.isEmpty, !title.isEmpty, !project.isEmpty else { return nil }
@@ -214,7 +231,7 @@ private extension ResidentWorkContext {
             headingPath: [],
             blockAnchor: "resident-work"
         )
-        let updatedAt = latestDate(item: item, execution: execution)
+        let updatedAt = try latestDate(item: item, execution: execution)
         let triggers = lexicalTriggers(item: item, execution: execution, identityTerms: identityTerms)
         var entities = [
             ContextEntity(kind: "desk_handle", id: item.handle, label: title),
@@ -308,12 +325,12 @@ private extension ResidentWorkContext {
     static func latestDate(
         item: DeskItem,
         execution: WorkshopExecution.WorkshopExecutionRecord?
-    ) -> Date {
-        let dates = [item.updatedAt, execution?.updatedAt].compactMap { raw -> Date? in
-            guard let raw else { return nil }
-            return DeskClock.parseISO(raw)
-        }
-        return dates.max() ?? .distantPast
+    ) throws -> Date {
+        let itemDate = try NativeContextProjectionText.requiredDate(item.updatedAt, owner: "Desk \(item.handle) updatedAt")
+        guard let execution else { return itemDate }
+        let executionDate = try NativeContextProjectionText.requiredDate(execution.updatedAt,
+            owner: "Workshop \(execution.id) updatedAt")
+        return max(itemDate, executionDate)
     }
 
     static func lexicalTriggers(

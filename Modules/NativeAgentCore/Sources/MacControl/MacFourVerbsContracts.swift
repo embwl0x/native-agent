@@ -1,7 +1,8 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `MacFourVerbsContracts.swift` | `MacFourVerbsSupplementalTarget`, `MacFourVerbsSupplement`, `MacFourVerbsSupplementalPerceptionSource`; four verbs dispatch through `MacControlClient` |
+// Blueprint: | `MacFourVerbsContracts.swift` | `MacFourVerbsSupplementalTarget`, `MacFourVerbsSupplement`, `MacFourVerbsSupplementalPerceptionSource`; four verbs dispatch through `MacControlClient`; permissionRemedy is the shared macOS grant remedy builder consumed by SystemPermissionPreflight and lower-level MacControl producers |
 
 /// A target discovered by the fused screenshot/vision lane. The addressing
 /// tokens remain on this side of the four-verb wall: the model sees the label
@@ -15,7 +16,7 @@ public struct MacFourVerbsSupplementalTarget: Sendable, Equatable {
     /// The screenshot mark's AX identity, private to fusion and never an
     /// action authority or a rendered name. Nil denotes pixel-only evidence.
     public let sourceAXPath: [Int]?
-    public let enabled: Bool
+    public let enabled: Bool?
     public let label: MacScreenText?
     /// Exact natural names for the same target. They add no second address and
     /// resolve through the ordinary ambiguity rules when several objects share
@@ -56,7 +57,7 @@ public struct MacFourVerbsSupplementalTarget: Sendable, Equatable {
         physicalOnly: Bool = false,
         motionUncertain: Bool = false,
         sourceAXPath: [Int]? = nil,
-        enabled: Bool = true,
+        enabled: Bool? = true,
         role: String? = nil,
         actions: [String] = [],
         settableAttributes: [String] = []
@@ -166,8 +167,8 @@ public struct MacImagePlace: Sendable, Equatable {
 }
 
 /// Her-screen Phase 5 — one step of a batched `act`: a verb, a name (or a
-/// place on an image), text/mode for `type`, and a named drag's `to`. No
-/// repeat, hold or button inside a step.
+/// place on an image, or a recorded frame/handle identity), text/mode for `type`, a named drag's `to`, and the
+/// same held keys and mouse button as a single act. No repeat inside a step.
 public struct MacActStep: Sendable, Equatable {
     public let verb: String
     public let target: String
@@ -175,15 +176,24 @@ public struct MacActStep: Sendable, Equatable {
     public let mode: MacTypeMode
     public let to: String?
     public let place: MacImagePlace?
+    public let holding: String?
+    public let button: String?
+    public let handle: String?
+    public let frameID: String?
 
     public init(verb: String, target: String, text: String? = nil, mode: MacTypeMode = .replace,
-                to: String? = nil, place: MacImagePlace? = nil) {
+                to: String? = nil, place: MacImagePlace? = nil, holding: String? = nil, button: String? = nil,
+                handle: String? = nil, frameID: String? = nil) {
         self.verb = verb
         self.target = target
         self.text = text
         self.mode = mode
         self.to = to
         self.place = place
+        self.holding = holding
+        self.button = button
+        self.handle = handle
+        self.frameID = frameID
     }
 }
 
@@ -214,11 +224,6 @@ public struct MacFourVerbsReply: Sendable, Equatable {
         self.ok = ok
         self.text = text
         var detail = detail
-        for key in ["error", "reason", "failure_code"] {
-            if detail[key] == .string("ax_untrusted") || detail[key] == .string("accessibility_untrusted") {
-                detail[key] = .string("accessibility_not_trusted")
-            }
-        }
         if !ok, detail["remedy"] == nil, case .string(let code)? = detail["error"] {
             detail["remedy"] = Self.privacyRemedy(code)
         }
@@ -228,16 +233,24 @@ public struct MacFourVerbsReply: Sendable, Equatable {
     public static func privacyRemedy(_ code: String) -> JSONValue? {
         let pane: String, capability: String
         switch code {
-        case "accessibility_not_trusted", "ax_untrusted", "accessibility_untrusted":
+        case "accessibility_not_trusted", "accessibility_permission_missing":
             pane = "Accessibility"; capability = "accessibility"
         case "screen_recording_not_trusted":
             pane = "Screen Recording"; capability = "screenRecording"
         default: return nil
         }
-        return Repair.remedy(owner: "macOS \(pane) grant", nextCall: .object([
-            "tool": .string("app"), "input": .object(["action": .string("permissions.request"), "args": .object([
-                "capability": .string(capability), "why": .string("NativeAgent needs \(pane) to \(capability == "accessibility" ? "click and type for you" : "see your screen"). Allow?"),
-            ])]),
-        ]), tap: "Allow \(pane) on the permission card in NativeAgent")
+        return permissionRemedy(capability, name: pane)
+    }
+
+    /// Shared by the MacIntegration preflight and its lower-level MacControl
+    /// producers, which cannot import the module that depends on them.
+    public static func permissionRemedy(_ capability: String, name: String,
+                                        mode: InlineInteraction.AccessMode? = nil) -> JSONValue {
+        var args: [String: JSONValue] = ["capability": .string(capability),
+            "why": .string("NativeAgent needs \(name) for this work. Allow?")]
+        if let mode { args["mode"] = .string(mode.rawValue) }
+        return Repair.remedy(owner: "macOS \(name) grant", nextCall: .object([
+            "tool": .string("app"), "input": .object(["action": .string("permissions.request"), "args": .object(args)]),
+        ]), tap: "Allow \(name) on the permission card in NativeAgent")
     }
 }

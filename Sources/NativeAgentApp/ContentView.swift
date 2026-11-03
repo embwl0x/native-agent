@@ -25,7 +25,7 @@ import CloudKit
 import DeviceSync
 #endif
 
-// Blueprint: | `ContentView.swift` | `ContentView`: Simple/Advanced/Agent shell assembly, navigation destinations, first-run presentation and iCloud action refresh routing |
+// Blueprint: | `ContentView.swift` | `ContentView`: Simple/Advanced/Agent shell assembly, scene-owned chat shortcut panels and onward navigation, first-run presentation and iCloud action refresh routing |
 
 struct ContentView: View {
     // Page transitions respect Reduce Motion.
@@ -34,7 +34,6 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @SceneStorage("selection") private var selectionRaw = SidebarItem.chat.rawValue
     @State private var hasMountedBots = false
-    @SceneStorage("skillsToolsSection") private var skillsToolsSectionRaw = SkillsToolsSection.skills.rawValue
     @AppStorage("nativeagent.showTour") private var showTour = false
     /// The visible Simple, Advanced or Agent shell.
     @AppStorage(SimpleViewMode.key) private var viewModeRaw = ""
@@ -65,6 +64,7 @@ struct ContentView: View {
     // ContentView owns Desk's new-task sheet so repeated presentations remain available.
     @State private var showNewWorkshopTask = false
     @State private var navigationMountID: UUID?
+    @State private var chatShortcut: ChatSlashPage?
     @State private var agentRoom = "home"
 
     private var selection: Binding<SidebarItem> {
@@ -95,7 +95,17 @@ struct ContentView: View {
         RenderAudit.bump("contentview.body")
         return ZStack {
             Group {
-            if showsSimpleView {
+            if let failure = SimpleViewMode.readFailure {
+                VStack(spacing: 16) {
+                    Text("View unavailable").font(.title2)
+                    Text(failure).textSelection(.enabled)
+                    HStack {
+                        Button("Choose Simple") { viewModeRaw = SimpleViewMode.simple }
+                        Button("Choose Advanced") { viewModeRaw = SimpleViewMode.advanced }
+                        Button("Choose Agent") { viewModeRaw = SimpleViewMode.agent }
+                    }
+                }.padding(24)
+            } else if showsSimpleView {
                 SimpleShellView()
             } else if showsAgentView {
                 AgentScreenView(room: $agentRoom)
@@ -105,12 +115,9 @@ struct ContentView: View {
                 if !sidebarsHidden {
                 ShellSidebarRail(
                     selection: selection,
-                    needsYou: Set(
-                        SidebarItem.rail(appModel.engine.layout.layout).compactMap { $0 }
-                            // Today's rail dot and header read the same Needs you count.
-                            .filter { $0.normalized == .activity && (appModel.engine.desk.ownerWaitingCount ?? 0) > 0 }
-                            .map(\.normalized)
-                    )
+                    // The checked rail decides which rows exist; its Today dot reads the shared count.
+                    needsYou: appModel.engine.desk.ownerWaitingCount.map { $0 > 0 ? [.activity] : [] },
+                    attentionItem: .activity
                 )
                 .navigationTitle("NativeAgent")
                 }
@@ -201,8 +208,8 @@ struct ContentView: View {
                     case .inboxPolicy:
                         ShellRailPage(title: "Notifications", alive: true) { InboxSettingsView() }
                     // Retired destinations resolve before rendering.
-                    case .memory, .settingsHub, .approvals, .workshop, .legacyWorkshop, .work, .skillLifecycle, .skills, .tools,
-                         .autoImprovement, .panels, .command, .macIntegration, .knowledge, .dreams, .cognition, .inspector, .telegram:
+                    case .skills, .tools,
+                         .macIntegration, .knowledge, .dreams, .cognition, .inspector, .telegram:
                         EmptyView()  // unreachable: normalized and shellHome resolve these above
                     }
                 }
@@ -265,12 +272,12 @@ struct ContentView: View {
             }
             }
             // S.5: hide NavigationSplitView from VoiceOver while onboarding overlay is active
-            .accessibilityHidden(showTour || showFirstRunOnboarding)
+            .accessibilityHidden((showTour && appModel.engine.layout.layout != nil) || showFirstRunOnboarding)
 
             // The tour appears only when explicitly replayed from About.
-            if showTour {
+            if showTour, let layout = appModel.engine.layout.layout {
                 OnboardingTourOverlay(
-                    layout: appModel.engine.layout.layout,
+                    layout: layout,
                     onComplete: {
                         showTour = false
                     },
@@ -279,6 +286,19 @@ struct ContentView: View {
                     }
                 )
                 .transition(NativeAgentMotion.fade)
+            }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if case .unavailable = appModel.engine.layout.availability {
+                SurfaceLayoutContent(appModel.engine.layout.availability) { _ in EmptyView() }
+            }
+        }
+        .disabled(chatShortcut != nil)
+        .overlay {
+            if let page = chatShortcut {
+                SimpleSetupPanel { chatShortcut = nil } content: {
+                    page.content { chatShortcut = nil }
+                }
             }
         }
         // The notice lane sits under pinned chat chrome or at the top of other pages.
@@ -301,14 +321,6 @@ struct ContentView: View {
         }
         .onAppear {
             presentTourReplayIfNeeded(requestID: tourReplayCoordinator.requestID)
-            // Translate saved destinations into their rail page and tab once.
-            if let saved = SidebarItem(rawValue: selectionRaw),
-               let home = SidebarItem.shellHome(for: saved) {
-                let tab = (home.parent == .diagnostics && home.tab == "skills"
-                    && (saved == .tools || skillsToolsSectionRaw == SkillsToolsSection.tools.rawValue)) ? "tools" : home.tab
-                UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(home.parent))
-                selectionRaw = home.parent.rawValue
-            }
             guard navigationMountID == nil else { return }
             navigationMountID = ApplicationLifetime.shared.mountMainScene(visiblePageInput: {
                 switch SimpleViewMode.current {
@@ -431,7 +443,6 @@ struct ContentView: View {
                     guard let session = appModel.engine.transcripts.sessions.first(where: { $0.id == sessionId }) else { return }
                     await appModel.selectChatSession(session)
                 }
-                await appModel.refreshChatMessagesAfterTurn(sessionId: sessionId)
             }
         }
     }
@@ -461,15 +472,32 @@ struct ContentView: View {
     }
 
     private func applyNavigationDestination(_ destination: NativeAgentNavigationDestination) {
+        if case .chatShortcut(let page) = destination {
+            chatShortcut = page
+            return
+        }
+        if chatShortcut != nil {
+            chatShortcut = nil
+            if destination != .sidebar(.chat) {
+                viewModeRaw = SimpleViewMode.advanced
+            }
+        }
         switch destination {
+        case .chatShortcut: break // Handled above.
+        case .savedThing(let saved):
+            appModel.pendingPaletteDestination = saved
+            viewModeRaw = SimpleViewMode.advanced
+            switch saved {
+            case .botReply: selectSidebarItem(.bots)
+            case .dream: selectSidebarItem(.dreams)
+            case .memory:
+                UserDefaults.standard.set("memories", forKey: ShellRailTab.storageKey(.memories))
+                selectSidebarItem(.memories)
+            }
         case .activity(let section):
             applyActivitySection(section)
         case .skillsTools(let section):
             applySkillsToolsSection(section)
-        case .sidebar(.approvals):
-            applyActivitySection(.approvals)
-        case .sidebar(.autoImprovement):
-            applyActivitySection(.selfImprovement)
         case .sidebar(let item):
             if item == .tools {
                 applySkillsToolsSection(.tools)
@@ -486,7 +514,8 @@ struct ContentView: View {
             }
             // A page route lands on its first visible tab; SettingsLink
             // chooses a requested tab after routing.
-            if let first = ShellRailTab.all(appModel.engine.layout.layout).first(where: { $0.page == target })?.tabs.first?.key {
+            let layout = appModel.engine.layout.availability
+            if let first = ShellRailTab.all(layout).first(where: { $0.page == target })?.tabs.first?.key {
                 UserDefaults.standard.set(first, forKey: ShellRailTab.storageKey(target))
             }
             selectSidebarItem(target)

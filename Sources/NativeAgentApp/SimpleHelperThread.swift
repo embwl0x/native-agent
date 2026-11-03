@@ -12,7 +12,7 @@ import PersistenceCore
 import ProviderRouting
 import AppKit
 import AppToolRuntime
-// Blueprint: | `SimpleHelperThread.swift` | SimpleHelperRuns shows helper history and messages; accepted drafts send to the helper or the resident's chat |
+// Blueprint: | `SimpleHelperThread.swift` | SimpleHelperRuns shows helper history and messages, with shared read failures and retained-history status; accepted drafts send to the helper or the resident's chat |
 
 struct SimpleHelperRuns: View {
     let record: BotsShelfRecord
@@ -32,8 +32,14 @@ struct SimpleHelperRuns: View {
         let runs = store.helperRuns[record.id]?.history ?? []
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 14) {
-                if runs.isEmpty, lines.isEmpty {
-                    Text("No runs yet.")
+                if let error = store.refreshError {
+                    Text(error + (runs.isEmpty && lines.isEmpty ? "" : "\nShowing retained history."))
+                        .font(ShellType.body)
+                        .foregroundStyle(NativeAgentShell.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if runs.isEmpty, lines.isEmpty, store.refreshError == nil {
+                    Text(store.loaded ? "No runs yet." : "Reading history…")
                         .font(ShellType.body)
                         .foregroundStyle(NativeAgentShell.secondary)
                 }

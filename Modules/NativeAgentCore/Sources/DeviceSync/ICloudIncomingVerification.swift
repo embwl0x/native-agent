@@ -34,6 +34,10 @@ actor ICloudIncomingVerifier {
 /// message; that would require a separate signed return receipt from iOS.
 enum ChatDeliveryReceiptStatus: String, Sendable {
     case failedBeforeDispatch = "failed_before_dispatch"
+    case dispatchReserved = "dispatch_reserved"
+    case submissionUnknown = "submission_unknown"
+    /// A filesystem write was admitted, but its commit has not been observed.
+    case commitUnverified = "commit_unverified"
     /// The Drive file exists locally and still depends on iCloud replication.
     case queuedForICloudSync = "queued_for_icloud_sync"
     /// CloudKit accepted the outbound record, but iOS has not acknowledged it.
@@ -44,7 +48,7 @@ enum ChatDeliveryReceiptStatus: String, Sendable {
     case confirmedByPeer = "confirmed_by_peer"
     var deliveryConfirmed: Bool {
         switch self {
-        case .failedBeforeDispatch, .queuedForICloudSync, .acceptedByTransport:
+        case .failedBeforeDispatch, .dispatchReserved, .submissionUnknown, .commitUnverified, .queuedForICloudSync, .acceptedByTransport:
             return false
         case .deliveredToMac, .confirmedByPeer:
             return true

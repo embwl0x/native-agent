@@ -24,7 +24,7 @@ import MemoryV2
 import StandingBots
 import TurnTrace
 import Studio
-// Blueprint: | `QuietSetting.swift` | QuietSetting value and read/write contract, setting errors, host provider and MainActor write receipt detail |
+// Blueprint: | `QuietSetting.swift` | QuietSetting value and throwing read/choice contract; unavailable Trust rejects policy-backed controls on every page before read or write; setting errors, host provider and MainActor write receipt detail |
 
 public typealias QuietSettingsHostProvider = @MainActor @Sendable () -> (any QuietSettingsHost)?
 
@@ -87,14 +87,17 @@ public struct QuietSetting: Sendable {
     public let choices: [String]
     /// Choices that only exist at run time — the accounts this Mac has actually connected. The catalog reports exactly what the write
     /// enforces, out of one closure, so a set can never be refused for a value `app_settings_list` had just offered.
-    public let liveChoices: (@MainActor @Sendable (@escaping QuietSettingsHostProvider) async -> [String])?
+    public let liveChoices: (@MainActor @Sendable (@escaping QuietSettingsHostProvider) async throws -> [String])?
     public let note: String
     /// The person's own posture. These READ like any other setting and refuse to be written, saying why — the agent widening its own
     /// authority is the one thing self-administration must not be able to do.
     public let ownerOnly: Bool
     /// Writable only in Full Mac, with receipts; raising to Full Mac remains the owner's call.
     public let fullMacOnly: Bool
-    public let read: @MainActor @Sendable (any QuietSettingsHost) async -> JSONValue
+    /// Its value lives on another device: a page read lists it without asking that device
+    /// (a page never waits on a round trip); setting.get reads it.
+    public let readsAnotherDevice: Bool
+    public let read: @MainActor @Sendable (any QuietSettingsHost) async throws -> JSONValue
     public let write: (@MainActor @Sendable (any QuietSettingsHost, JSONValue) async throws -> Void)?
     /// The rule a value must pass before it is written (which way a lower-only switch may move, what a narrow-only list may gain), read
     /// only. `write` asks it first, and the door's preview asks it alone, so a preview refuses what the write would.
@@ -106,11 +109,13 @@ public struct QuietSetting: Sendable {
         label: String,
         kind: Kind,
         choices: [String] = [],
-        liveChoices: (@MainActor @Sendable (@escaping QuietSettingsHostProvider) async -> [String])? = nil,
+        liveChoices: (@MainActor @Sendable (@escaping QuietSettingsHostProvider) async throws -> [String])? = nil,
         note: String = "",
         ownerOnly: Bool = false,
         fullMacOnly: Bool = false,
-        read: @escaping @MainActor @Sendable (any QuietSettingsHost) async -> JSONValue,
+        readsAnotherDevice: Bool = false,
+        requiresTrustPolicy: Bool = false,
+        read: @escaping @MainActor @Sendable (any QuietSettingsHost) async throws -> JSONValue,
         write: (@MainActor @Sendable (any QuietSettingsHost, JSONValue) async throws -> Void)? = nil,
         check: (@MainActor @Sendable (any QuietSettingsHost, JSONValue) async -> QuietSettingError?)? = nil
     ) {
@@ -123,10 +128,19 @@ public struct QuietSetting: Sendable {
         self.note = note
         self.ownerOnly = ownerOnly
         self.fullMacOnly = fullMacOnly
-        self.read = read
+        self.readsAnotherDevice = readsAnotherDevice
+        self.read = { host in
+            if (page == "trust" || requiresTrustPolicy), host.trustPolicy == nil {
+                throw QuietSettingError.unavailable("Trust policy is unavailable. Read Trust and repair its reported policy error before reading this control.")
+            }
+            return try await read(host)
+        }
         self.check = check
         if let write {
             self.write = { @MainActor @Sendable host, value in
+                if (page == "trust" || requiresTrustPolicy), host.trustPolicy == nil {
+                    throw QuietSettingError.unavailable("Trust policy is unavailable. Read Trust and repair its reported policy error before changing this control.")
+                }
                 if let refused = await check?(host, value) { throw refused }
                 try await write(host, value)
             }
@@ -149,7 +163,7 @@ public struct QuietSetting: Sendable {
         return fullMac || !fullMacOnly
     }
 
-    public func catalogRow(fullMac: Bool, host: @escaping QuietSettingsHostProvider) async -> JSONValue {
+    public func catalogRow(fullMac: Bool, host: @escaping QuietSettingsHostProvider) async throws -> JSONValue {
         var row: [String: JSONValue] = [
             "id": .string(id),
             "page": .string(page),
@@ -157,7 +171,7 @@ public struct QuietSetting: Sendable {
             "type": .string(kind.rawValue),
             "writable": .bool(writable(fullMac: fullMac)),
         ]
-        let offered = await (liveChoices?(host) ?? choices)
+        let offered = try await (liveChoices?(host) ?? choices)
         if !offered.isEmpty { row["choices"] = .array(offered.map { .string($0) }) }
         if !note.isEmpty { row["note"] = .string(note) }
         if ownerOnly {

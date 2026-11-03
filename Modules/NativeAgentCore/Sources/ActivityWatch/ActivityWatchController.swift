@@ -4,7 +4,7 @@ import Experiences
 import Observation
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `ActivityWatchController.swift` | `ActivityWatchController`, `ActivityCaptureIssue`; capture lifecycle and retained termination join of startup, policy, event, retention and watcher bodies; serialized off-main policy reads/writes and capture-ordered exclusion purges, exact policy-file invalidation and one retention schedule using the runner's completed-run stamp and effective clamped capture policy; issues join their Experience receipts, with injected platform error and notification presentation; Mac permissions, quiet controls and the menu indicator reach this same lifecycle/policy owner through engine.activityWatch |
+// Blueprint: | `ActivityWatchController.swift` | `ActivityWatchController`, `ActivityCaptureIssue`; last-checked policy and explicit availability, serialized writes and capture-ordered exclusion purges; exact policy/cadence events rearm checked retention, failed passes retain their issue and retry on the runner's interval without advancing its completed-run stamp; termination retains the watcher's eventual settlement alongside startup, policy and event bodies; issues join Experience receipts; Trust controls, quiet settings and the running indicator reach this owner through engine.activityWatch |
 
 public struct ActivityCaptureIssue: Identifiable, Equatable, Sendable {
     public enum Severity: Int, Comparable, Equatable, Sendable {
@@ -30,14 +30,18 @@ public struct ActivityCaptureIssue: Identifiable, Equatable, Sendable {
 /// one of them has been told to stop.
 ///
 /// **The invariant this type exists to hold:** `isCapturing` is TRUE if and
-/// only if `ActivityWatcher` currently has observers installed. It is not a
+/// only if `ActivityWatcher` reports a running capture service. It is not a
 /// separate belief about what should be happening — it is read straight off the
-/// watcher. That is what makes the menu-bar dot honest: it cannot say "not
-/// recording" while the observers are live, because it has no state of its own
-/// in which to be wrong.
+/// watcher. A failed required attachment reports degraded capture even while
+/// workspace/timer sources remain installed to observe its recovery.
 @MainActor
 @Observable
 public final class ActivityWatchController {
+    public enum PolicyAvailability: Equatable, Sendable {
+        case loading
+        case available
+        case unavailable(String)
+    }
     public enum DeletionResult: Sendable {
         case deleted(rows: Int)
         case failed(message: String)
@@ -48,8 +52,15 @@ public final class ActivityWatchController {
     /// two leaves capture off-or-unchanged rather than running under a policy
     /// nothing recorded.
     public private(set) var policy: ActivityPolicy
+    /// `policy` retains its last checked values on failure; these are not current authority.
+    public private(set) var policyAvailability: PolicyAvailability = .loading
+    public var isPolicyAvailable: Bool { policyAvailability == .available }
+    /// Initial UI storage is not a checked policy. The first successful read
+    /// (even after repair) establishes saved consent; later external changes
+    /// obey the tightening-only rule against that established snapshot.
+    private var hasCheckedPolicy = false
 
-    /// True while the watcher actually has observers installed. Drives the
+    /// True while the watcher reports a running capture service. Drives the
     /// menu-bar indicator.
     public private(set) var isCapturing = false
 
@@ -89,6 +100,7 @@ public final class ActivityWatchController {
     private var startupTask: Task<Void, Never>?
     private var policyEventsTask: Task<Void, Never>?
     private var retentionTask: Task<Void, Never>?
+    private var retentionEventsTask: Task<Void, Never>?
     @ObservationIgnored private var terminationDrain: Task<Void, Never>?
 
     public init(
@@ -106,9 +118,13 @@ public final class ActivityWatchController {
         policyTask = Task { [policyStore] in
             do {
                 policy = try await Task.detached(priority: .utility) { try policyStore.loadChecked() }.value
+                hasCheckedPolicy = true
+                policyAvailability = .available
                 return true
             } catch {
-                await recordIssue(errorMessage(error, "read the activity policy"), severity: .critical)
+                let message = errorMessage(error, "read the activity policy")
+                policyAvailability = .unavailable(message)
+                await recordIssue(message, severity: .critical)
                 return false
             }
         }
@@ -145,6 +161,19 @@ public final class ActivityWatchController {
         if retentionTask == nil {
             scheduleRetention()
         }
+        if retentionEventsTask == nil {
+            let events = FileChangeEvents(paths: [ActivityWatchPaths.retentionStateURL(dataRoot: dataRoot)])
+            retentionEventsTask = Task { @MainActor [weak self] in
+                defer { events.cancel() }
+                for await _ in events.stream {
+                    guard let self, !self.shuttingDown else { return }
+                    self.scheduleRetention()
+                }
+                guard let self, !Task.isCancelled, !self.shuttingDown else { return }
+                self.retentionTask?.cancel()
+                await self.recordIssue("Activity retention file observation is unavailable. Cleanup is paused; reopen NativeAgent after repairing the cadence path to rearm observation.", severity: .warning)
+            }
+        }
         startCapture()
     }
 
@@ -154,14 +183,15 @@ public final class ActivityWatchController {
             guard let self else { return }
             defer { self.startupTask = nil }
             _ = await self.policyTask?.value
-            guard !Task.isCancelled, !self.shuttingDown, self.policy.captureEnabled else { return }
-            guard let watcher = await self.ensureWatcher(), !Task.isCancelled,
+            guard !Task.isCancelled, !self.shuttingDown, self.isPolicyAvailable,
                   self.policy.captureEnabled else { return }
+            guard let watcher = await self.ensureWatcher(), !Task.isCancelled,
+                  self.isPolicyAvailable, self.policy.captureEnabled else { return }
             let started = await watcher.startBounded()
             guard !Task.isCancelled else { return }
             self.refreshCapturingFlag()
             if !started {
-                await self.recordIssue("Activity capture could not start cleanly. Its partial startup was rolled back.", severity: .critical)
+                await self.recordIssue("Activity capture did not reach running state. Check the activity capture notices; its lifecycle retains any unfinished shutdown.", severity: .critical)
             }
             self.scheduleRetention()
         }
@@ -186,18 +216,27 @@ public final class ActivityWatchController {
         let startup = startupTask
         let events = policyEventsTask
         let retention = retentionTask
+        let retentionEvents = retentionEventsTask
         let policy = policyTask
         startup?.cancel()
         events?.cancel()
         retention?.cancel()
+        retentionEvents?.cancel()
         policy?.cancel()
         let watcher = watcher
         let drain = Task.detached(priority: .utility) {
             await settle {
-                await watcher?.stop()
+                if let watcher {
+                    let request = await watcher.requestStop()
+                    if request.outcome == .settlementPending {
+                        FileHandle.standardError.write(Data("activity-watch: stop request bounded; settlement pending\n".utf8))
+                    }
+                    await request.settlement?.value
+                }
                 await startup?.value
                 await events?.value
                 await retention?.value
+                await retentionEvents?.value
                 _ = await policy?.value
             }
         }
@@ -211,7 +250,7 @@ public final class ActivityWatchController {
             guard let store = try await ActivitySpanStore.acquire(dataRoot: dataRoot),
                   !Task.isCancelled else { return nil }
             await reloadPolicy()
-            guard !shuttingDown, !Task.isCancelled, policy.captureEnabled else { return nil }
+            guard !shuttingDown, !Task.isCancelled, isPolicyAvailable, policy.captureEnabled else { return nil }
             if let watcher { return watcher }
             let created = ActivityWatcher(
                 store: store,
@@ -220,8 +259,13 @@ public final class ActivityWatchController {
                     Task { @MainActor [weak self] in
                         self?.refreshCapturingFlag()
                         if state == .degraded {
-                            await self?.recordIssue("Activity capture is unavailable. Its shutdown has not been confirmed.", severity: .critical)
+                            await self?.recordIssue("Activity capture is degraded; it is not reporting a running capture service. Observation repair or unfinished shutdown remains owned by the watcher.", severity: .critical)
                         }
+                    }
+                },
+                observationIssue: { [weak self] detail in
+                    Task { @MainActor [weak self] in
+                        await self?.recordIssue(detail, severity: .warning)
                     }
                 }
             )
@@ -248,16 +292,35 @@ public final class ActivityWatchController {
                 let policyStore = policyStore
                 loaded = try await Task.detached(priority: .utility) { try policyStore.loadChecked() }.value
             } catch {
-                policy = ActivityPolicy()
-                watcher?.updatePolicy(policy)
+                let message = errorMessage(error, "read the activity policy")
+                policyAvailability = .unavailable(message)
+                await watcher?.policyUnavailable()
                 refreshCapturingFlag()
-                await recordIssue(errorMessage(error, "read the activity policy"), severity: .critical)
+                await recordIssue(message, severity: .critical)
                 return false
             }
             guard !shuttingDown else { return false }
+            if !hasCheckedPolicy {
+                policy = loaded
+                hasCheckedPolicy = true
+                policyAvailability = .available
+                if loaded.captureEnabled { startCapture() }
+                scheduleRetention()
+                return true
+            }
+            let wasAvailable = isPolicyAvailable
             guard let safe = ActivityWatcher.safelyPolled(
                 loaded, current: policy, currentlyEnabled: policy.captureEnabled
-            ), safe != policy else { return true }
+            ) else {
+                // A readable external enable is still not consent. Keep the
+                // existing choices and require a settings decision to enable.
+                policyAvailability = .available
+                scheduleRetention()
+                return true
+            }
+            policyAvailability = .available
+            scheduleRetention()
+            guard safe != policy || !wasAvailable else { return true }
             policy = safe
             watcher?.updatePolicy(safe)
             refreshCapturingFlag()
@@ -286,6 +349,19 @@ public final class ActivityWatchController {
 
     // MARK: - Policy mutation
 
+    /// Settings readers await the same serialized policy owner; stale checked
+    /// choices are never presented as current consent while authority is unavailable.
+    public func checkedPolicy() async throws -> ActivityPolicy {
+        _ = await policyTask?.value
+        guard isPolicyAvailable else {
+            if case .unavailable(let detail) = policyAvailability {
+                throw ActivityPolicyStore.StoreError.unavailable(detail)
+            }
+            throw ActivityPolicyStore.StoreError.unavailable("the initial read has not completed")
+        }
+        return policy
+    }
+
     /// The ONE write path. Persists, then propagates.
     ///
     /// Order is load-bearing. The policy file is what `activity_query` and a
@@ -299,6 +375,7 @@ public final class ActivityWatchController {
         let previous = policyTask
         let task = Task { [self] in
             _ = await previous?.value
+            guard isPolicyAvailable else { return false }
             var next = policy
             change(&next)
             return await persist(next)
@@ -316,6 +393,8 @@ public final class ActivityWatchController {
             return false
         }
         policy = next
+        hasCheckedPolicy = true
+        policyAvailability = .available
         guard !shuttingDown else { return true }
 
         if let watcher {
@@ -327,7 +406,7 @@ public final class ActivityWatchController {
         // Lifecycle invalidations keep this exact after asynchronous teardown;
         // this immediate read covers the mutation edge itself without a timer.
         refreshCapturingFlag()
-        if !next.captureEnabled { scheduleRetention() }
+        scheduleRetention()
         return true
     }
 
@@ -361,6 +440,7 @@ public final class ActivityWatchController {
         let previous = policyTask
         let task = Task { [self] in
             _ = await previous?.value
+            guard isPolicyAvailable else { return false }
             var next = policy
             next.excludedBundleIDs.insert(trimmed)
             // Never purge rows unless the exclusion first became durable.
@@ -418,6 +498,12 @@ public final class ActivityWatchController {
         }
     }
 
+    private enum RetentionPass {
+        case checked
+        case retry
+        case paused
+    }
+
     private func scheduleRetention() {
         guard !shuttingDown else { return }
         let previous = retentionTask
@@ -426,14 +512,19 @@ public final class ActivityWatchController {
             await previous?.value
             while !Task.isCancelled {
                 guard let self else { return }
-                let succeeded = await self.runRetention()
                 let delay: TimeInterval
-                if !succeeded && self.isCapturing { delay = ActivityWatcher.tickInterval }
-                else {
+                switch await self.runRetention() {
+                case .paused:
+                    return
+                case .retry:
+                    // A failed pass owes another attempt, not a completed-run
+                    // stamp. Its old due time may already be past; do not spin.
+                    delay = ActivityRetentionRunner.defaultInterval
+                case .checked:
                     do { delay = try ActivityRetentionRunner(dataRoot: self.dataRoot).nextRunDelay() }
                     catch {
-                        await self.recordIssue("Retention cadence state is unreadable; running on the default interval. " + self.errorCause(error, "read retention cadence"), severity: .warning)
-                        delay = ActivityRetentionRunner.defaultInterval
+                        await self.recordIssue("Activity retention is paused until its saved cadence is repaired. " + self.errorCause(error, "read retention cadence"), severity: .warning)
+                        return
                     }
                 }
                 do { try await Task.sleep(for: .seconds(delay)) }
@@ -442,33 +533,33 @@ public final class ActivityWatchController {
         }
     }
 
-    private func runRetention() async -> Bool {
+    private func runRetention() async -> RetentionPass {
         _ = await policyTask?.value
+        guard isPolicyAvailable, !Task.isCancelled else { return .paused }
         let runner = ActivityRetentionRunner(dataRoot: dataRoot)
         do {
             let policyStore = policyStore
             let current = try await Task.detached(priority: .utility) { try policyStore.loadChecked() }.value
-            guard let store = try await existingStore() else { return true }
-            if let fault = try await runner.runIfDue(
+            guard let store = try await existingStore() else { return .paused }
+            try await runner.runIfDue(
                 store: store,
                 policy: policy.captureEnabled ? policy : current,
                 now: Date().timeIntervalSince1970
-            ) {
-                await recordIssue("Retention ran, but its last-run state could not be read: " + fault, severity: .warning)
-            }
-            return true
+            )
+            return .checked
         } catch {
             // Retention failure does not expand collection authority, but it
             // does leave older local rows in place and must stay visible.
             await recordIssue(
-                "Couldn't remove expired activity rows. " + errorCause(error, "remove expired activity rows"),
+                "Activity retention could not complete this pass; cleanup will retry in six hours. Repair its policy, cadence or store if the problem persists. " + errorCause(error, "remove expired activity rows"),
                 severity: .warning
             )
-            return false
+            return .retry
         }
     }
 
     public func recordIssue(_ message: String, severity: ActivityCaptureIssue.Severity) async {
+        guard issues.last?.message != message else { return }
         let issue = ActivityCaptureIssue(id: UUID(), occurredAt: Date(), severity: severity, message: message)
         issues.append(issue)
         if issues.count > 12 { issues = Array(presentationIssues.prefix(12)) }

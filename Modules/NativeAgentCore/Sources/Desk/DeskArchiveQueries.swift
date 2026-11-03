@@ -4,7 +4,7 @@ import Foundation
 import PersistenceCore
 import NativeAgentCore
 import Synchronization
-// Blueprint: | `DeskArchiveQueries.swift` | Archival, current-life readings and hierarchy queries |
+// Blueprint: | `DeskArchiveQueries.swift` | Archival, complete checked archive history, current-life readings and hierarchy queries; pending scheduler imports cannot be archived before the migration commit |
 extension SwiftNativeDeskStore {
     /// archive_item -> append ArchiveRecord(s) to desk_archive.jsonl and exclude
     /// the item (and its whole subtree) from live state. REFUSES any standing
@@ -26,6 +26,9 @@ extension SwiftNativeDeskStore {
             }
             // Validate the whole subtree so archiving cannot orphan a live descendant.
             let subtree = Self.descendants(of: handle, in: state)
+            if let pending = ([item] + subtree).first(where: { node in
+                node.step.map { !MyQueue.migrationReady($0, dataRoot: dataRoot) } ?? false
+            }) { throw DeskError.archiveRefusedPendingMigration(handle: pending.handle) }
             if let standing = subtree.first(where: { $0.kind == .standing }) {
                 throw DeskError.archiveRefusedStanding(handle: standing.handle)
             }
@@ -181,10 +184,20 @@ extension SwiftNativeDeskStore {
               let base = SnapshotTailOpLog.fileStamp(basePath) else { return nil }
         return DeskLiveStateMemo.FeedStamp(ops: ops, base: base)
     }
-    /// All archived item records, in feed (append) order.
+    /// All archived item records, in feed (append) order. A malformed record
+    /// makes this history unavailable; it never becomes a successful omission
+    /// from archive identity checks or the archive presentation.
     public func archivedRecords() async throws -> [ArchiveRecord] {
         let raw = try await SwiftNativePersistenceCore.readJSONL(archivePath)
-        return raw.compactMap { ArchiveRecord.fromJSON($0) }
+        var records: [ArchiveRecord] = []
+        records.reserveCapacity(raw.count)
+        for (index, value) in raw.enumerated() {
+            guard let record = ArchiveRecord.fromJSON(value) else {
+                throw PersistenceCoreError.ioFailure("Desk archive history unavailable at \(archivePath.path): record \(index + 1) is not a complete archive record. Original bytes retained; repair the named record before reading or changing archive history.")
+            }
+            records.append(record)
+        }
+        return records
     }
     /// Every descendant of `handle` (children, grandchildren, …) in `state`,
     /// breadth-first. Cycle-safe: each handle is visited at most once.

@@ -301,30 +301,40 @@ public struct MemoryEmbeddingCorpusRow: Sendable, Equatable {
     public let kind: MemoryEmbeddingCorpusKind
     public let id: String
     public let content: String
+    /// Exact UTF-8 SHA-256 for this derived candidate, distinct from the
+    /// normalized claim hash used by canonical tombstone matching.
     public let contentHash: String
 
     public init(kind: MemoryEmbeddingCorpusKind, id: String, content: String) {
         self.kind = kind
         self.id = id
         self.content = content
-        self.contentHash = MemoryStorage.contentHash(content)
+        self.contentHash = MemoryStorage.contentFingerprint(content)
     }
 }
 
 public struct MemoryEmbeddingStagedRow: Sendable {
     public let row: MemoryEmbeddingCorpusRow
-    public let vector: [Float]
+    public let result: MemoryEmbeddingItem
 
-    public init(row: MemoryEmbeddingCorpusRow, vector: [Float]) {
+    public init(row: MemoryEmbeddingCorpusRow, result: MemoryEmbeddingItem) {
         self.row = row
-        self.vector = vector
+        self.result = result
     }
+}
+
+public struct MemoryEmbeddingActivationFailure: Sendable, Equatable {
+    public let epoch: String
+    public let reason: String
+    public let recordedAt: String
 }
 
 public struct MemoryEmbeddingEpochState: Sendable, Equatable {
     public let activeEpoch: String?
+    public let dimensions: Int?
     public let previousEpoch: String?
     public let activatedAt: String?
+    public let activationFailure: MemoryEmbeddingActivationFailure?
 
     public var protected: Bool { activeEpoch != nil }
 }
@@ -334,6 +344,7 @@ public struct MemoryEmbeddingEpochActivationReport: Sendable, Equatable {
     public let memories: Int
     public let proposals: Int
     public let tombstones: Int
+    public let unembeddable: Int
     public let previousEpoch: String?
     public let activatedAt: String
 

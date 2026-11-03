@@ -308,24 +308,14 @@ extension ChatView {
                             )
                         }
                     }
-                    // Refresh completed active-session messages; unscoped notices require full chat state.
+                    // Unscoped notices require full chat state; the open conversation's own rows arrive from the store.
                     .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
                         guard let completedSessionId = note.object as? String else {
                             Task { await appModel.loadChatState() }
                             return
                         }
-                        guard completedSessionId == appModel.activeChatSessionId else {
+                        if completedSessionId != appModel.activeChatSessionId {
                             Task { await appModel.followMovedAnchorInSimple() }
-                            return
-                        }
-                        // A local turn that already landed its disk snapshot says
-                        // so in userInfo; skip the duplicate whole-transcript read
-                        // (remote turns and failed local refreshes never set it).
-                        let alreadyRefreshed = (note.userInfo?["messagesAlreadyRefreshed"] as? Bool) == true
-                        Task {
-                            await appModel.refreshChatMessagesAfterTurn(
-                                sessionId: completedSessionId,
-                                messagesAlreadyRefreshed: alreadyRefreshed)
                         }
                     }
                     .modifier(TranscriptChangeRefresh(appModel: appModel))
@@ -469,10 +459,12 @@ private struct TranscriptChangeRefresh: ViewModifier {
     let appModel: AppModel
 
     func body(content: Content) -> some View {
-        content.onReceive(NotificationCenter.default.publisher(for: .nativeAgentChatTranscriptDidChange)
-            .receive(on: DispatchQueue.main)) { note in
-            guard let changed = note.object as? String, changed == appModel.activeChatSessionId else { return }
-            Task { await appModel.refreshChatMessagesAfterTurn(sessionId: changed) }
+        // The open conversation is a projection of its file: every surface's write appears when the store takes it.
+        content.task(id: "transcript:\(appModel.activeChatSessionId)") {
+            let sessionId = appModel.activeChatSessionId
+            await appModel.engine.transcripts.watchChanges(sessionID: sessionId) {
+                await appModel.readActiveTranscript(sessionId: sessionId)
+            }
         }
         // ...and while a turn from another door is working, the card says so,
         // including one already running when a conversation is opened.

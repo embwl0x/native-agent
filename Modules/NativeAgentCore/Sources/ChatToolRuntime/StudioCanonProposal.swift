@@ -7,7 +7,7 @@ import NativeAgentCore
 import PersistenceCore
 import Studio
 import TrustCenter
-// Blueprint: | `StudioCanonProposal.swift` | `StudioCanonProposal`: compatible approval payloads, pending cap, action/work and evidence-fingerprint dedupe; resolved cards append idempotently only with their seat and live-turn provenance |
+// Blueprint: | `StudioCanonProposal.swift` | `StudioCanonProposal`: strict current approval payloads before resolution, application and dedupe; work identity scopes damaged-card failures and named gaps; pending cap, action/work and evidence-fingerprint dedupe; resolved cards append idempotently only with their seat and live-turn provenance |
 
 /// The staged canon proposal: the card, its payload, and its landing.
 public enum StudioCanonProposal {
@@ -89,21 +89,58 @@ public enum StudioCanonProposal {
     }
 
     /// Pending cards dedupe by action/work; settled cards dedupe by evidence fingerprint, allowing new evidence.
+    /// A damaged card blocks only its own work; unrelated or unidentifiable cards leave named gaps.
     public static func isAlreadyFiled(
         draft: StudioCanonProposalDraft,
-        records: [ApprovalRecord]
-    ) -> Bool {
-        records.contains { record in
-            if record.status == "pending" { return proposalKey(of: record) == draft.key }
-            return evidenceFingerprint(of: record) == draft.evidenceFingerprint
+        records: [ApprovalRecord],
+        gaps: inout [String]
+    ) throws -> Bool {
+        let workKey = StudioCanonLaw.workKey(title: draft.workTitle, creator: draft.workCreator)
+        var alreadyFiled = false
+        func noteGap(_ error: any Error) {
+            let gap = error.localizedDescription
+            if !gaps.contains(gap) { gaps.append(gap) }
         }
+        for record in records {
+            let work: (title: String, creator: String?)
+            do { work = try savedWork(of: record) }
+            catch { noteGap(error); continue }
+            let sameWork = StudioCanonLaw.workKey(title: work.title, creator: work.creator) == workKey
+            do {
+                let saved = try self.draft(of: record)
+                guard sameWork else { continue }
+                if record.status == "pending" {
+                    if saved.key == draft.key { alreadyFiled = true }
+                } else if evidenceFingerprint(of: record) == draft.evidenceFingerprint {
+                    alreadyFiled = true
+                }
+            } catch {
+                if sameWork { throw error }
+                noteGap(error)
+            }
+        }
+        return alreadyFiled
     }
 
-    public static func proposalKey(of record: ApprovalRecord) -> String? {
+    private static func invalid(_ field: String, record: ApprovalRecord) -> ToolFailureError {
+        ToolFailureError("Canon proposal \(record.id): saved payload field \(field) is missing or malformed. The card was preserved for reconciliation.",
+            effects: .none, owner: "Studio canon proposal \(record.id)",
+            code: "studio_canon_payload_unavailable", status: .failed,
+            instruction: "Inspect the existing approval's original payload and cited entries; repair only from that evidence before resolving. Do not invent missing evidence or stage a replacement decision.", recovery: .repair)
+    }
+
+    private static func savedWork(of record: ApprovalRecord) throws -> (title: String, creator: String?) {
         guard case .object(let payload) = record.payload,
-              payload["schema"] == .string(payloadSchema),
-              case .string(let key)? = payload["proposalKey"], !key.isEmpty else { return nil }
-        return key
+              case .object(let work)? = payload["work"],
+              case .string(let title)? = work["title"], !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw invalid("work.title", record: record)
+        }
+        var creator: String?
+        if let value = work["creator"] {
+            guard case .string(let text) = value, !text.isEmpty else { throw invalid("work.creator", record: record) }
+            creator = text
+        }
+        return (title, creator)
     }
 
     public static func evidenceFingerprint(of record: ApprovalRecord) -> String? {
@@ -115,34 +152,42 @@ public enum StudioCanonProposal {
     }
 
     /// The card's own draft, read back for the resolve path.
-    public static func draft(of record: ApprovalRecord) -> StudioCanonProposalDraft? {
+    public static func draft(of record: ApprovalRecord) throws -> StudioCanonProposalDraft {
+        func invalid(_ field: String) -> ToolFailureError {
+            Self.invalid(field, record: record)
+        }
         guard case .object(let payload) = record.payload,
-              payload["schema"] == .string(payloadSchema),
-              case .string(let actionRaw)? = payload["canonAction"],
-              let action = StudioCanonAction(rawValue: actionRaw),
-              case .object(let work)? = payload["work"],
-              case .string(let title)? = work["title"], !title.isEmpty else { return nil }
-        var creator: String?
-        if case .string(let value)? = work["creator"], !value.isEmpty { creator = value }
-        var evidenceKind = StudioCanonEvidenceKind.recurrence
-        if case .string(let raw)? = payload["evidenceKind"],
-           let parsed = StudioCanonEvidenceKind(rawValue: raw) { evidenceKind = parsed }
-        var entryIDs: [String] = []
-        if case .array(let arr)? = payload["evidenceEntryIds"] {
-            entryIDs = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
+              record.action == approvalAction,
+              payload["schema"] == .string(payloadSchema), payload["kind"] == .string(approvalAction),
+              payload["soleApprover"] == .string(StudioCanonSeat.agent),
+              payload["ownerMayApprove"] == .bool(false), payload["autoCanonization"] == .bool(false) else {
+            throw invalid("schema/kind/authority")
         }
-        func int(_ key: String) -> Int {
-            if case .int(let value)? = payload[key] { return Int(value) }
-            return 0
+        func string(_ key: String, emptyAllowed: Bool = false) throws -> String {
+            guard case .string(let text)? = payload[key], emptyAllowed || !text.isEmpty else { throw invalid(key) }
+            return text
         }
-        var lastActivity = ""
-        if case .string(let value)? = payload["lastActivityAt"] { lastActivity = value }
-        return StudioCanonProposalDraft(
-            action: action, workTitle: title, workCreator: creator,
+        guard let action = StudioCanonAction(rawValue: try string("canonAction")),
+              let evidenceKind = StudioCanonEvidenceKind(rawValue: try string("evidenceKind")) else { throw invalid("canonAction/evidenceKind") }
+        let work = try savedWork(of: record)
+        guard case .array(let values)? = payload["evidenceEntryIds"], values.count <= StudioCanonRow.maximumEvidenceEntryIDs else { throw invalid("evidenceEntryIds") }
+        let entryIDs: [String] = try values.map {
+            guard case .string(let id) = $0, !id.isEmpty else { throw invalid("evidenceEntryIds[]") }
+            return id
+        }
+        func int(_ key: String) throws -> Int {
+            guard case .int(let value)? = payload[key], value >= 0, let count = Int(exactly: value) else { throw invalid(key) }
+            return count
+        }
+        let draft = try StudioCanonProposalDraft(
+            action: action, workTitle: work.title, workCreator: work.creator,
             evidenceKind: evidenceKind, evidenceEntryIDs: entryIDs,
             recurrenceCount: int("recurrenceCount"), recallHits: int("recallHits"),
-            lastActivityAt: lastActivity, reasonLine: record.reason
+            lastActivityAt: string("lastActivityAt", emptyAllowed: true), reasonLine: record.reason
         )
+        guard try string("proposalKey") == draft.key else { throw invalid("proposalKey") }
+        _ = try string("evidenceFingerprint")
+        return draft
     }
 
     public enum Outcome: Sendable, Equatable {
@@ -167,9 +212,7 @@ public enum StudioCanonProposal {
               let decision = record.decision else {
             throw StudioCanonError.unknownProposal(record.id)
         }
-        guard let draft = draft(of: record) else {
-            throw StudioCanonError.unknownProposal(record.id)
-        }
+        let draft = try draft(of: record)
         guard record.localOnly, !record.remoteResolvable else {
             throw StudioCanonError.approvalNotFromAgentSeat(record.decidedBy ?? "remote")
         }

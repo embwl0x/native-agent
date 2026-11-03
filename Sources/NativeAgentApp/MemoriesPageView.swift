@@ -6,7 +6,7 @@ import NativeAgentCore
 import MemoryV2
 import PersistenceCore
 
-// Blueprint: | `MemoriesPageView.swift` | `MemoriesPageView`: canonical recall rows without inventory substitution; request-scoped loading/failure, retained rows labeled by their original query |
+// Blueprint: | `MemoriesPageView.swift` | `MemoriesPageView`: canonical recall rows without inventory substitution; exact palette ids read through MemoryFacade into full-text detail; only the live page applies search changes; request-scoped loading/failure, retained rows labeled by their original query |
 
 // MARK: - Metrics
 
@@ -29,6 +29,7 @@ enum MemoriesPageMetrics {
 struct MemoriesPageView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
 
     @State private var query = ""
     @State private var loaded = false
@@ -42,6 +43,12 @@ struct MemoriesPageView: View {
     @State private var savingProposalIDs: Set<String> = []
     @State private var ordered: [MemoryRow] = []
     @State private var found: [MemoryRow] = []
+    @State private var selectionRead = LatestRead()
+    @State private var selectionTask: Task<Void, Never>?
+
+    init(initialQuery: String = "") {
+        _query = State(initialValue: initialQuery)
+    }
 
     private struct MemoryRow: Identifiable, Sendable {
         let memory: MemoryV2.MemoryRecord
@@ -128,6 +135,7 @@ struct MemoriesPageView: View {
                     { correct(memoryID: id, text: item.text) }
                 }
             )
+            .accessibilityIdentifier("memories.selected-memory.\(item.id)")
         }
         // Same live binding TodayView takes: the memory database and its WAL,
         // debounced, re-armed whenever the window comes back to the front. A
@@ -168,12 +176,50 @@ struct MemoriesPageView: View {
         // The owner starts its generation gate before its debounce, so a new
         // keystroke invalidates old results instead of leaving a previous
         // query's rows under the current search text.
-        .onChange(of: query) { _, newValue in
+        .onChange(of: query, initial: true) { _, newValue in
+            // A screenshot reads the shared owner; it must not clear or
+            // replace the search belonging to the page User has open.
+            guard !quietOffscreenRead else { return }
             found = []
             searchTask?.cancel()
             searchTask = Task { await memory.search(query: newValue) }
         }
-        .onDisappear { searchTask?.cancel() }
+        .onDisappear {
+            searchTask?.cancel()
+            selectionTask?.cancel()
+        }
+        .onChange(of: appModel.pendingPaletteDestination, initial: true) { _, _ in
+            acceptPaletteDestination()
+        }
+    }
+
+    private func acceptPaletteDestination() {
+        guard !quietOffscreenRead,
+              case .memory(let id)? = appModel.pendingPaletteDestination else { return }
+        // Consume before suspending; changing the route must not cancel its own read.
+        appModel.pendingPaletteDestination = nil
+        selectionTask?.cancel()
+        fullText = nil
+        notice = "Reading the selected memory…"
+        selectionTask = Task {
+            _ = await selectionRead.read({ () async -> Result<MemoryV2.MemoryRecord?, Error> in
+                // Use the saved-inventory contract (including graduated
+                // memories), not the narrower recall-eligible ids contract.
+                do { return .success(try await memory.activeMemories(limit: nil).first { $0.id == id }) }
+                catch { return .failure(error) }
+            }, publish: { result in
+                do {
+                    guard let record = try result.get() else {
+                        notice = "The selected memory is unavailable in the current store."
+                        return
+                    }
+                    notice = nil
+                    fullText = MemoriesFullText(id: record.id, text: record.text, memoryID: record.id)
+                } catch {
+                    notice = UserFacingError.message(error, action: "read the selected memory")
+                }
+            })
+        }
     }
 
     private var memory: MemoryFacade { appModel.engine.memory }
@@ -312,7 +358,13 @@ struct MemoriesPageView: View {
             line: row.line,
             meta: row.meta,
             isPinned: memory.pinned == true,
-            onRead: { fullText = MemoriesFullText(id: memory.id, text: memory.text, memoryID: memory.id) },
+            onRead: {
+                selectionTask?.cancel()
+                selectionRead.write {
+                    notice = nil
+                    fullText = MemoriesFullText(id: memory.id, text: memory.text, memoryID: memory.id)
+                }
+            },
             onTogglePin: { Task { await togglePin(memory) } },
             onDelete: { Task { await delete(memory) } }
         )

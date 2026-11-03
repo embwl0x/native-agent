@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `LLMClient.swift` | `LLMClient` named completion and structured streaming; request context, prompt layout, offered schemas and message/stream contracts |
+// Blueprint: | `LLMClient.swift` | `LLMClient` named completion, structured streaming and checked throwing serving-provider identity; request context includes explicit preview generation, whose sole inert receipt belongs to mind.run_now; prompt layout, offered schemas and message/stream contracts |
 
 // MARK: - LLMCallContext (request scope)
 //
@@ -10,6 +10,9 @@ import Foundation
 // and calls without any scope omit the cache hint.
 // Bindings wrap synchronous stream construction so inner Tasks inherit them.
 public enum LLMCallContext {
+    /// A real generation for an explicit mind preview. Its caller records the
+    /// sole inert mind.run_now trace; no usage, health or repair learns from it.
+    @TaskLocal public static var preview = false
     /// The shared router owns the admitted call's wall and cancels its process.
     @TaskLocal public static var wallOwned = false
     /// The admitted turn's client, for thoughts made by its owned code.
@@ -18,7 +21,15 @@ public enum LLMCallContext {
     @TaskLocal public static var turnTokenBudget: TurnTokenBudget?
     @TaskLocal public static var surface: String?
     @TaskLocal public static var purpose: String = "other"
+    /// Whole-reply output on an abnormal end. Delivered before the original
+    /// error is rethrown; callers own retention separately from error identity.
+    @TaskLocal public static var partialReply: (@Sendable (String) async -> Void)?
     @TaskLocal public static var sessionId: String?
+    /// Only the conversation's own provider requests may calibrate its context.
+    /// Secondary model calls mark their request shape unmeasured.
+    @TaskLocal public static var conversationRequest = false
+    /// Encoded, payload-free replay recipe from the actual request builder.
+    @TaskLocal public static var sessionRequestPlan: Data?
     /// Exact model admitted with the provider/effort/tier tuple at the outer
     /// turn boundary. A downstream adapter may reread canonical routing to
     /// fail closed on corruption, but it must not splice a newer valid picker
@@ -141,16 +152,31 @@ public protocol LLMClient: Sendable {
     /// The provider a `streamMessages` call for `model` on `surface` would be
     /// served by right now, under the caller's bound `LLMCallContext` — the
     /// same resolution the call runs, so a caller choosing how to talk to the
-    /// adapter reads its answer instead of guessing from a model prefix. Nil
-    /// when the client does not route (test doubles) or the call would fail
-    /// before reaching any adapter.
-    func servingProviderID(model: String?, surface: String) async -> String?
+    /// adapter reads its checked answer instead of guessing from a model prefix.
+    /// Unavailable routing preserves the owner's error before a grammar is chosen.
+    func servingProviderID(model: String?, surface: String) async throws -> String
+
+    /// The output cap this request's adapter will put on the wire. Zero means
+    /// that transport sends no output-cap field, not an unknown model limit.
+    func requestOutputTokens(model: String, surface: String) async throws -> Int
 }
 
 extension LLMClient {
-    /// Clients that do not route to provider adapters serve no provider.
-    public func servingProviderID(model: String?, surface: String) async -> String? {
-        nil
+    public func requestOutputTokens(model: String, surface: String) async throws -> Int {
+        throw LLMErrorForOutputMeasurement.unavailable
+    }
+    public func servingProviderID(model: String?, surface: String) async throws -> String {
+        throw LLMErrorForOutputMeasurement.providerUnavailable
+    }
+}
+
+private enum LLMErrorForOutputMeasurement: LocalizedError {
+    case unavailable, providerUnavailable
+    var errorDescription: String? {
+        switch self {
+        case .unavailable: "This model client does not expose its request output allowance; context admission is unavailable."
+        case .providerUnavailable: "This model client does not expose its serving provider; tool protocol admission is unavailable."
+        }
     }
 }
 

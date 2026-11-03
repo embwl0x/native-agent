@@ -73,7 +73,7 @@ extension AgentConversationStore {
                                              from: String, steeredBy: [String],
                                              recordReply: () throws -> Void = {}) throws -> Bool {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        let identity = AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
+        let identity = try AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
         return try locked {
             var rows = try load()
             let matches = rows.indices.filter { index in
@@ -123,14 +123,28 @@ extension AgentConversationStore {
                 exchange.status == "held"
                     || exchange.status == "delivering" && (exchange.settledAt ?? .distantPast) < AbandonedTurnReconciler.processEpoch
             }
-            let all = rows.filter { $0.agent == agent }.flatMap { row in
-                (row.exchanges ?? []).filter(waiting).compactMap { exchange in
-                    exchange.prompt.map { Held(row: row.id, exchange: exchange.id, at: exchange.sentAt, text: $0, conversation: row.conversationID) }
+            // The canonical contact transcript owns the accepted message. The
+            // exchange's bounded prompt is presentation only, never payload.
+            let pending = rows.filter { $0.agent == agent && ($0.exchanges ?? []).contains(where: waiting) }
+            guard !pending.isEmpty else { return ([], 0) }
+            guard agent.hasPrefix("peer:") else { throw Failure(message: "A held send requires its exact contact identity.") }
+            let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+            let lines = try ContactThread.lines(dataRoot: root, owner: String(agent.dropFirst(5)))
+            let all = try pending.flatMap { row in
+                try (row.exchanges ?? []).filter(waiting).map { exchange in
+                    let messages = lines.filter { $0.sendID == exchange.id && $0.mine }
+                    guard messages.count == 1, let message = messages.first else {
+                        throw Failure(message: "Held message \(exchange.id) has no unique canonical payload; repair its contact transcript before delivery. Nothing was drained.")
+                    }
+                    return Held(row: row.id, exchange: exchange.id, at: exchange.sentAt, text: message.text, conversation: row.conversationID)
                 }
             }.sorted { $0.at < $1.at }
             var taken: [Held] = []
             for item in all {
-                guard fits(taken + [item]) else { break }
+                guard fits(taken + [item]) else {
+                    if taken.isEmpty { throw Failure(message: "Held message \(item.exchange) exceeds this host's response capacity. It remains held in full; nothing was drained.") }
+                    break
+                }
                 taken.append(item)
             }
             guard !taken.isEmpty else { return ([], all.count) }
@@ -198,10 +212,16 @@ extension AgentConversationStore {
 
     /// The accepted message id of the send waiting in exactly this conversation, for an answer that names the conversation, not the message.
     public func waitingMessage(agent: String, conversationID: String) throws -> String? {
-        let identity = AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
+        let identity = try AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
         return try records().filter { identity.canonical($0.agent) == identity.canonical(agent) && $0.phase == "waiting" && $0.conversationID == conversationID }
-            .max { ($0.operationStartedAt ?? $0.updatedAt) < ($1.operationStartedAt ?? $1.updatedAt) }
-            .flatMap { if case .string(let id)? = $0.readInput?["message_id"], !id.isEmpty { id } else { nil } }
+            .map { row -> (row: AgentConversationRecord, started: Date) in
+                guard let started = row.operationStartedAt else {
+                    throw Failure(message: "Conversation \(row.id) has no operation start time; repair its retained evidence before selecting a waiting message.")
+                }
+                return (row, started)
+            }
+            .max { $0.started < $1.started }
+            .flatMap { if case .string(let id)? = $0.row.readInput?["message_id"], !id.isEmpty { id } else { nil } }
     }
 
     /// A contact's answer that came as a message of its own (Claude over the bridge) settles the send it names by its exact accepted message id, and only that one, through whichever of her doors it went; an answer naming nothing settles
@@ -209,7 +229,7 @@ extension AgentConversationStore {
     /// that steered it), carried onto any copy verbatim.
     @discardableResult public func settleReply(agent: String, messageID: String, text: String,
                                                landedIn: String? = nil, from: String, steeredBy: [String]) throws -> Bool {
-        let identity = AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
+        let identity = try AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
         return try locked {
             var rows = try load()
             guard !messageID.isEmpty, let index = rows.firstIndex(where: {
@@ -256,7 +276,7 @@ extension AgentConversationStore {
             for index in rows.indices {
                 let row = rows[index]
                 guard ["waiting", "attention"].contains(row.phase), !row.automaticRead,
-                      let lane = AgentConversationDelivery.lane(for: row.agent, dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent()),
+                      let lane = try AgentConversationDelivery.lane(for: row.agent, dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent()),
                       row.readInput?["agent"] == .string(row.agent),
                       case .string(let messageID)? = row.readInput?["message_id"],
                       !messageID.isEmpty else { continue }
@@ -320,7 +340,7 @@ extension AgentConversationStore {
         guard outcome.phase != "waiting", outcome.phase != "sending" else { return receipt }
         let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
         let owner = String(row.agent.dropFirst(5)), id = exchange ?? row.operationID
-        let identity = AgentContactIdentity(dataRoot: root)
+        let identity = try AgentContactIdentity(dataRoot: root)
         var line = try ContactThread.mergedLines(dataRoot: root, owner: owner, identity: identity)
             .last(where: { $0.answers == id && ContactThread.bridgedText($0.text) == ContactThread.bridgedText(text) })
         if line == nil {

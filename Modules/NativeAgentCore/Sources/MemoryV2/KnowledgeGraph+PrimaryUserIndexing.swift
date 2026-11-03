@@ -2,7 +2,8 @@ import Foundation
 import GRDB
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `KnowledgeGraph+PrimaryUserIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: shared `profileNames`, `resolvePrimaryUserName`, `consolidatePrimaryUserEntities`, `removeUnreferencedPrimaryUserRole` |
+import PersonaEngine
+// Blueprint: | `KnowledgeGraph+PrimaryUserIndexing.swift` | `SwiftNativeKnowledgeGraphIndexer`: shared `profileNames`, `primaryUserName`, `consolidatePrimaryUserEntities`, `removeUnreferencedPrimaryUserRole` |
 
 extension SwiftNativeKnowledgeGraphIndexer {
     struct PrimaryUserConsolidation {
@@ -13,23 +14,38 @@ extension SwiftNativeKnowledgeGraphIndexer {
     /// Resolve the user identity only from onboarding's canonical profile.
     /// Generic or unavailable values retain the role label rather than
     /// guessing a person's name from accepted-memory prose.
-    static func resolvePrimaryUserName(explicit: String?, profileURL: URL) -> String {
+    static func primaryUserName(explicit: String?, saved: String?) -> String {
         if let explicit {
             return usableProfileName(explicit, rejecting: ["user", "the user"]) ?? "the user"
         }
-        return profileNames(profileURL: profileURL).user ?? "the user"
+        return saved ?? "the user"
     }
 
     /// Read onboarding's names together so graph extraction and memory query
     /// expansion use the same identity and rejection vocabulary.
-    public static func profileNames(profileURL: URL) -> (agent: String?, user: String?) {
-        guard let data = try? Data(contentsOf: profileURL),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return (nil, nil)
+    public static func profileNames(profileURL: URL) throws -> (agent: String?, user: String?) {
+        let data: Data
+        do { data = try Data(contentsOf: profileURL) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return (nil, nil) }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw MemoryStorageError.databaseUnavailable("\(profileURL.path) is not a profile object; repair the saved identity before graph indexing or name expansion.")
         }
-        return (
-            usableProfileName(object["name"] as? String, rejecting: ["assistant", "the assistant", "agent", "the agent"]),
-            usableProfileName(object["userName"] as? String, rejecting: ["user", "the user"])
+        let profile = try PersonaCompiler.decodeProfile(raw: object)
+        if let userName = profile.extras["userName"], userName.stringValue == nil {
+            throw MemoryStorageError.databaseUnavailable("\(profileURL.path): userName must be a string; repair the saved identity before graph indexing or name expansion.")
+        }
+        func checkedName(_ raw: String?, key: String, rejecting: Set<String>) throws -> String? {
+            guard let raw else { return nil }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !rejecting.contains(trimmed.lowercased()) else { return nil }
+            guard let name = usableProfileName(raw, rejecting: rejecting) else {
+                throw MemoryStorageError.databaseUnavailable("\(profileURL.path): \(key) is not a usable saved name; repair its length or control characters before indexing.")
+            }
+            return name
+        }
+        return try (
+            checkedName(profile.name, key: "name", rejecting: ["assistant", "the assistant", "agent", "the agent"]),
+            checkedName(profile.extras["userName"]?.stringValue, key: "userName", rejecting: ["user", "the user"])
         )
     }
 
@@ -52,18 +68,15 @@ extension SwiftNativeKnowledgeGraphIndexer {
     private static func primaryUserAliases(
         name: String,
         existingRows: [Row] = []
-    ) -> [String] {
+    ) throws -> [String] {
         var aliases: [String] = ["the user", "User"]
         for row in existingRows {
             if let existingName: String = row["name"] {
                 aliases.append(existingName)
             }
             let raw: String? = row["aliases_json"]
-            guard let raw,
-                  let data = raw.data(using: .utf8),
-                  let decoded = try? JSONDecoder().decode([String].self, from: data) else {
-                continue
-            }
+            guard let raw else { continue }
+            let decoded = try JSONDecoder().decode([String].self, from: Data(raw.utf8))
             aliases.append(contentsOf: decoded)
         }
         var seen: Set<String> = []
@@ -107,9 +120,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
             """, arguments: [configuredLower, configuredLower])
         guard let first = rows.first else { return PrimaryUserConsolidation() }
 
-        func role(_ row: Row) -> String? {
+        func role(_ row: Row) throws -> String? {
             let raw: String? = row["metadata_json"]
-            guard case .string(let value)? = metadataObject(raw)["role"] else {
+            guard case .string(let value)? = try metadataObject(raw)["role"] else {
                 return nil
             }
             return value
@@ -123,7 +136,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             return value ?? ""
         }
 
-        let canonical = rows.first(where: { role($0) == "primary_user" })
+        let canonical = try rows.first(where: { try role($0) == "primary_user" })
             ?? rows.first(where: {
                 type($0).lowercased() == "person"
                     && name($0).caseInsensitiveCompare(primaryUserName) == .orderedSame
@@ -199,11 +212,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
             report.entitiesRemoved += db.changesCount
         }
 
-        var metadata = metadataObject(canonical["metadata_json"])
-        metadata["role"] = .string("primary_user")
-        metadata["embedding_text"] = .string("person: \(primaryUserName)")
-        metadata["indexer"] = .string(indexVersion)
-        let aliases = primaryUserAliases(name: primaryUserName, existingRows: rows)
+        let metadata = primaryUserMetadata(
+            name: primaryUserName, existing: try metadataObject(canonical["metadata_json"]))
+        let aliases = try primaryUserAliases(name: primaryUserName, existingRows: rows)
         let aliasData = try JSONEncoder().encode(aliases)
         let aliasJSON = String(decoding: aliasData, as: UTF8.self)
         try db.execute(sql: """
@@ -245,11 +256,25 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return PrimaryUserConsolidation(entitiesRemoved: db.changesCount)
     }
 
+    /// The shared identity comes from the profile, not the last fact indexed.
+    /// Source evidence belongs to each fact and relationship separately.
+    private static func primaryUserMetadata(
+        name: String, existing: [String: JSONValue] = [:]
+    ) -> [String: JSONValue] {
+        var metadata = existing
+        for key in ["memory_id", "last_memory_id", "last_memory_source"] {
+            metadata.removeValue(forKey: key)
+        }
+        metadata["role"] = .string("primary_user")
+        metadata["embedding_text"] = .string("person: \(name)")
+        metadata["indexer"] = .string(indexVersion)
+        return metadata
+    }
+
     static func upsertPrimaryUserEntity(
         _ db: Database,
         primaryUserName: String,
-        now: String,
-        fact: KnowledgeGraphMemoryFact
+        now: String
     ) throws -> String {
         if let row = try Row.fetchOne(db, sql: """
             SELECT id, aliases_json, metadata_json, mention_count
@@ -271,13 +296,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
             guard !overflow else {
                 throw MemoryStorageError.databaseUnavailable("kg_entities mention_count overflow for row \(id)")
             }
-            var metadata = metadataObject(row["metadata_json"])
-            metadata["role"] = .string("primary_user")
-            metadata["embedding_text"] = .string("person: \(primaryUserName)")
-            metadata["last_memory_id"] = .string(fact.id)
-            if let source = fact.source { metadata["last_memory_source"] = .string(source) }
-            metadata["indexer"] = .string(indexVersion)
-            let aliases = primaryUserAliases(name: primaryUserName, existingRows: [row])
+            let metadata = primaryUserMetadata(
+                name: primaryUserName, existing: try metadataObject(row["metadata_json"]))
+            let aliases = try primaryUserAliases(name: primaryUserName, existingRows: [row])
             let aliasData = try JSONEncoder().encode(aliases)
             try db.execute(sql: """
                 UPDATE kg_entities SET
@@ -302,15 +323,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
 
         let id = try uniqueEntityID(db)
-        let aliases = primaryUserAliases(name: primaryUserName)
+        let aliases = try primaryUserAliases(name: primaryUserName)
         let aliasData = try JSONEncoder().encode(aliases)
-        let metadata: [String: JSONValue] = [
-            "role": .string("primary_user"),
-            "embedding_text": .string("person: \(primaryUserName)"),
-            "last_memory_id": .string(fact.id),
-            "last_memory_source": fact.source.map(JSONValue.string) ?? .null,
-            "indexer": .string(indexVersion),
-        ]
+        let metadata = primaryUserMetadata(name: primaryUserName)
         try db.execute(sql: """
             INSERT INTO kg_entities
               (id, name, type, summary, aliases_json, mention_count,

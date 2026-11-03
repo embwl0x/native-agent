@@ -3,8 +3,10 @@ import NativeAgentCore
 import PersistenceCore
 import Dispatcher
 import MacControl
+import MacIntegration
 import CoreGraphics
-// Blueprint: | `SwiftToolDispatcher+DesktopPixels.swift` | `SwiftToolDispatcher`: `desktopPixelsRequested`, `desktopPixels`; screenshot saving uses cancellable SubprocessWork and settles observed saved paths exactly once without model pixel delivery |
+import Senses
+// Blueprint: | `SwiftToolDispatcher+DesktopPixels.swift` | `SwiftToolDispatcher`: `desktopPixelsRequested`, `desktopPixels`; composed images retain capture-time AX hit evidence and named masking failures, never identities or pixels for uninspectable layers; screenshot saving uses cancellable SubprocessWork and settles observed saved paths exactly once without model pixel delivery |
 
 extension SwiftToolDispatcher {
     func impl_mac_screenshot_save(input: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -13,7 +15,7 @@ extension SwiftToolDispatcher {
                 nextCall: ToolFailureError.call("app", ["find": .string("mac.screenshot_save")]),
                 code: code, status: .refused, instruction: "Correct args.\(field); inspect mac.screenshot_save for the accepted call.", recovery: .correctArguments)
         }
-        let access = await fullMacToolAccess(surface: surface)
+        let access = try await fullMacToolAccess(surface: surface)
         guard access.fileOpsAllowed, access.accessibilityAllowed else {
             if let need = macControlCategoryNeedEnvelope(
                 categories: ["accessibility", "file_ops"], mode: .write,
@@ -25,10 +27,10 @@ extension SwiftToolDispatcher {
                 instruction: "Ask the owner to review Full Mac file access and Accessibility in Trust.")
         }
         guard defaultMacScreenCaptureSource().isScreenRecordingTrusted() else {
-            throw ToolFailureError("Screen Recording permission is required to save a screenshot.", effects: .none,
-                owner: "macOS Screen Recording grant", tap: "System Settings > Privacy & Security > Screen Recording > NativeAgent",
-                personDecides: true, code: "screen_recording_not_trusted", status: .refused,
-                instruction: "Ask the owner to enable NativeAgent's Screen Recording grant.")
+            return .object(["status": .string("refused"), "effects": .string("none"),
+                "reason": .string("screen_recording_not_trusted"),
+                "detail": .string("Screen Recording permission is required to save a screenshot."),
+                "remedy": SystemPermissionPreflight.remedy("screen_recording") ?? .null])
         }
         let selectors = ["window_id", "app", "region"].filter { input[$0] != nil && input[$0] != .null }
         guard selectors.count <= 1 else {
@@ -91,7 +93,7 @@ extension SwiftToolDispatcher {
             throw invalid("capture_path_exists", "A screenshot path already exists; choose another path.", field: "path", accepted: "unused PNG path, including numbered paths for additional displays")
         }
         try Task.checkCancellation()
-        let process = Process()
+        let process = ManagedProcess()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
         process.arguments = args + paths.map(\.path)
         process.standardInput = FileHandle.nullDevice
@@ -103,7 +105,9 @@ extension SwiftToolDispatcher {
             let saved = paths.filter { ((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 0 }
             let complete = exit.launched && exit.code == 0 && saved.count == paths.count
             let detail: String
-            if let launchError = exit.launchError {
+            if let failure = exit.terminationError {
+                detail = failure
+            } else if let launchError = exit.launchError {
                 detail = "screencapture could not start: \(launchError)"
             } else if exit.stopped {
                 detail = "Screenshot save stopped; observed \(saved.count) of \(paths.count) saved files."
@@ -211,7 +215,10 @@ extension SwiftToolDispatcher {
             do { try await Task.sleep(for: .milliseconds(100)) }
             catch { return cancelled() }
             guard !Task.isCancelled else { return cancelled() }
-            guard let again = desktopWindowInventory() else { break }
+            guard let again = desktopWindowInventory() else {
+                return failed("desktop_window_list_unavailable", "The desktop window list could not be refreshed for masking. No image was delivered.",
+                    instruction: "Read the front app's text and controls to establish available coverage; desktop masking needs a readable window list.")
+            }
             if NSArray(array: windows).isEqual(to: again) { break }
             windows = again
         }
@@ -226,7 +233,11 @@ extension SwiftToolDispatcher {
         // Recheck the shot-time inventory before inspection: moved or vanished
         // windows refuse capture; newly appeared windows are masked in full.
         // Later movement prevents a window from matching its inspected root.
-        guard let settled = desktopWindowInventory(), desktopWindowsHeld(windows, through: settled) else {
+        guard let settled = desktopWindowInventory() else {
+            return failed("desktop_window_list_unavailable", "The capture-time desktop window list could not be read for masking. No image was delivered.",
+                instruction: "Read the front app's text and controls to establish available coverage; desktop masking needs a readable window list.")
+        }
+        guard desktopWindowsHeld(windows, through: settled) else {
             return failed("desktop_windows_changed", "A desktop window moved or closed during capture. No image was delivered.",
                 instruction: "Inspect the current text and controls; request pixels only after the windows stop moving.")
         }
@@ -277,9 +288,15 @@ extension SwiftToolDispatcher {
         result["captured_at"] = .string(ISO8601DateFormatter().string(from: Date()))
         result["verification_scope"] = .string("visual_observation_only")
         result["masked_windows"] = .int(Int64(maskedWindows))
+        let maskingFailures: [JSONValue] = layers.compactMap { layer in
+            guard let failure = layer.inspectionFailure else { return nil }
+            return .object(["window_id": .int(Int64(layer.number)), "message": .string(failure)])
+        }
+        if !maskingFailures.isEmpty { result["masking_failures"] = .array(maskingFailures) }
         var note = "Primary-display pixels, bounded so the model sees them at the receipt's own size (short side ≤ 768 px). Secret fields are masked; windows whose contents could not be safely inspected are masked in full. Inspect the image to assess the outcome; capture success alone does not verify an action. Protected content may be unavailable."
         if result["status"] == .string("ok") {
-            let frame = MacImageFrames.remember(MacScreenViewGeometry(bounds: shot.bounds, pixelWidth: masked.width, pixelHeight: masked.height))
+            let frame = MacImageFrames.remember(MacScreenViewGeometry(bounds: shot.bounds, pixelWidth: masked.width,
+                pixelHeight: masked.height, capture: shot.capture?.composing(layers.map { ($0.number, $0.capture) })))
             result["image"] = frame.fields
             note += " " + frame.words
         }
@@ -294,6 +311,8 @@ extension SwiftToolDispatcher {
         let frame: MacAXFrame
         let image: CGImage?
         let secrets: [MacAXFrame]
+        var capture: MacImageCapture? = nil
+        var inspectionFailure: String? = nil
     }
 
     private static func desktopLayers(
@@ -372,6 +391,7 @@ extension SwiftToolDispatcher {
                 continue
             }
             let matches = rootsByPID[pid, default: []].filter { $0.identity.frame.map { near($0, frame) } ?? false }
+            var inspectionFailure: String?
             // The match must hold both ways: two CG windows of one app near one
             // frame (a document and a hidden sibling panel) would both match the
             // same AX root, and one window's inspection would then vouch for the
@@ -382,25 +402,39 @@ extension SwiftToolDispatcher {
                 // must stay fixed while other content may change. Incomplete or
                 // unreadable inspection, unplaceable controls, or a changed root
                 // masks the whole window; zero-area controls paint nothing.
-                func fields() -> [MacAXFrame]? {
-                    guard let nodes = try? MacScreenViewTextRedaction.inspectSecretFields(
-                        source: accessibility, root: root.ref, deadline: share) else { return nil }
-                    return MacScreenViewTextRedaction.secretFrames(nodes: nodes, geometry: geometry, deadline: share)
+                var imageTargets: [MacImageCapture.PointTarget] = []
+                func fields(recordTargets: Bool = false) -> [MacAXFrame]? {
+                    let nodes: [MacAXNode]
+                    do {
+                        nodes = try MacScreenViewTextRedaction.inspectSecretFields(
+                            source: accessibility, root: root.ref, deadline: share)
+                    } catch {
+                        inspectionFailure = (error as? SenseFailure)?.message ?? error.localizedDescription
+                        return nil
+                    }
+                    guard let secrets = MacScreenViewTextRedaction.secretFrames(nodes: nodes, geometry: geometry, deadline: share) else { return nil }
+                    if recordTargets {
+                        imageTargets = MacImageCapture.pointTargets(nodes: nodes, pid: pid,
+                            deadline: share, source: defaultMacAXActSource())
+                    }
+                    return secrets
                 }
                 // A secret that moved masks the window whole: the capture's instant is unknown, and a union of its two places leaves the pixels between them bare.
-                if let before = fields(),
+                if let before = fields(recordTargets: true),
                    case .success(let own) = await capture(number, max(1, Int((frame.w * pixelsPerPoint * scale).rounded()))),
                    let image = own.cgImage,
                    MacAXLimits.$readDeadline.withValue(share, operation: { accessibility.windowRoots(pid: pid) })
                        .contains(where: { $0.identity == root.identity }),
                    let after = fields(), Set(after) == Set(before) {
-                    layers.append(DesktopLayer(number: number, frame: frame, image: image, secrets: before))
+                    layers.append(DesktopLayer(number: number, frame: frame, image: image, secrets: before,
+                        capture: own.capture?.recordingTargets(imageTargets)))
                     continue
                 }
             }
             // Uninspectable content is a sensitive region in its entirety,
             // including our own windows (which AX deliberately cannot read).
-            layers.append(DesktopLayer(number: number, frame: frame, image: nil, secrets: []))
+            layers.append(DesktopLayer(number: number, frame: frame, image: nil, secrets: [],
+                inspectionFailure: inspectionFailure))
         }
         // A window that appeared as the shot was taken may be in the pixels, in
         // front of anything: masked whole, painted last.

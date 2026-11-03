@@ -36,7 +36,7 @@ enum InboxActionFileBoundary {
         return candidate
     }
 
-    private static func isCanonicalUUID(_ value: String) -> Bool {
+    static func isCanonicalUUID(_ value: String) -> Bool {
         guard value.utf8.count == 36, let parsed = UUID(uuidString: value) else {
             return false
         }

@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `ChatRichContentParser.swift` | `ChatRichContentParser`: shared fence, list and sanitized inline grammar; `ChatContentCache`: bounded content-keyed FIFO storage |
+// Blueprint: | `ChatRichContentParser.swift` | `ChatRichContentParser`: shared fence, list and sanitized inline grammar with explicit parse outcomes and failure presentation; `ChatContentCache`: bounded content-keyed FIFO storage |
 
 // Split fences before inline parsing so code remains literal on both platforms.
 /// Identity is deliberately NOT derived from the block's contents: a message
@@ -13,13 +13,35 @@ public enum ChatContentBlock: Equatable, Sendable {
 }
 
 public enum ChatRichContentParser {
+    /// A failed parse is never a successfully rendered literal message. Keep
+    /// its cause and source together through caches and presentation.
+    public enum InlineOutcome: Sendable {
+        case parsed(AttributedString)
+        case failed(source: String, reason: String)
+
+        /// The same visible failure on every surface, including Copy. Source
+        /// is evidence below the notice, not input to a second interpreter.
+        public var presentation: AttributedString {
+            switch self {
+            case .parsed(let text): return text
+            case .failed(let source, let reason):
+                return AttributedString("Message formatting could not be read: \(reason)\n\nOriginal text:\n\(source)")
+            }
+        }
+    }
+
     /// Uncached for growing streaming text; settled callers retain by content.
-    public static func inline(_ content: String) -> AttributedString? {
-        guard let raw = try? AttributedString(
-            markdown: content,
-            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) else { return nil }
-        return ChatLinkPolicy.sanitized(raw)
+    public static func inline(_ content: String) -> InlineOutcome {
+        do {
+            let raw = try AttributedString(
+                markdown: content,
+                options: AttributedString.MarkdownParsingOptions(
+                    interpretedSyntax: .inlineOnlyPreservingWhitespace, failurePolicy: .throwError)
+            )
+            return .parsed(ChatLinkPolicy.sanitized(raw))
+        } catch {
+            return .failed(source: content, reason: error.localizedDescription)
+        }
     }
 
     public struct ProseRow: Equatable, Sendable {

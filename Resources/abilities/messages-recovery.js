@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id": "messages-recovery", "kind": "tool", "version": 1, "reach": {"capabilities": []}, "face": {"page": "messages"}, "record": {"description": "Recovery wording for structured messages failure reasons. No app access or effects.", "actions": [], "inputSchema": {"type": "object", "readOnly": true, "properties": {}, "additionalProperties": false}}}
+{"id": "messages-recovery", "kind": "ability", "version": 1, "reach": {"capabilities": []}, "face": {"page": "messages"}, "record": {"description": "Recovery wording for structured messages failure reasons. No app access or effects.", "actions": [], "inputSchema": {"type": "object", "readOnly": true, "properties": {}, "additionalProperties": false}}}
 */
 function run(input) {
     return {

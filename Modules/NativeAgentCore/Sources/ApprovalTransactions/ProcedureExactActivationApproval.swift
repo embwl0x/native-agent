@@ -17,32 +17,25 @@ extension ApprovalExecution {
         guard record.action == SwiftNativeApprovalInbox
             .procedureExactActivationApprovalAction,
               record.status == "resolved" else { return }
+        await performDomainApprovalExecution(record, dataRoot: dataRoot) {
         guard record.decision == ApprovalDecision.approved.rawValue else {
-            try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                record.id,
-                executedAction: .object([
+            return .init(action: .object([
                     "action": .string(record.action),
                     "decision": .string(record.decision ?? "unknown"),
                     "activated": .bool(false),
                 ]),
-                detail: "Exact procedure activation \(record.decision ?? "not approved"); active routing unchanged."
-            )
-            return
+                detail: "Exact procedure activation \(record.decision ?? "not approved"); active routing unchanged.")
         }
         guard let proposal = SwiftNativeApprovalInbox
             .procedureExactActivationProposal(from: record) else {
-            try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                record.id,
-                executedAction: .object([
+            return .init(action: .object([
                     "action": .string(record.action),
                     "status": .string("failed"),
                     "error": .string("invalid activation proposal binding"),
                 ]),
                 detail: "FAILED: exact procedure activation proposal binding is invalid."
             )
-            return
         }
-        do {
             let store = ProcedureArtifactStore(dataRoot: dataRoot)
             let artifact = try await store.load(proposal.artifactID)
             guard await WorkshopProcedureExactActivationQualifier.proposalStillMatchesCanonicalEvidence(
@@ -55,9 +48,7 @@ extension ApprovalExecution {
             let manifest = try await store.installAndActivateExact(
                 proposal: proposal, reviewerDecision: decision
             )
-            try await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                record.id,
-                executedAction: .object([
+            return .init(action: .object([
                     "action": .string(record.action),
                     "status": .string("activated"),
                     "activation_id": .string(manifest.id),
@@ -67,16 +58,6 @@ extension ApprovalExecution {
                     "permission_authority": .bool(false),
                 ]),
                 detail: "Activated exact typed routing for \(manifest.proposal.procedureID); TrustCenter and canonical verification remain mandatory."
-            )
-        } catch {
-            try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                record.id,
-                executedAction: .object([
-                    "action": .string(record.action),
-                    "status": .string("failed"),
-                    "error": .string(String(describing: error)),
-                ]),
-                detail: "FAILED: exact procedure activation was not installed (\(error.localizedDescription))."
             )
         }
     }

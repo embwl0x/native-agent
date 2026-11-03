@@ -24,9 +24,8 @@ public struct TelegramRestartBridge: Sendable {
         self.deferredRestart = deferredRestart
     }
 
-    public func ownerChatIds() async -> Set<Int64> {
-        // Re-read the owner allowlist per call; empty or missing config fails closed.
-        TelegramConfig.loadFromDisk(dataRoot: dataRoot)?.allowedChatIds ?? []
+    public func ownerUserId() throws -> Int64? {
+        try TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: false)?.ownerUserId
     }
 
     public func requestRestart(reason: String) async -> TelegramSlashDispatchOutcome {
@@ -82,20 +81,15 @@ extension SwiftNativeTelegramBot {
                 reply: "restart is not wired in this build. Restart NativeAgent from the Mac app."
             )
         }
-        // Require wire chat.type == private, or a positive chat ID when chat.type is absent.
-        let isPrivate: Bool = {
-            if let chatType { return chatType == "private" }
-            if let chatId { return chatId > 0 }
-            return false
-        }()
-        guard isPrivate else {
+        guard chatType == "private" else {
             return TelegramSlashDispatchOutcome(
                 reply: "/restart only works in a private chat with the owner; group chats cannot restart the app."
             )
         }
-        let owners = await restart.ownerChatIds()
-        // Missing allowlist or chat identity fails the owner gate closed.
-        guard let chatId, !owners.isEmpty, owners.contains(Int64(chatId)) else {
+        let owner: Int64?
+        do { owner = try restart.ownerUserId() }
+        catch { return TelegramSlashDispatchOutcome(reply: "Restart unavailable: \(error.localizedDescription)") }
+        guard let chatId, let owner, owner == Int64(chatId) else {
             return TelegramSlashDispatchOutcome(
                 reply: "/restart is owner-gated; this chat is not authorized."
             )

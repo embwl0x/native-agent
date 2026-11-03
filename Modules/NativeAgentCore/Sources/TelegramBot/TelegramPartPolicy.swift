@@ -30,10 +30,10 @@ extension SwiftNativeTelegramBot {
     /// can arrange their buttons, but cannot introduce another callback action.
     func modelPicker(_ op: String, menu: TelegramModelMenu?, args: [String] = [],
         providerId: String? = nil, modelId: String? = nil) async throws -> TelegramModelPickerDecision {
-        let packet: JSONValue = menu.flatMap { menu in menu.providers.map { providers in .object([
+        let packet: JSONValue = menu.map { menu in .object([
             "surface": .string(menu.surface), "currentModel": .string(menu.currentModel),
             "currentProvider": .string(menu.currentProvider),
-            "providers": .array(providers.map { provider in .object([
+            "providers": .array(menu.providers.map { provider in .object([
                 "id": .string(provider.id), "displayName": .string(provider.displayName),
                 "isCurrent": .bool(provider.isCurrent),
                 "callback": .string(TelegramModelSelectionCallback.providerData(id: provider.id)),
@@ -42,7 +42,7 @@ extension SwiftNativeTelegramBot {
                     "callback": .string(TelegramModelSelectionCallback.modelData(providerId: provider.id, modelId: model.id))
                 ]) })
             ]) })
-        ]) } } ?? .null
+        ]) } ?? .null
         let current = packet == .null ? menu : nil
         let decision: TelegramModelPickerDecision = try await callTelegramPart("telegram-model-picker", input: .object([
             "op": .string(op), "menu": packet,
@@ -70,7 +70,7 @@ extension SwiftNativeTelegramBot {
               case .array(let rows)? = markup["inline_keyboard"], rows.count <= 41 else {
             throw PartCallError(code: "bad_result", message: "The model picker returned an invalid Telegram menu.")
         }
-        let allowed = Set((menu.providers ?? []).flatMap { provider in
+        let allowed = Set(menu.providers.flatMap { provider in
             [TelegramModelSelectionCallback.providerData(id: provider.id)] + provider.models.map {
                 TelegramModelSelectionCallback.modelData(providerId: provider.id, modelId: $0.id)
             }
@@ -83,6 +83,11 @@ extension SwiftNativeTelegramBot {
                 throw PartCallError(code: "bad_result", message: "The model picker returned a button outside the checked routing choices.")
             }
         }
-        return (text, .object(markup))
+        let issues = menu.catalogIssues
+        let presented = issues.isEmpty ? text : text + "\n" + issues
+        guard presented.count <= 4_096 else {
+            throw PartCallError(code: "bad_result", message: "Telegram model catalog diagnostics exceed the menu limit. Read Providers to repair its catalogs.")
+        }
+        return (presented, .object(markup))
     }
 }

@@ -22,7 +22,7 @@ struct EmbeddingModelDownloadRow: View {
             if controller.status.running {
                 Button("Pause") { controller.cancel() }
             } else {
-                Button("Check / resume") { controller.start(createOnly: false, reconcile: true) }
+                Button("Check / resume") { controller.start(createOnly: false) }
                     .disabled(controller.activating)
             }
         }

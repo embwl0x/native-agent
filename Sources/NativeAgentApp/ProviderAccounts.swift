@@ -47,8 +47,8 @@ struct ProviderRowView: View {
     private func providerIcon(_ id: String) -> String {
         switch id {
         case "codex":             return "sparkles"
-        case "anthropic", "anthropic_mcp", "anthropic_oauth_direct": return "brain"
-        case "xai", "xai_oauth_direct": return "sparkles"
+        case "anthropic", "anthropic_oauth_direct": return "brain"
+        case "xai_oauth_direct": return "sparkles"
         case "openrouter":        return "shuffle"
         case "moonshot":          return "moon.stars.fill"
         case "kimi-code":         return "curlybraces"

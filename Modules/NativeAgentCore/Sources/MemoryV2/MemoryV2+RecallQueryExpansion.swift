@@ -61,12 +61,14 @@ public enum MemoryRecallQueryExpansion {
     /// Agent and user names from `profile.json` beside the store, cached by
     /// file modification date so the hot recall path pays one stat, not a
     /// parse, per call.
-    public static func names(storeDirectory: URL) -> Names {
+    public static func names(storeDirectory: URL) throws -> Names {
         let url = storeDirectory.appendingPathComponent("profile.json")
-        let modified = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
-        return cache.withLock { cache in
+        let modified: Date?
+        do { modified = try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { modified = nil }
+        return try cache.withLock { cache in
             if let cached = cache[url.path], cached.modified == modified { return cached.names }
-            let profile = SwiftNativeKnowledgeGraphIndexer.profileNames(profileURL: url)
+            let profile = try SwiftNativeKnowledgeGraphIndexer.profileNames(profileURL: url)
             let names = Names(agent: profile.agent, user: profile.user)
             cache[url.path] = (modified, names)
             return names

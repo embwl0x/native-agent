@@ -57,6 +57,10 @@ extension SwiftToolDispatcher {
             return (ChatHistorySearchRow(valid: false, identity: trimmed, content: "", searchable: "", folded: "",
                 displayPrefix: "", shape: decoded.value == nil ? 0 : 1), nil)
         }
+        guard ContactThread.Line(obj).provenanceFailure == nil else {
+            return (ChatHistorySearchRow(valid: false, identity: trimmed, content: "", searchable: "", folded: "",
+                displayPrefix: "", shape: 1), nil)
+        }
         func string(_ value: JSONValue?) -> String? { if case .string(let text)? = value { return text }; return nil }
         let role = (decoded.role ?? "unknown").lowercased()
         let words = role == "tool" ? nil : decoded.content
@@ -64,7 +68,7 @@ extension SwiftToolDispatcher {
         let timestamp = decoded.timestamp
         let instant = timestamp.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
         let metadata = persistedHistoryMetadata(row: obj)
-        let name = string(metadata["toolName"] ?? obj["toolName"])
+        let name = string(metadata["toolName"])
         func project(_ text: String) -> ChatHistorySearchRow {
             let content = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : text
             // Only persisted bridge provenance strips routing boilerplate; quoted words stay searchable.
@@ -93,22 +97,19 @@ extension SwiftToolDispatcher {
     static func persistedHistoryMetadata(row: [String: JSONValue]) -> [String: JSONValue] {
         switch row["metadata"] {
         case .object(let object)?: return object
-        case .string(let text)?:
-            if let value = try? JSONValue.parse(Data(text.utf8)), case .object(let object) = value { return object }
-            return [:]
         default: return [:]
         }
     }
 
     /// A narrow projection owned by explicit history tools. Do not teach the ordinary history reader to inject tool metadata into every new turn.
     static func persistedToolReceiptText(row: [String: JSONValue], metadata: [String: JSONValue]) -> String {
-        func value(_ key: String) -> JSONValue? { metadata[key] ?? row[key] }
+        func value(_ key: String) -> JSONValue? { metadata[key] }
         func serialized(_ value: JSONValue?) -> String? {
             guard let value, value != .null else { return nil }
             if case .string(let text) = value { return text }
             return try? value.serialize(pretty: false)
         }
-        let toolName = serialized(value("toolName")) ?? serialized(value("name")) ?? "unknown"
+        let toolName = serialized(value("toolName")) ?? "unknown"
         var clipped = false
         func bounded(_ text: String, maximum: Int) -> String {
             let redacted = ChatSecretRedactor.redactText(String(text.prefix(maximum + 512)))
@@ -123,7 +124,7 @@ extension SwiftToolDispatcher {
             ))
         }
         let result = serialized(value("resultSummary"))
-            ?? serialized(row["content"]) ?? serialized(row["text"]) ?? ""
+            ?? serialized(row["content"]) ?? ""
         // Preserve a clipped JSON string as a string. Parsing a surviving prefix into a fresh success envelope would invent missing evidence. An app call of a folded action is redacted as the tool it ran.
         let ran = ToolNameAliases.shown(toolName, inputJSON: serialized(value("inputJSON"))).name
         receipt["resultSummary"] = .string(bounded(
@@ -187,9 +188,8 @@ extension SwiftToolDispatcher {
 
     /// The sources a tool receipt's own result labels, or its routed contact.
     private static func toolReceiptSources(row: [String: JSONValue], metadata: [String: JSONValue]) -> [String] {
-        let tool = (metadata["toolName"] ?? row["toolName"]
-            ?? metadata["name"] ?? row["name"])?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? ""
-        let storedInput = metadata["inputJSON"] ?? row["inputJSON"]
+        let tool = (metadata["toolName"])?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? ""
+        let storedInput = metadata["inputJSON"]
         let input: [String: JSONValue]
         if case .string(let text)? = storedInput,
            let parsed = try? JSONValue.parse(Data(text.utf8)) {
@@ -198,7 +198,7 @@ extension SwiftToolDispatcher {
             input = (storedInput?.objectValue ?? [:])
         }
         for key in ["receiptEvidence", "resultSummary", "resultBody", "content", "text"] {
-            let stored = metadata[key] ?? row[key]
+            let stored = metadata[key]
             let result: JSONValue?
             if case .string(let text)? = stored { result = try? JSONValue.parse(Data(text.utf8)) }
             else { result = stored }

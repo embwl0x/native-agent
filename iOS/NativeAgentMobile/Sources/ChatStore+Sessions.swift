@@ -73,6 +73,7 @@ extension ChatStore {
         let freshSessionID = UUID().uuidString
         MobileChatSelectionIntent.selectSession(freshSessionID)
         // Dictation ends with the conversation it belongs to.
+        onTalkSessionChange?()
         onSessionChange?()
         // New chat takes priority over pending history reads and releases the composer immediately.
         cancelSessionSwitch()
@@ -86,7 +87,7 @@ extension ChatStore {
         for correlationID in retiringCorrelations {
             markICloudReplyResolved(correlationID, discardRetainedSend: false)
         }
-        isPollingFallback = false
+        showsReplyWaitHint = false
         errorBanner = nil
         // The fresh session starts with an unlocked composer.
         isLoading = false
@@ -109,6 +110,7 @@ extension ChatStore {
         loadTranscript: @escaping SessionTranscriptLoader
     ) {
         // Every conversation change ends dictation at its owner.
+        onTalkSessionChange?()
         onSessionChange?()
         sendTask?.cancel()
         sendTask = nil
@@ -120,7 +122,7 @@ extension ChatStore {
         for correlationID in retiringCorrelations {
             markICloudReplyResolved(correlationID, discardRetainedSend: false)
         }
-        isPollingFallback = false
+        showsReplyWaitHint = false
         isSwitchingSession = true
         sessionSwitchGeneration &+= 1
         let switchGeneration = sessionSwitchGeneration

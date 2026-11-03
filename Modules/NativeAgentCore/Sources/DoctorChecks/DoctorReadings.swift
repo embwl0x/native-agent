@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Experiences
-// Blueprint: | `DoctorReadings.swift` | Shared Doctor readings, ownership, recovery steps, executable repair and provider observation values; CheckResult preserves the report and experience projection shape; app defects never create coding requests |
+// Blueprint: | `DoctorReadings.swift` | Shared Doctor readings, ownership, explicit human_action recovery steps, executable repair and provider observations; cached repair prose never determines a human step; CheckResult preserves report and experience projection shape |
 
 /// Stable Doctor check shape:   {"id", "title", "status", "detail", "harm", "repair"}. Readings use "unmeasured"; adverse rows
 /// say why they matter in `harm`.
@@ -12,8 +12,7 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
     public var status: String
     public var detail: String
     public var harm: String?
-    /// Executable repair instruction in reports; legacy core checks are normalized by EngineDoctorRuntime before they reach
-    /// consumers.
+    /// Executable repair instruction in reports; never interpreted as a human step.
     public var repair: String?
     public var receipt: String?
     /// Whether the repair changed app-owned state; nil in older readings.
@@ -69,15 +68,10 @@ public struct CheckResult: Sendable, Codable, Equatable, Identifiable {
         self.repairExperience = repairExperience
     }
 
-    /// The human step for an adverse row, including older cached rows with only legacy repair copy. Doctor repairs what it can;
-    /// a row with neither a repair nor a step names its harm before it can be routed.
-    public func recoveryAction(repairAvailable: Bool) -> String? {
+    /// Only a declared human step is offered. Cached repair prose without this
+    /// field has unknown intent; a fresh reading must supply the current remedy.
+    public func recoveryAction() -> String? {
         if let action = human_action?.trimmingCharacters(in: .whitespacesAndNewlines), !action.isEmpty {
-            return action
-        }
-        guard !repairAvailable, DoctorSafeRepairPolicy.isAdverse(status) else { return nil }
-        if let action = repair?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !action.isEmpty, !DoctorSafeRepairPolicy.isCoreRepairInstruction(action) {
             return action
         }
         return nil
@@ -110,10 +104,10 @@ extension CheckResult {
         if repairExperience != nil { return human_action }
         guard DoctorSafeRepairPolicy.isAdverse(status), ask != nil || repairCall == nil else { return nil }
         if owner == .builder {
-            return "Ask the person to resolve \(repairOwner ?? checkID). " + (recoveryAction(repairAvailable: false)
+            return "Ask the person to resolve \(repairOwner ?? checkID). " + (recoveryAction()
                 ?? "Report this app defect and failed check \(checkID) to NativeAgent's maintainer; preserve saved data and all Trust, sign-in and privacy decisions.")
         }
-        return recoveryAction(repairAvailable: false)
+        return recoveryAction()
     }
 
     public var remedy: JSONValue? {
@@ -136,7 +130,7 @@ extension CheckResult {
     /// The reported row: its human step, an executable repair only where one runs, and its owner. Every writer of a Doctor
     /// report settles through it.
     public func settled(liveAvailable: Bool, coreAvailable: Bool) -> CheckResult {
-        let humanAction = recoveryAction(repairAvailable: liveAvailable || coreAvailable) ?? (liveAvailable
+        let humanAction = recoveryAction() ?? (liveAvailable
             ? "Press Repair in Diagnostics → Health checks to retry this live service."
             : nil)
         var reading = self
@@ -180,7 +174,7 @@ public enum DoctorChecksError: Error, LocalizedError {
 }
 
 public typealias DoctorTelegramSnapshot = (enabled: Bool, tokenConfigured: Bool, isTransientPollInterruption: Bool, actionableError: String?, pollerEnabled: Bool, hasFreshSuccessfulPoll: Bool, isStarting: Bool)
-public typealias DoctorAutonomySnapshot = (enabled: Bool?, disabledReason: String?, status: String, mode: String?, runningImprovements: Int?)
+public typealias DoctorAutonomySnapshot = (enabled: Bool?, disabledReason: String?, status: String, mode: String?)
 public typealias DoctorToolSnapshot = (status: String, name: String)
 public typealias DoctorBridgeSnapshot = (name: String, health: (failure: String?, boundPort: UInt16?, isActive: Bool, port: UInt16), expected: Bool)
 

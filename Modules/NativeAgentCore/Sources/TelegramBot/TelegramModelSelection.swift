@@ -8,7 +8,7 @@ import DeviceSync
 import NotificationInbox
 import PersistenceCore
 
-// Blueprint: | `TelegramModelSelection.swift` | Account-scoped provider/model selection, capability lookup, menu values and bot-facing model access |
+// Blueprint: | `TelegramModelSelection.swift` | Account-scoped selection from one checked provider/routing snapshot and the provider owner's typed catalogs; exact provider identities, per-provider catalog causes and optional declared capabilities reach commands and menus without inference |
 
 public struct TelegramProviderRoutingBridge: Sendable {
     let routing: SwiftNativeProviderRouting
@@ -46,61 +46,34 @@ public struct TelegramProviderRoutingBridge: Sendable {
         )
     }
 
-    public func modelMenuForSurface(_ surface: String) async -> TelegramModelMenu? {
-        guard let snapshot = try? await routing.checkedRoutingSnapshot(),
-              let preference = snapshot.preferences[surface] else {
-            return nil
+    public func modelMenuForSurface(_ surface: String) async throws -> TelegramModelMenu {
+        let snapshot = try await routing.checkedProviderSnapshot()
+        guard let preference = snapshot.routing.preferences[surface],
+              let currentProvider = snapshot.routing.activeProviders[surface] else {
+            throw ProviderRoutingError.configurationFailed("The checked \(surface) route is unavailable. Read Providers to repair routing.")
         }
-        let current = (
-            model: preference.model,
-            provider: snapshot.activeProviders[surface]
-                ?? routing.inferProviderForModel(preference.model)
-                ?? "unknown"
-        )
-        let currentProvider = current.provider
-        let providers = try? await routing.listProviders()
-        let choices = providers.map { providers in providers
-            .filter { Self.isSelectableProvider($0, currentProvider: currentProvider) }
-            .map { provider in
-                let isCurrent = TelegramModelMenu.providerIDsMatch(provider.id, currentProvider)
-                var models = Self.modelChoices(
-                    from: provider,
-                    currentModel: current.model,
-                    isCurrentProvider: isCurrent
-                )
-                if isCurrent,
-                   !models.contains(where: { $0.id == current.model }) {
-                    let descriptor = FirstPartyModelCatalog.descriptor(
-                        for: current.model,
-                        providerID: provider.id
-                    )
-                    models.insert(
-                        TelegramModelChoice(
-                            id: current.model,
-                            name: current.model,
-                            isCurrent: true,
-                            supportedReasoningEfforts: descriptor?.supportedReasoningEfforts ?? [],
-                            supportsFast: descriptor?.supportsFast ?? false
-                        ),
-                        at: 0
-                    )
+        let providers = snapshot.providers
+        let choices = providers.filter { Self.isSelectableProvider($0, currentProvider: currentProvider) }.map { provider in
+            let isCurrent = TelegramModelMenu.providerIDsMatch(provider.id, currentProvider)
+            let models: [TelegramModelChoice]
+            var issue: String?
+            do {
+                models = try routing.checkedCatalogModels(for: provider.id).map { model in
+                    TelegramModelChoice(id: model.id, name: model.name,
+                        isCurrent: isCurrent && model.id == preference.model,
+                        supportedReasoningEfforts: model.supported_reasoning_efforts,
+                        supportsFast: model.supports_fast)
                 }
-                return TelegramModelProviderChoice(
-                    id: provider.id,
-                    displayName: provider.displayName ?? Self.displayName(for: provider.id),
-                    isCurrent: isCurrent,
-                    models: models
-                )
+            } catch {
+                models = []
+                issue = error.localizedDescription
             }
-            .filter { !$0.models.isEmpty }
+            return TelegramModelProviderChoice(id: provider.id,
+                displayName: provider.displayName ?? provider.id, isCurrent: isCurrent,
+                models: models, catalogIssue: issue)
         }
-
-        return TelegramModelMenu(
-            surface: surface,
-            currentModel: current.model,
-            currentProvider: currentProvider,
-            providers: choices
-        )
+        return TelegramModelMenu(surface: surface, currentModel: preference.model,
+            currentProvider: currentProvider, providers: choices)
     }
 
     private static func isSelectableProvider(_ provider: Provider, currentProvider: String) -> Bool {
@@ -121,105 +94,6 @@ public struct TelegramProviderRoutingBridge: Sendable {
         return false
     }
 
-    private static func modelChoices(
-        from provider: Provider,
-        currentModel: String,
-        isCurrentProvider: Bool
-    ) -> [TelegramModelChoice] {
-        var out: [TelegramModelChoice] = []
-        var seen: Set<String> = []
-        for object in modelObjects(from: provider) {
-            guard let id = firstString(object, keys: ["id", "model_id", "model"]),
-                  !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                continue
-            }
-            let name = firstString(object, keys: ["name", "display_name", "displayName"]) ?? id
-            if seen.insert(id).inserted {
-                out.append(TelegramModelChoice(
-                    id: id,
-                    name: name,
-                    isCurrent: isCurrentProvider && id == currentModel,
-                    supportedReasoningEfforts: stringArray(
-                        object,
-                        keys: ["supported_reasoning_efforts", "supportedReasoningEfforts"]
-                    ),
-                    supportsFast: firstBool(
-                        object,
-                        keys: ["supports_fast", "supportsFast"]
-                    ) ?? false
-                ))
-            }
-        }
-        return out
-    }
-
-    private static func modelObjects(from provider: Provider) -> [[String: JSONValue]] {
-        guard case .array(let items)? = provider.modelCatalog else { return [] }
-        return items.compactMap { item in
-            guard case .object(let obj) = item else { return nil }
-            return obj
-        }
-    }
-
-    private static func firstString(
-        _ object: [String: JSONValue],
-        keys: [String]
-    ) -> String? {
-        for key in keys {
-            guard let value = object[key] else { continue }
-            switch value {
-            case .string(let str):
-                let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
-            case .int(let int):
-                return String(int)
-            case .double(let double):
-                return String(double)
-            case .bool(let bool):
-                return bool ? "true" : "false"
-            case .null, .array, .object:
-                continue
-            }
-        }
-        return nil
-    }
-
-    private static func stringArray(
-        _ object: [String: JSONValue],
-        keys: [String]
-    ) -> [String] {
-        for key in keys {
-            guard case .array(let values)? = object[key] else { continue }
-            return values.compactMap { value in
-                guard case .string(let string) = value else { return nil }
-                return string
-            }
-        }
-        return []
-    }
-
-    private static func firstBool(
-        _ object: [String: JSONValue],
-        keys: [String]
-    ) -> Bool? {
-        for key in keys {
-            guard case .bool(let value)? = object[key] else { continue }
-            return value
-        }
-        return nil
-    }
-
-    private static func displayName(for providerId: String) -> String {
-        switch TelegramModelMenu.normalizedProviderID(providerId) {
-        case "anthropic": return "Anthropic"
-        case "openai": return "ChatGPT / OpenAI"
-        case "codex": return "Codex CLI"
-        case "xai": return "xAI Grok"
-        case "moonshot": return "Moonshot AI (Kimi)"
-        case "openrouter": return "OpenRouter"
-        default: return providerId.replacingOccurrences(of: "_", with: " ").capitalized
-        }
-    }
 
 }
 
@@ -227,14 +101,13 @@ public struct TelegramModelMenu: Sendable, Equatable {
     public let surface: String
     public let currentModel: String
     public let currentProvider: String
-    /// Nil means the provider catalog is unavailable; selection is still checked.
-    public let providers: [TelegramModelProviderChoice]?
+    public let providers: [TelegramModelProviderChoice]
 
     public init(
         surface: String,
         currentModel: String,
         currentProvider: String,
-        providers: [TelegramModelProviderChoice]?
+        providers: [TelegramModelProviderChoice]
     ) {
         self.surface = surface
         self.currentModel = currentModel
@@ -242,37 +115,26 @@ public struct TelegramModelMenu: Sendable, Equatable {
         self.providers = providers
     }
 
-    /// Catalog unavailability does not erase the checked current selection.
-    public var currentCapabilities: (reasoningEfforts: [String], supportsFast: Bool)? {
-        if let provider = providers?.first(where: {
-               TelegramModelMenu.providerIDsMatch($0.id, currentProvider)
-           }),
-           let model = provider.models.first(where: {
-               $0.id.caseInsensitiveCompare(currentModel) == .orderedSame
-           }),
-           !model.supportedReasoningEfforts.isEmpty || model.supportsFast {
+    /// Only the bound provider's published model describes its capabilities.
+    public var catalogIssues: String {
+        providers.compactMap { $0.catalogIssue }.joined(separator: "\n")
+    }
+
+    public var currentCapabilities: (reasoningEfforts: [String]?, supportsFast: Bool?) {
+        get throws {
+            guard let provider = providers.first(where: { Self.providerIDsMatch($0.id, currentProvider) }) else {
+                throw ProviderRoutingError.configurationFailed("The selected provider is unavailable. Read Providers.")
+            }
+            if let issue = provider.catalogIssue { throw ProviderRoutingError.configurationFailed(issue) }
+            guard let model = provider.models.first(where: { $0.id == currentModel }) else {
+                throw ProviderRoutingError.configurationFailed("The selected model is absent from its checked catalog. Refresh models in Providers.")
+            }
             return (model.supportedReasoningEfforts, model.supportsFast)
         }
-        guard let descriptor = FirstPartyModelCatalog.descriptor(
-            for: currentModel,
-            providerID: currentProvider
-        ) else { return nil }
-        return (descriptor.supportedReasoningEfforts, descriptor.supportsFast)
     }
 
     public static func providerIDsMatch(_ lhs: String, _ rhs: String) -> Bool {
-        normalizedProviderID(lhs) == normalizedProviderID(rhs)
-    }
-
-    public static func normalizedProviderID(_ raw: String) -> String {
-        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth":
-            return "xai_oauth_direct"
-        case "moonshot", "kimi":
-            return "moonshot"
-        default:
-            return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        }
+        lhs == rhs
     }
 
 }
@@ -282,17 +144,20 @@ public struct TelegramModelProviderChoice: Sendable, Equatable {
     public let displayName: String
     public let isCurrent: Bool
     public let models: [TelegramModelChoice]
+    public let catalogIssue: String?
 
     public init(
         id: String,
         displayName: String,
         isCurrent: Bool = false,
-        models: [TelegramModelChoice]
+        models: [TelegramModelChoice],
+        catalogIssue: String? = nil
     ) {
         self.id = id
         self.displayName = displayName
         self.isCurrent = isCurrent
         self.models = models
+        self.catalogIssue = catalogIssue
     }
 }
 
@@ -300,15 +165,15 @@ public struct TelegramModelChoice: Sendable, Equatable {
     public let id: String
     public let name: String
     public let isCurrent: Bool
-    public let supportedReasoningEfforts: [String]
-    public let supportsFast: Bool
+    public let supportedReasoningEfforts: [String]?
+    public let supportsFast: Bool?
 
     public init(
         id: String,
         name: String,
         isCurrent: Bool = false,
-        supportedReasoningEfforts: [String] = [],
-        supportsFast: Bool = false
+        supportedReasoningEfforts: [String]?,
+        supportsFast: Bool?
     ) {
         self.id = id
         self.name = name
@@ -319,15 +184,16 @@ public struct TelegramModelChoice: Sendable, Equatable {
 }
 
 extension SwiftNativeTelegramBot {
-    public func telegramModelMenuForSurface(_ surface: String = "telegram") async -> TelegramModelMenu? {
-        await completenessDeps?.routing?.modelMenuForSurface(surface)
+    public func telegramModelMenuForSurface(_ surface: String = "telegram") async throws -> TelegramModelMenu {
+        guard let routing = completenessDeps?.routing else { throw TelegramBotError.notConfigured }
+        return try await routing.modelMenuForSurface(surface)
     }
 
-    /// Current model in plain words, or nil when routing is unavailable.
-    public func telegramPlainModelPhrase(_ surface: String = "telegram") async -> String? {
-        guard let menu = await completenessDeps?.routing?.modelMenuForSurface(surface) else { return nil }
+    /// Current model in plain words; unavailable routing preserves its cause.
+    public func telegramPlainModelPhrase(_ surface: String = "telegram") async throws -> String {
+        let menu = try await telegramModelMenuForSurface(surface)
         var name = menu.currentModel
-        for provider in menu.providers ?? [] where TelegramModelMenu.providerIDsMatch(provider.id, menu.currentProvider) {
+        for provider in menu.providers where TelegramModelMenu.providerIDsMatch(provider.id, menu.currentProvider) {
             for model in provider.models where model.id.caseInsensitiveCompare(menu.currentModel) == .orderedSame {
                 let trimmed = model.name.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty { name = trimmed }

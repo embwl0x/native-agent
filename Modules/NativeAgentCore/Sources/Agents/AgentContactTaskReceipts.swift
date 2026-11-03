@@ -13,14 +13,14 @@ import CoreFoundation
 import ProviderRouting
 import CryptoKit
 import SQLite3
-// Blueprint: | `AgentContactTaskReceipts.swift` | Retained task receipts, checked archive and payload compaction |
+// Blueprint: | `AgentContactTaskReceipts.swift` | Canonical SQLite task receipts and checked payload compaction; recovery-debt payloads remain retained; launch recovery requires a complete checked store read; the finished per-reply JSON importer is removed |
 extension AgentContactTasks {
     private func taskKey(id: String, owner: String) -> String {
         AgentPeerReplayClaimStore.digest(Data((owner + "\u{1f}" + id).utf8))
     }
     func retain(_ task: AgentContactTask) throws {
         var task = task
-        if task.state.terminal, !task.owesCallbacks, !task.hasReplyPayload { task.replyPayloadExpired = true }
+        if task.state.terminal, task.replyRecovery == nil, !task.owesCallbacks, !task.hasReplyPayload { task.replyPayloadExpired = true }
         try saveTasks([task])
         if task.state.terminal, task.hasReplyPayload {
             terminalPayloadWrites += 1
@@ -31,7 +31,7 @@ extension AgentContactTasks {
         }
     }
     private func compactReplyPayloads() throws {
-        let retained = try retainedTasks().filter { $0.state.terminal && !$0.owesCallbacks && $0.replyPayloadExpired != true && $0.hasReplyPayload }
+        let retained = try retainedTasks().filter { $0.state.terminal && $0.replyRecovery == nil && !$0.owesCallbacks && $0.replyPayloadExpired != true && $0.hasReplyPayload }
         var expired: [AgentContactTask] = []
         for saved in retained.sorted(by: { $0.updated < $1.updated }).prefix(max(0, retained.count - capacity)) {
             var compact = saved
@@ -86,38 +86,8 @@ extension AgentContactTasks {
         }
         return try body(database)
     }
-    func retainedTasks(id: String? = nil, owner: String? = nil) throws -> [AgentContactTask] {
+    func retainedTasks(id: String? = nil, owner: String? = nil, requireComplete: Bool = false) throws -> [AgentContactTask] {
         let key = id.flatMap { id in owner.map { taskKey(id: id, owner: $0) } }
-        let directory = dataRoot.appendingPathComponent("agents/a2a-replies")
-        let urls: [URL]
-        var info = stat()
-        if let key { urls = [directory.appendingPathComponent(key + ".json")] }
-        else if Darwin.lstat(directory.path, &info) != 0, errno == ENOENT { urls = [] }
-        else { urls = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).filter { $0.pathExtension == "json" } }
-        var unavailable: Set<String> = []
-        // Import file-first evidence durably before removing it; an interrupted import repeats safely.
-        for url in urls {
-            do {
-                let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-                if fd < 0, errno == ENOENT { continue }
-                guard fd >= 0 else { throw AgentContactFailure(code: -32603, message: "Retained task could not be opened at \(url.path). Existing bytes were preserved.") }
-                let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-                defer { try? handle.close() }
-                let limit = AgentContactPart.maximumOutputBytes * 2
-                guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size >= 0, info.st_size <= limit,
-                      let data = try handle.read(upToCount: limit + 1), data.count <= limit,
-                      let task = try? JSONDecoder().decode(AgentContactTask.self, from: data),
-                      NativeAgentA2AWire.locator(task.id) != nil, taskKey(id: task.id, owner: task.owner) == url.deletingPathExtension().lastPathComponent else {
-                    throw AgentContactFailure(code: -32603, message: "Retained task is invalid at \(url.path). Existing bytes were preserved.")
-                }
-                try saveTasks([task])
-                try FileManager.default.removeItem(at: url)
-            } catch {
-                if key != nil { throw error }
-                unavailable.insert(url.deletingPathExtension().lastPathComponent)
-                nativeLog("AgentContactTasks: retained task remains unavailable at %@: %@", url.path, error.localizedDescription)
-            }
-        }
         return try withTaskDatabase { database in
             var statement: OpaquePointer?
             guard sqlite3_prepare_v2(database, key == nil ? "SELECT key, receipt FROM outcomes" : "SELECT key, receipt FROM outcomes WHERE key = ?", -1, &statement, nil) == SQLITE_OK else {
@@ -136,7 +106,6 @@ extension AgentContactTasks {
                     throw AgentContactFailure(code: -32603, message: "The conversation could not be read")
                 }
                 let storedKey = String(cString: rawKey)
-                if unavailable.contains(storedKey) { continue }
                 let count = Int(sqlite3_column_bytes(statement, 1))
                 guard count > 0, count <= AgentContactPart.maximumOutputBytes * 2,
                       let bytes = sqlite3_column_blob(statement, 1),
@@ -144,7 +113,7 @@ extension AgentContactTasks {
                       NativeAgentA2AWire.locator(task.id) != nil,
                       taskKey(id: task.id, owner: task.owner) == storedKey,
                       key == nil || (task.id == id && task.owner == owner) else {
-                    if key != nil { throw AgentContactFailure(code: -32603, message: "The retained task is invalid. Existing bytes were preserved.") }
+                    if key != nil || requireComplete { throw AgentContactFailure(code: -32603, message: "The retained task at key \(storedKey) is invalid. Existing bytes were preserved.") }
                     nativeLog("AgentContactTasks: invalid retained task at %@; existing bytes were preserved", storedKey)
                     continue
                 }

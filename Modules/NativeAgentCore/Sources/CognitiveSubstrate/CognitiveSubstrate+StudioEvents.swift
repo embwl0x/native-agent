@@ -68,15 +68,14 @@ public extension CognitiveSubstrate {
 
     /// Mint a filed entry's event only when its title and id are nonempty.
     func studioJournalEvent(
-        for entry: StudioJournalEntry,
-        at now: Date? = nil
-    ) -> CognitiveEvent? {
+        for entry: StudioJournalEntry
+    ) throws -> CognitiveEvent? {
         let title = entry.work.title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty, !entry.id.isEmpty else { return nil }
         let felt = studioJournalFelt(for: entry)
-        let occurredAt = now
-            ?? NativeTimestampFormat.parseISO8601FractionalFirst(entry.recordedAt)
-            ?? dependencies.now()
+        guard let occurredAt = NativeTimestampFormat.parseISO8601FractionalFirst(entry.recordedAt) else {
+            throw CognitiveArtifactCodec.FieldFailure(path: "studio_journal:\(entry.id).recordedAt")
+        }
         // The summary names the ACT, never the judgment. Her written response
         // stays in the journal, which is the record of it; a continuity node is
         // a pointer to that, not a second copy competing for the same space.
@@ -109,8 +108,14 @@ public extension CognitiveSubstrate {
     /// Put one filed entry on the bus. Idempotent by the event's stable id: the
     /// field's seen-event check makes a replay inert.
     func ingestStudioJournalEntry(_ entry: StudioJournalEntry) async {
-        guard let event = studioJournalEvent(for: entry) else { return }
-        await ingest(event)
+        do {
+            guard let event = try studioJournalEvent(for: entry) else { return }
+            await ingest(event)
+        } catch {
+            await recordReceipt(kind: "studio_journal.unavailable", payload: .object([
+                "id": .string(entry.id), "error": .string(String(describing: error)),
+            ]))
+        }
     }
 }
 

@@ -6,7 +6,7 @@ import NativeAgentCore
 import Security
 import PersistenceCore
 import Experiences
-// Blueprint: | `AgentHostConnection.swift` | `AgentHostConnection` enum; `builderWorkspaceRoot`, `isNamedConnect`; Connect resolves host or exact peer identity (a peer only in its own workspace; another folder is that folder's own contact), re-mints a missing key on the same contact, retires proof and rewrites only its connector entry under the settings lock; elevation remains store-owned; disconnect revokes before settings cleanup and keeps failed cleanup owed to the person through RepairOwed and fileRepairInstruction; missing helpers and secure-random failures name the defect and person; `verifySetup` stays read-only |
+// Blueprint: | `AgentHostConnection.swift` | `AgentHostConnection` enum; `builderWorkspaceRoot`, `isNamedConnect`; Connect resolves host or exact peer identity within its workspace, re-mints a missing key on the same contact, retires proof and reconciles owned connector/messaging settings under the settings lock; cards name the caller-supplied persona and scoped approval/removal; elevation remains store-owned; disconnect revokes before settings cleanup and keeps failed cleanup owed through RepairOwed and fileRepairInstruction; `verifySetup` checks both entry and allowances without host writes |
 
 /// One reversible setup path for discovery and the person's Connect action.
 ///
@@ -152,7 +152,7 @@ public enum AgentHostConnection {
     /// The disclosed setup, and nothing else. Line one is the card's title and
     /// the rest is its detail, so the wording below is the wording the person
     /// reads.
-    public static func cardText(_ proposal: Proposal, appName: String) -> String {
+    public static func cardText(_ proposal: Proposal, appName: String, agentName: String = "this agent") -> String {
         let row = proposal.row
         if row.format == .shellEnvironment {
             return """
@@ -180,7 +180,7 @@ public enum AgentHostConnection {
             This app asks you only when \(row.displayName) asks it for permission. Our approval cards do not control everything that program can do.
             Starting folder: \(proposal.workingDirectory.path)
             Program: \(proposal.executable?.path ?? "unavailable")
-            The program at this path is what will be run. Its absolute path, file identity and digest are re-checked before every launch. If they change, nothing runs until you review a fresh approval. This uses the same trust in files in your folders as any app launch on a Mac.
+            The program at this path is what will be run. Its absolute path, file identity and digest are re-checked before every launch. Under Full Mac an update to it keeps it connected and the change is recorded; under other Trust settings a changed program waits for your review. This uses the same trust in files in your folders as any app launch on a Mac.
             \(executableChanges(proposal))
             Version: read from its --version only after you approve. Written against \(row.acp!.referenceVersion) (ACP registry pin).
             Requested mode: \(row.acp!.permissionMode). This is the program's own restriction, not an enforcement guarantee from this app.
@@ -191,11 +191,19 @@ public enum AgentHostConnection {
         return """
         Connect \(row.displayName) to \(appName)?
         I'll add a messaging connection to \(row.displayName)'s settings so we can exchange messages on this Mac. Existing settings will be preserved.
-        Changes: \(AgentHostDirectory.changesLine(row: row, command: proposal.command))\(row.messagingPermissionsPath != nil ? "\nMessaging permissions (host.messagingPermissionsPath=\(row.messagingPermissionsPath!)): allow only this connection's agent_message and agent_reply MCP tools. Disconnect removes only allowances added here; existing Ask/Deny rules are never overridden." : "")
+        Changes: \(AgentHostDirectory.changesLine(row: row, command: proposal.command))\(messagingPermissionsLine(row, agentName: agentName))
         Access: \(AgentHostDirectory.accessSummary)
         Restart: \(row.restartNote)\(Self.probeLine(proposal))
         You can disconnect later. This does not open access from the network.
         """
+    }
+
+    private static func messagingPermissionsLine(_ row: AgentHostRow, agentName: String) -> String {
+        guard row.format == .codexTOML || (row.messagingPermissionsPath != nil && row.messagingPermissionSyntax != nil) else { return "" }
+        let location = row.format == .codexTOML ? row.expandedConfigPath : AgentHostDirectory.expand(row.messagingPermissionsPath!)
+        let removal = row.format == .codexTOML ? "Disconnect removes this entry and its messaging allowance."
+            : "Disconnect removes only allowances added here; existing Ask/Deny rules are never overridden."
+        return "\nMessaging permissions (\(location)): allow only this connection's agent_message and agent_reply MCP tools, so this agent can message \(agentName) without being asked each time. \(removal)"
     }
 
     private static func executableChanges(_ proposal: Proposal) -> String {
@@ -503,22 +511,25 @@ public enum AgentHostConnection {
 
     private static func ensureMessagingPermissions(contact: AgentPeerContact, store: AgentPeerStore) throws -> Bool {
         guard let id = AgentPeerStore.hostRowID(contact.endpoint),
-              let path = AgentHostDirectory.row(named: id)?.messagingPermissionsPath else { return false }
-        let outcome = try AgentHostConfigWriter.grantAntigravityMessaging(
+              let row = AgentHostDirectory.row(named: id),
+              let path = row.messagingPermissionsPath, let syntax = row.messagingPermissionSyntax else { return false }
+        let outcome = try AgentHostConfigWriter.grantMessaging(
             path: AgentHostDirectory.expand(path),
-            server: AgentHostDirectory.entryName, peerID: contact.id, recordURL: permissionRecord(contact, store))
+            server: AgentHostDirectory.entryName, syntax: syntax, peerID: contact.id, recordURL: permissionRecord(contact, store))
         return outcome.backupPath != nil
     }
 
     private static func removeMessagingPermissions(contact: AgentPeerContact, store: AgentPeerStore) throws {
         guard let id = AgentPeerStore.hostRowID(contact.endpoint),
-              let path = AgentHostDirectory.row(named: id)?.messagingPermissionsPath else { return }
-        try AgentHostConfigWriter.removeAntigravityMessaging(
+              let row = AgentHostDirectory.row(named: id),
+              let path = row.messagingPermissionsPath, let syntax = row.messagingPermissionSyntax else { return }
+        try AgentHostConfigWriter.removeMessaging(
             path: AgentHostDirectory.expand(path),
-            server: AgentHostDirectory.entryName, peerID: contact.id, recordURL: permissionRecord(contact, store))
+            server: AgentHostDirectory.entryName, syntax: syntax, peerID: contact.id, recordURL: permissionRecord(contact, store))
     }
 
     private static func permissionRecord(_ contact: AgentPeerContact, _ store: AgentPeerStore) -> URL {
+        // Stable receipt namespace, also used for hosts added after Antigravity.
         store.fileURL.deletingLastPathComponent().appendingPathComponent("antigravity-\(contact.id)-permission-backups.json")
     }
 

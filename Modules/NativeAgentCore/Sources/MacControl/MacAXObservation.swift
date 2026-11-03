@@ -19,7 +19,7 @@ import os
 import CoreText
 import ScreenCaptureKit
 #endif
-// Blueprint: | `MacAXObservation.swift` | Anchored accessibility reading, scoping and search |
+// Blueprint: | `MacAXObservation.swift` | Anchored accessibility reading, scoping and search; tree/find diagnostics derive optional-attribute and action-name gap counts and first errors from observed nodes |
 extension SwiftNativeMacControl {
     func handleAXStatus() -> MacControlResult {
         let started = now()
@@ -93,6 +93,7 @@ extension SwiftNativeMacControl {
         case appGone
         case windowGone
         case windowDrifted(String)
+        case rendererUnavailable(String)
         /// Refuse self-process AX walks before any read: AppKit re-entry can deadlock the main thread.
         case selfProcess
     }
@@ -109,10 +110,27 @@ extension SwiftNativeMacControl {
         complete: Bool = false,
         section: String? = nil
     ) -> MacAnchoredRead {
+        #if canImport(ApplicationServices) && os(macOS)
+        do { return try MacAXAttributeRead.checked {
+            anchoredSnapshotRead(limits: limits, pid: pid, window: window, complete: complete, section: section)
+        } } catch { return .rendererUnavailable(error.localizedDescription) }
+        #else
+        return anchoredSnapshotRead(limits: limits, pid: pid, window: window, complete: complete, section: section)
+        #endif
+    }
+    private func anchoredSnapshotRead(limits: MacAXLimits, pid: Int32?, window: MacAXWindowIdentity?,
+        complete: Bool, section: String?) -> MacAnchoredRead {
         // See `MacAnchoredRead.selfProcess` — refusing here, before any element
         // is resolved, is what keeps the in-process AppKit re-entry deadlock
         // structurally unreachable from every snapshot caller.
         if pid == getpid() { return .selfProcess }
+        #if canImport(ApplicationServices) && os(macOS)
+        if accessibilitySource is SystemMacAXElementSource,
+           let target = pid ?? accessibilitySource.frontmostApp()?.processIdentifier, target != getpid() {
+            do { try SystemMacAXElementSource.ensureRenderer(AXUIElementCreateApplication(target), refresh: true) }
+            catch { return .rendererUnavailable(error.localizedDescription) }
+        }
+        #endif
         let root: MacAXElementRef
         var identity: MacAXWindowIdentity?
         if let pid, let window {
@@ -137,14 +155,16 @@ extension SwiftNativeMacControl {
             root = preferred
             identity = MacAXWindowIdentity(
                 pid: pid, index: nil, role: attributes.role,
-                subrole: attributes.subrole, title: attributes.title, frame: attributes.frame
+                subrole: attributes.subrole, title: attributes.title, frame: attributes.frame,
+                attributeGaps: attributes.attributeGaps
             )
         } else {
             if let front = accessibilitySource.frontmostApp(),
                front.processIdentifier == getpid() {
                 return .selfProcess
             }
-            guard let frontmost = accessibilitySource.frontmostWindowRoot() else { return .appGone }
+            guard let front = accessibilitySource.frontmostApp(),
+                  let frontmost = accessibilitySource.windowRoot(pid: front.processIdentifier) else { return .appGone }
             root = frontmost
             // The frontmost read still names its window, so the FRAME it mints
             // can be re-found later — that is what makes the first look
@@ -152,15 +172,15 @@ extension SwiftNativeMacControl {
             // (`frontmostWindowRoot()` answers with a window, not a position),
             // and `nil` is how the identity says so: an index it guessed at
             // would score a wrong candidate up.
-            if let app = accessibilitySource.frontmostApp(),
-               let attributes = accessibilitySource.attributes(of: root) {
+            if let attributes = accessibilitySource.attributes(of: root) {
                 identity = MacAXWindowIdentity(
-                    pid: app.processIdentifier,
+                    pid: front.processIdentifier,
                     index: nil,
                     role: attributes.role,
                     subrole: attributes.subrole,
                     title: attributes.title,
-                    frame: attributes.frame
+                    frame: attributes.frame,
+                    attributeGaps: attributes.attributeGaps
                 )
             }
         }
@@ -207,22 +227,14 @@ extension SwiftNativeMacControl {
         )
         let snapshot = sectionPath.isEmpty ? walk : MacAXTreeSnapshot(nodes: ancestors + walk.nodes.map {
             MacAXNode(attributes: $0.attributes, path: sectionPath + $0.path, element: $0.element)
-        }, truncated: walk.truncated, truncationReasons: walk.truncationReasons, skippedAtLeast: walk.skippedAtLeast)
-        let focusPath = accessibilitySource.focusedElementPath(relativeTo: root)
+        }, truncated: walk.truncated, truncationReasons: walk.truncationReasons, skippedAtLeast: walk.skippedAtLeast,
+            readFailures: walk.readFailures)
+        guard let ownerPID = identity?.pid ?? pid,
+              let app = accessibilitySource.appInfo(pid: ownerPID) else { return .appGone }
+        let focusPath = accessibilitySource.focusedElementPath(in: snapshot, relativeTo: root)
         return .read(MacAXRead(
             snapshot: snapshot,
-            // S7 — a pid-anchored read reports THAT process, never
-            // `frontmostApp()`. When the source cannot name it, the pid itself
-            // is still the truth and stays carried (the frame's whole anchor
-            // hangs off it); the NAME is not invented from another app's.
-            app: pid.map { anchored in
-                accessibilitySource.appInfo(pid: anchored)
-                    ?? MacAXAppInfo(
-                        name: "pid \(anchored)",
-                        bundleIdentifier: nil,
-                        processIdentifier: anchored
-                    )
-            } ?? accessibilitySource.frontmostApp(),
+            app: app,
             rootTitle: snapshot.nodes.first?.attributes.title,
             focusPath: focusPath,
             root: root,
@@ -242,7 +254,7 @@ extension SwiftNativeMacControl {
         limits: MacAXLimits,
         scope: MacLookScope,
         completeWindow: Bool = false
-    ) -> (read: MacAXRead, seam: [String: JSONValue]) {
+    ) throws -> (read: MacAXRead, seam: [String: JSONValue]) {
         var seam: [String: JSONValue] = [:]
         if let section = windowRead.section {
             return (windowRead, ["scope": .string("section"), "scope_name": .string(section), "complete_window": .bool(false)])
@@ -259,7 +271,7 @@ extension SwiftNativeMacControl {
         // conversation, canvas). Choosing the first shallow, nonempty area
         // hides the rest. Read the complete window after enabling the renderer
         // and retain window-relative paths for every existing mac.act target.
-        if scope != .chrome, MacChromiumAccessibility.looksChromium(
+        if scope != .chrome, try MacChromiumAccessibility.looksChromium(
             bundleId: windowRead.app?.bundleIdentifier,
             pid: windowRead.app?.processIdentifier,
             snapshot: windowRead.snapshot
@@ -289,7 +301,7 @@ extension SwiftNativeMacControl {
                 windowIdentity: windowRead.windowIdentity
             ), seam)
         }
-        let chromiumFamily = MacChromiumAccessibility.looksChromium(
+        let chromiumFamily = try MacChromiumAccessibility.looksChromium(
             bundleId: windowRead.app?.bundleIdentifier,
             pid: windowRead.app?.processIdentifier,
             snapshot: windowRead.snapshot
@@ -365,9 +377,10 @@ extension SwiftNativeMacControl {
             nodes: pageWalk.nodes.map { MacAXNode(attributes: $0.attributes, path: web.path + $0.path) },
             truncated: pageWalk.truncated,
             truncationReasons: pageWalk.truncationReasons,
-            skippedAtLeast: pageWalk.skippedAtLeast
+            skippedAtLeast: pageWalk.skippedAtLeast,
+            readFailures: pageWalk.readFailures
         )
-        let pageFocus = accessibilitySource.focusedElementPath(relativeTo: web.ref).map { web.path + $0 }
+        let pageFocus = accessibilitySource.focusedElementPath(in: pageWalk, relativeTo: web.ref).map { web.path + $0 }
         let chromeControls = windowRead.snapshot.nodes.filter { node in
             MacPerceptionCompiler.isInteractive(node.attributes)
                 && !node.path.starts(with: web.path)
@@ -508,11 +521,12 @@ extension SwiftNativeMacControl {
                         nodes: walk.nodes.map { MacAXNode(attributes: $0.attributes, path: base + $0.path) },
                         truncated: walk.truncated,
                         truncationReasons: walk.truncationReasons,
-                        skippedAtLeast: walk.skippedAtLeast
+                        skippedAtLeast: walk.skippedAtLeast,
+                        readFailures: walk.readFailures
                     ),
                     app: read.app,
                     rootTitle: read.rootTitle,
-                    focusPath: accessibilitySource.focusedElementPath(relativeTo: ancestor).map { base + $0 },
+                    focusPath: accessibilitySource.focusedElementPath(in: walk, relativeTo: ancestor).map { base + $0 },
                     root: ancestor,
                     windowIdentity: read.windowIdentity
                 ),
@@ -523,13 +537,16 @@ extension SwiftNativeMacControl {
         return (read, ["seek": .string(seek), "seek_found": .bool(false)])
     }
     static func axTruncationJSON(_ snapshot: MacAXTreeSnapshot, limits: MacAXLimits) -> [String: JSONValue] {
-        [
+        let output: [String: JSONValue] = [
             "truncated": .bool(snapshot.truncated),
+            "partial": .bool(snapshot.truncated),
             "truncation_reasons": .array(snapshot.truncationReasons.map { .string($0) }),
+            "read_failures": .array(snapshot.readFailures.map(JSONValue.string)),
             "skipped_at_least": .int(Int64(snapshot.skippedAtLeast)),
             "max_nodes": .int(Int64(limits.maxNodes)),
             "max_depth": .int(Int64(limits.maxDepth)),
         ]
+        return output.merging(snapshot.readGapsJSON) { _, gap in gap }
     }
     func handleAXTree(_ body: [String: JSONValue]) -> MacControlResult {
         let started = now()
@@ -538,6 +555,10 @@ extension SwiftNativeMacControl {
         let anchored = axSnapshot(limits: limits)
         if case .selfProcess = anchored {
             return selfInspectionResult(action: "ax_tree", started: started)
+        }
+        if case .rendererUnavailable(let reason) = anchored {
+            return MacControlResult(ok: false, action: "ax_tree", output: .object(["message": .string(reason)]),
+                error: "renderer_accessibility_unavailable", durationMs: Int(now().timeIntervalSince(started) * 1000))
         }
         guard case .read(let read) = anchored else {
             return MacControlResult(

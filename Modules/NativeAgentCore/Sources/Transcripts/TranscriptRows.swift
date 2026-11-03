@@ -12,6 +12,16 @@ public enum ContactThread {
     // Production export excludes it; ChatExport writes Markdown and
     // DeviceSync publishes bounded person-visible rows.
 
+    /// Canonical transcript bytes have one strict UTF-8/JSON-object boundary.
+    /// The general JSONValue parser admits historical nonfinite tokens, so it
+    /// cannot establish that a saved transcript row is undamaged.
+    public static func decodeRow(_ data: Data) throws -> [String: JSONValue] {
+        guard String(data: data, encoding: .utf8) != nil else { throw CocoaError(.fileReadInapplicableStringEncoding) }
+        let raw = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        guard case .object(let fields) = JSONValue(fromFoundation: raw) else { throw CocoaError(.fileReadCorruptFile) }
+        return fields
+    }
+
     public static func append(_ row: JSONValue, to path: URL,
                               uniqueRunID: String? = nil) async throws {
         try await SwiftNativePersistenceCore.withFileLock(path) {
@@ -77,13 +87,15 @@ public enum ContactThread {
         public var sendState: String?
         public var metadata: [String: JSONValue] = [:]
         public var speaker = ""
+        /// A damaged authoritative field withholds this row; it is never reconstructed.
+        public private(set) var provenanceFailure: String?
         public var mine: Bool { role == "assistant" || stamp.source == "self" }
         public var contact: Bool { stamp.contact && !mine }
         public var source: String? { contact ? stamp.source : nil }
         public var steeredBy: [String] { stamp.steeredBy }
         public var speakers: [String] { contact ? [source ?? "another agent"] : [] }
         public var human: Bool {
-            role == "user" && metadata["mechanicalKind"] == nil && !mine && !contact
+            provenanceFailure == nil && role == "user" && metadata["mechanicalKind"] == nil && !mine && !contact
                 && Self.object(metadata["origin"])["authored"] != .string("agent")
         }
 
@@ -97,11 +109,13 @@ public enum ContactThread {
             let role = role ?? row["role"]?.stringValue ?? ""
             let metadata = metadata ?? Self.object(row["metadata"])
             let id = row["id"]?.stringValue ?? ""
-            self.init(text: text ?? (row["content"] ?? row["text"])?.stringValue ?? "",
-                      stamp: TranscriptRowStamp(json: row["stamp"])
-                        ?? .of(id: id, role: role, metadata: metadata, rowSource: row["source"]?.stringValue), id: id, role: role)
+            let failure = Self.provenanceFailure(in: row, metadata: metadata)
+            self.init(text: text ?? row["content"]?.stringValue ?? "",
+                      stamp: failure != nil ? .init(source: nil, steeredBy: [], contact: false) : row["stamp"] == nil
+                        ? .of(id: id, role: role, metadata: metadata, rowSource: row["source"]?.stringValue)
+                        : (TranscriptRowStamp(json: row["stamp"]) ?? .init(source: nil, steeredBy: [], contact: false)), id: id, role: role)
             self.metadata = metadata
-            self.timestamp = timestamp ?? (row["createdAt"] ?? row["timestamp"])?.stringValue
+            self.timestamp = timestamp ?? row["createdAt"]?.stringValue
             self.date = self.timestamp.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
             self.run = row["runId"]?.stringValue
             self.byPerson = metadata["byPerson"] == .bool(true)
@@ -110,40 +124,77 @@ public enum ContactThread {
             } : nil
             self.sendID = role == "assistant" ? metadata["dotClientUserMessageID"]?.stringValue : nil
             self.sendState = metadata["sendState"]?.stringValue
+            if let failure {
+                self.provenanceFailure = "Transcript row \(id.isEmpty ? "<missing id>" : id): \(failure). Repair its saved provenance before reading it."
+                self.text = ""
+                self.byPerson = false
+                nativeLog("Transcript row %@ unavailable: %@", id, failure)
+            }
         }
 
         public init?(jsonl data: Data) {
-            guard case .object(let row)? = try? JSONValue.parse(data),
-                  case .string? = row["content"] ?? row["text"] else { return nil }
+            guard let row = try? ContactThread.decodeRow(data),
+                  case .string? = row["content"] else { return nil }
             self.init(row)
         }
 
         fileprivate static func object(_ value: JSONValue?) -> [String: JSONValue] {
             if case .object(let fields)? = value { return fields }
-            if case .string(let text)? = value, let parsed = try? JSONValue.parse(Data(text.utf8)) { return object(parsed) }
             return [:]
+        }
+
+        private static func provenanceFailure(in row: [String: JSONValue], metadata: [String: JSONValue]) -> String? {
+            if let stamp = row["stamp"], TranscriptRowStamp(json: stamp) == nil { return "saved stamp is malformed" }
+            if let source = row["source"], case .string = source {} else if row["source"] != nil { return "saved source is not text" }
+            for key in ["byPerson", "unattested"] {
+                if let value = metadata[key], case .bool = value {} else if metadata[key] != nil { return "\(key) is not a Boolean" }
+            }
+            if let value = row["metadata"] {
+                switch value {
+                case .object: break
+                default: return "saved metadata is not an object"
+                }
+            }
+            for key in ["origin", "envelope"] {
+                guard let value = metadata[key] else { continue }
+                let fields: [String: JSONValue]
+                switch value {
+                case .object(let object): fields = object
+                default: return "\(key) is not an object"
+                }
+                for name in ["agent", "userId", "surface", "replyTo", "authored"] {
+                    if let field = fields[name], case .string = field {} else if fields[name] != nil { return "\(key).\(name) is not text" }
+                }
+            }
+            if let sources = metadata["untrusted_sources"] {
+                guard case .array(let values) = sources,
+                      values.allSatisfy({ if case .string = $0 { true } else { false } }) else { return "untrusted_sources is malformed" }
+            }
+            return nil
         }
     }
 
     public enum TextStyle { case verbatim, log, thread }
 
     /// The byte read shared by tail and incremental adapters; each owns its row boundaries and selection.
-    public static func read(_ handle: FileHandle, from offset: UInt64, bytes: Int? = nil) -> Data? {
-        try? handle.seek(toOffset: offset)
-        if let bytes { return try? handle.read(upToCount: bytes) }
-        return try? handle.readToEnd()
+    public static func read(_ handle: FileHandle, from offset: UInt64, bytes: Int? = nil) throws -> Data? {
+        try handle.seek(toOffset: offset)
+        if let bytes { return try handle.read(upToCount: bytes) }
+        return try handle.readToEnd()
     }
 
     /// One stamped-row projection for sessions, contact threads and retained
-    /// previews. A cache/index read omits `mark`; only the selected display
+    /// previews; answer selection requires the matching canonical line.
+    /// A cache/index read omits `mark`; only the selected display
     /// supplies it, so each displayed contact line is consumed exactly once.
     public static func project(_ rows: some Sequence<Line>, style: TextStyle = .verbatim, thread owner: String? = nil,
                                person: String = "the person", own: String = "you", names: [String: String] = [:],
                                contactPrefix: String = "", unlistedPeer: String? = nil, unattested: String? = nil,
-                               answering: String? = nil, fallback: Line? = nil,
+                               answering: String? = nil,
                                mark: ((_ principal: String, _ words: String) -> Void)? = nil) -> [Line] {
         var started: Set<String> = [], seen: Set<String> = []
         var lines = rows.filter { row in
+            guard row.provenanceFailure == nil else { return false }
             guard let owner else { return true }
             guard !seen.contains(row.id) else { return false }
             let origin = Line.object(row.metadata["origin"]), envelope = Line.object(row.metadata["envelope"])
@@ -163,7 +214,7 @@ public enum ContactThread {
             return true
         }
         if owner != nil { lines = lines.filter { !$0.mine || $0.sendID != nil || ($0.run.map(started.contains) ?? true) } }
-        if let answering { lines = (lines.last { !$0.mine && $0.answers == answering } ?? fallback).map { [$0] } ?? [] }
+        if let answering { lines = lines.last { !$0.mine && $0.answers == answering }.map { [$0] } ?? [] }
         return lines.compactMap { row in
             var row = row
             switch style {
@@ -234,7 +285,7 @@ public struct DelegatedReplyEnvelope: Sendable {
             && rows[2].prefix(notice.count).lowercased() == notice && text.contains("\nCodex result:\n")
             && ["codex replied to ", "codex wakeup failed", "codex turn stalled", "codex wakeup produced no reply"].contains(where: title.hasPrefix)
         codexTitle = codex ? title : nil
-        let markers = ["--- Claude's reply ---", "--- OMP's reply ---"]
+        let markers = ["--- OMP's reply ---"]
         let marker = markers.compactMap { text.range(of: $0) }.min(by: { $0.lowerBound < $1.lowerBound })
         let codexResult = text.range(of: "\nCodex result:\n")
         let start = codex ? codexResult : marker
@@ -255,8 +306,7 @@ public struct DelegatedReplyEnvelope: Sendable {
 
     public var isHistorical: Bool {
         let head = text.prefix(400).lowercased()
-        return head.hasPrefix("originating message id:") || head.hasPrefix("[claude-wake]")
-            || head.hasPrefix("[omp-wake]") || head.hasPrefix("[delegation update from nativeagent")
+        return head.hasPrefix("originating message id:") || head.hasPrefix("[omp-wake]")
             || codexTitle != nil
     }
 
@@ -264,12 +314,12 @@ public struct DelegatedReplyEnvelope: Sendable {
         if marked { return reply }
         let head = text.prefix(400).lowercased()
         guard head.contains("automated completion event") || head.hasPrefix("originating message id:")
-            || head.hasPrefix("[claude-wake]") || head.hasPrefix("[omp-wake]") else { return text }
+            || head.hasPrefix("[omp-wake]") else { return text }
         let keys = ["originating message id:", "topic:", "priority:", "status:", "duration:"]
         return text.split(separator: "\n", omittingEmptySubsequences: false).drop { line in
             let lowered = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             return lowered.isEmpty || lowered.contains("automated completion event")
-                || lowered.hasPrefix("[claude-wake] [notice]") || keys.contains(where: lowered.hasPrefix)
+                || keys.contains(where: lowered.hasPrefix)
         }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

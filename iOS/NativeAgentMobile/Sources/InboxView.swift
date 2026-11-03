@@ -1,7 +1,7 @@
 import SwiftUI
 import NativeAgentShared
 import UserNotifications
-// Blueprint: | `InboxView.swift` | Inbox list, card rows and reading navigation use the shared sync projection |
+// Blueprint: | `InboxView.swift` | Inbox list, card rows and local detail navigation use the shared sync projection; mutations require producer-declared actions |
 
 // MARK: - Top-level view
 
@@ -35,6 +35,7 @@ struct InboxView: View {
     }
 
     private var headerLine: String {
+        guard sync.inboxSnapshotLoaded || MobileDesignSamples.screen != nil else { return "Notes have not arrived from the Mac yet." }
         switch active.count {
         case 0: return "No unread notes from me."
         case 1: return "One unread note from me."
@@ -111,13 +112,16 @@ struct InboxView: View {
             selectedDetailItemID = item.id
         })
         .swipeActions(edge: .trailing) {
-            Button("Dismiss") {
-                Task {
-                    await store.performAction(id: item.id, actionID: "dismiss",
-                                              pairingStore: pairingStore)
+            // Only where the card offers it: an approval's card is settled by its approval.
+            if item.presentableActions.contains(where: { $0.id == "dismiss" }) {
+                Button("Dismiss") {
+                    Task {
+                        await store.performAction(id: item.id, actionID: "dismiss",
+                                                  pairingStore: pairingStore)
+                    }
                 }
+                .tint(.gray)
             }
-            .tint(.gray)
         }
     }
 
@@ -129,6 +133,10 @@ struct InboxView: View {
                 .foregroundStyle(AlivePalette.secondary)
                 .frame(maxWidth: .infinity)
                 .padding(.top, 48)
+        } else if store.items.isEmpty && !sync.inboxSnapshotLoaded && MobileDesignSamples.screen == nil {
+            AliveCalmState(title: "Inbox unavailable", line: "The Mac inbox snapshot has not arrived. Keep NativeAgent open on the paired Mac and check again after reconnecting.", actionTitle: "Check again") {
+                Task { await store.refresh(pairingStore: pairingStore) }
+            }
         } else if MobileDesignSamples.rows(store.items).isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Nothing here yet.")
@@ -232,10 +240,6 @@ struct InboxCardRow: View {
         actionIDs.contains("approve")
     }
 
-    private var showsView: Bool {
-        actionIDs.contains("view") || item.detail?.isEmpty == false
-    }
-
     private var rejectActionID: String? {
         if actionIDs.contains("reject") { return "reject" }
         if actionIDs.contains("deny") { return "deny" }
@@ -284,20 +288,20 @@ struct InboxCardRow: View {
                             .aliveSecondaryButton()
                     }
 
-                    if showsView {
-                        if hasApproveAction {
-                            Button("Read") {
-                                onView()
-                                if item.isUnread { onAction("read") }
-                            }
-                            .aliveSecondaryButton()
-                        } else {
-                            Button("Read") {
-                                onView()
-                                if item.isUnread { onAction("read") }
-                            }
-                            .alivePrimaryButton()
+                    // Detail is the card's own content, independent of its
+                    // executable actions. Only a declared read may change status.
+                    if hasApproveAction {
+                        Button("Read") {
+                            onView()
+                            if item.isUnread && actionIDs.contains("read") { onAction("read") }
                         }
+                        .aliveSecondaryButton()
+                    } else {
+                        Button("Read") {
+                            onView()
+                            if item.isUnread && actionIDs.contains("read") { onAction("read") }
+                        }
+                        .alivePrimaryButton()
                     }
 
                     if let action = item.presentableActions.first(where: { $0.id == "act" }) {
@@ -312,8 +316,10 @@ struct InboxCardRow: View {
                             .aliveSecondaryButton()
                     }
 
-                    Button("Dismiss") { onAction("dismiss") }
-                        .aliveSecondaryButton()
+                    if actionIDs.contains("dismiss") {
+                        Button("Dismiss") { onAction("dismiss") }
+                            .aliveSecondaryButton()
+                    }
 
                     // Card-specific extra actions (filter out standard ones we already show)
                     ForEach(extraActions, id: \.id) { action in

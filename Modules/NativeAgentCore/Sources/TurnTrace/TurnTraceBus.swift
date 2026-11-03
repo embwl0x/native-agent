@@ -1,8 +1,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import NativeAgentShared
 import os
-// Blueprint: | `TurnTraceBus.swift` | In-process multicast and bounded ingress/disk queues with sole retained workers; durable terminal delivery before checkpoint retirement |
+// Blueprint: | `TurnTraceBus.swift` | In-process multicast and bounded ingress/disk queues with sole retained workers; durable terminal delivery before checkpoint retirement; turn-scoped flush markers retain prior accepted-write failure and capture outstanding tickets with cancellation and a five-second deadline, independent of later traffic |
 
 /// Nonblocking live multicast with bounded subscriber buffers;
 /// overflow drops the oldest buffered event.
@@ -26,7 +27,8 @@ public actor TurnTraceBus {
 
     /// Per-bus persistence isolates disk waits from process-wide live delivery.
     private nonisolated let persistLane: TurnTracePersistLane
-    private nonisolated let persistQueue = _FIFO<TurnTraceEvent>(capacity: 4096)
+    private nonisolated let persistQueue = _FIFO<TrackedEvent>(capacity: 4096)
+    private nonisolated let flushes = TurnFlushes()
 
     public init(persistLane: TurnTracePersistLane = TurnTracePersistLane()) {
         self.persistLane = persistLane
@@ -69,8 +71,104 @@ public actor TurnTraceBus {
     private nonisolated static let emissionPump = _FIFO<PendingEmission>(capacity: 4096)
 
     private struct PendingEmission: Sendable {
-        let event: TurnTraceEvent
+        let tracked: TrackedEvent
         let bus: TurnTraceBus
+    }
+
+    private struct TrackedEvent: Sendable {
+        let event: TurnTraceEvent
+        let ticket: UUID
+    }
+
+    /// A marker covers this turn's prior failures and outstanding accepted events.
+    /// Later traffic cannot extend it; neither cancellation nor a deadline waits
+    /// for a blocked persistence worker to return.
+    private final class TurnFlushes: @unchecked Sendable {
+        final class Marker: @unchecked Sendable {
+            let id = UUID()
+            private let lock = NSLock()
+            private var result: Result<Void, Error>?
+            private var continuation: CheckedContinuation<Void, Error>?
+
+            func resolve(_ outcome: Result<Void, Error>) {
+                let waiter = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+                    guard result == nil else { return nil }
+                    result = outcome
+                    let waiter = continuation; continuation = nil
+                    return waiter
+                }
+                waiter?.resume(with: outcome)
+            }
+
+            func wait() async throws {
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { (waiter: CheckedContinuation<Void, Error>) in
+                        let ready = lock.withLock { () -> Result<Void, Error>? in
+                            if let result { return result }
+                            continuation = waiter
+                            return nil
+                        }
+                        if let ready { waiter.resume(with: ready) }
+                    }
+                } onCancel: { self.resolve(.failure(CancellationError())) }
+            }
+        }
+        private struct Waiting {
+            let marker: Marker
+            var tickets: Set<UUID>
+        }
+        private let lock = NSLock()
+        private var pending: [String: Set<UUID>] = [:]
+        // One retained cause per damaged turn is enough to forbid a clean flush.
+        // Never evict or clear it on capture: a later successful append cannot
+        // restore an earlier lost row. Successful turns retain no result state.
+        private var failures: [String: Error] = [:]
+        private var waiting: [UUID: Waiting] = [:]
+
+        func begin(_ turn: String) -> UUID {
+            lock.withLock {
+                let ticket = UUID()
+                pending[turn, default: []].insert(ticket)
+                return ticket
+            }
+        }
+
+        func end(_ tracked: TrackedEvent, error: Error? = nil) {
+            let completed = lock.withLock { () -> [(Marker, Result<Void, Error>)] in
+                let turn = tracked.event.turnId, ticket = tracked.ticket
+                if let error, failures[turn] == nil { failures[turn] = error }
+                pending[turn]?.remove(ticket)
+                if pending[turn]?.isEmpty == true { pending[turn] = nil }
+                var completed: [(Marker, Result<Void, Error>)] = []
+                for id in Array(waiting.keys) {
+                    guard var entry = waiting[id], entry.tickets.remove(ticket) != nil else { continue }
+                    if let error {
+                        waiting[id] = nil
+                        completed.append((entry.marker, .failure(error)))
+                    } else if entry.tickets.isEmpty {
+                        waiting[id] = nil
+                        completed.append((entry.marker, .success(())))
+                    } else { waiting[id] = entry }
+                }
+                return completed
+            }
+            for (marker, result) in completed { marker.resolve(result) }
+        }
+
+        func capture(_ turn: String) -> Marker {
+            let marker = Marker()
+            let ready = lock.withLock { () -> Result<Void, Error>? in
+                if let error = failures[turn] { return .failure(error) }
+                let tickets = pending[turn] ?? []
+                guard !tickets.isEmpty else { return .success(()) }
+                waiting[marker.id] = Waiting(marker: marker, tickets: tickets)
+                return nil
+            }
+            if let ready { marker.resolve(ready) }
+            return marker
+        }
+
+        func remove(_ marker: Marker) { lock.withLock { waiting[marker.id] = nil } }
     }
 
     private final class _FIFO<Element: Sendable>: @unchecked Sendable {
@@ -83,14 +181,16 @@ public actor TurnTraceBus {
         init(capacity: Int) { self.capacity = capacity }
         /// Queue admission and publication of the sole retained worker share
         /// the lock. Its handle retires only after the final delivery settles.
-        func enqueue(_ pending: Element, deliver: @escaping @Sendable (Element) async -> Void) {
+        @discardableResult
+        func enqueue(_ pending: Element, deliver: @escaping @Sendable (Element) async -> Void) -> Bool {
             lock.lock(); defer { lock.unlock() }
-            guard queue.count - head < capacity else { return }
+            guard queue.count - head < capacity else { return false }
             queue.append(pending)
-            guard worker == nil else { return }
+            guard worker == nil else { return true }
             worker = Task.detached(priority: .utility) { [self] in
                 while let next = self.next() { await deliver(next) }
             }
+            return true
         }
         func next() -> Element? {
             lock.lock()
@@ -139,12 +239,35 @@ public actor TurnTraceBus {
         await persistQueue.waitUntilIdle()
     }
 
+    /// Flush this turn's already-accepted queue entries, with a five-second
+    /// deadline. Any prior accepted-write failure on this bus still throws.
+    /// This is ordering evidence only: the caller must still verify the
+    /// checkpoint and persisted terminal. Queue loss is never completion.
+    public nonisolated func flush(turnId: String) async throws {
+        try Task.checkCancellation()
+        let marker = flushes.capture(turnId)
+        defer { flushes.remove(marker) }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await marker.wait() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 5_000_000_000)
+                throw ToolFailureError("Turn \(turnId)'s trace flush did not finish within five seconds; recovery remains unconfirmed.", effects: .unknown)
+            }
+            defer { group.cancelAll() }
+            try await group.next()
+        }
+        try Task.checkCancellation()
+    }
+
     /// Nonblocking emission through bounded ingress and per-bus persistence queues.
     /// Events over either queue's capacity are dropped.
     public nonisolated static func fire(_ event: TurnTraceEvent, on bus: TurnTraceBus = .shared) {
         let event = sequencingDispatch(event)
-        emissionPump.enqueue(.init(event: event, bus: bus)) { pending in
-            await pending.bus.deliver(pending.event)
+        let tracked = TrackedEvent(event: event, ticket: bus.flushes.begin(event.turnId))
+        if !emissionPump.enqueue(.init(tracked: tracked, bus: bus), deliver: { pending in
+            await pending.bus.deliver(pending.tracked)
+        }) {
+            bus.flushes.end(tracked, error: ToolFailureError("Trace ingress was full; the turn's evidence is incomplete.", effects: .unknown))
         }
     }
 
@@ -171,9 +294,22 @@ public actor TurnTraceBus {
 
     /// Publish to subscribers without awaiting them, then enqueue persistence.
     public func deliver(_ event: TurnTraceEvent) {
+        deliver(TrackedEvent(event: event, ticket: flushes.begin(event.turnId)))
+    }
+
+    private func deliver(_ tracked: TrackedEvent) {
+        let event = tracked.event
         if event.turnId != "unknown" || event.diagnostic.isEmpty { deliverToSubscribers(event) }
-        persistQueue.enqueue(event) { [persistLane] next in
-            await persistLane.append(next)
+        if !persistQueue.enqueue(tracked, deliver: { [persistLane, flushes] next in
+            do {
+                try await persistLane.appendChecked(next.event)
+                flushes.end(next)
+            } catch {
+                ModuleLog(category: "TurnTracePersistLane")("append failed (\(next.event.kind), turn \(next.event.turnId)): \(error)", level: .error)
+                flushes.end(next, error: error)
+            }
+        }) {
+            flushes.end(tracked, error: ToolFailureError("Trace persistence queue was full; the turn's evidence is incomplete.", effects: .unknown))
         }
     }
 

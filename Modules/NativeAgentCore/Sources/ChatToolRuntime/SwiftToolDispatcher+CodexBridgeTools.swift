@@ -40,9 +40,13 @@ extension SwiftToolDispatcher {
     enum CodexBrainControlError: Error, Equatable {
         case invalidReasoningEffort(requested: String, model: String?, supported: [String])
         case invalidFastValue
+        case unavailableControls(String)
 
         var envelope: JSONValue {
             switch self {
+            case .unavailableControls(let detail):
+                return .object(["status": .string("failed"), "effects": .string("none"),
+                    "reason": .string("controls_unavailable"), "detail": .string(detail)])
             case .invalidReasoningEffort(let requested, let model, let supported):
                 var object: [String: JSONValue] = [
                     "status": .string("failed"), "effects": .string("none"),
@@ -64,7 +68,7 @@ extension SwiftToolDispatcher {
     }
 
     static func codexBrainControls(
-        from input: [String: JSONValue]
+        from input: [String: JSONValue], dataRoot: URL
     ) -> Result<CodexBrainControls, CodexBrainControlError> {
         let model: String? = {
             guard case .string(let raw)? = input["model"] else { return nil }
@@ -75,9 +79,6 @@ extension SwiftToolDispatcher {
             guard case .string(let raw)? = input["reasoning_effort"] else { return nil }
             let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
-                .replacingOccurrences(of: "-", with: "_")
-                .replacingOccurrences(of: " ", with: "_")
-            if ["extra_high", "extrahigh"].contains(normalized) { return "xhigh" }
             return normalized.isEmpty ? nil : normalized
         }()
         let fast: Bool?
@@ -90,22 +91,27 @@ extension SwiftToolDispatcher {
             fast = nil
         }
 
-        if let effort {
-            let supported: Set<String>
-            if let model {
-                supported = OpenAIExecutionControls.supportedReasoningEfforts(
-                    model: model,
-                    transport: .codexCLI
-                )
-            } else {
-                supported = ["low", "medium", "high", "xhigh", "max", "ultra"]
+        // These builder tools launch the command CLI, whose selected sign-in
+        // can differ from NativeAgent's runtime account. Bind that exact source.
+        let auth = ChatGPTTransport.preferredAuthPath(source: .commandCLI)
+        if effort != nil || fast == true {
+            guard let model else {
+                return .failure(.unavailableControls("Choose an explicit model with reasoning_effort or Fast so its account catalog can establish the controls."))
             }
-            guard supported.contains(effort) else {
-                return .failure(.invalidReasoningEffort(
-                    requested: effort,
+            if let effort {
+                let supported = OpenAIExecutionControls.supportedReasoningEfforts(
                     model: model,
-                    supported: supported.sorted()
-                ))
+                    transport: .codexCLI, dataRoot: dataRoot, oauthAuthURL: auth
+                )
+                guard supported.contains(effort) else {
+                    return .failure(.invalidReasoningEffort(requested: effort, model: model, supported: supported.sorted()))
+                }
+            }
+            if fast == true {
+                do {
+                    _ = try OpenAIExecutionControls.serviceTier(model: model, requested: "priority",
+                        transport: .codexCLI, dataRoot: dataRoot, oauthAuthURL: auth)
+                } catch { return .failure(.unavailableControls(error.localizedDescription)) }
             }
         }
 
@@ -128,24 +134,8 @@ extension SwiftToolDispatcher {
         return .object(resolved.stringFields.mapValues(JSONValue.string))
     }
 
-    private func inferredRepositoryCheckout(fromRequestText text: String) -> String? {
-        let candidates = Self.repositorySlugCandidates(inRequestText: text)
-        guard !candidates.isEmpty else { return nil }
-        var resolved: [String] = []
-        for candidate in candidates {
-            guard let checkout = GitHubCommandCheckoutResolver.resolve(
-                repository: candidate,
-                dataRoot: dataRoot
-            ) else { continue }
-            let path = checkout.standardizedFileURL.path
-            if !resolved.contains(path) { resolved.append(path) }
-            if resolved.count > 1 { return nil }
-        }
-        return resolved.count == 1 ? resolved[0] : nil
-    }
-
     func runCodexMessage(input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        guard AgentConversationDelivery.lane(for: "codex", dataRoot: dataRoot, bridgeConfigRoot: agentBridgeConfigRoot) != nil else {
+        guard try AgentConversationDelivery.lane(for: "codex", dataRoot: dataRoot, bridgeConfigRoot: agentBridgeConfigRoot) != nil else {
             throw ToolFailureError("No contact carries this inbox door.", effects: .none, owner: "Saved agent contacts", nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]))
         }
         let text: String, priority: String
@@ -170,9 +160,7 @@ extension SwiftToolDispatcher {
             else { return "report" }
             return "receipt_only"
         }()
-        // Resolve the builder conversation before repository inference so a
-        // follow-up remains the same worker thread while still using the new
-        // message text/topic for trusted checkout selection.
+        // Resolve the conversation first: a follow-up owns its saved checkout.
         let messageId = Self.builderMessageId(input: input)
         let conversation: BuilderConversationSelection
         switch Self.builderConversationSelection(
@@ -187,7 +175,7 @@ extension SwiftToolDispatcher {
         let topic = conversation.topic
         let originSessionId = ChatToolSessionInjection.explicitSessionId(in: input)
         let brain: CodexBrainControls
-        switch Self.codexBrainControls(from: input) {
+        switch Self.codexBrainControls(from: input, dataRoot: dataRoot) {
         case .success(let controls): brain = controls
         case .failure(let error): return error.envelope
         }
@@ -207,31 +195,27 @@ extension SwiftToolDispatcher {
         // resolver, so the trust
         // anchor stays "this checkout's git remote really is that repo" rather
         // than "the model said so". An unresolvable or malformed repository
-        // yields nil and the send proceeds with today's no-profile behavior.
-        let repositoryResolvedDirectory: String? = {
+        // is refused before sending; inspection failure never selects another checkout.
+        let repositoryResolvedDirectory: String? = try {
             guard !isFollowUp,
                   requestedDirectory == nil,
                   case .string(let raw)? = input["repository"] else { return nil }
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard Self.isWellFormedRepositorySlug(value) else { return nil }
-            guard let checkout = GitHubCommandCheckoutResolver.resolve(
+            guard Self.isWellFormedRepositorySlug(value) else {
+                throw ToolFailureError("repository must be an owner/name GitHub slug.", argumentPath: "$.repository", effects: .none)
+            }
+            guard let checkout = try GitHubCommandCheckoutResolver.resolve(
                 repository: value,
                 dataRoot: dataRoot
-            ) else { return nil }
+            ) else {
+                throw ToolFailureError("No checked local checkout matches \(value).", argumentPath: "$.repository", effects: .none,
+                    instruction: "Supply the intended checked-out repository's working directory explicitly.")
+            }
             return checkout.standardizedFileURL.path
-        }()
-
-        // An omitted repository is inferred from the request and verified against the checkout remote.
-        let inferredRepositoryDirectory: String? = {
-            guard !isFollowUp,
-                  requestedDirectory == nil,
-                  repositoryResolvedDirectory == nil else { return nil }
-            return inferredRepositoryCheckout(fromRequestText: [text, topic ?? ""].joined(separator: "\n"))
         }()
 
         let resolvedBaseDirectory = requestedDirectory
             ?? repositoryResolvedDirectory
-            ?? inferredRepositoryDirectory
         let callerSelectedDirectory = requestedDirectory ?? repositoryResolvedDirectory
         let worktreeResult = try await BuilderWorktreeAllocator.shared.resolve(
             agent: .codex,
@@ -257,8 +241,7 @@ extension SwiftToolDispatcher {
         // This capability marker is created only from a remote-verified
         // repository checkout. It is never accepted from caller-supplied
         // working_directory, topic text, or repository-controlled prose.
-        let executionProfile = (repositoryResolvedDirectory != nil
-            || inferredRepositoryDirectory != nil)
+        let executionProfile = repositoryResolvedDirectory != nil
             ? "github-command-repository-network-v1"
             : nil
 
@@ -322,8 +305,6 @@ extension SwiftToolDispatcher {
             retryWake: fields["retryWake"] == .bool(true),
             queuedAt: Self.stringField("queuedAt", in: receipt) ?? timestamp
         )
-        let quarantineNote = Self.BuilderInboxQuarantineNote()
-        if let path = Self.stringField("quarantinedPath", in: receipt) { quarantineNote.record(path) }
         let path = inboxURL.path
         guard appendResult.status != "conflict" else {
             return .object([
@@ -346,7 +327,6 @@ extension SwiftToolDispatcher {
                 ? "NativeAgent queues the note and records Codex's terminal receipt without creating another chat turn for the agent. Failures still return visibly."
                 : "NativeAgent queues the inbox row, attempts a Mac notification, wakes Codex, and watches for the final answer. For a contextual follow-up, call codex_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id. If Codex is busy, the wake remains queued until that thread is idle."),
         ]) { _, new in new }
-        Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
         // Keep the ignored directory notice independent of the Desk-binding note.
         if let ignoredRequestedDirectory = worktreeAssignment?.ignoredRequestedDirectory {
             response["workingDirectoryIgnored"] = .string(ignoredRequestedDirectory)
@@ -361,10 +341,7 @@ extension SwiftToolDispatcher {
             // Make repository attachment observable: a silently-applied profile is
             // indistinguishable from a silently-missing one at the call site.
             response["executionProfile"] = .string(executionProfile)
-            response["repositorySource"] = .string(
-                repositoryResolvedDirectory != nil ? "repository_parameter"
-                    : "inferred_from_request"
-            )
+            response["repositorySource"] = .string("repository_parameter")
         }
         response["notification"] = await postCodexMessageArrivalNotification(
             surface: surface,
@@ -424,7 +401,15 @@ extension SwiftToolDispatcher {
         topic: String?
     ) async -> JSONValue {
         let admitted = await fullMacYoloAdmitted(surface: surface)
-        let allowed = await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMac, mode: .write, fullMacAdmitted: admitted)
+        let allowed: Bool
+        do { allowed = try await macIntegrationPermissionStore.allows(MacIntegrationID.notifyMac, mode: .write) }
+        catch {
+            return .object(["status": .string("unavailable"), "posted": .bool(false),
+                "reason": .string("integration_permission_unavailable"), "messageId": .string(messageId),
+                "message": .string(error.localizedDescription),
+                "remedy": Repair.why(owner: "security/mac_integration_permissions.json", tap: "Trust > Mac",
+                    instruction: "Preserve the saved permission bytes and repair the authority before continuing.")])
+        }
         guard allowed else {
             return .object([
                 "status": .string("skipped"),
@@ -511,8 +496,8 @@ extension SwiftToolDispatcher {
     }
     // MARK: - invoke_codex spawn handler
     //
-    // Spawns `codex exec` as a Process, waits for a bounded non-interactive
-    // answer, and writes an audit envelope to data/from_codex/<uuid>.json.
+    // Admits `codex exec` independently of its bounded observation, then
+    // settles its actual exit in data/from_codex/<uuid>.json.
     // JSON prompt/reply evidence and CLI last-message text stay local: no
     // backup/export/phone file sync; PrivacyMap: from_codex. Retention is 100 pairs.
     // The phone receives the separately recorded Runs projection.
@@ -523,7 +508,54 @@ extension SwiftToolDispatcher {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         launch: DrivenAgentLaunch
     ) async throws -> JSONValue {
-        if let denied = launch.deniedResult { return denied }
+        switch launch {
+        case .refused(let refusal): return refusal
+        case .admitted(let program):
+            return try await runAdmittedInvokeCodex(input: input, dataRoot: dataRoot, launch: program)
+        }
+    }
+
+    private static func runAdmittedInvokeCodex(input: [String: JSONValue], dataRoot: URL,
+                                              launch: DrivenAgentLaunch.Program) async throws -> JSONValue {
+        let auditDir = dataRoot.appendingPathComponent("from_codex", isDirectory: true)
+        if let raw = input["run_id"] {
+            if let abort = input["abort"] {
+                guard case .bool = abort else {
+                    throw ToolFailureError("abort must be true or false.", effects: .none)
+                }
+            }
+            guard case .string(let id) = raw, let uuid = UUID(uuidString: id) else {
+                throw ToolFailureError("run_id must be the exact returned UUID.", effects: .none)
+            }
+            let runId = uuid.uuidString
+            let auditURL = auditDir.appendingPathComponent("\(runId).json")
+            let work = SubprocessWork.retained(at: auditURL.path)
+            if input["abort"] == .bool(true) { work?.stop() }
+            let audit: JSONValue
+            do { audit = try JSONValue.parse(Data(contentsOf: auditURL)) }
+            catch {
+                throw ToolFailureError("Codex's audit could not be read: \(error.localizedDescription). This does not establish its execution outcome.",
+                    effects: .unknown, owner: auditURL.path, code: "codex_observation_unavailable",
+                    instruction: "Inspect this exact run's retained process and audit evidence before repeating work.", recovery: .inspect)
+            }
+            guard case .object(let fields) = audit,
+                  case .string(let status)? = fields["status"],
+                  case .string(let outcome)? = fields["outcome"],
+                  ["unsettled", "settled"].contains(outcome) else {
+                throw ToolFailureError("Codex audit has no valid status/outcome evidence.", effects: .unknown, owner: auditURL.path)
+            }
+            // A vanished owner is not an observed exit (app restart, for
+            // example). Retain the audit and report an unknown outcome.
+            let terminal = outcome == "settled"
+            return .object(["runId": .string(runId), "auditPath": .string(auditURL.path),
+                "status": .string(terminal ? status : work == nil ? "unknown" : "pending"),
+                "outcome": .string(terminal ? "settled" : "unsettled"),
+                "abortRequested": .bool(input["abort"] == .bool(true) && work != nil),
+                "audit": audit])
+        }
+        guard input["abort"] == nil || input["abort"] == .bool(false) else {
+            throw ToolFailureError("Abort requires the exact run_id; no new work launched.", effects: .none)
+        }
         guard case .string(let text)? = input["text"], !text.isEmpty else {
             return .object([
                 "status": .string("failed"),
@@ -547,8 +579,12 @@ extension SwiftToolDispatcher {
                 "reason": .string("invalid_working_directory"), "detail": .string(error.localizedDescription)])
         }
         let timeoutSeconds: Int = {
-            if case .int(let i)? = input["timeout_seconds"] { return max(30, min(3600, Int(i))) }
+            if case .int(let i)? = input["timeout_seconds"] { return Int(max(0, min(3600, i))) }
             return 600
+        }()
+        let executionTimeoutSeconds: Int = {
+            if case .int(let i)? = input["execution_timeout_seconds"] { return Int(max(30, min(86400, i))) }
+            return 3600
         }()
         let sandbox: String = {
             if case .string(let s)? = input["sandbox"] {
@@ -560,17 +596,16 @@ extension SwiftToolDispatcher {
             return launch.permission.codexSandbox
         }()
         if sandbox == "danger-full-access", launch.permission != .fullMac {
-            var denied: [String: JSONValue] = [
+            let denied: [String: JSONValue] = [
                 "status": .string("denied"),
                 "reason": .string("full_mac_required"),
                 "sandbox": .string(sandbox),
                 "message": .string("invoke_codex danger-full-access requires Full Mac. Retry with workspace-write or turn on Full Mac."),
             ]
-            if let note = launch.note { denied["note"] = .string(note) }
             return .object(denied)
         }
         let brain: CodexBrainControls
-        switch codexBrainControls(from: input) {
+        switch codexBrainControls(from: input, dataRoot: dataRoot) {
         case .success(let controls): brain = controls
         case .failure(let error): return error.envelope
         }
@@ -589,22 +624,13 @@ extension SwiftToolDispatcher {
 
         let runId = UUID().uuidString
         let started = Date()
-        let auditDir = dataRoot
-            .appendingPathComponent("from_codex", isDirectory: true)
-        try? FileManager.default.createDirectory(at: auditDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: auditDir, withIntermediateDirectories: true)
         let auditURL = auditDir.appendingPathComponent("\(runId).json")
         let lastMessageURL = auditDir.appendingPathComponent("\(runId)-last-message.txt")
 
         let environment = AgentBridgeRuntime.processEnvironment()
-        guard let codex = launch.executable.map({ URL(fileURLWithPath: $0) })
-                ?? AgentBridgeRuntime.executableURL(named: "codex", environment: environment) else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("codex_cli_not_found"),
-                "fix": .string("Install and sign in to Codex CLI, then restart NativeAgent."),
-            ])
-        }
-        let process = Process()
+        let codex = URL(fileURLWithPath: launch.executable)
+        let process = ManagedProcess()
         process.executableURL = codex
         var args = codexExecArguments(
             sandbox: sandbox,
@@ -621,9 +647,21 @@ extension SwiftToolDispatcher {
         process.currentDirectoryURL = URL(fileURLWithPath: cwdRaw)
         process.environment = environment
 
+        let pending: JSONValue = .object(["status": .string("pending"), "outcome": .string("unsettled"),
+            "runId": .string(runId), "auditPath": .string(auditURL.path), "cwd": .string(cwdRaw),
+            "executable": .string(codex.path), "lastMessagePath": .string(lastMessageURL.path),
+            "executionTimeoutSeconds": .int(Int64(executionTimeoutSeconds)),
+            "detail": .string("Observation ended; Codex retains this execution until actual exit, explicit abort, or its execution limit. Inspect this run_id before repeating work.")])
         let outputCapture = try InvokeOutputCapture(process: process)
-
-        return await SubprocessWork(process).run(timeoutSeconds: timeoutSeconds) { exit in
+        do {
+            try Task.checkCancellation()
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(try pending.serializedData(pretty: true), to: auditURL)
+        } catch {
+            _ = outputCapture.finish()
+            throw error
+        }
+        return await SubprocessWork(process).observe(key: auditURL.path, waitSeconds: timeoutSeconds,
+            executionTimeoutSeconds: executionTimeoutSeconds, pending: pending) { exit in
             let (stdoutText, stderrText) = outputCapture.finish()
             let header = stderrText.components(separatedBy: "--------").dropFirst().first ?? ""
             let fields = Dictionary(header.split(separator: "\n").compactMap { line -> (String, String)? in
@@ -633,15 +671,13 @@ extension SwiftToolDispatcher {
             let reportedBrain = CodexBrainControls(model: fields["model"], reasoningEffort: fields["reasoning effort"],
                 serviceTier: fields["service tier"], fast: nil)
             let brainSource = header.isEmpty ? "unreported" : "codex_cli_header"
-            let lastMessage = (try? String(contentsOf: lastMessageURL, encoding: .utf8)) ?? ""
-            let replyText = lastMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? stdoutText
-                : lastMessage
+            let finalReply = CodexFinalReply.read(lastMessageURL)
+            let replyText = finalReply.text ?? ""
             let exitCode = exit.code
             let durationMs = Int(Date().timeIntervalSince(started) * 1000)
             let didTimeOut = exit.timedOut
             let cancelled = exit.stopped
-            let status = cancelled ? "stopped" : exitCode == 0 ? "completed" : "failed"
+            let status = cancelled ? "stopped" : exitCode == 0 && finalReply.failure == nil ? "completed" : "failed"
 
             var auditEntry: [String: Any] = [
                 "runId": runId,
@@ -650,8 +686,10 @@ extension SwiftToolDispatcher {
                 "durationMs": durationMs,
                 "exitCode": Int(exitCode),
                 "cwd": cwdRaw,
+                "executable": codex.path,
                 "sandbox": sandbox,
                 "timeoutSeconds": timeoutSeconds,
+                "executionTimeoutSeconds": executionTimeoutSeconds,
                 "timedOut": didTimeOut,
                 "cancelled": cancelled,
                 "status": status,
@@ -663,6 +701,8 @@ extension SwiftToolDispatcher {
                 "lastMessagePath": lastMessageURL.path,
                 "brainSource": brainSource,
             ]
+            if let failure = finalReply.failure { auditEntry["finalReplyError"] = failure }
+            if let failure = exit.terminationError { auditEntry["terminationError"] = failure }
             if let commitHash { auditEntry["commitHash"] = commitHash }
             if let model = reportedBrain.model { auditEntry["model"] = model }
             if let effort = reportedBrain.reasoningEffort { auditEntry["reasoningEffort"] = effort }
@@ -676,14 +716,19 @@ extension SwiftToolDispatcher {
                 auditError = nil
             } catch { auditError = String(describing: error) }
 
-            let completed = exitCode == 0 && !cancelled
+            let completed = exitCode == 0 && !cancelled && finalReply.failure == nil
             let terminalStatus = auditError == nil ? status : "failed"
-            let reason = completed ? nil : didTimeOut ? "timeout_after_\(timeoutSeconds)s" : cancelled ? "stopped"
+            let reason = exit.terminationError != nil ? "process_termination_incomplete" : completed ? nil : didTimeOut ? "execution_timeout_after_\(executionTimeoutSeconds)s" : cancelled ? "stopped"
+                : finalReply.failure != nil && exitCode == 0 ? "final_reply_unavailable"
                 : exit.launchError != nil ? "spawn_failed" : "subprocess_exit_\(exitCode)"
             let detail: String? = if let auditError {
                 "The captured reply is returned, but its audit could not be saved: \(auditError)"
+            } else if let failure = exit.terminationError {
+                failure
             } else if let error = exit.launchError {
                 ChatToolOutcome.errorMessage(ToolFailureError(error, effects: .none, code: "spawn_failed"))
+            } else if let failure = finalReply.failure {
+                "Codex's final reply did not read: \(failure). Inspect \(lastMessageURL.path) and the captured process output before repeating any work."
             } else if !completed {
                 exit.launched ? "The process ended. Its partial reply and captured output are saved; any changes already made remain."
                     : "Stopped before launch. Nothing ran."
@@ -730,6 +775,28 @@ extension SwiftToolDispatcher {
                         uniquingKeysWith: { _, cause in cause })
                     result = .object(fields)
                 }
+            }
+            if exit.launched, let failure = finalReply.failure, case .object(var fields) = result {
+                fields["final_reply_error"] = .string(failure)
+                fields["stdout"] = .string(stdoutText)
+                if exitCode == 0 && !cancelled {
+                    let instruction = "Inspect the saved Codex process evidence and repair its final-reply file. Check existing effects before repeating work."
+                    fields.merge(Self.builderFailureFields(
+                        ToolFailureError(failure, effects: .unknown, owner: lastMessageURL.path,
+                            code: "final_reply_unavailable", instruction: instruction, recovery: .reconcile),
+                        tool: "invoke_codex", reason: "final_reply_unavailable", effects: .unknown,
+                        owner: lastMessageURL.path, instruction: instruction),
+                        uniquingKeysWith: { _, owned in owned })
+                }
+                result = .object(fields)
+            }
+            if let failure = exit.terminationError, case .object(var fields) = result {
+                fields["effects"] = .string("unknown")
+                fields["detail"] = .string(failure)
+                fields["stdout"] = .string(stdoutText)
+                fields["remedy"] = Repair.reconcile(instruction: "Reconcile the original Codex run and repair its retained process group before sending again.",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["find": .string("codex")])]))
+                result = .object(fields)
             }
             if let auditError, case .object(var fields) = result {
                 fields["status"] = .string(terminalStatus)

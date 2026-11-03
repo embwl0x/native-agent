@@ -137,11 +137,18 @@ extension AppToolExecutor {
         // or the one its inbox note points at, as the inbox opens it.
         let openSession = appModel.activeChatSessionId
         var sessionID = openSession
-        var found = openSession.isEmpty ? nil
-            : await InlineInteractionResolver.interaction(id: id, sessionID: openSession, dataRoot: dataRoot)
-        if found == nil, let raisedIn = try? await InlineInteractionDelivery.pointer(id: "interaction:\(id)", dataRoot: dataRoot).sessionID {
-            sessionID = raisedIn
-            found = await InlineInteractionResolver.interaction(id: id, sessionID: raisedIn, dataRoot: dataRoot)
+        var found: InlineInteraction?
+        do {
+            found = openSession.isEmpty ? nil
+                : try await InlineInteractionResolver.interaction(id: id, sessionID: openSession, dataRoot: dataRoot)
+            if found == nil {
+                let raisedIn = try await InlineInteractionDelivery.pointer(id: "interaction:\(id)", dataRoot: dataRoot).sessionID
+                sessionID = raisedIn
+                found = try await InlineInteractionResolver.interaction(id: id, sessionID: raisedIn, dataRoot: dataRoot)
+            }
+        } catch {
+            return refuse(Self.interactionFailure("card_unavailable",
+                TurnSecretRedactor.redactText(error.localizedDescription), extra: ["interaction_id": .string(id)]))
         }
         guard let current = found else {
             return refuse(Self.interactionFailure(
@@ -162,9 +169,13 @@ extension AppToolExecutor {
         // The caller is asked by identity, not by door: the transport-verified
         // chat and person must agree where either side recorded one, and the
         // turn must be in the conversation that raised the card.
-        guard let cardOrigin = await InlineInteractionResolver.originEnvelope(
-            of: id, sessionID: sessionID, dataRoot: dataRoot
-        ), !cardOrigin.surface.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        let origin: TurnEnvelope?
+        do { origin = try await InlineInteractionResolver.originEnvelope(of: id, sessionID: sessionID, dataRoot: dataRoot) }
+        catch {
+            return refuse(Self.interactionFailure("card_unavailable",
+                TurnSecretRedactor.redactText(error.localizedDescription), extra: ["interaction_id": .string(id)]))
+        }
+        guard let cardOrigin = origin, !cardOrigin.surface.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return refuse(Self.interactionFailure(
                 "origin_unverifiable",
                 "I can't tell whose card this is — the row that raised it records no origin, so "
@@ -353,7 +364,8 @@ extension AppToolExecutor {
                         began, sessionID: sessionID, dataRoot: dataRoot
                     )
                 } catch {
-                    guard let onDisk = await InlineInteractionResolver.interaction(
+                    do {
+                    guard let onDisk = try await InlineInteractionResolver.interaction(
                         id: id, sessionID: sessionID, dataRoot: dataRoot
                     ) else {
                         return Self.interactionFailure(
@@ -362,6 +374,10 @@ extension AppToolExecutor {
                         )
                     }
                     pending = onDisk
+                    } catch {
+                        return Self.interactionFailure("card_unavailable", error.localizedDescription,
+                            extra: ["interaction_id": .string(id)])
+                    }
                 }
                 let reason = atMutation.map {
                     "\(authority) changes what the agent itself is allowed to do, and only Full "
@@ -607,7 +623,13 @@ extension AppToolExecutor {
     ) async -> InteractionGrantOutcome {
         var outcome = InteractionGrantOutcome()
         guard !categories.isEmpty else { return outcome }
-        guard InlineInteractionRegistry.macControlPostureAllowsCategories(dataRoot: dataRoot) else {
+        let posturePermits: Bool
+        do { posturePermits = try InlineInteractionRegistry.macControlPostureAllowsCategories(dataRoot: dataRoot) }
+        catch {
+            for category in categories { outcome.failed(category, error.localizedDescription) }
+            return outcome
+        }
+        guard posturePermits else {
             nativeLog("[\(logTag)] mac control grant refused: posture does not allow categories")
             for category in categories { outcome.failed(category, "The current posture does not allow Mac control categories.") }
             return outcome
@@ -730,8 +752,10 @@ extension AppToolExecutor {
         case .failure(let refusal): return refusal.answer
         case .success(let ready): (posture, attachments) = ready
         }
-        let reachesUser = await Self.reachesUser(surface: surface, fullMac: posture?.name == Self.fullMacModeName,
-                                               dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+        let reachesUser: Bool
+        do { reachesUser = try await Self.reachesUser(surface: surface, fullMac: posture?.name == Self.fullMacModeName,
+                                               dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()) }
+        catch { return ChatToolOutcome.failure(error: error, tool: "interaction_act", effects: ToolFailureError.Effects.none) }
         let outcome = await appModel.runComposer(
             verb: verb,
             value: Self.interactionText(input["value"]),
@@ -777,8 +801,10 @@ extension AppToolExecutor {
         case .failure(let refusal): return refusal.answer
         case .success(let ready): posture = ready.0
         }
-        let reachesUser = await Self.reachesUser(surface: surface, fullMac: posture?.name == Self.fullMacModeName,
-                                               dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+        let reachesUser: Bool
+        do { reachesUser = try await Self.reachesUser(surface: surface, fullMac: posture?.name == Self.fullMacModeName,
+                                               dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot()) }
+        catch { return ChatToolOutcome.failure(error: error, tool: "interaction_act", effects: ToolFailureError.Effects.none) }
         return host.composerFence(
             verb: verb, value: Self.interactionText(input["value"]), sessionId: Self.interactionText(input["session_id"]),
             reachesUser: reachesUser,

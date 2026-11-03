@@ -20,7 +20,6 @@ public enum CognitiveNodeKind: String, Sendable, Equatable, CaseIterable {
     case toolObservation
     case correction
     case providerHealth
-    case workshopExecution = "mission" // compatibility wire ID
     case appLifecycle
     /// Round 3 Wave A2 — bodily resolutions (relief/disappointment) with the
     /// resolved path as aboutness. Additive wire string; felt-tissue eligible.
@@ -133,7 +132,7 @@ public struct CognitiveNode: Sendable, Equatable, Identifiable {
             return explicit
         }
         switch kind {
-        case .toolObservation, .providerHealth, .workshopExecution, .appLifecycle, .feltResolution:
+        case .toolObservation, .providerHealth, .appLifecycle, .feltResolution:
             return .system
         case .conversationFocus, .correction:
             return .live
@@ -164,30 +163,6 @@ public struct CognitiveSubstrateSnapshot: Sendable, Equatable {
         self.nodes = nodes
         self.persistenceHealth = persistenceHealth
     }
-}
-
-/// A fixed-time read that settles a copy of the continuity field. The live
-/// actor's decay anchors, capacity, dirty state, and persistence are untouched.
-/// The three substrate-native felt proxies (W4/P2), CAPTURED at freeze time.
-///
-/// They must ride in the frozen read rather than be recomputed: they are derived
-/// from live actor state (`field` timestamps, `pendingCompletion`, the live
-/// configuration), so a frozen re-render that recomputed them would drift from
-/// the capsule it is supposed to reproduce byte for byte — which is exactly what
-/// "a frozen capsule retains every captured render input" exists to catch.
-/// nil means the proxy had no honest evidence, and stays absent.
-public struct CognitiveFeltProxyReads: Sendable, Equatable {
-    public var fatigue: Double?
-    public var curiosity: Double?
-    public var clarity: Double?
-
-    public init(fatigue: Double? = nil, curiosity: Double? = nil, clarity: Double? = nil) {
-        self.fatigue = fatigue
-        self.curiosity = curiosity
-        self.clarity = clarity
-    }
-
-    public static let absent = CognitiveFeltProxyReads()
 }
 
 /// Presentation-only state frozen by value with a cognition epoch.
@@ -291,6 +266,8 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     }
 }
 
+/// A fixed-time read that settles a copy of the continuity field. The live
+/// actor's decay anchors, capacity, dirty state, and persistence are untouched.
 public struct CognitiveFrozenRead: Sendable, Equatable {
     public let fixedAt: Date
     public let mindEpoch: UInt64
@@ -298,14 +275,22 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
     public let personalityDynamics: PersonalityDynamicsConfiguration
     public let snapshot: CognitiveSubstrateSnapshot
     public let workspace: CognitiveWorkspaceSnapshot
+    public let associations: [CognitiveAssociationEdge]
     public let affect: CognitiveAffectState
     public let mood: CognitiveMoodReading
-    public let feltProxies: CognitiveFeltProxyReads
     public let soundLandingScores: [UUID: Double]
     public let capsulePresentationState: CognitiveCapsulePresentationState
     public let associationSuppressions: [CognitiveAssociationSuppression]
     public let trustedPeerIds: Set<String>
     public let cares: [CognitiveCare]
+    public let carePersonAliases: [String: String]
+    public let carePeopleAvailable: Bool
+    public let selfTraits: [CognitiveSelfKnowledge.Trait]
+    public let personLines: [String: String]
+    public let personPresenceLine: String?
+    public let episodeCount: Int
+    public let reflectionCount: Int
+    public let ablations: [String: Bool]
 
     public init(
         fixedAt: Date,
@@ -313,15 +298,23 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         personalityDynamics: PersonalityDynamicsConfiguration = .default,
         snapshot: CognitiveSubstrateSnapshot,
         workspace: CognitiveWorkspaceSnapshot,
+        associations: [CognitiveAssociationEdge],
         affect: CognitiveAffectState = CognitiveAffectState(),
         mood: CognitiveMoodReading = CognitiveMoodReading(valence: 0, basis: 0),
-        feltProxies: CognitiveFeltProxyReads = .absent,
         soundLandingScores: [UUID: Double] = [:],
         capsulePresentationState: CognitiveCapsulePresentationState = CognitiveCapsulePresentationState(),
         associationSuppressions: [CognitiveAssociationSuppression] = [],
         trustedPeerIds: Set<String> = [],
         mindEpoch: UInt64 = 0,
-        cares: [CognitiveCare] = []
+        cares: [CognitiveCare] = [],
+        carePersonAliases: [String: String] = [:],
+        carePeopleAvailable: Bool = true,
+        selfTraits: [CognitiveSelfKnowledge.Trait] = [],
+        personLines: [String: String] = [:],
+        personPresenceLine: String? = nil,
+        episodeCount: Int = 0,
+        reflectionCount: Int = 0,
+        ablations: [String: Bool] = [:]
     ) {
         self.fixedAt = fixedAt
         self.mindEpoch = mindEpoch
@@ -329,14 +322,22 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         self.personalityDynamics = personalityDynamics
         self.snapshot = snapshot
         self.workspace = workspace
+        self.associations = associations
         self.affect = affect
         self.mood = mood
-        self.feltProxies = feltProxies
         self.soundLandingScores = soundLandingScores
         self.capsulePresentationState = capsulePresentationState
         self.associationSuppressions = associationSuppressions
         self.trustedPeerIds = trustedPeerIds
         self.cares = cares
+        self.carePersonAliases = carePersonAliases
+        self.carePeopleAvailable = carePeopleAvailable
+        self.selfTraits = selfTraits
+        self.personLines = personLines
+        self.personPresenceLine = personPresenceLine
+        self.episodeCount = episodeCount
+        self.reflectionCount = reflectionCount
+        self.ablations = ablations
     }
 }
 

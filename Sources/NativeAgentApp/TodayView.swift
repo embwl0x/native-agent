@@ -164,7 +164,8 @@ struct TodayView: View {
                 )
 
                 // The page's blocks in the layout's order (ui/layout.json, today).
-                let blocks = appModel.engine.layout.layout.shown("today", profile: SimpleViewMode.advanced).map(\.name)
+                SurfaceLayoutContent(appModel.engine.layout.availability) { layout in
+                let blocks = layout.contentNames("today", profile: SimpleViewMode.advanced)
                 let waiting = blocks.contains("waiting") && hasWaiting
                 let earlier = blocks.contains("earlier") ? Self.earlierNotesLine(earlierNotes) : nil
                 let did = blocks.contains("did") ? didRows : []
@@ -222,6 +223,7 @@ struct TodayView: View {
                     }
                 }
                 if empty, !blocks.contains("queues") { emptyLine }
+                }
 
                 // A store that would not open is the one thing a quiet page
                 // must still say out loud. One line, grey, no error text.
@@ -311,7 +313,6 @@ struct TodayView: View {
         }
         .onDisappear { if !quietOffscreenRead { today.stop() } }
         .quietReadTask(live: false) {
-            await appModel.publishWorkStatus()
             await today.refresh(appModel.engine, activeSessionID: appModel.activeChatSessionId)
         }
     }
@@ -460,8 +461,7 @@ struct TodaySection: View {
     }
 }
 
-/// What's ahead, as pills. Only what the page already reads — the horizon and
-/// the next dream — never an invented plan.
+/// What's ahead, as pills: her next clock intentions, horizon and next dream.
 struct TodayAhead: View {
     let rows: [TodayRow]
 

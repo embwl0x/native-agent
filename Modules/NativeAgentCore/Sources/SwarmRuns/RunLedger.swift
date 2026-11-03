@@ -14,8 +14,8 @@ import NativeAgentShared
 /// appends one row here at completion.
 ///
 /// Contract notes:
-/// - Reads accept a bare array or a {"runs": [...]} wrapper. Appends
-///   preserve raw rows and write a bare array, newest first.
+/// - Reads and writes use a bare array of runs, newest first. Appends
+///   preserve raw rows.
 /// - Rows carry the RunRecord fields the readers decode:
 ///   id / kind / status / model / prompt / output / error / createdAt /
 ///   durationSeconds. Swarm rows also retain the selected run reasoningEffort;
@@ -121,9 +121,6 @@ public enum RunLedger {
         switch raw {
         case .array(let rows):
             return rows
-        case .object(let obj):
-            if case .array(let rows)? = obj["runs"] { return rows }
-            fallthrough
         default:
             throw PersistenceCoreError.ioFailure("Not a run ledger (expected an array of runs)")
         }

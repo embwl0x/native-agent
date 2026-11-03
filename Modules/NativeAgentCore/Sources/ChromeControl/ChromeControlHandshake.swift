@@ -4,7 +4,7 @@ import NativeAgentChromeRelayCore
 import PersistenceCore
 import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `ChromeControlHandshake.swift` | `ChromeControlHandshake`: private per-listener token, registered relay executable/signer and browser-parent authentication, bounded hello framing and listener-generation acknowledgement |
+// Blueprint: | `ChromeControlHandshake.swift` | `ChromeControlHandshake`: private per-listener token, registered relay executable/signer and browser-parent authentication with original checked failure/status, bounded hello framing, accepted browser PID and listener-generation acknowledgement |
 
 /// Only an authenticated registered relay may replace the live channel.
 enum ChromeControlHandshake {
@@ -37,7 +37,7 @@ enum ChromeControlHandshake {
     /// never gets to hold the accept task for the hello's whole budget.
     static func validateConnection(
         descriptor: Int32, expecting: Set<String>, token: String
-    ) throws {
+    ) throws -> pid_t? {
         guard !expecting.isEmpty else {
             throw ChromeControlRuntimeError.handshakeRejected("the app has no authenticated relay identity.")
         }
@@ -52,30 +52,27 @@ enum ChromeControlHandshake {
             throw ChromeControlRuntimeError.handshakeRejected("the peer executable is not the registered relay.")
         }
         // The running relay must match this app's signer, even after its parent exits.
-        guard ChromeSocketIdentity.peerIsTrusted(
-            descriptor: descriptor, identifiers: ["NativeAgentChromeRelay"]
-        ) else {
-            nativeLog("[NativeAgent] Chrome control refused a relay with an unexpected code identity.")
-            throw ChromeControlRuntimeError.handshakeRejected("the relay's code identity does not match NativeAgent.")
-        }
+        do { try ChromeSocketIdentity.checkTrustedPeer(descriptor: descriptor, identifiers: ["NativeAgentChromeRelay"]) }
+        catch { throw ChromeControlRuntimeError.handshakeRejected(error.localizedDescription) }
         guard let parent = ChromeHostIdentity.parentProcessID(of: pid) else {
             nativeLog("[NativeAgent] Chrome control refused a relay whose parent could not be read.")
             throw ChromeControlRuntimeError.handshakeRejected("the relay's parent process could not be read.")
         }
         // Both app and relay require a browser-launched native messaging host.
-        let parentIsBrowser = ChromeHostIdentity.isBrowserProcess(parent)
-        // A relay reparented to launchd must prove its browser parent at launch.
-        guard parentIsBrowser || parent == 1 else {
-            nativeLog("[NativeAgent] Chrome control refused a relay whose parent is not a browser.")
-            throw ChromeControlRuntimeError.handshakeRejected("the relay was not launched by a signed browser.")
+        // A relay reparented to launchd proves its browser parent at launch.
+        // Otherwise preserve the exact live Security check/status on refusal.
+        if parent != 1 {
+            do { _ = try ChromeHostIdentity.checkedBrowserSigningIdentifier(forProcess: parent) }
+            catch { throw ChromeControlRuntimeError.handshakeRejected(error.localizedDescription) }
         }
         let hello = try readHello(descriptor: descriptor, token: token)
-        if parentIsBrowser { return }
+        if parent != 1 { return parent }
         // Only the registered, signer-validated relay may attest its launch parent.
         guard helloCarriesParentEvidence(hello) else {
             nativeLog("[NativeAgent] Chrome control refused a reparented relay with no launch-time parent evidence.")
             throw ChromeControlRuntimeError.handshakeRejected("the reparented relay has no valid launch-time browser evidence.")
         }
+        return nil
     }
 
     private static func helloCarriesParentEvidence(_ hello: [String: JSONValue]) -> Bool {

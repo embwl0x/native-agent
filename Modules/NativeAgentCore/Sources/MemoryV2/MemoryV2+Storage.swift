@@ -185,6 +185,7 @@ public actor MemoryStorage {
         stamped.metadata = try MemorySenseProvenance.stamping(stamped.metadata)
         let memory = stamped
         let result = try await dbPool.write { db -> (StoredMemory?, [StoredMemory], [StoredMemory]) in
+            try Self.requireWritableEpoch(in: db, vector: memory.embedding, epoch: memory.embeddingEpoch)
             try Self.requireNotTombstoned(memory, in: db)
             let rows = try Row.fetchAll(db, sql: """
                 SELECT * FROM memories WHERE status = 'active'
@@ -200,7 +201,6 @@ public actor MemoryStorage {
             }
             guard insertIfMissing else { return (nil, [], []) }
             try Self.validateTemporalEvidence(memory)
-            try Self.requireWritableEpoch(in: db, vector: memory.embedding, epoch: memory.embeddingEpoch)
             try Self.executeMemoryInsert(memory, in: db)
             let demoted = try superseding.map { try Self.demoteSuperseded($0, by: memory, in: db) }
             let evicted = try Self.pruneMemoriesToBound(in: db, limit: memoryLimit, preservingIDs: [memory.id])
@@ -346,6 +346,27 @@ public actor MemoryStorage {
         try db.execute(sql: """
             UPDATE memories SET metadata_json = ?, observed_at = ?, updated_at = ? WHERE id = ?
         """, arguments: [Self.encodeMetadata(row.metadata), row.observedAt, row.updatedAt, row.id])
+        try Self.recordCorrectionOccurrence(metadata: memory.metadata, rowID: memory.id, createdAt: memory.createdAt,
+                                           on: row.id, in: db)
+        if carryingHistory, memory.id != row.id {
+            // Move the full record, never the bounded metadata preview. The
+            // same origin already on the survivor remains one occurrence.
+            if try Row.fetchOne(db, sql: """
+                SELECT 1 FROM correction_occurrences a JOIN correction_occurrences b ON a.origin_id = b.origin_id
+                WHERE a.memory_id = ? AND b.memory_id = ?
+                  AND (a.occurred_at IS NOT b.occurred_at OR a.session_id IS NOT b.session_id OR a.history IS NOT b.history)
+                LIMIT 1
+                """, arguments: [memory.id, row.id]) != nil {
+                throw MemoryStorageError.invalidTemporalEvidence("duplicate corrections disagree about the same occurrence")
+            }
+            try db.execute(sql: """
+                INSERT INTO correction_occurrences (memory_id, origin_id, at, occurred_at, session_id, history)
+                SELECT ?, origin_id, at, occurred_at, session_id, history
+                FROM correction_occurrences WHERE memory_id = ?
+                ON CONFLICT(memory_id, origin_id) DO NOTHING
+                """, arguments: [row.id, memory.id])
+            try db.execute(sql: "DELETE FROM correction_occurrences WHERE memory_id = ?", arguments: [memory.id])
+        }
         guard let saved = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [row.id]).map(Self.decodeMemory) else {
             throw MemoryStorageError.databaseUnavailable("committed memory is missing")
         }
@@ -392,7 +413,7 @@ public actor MemoryStorage {
     }
 
     /// Runs inside the caller's write transaction.
-    static func executeMemoryInsert(_ memory: StoredMemory, in db: Database) throws {
+    static func executeMemoryInsert(_ memory: StoredMemory, in db: Database, recordCorrection: Bool = true) throws {
         try db.execute(sql: """
             INSERT INTO memories
               (id, content, persona_id, source, confidence,
@@ -412,16 +433,23 @@ public actor MemoryStorage {
             memory.validFrom, memory.validTo, memory.observedAt,
             Self.encodeMetadata(memory.evidence)
         ])
+        if recordCorrection {
+            try Self.recordCorrectionOccurrence(metadata: memory.metadata, rowID: memory.id, createdAt: memory.createdAt,
+                                               on: memory.id, in: db)
+        }
     }
 
     /// Active rows whose vector is owed, oldest first.
-    public func memoriesOwingVectors(limit: Int) async throws -> [(id: String, content: String)] {
+    public func memoriesOwingVectors(limit: Int, epoch: MemoryEmbeddingEpoch) async throws -> [(id: String, content: String)] {
         try await dbPool.read { db in
             try Row.fetchAll(db, sql: """
                 SELECT id, content FROM memories
                 WHERE embedding IS NULL AND status = 'active' AND TRIM(COALESCE(content, '')) <> ''
+                  AND NOT EXISTS (SELECT 1 FROM memory_embedding_failures f
+                    WHERE f.kind = 'memory' AND f.row_id = memories.id
+                      AND f.content = CAST(memories.content AS BLOB) AND f.epoch = ?)
                 ORDER BY rowid LIMIT ?
-                """, arguments: [max(1, limit)]).map { ($0["id"], $0["content"]) }
+                """, arguments: [epoch.rawValue, max(1, limit)]).map { ($0["id"], $0["content"]) }
         }
     }
 
@@ -478,6 +506,7 @@ public actor MemoryStorage {
                 }
             }
             guard let reason else {
+                try Self.clearEmbeddingFailure(in: db, kind: .memory, id: id)
                 try db.execute(sql: """
                     UPDATE memories SET embedding = ?, embedding_epoch = ?,
                         metadata_json = json_remove(metadata_json, '$.\(Self.preservesIDKey)', '$.\(Self.pendingAdmissionKey)',
@@ -711,7 +740,7 @@ public actor MemoryStorage {
     /// for this page, within the same SQLite read transaction.
     public func curationPage(
         archived: Bool, kind: String?, surface: String, persona: String?, newestFirst: Bool,
-        afterKey: (String, String)?, afterID: String?, offset: Int, limit: Int
+        afterKey: (String, String)?, offset: Int, limit: Int
     ) async throws -> (records: [MemoryRecord], total: Int, nextOffset: Int) {
         try await dbPool.read { db in
             let direction = newestFirst ? "DESC" : "ASC"
@@ -723,9 +752,8 @@ public actor MemoryStorage {
             var ids: [String] = []
             var total = 0
             var start = afterKey == nil ? offset : 0
-            var foundAfterID = false
             while let row = try cursor.next() {
-                let record = MemoryRecord(stored: try StoredMemory(
+                let stored = try StoredMemory(
                     id: row.decode(forColumn: "id"), content: "",
                     personaId: row.decode(forColumn: "persona_id"),
                     createdAt: row.decode(forColumn: "created_at"),
@@ -733,7 +761,9 @@ public actor MemoryStorage {
                     lifecycle: row.decode(forColumn: "lifecycle") ?? MemoryLifecycle.confirmed,
                     validTo: row.decode(forColumn: "valid_to"),
                     metadata: Self.decodeMetadata(row.decode(forColumn: "metadata_json"))
-                ))
+                )
+                try Self.validateTemporalEvidence(stored)
+                let record = MemoryRecord(stored: stored)
                 guard archived ? Self.isRecoverable(record)
                     : record.status == "active" && MemoryLifecycle.isRecallEligible(record.lifecycle)
                         && !Self.metadataFlag(record.extras, Self.pendingAdmissionKey)
@@ -748,12 +778,6 @@ public actor MemoryStorage {
                 if let key = afterKey,
                    newestFirst ? (record.createdAt, record.id) >= key : (record.createdAt, record.id) <= key {
                     start += 1
-                    continue
-                }
-                if afterKey == nil, !foundAfterID, record.id == afterID {
-                    foundAfterID = true
-                    start = total
-                    ids.removeAll()
                     continue
                 }
                 if index >= start, ids.count < limit { ids.append(record.id) }

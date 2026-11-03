@@ -7,7 +7,7 @@ import StandingBots
 import ProviderRouting
 import ChatToolRuntime
 import Experiences
-// Blueprint: | `EngineDeviceSyncHelpers.swift` | Phone helper edit validation, revisions, provider pin/follow semantics and contact commands; `editBotDefinition` fresh merge/timing; `botsShelfRead` supplies one helper status projection to Mac and DeviceSync; action receipts use the committed definition independently of snapshot refresh, whose `helpers_snapshot_error` marks the phone's shared helpers snapshot stale without failing the committed action; successful refresh replaces it without status overrides |
+// Blueprint: | `EngineDeviceSyncHelpers.swift` | Phone helper edit validation, revisions, provider pin/follow semantics and contact commands; following edits share field-specific refusals and inherited-value no-op notes with tools; `editBotDefinition` fresh merge/timing; `botsShelfRead` supplies one helper status projection to Mac and DeviceSync; action receipts use the committed definition independently of snapshot refresh, whose `helpers_snapshot_error` marks the phone's shared helpers snapshot stale without failing the committed action; successful refresh replaces it without status overrides |
 
 extension NativeAgentEngine {
     public func deviceHelpersSnapshot() async throws -> MobileHelpersSnapshot {
@@ -55,38 +55,64 @@ extension NativeAgentEngine {
                                     budget: BotBudget(tokens: BotRunLimits.maximumTokens, seconds: BotRunLimits.maximumSeconds))
             }
             let modelPinned = edit.modelPinned ?? ((!edit.provider.isEmpty && !edit.model.isEmpty) || bot.modelPinned == true)
+            var selection = bot
+            selection.name = edit.name
+            selection.modelPinned = modelPinned
+            // Empty strings are unset controls. The full-form Boolean is
+            // explicit (including false) unless the phone marks it unsubmitted.
+            var fields: [String: JSONValue] = [:]
+            if edit.fastIsSet != false { fields["fast"] = .bool(edit.fast) }
+            if !edit.provider.isEmpty { fields["provider"] = .string(edit.provider) }
+            if !edit.model.isEmpty { fields["model"] = .string(edit.model) }
+            if !edit.think.isEmpty { fields["reasoning_effort"] = .string(edit.think) }
+            let notes = try await BotChatContract.followingSettings(for: selection, fields: fields, dataRoot: root)
             var selectedModel: ProviderModelInfo?
             if modelPinned {
                 let providers = try await self.providers.list().providers
                 guard let provider = providers.first(where: { $0.provider_id == edit.provider && $0.auth_status.eligible }),
                       let model = provider.models.first(where: { $0.id == edit.model }),
-                      (model.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"]).contains(edit.think),
+                      model.supported_reasoning_efforts?.contains(edit.think) == true,
                       !edit.fast || model.supports_fast == true else { throw HelperRemoteError.model }
                 selectedModel = model
             }
-            let when: String
+            let cadence: BotCadence
+            var trigger: BotEventTrigger?
             switch edit.timing {
-            case "manual": when = "Manual only"
-            case "interval": when = "Every N hours"
-            case "cron": when = "Custom"
-            case "event": when = "On an event"
+            case "manual": cadence = .manual
+            case "interval":
+                guard let hours = Double(edit.hours), hours.isFinite, hours > 0 else { throw HelperRemoteError.invalid }
+                cadence = .interval(seconds: hours * 3600)
+            case "cron": cadence = .cron(expression: edit.cron)
+            case "event":
+                cadence = .manual
+                guard let source = BotEventSource(rawValue: edit.eventSource) else { throw HelperRemoteError.invalid }
+                let target = edit.eventFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard BotEventTrigger.isChannelID(target) else { throw HelperRemoteError.invalid }
+                trigger = BotEventTrigger(source: source, filter: target.uppercased(), keyword: edit.eventKeyword)
             default: throw HelperRemoteError.invalid
             }
-            guard let source = BotEventSource(rawValue: edit.timing == "event" ? edit.eventSource : "slack") else { throw HelperRemoteError.invalid }
-            var candidate: BotDefinition
-            do {
-                candidate = try BotDefinitionStore.editorDefinition(bot, name: edit.name, brief: edit.brief,
-                    provider: edit.provider, model: edit.model, think: edit.think, modelPinned: modelPinned,
-                    providerReady: selectedModel != nil, supportedEfforts: selectedModel?.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"],
-                    supportsFast: selectedModel?.supports_fast == true, fast: edit.fast,
-                    tokens: edit.tokens, seconds: edit.seconds, daily: edit.daily, when: when, hours: edit.hours,
-                    cron: edit.cron, weekday: 0, clockText: "", timingUnchanged: false,
-                    eventSource: source, eventFilter: edit.eventFilter, eventKeyword: edit.eventKeyword, tell: edit.tell, condition: edit.condition)
-            } catch { throw HelperRemoteError.invalid }
-            // The phone payload does not edit personality.
-            candidate.personality = bot.personality
+            let tokens: Int
+            if edit.tokens.isEmpty { tokens = BotRunLimits.maximumTokens }
+            else if let value = Int(edit.tokens), value > 0 { tokens = value }
+            else { throw HelperRemoteError.invalid }
+            let seconds: Double
+            if edit.seconds.isEmpty { seconds = BotRunLimits.maximumSeconds }
+            else if let value = Double(edit.seconds), value.isFinite, value > 0 { seconds = value }
+            else { throw HelperRemoteError.invalid }
+            let daily: Int?
+            if edit.daily.isEmpty { daily = nil }
+            else if let value = Int(edit.daily), value > 0 { daily = value }
+            else { throw HelperRemoteError.invalid }
+            guard !edit.tell || !edit.condition.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HelperRemoteError.invalid }
+            let candidate = BotDefinitionStore.editedDefinition(bot, name: edit.name, personality: bot.personality, brief: edit.brief,
+                provider: edit.provider, model: edit.model, think: edit.think, modelPinned: modelPinned,
+                fast: selectedModel?.supports_fast == true && edit.fast,
+                budget: BotBudget(tokens: tokens, seconds: seconds), dailyTokenCeiling: daily,
+                cadence: cadence, eventTrigger: trigger, notificationCondition: edit.tell ? edit.condition : nil)
             let recovered = try edit.id == nil ? store.create(candidate) : store.update(candidate)
-            return try await helperReceipt(recovered)
+            var receipt = try await helperReceipt(recovered)
+            if !notes.isEmpty { receipt["message"] = notes.joined(separator: "\n") }
+            return receipt
         case "get_helper", "pause_helper", "run_helper":
             guard let id else { throw HelperRemoteError.invalid }
             var bot = try store.get(id)
@@ -139,7 +165,7 @@ extension NativeAgentEngine {
     private func helperReceipt(_ bot: BotDefinition) async throws -> [String: String] {
         var edit = MobileHelperEdit()
         edit.id = bot.id; edit.revision = bot.updatedAt.timeIntervalSinceReferenceDate
-        edit.name = bot.name; edit.brief = [bot.brief, bot.outputFormat ?? ""].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        edit.name = bot.name; edit.brief = bot.brief
         edit.provider = bot.provider ?? ""; edit.model = bot.model ?? ""; edit.think = bot.reasoningEffort ?? ""; edit.fast = bot.fast ?? false
         edit.modelPinned = bot.modelPinned ?? false
         edit.tokens = String(bot.budget.tokens); edit.seconds = String(bot.budget.seconds)

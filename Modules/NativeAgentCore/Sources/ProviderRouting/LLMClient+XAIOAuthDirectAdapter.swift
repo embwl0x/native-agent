@@ -12,6 +12,9 @@ public let XAIOAuthDirectExhaustedMarker = "xai_oauth_direct_exhausted: re-sign-
 /// It authenticates against xAI and calls Grok models at https://api.x.ai/v1.
 public final class XAIOAuthTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
+    /// This transport sends no output-cap field.
+    public func requestOutputTokens(model: String) throws -> Int { 0 }
+
     public let providerId: String = "xai_oauth_direct"
 
     public static let defaultEndpoint = URL(string: "https://api.x.ai/v1/chat/completions")!
@@ -64,8 +67,8 @@ public final class XAIOAuthTransport: LLMTransport {
         tools: [LLMToolSchema]?
     ) async throws -> String {
         // The stream owns the account-bound refresh and the one 401 retry, as a turn's does.
-        try await LLMMessageStreamEvent.reply(collecting:
-            streamMessages(messages: messages, system: system, model: model, tools: tools))
+        return try await LLMMessageStreamEvent.reply(collecting:
+            self.streamMessages(messages: messages, system: system, model: model, tools: tools), using: telemetry)
     }
 
 
@@ -119,7 +122,7 @@ public final class XAIOAuthTransport: LLMTransport {
                             throw LLMError.authRejected(provider: "xai_oauth_direct", detail: XAIOAuthDirectExhaustedMarker)
                         }
                         try await ProviderWire.validateChatCompletions(bytes, response)
-                        var decoder = ChatCompletionsStreamDecoder(providerLabel: "xAI")
+                        var decoder = ChatCompletionsStreamDecoder(providerLabel: "xAI", diagnosticDataRoot: telemetry.diagnosticDataRoot)
                         try await decoder.consume(
                             SSEEventStream(bytes), continuation: continuation,
                             request: req, providerID: providerId, model: effectiveModel, idPrefix: "xai_tool",
@@ -136,6 +139,7 @@ public final class XAIOAuthTransport: LLMTransport {
                     continuation.finish(throwing: error)
                 }
             }
+            ProviderReplyWork.current?.own(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }
@@ -151,13 +155,13 @@ public final class XAIOAuthTransport: LLMTransport {
     ) throws -> [String: Any] {
         var body: [String: Any] = [
             "model": model,
-            "messages": OpenAITransport.chatMessages(messages: messages, system: system),
+            "messages": try OpenAITransport.chatMessages(messages: messages, system: system),
             "stream": stream,
         ]
         // Streaming requests ask for token usage on the final SSE frame.
         if stream { body["stream_options"] = ["include_usage": true] }
         try OpenAITransport.applyTools(to: &body, tools: tools)
-        FirstPartyExecutionControls.applyXAIControls(to: &body, model: model)
+        try FirstPartyExecutionControls.applyXAIControls(to: &body, model: model)
         return body
     }
 
@@ -273,30 +277,22 @@ public final class XAIOAuthTransport: LLMTransport {
         guard (200..<300).contains(status) else {
             throw LLMError.underlying(message: "xai_oauth_direct refresh HTTP \(status): \(Self.boundedBodyString(data))")
         }
-        guard let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let access = payload["access_token"] as? String,
-              !access.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw LLMError.invalidResponse(status: status)
-        }
+        let answer = try OAuthGrantOperations.validateTokenResponse(data, requiringRefreshToken: false)
+        let payload = answer.fields
         var updates: [String: Any] = [
-            "auth_mode": "oauth_pkce",
+            "auth_mode": "oauth",
             "client_id": Self.clientID,
-            "access_token": access,
-            "refresh_token": (payload["refresh_token"] as? String) ?? state.refreshToken,
+            "access_token": answer.accessToken,
             "token_type": (payload["token_type"] as? String) ?? "Bearer",
             "last_refresh": NativeTimestampFormat.plainZulu(Date()),
             "discovery": ["token_endpoint": state.tokenEndpoint.absoluteString],
         ]
+        updates["expires_in"] = answer.expiresIn
+        updates["expires_at"] = answer.expiresIn.map { NativeTimestampFormat.basicZulu(Date().addingTimeInterval($0)) }
+        if let refresh = answer.refreshToken { updates["refresh_token"] = refresh }
         try OAuthRefreshBinding.requireSameAccount(payload, original: state.object, provider: "xai_oauth_direct")
         if let idToken = payload["id_token"] as? String {
             updates["id_token"] = idToken
-        }
-        if let expiresIn = payload["expires_in"] as? Int {
-            updates["expires_in"] = expiresIn
-            updates["expires_at"] = NativeTimestampFormat.basicZulu(Date().addingTimeInterval(TimeInterval(expiresIn)))
-        } else if let expiresInDouble = payload["expires_in"] as? Double {
-            updates["expires_in"] = expiresInDouble
-            updates["expires_at"] = NativeTimestampFormat.basicZulu(Date().addingTimeInterval(expiresInDouble))
         }
         // Under the shared path lock, compare token-key generations and merge onto current settings.
         // Superseded refreshes skip the write and return a current credential only for the same account.
@@ -308,10 +304,8 @@ public final class XAIOAuthTransport: LLMTransport {
                 return try Self.loadTokenState(path: tokenPath, requestAccount: requestAccount)
             }
             var object = current
-            if object["access_token"] == nil && object["refresh_token"] == nil {
-                for (key, value) in OAuthRefreshBinding.tokenSet(object, provider: "xai_oauth_direct") { object[key] = value }
-                object.removeValue(forKey: "tokens")
-            }
+            object.removeValue(forKey: "expires_at")
+            object.removeValue(forKey: "expires_in")
             for (key, value) in updates { object[key] = value }
             try Self.writeJSONObject(object, to: tokenPath)
             return try Self.loadTokenState(path: tokenPath)
@@ -407,12 +401,11 @@ private func jwtExpiry(_ token: String) -> Date? {
 }
 
 /// The `expires_at` this adapter itself persisted on the last refresh, in
-/// either the top-level or the PKCE-nested shape. `parseExpiresAt` accepts ISO
+/// the flat token set. `parseExpiresAt` accepts ISO
 /// basic, full ISO (with or without fractional seconds) and unix stamps; it
 /// is shared with the other OAuth adapters.
 private func persistedExpiry(_ obj: [String: Any]) -> Date? {
     let raw = obj["expires_at"]
-        ?? (obj["tokens"] as? [String: Any])?["expires_at"]
     guard let raw else { return nil }
     return parseExpiresAt(raw)
 }

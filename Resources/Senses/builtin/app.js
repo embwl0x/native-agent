@@ -40,7 +40,7 @@ var AppKit = (() => {
         const shown = controls.slice(controlOffset, controlOffset + 80);
         const things = shown.map(control => ({name: control.label || control.role, kind: control.role,
             address: selection(source, control), detail: control.value || "",
-            verbs: control.enabled === false ? [] : verbs(control.role)}));
+            verbs: control.enabled === true ? verbs(control.role) : []}));
         const page = {address: request.address || root, title: source.app_bundle_id,
             text: (note ? note + "\n" : "") + text, things, folded: []};
         if (offset + text.length < full.length || controlOffset + shown.length < controls.length) {
@@ -55,7 +55,7 @@ var AppKit = (() => {
         const source = tree(sense.source.read()), target = JSON.parse(request.address);
         const control = (source.affordances || []).find(control => control.handle === target.handle);
         if (target.app !== source.app_bundle_id || target.frame_id !== source.frame_id || !control
-            || control.enabled === false || !verbs(control.role).includes(request.verb)) NativeKit.fail("Read the app again before acting on this thing");
+            || control.enabled !== true || !verbs(control.role).includes(request.verb)) NativeKit.fail("Read the app again before acting on this thing");
         const args = request.args || {};
         return sense.act("mac.act", request.address, {app: target.app, frame_id: target.frame_id,
             handle: target.handle, verb: request.verb === "press" ? "click" : request.verb,

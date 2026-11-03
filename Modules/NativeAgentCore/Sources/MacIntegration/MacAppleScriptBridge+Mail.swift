@@ -3,7 +3,7 @@ import Foundation
 import AppKit
 import SQLite3
 import PersistenceCore
-// Blueprint: | `MacAppleScriptBridge+Mail.swift` | `MacAppleScriptBridge`: `mailListRecent`, `mailSearch`, `mailSend`, `mailDraft` |
+// Blueprint: | `MacAppleScriptBridge+Mail.swift` | `MacAppleScriptBridge`: Mail reads and mutations, distinct compose/target refusals and exact reply-result decoding with unknown-effect reconciliation |
 
 extension MacAppleScriptBridge {
     // MARK: MAIL
@@ -37,7 +37,7 @@ extension MacAppleScriptBridge {
             return failedEnvelope(integration: "mail", reason: "missing_to")
         }
         guard let subject = input["subject"]?.scalarText else {
-            return failedEnvelope(integration: "mail", reason: "missing_subject")
+            return failedEnvelope(integration: "mail", reason: "missing_compose_subject")
         }
         guard let body = input["body"]?.scalarText else {
             return failedEnvelope(integration: "mail", reason: "missing_body")
@@ -186,27 +186,9 @@ extension MacAppleScriptBridge {
                     : states.contains(.string("completed")) ? "partial" : "failed")
             } else {
                 do {
-                    let local = mailLocalRead(row, batch: true)
-                    if let mismatch = local.accountMismatch {
-                        receipt["status"] = .string("failed"); receipt["reason"] = .string("account_mismatch"); receipt["detail"] = .string(mismatch)
-                        receipts.append(.object(receipt)); continue
-                    }
-                    if let body = local.row {
-                        receipt.merge(body) { _, new in new }; receipt["status"] = .string("completed")
-                        receipts.append(.object(receipt)); continue
-                    }
-                    let raw = try await runAppleScript(mailWorkspaceScript(input: row, batch: true), bundleID: "com.apple.mail")
-                    let messages = parseMailWorkspaceRecords(raw)
-                    if let setup = readSetupEnvelope(raw: raw, integration: "mail"), case .object(let result) = setup {
-                        receipt.merge(result) { _, new in new }; stopped = true
-                    } else if raw == "__MESSAGE_CHANGED__" {
-                        receipt["status"] = .string("failed"); receipt["reason"] = .string("message_changed_or_moved_refresh_inbox")
-                    } else if messages.count == 1, case .object(let body) = messages[0] {
-                        receipt.merge(body) { _, new in new }; receipt["status"] = .string("completed")
-                        receipt["attachments_status"] = .string(local.attachments)
-                    } else {
-                        receipt["status"] = .string("failed"); receipt["reason"] = .string("invalid_mail_read_receipt")
-                    }
+                    let body = try mailFileRead(input: row, batch: true)
+                    receipt.merge(body) { _, new in new }
+                    receipt["status"] = .string("completed")
                 } catch let back as SkillRunContext.HandBack {
                     return SkillRunContext.handBack(back.why)
                 } catch let AppleScriptError.permissionDenied(app) {
@@ -328,7 +310,7 @@ extension MacAppleScriptBridge {
             """)
     }
 
-    /// Find one inbox message via AppleScript, using the index after a miss or lookup timeout.
+    /// Find one inbox message through its checked Apple Event locator; lookup failure stops the mutation.
     /// Move to Trash explicitly; `delete` can be permanent under account settings.
     public static func mailDelete(input: [String: JSONValue]) async throws -> JSONValue {
         let exact = MailReadLocator.parse(input)
@@ -336,7 +318,7 @@ extension MacAppleScriptBridge {
             return failedEnvelope(integration: "mail", reason: "invalid_message_locator")
         }
         let subject = input["subject"]?.scalarText ?? ""
-        guard exact != nil || !subject.isEmpty else { return failedEnvelope(integration: "mail", reason: "missing_subject") }
+        guard exact != nil || !subject.isEmpty else { return failedEnvelope(integration: "mail", reason: "missing_message_selector") }
         let moveToTrash = """
             set msg to item 1 of hits
             set trashBox to missing value
@@ -366,131 +348,14 @@ extension MacAppleScriptBridge {
                 error errText number errNum
             end try
             """
-        let inboxResult = await mailManage(input: input, action: "deleted", single: true, body: moveToTrash)
-        guard case .object(let result) = inboxResult,
-              case .string(let reason)? = result["reason"],
-              reason == "no_matching_message" || reason == "mail_lookup_timed_out" else { return inboxResult }
-        var expectedAccountID = ""
-        if let account = exact?.account {
-            let source = """
-            with timeout of 8 seconds
-            tell application "__NativeAgentApp__"
-                set sourceAccounts to (accounts whose name is "\(escapeForAppleScript(account))")
-                if (count of sourceAccounts) is not 1 then return ""
-                return (id of item 1 of sourceAccounts) as text
-            end tell
-            end timeout
-            """
-            do { expectedAccountID = try await runAppleScript(source, bundleID: "com.apple.mail").trimmingCharacters(in: .whitespacesAndNewlines) }
-            catch let AppleScriptError.permissionDenied(app) { return deniedEnvelope(integration: "mail", app: app) }
-            catch { return failedEnvelope(integration: "mail", error: error) }
-            guard !expectedAccountID.isEmpty else { return mailMutationResult("-2", action: "deleted") }
-        }
-        guard let database = mailIndexDatabase() else { return failedEnvelope(integration: "mail", reason: "mail_index_unavailable") }
-        defer { sqlite3_close(database) }
-        guard sqlite3_create_function_v2(database, "mail_sender_text", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nil, { context, _, values in
-            guard let values else { sqlite3_result_null(context); return }
-            let comment = sqlite3_value_text(values[0]).map { String(cString: $0) } ?? ""
-            let address = sqlite3_value_text(values[1]).map { String(cString: $0) } ?? ""
-            let sender = MacAppleScriptBridge.mailSenderText(comment: comment, address: address)
-            sqlite3_result_text(context, sender, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-        }, nil, nil, nil) == SQLITE_OK else {
-            return failedEnvelope(integration: "mail", reason: "mail_index_unavailable")
-        }
-        let sender = input["sender"]?.scalarText ?? ""
-        let predicate = exact == nil
-            ? "(coalesce(m.subject_prefix, '') || coalesce(s.subject, '')) = ?1 COLLATE NOCASE AND (?2 = '' OR instr(lower(mail_sender_text(a.comment, a.address)), lower(?2)) > 0)"
-            : "g.message_id_header IN (?2, ?3)"
-        let order = exact == nil ? "" : "ORDER BY CASE WHEN m.ROWID = ?1 THEN 0 ELSE 1 END"
-        let sql = """
-        SELECT m.ROWID, g.message_id_header, b.url FROM messages m
-        LEFT JOIN subjects s ON s.ROWID = m.subject LEFT JOIN addresses a ON a.ROWID = m.sender
-        LEFT JOIN message_global_data g ON g.ROWID = m.global_message_id
-        JOIN mailboxes b ON b.ROWID = m.mailbox WHERE m.deleted = 0 AND \(predicate)
-        AND (?4 = '' OR substr(b.url, instr(b.url, '://') + 3, length(?4) + 1) = (?4 || '/') COLLATE NOCASE)
-        \(order) LIMIT 2
-        """
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
-            return failedEnvelope(integration: "mail", reason: "mail_index_unavailable")
-        }
-        defer { sqlite3_finalize(statement) }
-        sqlite3_bind_text(statement, 4, expectedAccountID, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-        if let exact {
-            sqlite3_bind_int64(statement, 1, exact.id)
-            sqlite3_bind_text(statement, 2, exact.messageID, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-            sqlite3_bind_text(statement, 3, "<\(exact.messageID)>", -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-        } else {
-            sqlite3_bind_text(statement, 1, subject, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-            sqlite3_bind_text(statement, 2, sender, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-        }
-        var targets: [(id: Int64, messageID: String, url: String)] = []
-        var step = sqlite3_step(statement)
-        while step == SQLITE_ROW {
-            func text(_ column: Int32) -> String { sqlite3_column_text(statement, column).map { String(cString: $0) } ?? "" }
-            var messageID = text(1)
-            if messageID.hasPrefix("<"), messageID.hasSuffix(">") { messageID = String(messageID.dropFirst().dropLast()) }
-            targets.append((sqlite3_column_int64(statement, 0), messageID, text(2)))
-            step = sqlite3_step(statement)
-        }
-        guard step == SQLITE_DONE else { return failedEnvelope(integration: "mail", reason: "mail_index_unavailable") }
-        guard let target = targets.first else { return failedEnvelope(integration: "mail", reason: "mail_delete_no_match") }
-        guard targets.count == 1 || target.id == exact?.id else {
-            return .object(["status": .string("failed"), "integration": .string("mail"),
-                "reason": .string("several_messages_match"),
-                "message": .string("Several indexed messages match, so nothing changed. Use a fresh message_id and expected_message_id for one message.")])
-        }
-        guard let url = URL(string: target.url), let accountID = url.host, !url.path.isEmpty else {
-            return failedEnvelope(integration: "mail", reason: "invalid_message_locator")
-        }
-        var identityCheck = "if (id of item 1 of hits) is not \(target.id) then return \"-2\""
-        let expectedID = exact?.messageID ?? target.messageID
-        if !expectedID.isEmpty {
-            identityCheck += "\nif ((message id of item 1 of hits) as text) is not \"\(escapeForAppleScript(expectedID))\" then return \"-2\""
-        }
-        if let account = exact?.account {
-            identityCheck += "\nif ((name of account of mailbox of item 1 of hits) as text) is not \"\(escapeForAppleScript(account))\" then return \"-2\""
-        }
-        let subjectCheck = exact == nil ? """
-            if ((subject of item 1 of hits) as text) is not "\(escapeForAppleScript(subject))" then return "-2"
-            \(sender.isEmpty ? "" : "if ((sender of item 1 of hits) as text) does not contain \"\(escapeForAppleScript(sender))\" then return \"-2\"")
-            """ : ""
-        let sourceBox = url.scheme == "local"
-            ? "set targetBox to mailbox \"\(escapeForAppleScript(String(url.path.dropFirst())))\""
-            : """
-            set sourceAccounts to (accounts whose id is "\(escapeForAppleScript(accountID))")
-            if (count of sourceAccounts) is not 1 then return "-2"
-            set targetBox to mailbox "\(escapeForAppleScript(String(url.path.dropFirst())))" of item 1 of sourceAccounts
-            """
-        let source = """
-        set lookupDeadline to (current date) + 6
-        with timeout of 8 seconds
-        tell application "__NativeAgentApp__"
-            try
-                \(sourceBox.components(separatedBy: "\n").map { mailLookupCommand($0, deadline: "lookupDeadline") }.joined(separator: "\n"))
-                \(mailLookupCommand("set hits to {message id \(target.id) of targetBox}", deadline: "lookupDeadline"))
-                \(identityCheck.components(separatedBy: "\n").map { mailLookupCommand($0, deadline: "lookupDeadline") }.joined(separator: "\n"))
-                \(subjectCheck.components(separatedBy: "\n").filter { !$0.isEmpty }.map { mailLookupCommand($0, deadline: "lookupDeadline") }.joined(separator: "\n"))
-                \(mailLookupCommand("set firstSubject to (subject of item 1 of hits) as text", deadline: "lookupDeadline"))
-            on error errText number errNum
-                if errNum is -1712 then return "__LOOKUP_TIMED_OUT__"
-                error errText number errNum
-            end try
-            \(moveToTrash)
-            return "1|" & firstSubject
-        end tell
-        end timeout
-        """
-        do { return mailMutationResult(try await runAppleScript(source, bundleID: "com.apple.mail"), action: "deleted") }
-        catch let AppleScriptError.permissionDenied(app) { return deniedEnvelope(integration: "mail", app: app) }
-        catch { return failedEnvelope(integration: "mail", error: error) }
+        return await mailManage(input: input, action: "deleted", single: true, body: moveToTrash)
     }
 
     private static func mailManage(input: [String: JSONValue], action: String, single: Bool, body: String) async -> JSONValue {
         let exact = MailReadLocator.parse(input)
         if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
         let subject = input["subject"]?.scalarText ?? ""
-        guard exact != nil || !subject.isEmpty else { return failedEnvelope(integration: "mail", reason: "missing_subject") }
+        guard exact != nil || !subject.isEmpty else { return failedEnvelope(integration: "mail", reason: "missing_message_selector") }
         let whereClause = exact.map { "id is \($0.id)" }
             ?? Self.mailMatchWhereClause(subjectAS: escapeForAppleScript(subject), sender: input["sender"]?.scalarText)
         let deadline = action == "deleted" ? "lookupDeadline" : nil
@@ -555,7 +420,7 @@ extension MacAppleScriptBridge {
     }
 
     /// Reply by exact inbox/message identity, or a unique subject/sender.
-    /// Required: body. Optional: sender for legacy disambiguation, reply_all (bool,
+    /// Required: body. Optional: sender for subject-addressed disambiguation, reply_all (bool,
     /// default false).
     /// Returns: {status, action: "sent_reply", subject}.
     public static func mailReply(input: [String: JSONValue]) async throws -> JSONValue {
@@ -610,7 +475,7 @@ extension MacAppleScriptBridge {
         if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
         let subject = input["subject"]?.scalarText ?? ""
         guard exact != nil || !subject.isEmpty else {
-            return failedEnvelope(integration: "mail", reason: "missing_subject")
+            return failedEnvelope(integration: "mail", reason: "missing_message_selector")
         }
         guard let body = input["body"]?.scalarText, !body.isEmpty else {
             return failedEnvelope(integration: "mail", reason: "missing_body")
@@ -653,16 +518,26 @@ extension MacAppleScriptBridge {
         """
         do {
             let raw = try await runAppleScript(source, bundleID: "com.apple.mail").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !send, raw.hasPrefix("draft|") || raw.hasPrefix("__DRAFT_") { return mailDraftResult(raw, input: input) }
-            let code = Int(raw) ?? 0
-            if code == -2 { return failedEnvelope(integration: "mail", reason: "message_changed_or_ambiguous_refresh_inbox") }
-            if code < 0 {
-                return failedEnvelope(integration: "mail", reason: "mail_refused_send")
+            switch raw {
+            case "-2": return failedEnvelope(integration: "mail", reason: "message_changed_or_ambiguous_refresh_inbox")
+            case "0": return failedEnvelope(integration: "mail", reason: "no_matching_message")
+            case "-1" where send: return failedEnvelope(integration: "mail", reason: "mail_refused_send")
+            case "1" where send: break
+            case "__DRAFT_UNCONFIRMED__" where !send:
+                return mailDraftResult(raw, input: input)
+            default:
+                if !send, raw.hasPrefix("draft|"), let id = Int64(raw.dropFirst(6)), id > 0,
+                   raw == "draft|\(id)" {
+                    return mailDraftResult(raw, input: input)
+                }
+                return .object([
+                    "status": .string("outcome_unknown"), "integration": .string("mail"),
+                    "effects": .string("unknown"), "reason": .string("unexpected_mail_reply_result"),
+                    "requested_message": .object(input.filter { MailReadLocator.fields.union(["subject", "sender"]).contains($0.key) }),
+                    "action": .string(send ? "sent_reply" : "draft_save_unconfirmed"),
+                    "message": .string("Mail returned an unrecognized reply result. Check the original conversation and \(send ? "Sent and Outbox" : "Drafts") before trying again."),
+                ])
             }
-            if code == 0 {
-                return failedEnvelope(integration: "mail", reason: "no_matching_message")
-            }
-            guard send else { return failedEnvelope(integration: "mail", reason: "draft_save_unconfirmed") }
             return .object([
                 "status": .string("completed"),
                 "action": .string("sent_reply"),

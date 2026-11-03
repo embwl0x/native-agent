@@ -1,0 +1,28 @@
+# Git pathspecs for repository-owned Mac build inputs. Keep assembly changes here
+# with project.yml/Package.swift; ordinary repository notes are not build inputs.
+Sources
+Modules/*/Sources
+Modules/*/Package.swift
+Package.swift
+Package.resolved
+project.yml
+Config
+NativeAgent*.entitlements
+VERSION
+Resources
+Extensions/NativeAgentWidget
+Extensions/NativeAgentChrome/manifest.json
+Extensions/NativeAgentChrome/src
+# Bundled documentation (project.yml resources and stamp phase).
+docs/data-bounds.md
+docs/licenses/A2A-gRPC-NOTICES.txt
+docs/release-notes/*.md
+# Build/generator programs, their inputs, and bundled bridge helpers.
+script/build_inputs.txt
+script/lib
+script/build_and_run.sh
+script/release.sh
+script/sync_build_declarations.rb
+script/regenerate_a2a_grpc.sh
+script/proto
+script/*.js

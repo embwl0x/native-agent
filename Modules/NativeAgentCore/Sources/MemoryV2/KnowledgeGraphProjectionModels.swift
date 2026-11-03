@@ -84,16 +84,14 @@ public struct GraphEntity: Identifiable, Codable, Hashable, Sendable {
     public var kind: String?
     public var confidence: Double?
     public var mentions: Int?
-    public var sourceNodeIds: [String]?
     public var updatedAt: String?
-    public init(id: String, name: String, aliases: [String]? = nil, kind: String? = nil, confidence: Double? = nil, mentions: Int? = nil, sourceNodeIds: [String]? = nil, updatedAt: String? = nil) {
+    public init(id: String, name: String, aliases: [String]? = nil, kind: String? = nil, confidence: Double? = nil, mentions: Int? = nil, updatedAt: String? = nil) {
         self.id = id
         self.name = name
         self.aliases = aliases
         self.kind = kind
         self.confidence = confidence
         self.mentions = mentions
-        self.sourceNodeIds = sourceNodeIds
         self.updatedAt = updatedAt
     }
 }

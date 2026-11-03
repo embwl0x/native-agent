@@ -7,7 +7,7 @@ import PersistenceCore
 /// Canonical first-party model capabilities used by provider inspection,
 /// Mac/iOS/Telegram pickers, preference validation, and request serialization.
 ///
-/// Account-scoped ChatGPT/Codex discovery can override shipped rows from its signed local cache.
+/// Account-scoped ChatGPT/Codex discovery lives only in its checked account catalog.
 public struct FirstPartyModelDescriptor: Sendable, Equatable {
     public let id: String
     public let name: String
@@ -89,10 +89,7 @@ public struct FirstPartyModelDescriptor: Sendable, Equatable {
 public enum FirstPartyModelCatalog {
     public static let gpt6AstraModelID = "gpt-6-astra"
     public static let publicGPT6AstraEfforts = ["low", "medium", "high", "xhigh", "max"]
-    public static let accountGPT6AstraEfforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
     public static let publicGPT56Efforts = ["none", "low", "medium", "high", "xhigh", "max"]
-    public static let accountGPT56SolTerraEfforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
-    public static let accountGPT56LunaEfforts = ["low", "medium", "high", "xhigh", "max"]
     public static let fullClaudeEfforts = ["low", "medium", "high", "xhigh", "max"]
     public static let claude46Efforts = ["low", "medium", "high", "max"]
     public static let grok45Efforts = ["low", "medium", "high"]
@@ -110,23 +107,7 @@ public enum FirstPartyModelCatalog {
         .init(id: gpt6AstraModelID, name: "GPT-6-Astra", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT6AstraEfforts, supportsFast: true, usesResponses: true),
     ]
 
-    /// Subscription-backed ChatGPT/Codex fallback. A signed models cache
-    /// overrides these rows when present, but a transiently incomplete cache
-    /// must not erase models that this account has already executed live.
-    public static let chatGPTAccountFallbackModels: [FirstPartyModelDescriptor] = [
-        .init(id: "gpt-5.6-sol", name: "GPT-5.6 Sol", contextLength: 372_000, supportsJSONMode: true, defaultReasoningEffort: "low", supportedReasoningEfforts: accountGPT56SolTerraEfforts, supportsFast: true),
-        .init(id: "gpt-5.6-terra", name: "GPT-5.6 Terra", contextLength: 372_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT56SolTerraEfforts, supportsFast: true),
-        .init(id: "gpt-5.6-luna", name: "GPT-5.6 Luna", contextLength: 372_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT56LunaEfforts, supportsFast: true),
-        .init(id: gpt6AstraModelID, name: "GPT-6-Astra", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT6AstraEfforts, supportsFast: true),
-        .init(id: "gpt-6.1-sol", name: "GPT-6.1-Sol", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT6AstraEfforts, supportsFast: true),
-        .init(id: "gpt-6.1-terra", name: "GPT-6.1-Terra", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT6AstraEfforts, supportsFast: true),
-        .init(id: "gpt-6-sol", name: "GPT-6-Sol", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT6AstraEfforts, supportsFast: true),
-        .init(id: "gpt-6-luna", name: "GPT-6-Luna", contextLength: 272_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: accountGPT56LunaEfforts, supportsFast: true),
-    ]
-
-    /// Current Claude API catalog for the account, including still-available
-    /// pinned models. `none` means the model has no adjustable API effort
-    /// parameter; it is not sent on the wire.
+    /// Anthropic's declared model contract.
     public static let anthropicModels: [FirstPartyModelDescriptor] = [
         // The first row is a new account's default, saved on connect.
         // Opus 5.5 allows 128K output, requires thinking and rejects forced tool_choice any/tool.
@@ -207,7 +188,7 @@ public enum FirstPartyModelCatalog {
         // same model id has different public/account windows. Provider pickers
         // still use their exact catalog; this lookup chooses the smallest
         // verified window so Fluid Context cannot overfill either transport.
-        return (publicOpenAIModels + chatGPTAccountFallbackModels + anthropicModels + xAIModels + moonshotModels + kimiCodeModels)
+        return (publicOpenAIModels + anthropicModels + xAIModels + moonshotModels + kimiCodeModels)
             .filter { $0.id.lowercased() == id }
             .min { $0.contextLength < $1.contextLength }
     }
@@ -222,7 +203,6 @@ public enum FirstPartyModelCatalog {
         let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let provider = providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let models = self.models(forProviderID: provider)
-        guard !models.isEmpty else { return descriptor(for: id) }
         return models.first { $0.id.lowercased() == id }
     }
 
@@ -230,11 +210,11 @@ public enum FirstPartyModelCatalog {
     public static func models(forProviderID providerID: String) -> [FirstPartyModelDescriptor] {
         switch providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "openai": return publicOpenAIModels
-        case "codex", "openai_oauth_direct": return chatGPTAccountFallbackModels
-        case "anthropic", "anthropic_oauth_direct", "anthropic_mcp": return anthropicModels
-        case "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth":
+        case "codex", "openai_oauth_direct": return []
+        case "anthropic", "anthropic_oauth_direct": return anthropicModels
+        case "xai_oauth_direct":
             return xAIModels
-        case "moonshot", "kimi": return moonshotModels
+        case "moonshot": return moonshotModels
         case "kimi-code": return kimiCodeModels
         default: return []
         }
@@ -321,20 +301,22 @@ public enum FirstPartyExecutionControls {
     public static func anthropicMaxOutputTokens(
         model: String,
         requestedEffort: String?,
-        explicitOverride: Int?
-    ) -> Int {
+        explicitOverride: Int?,
+        providerID: String = "anthropic"
+    ) throws -> Int {
         if let explicitOverride {
             return max(1, explicitOverride)
         }
-        guard let descriptor = FirstPartyModelCatalog.anthropicDescriptor(for: model) else {
-            return 16_384
+        guard let descriptor = FirstPartyModelCatalog.descriptor(for: model, providerID: providerID) else {
+            throw LLMError.providerError(message: "Output budget for \(model) on \(providerID) is unknown. Refresh Providers and select a catalog model.")
         }
         let requested = requestedEffort?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        let effort = requested.flatMap {
-            descriptor.supportedReasoningEfforts.contains($0) ? $0 : nil
-        } ?? descriptor.defaultReasoningEffort
+        if let requested, !descriptor.supportedReasoningEfforts.contains(requested) {
+            throw LLMError.providerError(message: "Think level '\(requested)' is unsupported for \(model). Choose a supported level in Providers.")
+        }
+        let effort = requested ?? descriptor.defaultReasoningEffort
         switch effort {
         case "xhigh", "max":
             return 65_536
@@ -373,21 +355,23 @@ public enum FirstPartyExecutionControls {
             + "(stop_reason=\(reason))")
     }
 
-    public static func anthropicEffort(model: String, requested: String?) -> String? {
-        guard let descriptor = FirstPartyModelCatalog.anthropicDescriptor(for: model),
-              let requested else { return nil }
-        let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard normalized != "none", descriptor.supportedReasoningEfforts.contains(normalized) else {
-            return nil
+    public static func anthropicEffort(model: String, requested: String?) throws -> String? {
+        guard let requested else { return nil }
+        guard let descriptor = FirstPartyModelCatalog.anthropicDescriptor(for: model) else {
+            throw LLMError.providerError(message: "Think controls for \(model) are unknown. Choose a catalog model in Providers.")
         }
-        return normalized
+        let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard descriptor.supportedReasoningEfforts.contains(normalized) else {
+            throw LLMError.providerError(message: "Think level '\(requested)' is unsupported for \(model). Choose a supported level in Providers.")
+        }
+        return normalized == "none" ? nil : normalized
     }
 
-    public static func applyAnthropicControls(to body: inout [String: Any], model: String) {
+    public static func applyAnthropicControls(to body: inout [String: Any], model: String) throws {
         if FirstPartyModelCatalog.anthropicDescriptor(for: model)?.adaptiveThinking == true {
             body["thinking"] = ["type": "adaptive", "display": "summarized"]
         }
-        guard let effort = anthropicEffort(model: model, requested: LLMCallContext.reasoningEffort) else {
+        guard let effort = try anthropicEffort(model: model, requested: LLMCallContext.reasoningEffort) else {
             return
         }
         var outputConfig = body["output_config"] as? [String: Any] ?? [:]
@@ -395,27 +379,30 @@ public enum FirstPartyExecutionControls {
         body["output_config"] = outputConfig
     }
 
-    public static func xAIReasoningEffort(model: String, requested: String?) -> String? {
-        guard let descriptor = FirstPartyModelCatalog.xAIDescriptor(for: model),
-              let requested else { return nil }
-        let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard normalized != "none",
-              descriptor.supportedReasoningEfforts.count > 1,
-              descriptor.supportedReasoningEfforts.contains(normalized) else {
-            return nil
+    public static func xAIReasoningEffort(model: String, requested: String?) throws -> String? {
+        guard let requested else { return nil }
+        guard let descriptor = FirstPartyModelCatalog.xAIDescriptor(for: model) else {
+            throw LLMError.providerError(message: "xAI Think controls for \(model) are unknown. Choose a catalog model in Providers.")
         }
+        let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard descriptor.supportedReasoningEfforts.contains(normalized) else {
+            throw LLMError.providerError(message: "Think level '\(requested)' is unsupported for \(model) on xAI. Choose a supported level in Providers.")
+        }
+        guard normalized != "none", descriptor.supportedReasoningEfforts.count > 1 else { return nil }
         return normalized
     }
 
-    public static func applyXAIControls(to body: inout [String: Any], model: String) {
-        if let effort = xAIReasoningEffort(model: model, requested: LLMCallContext.reasoningEffort) {
+    public static func applyXAIControls(to body: inout [String: Any], model: String) throws {
+        if let effort = try xAIReasoningEffort(model: model, requested: LLMCallContext.reasoningEffort) {
             body["reasoning_effort"] = effort
         }
         let tier = LLMCallContext.serviceTier?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        if tier == "priority" || tier == "fast",
-           FirstPartyModelCatalog.xAIDescriptor(for: model)?.supportsFast == true {
+        if let tier, tier != "default" {
+            guard tier == "priority", FirstPartyModelCatalog.xAIDescriptor(for: model)?.supportsFast == true else {
+                throw LLMError.providerError(message: "Service tier '\(tier)' is unsupported for \(model) on xAI. Choose a supported tier in Providers.")
+            }
             body["service_tier"] = "priority"
         }
     }

@@ -35,7 +35,7 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     /// Persisted sentinel: 1 while a call awaits its receipt, nil otherwise; never a step index.
     public var runningStep: Int?
     public var deliveryPending = false
-    /// Input events and started-effect identities/digests. Relaunch reruns `step`
+    /// Input events and started-effect identities. Relaunch reruns `step`
     /// to reconstruct state and effects; returned effect bodies are not stored.
     public var log: [JSONValue]?
 
@@ -192,11 +192,18 @@ public struct AbandonedTurnReconciler: Sendable {
         var terminated: Set<String> = []
         var terminalIndex: [URL: (terminated: Set<String>, replyReady: Set<String>)] = [:]
 
-        let scan = scanRange(today: today)
+        var persistenceFailures: [String] = []
+        let scan: (newestOffset: Int, oldestOffset: Int)?
+        do { scan = try scanRange(today: today) }
+        catch {
+            scan = nil
+            persistenceFailures.append("Turn recovery scan coverage is unavailable: \(error.localizedDescription)")
+        }
         // Catch-up terminals are written today, outside a historical window.
         // Read them before selecting candidates so prior passes do not spend
         // the attempt budget again. Today's accepted turns stay outside that window.
-        let terminalOnlyDays = scan.newestOffset > 0 ? [0] : []
+        let scanDays = scan.map { Array($0.newestOffset...$0.oldestOffset) } ?? []
+        let terminalOnlyDays = (scan?.newestOffset ?? 0) > 0 ? [0] : []
         func readDay(_ path: URL, includeAccepted: Bool) async throws {
             guard terminalIndex[path] == nil else { return }
             var terminalTurns = Set<String>()
@@ -220,13 +227,12 @@ public struct AbandonedTurnReconciler: Sendable {
         }
         // An unreadable day hides only what it holds: checkpoints are still found
         // and judged on their own days, and the window stays pending.
-        var persistenceFailures: [String] = []
-        for dayOffset in terminalOnlyDays + Array(scan.newestOffset...scan.oldestOffset) {
+        for dayOffset in terminalOnlyDays + scanDays {
             guard let day = TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -dayOffset, to: today)
             else { continue }
             let path = lane.path(for: day)
             do {
-                try await readDay(path, includeAccepted: dayOffset >= scan.newestOffset)
+                try await readDay(path, includeAccepted: dayOffset >= (scan?.newestOffset ?? 0))
                 terminated.formUnion(terminalIndex[path]!.terminated)
             } catch {
                 persistenceFailures.append("\(path.lastPathComponent) is unreadable: \(error.localizedDescription)")
@@ -378,10 +384,11 @@ public struct AbandonedTurnReconciler: Sendable {
         // The cursor advances only over scanned days whose candidates are confirmed.
         // A failed read/append or deferred candidate leaves the window pending.
         // Stable repair identities make another sweep of unfinished turns idempotent.
-        if persistenceFailures.isEmpty, !deferred, let newestScannedDay = TurnTracePersistLane.dayCalendar.date(
+        if persistenceFailures.isEmpty, !deferred, let scan, let newestScannedDay = TurnTracePersistLane.dayCalendar.date(
             byAdding: .day, value: -scan.newestOffset, to: today
         ) {
-            writeCursor(day: newestScannedDay)
+            do { try writeCursor(day: newestScannedDay) }
+            catch { persistenceFailures.append("Turn recovery cursor could not be published at \(cursorPath.path): \(error.localizedDescription)") }
         }
         return Outcome(
             acceptedScanned: accepted.count,
@@ -421,9 +428,9 @@ public struct AbandonedTurnReconciler: Sendable {
     /// oldest unswept days first and the cursor advances by that much, so the
     /// next sweep continues where this one stopped rather than skipping to
     /// today.
-    private func scanRange(today: Date) -> (newestOffset: Int, oldestOffset: Int) {
+    private func scanRange(today: Date) throws -> (newestOffset: Int, oldestOffset: Int) {
         // Without a cursor, drain from before the oldest trace day, oldest-first.
-        guard let cursorDay = persistedCursorDay() ?? oldestTraceDay().flatMap({
+        guard let cursorDay = try persistedCursorDay() ?? oldestTraceDay().flatMap({
             TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -1, to: $0)
         }) else {
             // Nothing has ever been traced. Ordinary window ending today.
@@ -443,22 +450,25 @@ public struct AbandonedTurnReconciler: Sendable {
     }
 
     /// The day recorded by the last sweep, if the cursor file is readable.
-    private func persistedCursorDay() -> Date? {
-        guard let raw = try? String(contentsOf: cursorPath, encoding: .utf8),
-              let value = try? JSONValue.parse(Data(raw.utf8)),
-              case .object(let obj) = value,
+    private func persistedCursorDay() throws -> Date? {
+        let data: Data
+        do { data = try Data(contentsOf: cursorPath) }
+        catch CocoaError.fileReadNoSuchFile { return nil }
+        guard case .object(let obj) = try JSONValue.parse(data),
               case .string(let day)? = obj["lastSweptDay"],
-              let last = TurnTracePersistLane.day(from: day) else { return nil }
+              let last = TurnTracePersistLane.day(from: day) else {
+            throw PersistenceCoreError.ioFailure("Unreadable turn recovery cursor at \(cursorPath.path). Repair its lastSweptDay without advancing past unreviewed work.")
+        }
         return last
     }
 
     /// Oldest `yyyy-MM-dd.jsonl` day file on disk, or nil when none exist.
     /// Read from the lane's own directory so writer root overrides apply.
-    private func oldestTraceDay() -> Date? {
+    private func oldestTraceDay() throws -> Date? {
         let dir = lane.path(for: now()).deletingLastPathComponent()
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: nil
-        ) else { return nil }
+        let entries: [URL]
+        do { entries = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
         return entries
             .filter { $0.pathExtension == "jsonl" }
             .compactMap {
@@ -475,8 +485,8 @@ public struct AbandonedTurnReconciler: Sendable {
             .appendingPathComponent("abandoned-reconciler-cursor.json")
     }
 
-    private func writeCursor(day date: Date) {
+    private func writeCursor(day date: Date) throws {
         let day = TurnTracePersistLane.dayString(from: date)
-        try? SwiftNativePersistenceCore.writeDataAtomicDurable(Data("{\"lastSweptDay\":\"\(day)\"}".utf8), to: cursorPath)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(Data("{\"lastSweptDay\":\"\(day)\"}".utf8), to: cursorPath)
     }
 }

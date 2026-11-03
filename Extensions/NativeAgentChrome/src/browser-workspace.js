@@ -43,51 +43,7 @@ export class BrowserWorkspace {
     this.tabsChanged(tabs);
   }
 
-  // Old groups were presentation, not authority. Keep only proved ownership.
-  async migrateLegacyCustody() {
-    if (!this.legacyMigration) this.legacyMigration = this.migrateLegacyCustodyLocked().catch(error => {
-      this.legacyMigration = null;
-      throw error;
-    });
-    return this.legacyMigration;
-  }
-
-  async migrateLegacyCustodyLocked() {
-    const custody = "nativeAgentTabCustodyV1", leases = "nativeAgentTabLeasesV1", reload = "nativeAgentExtensionReloadV1";
-    const marker = "nativeAgentGroupAuthorityV1";
-    const local = await this.chrome.storage.local.get([reload, marker]);
-    if (local[marker] === true) return;
-    const session = await this.chrome.storage.session.get([custody, leases]);
-    const stores = [session, local[reload]?.session ?? {}];
-    const custodyRows = stores.flatMap(store => Array.isArray(store[custody]) ? store[custody] : []);
-    const leaseRows = stores.flatMap(store => Array.isArray(store[leases]) ? store[leases] : []);
-    // Group-authority releases already removed these stores; their groups are owned.
-    const groups = stores.some(store => Object.hasOwn(store, custody) || Object.hasOwn(store, leases))
-      ? await this.chrome.tabGroups.query({ title: GROUP_TITLE }) : [];
-    for (const group of groups) for (const tab of await this.chrome.tabs.query({ groupId: group.id })) {
-      const records = custodyRows.filter(row => row?.tabId === tab.id);
-      const proved = records.length ? records.every(row => row.userOwned === false && !row.unverifiedNavigation
-        && ["created", "claimed", "adopted"].includes(row.ownership) && row.lastAgentURL === (tab.url ?? ""))
-        : leaseRows.some(row => row?.tabId === tab.id && row.windowId === tab.windowId
-          && typeof row.leaseId === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(row.leaseId)
-          && ["created", "claimed", "adopted"].includes(row.ownership)
-          && (row.renderingMode === undefined || (row.renderingMode === "visible_work_window" && row.ownership === "created"))
-          && row.state === "active" && Number.isInteger(row.userSequence) && row.userSequence >= 0
-          && Number.isFinite(Date.parse(row.createdAt)) && Number.isFinite(Date.parse(row.renewedAt))
-          && Number.isFinite(Date.parse(row.expiresAt))
-          && (Date.parse(row.expiresAt) > Date.now() || (Number.isFinite(row.pausedRemainingMs) && row.pausedRemainingMs > 0))
-          && typeof row.originalTab?.active === "boolean" && typeof row.originalTab?.title === "string"
-          && typeof row.originalTab?.url === "string");
-      if (!proved || tab.active) await this.chrome.tabs.ungroup(tab.id);
-    }
-    // Checkpoint only after every hand-back succeeds; keep evidence on failure.
-    await this.chrome.storage.local.set({ [marker]: true });
-    await this.chrome.storage.session.remove([custody, leases]);
-    await this.chrome.storage.local.remove(reload);
-  }
-
   async refresh() {
-    await this.migrateLegacyCustody();
     for (const [tabId, entry] of [...this.yielding]) await this.yieldForTab(tabId, entry.reason);
     const groups = await this.chrome.tabGroups.query({ title: GROUP_TITLE });
     this.groupIds = new Set(groups.map(group => group.id));
@@ -106,7 +62,6 @@ export class BrowserWorkspace {
   }
 
   async requireTab(tabId) {
-    await this.migrateLegacyCustody();
     const unfinished = this.yielding.get(tabId);
     if (unfinished) await this.yieldForTab(tabId, unfinished.reason);
     const tab = await this.currentTab(tabId);
@@ -217,13 +172,13 @@ export class BrowserWorkspace {
   }
 
   async createTab(requireActive) {
-    await this.migrateLegacyCustody();
-    let window = await this.chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
+    const windows = await this.chrome.windows.getAll({ windowTypes: ["normal"] });
+    let window = windows.find(candidate => candidate.focused) ?? windows[0];
     // No normal window (only DevTools, or all closed): open one in the background.
     // Its own blank tab stays active, so her tab is still created inactive.
     requireActive();
     let createdWindow = false;
-    if (!Number.isInteger(window?.id)) {
+    if (windows.length === 0) {
       window = await this.chrome.windows.create({ focused: false, url: "about:blank" });
       createdWindow = true;
     }

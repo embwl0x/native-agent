@@ -4,7 +4,7 @@ import NativeAgentShared
 import MacControl
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `MacAppleScriptBridge+Runtime.swift` | `MacAppleScriptBridge`: delegates `runAppleScript` to MacControl, skill hand-back and integration envelopes; `deniedEnvelope`; Music recipe/parsers live in the editable `Resources/abilities/music-library.js` and `music.js` seeds, called through L0 `Parts.call` by MacIntegrationDeliveryActions; the playback receipt and effects survive failed readback as a separate `now_playing` fact, and exact title/artist selection uses Unicode full case folding |
+// Blueprint: | `MacAppleScriptBridge+Runtime.swift` | `MacAppleScriptBridge`: delegates `runAppleScript` to MacControl, skill hand-back and integration envelopes; `deniedEnvelope`; Music recipe/parsers live in the editable `Resources/abilities/music-library.js` and `music.js` seeds, called through L0 `Parts.call` by MacIntegrationDeliveryActions; the playback receipt and effects survive failed readback as a separate `now_playing` fact; metadata uses checked typed lists, and Music's case-insensitive exact title/artist query counts all matches before limiting refusal examples |
 
 extension MacAppleScriptBridge {
     // MARK: - AppleScript invocation
@@ -32,6 +32,7 @@ extension MacAppleScriptBridge {
     }
 
     static func failedEnvelope(integration: String, error: Error) -> JSONValue {
+        if let refusal = error as? MacAppActRefusal { return .object(refusal.fields) }
         if let back = error as? SkillRunContext.HandBack { return SkillRunContext.handBack(back.why) }
         let ns = error as NSError
         if ns.domain == "NativeAgentAppleScript", ns.code == AppleScriptExecution.appleScriptOutcomeUnknownCode {
@@ -103,18 +104,21 @@ extension MacAppleScriptBridge {
 
     // MARK: - Input helpers
 
-    package static func clampedInt(_ raw: JSONValue?, defaultValue: Int, min: Int, max: Int) -> Int {
-        let value: Int
+    package static func clampedInt(_ raw: JSONValue?, defaultValue: Int, min: Int, max: Int) throws -> Int {
+        guard let raw else { return Swift.max(min, Swift.min(max, defaultValue)) }
+        let value: Int?
         switch raw {
         case .int(let i):
-            value = Int(i)
+            value = Int(exactly: i)
         case .double(let d):
-            value = Int(exactly: d.rounded(.towardZero)) ?? defaultValue
+            value = Int(exactly: d)
         case .string(let s):
-            value = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) ?? defaultValue
+            value = Int(s.trimmingCharacters(in: .whitespacesAndNewlines))
         default:
-            value = defaultValue
+            value = nil
         }
+        guard let value else { throw NSError(domain: "NativeAgentInput", code: -400,
+            userInfo: [NSLocalizedDescriptionKey: "A supplied numeric limit, offset or duration is not an integer. Correct the argument; defaults apply only when omitted."]) }
         return Swift.max(min, Swift.min(max, value))
     }
 
@@ -143,10 +147,10 @@ extension MacAppleScriptBridge {
 
     // MARK: - Output record parsers
 
-    /// Converts localized AppleScript dates to ISO-8601, retaining unparseable dates as text.
-    static func normalizeAppleScriptDate(_ raw: String) -> String {
+    /// Converts supported AppleScript date spellings to ISO-8601; unsupported dates remain a read failure.
+    static func normalizeAppleScriptDate(_ raw: String) throws -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return "" }
+        if trimmed.isEmpty { throw NSError(domain: "NativeAgentDate", code: -1, userInfo: [NSLocalizedDescriptionKey: "AppleScript returned no date. Read the source again."]) }
         let formats = [
             "EEEE, MMMM d, yyyy 'at' h:mm:ss a",
             "EEEE, MMMM d, yyyy 'at' HH:mm:ss",
@@ -162,27 +166,36 @@ extension MacAppleScriptBridge {
                 return NativeTimestampFormat.plainZulu(d)
             }
         }
-        // Fall back to raw; downstream just gets the locale string.
-        return trimmed
+        throw NSError(domain: "NativeAgentDate", code: -1, userInfo: [NSLocalizedDescriptionKey: "AppleScript returned an unsupported localized date. Repair the source date adapter before reading it again."])
     }
 
-    static func parseNoteRecords(_ raw: String) throws -> (total: Int64, notes: [JSONValue]) {
+    static func parseNoteRecords(_ raw: String) throws -> (total: Int64, notes: [JSONValue], gaps: [String]) {
         let payload = try JSONDecoder().decode(JSONValue.self, from: Data(raw.utf8))
         guard case .object(let root) = payload, case .int(let total)? = root["total"], total >= 0,
-              case .array(let records)? = root["notes"], records.count <= total else {
+              case .array(let records)? = root["notes"], records.count <= total,
+              case .array(let rawGaps)? = root["gaps"] else {
             throw NSError(domain: "NativeAgentNotes", code: -1, userInfo: [NSLocalizedDescriptionKey: "Notes returned invalid JSON records."])
         }
-        let notes = try records.map { record -> JSONValue in
-            guard case .object(var row) = record, case .string(let id)? = row["id"], !id.isEmpty,
-                  case .string(let modified)? = row["modified_at"],
-                  case .string? = row["body"] ?? row["body_preview"],
-                  case .bool? = row["title_line_elided"],
-                  case .bool? = row["truncated"] else {
-                throw NSError(domain: "NativeAgentNotes", code: -1, userInfo: [NSLocalizedDescriptionKey: "Notes returned an incomplete JSON record."])
+        var gaps = try rawGaps.map { gap -> String in
+            guard case .string(let detail) = gap, !detail.isEmpty else {
+                throw NSError(domain: "NativeAgentNotes", code: -1, userInfo: [NSLocalizedDescriptionKey: "Notes returned an invalid gap record."])
             }
-            row["modified_at"] = .string(Self.normalizeAppleScriptDate(modified))
-            return .object(row)
+            return detail
         }
-        return (total, notes)
+        var notes: [JSONValue] = []
+        for (index, record) in records.enumerated() {
+            do {
+                guard case .object(var row) = record, case .string(let id)? = row["id"], !id.isEmpty,
+                      case .string(let modified)? = row["modified_at"],
+                      case .string? = row["body"] ?? row["body_preview"],
+                      case .bool? = row["title_line_elided"],
+                      case .bool? = row["truncated"] else {
+                    throw NSError(domain: "NativeAgentNotes", code: -1, userInfo: [NSLocalizedDescriptionKey: "Notes returned an incomplete JSON record."])
+                }
+                row["modified_at"] = .string(try Self.normalizeAppleScriptDate(modified))
+                notes.append(.object(row))
+            } catch { gaps.append("notes[\(index)]: \(error.localizedDescription)") }
+        }
+        return (total, notes, gaps)
     }
 }

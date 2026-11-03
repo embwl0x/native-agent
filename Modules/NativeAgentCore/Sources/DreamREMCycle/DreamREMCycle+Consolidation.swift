@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `DreamREMCycle+Consolidation.swift` | `REMConsolidator`: one explicitly routed GROWTH completion and proposal parsing with verbatim source-bound supporting passages |
+// Blueprint: | `DreamREMCycle+Consolidation.swift` | `REMConsolidator`: one explicitly routed GROWTH completion and proposal parsing with verbatim source-bound supporting passages and displaced alternatives |
 
 /// One passage a candidate actually rests on: the verbatim words from ONE dream
 /// entry, bound to that entry's date and to the sources behind it. Not a
@@ -15,20 +15,20 @@ public struct REMSupportingPassage: Sendable, Codable, Equatable {
     /// before it gets here.
     public var quote: String
     /// The dates the material behind that entry actually HAPPENED on. Empty
-    /// when the entry carries no provenance (legacy entries): unavailable, and
+    /// when no lived dates were established: unavailable, and
     /// labelled as such — never counted as support.
     public var livedDates: [String]
     /// The claim's row citations, grouped by exchange when known.
     public var sourceRefs: [String]
-    /// Only the claim-bound writer sets this; old diary-wide refs are not support.
-    public var claimBound: Bool?
+    /// Only the claim-bound writer sets this; other citations are not claim support.
+    public var claimBound: Bool
 
     public init(
         dreamDate: String,
         quote: String,
         livedDates: [String] = [],
         sourceRefs: [String] = [],
-        claimBound: Bool? = nil
+        claimBound: Bool = false
     ) {
         self.dreamDate = dreamDate
         self.quote = quote
@@ -70,38 +70,38 @@ extension REMConsolidator {
         let quote: String
     }
 
+    /// The reply is one object: models reliably return objects, and a bare array has no room to grow.
+    private struct LLMProposalReply: Decodable { let proposals: [LLMProposalDTO] }
+
     private struct LLMProposalDTO: Decodable {
         let targetDoc: String
         let proposalText: String
         let evidenceDates: [String]
         let confidence: Double
-        /// The words the candidate rests on, per dream entry. Optional so an
-        /// older/sloppier reply still parses — a proposal with no verifiable
-        /// passage simply carries none and is labelled accordingly.
+        /// The words the candidate rests on, per dream entry. A proposal with
+        /// no supplied passage has no verifiable support.
         let supportingPassages: [LLMPassageDTO]?
-        /// What surprised her or changed; absent in older replies.
+        /// What surprised her or changed, when she names it.
         let whatChanged: String?
+        let replaced: REMReplacement?
 
         private enum CodingKeys: String, CodingKey {
-            case targetDoc, proposalText, evidenceDates, confidence, supportingPassages, whatChanged
+            case targetDoc, proposalText, evidenceDates, confidence, supportingPassages, whatChanged, replaced
         }
 
-        // A smaller model often writes the confidence as "0.8": take the number either way.
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             targetDoc = try c.decode(String.self, forKey: .targetDoc)
             proposalText = try c.decode(String.self, forKey: .proposalText)
             evidenceDates = try c.decode([String].self, forKey: .evidenceDates)
-            if let number = try? c.decode(Double.self, forKey: .confidence) {
-                confidence = number
-            } else if let text = try? c.decode(String.self, forKey: .confidence),
-                      let number = Double(text.trimmingCharacters(in: .whitespaces)) {
-                confidence = number
-            } else {
-                confidence = try c.decode(Double.self, forKey: .confidence)
+            confidence = try c.decode(Double.self, forKey: .confidence)
+            guard confidence.isFinite, (0...1).contains(confidence) else {
+                throw DecodingError.dataCorruptedError(forKey: .confidence, in: c,
+                    debugDescription: "confidence must be a finite number in 0...1")
             }
             supportingPassages = try c.decodeIfPresent([LLMPassageDTO].self, forKey: .supportingPassages)
             whatChanged = try c.decodeIfPresent(String.self, forKey: .whatChanged)
+            replaced = try c.decodeIfPresent(REMReplacement.self, forKey: .replaced)
         }
     }
 
@@ -121,13 +121,18 @@ extension REMConsolidator {
         var diagnostics = Distillation()
         if entries.isEmpty { return diagnostics }
         let entryDateSet = Set(entries.map { $0.date })
-        var evidence: [String: [(content: String, claims: [String: [String]], legacy: Bool)]] = [:]
+        var evidence: [String: [(content: String, claims: [String: [String]])]] = [:]
         for entry in entries {
             guard let content = entry.content else { continue }
-            let claims = Dictionary(grouping: DreamEntryProvenance.readClaims(in: content, as: DreamEntryProvenance.self),
+            let sections = DreamEntryProvenance.readClaims(in: content, as: DreamEntryProvenance.self)
+            // The weekly owner selects readable sections before reaching this boundary.
+            // Refuse a bypass rather than letting damaged evidence become fewer claims.
+            if let gap = sections.compactMap(\.unavailable).first {
+                throw PersistenceCoreError.ioFailure("dream_diary/\(entry.filename ?? entry.date): \(gap)")
+            }
+            let claims = Dictionary(grouping: sections.flatMap(\.claims),
                                     by: { DreamEntryProvenance.plain($0.quote) }).mapValues { $0.flatMap(\.sourceRefs) }
-            evidence[entry.date, default: []].append((DreamEntryProvenance.plain(content), claims,
-                !content.contains("<!-- claim-sources") && !content.contains("<!-- dream-peers")))
+            evidence[entry.date, default: []].append((DreamEntryProvenance.plain(content), claims))
         }
 
         let encoder = JSONEncoder()
@@ -161,7 +166,26 @@ extension REMConsolidator {
                 diagnostics.evidenceDateDrops += 1
                 continue
             }
-            kept.append(bindSupport(p, evidence: evidence, identities: identities, diagnostics: &diagnostics))
+            var bound = bindSupport(p, evidence: evidence, identities: identities, diagnostics: &diagnostics)
+            if let replaced = p.replaced {
+                // Preserve exact source bytes, never the model's claim alone.
+                // GROWTH is a paragraph; a dream alternative is a verbatim
+                // passage in the named entry, with its actual file identity.
+                if replaced.source == "GROWTH.md", !replaced.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   REMGrowthWriter.containsEntryParagraph(growthBody, replaced.text) {
+                    bound.replaced = replaced
+                } else if let entry = entries.first(where: {
+                    replaced.source == "dream:\($0.date)" && !replaced.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        && $0.content?.contains(replaced.text) == true
+                }) {
+                    bound.replaced = REMReplacement(
+                        source: "dream_diary/\(entry.filename ?? "\(entry.date).md")", text: replaced.text)
+                } else {
+                    bound.replaced = nil
+                    diagnostics.parseErrors.append("replaced content could not be bound to its source; not recorded")
+                }
+            }
+            kept.append(bound)
         }
         diagnostics.proposals = kept
         return diagnostics
@@ -169,7 +193,7 @@ extension REMConsolidator {
 
     /// A claim carries matching same-night entries' own sources, never diary-wide inputs.
     func bindSupport(_ proposal: REMProposalRow,
-        evidence: [String: [(content: String, claims: [String: [String]], legacy: Bool)]],
+        evidence: [String: [(content: String, claims: [String: [String]])]],
         identities: [String: String], diagnostics: inout Distillation) -> REMProposalRow {
         var passages: [REMSupportingPassage] = []
         for passage in proposal.supportingPassages ?? [] {
@@ -181,8 +205,7 @@ extension REMConsolidator {
                 continue
             }
             let refs = Set(contents.flatMap { $0.claims[normalized] ?? [] }).sorted()
-            // Only matching entries can establish legacy eligibility.
-            guard !refs.isEmpty || contents.contains(where: \.legacy) else {
+            guard !refs.isEmpty else {
                 diagnostics.passageDrops += 1
                 continue
             }
@@ -220,7 +243,7 @@ extension REMConsolidator {
 
     private func parseLLMResponse(_ raw: String, diagnostics: inout Distillation) -> [REMProposalRow] {
         do {
-            let dtos = try JSONValue.decodeCompletion(raw, as: [LLMProposalDTO].self)
+            let dtos = try JSONValue.decodeCompletion(raw, as: LLMProposalReply.self).proposals
             let createdAt = ISO8601DateFormatter().string(from: Date())
             var result: [REMProposalRow] = []
             for dto in dtos {
@@ -253,7 +276,8 @@ extension REMConsolidator {
                     supportingPassages: (dto.supportingPassages ?? []).map {
                         REMSupportingPassage(dreamDate: $0.date, quote: $0.quote)
                     },
-                    whatChanged: Self.normalizedWhatChanged(dto.whatChanged)
+                    whatChanged: Self.normalizedWhatChanged(dto.whatChanged),
+                    replaced: dto.replaced
                 ))
             }
             return result

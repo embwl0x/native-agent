@@ -9,8 +9,12 @@ extension SchedulerDueJobRunner {
         // job. Recreating it goes through Add Nightly Reflection's own path
         // (reactivating a cancelled job) instead of adding a second daily dream.
         // A one-time dream is still an ordinary job.
-        if input["kind"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "dream",
+        if input["kind"] == .string("dream"),
            !SchedulerJobNormalizer.isOneShot(input) {
+            // This early return is still a create request. Validate through the
+            // same owner before it can reactivate a real nightly occurrence.
+            _ = try SchedulerJobNormalizer.normalize(body: input, now: { Date() },
+                uuid: { UUID().uuidString.lowercased() })
             return try await nightlyDreamJob(writer: writer)
         }
         return try await createJob(input)

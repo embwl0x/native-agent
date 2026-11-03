@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `MacMenuBar.swift` | `MacMenuBar`: bounded native menu reads, path resolution and safe semantic presentation |
+// Blueprint: | `MacMenuBar.swift` | Checked menu reads retain element-scoped optional attribute gaps; press walks only the exact named branch under the shared AX budget, retaining sibling duplicate evidence; normalized resolution and occurrence selectors share discovery's command identity |
 
 public enum MacMenuBar {
     /// Named levels returned by a listing.
@@ -32,26 +32,29 @@ public enum MacMenuBar {
         /// address and it never leaves this module — it is bookkeeping, and the
         /// four-verb wall exists so bookkeeping does not reach the model.
         public let path: [Int]
-        public let enabled: Bool
+        public let enabled: Bool?
         /// True when this item OPENS something rather than doing something. It
         /// is still returned (a model that cannot see "Export" cannot ask for
         /// "Export › PDF"), and pressing it is still a legitimate act.
         public let hasSubmenu: Bool
         /// Identifier and key equivalent, when the item publishes them.
         public let commandKey: String?
+        public let attributeGaps: [String]
 
         public init(
             titlePath: [String],
             path: [Int],
-            enabled: Bool,
+            enabled: Bool?,
             hasSubmenu: Bool,
-            commandKey: String? = nil
+            commandKey: String? = nil,
+            attributeGaps: [String] = []
         ) {
             self.titlePath = titlePath
             self.path = path
             self.enabled = enabled
             self.hasSubmenu = hasSubmenu
             self.commandKey = commandKey
+            self.attributeGaps = attributeGaps
         }
 
         /// How this organ PRINTS a path.
@@ -65,11 +68,14 @@ public enum MacMenuBar {
         public let truncated: Bool
         /// Set when there is no menu bar to read at all.
         public let unavailable: String?
+        /// Includes unnamed wrappers and items whose names could not be read.
+        public let attributeGaps: [String]
 
-        public init(items: [Item], truncated: Bool, unavailable: String? = nil) {
+        public init(items: [Item], truncated: Bool, unavailable: String? = nil, attributeGaps: [String] = []) {
             self.items = items
             self.truncated = truncated
             self.unavailable = unavailable
+            self.attributeGaps = attributeGaps
         }
     }
 
@@ -87,14 +93,27 @@ public enum MacMenuBar {
     /// "File › Export › PDF".
     ///
     /// `top` restricts the walk to top-level names containing it;
-    /// `until` stops at the first item it accepts.
+    /// `until` stops at the first item it accepts. `matchingPath` restricts
+    /// descent to exact named levels, retaining siblings for duplicate checks.
     public static func read(
         source: any MacAXElementSource,
         pid: Int32,
         top: String? = nil,
         until stop: ((Item) -> Bool)? = nil,
+        matchingPath: [String]? = nil,
         depth: Int = maxPathDepth
     ) -> Reading {
+        do {
+            return try MacAccessibilityReader.withReadBudget {
+                try readChecked(source: source, pid: pid, top: top, until: stop, matchingPath: matchingPath, depth: depth)
+            }
+        } catch {
+            return Reading(items: [], truncated: true, unavailable: error.localizedDescription)
+        }
+    }
+
+    private static func readChecked(source: any MacAXElementSource, pid: Int32, top: String?,
+                                    until stop: ((Item) -> Bool)?, matchingPath: [String]?, depth: Int) throws -> Reading {
         guard pid != getpid() else {
             return Reading(items: [], truncated: false, unavailable: "self_process")
         }
@@ -105,46 +124,81 @@ public enum MacMenuBar {
             return Reading(items: [], truncated: false, unavailable: "no_menu_bar")
         }
         var items: [Item] = []
+        var attributeGaps: [String] = []
         var truncated = false
         var inMenu = 0
         var done = false
         let wantedTop = top.map(normalized)
+        let wantedPath = matchingPath.map { $0.map(normalized) }
 
         let namedDepth = max(1, min(depth, findPathDepth))
         // Bound unnamed wrappers and total visits as well as named levels.
         let structuralDepth = namedDepth * 2 + 1
-        let maxNodes = maxChildrenPerMenu * (maxItems * 2 + 1) + 1
+        let maxNodes = MacAXLimits.deepPageMaxNodes
         var pending: [(element: MacAXElementRef, titles: [String], indices: [Int])] = []
         var visited: [Int: [MacAXElementRef]] = [:]
         var nodeCount = 0
 
-        func enqueueChildren(_ element: MacAXElementRef, titles: [String], indices: [Int]) {
+        func checkDeadline() throws {
+            try Task.checkCancellation()
+            if MacAXLimits.readDeadline.map({ Date() >= $0 }) == true {
+                throw MacAccessibilityReader.NativeReadFailure(detail: "Menu reading exhausted the shared AX time budget; menu coverage is incomplete.")
+            }
+        }
+        func children(_ element: MacAXElementRef) throws -> [MacAXElementRef] {
+            try checkDeadline()
+            let total = try source.checkedChildCount(of: element)
+            // A press spends the shared node budget on its branch, not the
+            // listing's 60-child/160-item presentation caps. Read its siblings
+            // too: an unseen duplicate cannot establish uniqueness.
+            let limit = min(total, wantedPath == nil ? maxChildrenPerMenu : max(0, maxNodes - nodeCount))
+            let children = try source.checkedChildren(of: element, limit: limit)
+            guard children.count == limit else {
+                throw MacAccessibilityReader.NativeReadFailure(detail: "Menu child read was incomplete.")
+            }
+            if total > children.count { truncated = true }
+            return children
+        }
+        func attributes(_ element: MacAXElementRef, path: [Int]) throws -> MacAXAttributes {
+            try checkDeadline()
+            let attributes = try source.checkedAttributes(of: element)
+            for gap in attributes.attributeGaps {
+                attributeGaps.append("\(path): \(gap)")
+            }
+            if attributes.labelUnreadable, ["AXMenuBarItem", "AXMenuItem"].contains(attributes.role) {
+                attributeGaps.append("\(path): menu name unreadable")
+                truncated = true
+            }
+            return attributes
+        }
+        func enqueueChildren(_ element: MacAXElementRef, titles: [String], indices: [Int]) throws {
             guard indices.count < structuralDepth else { truncated = true; return }
-            let children = source.children(of: element, limit: maxChildrenPerMenu + 1)
-            if children.count > maxChildrenPerMenu { truncated = true }
-            for (offset, child) in children.prefix(maxChildrenPerMenu).enumerated().reversed() {
+            for (offset, child) in try children(element).enumerated().reversed() {
                 pending.append((child, titles, indices + [offset]))
             }
         }
 
-        enqueueChildren(root, titles: [], indices: [])
+        try enqueueChildren(root, titles: [], indices: [])
         while let next = pending.popLast(), !done {
+                try checkDeadline()
                 guard nodeCount < maxNodes else { truncated = true; break }
                 nodeCount += 1
                 let (child, titles, indexPath) = next
-                guard titles.isEmpty || inMenu < maxItems else { truncated = true; continue }
+                guard wantedPath != nil || titles.isEmpty || inMenu < maxItems else { truncated = true; continue }
                 let hash = source.elementHash(child) ?? child.id
                 guard visited[hash]?.contains(where: { source.sameElement($0, child) }) != true else {
                     truncated = true
                     continue
                 }
                 visited[hash, default: []].append(child)
-                guard let attributes = source.attributes(of: child), !attributes.isHiddenMenuItem else { continue }
-                switch attributes.role {
+                let observed = try attributes(child, path: indexPath)
+                guard !observed.isHiddenMenuItem else { continue }
+                switch observed.role {
                 case "AXMenu":
-                    enqueueChildren(child, titles: titles, indices: indexPath)
+                    try enqueueChildren(child, titles: titles, indices: indexPath)
                 case "AXMenuBarItem", "AXMenuItem":
-                    let title = cleanTitle(attributes.title ?? attributes.value)
+                    guard !observed.labelUnreadable else { continue }
+                    let title = cleanTitle(observed.title ?? observed.value)
                     // A separator publishes no title. It is furniture, not an
                     // address; skipping it is not hiding anything.
                     guard let title, !title.isEmpty else { continue }
@@ -155,21 +209,28 @@ public enum MacMenuBar {
                         inMenu = 0
                     }
                     let names = titles + [title]
+                    if let wantedPath {
+                        guard names.count <= wantedPath.count,
+                              names.map(normalized) == Array(wantedPath.prefix(names.count)) else { continue }
+                    }
                     // Does it OPEN something? The AXMenu child is the answer,
                     // and asking costs one ranged child read. Its real OFFSET
                     // is recorded, never assumed to be 0 — the act address is
                     // a child-index chain and an assumed index is a wrong-press
                     // waiting to happen in the one app that orders it otherwise.
-                    let submenu = source
-                        .children(of: child, limit: 4)
-                        .enumerated()
-                        .first { source.attributes(of: $0.element)?.role == "AXMenu" }
+                    var submenu: (offset: Int, element: MacAXElementRef)?
+                    for (offset, candidate) in try children(child).enumerated() {
+                        guard nodeCount < maxNodes else { truncated = true; break }
+                        nodeCount += 1
+                        if try attributes(candidate, path: indexPath + [offset]).role == "AXMenu" { submenu = (offset, candidate); break }
+                    }
                     let item = Item(
                         titlePath: names,
                         path: indexPath,
-                        enabled: attributes.enabled,
+                        enabled: observed.enabled,
                         hasSubmenu: submenu != nil,
-                        commandKey: attributes.menuCommandKey
+                        commandKey: observed.menuCommandKey,
+                        attributeGaps: observed.attributeGaps
                     )
                     items.append(item)
                     inMenu += 1
@@ -177,7 +238,11 @@ public enum MacMenuBar {
                         done = true
                         break
                     }
-                    if let submenu, names.count < namedDepth {
+                    if wantedPath?.count == names.count {
+                        // The target and its same-level siblings are the whole
+                        // required scope; its descendants cannot change it.
+                        continue
+                    } else if let submenu, names.count < namedDepth {
                         pending.append((submenu.element, names, indexPath + [submenu.offset]))
                     } else if submenu != nil {
                         // The cap stopped the descent, and saying so is the
@@ -189,7 +254,7 @@ public enum MacMenuBar {
                     continue
                 }
         }
-        return Reading(items: items, truncated: truncated)
+        return Reading(items: items, truncated: truncated, attributeGaps: attributeGaps)
     }
 
     static func cleanTitle(_ raw: String?) -> String? {
@@ -210,6 +275,7 @@ public enum MacMenuBar {
         /// It is right there, and the app has it switched off. A different fact
         /// from "not found", and the only one that stops a re-try loop.
         case disabled(Item)
+        case unavailable(Item)
     }
 
     /// Split a spoken path on any accepted separator.
@@ -233,35 +299,84 @@ public enum MacMenuBar {
         raw.contains(where: { "›»→>".contains($0) })
     }
 
+    private static let occurrenceNames = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth"]
+
+    /// An explicit occurrence is part of a displayed choice, never a cached
+    /// AX address. Resolve it again against this call's current menu order.
+    static func selection(_ raw: String) -> (path: String, occurrence: Int?) {
+        let raw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard raw.hasSuffix("]"), let suffix = raw.range(of: " [", options: .backwards) else { return (raw, nil) }
+        let word = String(raw[suffix.upperBound..<raw.index(before: raw.endIndex)]).lowercased()
+        let occurrence = occurrenceNames.firstIndex(of: word).map { $0 + 1 }
+            ?? (word.hasPrefix("item ") ? Int(word.dropFirst(5)) : nil)
+        guard let occurrence, occurrence > 0 else { return (raw, nil) }
+        return (String(raw[..<suffix.lowerBound]), occurrence)
+    }
+
+    static func choice(_ item: Item, among items: [Item]) -> String {
+        let same = items.filter { $0.titlePath.map(normalized) == item.titlePath.map(normalized) }
+        guard same.count > 1, let index = same.firstIndex(of: item) else { return item.display }
+        return item.display + " [" + (index < occurrenceNames.count ? occurrenceNames[index] : "item \(index + 1)") + "]"
+    }
+
     /// Resolve a spoken path against one reading.
     ///
     /// Execution requires every normalized title component exactly. Partial
     /// names remain discovery suggestions, never a different command to press.
-    public static func resolve(_ raw: String, among items: [Item]) -> Resolution {
+    /// One full named path is one command when the duplicates are published
+    /// commands (each has an identifier or key equivalent: Safari's ⌘W and
+    /// ⇧⌘W "Close Window"), or exactly one is enabled, or a supplied chord picks
+    /// one. Duplicates that publish nothing (two windows titled alike under
+    /// Window) stay an answer, never a guess.
+    static func uniqueCommands(_ items: [Item], prefer: (Item) -> Bool = { _ in false }) -> [Item] {
+        var order: [[String]] = [], groups: [[String]: [Item]] = [:]
+        for item in items {
+            let key = item.titlePath.map(normalized)
+            if groups[key] == nil { order.append(key) }
+            groups[key, default: []].append(item)
+        }
+        return order.flatMap { key -> [Item] in
+            let group = groups[key] ?? []
+            let enabled = group.filter { $0.enabled == true }
+            let available = enabled.isEmpty ? group : enabled
+            let preferred = available.filter(prefer)
+            let choices = preferred.isEmpty ? available : preferred
+            // Rank enabled and supplied-chord copies before collapsing a
+            // published command. Unpublished copies remain addressable choices.
+            if choices.count == 1 || choices.allSatisfy({ $0.commandKey != nil }) {
+                return Array(choices.prefix(1))
+            }
+            return choices
+        }
+    }
+
+    public static func resolve(_ raw: String, among items: [Item], prefer: (Item) -> Bool = { _ in false }) -> Resolution {
         // BOTH SIDES are normalized, and that is not a detail: a menu title
         // carries a trailing ellipsis ("Export…") that a person never types,
         // and normalizing only the menu's side means the exact path this organ
         // PRINTS does not resolve when it is handed straight back.
-        let wanted = components(raw).map(normalized)
+        let selected = selection(raw)
+        let wanted = components(selected.path).map(normalized)
         guard !wanted.isEmpty else { return .notFound(nearest: topLevelNames(items)) }
         func levels(_ item: Item) -> [String] { item.titlePath.map(normalized) }
 
         let sameDepth = items.filter { $0.titlePath.count == wanted.count }
-            // The same path AND the same command identity is one command listed
-            // twice (Keynote's File › New…: one identifier, one ⌘N): the first
-            // stands for all. Same-titled items without that identity — two
-            // windows named alike under Window — stay an answer, never a guess.
-            var seen = Set<[String]>()
-            let hits = sameDepth.filter { levels($0) == wanted }.filter { item in
-                guard let key = item.commandKey else { return true }
-                return seen.insert(levels(item) + [key]).inserted
+        let hits = uniqueCommands(sameDepth.filter { levels($0) == wanted }, prefer: prefer)
+        if let occurrence = selected.occurrence {
+            guard hits.indices.contains(occurrence - 1) else {
+                return .notFound(nearest: hits.map { choice($0, among: hits) })
             }
-            if hits.count == 1 {
-                return hits[0].enabled ? .matched(hits[0]) : .disabled(hits[0])
-            }
-            if hits.count > 1 {
-                return .ambiguous(candidates: hits.map(\.display).sorted())
-            }
+            let item = hits[occurrence - 1]
+            guard let enabled = item.enabled else { return .unavailable(item) }
+            return enabled ? .matched(item) : .disabled(item)
+        }
+        if hits.count == 1 {
+            guard let enabled = hits[0].enabled else { return .unavailable(hits[0]) }
+            return enabled ? .matched(hits[0]) : .disabled(hits[0])
+        }
+        if hits.count > 1 {
+            return .ambiguous(candidates: hits.map { choice($0, among: hits) })
+        }
         return .notFound(nearest: nearest(to: wanted, among: items))
     }
 
@@ -299,19 +414,22 @@ public enum MacMenuBar {
     public static func words(for resolution: Resolution, requested raw: String) -> String? {
         func safe(_ title: String) -> String {
             if case .string(let text) = MacScreenViewTextRedaction.redactedLegendString(
-                title, valueChars: pathChars(maxPathDepth)
+                title, valueChars: pathChars(findPathDepth) + 24
             ) { return text }
             return "[redacted]"
         }
         switch resolution {
         case .matched:
             return nil
+        case .unavailable(let item):
+            return "\"\(safe(item.display))\" has no readable enabled state. Read this app's menu again before pressing it."
         case .disabled(let item):
             return "\"\(safe(item.display))\" is in the menu but it is greyed out right now, "
                 + "so pressing it would do nothing. The app has it switched off in this state."
         case .ambiguous(let candidates):
             return "\"\(safe(raw))\" matches more than one menu path — "
-                + candidates.map(safe).joined(separator: ", ") + ". Say which one."
+                + candidates.map(safe).joined(separator: ", ")
+                + ". Use a displayed choice including its [first]/[second] suffix, or its key chord if one is shown."
         case .notFound(let nearest):
             guard !nearest.isEmpty else {
                 return "There is no \"\(safe(raw))\" in this app's menu bar. Read the menu again and use a path it shows."
@@ -330,7 +448,9 @@ public enum MacMenuBar {
         var out: [String: JSONValue] = [
             "count": .int(Int64(reading.items.count)),
             "truncated": .bool(reading.truncated),
+            "partial": .bool(reading.truncated),
             "max_depth": .int(Int64(depth)),
+            "attribute_gaps": .array(reading.attributeGaps.map(JSONValue.string)),
         ]
         if let unavailable = reading.unavailable {
             out["available"] = .bool(false)
@@ -339,15 +459,17 @@ public enum MacMenuBar {
         }
         out["available"] = .bool(true)
         if !statesKnown { out["enabled_state"] = .string("unknown until it's in front") }
+        let choices = uniqueCommands(reading.items)
         out["paths"] = .array(reading.items.map { item in
             var row: [String: JSONValue] = [
                 "path": MacScreenViewTextRedaction.redactedLegendString(
-                    item.display,
-                    valueChars: pathChars(depth)
+                    choice(item, among: choices),
+                    valueChars: pathChars(depth) + 24
                 ),
             ]
-            if statesKnown { row["enabled"] = .bool(item.enabled) }
+            if statesKnown { row["enabled"] = item.enabled.map(JSONValue.bool) ?? .null }
             if item.hasSubmenu { row["opens_submenu"] = .bool(true) }
+            if !item.attributeGaps.isEmpty { row["attribute_gaps"] = .array(item.attributeGaps.map(JSONValue.string)) }
             return .object(row)
         })
         return .object(out)

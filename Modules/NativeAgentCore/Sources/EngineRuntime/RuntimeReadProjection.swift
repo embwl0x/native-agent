@@ -7,16 +7,9 @@ import TrustCenter
 import ProviderRouting
 import ChatSessionWork
 import PersonaEngine
-// Blueprint: | `RuntimeReadProjection.swift` | Autonomy delegates to TrustFacade's policy projection; unused personal-OS compiler read is deleted (Capabilities renders the published profile); `getSessionContext` requires the effective session provider |
+// Blueprint: | `RuntimeReadProjection.swift` | Checked Mac activity history rejects damaged rows; canonical activity identity is executionId only. Session context projects matching provider-observed input usage and the detected window; absent measurements are unavailable, never estimates or zeroes. Autonomy delegates to TrustFacade's policy projection. |
 
-private struct SessionProviderUsageReceipt: Decodable {
-    let model: String
-    let lastRequestInputTokens: Int
-    let previousTurnInputTokens: Int?
-    let turnInputDeltaTokens: Int?
-}
-
-/// Mac-local activity rows; historical missionId remains readable permanently.
+/// Mac-local activity rows use the canonical execution identity.
 public struct ActivityEvent: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var kind: String
@@ -28,7 +21,6 @@ public struct ActivityEvent: Identifiable, Codable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, kind, title, detail, status, createdAt, executionId
-        case legacyExecutionId = "missionId"
     }
 
     public init(from decoder: Decoder) throws {
@@ -40,7 +32,6 @@ public struct ActivityEvent: Identifiable, Codable, Hashable, Sendable {
         self.status = try c.decode(String.self, forKey: .status)
         self.createdAt = try c.decode(String.self, forKey: .createdAt)
         self.executionId = try c.decodeIfPresent(String.self, forKey: .executionId)
-            ?? c.decodeIfPresent(String.self, forKey: .legacyExecutionId)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -75,92 +66,47 @@ public enum RuntimeReadouts {
         dataRoot: URL,
         configuredThresholdTokens: Int?
     ) async throws -> SessionContextStatus {
-        // Saved context.json is not authoritative; derive status from current transcript, provider receipts and routing.
-        // Live estimate from messages on disk.
-        let messagesPath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(sessionId).jsonl")
-        let statistics = await ChatTranscriptCache.shared.contextStatistics(at: messagesPath)
-        let totalChars = statistics.totalChars
-        let messageCount = statistics.messageCount
-
+        // The ring reports observed provider usage. Compaction separately sizes
+        // the next built request through the same measurement owner.
         let resolvedModel = (model?.isEmpty == false ? model! : "")
-        let transcriptTokens = max(0, Int((Double(totalChars) / ContextBudgetPolicy.transcriptCharactersPerToken).rounded()))
-
-        // Her window (`effectiveWindowTokens`): 60% of the selected model's on
-        // this session's effective route, capped by a Custom size; an injected size is Custom.
-        // The ring is of it, the same window the composer card reads, and she
-        // compacts at it. A window no catalog row states is 0: unknown.
+        // The detected model window, limited by a Custom cap. Unknown stays unknown.
         var windowConfig = ChatSessionAutocompactionConfig.productionDefault()
         if let configuredThresholdTokens, configuredThresholdTokens > 0 {
             windowConfig.thresholdTokens = configuredThresholdTokens
             windowConfig.contextWindowMode = .custom
         }
         let window = windowConfig.effectiveWindowTokens(forModel: resolvedModel, providerID: providerID, dataRoot: dataRoot)
-        let budget = window ?? 0
-
-        let providerUsagePath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("session_state", isDirectory: true)
-            .appendingPathComponent(sessionId, isDirectory: true)
-            .appendingPathComponent("provider_usage.json")
-        let providerReceipt: SessionProviderUsageReceipt? = {
-            guard let data = try? Data(contentsOf: providerUsagePath),
-                  let receipt = try? JSONDecoder().decode(SessionProviderUsageReceipt.self, from: data),
-                  receipt.lastRequestInputTokens >= 0 else {
-                return nil
-            }
-            return receipt
-        }()
-        // What the session has spent does not vanish because the person picked
-        // a different model mid-conversation: the same history is still in the
-        // window. Only the denominator changes (`budget`, keyed to
-        // `resolvedModel` above), so the ring re-scales instead of dropping to
-        // 0%. A new conversation still starts empty — that reset is the absence
-        // of this per-session receipt file, not a model comparison.
-        let receiptMatchesModel = providerReceipt.map {
-            $0.model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                == resolvedModel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        } ?? false
-        // A matching provider receipt is the authority even when selective
-        // history or compaction makes the real request smaller than the full
-        // transcript stored on disk.
-        let usedTokens = providerReceipt?.lastRequestInputTokens ?? transcriptTokens
-        let promptTokens = max(0, usedTokens - transcriptTokens)
-
-        let threshold = window ?? windowConfig.thresholdTokens
-
-        // A carried-over receipt counts tokens against the PREVIOUS model's
-        // window, so an 800k figure over a fresh 128k budget would read 600%.
-        // The used figure stays honest; only the displayed fraction is capped
-        // at full, which is what "the window is full" means on the new model.
-        let rawPercent: Double = budget > 0 ? (Double(usedTokens) / Double(budget)) * 100.0 : 0.0
-        let percent: Double = receiptMatchesModel ? rawPercent : min(rawPercent, 100.0)
+        guard let window, window > 0 else {
+            throw ProviderRoutingError.configurationFailed(windowConfig.configurationFailure
+                ?? "The selected model's context window is unavailable. Refresh its catalog in Providers.")
+        }
+        let measurement = try await SessionContextMeasurement.read(sessionId: sessionId,
+            model: resolvedModel, providerID: providerID, dataRoot: dataRoot, windowTokens: window)
+        guard let usedTokens = measurement.observedInputTokens else {
+            throw RuntimeReadError.unreadableFeed("Context usage has not been observed for this session's selected provider and model. Send a turn on this route to obtain a provider usage receipt.")
+        }
+        let budget = window
+        let threshold = windowConfig.triggerTokens(in: window, outputTokens: measurement.outputTokens)
+        let percent = (Double(usedTokens) / Double(budget)) * 100.0
 
         return SessionContextStatus(
             session_id: sessionId,
             used_tokens: usedTokens,
-            transcript_tokens: transcriptTokens,
-            prompt_tokens: promptTokens,
-            // Turn-over-turn deltas only mean something within one model's own
-            // accounting, so they drop on a switch even though the used figure
-            // carries. The first turn on the new model restates them.
-            previous_turn_tokens: receiptMatchesModel ? providerReceipt?.previousTurnInputTokens : nil,
-            turn_delta_tokens: receiptMatchesModel ? providerReceipt?.turnInputDeltaTokens : nil,
+            transcript_tokens: nil,
+            prompt_tokens: nil,
+            previous_turn_tokens: measurement.previousTurnTokens,
+            turn_delta_tokens: measurement.turnDeltaTokens,
             budget: budget,
             percent: percent,
-            message_count: messageCount,
+            message_count: measurement.messageCount,
             // A short transcript can still exceed its window.
-            compactable: transcriptTokens >= threshold,
+            compactable: usedTokens >= threshold,
             auto_compact_threshold: threshold,
             model: resolvedModel,
-            context_loaded: providerReceipt != nil,
-            context_mode: providerReceipt == nil
-                ? "transcript_estimate"
-                : (receiptMatchesModel ? "provider_receipt" : "provider_receipt_prior_model"),
+            context_loaded: true,
+            context_mode: "provider_usage_receipt",
             context_fingerprint: nil,
-            context_prompt_chars: totalChars
+            context_prompt_chars: measurement.renderedCharacters
         )
     }
 
@@ -170,11 +116,11 @@ public enum RuntimeReadouts {
 
     public static func getActivity(root: URL) async throws -> [ActivityEvent] {
         let readout = try await getActivityReadout(root: root)
-        guard !readout.records.isEmpty || readout.malformedRowCount == 0 else {
+        guard readout.malformedRowCount == 0 else {
             throw NSError(
                 domain: "NativeAgentActivity",
                 code: -422,
-                userInfo: [NSLocalizedDescriptionKey: "activity ledger contains no readable event records"]
+                userInfo: [NSLocalizedDescriptionKey: "Activity history is unavailable (\(readout.malformedRowCount) damaged rows in the recent ledger). Repair the retained rows before relying on a complete history."]
             )
         }
         return readout.records.map(\.event)

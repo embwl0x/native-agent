@@ -30,7 +30,8 @@
 #
 # Usage:  source script/lib/release_quarantine.sh
 #         release_quarantine_init "$QDIR" "publishing appcast for v1.2.3"
-#         DMG="$(release_quarantine_take "$QDIR" "$DMG")"
+#         release_quarantine_register "$QDIR" "NativeAgent-1.2.3.dmg"
+#         ... build directly in "$QDIR" ...
 #         ... publish ...
 #         release_quarantine_promote "$QDIR" "$ROOT/dist"
 
@@ -43,10 +44,7 @@ RELEASE_QUARANTINE_README=".QUARANTINE-DO-NOT-SHIP.txt"
 # artifacts promoted into dist/ by the next successful v0.2.0 publish — a
 # different, unpublished build shipped on the strength of another's verification.
 #
-# The register lives in a FILE, not a shell array, on purpose: callers naturally
-# write `DMG="$(release_quarantine_take ...)"`, and an array appended inside that
-# command substitution is appended in a subshell and lost — promotion would then
-# silently move nothing. A file survives the subshell.
+# The manifest records artifacts built directly inside this run's quarantine.
 RELEASE_QUARANTINE_MANIFEST_NAME=".QUARANTINE-MANIFEST"
 
 # $1 — quarantine dir, $2 — human reason
@@ -88,19 +86,6 @@ release_quarantine_register() {
   printf '%s\n' "$qdir/$base"
 }
 
-# Moves one path into quarantine and echoes its new location. Missing paths are
-# skipped silently (echoing nothing) so callers can pass optional artifacts.
-# $1 — quarantine dir, $2 — path to move
-release_quarantine_take() {
-  local qdir="$1" path="$2" base
-  [[ -e "$path" ]] || return 0
-  base="$(basename "$path")"
-  rm -rf "$qdir/$base"
-  mv "$path" "$qdir/$base" || return 1
-  printf '%s\n' "$base" >> "$qdir/$RELEASE_QUARANTINE_MANIFEST_NAME" || return 1
-  printf '%s\n' "$qdir/$base"
-}
-
 # Moves the artifacts THIS run registered into $2. Call ONLY after publication
 # has been verified.
 # $1 — quarantine dir, $2 — destination dir (usually dist/)
@@ -118,7 +103,7 @@ release_quarantine_promote() {
   while IFS= read -r base; do
     [[ -n "$base" ]] || continue
     [[ -e "$qdir/$base" ]] || continue
-    rm -rf "$dest/$base"
+    rm -rf "${dest:?}/$base"
     mv "$qdir/$base" "$dest/$base" || return 1
   done < "$manifest"
   rm -f "$manifest"

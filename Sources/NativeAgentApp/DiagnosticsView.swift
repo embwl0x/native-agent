@@ -1,6 +1,6 @@
 import DoctorChecks
 
-// Blueprint: | `DiagnosticsView.swift` | `DiagnosticsView` and refresh coalescer: one sequential shared snapshot across status/runs segments, with legacy tab routing; each mind's door predictions and their records (`Expansion.summary`) |
+// Blueprint: | `DiagnosticsView.swift` | `DiagnosticsView` and refresh coalescer: latest-run availability and measured-check header; one sequential shared snapshot across status/runs segments, with legacy tab routing; each mind's door predictions and their records (`Expansion.summary`) |
 
 import SwiftUI
 import ChatTurnRuntime
@@ -104,19 +104,27 @@ struct DiagnosticsView: View {
         }
     }
 
-    /// The header's one sentence, from the last health check. Nil before one
-    /// has run: the frame keeps its plain subtitle rather than guess.
+    /// Latest-run availability comes before retained checks; only measured,
+    /// passing rows can establish that every check passed.
     @MainActor
     static func headerLine(_ appModel: AppModel) -> String? {
-        guard let report = appModel.engine.doctor.report else { return nil }
+        let doctor = appModel.engine.doctor
+        if let issue = doctor.reportAvailabilityIssue {
+            return "My latest health checks are unavailable. \(issue)"
+        }
+        guard let report = doctor.report else { return nil }
         let summary = DoctorPlainCopy.summarize(report.checks)
         let total = summary.total
-        guard total > 0 else { return nil }
+        guard total > 0 else { return "My health checks are incomplete; no checks were measured." }
         let checks = total == 1 ? "check" : "checks"
         if summary.failing > 0 { return "\(summary.failing) of my \(total) health \(checks) failed." }
         if summary.warning > 0 { return "I'm running; \(summary.warning) of \(total) health \(checks) need a look." }
-        if summary.unclear > 0 { return "I'm running; \(summary.unclear) of \(total) health \(checks) came back unclear." }
-        return total == 1 ? "My last health check passed." : "All \(total) of my health checks passed."
+        let incomplete = summary.unclear + summary.reading
+        if incomplete > 0 { return "My health checks are incomplete; \(incomplete) of \(total) are unmeasured or unclear." }
+        if summary.healthy == total {
+            return total == 1 ? "My last health check passed." : "All \(total) of my health checks passed."
+        }
+        return "My health checks finished; \(summary.off + summary.notNeeded) were off or not needed."
     }
 
     @MainActor

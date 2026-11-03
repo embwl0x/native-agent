@@ -16,17 +16,19 @@ extension AppActions {
         }
     }
 
-    /// A sense's offered verbs use the same action vocabulary as every page.
-    static func senses(records: [SenseRecord]? = nil, catalog: [AppAction]? = nil) -> [AppAction] {
-        guard SensesHub.shared.registry != nil else { return [] }
+    /// File-owned discovery also runs before the live hub is installed at launch.
+    /// It projects checked records; executing a sense still requires the hub.
+    static func senses(records: [SenseRecord]? = nil, catalog: [AppAction]? = nil, dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> [AppAction] {
+        let records = try records ?? FileSenseRegistry(dataRoot: dataRoot).presentationRecords()
+        let catalog = try catalog ?? available(dataRoot: dataRoot)
         let scope = ChatToolSessionContext.verifiedSessionId ?? ""
         var seen: Set<String> = []
         let views = SenseDoorViews.shared.latest.filter { view in
-            view.scope == scope && view.record.verbsEnabled && (records == nil || records!.contains {
+            view.scope == scope && view.record.verbsEnabled && records.contains {
                 $0.id == view.record.id && $0.version == view.record.version && $0.verbsEnabled && $0.disabledBy != "owner"
-            })
+            }
         }
-        let reads = (records ?? []).filter { $0.status == .on && $0.disabledBy != "owner" }.map { record in
+        let reads = try records.filter { $0.status == .on && $0.disabledBy != "owner" }.map { record in
             let id: String
             let input: [String: JSONValue]
             switch record.corner {
@@ -35,7 +37,9 @@ extension AppActions {
             case .site(let host): id = "web.read"; input = ["url": .string("https://\(host)/<path>")]
             default: id = "sense.versions"; input = ["sense_id": .string(record.id)]
             }
-            let reader = (catalog ?? all).first { $0.id == id }!
+            guard let reader = catalog.first(where: { $0.id == id }) else {
+                throw SenseFailure(code: "reader_action_missing", message: "Sense \(record.id) requires \(id), which is missing from the checked action catalog. Repair its action registration.")
+            }
             return AppAction(id, record.corner.key, "Read \(record.id) · \(record.corner.key)", reader.args,
                 toolClass: .read, warn: reader.warn, tool: reader.tool, input: reader.input.merging(input) { _, bound in bound },
                 read: true,
@@ -148,7 +152,7 @@ extension AppToolExecutor {
             guard item.isEmpty || URL(string: url)?.host?.lowercased() == host else {
                 return Self.failure("invalid_address", "Read this corner with a URL on its host.", extra: siteFailureEvidence)
             }
-            if let view, let reader = view.readInput["__sense_action"]?.scalarText, let entry = AppActions.action(reader) {
+            if let view, let reader = view.readInput["__sense_action"]?.scalarText, let entry = try AppActions.action(reader) {
                 action = reader
                 let names = Set(entry.argSpecs.flatMap(\.names))
                 args = view.readInput.filter { names.contains($0.key) }.merging(args) { _, new in new }
@@ -304,7 +308,7 @@ extension AppToolExecutor {
         let dataRoot = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
         let outcome = await SenseActionContext.$perform.withValue({ actionID, target, value in
-            guard let action = AppActions.action(actionID), action.tool != "sense_act", case .object(var args) = value else {
+            guard let action = try AppActions.action(actionID), action.tool != "sense_act", case .object(var args) = value else {
                 throw SenseFailure(code: "invalid_action", message: "A sense act must name an existing app action with object arguments.")
             }
             if let siteBoundary {

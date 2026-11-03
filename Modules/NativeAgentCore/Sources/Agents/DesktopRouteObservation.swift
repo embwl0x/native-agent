@@ -93,6 +93,7 @@ import Senses
             "mode": .string(pollingReason != nil ? "external_protocol_poll" : sourceFailure != nil ? "unavailable" : "source_events")]
         if let pollingReason { fields["reason"] = .string(pollingReason) }
         if let sourceFailure { fields["reason"] = .string(sourceFailure.localizedDescription) }
+        if let source { fields["ax_watch_coverage"] = source.coverage }
         return .object(fields)
     }
     func next(until deadline: Date? = nil) async throws {

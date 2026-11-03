@@ -11,6 +11,7 @@ import Transcripts
 import Desk
 import MultimodalTTS
 import ChatToolRuntime
+import ChatSessionWork
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `ChatComposerSettings.swift` | Native composer menus and context receipt: keyboard access and shared routing/actions |
@@ -25,11 +26,12 @@ struct ComposerSessionRefresh: ViewModifier {
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     let sessionID: String
     var live = true
-    @AppStorage("nativeagent.contextWindowMode") private var windowMode = ""
-    @AppStorage("nativeagent.compactionThresholdTokens") private var windowSize = 0
+    @AppStorage(ChatSessionAutocompactionConfig.contextWindowModeKey) private var windowMode = "model"
+    @AppStorage(ChatSessionAutocompactionConfig.defaultsKey) private var windowSize = 200_000
+    @AppStorage(ChatSessionAutocompactionConfig.compactionPercentKey) private var compactionPercent = ChatSessionAutocompactionConfig.defaultCompactionPercent
 
     func body(content: Content) -> some View {
-        content.quietReadTask(id: "\(sessionID):\(windowMode):\(windowSize):\(live)") {
+        content.quietReadTask(id: "\(sessionID):\(windowMode):\(windowSize):\(compactionPercent):\(live)") {
             if quietOffscreenRead { await appModel.engine.providers.refreshSession(sessionID) }
             else if live { await appModel.engine.providers.observeSession(sessionID) }
         }
@@ -50,6 +52,7 @@ struct ChatComposerSettings: View {
     var focusWordToken: Int
     /// The hand-back shows only while it would do something.
     @State private var handoffWouldChange = false
+    @State private var handoffProblem: String?
     @AppStorage(ShotgunController.enabledKey) private var shotgunEnabled = true
 
     @FocusState private var focusedWord: ChatComposerCard?
@@ -64,6 +67,12 @@ struct ChatComposerSettings: View {
 
     var body: some View {
         HStack(spacing: 0) {
+            if let handoffProblem {
+                Image(systemName: "exclamationmark.triangle")
+                    .help(handoffProblem)
+                    .accessibilityLabel(handoffProblem)
+                    .padding(.trailing, 12)
+            }
             // Only while it would change something: a Mac action wants the
             // driver, User holds it, and the posture is below Full Mac.
             if handoffWouldChange {
@@ -157,7 +166,13 @@ struct ChatComposerSettings: View {
         // Re-read on every driver change, and when the posture moves.
         .task(id: routing.activeTrustPreset) {
             for await _ in await MacAttentionSessionStore.shared.driverChanges() {
-                handoffWouldChange = await MacAttentionSessionStore.shared.handoffWouldChange()
+                do {
+                    handoffWouldChange = try await MacAttentionSessionStore.shared.handoffWouldChange()
+                    handoffProblem = nil
+                } catch {
+                    handoffWouldChange = false
+                    handoffProblem = error.localizedDescription
+                }
             }
         }
         .modifier(ComposerSessionRefresh(sessionID: appModel.activeChatSessionId, live: chatPageIsVisible))
@@ -382,6 +397,11 @@ struct ChatComposerSettings: View {
             })
             addScope("Saved default for Chat", to: menu)
         case .effort:
+            if routing.efforts.isEmpty {
+                let knownEmpty = routing.presentation?.selectedModel?.supportedReasoningEfforts == []
+                addScope(knownEmpty ? "This model has no configurable thinking levels."
+                         : "Thinking choices unavailable. Reload Providers to read this model's capabilities.", to: menu)
+            }
             for (index, effort) in routing.efforts.enumerated() {
                 menu.addItem(ComposerMenuItem(effort.id, effort.label, selected: index == routing.effortIndex) {
                     routing.setEffort(index: index)

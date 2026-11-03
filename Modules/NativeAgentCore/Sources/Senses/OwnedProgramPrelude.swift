@@ -3,11 +3,17 @@ import Darwin
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `OwnedProgramPrelude.swift` | JavaScript app bindings and strict replay vocabulary |
+// Blueprint: | `OwnedProgramPrelude.swift` | Frozen callable app door and namespace bindings with working-shape misuse errors; bare registry verbs preserve their built-in bindings; preview/version-preserving calls and ordered batches, strict replay vocabulary; canonical host namespace and PIM action names shared with static save inspection |
 extension OwnedProgramRunner {
-    /// The `app` object the script sees. Its only native calls are `__call`
+    public static let hostPrimitiveNamespaces: Set<String> = ["files", "network", "program", "apps", "model"]
+    public static let hostDoorActions: Set<String> = [
+        "calendar.upcoming", "calendar.create", "calendar.modify", "calendar.delete",
+        "reminders.query", "reminders.create", "reminders.update", "reminders.delete",
+        "contacts.search", "contacts.save"
+    ]
+    /// The callable `app` door the script sees. Its only native calls are `__call`
     /// and `__log`, captured here and then removed from the global object.
-    /// A strict run's adds `expect`, `expect_fail`, `decide` and `step`, and
+    /// A strict run adds `expect`, `expect_fail`, `decide` and `step`, and
     /// an unknown action name reaches the door, so it fails as unknown_action.
     /// With `input`, the frozen `input` is parsed from its native binding.
     /// Her turn part (`turn`) gets its reach and a `run` that is its `step`.
@@ -32,7 +38,15 @@ extension OwnedProgramRunner {
         let unknown = """
 
               function named(space, base) {
-                return new Proxy(base, { get: function (t, key) {
+                var namespace = () => {
+                  throw new TypeError("app." + space + " is a namespace. Use app." + space + ".<verb>(args) or app({action:'" + space + ".<verb>',args:{}}).");
+                };
+                // A verb may itself be named name/length; those function
+                // properties are configurable until this namespace freezes.
+                Object.keys(base).forEach(function (key) {
+                  Object.defineProperty(namespace, key, {value: base[key], enumerable: true});
+                });
+                return new Proxy(Object.freeze(namespace), { get: function (t, key) {
                   if (typeof key !== "string" || key in t) return t[key];
                   if (key in api) return api[key];
                   return function () { return invoke("action", space + "." + key, Array.prototype.slice.call(arguments)); };
@@ -64,6 +78,13 @@ extension OwnedProgramRunner {
             set: function (value) { return invoke("state", "set", [value]); }
           });
         """
+        let namespaces = Self.hostPrimitiveNamespaces.sorted().map { "\($0): primitives(\"\($0)\")" }
+        let doorActions = Set(Self.hostDoorActions.compactMap { $0.split(separator: ".").first.map(String.init) }).sorted().map { space in
+            let methods = Self.hostDoorActions.sorted().filter { $0.hasPrefix(space + ".") }.map { key in
+                "\(key.split(separator: ".").last!): function (args) { return door(\"\(key)\", args); }"
+            }
+            return "\(space): Object.freeze({\(methods.joined(separator: ","))})"
+        }
         let host = !primitives ? (strict ? state + "Object.defineProperty(globalThis, \"host\", {value: Object.freeze({state: partState})});" : "") : state + """
           function primitive(operation, args) {
             if (operation.indexOf("files.") === 0) return door(operation, args);
@@ -87,37 +108,13 @@ extension OwnedProgramRunner {
               args.path = root + "/" + (args.path || "");
               delete args.root;
             }
-            var result = invoke("action", id, [args]);
-            if (!rooted || id !== "files.list") return result;
-            var entries = [];
-            for (;;) {
-              entries = entries.concat(result.entries.map(function (name) { return result.path + "/" + name.replace(/\\/$/, ""); }));
-              if (!result.next) return entries;
-              result = invoke("action", id, [result.next]);
-            }
+            return invoke("action", id, [args]);
           }
           Object.defineProperty(globalThis, "host", {value: Object.freeze({call: primitive, state: partState,
             measurementSystem: __measurementSystem,
             paths: Object.freeze({home: __home, workspace: __workspace}),
-            files: primitives("files"), network: primitives("network"), program: primitives("program"), apps: primitives("apps"),
-            model: primitives("model"), fetch: function (args) { return primitive("fetch", args); },
-            calendar: Object.freeze({
-              list: function (args) { return door("calendar.upcoming", args); },
-              search: function (args) { return door("calendar.upcoming", args); },
-              create: function (args) { return door("calendar.create", args); },
-              update: function (args) { return door("calendar.modify", args); },
-              delete: function (args) { return door("calendar.delete", args); }}),
-            reminders: Object.freeze({
-              list: function (args) { return door("reminders.query", args); },
-              search: function (args) { return door("reminders.query", args); },
-              create: function (args) { return door("reminders.create", args); },
-              update: function (args) { return door("reminders.update", args); },
-              delete: function (args) { return door("reminders.delete", args); }}),
-            contacts: Object.freeze({
-              search: function (args) { return door("contacts.search", args); },
-              read: function (args) { return door("contacts.search", args); },
-              create: function (args) { return door("contacts.save", args); },
-              update: function (args) { return door("contacts.save", args); }})}), writable: false, configurable: false});
+            \(namespaces.joined(separator: ",")), fetch: function (args) { return primitive("fetch", args); },
+            \(doorActions.joined(separator: ","))}), writable: false, configurable: false});
           Object.defineProperty(globalThis, "part", {value: Object.freeze({
             call: function (id, input) {
               if (typeof id !== "string" || !/^[a-z][a-z0-9_-]{1,63}$/.test(id))
@@ -171,8 +168,31 @@ extension OwnedProgramRunner {
             throw e;
           }
           \(host)\(reach)
-          var api = {
-            // Script API: authored app.call is refused by ability.save; dynamic abilities use host.call.
+          var api = Object.assign(function (request) {
+            if (!request || typeof request !== "object" || Array.isArray(request))
+              throw new TypeError("Use app({action:'desk.read',args:{handle:'desk.1'}}) or app.desk.read({handle:'desk.1'}).");
+            var batch = request;
+            function action(request) {
+              if (!request || typeof request !== "object" || typeof request.action !== "string" || !request.action.trim())
+                throw new TypeError("An app action needs {action:'space.verb',args:{}}; batches use app({actions:[{action:'space.verb',args:{}}]}).");
+              var options = {};
+              // Either preview protects the entry; its version overrides the batch's.
+              ["preview", "expected_version"].forEach(function (key) {
+                if (Object.prototype.hasOwnProperty.call(request, key)) options[key] = request[key];
+                else if (request !== batch && Object.prototype.hasOwnProperty.call(batch, key)) options[key] = batch[key];
+              });
+              if (request.preview === true || batch.preview === true) options.preview = true;
+              return invoke("action", request.action, [request.args === undefined ? {} : request.args, options]);
+            }
+            if (request.action !== undefined) return action(request);
+            if (request.actions !== undefined) {
+              if (!Array.isArray(request.actions)) throw new TypeError("app actions must be an array.");
+              return request.actions.map(action);
+            }
+            if (request.find !== undefined) return api.find(request.find);
+            return request.item === undefined ? api.read(request.page) : api.read(request.page, request.item);
+          }, {
+            // Literal app.call names are checked at save; computed names keep runtime declaration checks.
             call: function (id) { return invoke("action", id, Array.prototype.slice.call(arguments, 1)); },
             read: function () { return invoke("read", "", Array.prototype.slice.call(arguments)); },
             find: function (words) { return invoke("find", "", [words]); },
@@ -181,9 +201,11 @@ extension OwnedProgramRunner {
                 return typeof a === "string" ? a : JSON.stringify(a);
               }).join(" "));
             }\(marks)
-          };
+          });
           ids.forEach(function (id) {
             var dot = id.indexOf("."), space = id.slice(0, dot);
+            // Bare door verbs already have their own binding (app.find).
+            if (dot < 0) return;
             api[space] = api[space] || {};
             api[id] = api[space][id.slice(dot + 1)] = function () {
               return invoke("action", id, Array.prototype.slice.call(arguments));

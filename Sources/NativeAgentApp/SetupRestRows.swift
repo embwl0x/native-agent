@@ -1,6 +1,7 @@
 import NativeAgentShared
 import EngineRuntime
 import AppToolRuntime
+import ChatSessionWork
 
 // Blueprint: | `SetupRestRows.swift` | `SetupRestRows`: remaining settings controls in shared page rows, build identity and bundled data-limit reference handoff |
 // Settings rows share canonical storage and controllers inside the page's group cards.
@@ -20,11 +21,11 @@ struct SetupRestRows: View {
     @State private var tourReplayCoordinator = OnboardingTourReplay.shared
     @AppStorage("nativeagent.showTour") private var showTour = false
     // Her context window (ChatSessionAutocompactionConfig.effectiveWindowTokens):
-    // the model's default is 60% of its window; Custom is this size, still never
-    // past 60% of the active model's window. An empty mode reads as Custom once
-    // a size is saved, the same rule `productionDefault` applies.
-    @AppStorage("nativeagent.compactionThresholdTokens") private var compactionThresholdTokens = 200_000
-    @AppStorage("nativeagent.contextWindowMode") private var contextWindowMode = ""
+    // the detected model window, optionally limited by Custom. Automatic
+    // compaction starts at 85% and folds toward 55% of that window.
+    @AppStorage(ChatSessionAutocompactionConfig.defaultsKey) private var compactionThresholdTokens = 200_000
+    @AppStorage(ChatSessionAutocompactionConfig.contextWindowModeKey) private var contextWindowMode = "model"
+    @AppStorage(ChatSessionAutocompactionConfig.compactionPercentKey) private var compactionPercent = ChatSessionAutocompactionConfig.defaultCompactionPercent
     @Environment(AppModel.self) private var appModel
     @State private var dataLimitsFailure: String?
 
@@ -112,13 +113,17 @@ struct SetupRestRows: View {
             identifier: "setup.rest.shotgunShortcut"
         ) {
             Picker("Shotgun shortcut", selection: Binding(
-                get: { ShotgunShortcut(rawValue: shotgunShortcut) ?? .optionSpace },
-                set: { shortcut in
-                    shotgunShortcut = shortcut.rawValue
-                    ShotgunController.shared.applyShortcut()
+                get: { shotgunShortcut },
+                set: { raw in
+                    guard let shortcut = ShotgunShortcut(rawValue: raw) else { return }
+                    do { try ShotgunController.shared.setShortcut(shortcut) }
+                    catch { appModel.systemToasts.push(error: error.localizedDescription) }
                 }
             )) {
-                ForEach(ShotgunShortcut.allCases) { Text($0.title).tag($0) }
+                if ShotgunShortcut(rawValue: shotgunShortcut) == nil {
+                    Text("Unavailable — choose a shortcut").tag(shotgunShortcut)
+                }
+                ForEach(ShotgunShortcut.allCases) { Text($0.title).tag($0.rawValue) }
             }
             .labelsHidden()
             .fixedSize()
@@ -134,8 +139,7 @@ struct SetupRestRows: View {
     private var isCustomWindow: Binding<Bool> {
         Binding(
             get: {
-                contextWindowMode == "custom" || (contextWindowMode.isEmpty
-                    && UserDefaults.standard.integer(forKey: "nativeagent.compactionThresholdTokens") > 0)
+                contextWindowMode == "custom"
             },
             set: { contextWindowMode = $0 ? "custom" : "model" }
         )
@@ -144,10 +148,16 @@ struct SetupRestRows: View {
     private var compactionRow: some View {
         SetupRow(
             title: "Context window",
-            detail: "How much \(agentName) keeps in mind before compacting. On a model with a smaller window, \(agentName) uses 60% of that model's window.",
+            detail: ChatSessionAutocompactionConfig.productionDefault().configurationFailure
+                ?? "Uses the selected model's detected window. Custom sets a lower cap. Compact at sets the percentage for every model; the fold target scales below it (55% at the default 85%), and aging uses the same trigger.",
             identifier: "setup.rest.compaction"
         ) {
-            HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 8) {
+                Stepper("Compact at \(compactionPercent)% of the model's window",
+                        value: $compactionPercent,
+                        in: ChatSessionAutocompactionConfig.compactionPercentRange)
+                    .accessibilityIdentifier("setup.rest.compaction.percent")
+                HStack(spacing: 8) {
                 Picker("Context window", selection: isCustomWindow) {
                     Text("Model default").tag(false)
                     Text("Custom").tag(true)
@@ -174,6 +184,7 @@ struct SetupRestRows: View {
                         .accessibilityLabel("Custom context window size")
                         .accessibilityValue(Self.formatThresholdTokens(compactionThresholdTokens))
                         .accessibilityHint("Adjusts how much \(agentName) keeps in mind before compacting")
+                }
                 }
             }
         }
@@ -287,16 +298,16 @@ struct SetupRestRows: View {
 
     /// One-line, paste-into-a-bug-report identity of the running bytes:
     /// `0.3.7 (abc1234, modified)`. The revision is shown short; `modified` is
-    /// shown whenever the builder did not stamp clean-source truth, because an
-    /// unstamped bundle is exactly the case that must not be read as exact
-    /// proof of a commit (see NativeAgentBuildIdentity).
+    /// shown for a stamped dirty build. An incomplete stamp is reported as
+    /// unavailable, never reconstructed as a dev or modified build.
     static func buildIdentityLine(_ identity: NativeAgentBuildIdentity) -> String {
+        if identity.unavailableReason != nil { return identity.description }
         var line = identity.version
         var parenthetical: [String] = []
         if let revision = identity.sourceRevision, !revision.isEmpty {
             parenthetical.append(String(revision.prefix(7)))
         }
-        if identity.sourceDirty {
+        if identity.sourceDirty == true {
             parenthetical.append("modified")
         }
         if !parenthetical.isEmpty {
@@ -330,6 +341,11 @@ struct HazeSwatches: View {
 
     var body: some View {
         let selected = HazeColor(stored: hazeColor)
+        if selected == .unavailable {
+            Text("Unsupported saved color. Choose a color below to repair it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
         HStack(spacing: 8) {
             ForEach(HazeColor.allCases) { color in
                 Button {

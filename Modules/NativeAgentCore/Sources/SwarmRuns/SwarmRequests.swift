@@ -5,7 +5,7 @@ import TurnTrace
 import ToolExecution
 import Privacy
 import ProviderRouting
-// Blueprint: | `SwarmRequests.swift` | `AgentSwarmError`, `AgentSwarmPolicy`, `AgentSwarmWorkerSpec`, `AgentSwarmRunRequest`: policy bounds, request aliases, Work model/account binding, worker access and effort validation, and dry-run plans |
+// Blueprint: | `SwarmRequests.swift` | Swarm policy bounds, checked current request/worker fields with prompt as the sole mission field, required authenticated origin, Work model/account binding, catalog-backed effort and access validation, and dry-run plans |
 
 public enum AgentSwarmError: Error, LocalizedError, Equatable {
     case invalidRequest(String)
@@ -132,22 +132,32 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
         guard policy.enabled else {
             throw AgentSwarmError.policyDenied("agent_swarm is disabled by trust/policy.json swarmPolicy.enabled")
         }
-        let objective = firstString(input, keys: ["objective", "query", "prompt", "task"])
+        let fields: Set<String> = ["objective", "agents", "reasoning_effort", "agentCount", "access", "mode", "maxParallel", "timeoutSeconds", "synthesize", "dryRun", "maxOutputChars", "digestBudgetTokens", "requestedBy", "__session_id"]
+        let unknown = Set(input.keys).subtracting(fields)
+        guard unknown.isEmpty else {
+            throw AgentSwarmError.invalidRequest("agent_swarm has unrecognized fields: \(unknown.sorted().joined(separator: ", ")). Use the current swarm contract; no workers were started.")
+        }
+        guard let requestedBy = firstString(input, keys: ["requestedBy"]) else {
+            throw AgentSwarmError.invalidRequest("agent_swarm requires the dispatcher's authenticated requestedBy origin")
+        }
+        let objective = firstString(input, keys: ["objective"])
         guard let objective, !objective.isEmpty else {
-            throw AgentSwarmError.invalidRequest("objective must be non-empty text, for example objective: \"Review the proposed change\". query, prompt and task are also accepted.")
+            throw AgentSwarmError.invalidRequest("objective must be non-empty text, for example objective: \"Review the proposed change\".")
         }
 
-        // Requests keep Work's model/account; effort defaults to its Think level and must match its catalog, or low/medium/high/xhigh without one.
+        // Requests keep Work's model/account and its declared Think levels.
         var supportedEfforts: [String] = []
         for name in policy.supportedReasoningEfforts {
             let effort = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if !effort.isEmpty, !supportedEfforts.contains(effort) { supportedEfforts.append(effort) }
         }
-        if supportedEfforts.isEmpty { supportedEfforts = ["low", "medium", "high", "xhigh"] }
+        guard !supportedEfforts.isEmpty else {
+            throw ToolFailureError("The selected Work model's Think levels are unavailable. No workers were started.",
+                effects: .none, owner: "Providers → Work", code: "swarm_model_controls_unavailable",
+                instruction: "Repair the selected Work account's model catalog before starting workers; do not guess supported Think levels.", recovery: .repair)
+        }
         let requestedEffort = try parseEffort(input, defaultEffort: policy.defaultReasoningEffort, supportedEfforts: supportedEfforts)
         let defaultAccess = try workerAccess(input)
-        let models = stringArray(input["models"])
-        try requireBoundModel(input, models: models, bound: policy.defaultModel)
         let requestedModel = policy.defaultModel
         let explicitWorkers = try parseWorkerArray(
             input,
@@ -157,7 +167,7 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
             defaultAccess: defaultAccess
         )
         let requestedCount = intValue(
-            firstPresent(input, keys: ["agentCount", "agent_count", "count", "n", "numAgents", "num_agents"])
+            firstPresent(input, keys: ["agentCount"])
         )
         let maxAllowed = max(1, min(policy.maxAgents, AgentSwarmPolicy.hardMaxAgents))
         let workerCount: Int
@@ -188,39 +198,39 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
             workers = explicitWorkers
         }
 
-        let requestedParallel = intValue(firstPresent(input, keys: ["maxParallel", "max_parallel", "parallelism"]))
+        let requestedParallel = intValue(firstPresent(input, keys: ["maxParallel"]))
             ?? min(policy.maxParallel, workers.count)
         let maxParallel = max(1, min(requestedParallel, policy.maxParallel, workers.count, AgentSwarmPolicy.hardMaxAgents))
-        let synthesize = boolValue(firstPresent(input, keys: ["synthesize", "synthesis"]), defaultValue: workers.count > 1)
+        let synthesize = boolValue(firstPresent(input, keys: ["synthesize"]), defaultValue: workers.count > 1)
         // Synthesis uses the same checked model/account as the workers.
         let synthesisModel = requestedModel
         let timeoutSeconds = max(
             15,
-            min(intValue(firstPresent(input, keys: ["timeoutSeconds", "timeout_seconds", "timeout"])) ?? 240, 900)
+            min(intValue(firstPresent(input, keys: ["timeoutSeconds"])) ?? 240, 900)
         )
         let maxOutputChars = max(
             500,
-            min(intValue(firstPresent(input, keys: ["maxOutputChars", "max_output_chars"])) ?? 4_000, 12_000)
+            min(intValue(firstPresent(input, keys: ["maxOutputChars"])) ?? 4_000, 12_000)
         )
         // Non-positive budgets disable the additional digest limit.
-        var digestBudgetTokens: Int? = intValue(firstPresent(input, keys: ["digestBudgetTokens", "digest_budget_tokens"]))
+        var digestBudgetTokens: Int? = intValue(firstPresent(input, keys: ["digestBudgetTokens"]))
         if let b = digestBudgetTokens, b <= 0 { digestBudgetTokens = nil }
 
         return AgentSwarmRunRequest(
             objective: objective,
-            mode: firstString(input, keys: ["mode", "preset", "presetName", "preset_name"]) ?? "parallel",
+            mode: firstString(input, keys: ["mode"]) ?? "parallel",
             workers: workers,
             maxParallel: maxParallel,
             synthesize: synthesize,
             synthesisModel: synthesisModel,
             timeoutSeconds: timeoutSeconds,
-            dryRun: boolValue(firstPresent(input, keys: ["dryRun", "dry_run"]), defaultValue: false),
+            dryRun: boolValue(firstPresent(input, keys: ["dryRun"]), defaultValue: false),
             maxOutputChars: maxOutputChars,
             readOnly: workers.allSatisfy { $0.access == "read_only" },
             requestedModel: requestedModel,
             reasoningEffort: requestedEffort,
-            requestedBy: firstString(input, keys: ["requestedBy", "requested_by", "surface"]) ?? "chat_tool",
-            originSessionId: firstString(input, keys: ["__session_id", "session_id", "sessionId"]),
+            requestedBy: requestedBy,
+            originSessionId: firstString(input, keys: ["__session_id"]),
             digestBudgetTokens: digestBudgetTokens
         )
     }
@@ -254,16 +264,11 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
         supportedEfforts: [String],
         defaultAccess: String
     ) throws -> [AgentSwarmWorkerSpec] {
-        // Populated aliases win over placeholders; malformed lists fail instead of starting default workers.
-        var selected: [JSONValue]?
-        for key in ["agents", "workers", "roles", "workerConfigs", "worker_configs"] {
-            guard let raw = input[key], raw != .null else { continue }
-            guard case .array(let values) = raw else {
-                throw AgentSwarmError.invalidRequest("agent_swarm \(key) must be an array of worker objects or role strings")
-            }
-            if !values.isEmpty { selected = values; break }
+        // One current worker-list field; malformed lists fail before work starts.
+        guard let raw = input["agents"], raw != .null else { return [] }
+        guard case .array(let values) = raw else {
+            throw AgentSwarmError.invalidRequest("agent_swarm agents must be an array of worker objects or role strings")
         }
-        guard let values = selected else { return [] }
         var out: [AgentSwarmWorkerSpec] = []
         for (idx, value) in values.enumerated() {
             switch value {
@@ -280,20 +285,25 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
                     access: defaultAccess
                 ))
             case .object(let obj):
-                let role = firstString(obj, keys: ["role", "name", "title"]) ?? "independent analyst \(idx + 1)"
+                let fields: Set<String> = ["name", "role", "prompt", "reasoning_effort", "access", "contextSlice", "findingsCap"]
+                let unknown = Set(obj.keys).subtracting(fields)
+                guard unknown.isEmpty else {
+                    throw AgentSwarmError.invalidRequest("agent_swarm worker \(idx + 1) has unrecognized fields: \(unknown.sorted().joined(separator: ", ")). Use prompt for the worker's complete mission and contextSlice for context. No workers were started.")
+                }
+                let role = firstString(obj, keys: ["role"]) ?? "independent analyst \(idx + 1)"
                 let effort = try parseEffort(obj, defaultEffort: defaultEffort, supportedEfforts: supportedEfforts)
                 let access = try workerAccess(obj, fallback: defaultAccess)
-                let brief = try checkedWorkerText(obj, keys: ["prompt", "lensBrief", "lens_brief", "instructions"], index: idx)
-                let context = try checkedWorkerText(obj, keys: ["contextSlice", "context_slice", "context"], index: idx)
+                let brief = try checkedWorkerText(obj, key: "prompt", index: idx)
+                let context = try checkedWorkerText(obj, key: "contextSlice", index: idx)
                 out.append(AgentSwarmWorkerSpec(
-                    name: firstString(obj, keys: ["name", "id"]) ?? "worker-\(idx + 1)",
+                    name: firstString(obj, keys: ["name"]) ?? "worker-\(idx + 1)",
                     role: role,
                     prompt: brief ?? "",
                     model: defaultModel,
                     reasoningEffort: effort,
                     access: access,
                     contextSlice: context,
-                    findingsCap: intValue(firstPresent(obj, keys: ["findingsCap", "findings_cap"]))
+                    findingsCap: intValue(firstPresent(obj, keys: ["findingsCap"]))
                 ))
             default:
                 throw AgentSwarmError.invalidRequest("agent_swarm worker \(idx + 1) must be an object or nonempty role string")
@@ -302,64 +312,24 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
         return out
     }
 
-    /// Validate every supplied mission/context alias and retain the first nonblank text.
-    private static func checkedWorkerText(_ input: [String: JSONValue], keys: [String], index: Int) throws -> String? {
-        var selected: String?
-        for key in keys {
-            guard let value = input[key], value != .null else { continue }
-            guard case .string(let raw) = value else {
-                throw AgentSwarmError.invalidRequest("agent_swarm worker \(index + 1) field '\(key)' must be text, null, or omitted; explicit worker instructions/context were not discarded. No workers were started.")
-            }
-            let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if selected == nil && !text.isEmpty { selected = text }
+    /// One mission field and one context field; neither has an alias.
+    private static func checkedWorkerText(_ input: [String: JSONValue], key: String, index: Int) throws -> String? {
+        guard let value = input[key], value != .null else { return nil }
+        guard case .string(let raw) = value else {
+            throw AgentSwarmError.invalidRequest("agent_swarm worker \(index + 1) field '\(key)' must be text, null, or omitted; explicit worker instructions/context were not discarded. No workers were started.")
         }
-        return selected
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 
-    /// Every supplied default, rota, worker and synthesis model must name Work's model or nothing.
-    private static func requireBoundModel(
-        _ input: [String: JSONValue],
-        models: [String],
-        bound: String
-    ) throws {
-        var supplied: [String] = []
-        if let top = firstString(input, keys: ["model", "defaultModel", "requestedModel"]) {
-            supplied.append(top)
-        }
-        if let synth = firstString(input, keys: ["synthesisModel", "synthesis_model"]) {
-            supplied.append(synth)
-        }
-        supplied.append(contentsOf: models)
-        for key in ["agents", "workers", "roles", "workerConfigs", "worker_configs"] {
-            guard case .array(let values)? = input[key] else { continue }
-            for value in values {
-                guard case .object(let obj) = value else { continue }
-                if let worker = firstString(obj, keys: ["model", "requestedModel", "requested_model"]) {
-                    supplied.append(worker)
-                }
-            }
-        }
-        let boundName = bound.trimmingCharacters(in: .whitespacesAndNewlines)
-        for name in supplied {
-            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty, trimmed != boundName else { continue }
-            throw AgentSwarmError.invalidRequest(
-                "agent_swarm cannot choose its own model: it runs on the model picked for Work"
-                    + (boundName.isEmpty ? "" : " (\(boundName))")
-                    + ". Remove model/models/synthesisModel/per-worker model, or change the Work group in Providers."
-                    + " Requested: \(trimmed). No workers were started."
-            )
-        }
-    }
-
-    /// Validate both spellings so a malformed alias cannot silently disappear.
+    /// Validate the current Think field before work starts.
     private static func parseEffort(
         _ input: [String: JSONValue],
         defaultEffort: String,
         supportedEfforts: [String]
     ) throws -> String {
         var selected: String?
-        for key in ["reasoningEffort", "reasoning_effort"] {
+        for key in ["reasoning_effort"] {
             guard let value = input[key], value != .null else { continue }
             guard case .string(let raw) = value else {
                 throw AgentSwarmError.invalidRequest("agent_swarm \(key) must be text, null, or omitted. No workers were started.")
@@ -372,35 +342,26 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
             }
             if selected == nil { selected = effort }
         }
-        return selected ?? defaultEffort
+        let effort = selected ?? defaultEffort
+        guard supportedEfforts.contains(effort) else {
+            throw AgentSwarmError.invalidRequest("The Work model's saved Think level '\(effort)' is not in its catalog. Choose a supported level in Providers. No workers were started.")
+        }
+        return effort
     }
 
     private static func workerAccess(
         _ input: [String: JSONValue],
         fallback: String = "read_only"
     ) throws -> String {
-        for key in ["access", "workerAccess", "worker_access"] {
-            guard let value = input[key], value != .null else { continue }
-            guard case .string(let raw) = value else {
-                throw AgentSwarmError.invalidRequest("agent_swarm \(key) must be a worker access string")
-            }
-            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if normalized.isEmpty { continue }
-            switch normalized {
-            case "inherit", "auto", "tools", "tool_capable", "tool-capable", "workspace", "full":
-                return "inherit"
-            case "read_only", "readonly", "read-only", "reasoning":
-                return "read_only"
-            default:
-                throw AgentSwarmError.invalidRequest("agent_swarm \(key) is not a recognized worker access mode; use read_only or inherit")
-            }
+        guard let value = input["access"], value != .null else { return fallback }
+        guard case .string(let raw) = value else {
+            throw AgentSwarmError.invalidRequest("agent_swarm access must be a worker access string")
         }
-        for key in ["readOnly", "read_only"] {
-            guard let value = input[key], value != .null else { continue }
-            if case .string(let raw) = value, raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
-            return boolValue(value, defaultValue: true) ? "read_only" : "inherit"
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "inherit", "read_only": return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        default:
+            throw AgentSwarmError.invalidRequest("agent_swarm access is not a recognized worker access mode; use read_only or inherit")
         }
-        return fallback
     }
 
     static func firstPresent(_ input: [String: JSONValue], keys: [String]) -> JSONValue? {
@@ -417,15 +378,6 @@ public struct AgentSwarmRunRequest: Sendable, Equatable {
             if !trimmed.isEmpty { return trimmed }
         }
         return nil
-    }
-
-    static func stringArray(_ value: JSONValue?) -> [String] {
-        guard case .array(let vals)? = value else { return [] }
-        return vals.compactMap { val in
-            guard case .string(let raw) = val else { return nil }
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }
     }
 
     static func intValue(_ value: JSONValue?) -> Int? {

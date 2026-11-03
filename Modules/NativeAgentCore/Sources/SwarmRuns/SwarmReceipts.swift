@@ -45,7 +45,7 @@ public struct AgentSwarmSummary: Sendable, Equatable {
 
 public struct AgentSwarmSynthesis: Sendable, Equatable {
     public var model: String
-    public var status: String
+    public var status: AgentSwarmSynthesisStatus
     public var output: String
     public var outputTruncated: Bool
     public var error: String?
@@ -54,7 +54,7 @@ public struct AgentSwarmSynthesis: Sendable, Equatable {
     public var json: JSONValue {
         var obj: [String: JSONValue] = [
             "model": .string(model),
-            "status": .string(status),
+            "status": .string(status.rawValue),
             "output": .string(output),
             "outputTruncated": .bool(outputTruncated),
             "durationSeconds": .double(durationSeconds),

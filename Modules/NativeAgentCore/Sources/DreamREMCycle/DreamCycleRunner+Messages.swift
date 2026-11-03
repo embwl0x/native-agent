@@ -14,9 +14,8 @@ extension DreamCycleRunner {
     /// Merge user/assistant messages from EVERY session whose createdAt is after
     /// `mark`, then SAMPLE them into the `convCountLimit` / `convCharBudget`
     /// budget: reach across sessions first, then weight by what carried feeling.
-    /// Per-row timestamp prefers the row's `createdAt`, falling back to the
-    /// file's mtime for legacy rows that lack it (so old-shape JSONL still
-    /// orders + dedups). Returns the picked messages (chronological) plus the
+    /// Per-row occurrence time is the transcript's checked `createdAt`.
+    /// Returns the picked messages (chronological) plus the
     /// newest timestamp in the window (the next mark). Tool/system rows excluded.
     ///
     /// `feltRank` is the rank of a felt node's origin in the substrate's
@@ -64,7 +63,9 @@ extension DreamCycleRunner {
                     fromTranscriptRow: parsed,
                     sessionId: sid
                 ) {
-                    let coveredThrough = recollection.consolidatedThrough ?? mtime
+                    guard let coveredThrough = recollection.consolidatedThrough else {
+                        throw PersistenceCoreError.ioFailure("Recollection occurrence time unavailable at \(url.path); preserve and repair its source coverage before dreaming it")
+                    }
                     if coveredThrough <= mark { continue }
                     // Reject recollections straddling the mark to avoid dreaming consumed material twice.
                     if ChatSessionRecollections.straddles(recollection, mark: mark) {
@@ -108,12 +109,9 @@ extension DreamCycleRunner {
                 }
                 let runID: String? = if case .string(let id)? = obj["runId"], !id.isEmpty { id } else { nil }
                 let lived = !CognitiveMechanicalRowKind.marksMechanicalRow(metadata)
-                let at: Date = {
-                    if let p = ChatSessionRecollections.parseTimestamp(obj["createdAt"]) {
-                        return p
-                    }
-                    return mtime
-                }()
+                guard let at = ChatSessionRecollections.parseTimestamp(obj["createdAt"]) else {
+                    throw PersistenceCoreError.ioFailure("Transcript occurrence time unavailable at \(url.path); preserve and repair its createdAt before dreaming it")
+                }
                 // Keep admitted origins until exchanges are formed. A new
                 // reply can belong to an origin just before the watermark.
                 all.append(Row(at: at, sid: sid, mid: messageId, runID: runID, role: role, content: content,

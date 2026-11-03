@@ -24,7 +24,7 @@ Checks live NativeAgent organism health through:
   - NativeAgentApp process
   - local bridge /codex/state
   - persisted data/cognition/organism_state.json
-  - optional iOS organism_living_status.json snapshot
+  - canonical data-root iOS organism_living_status.json snapshot
 
 Environment overrides:
   NATIVE_AGENT_BRIDGE_URL
@@ -32,6 +32,10 @@ Environment overrides:
   NATIVE_AGENT_DATA_ROOT
   NATIVE_AGENT_ORGANISM_STATE_PATH
   NATIVE_AGENT_ORGANISM_IOS_SNAPSHOT
+
+NATIVE_AGENT_ORGANISM_IOS_SNAPSHOT selects an explicit diagnostic file; it
+does not establish the active phone snapshot's health. Without that override,
+only DATA_ROOT/mobile_snapshot_cache/snapshots/organism_living_status.json is read.
 
 The default (and --strict) exits nonzero when any check reports FAIL; warnings
 stay diagnostic.  --lenient prints the same report but always exits zero after
@@ -78,35 +82,6 @@ state_json() {
     -H "Authorization: Bearer $TOKEN" \
     -H "Accept: application/json" \
     "$BASE_URL/codex/state" >"$out"
-}
-
-find_ios_snapshot() {
-  if [ -n "$IOS_SNAPSHOT_PATH" ]; then
-    printf '%s\n' "$IOS_SNAPSHOT_PATH"
-    return 0
-  fi
-  # The resident Mac runtime's cache is the canonical local projection of the
-  # iOS snapshot. Prefer it deterministically; Spotlight ordering is undefined
-  # and previously selected a 2023 test fixture while fresh live data existed.
-  local cached="$DATA_ROOT/mobile_snapshot_cache/snapshots/organism_living_status.json"
-  if [ -f "$cached" ]; then
-    printf '%s\n' "$cached"
-    return 0
-  fi
-  if command -v mdfind >/dev/null 2>&1; then
-    local candidate
-    while IFS= read -r candidate; do
-      [ -n "$candidate" ] || continue
-      case "$candidate" in
-        "$REPO_ROOT"/tests/*|"$REPO_ROOT"/Tests/*|"$REPO_ROOT"/Modules/*/Tests/*)
-          continue
-          ;;
-      esac
-      printf '%s\n' "$candidate"
-      return 0
-    done < <(mdfind 'kMDItemFSName == "organism_living_status.json"' 2>/dev/null || true)
-  fi
-  return 1
 }
 
 bool_status() {
@@ -175,7 +150,7 @@ if [ "$bridge_rc" -eq 0 ]; then
   providers="$(jq -r '.organism.bodySchema.providersHealthy // false' "$state_file")"
   tools="$(jq -r '.organism.bodySchema.toolHandsAvailable // false' "$state_file")"
   phone="$(jq -r '.organism.bodySchema.iPhoneReachable // false' "$state_file")"
-  notifications="$(jq -r '.organism.bodySchema.notificationPathHealthy // false' "$state_file")"
+  notifications="$(jq -r '.organism.bodySchema.notificationPathHealthy | if type == "boolean" then tostring else "unknown" end' "$state_file")"
   approvals="$(jq -r '.organism.bodySchema.approvalChannelsOpen // false' "$state_file")"
   memory="$(jq -r '.organism.bodySchema.memoryHealthy // false' "$state_file")"
   resource="$(jq -r '.organism.bodySchema.resourcePressure // "unknown"' "$state_file")"
@@ -200,7 +175,9 @@ if [ "$bridge_rc" -eq 0 ]; then
   bool_status "$approvals" "approval path open" "false; expect approval-bound posture"
   bool_status "$memory" "memory healthy" "false; expect context-first posture"
   if [ "$phone" = "true" ] && [ "$notifications" = "true" ]; then
-    status PASS "phone/notification path" "reachable"
+    status PASS "phone/notification path" "reachable; notification receipt observed"
+  elif [ "$notifications" = "unknown" ]; then
+    status INFO "phone/notification path" "phone=$phone notification delivery unknown; reachability is not delivery evidence"
   else
     status WARN "phone/notification path" "phone=$phone notifications=$notifications; expect receipt-required posture"
   fi
@@ -240,8 +217,14 @@ else
 fi
 
 section "iOS Snapshot"
-snapshot_path="$(find_ios_snapshot || true)"
-if [ -n "$snapshot_path" ] && [ -f "$snapshot_path" ]; then
+if [ -n "$IOS_SNAPSHOT_PATH" ]; then
+  snapshot_path="$IOS_SNAPSHOT_PATH"
+  status INFO "snapshot source" "explicit diagnostic file; not active phone health evidence"
+else
+  snapshot_path="$DATA_ROOT/mobile_snapshot_cache/snapshots/organism_living_status.json"
+  status INFO "snapshot source" "canonical cache for dataRoot=$DATA_ROOT"
+fi
+if [ -f "$snapshot_path" ]; then
   if jq empty "$snapshot_path" >/dev/null 2>&1; then
     generated="$(jq -r '.generatedAt // "unknown"' "$snapshot_path")"
     ios_posture="$(jq -r '.posture // "unknown"' "$snapshot_path")"
@@ -259,7 +242,7 @@ if [ -n "$snapshot_path" ] && [ -f "$snapshot_path" ]; then
     status FAIL "organism_living_status" "found but invalid JSON: $snapshot_path"
   fi
 else
-  status INFO "organism_living_status" "source absent; set NATIVE_AGENT_ORGANISM_IOS_SNAPSHOT to inspect iOS snapshot directly"
+  status WARN "organism_living_status" "unavailable at $snapshot_path; no other snapshot is substituted"
 fi
 
 section "Next Troubleshooting Step"

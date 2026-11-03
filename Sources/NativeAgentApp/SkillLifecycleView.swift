@@ -95,12 +95,7 @@ struct SkillLifecycleView: View {
     @State private var readerTarget: String?
 
     private var skills: [SkillRecord] {
-        appModel.engine.tools.skills.map { record in
-            var skill = record
-            if skill.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { skill.id = skill.name }
-            if skill.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { skill.name = skill.id }
-            return skill
-        }
+        appModel.engine.tools.skills
     }
 
     private var searchResults: SkillLifecycleSearchPresentation.Results {
@@ -265,7 +260,7 @@ struct SkillSourceSheet: View {
                 if let source = info.body {
                     BoundedSkillText(text: source, limit: 4_000)
                 } else {
-                    Text("This guidance has no text to show.")
+                    Text(info.status == "unavailable" ? info.description : "This guidance has no text to show.")
                 }
             }
         }

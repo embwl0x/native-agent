@@ -4,7 +4,7 @@ import Speech
 import PhotosUI
 import NativeAgentShared
 import UniformTypeIdentifiers
-// Blueprint: | `ChatView+Choices.swift` | Mac-owned model configuration and chat option controls on ChatView |
+// Blueprint: | `ChatView+Choices.swift` | Mac-owned model configuration and chat option controls on ChatView; omits the unenforced No files choice |
 
 extension ChatView {
     // Every model control reads the shared Mac-owned tuple, including receipts.
@@ -86,8 +86,11 @@ extension ChatView {
                         }
                     }
                 } label: {
-                    controlPill("Thinking", title: reasoningLabel(selectedReasoningEffort))
+                    controlPill("Thinking", title: reasoningOptions.isEmpty
+                        ? (selectedModelInfo?.supported_reasoning_efforts?.isEmpty == true ? "Not supported" : "Unavailable — refresh models")
+                        : reasoningLabel(selectedReasoningEffort))
                 }
+                .disabled(reasoningOptions.isEmpty)
 
                 AliveDivider()
                 Menu {
@@ -206,10 +209,10 @@ extension ChatView {
     }
 
     private var reasoningOptions: [ReasoningEffortOption] {
-        let supported = selectedModelInfo?.supported_reasoning_efforts
-        let all = defaultReasoningEffortOptions
-        return NativeAgentShared.reasoningOptions(available: supported?.isEmpty == false ? all : Array(all.prefix(4)),
-            supported: supported, id: { $0.id })
+        let labels = Dictionary(uniqueKeysWithValues: defaultReasoningEffortOptions.map { ($0.id, $0) })
+        return (selectedModelInfo?.supported_reasoning_efforts ?? []).map { effort in
+            labels[effort] ?? ReasoningEffortOption(id: effort, label: effort.capitalized)
+        }
     }
 
     private var selectedModelInfo: ProviderModelInfo? {
@@ -224,12 +227,17 @@ extension ChatView {
     }
 
     private var fileAccessOptions: [(id: String, label: String, icon: String)] {
-        [
-            ("auto", "Auto", "wand.and.stars"),
-            ("read_only", "Read only", "eye"),
-            ("workspace", "Workspace", "folder"),
-            ("full", "Full Mac", "bolt.trianglebadge.exclamationmark")
-        ]
+        // `none` remains a recognized wire value, but the current file gate
+        // cannot enforce it for every file tool. Do not offer that promise.
+        ICloudChatFileAccessPolicy.Mode.allCases.compactMap { mode -> (id: String, label: String, icon: String)? in
+            switch mode {
+            case .auto: (mode.rawValue, "Auto", "wand.and.stars")
+            case .readOnly: (mode.rawValue, "Read only", "eye")
+            case .workspace: (mode.rawValue, "Workspace", "folder")
+            case .full: (mode.rawValue, "Full Mac", "bolt.trianglebadge.exclamationmark")
+            case .none: nil
+            }
+        }
     }
 
     private func modelLabel(_ id: String) -> String {
@@ -250,6 +258,6 @@ extension ChatView {
 
     private func fileAccessLabel(_ id: String) -> String {
         let normalized = ChatRuntimeControlPresentation.normalizedFileAccessID(id)
-        return fileAccessOptions.first(where: { $0.id == normalized })?.label ?? "Auto"
+        return fileAccessOptions.first(where: { $0.id == normalized })?.label ?? "Unavailable file access"
     }
 }

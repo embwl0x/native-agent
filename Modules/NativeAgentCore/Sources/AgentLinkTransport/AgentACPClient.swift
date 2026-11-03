@@ -1,6 +1,7 @@
 import Darwin
 import Dispatch
 import Foundation
+import Experiences
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
@@ -47,6 +48,17 @@ public actor AgentACPClient {
         package let detail: String
     }
 
+    /// No permission decision was available. This is not a refusal by the
+    /// person; the original owner error and any cancellation-write error stand.
+    package struct PermissionUnavailable: Error, LocalizedError {
+        package let cause: any Error
+        package var settlementFailure: String? = nil
+        package var errorDescription: String? {
+            "The permission decision was unavailable: \(cause.localizedDescription). Completion is unconfirmed; do not resend automatically."
+                + (settlementFailure.map { " Peer cancellation was not confirmed: " + $0 } ?? "")
+        }
+    }
+
     /// Only startup timeouts can prove that no prompt write was attempted.
     package static func startupTimeoutReceipt(_ error: any Error) -> [String: JSONValue]? {
         guard let failure = error as? Failure else { return nil }
@@ -66,7 +78,16 @@ public actor AgentACPClient {
     private var processID: pid_t = 0
     private let input = Pipe()
     private let output = Pipe()
-    private var pending: [Int64: CheckedContinuation<JSONValue, Error>] = [:]
+    private final class PendingRequest {
+        let done = ScopedWaiter()
+        var result: Result<JSONValue, Error>?
+    }
+    private var pending: [Int64: PendingRequest] = [:]
+
+    private func complete(_ request: PendingRequest, _ result: Result<JSONValue, Error>) {
+        request.result = result
+        request.done.resume()
+    }
     private var permissions: [String: (JSONValue, Task<Void, Never>)] = [:]
     private var nextID: Int64 = 0
     private var sessionID: String?
@@ -85,7 +106,8 @@ public actor AgentACPClient {
     private var started = false
     private var closing = false
     private var tree: ProcessTreeSnapshot?
-    private var cleanup: Task<Void, Never>?
+    private var cleanup: Task<String?, Never>?
+    private var terminationFailure: String?
     private var requiredMode: String?
     private var deniedPermission = false
     private var prompting = false
@@ -98,7 +120,8 @@ public actor AgentACPClient {
     /// The mode ids the agent advertised when this session opened.
     private var advertised: [String]?
 
-    package init() {}
+    package nonisolated let dataRoot: URL
+    package init(dataRoot: URL) { self.dataRoot = dataRoot.standardizedFileURL }
 
     /// The peer said at initialize it can reopen a session by id.
     var canRestoreSession: Bool {
@@ -233,9 +256,18 @@ public actor AgentACPClient {
         } catch {
             let reportedError: any Error = (error as? Failure == .timedOut && !prompting) ? startupTimeout : error
             shutdown()
-            await cleanup?.value
+            await retainCleanupResult()
             reader?.cancel()
             try? output.fileHandleForReading.close()
+            if let terminationFailure {
+                if var unavailable = reportedError as? PermissionUnavailable {
+                    unavailable.settlementFailure = [unavailable.settlementFailure, terminationFailure].compactMap { $0 }.joined(separator: "; ")
+                    throw unavailable
+                }
+                throw ToolFailureError(reportedError.localizedDescription + " " + terminationFailure, effects: .unknown,
+                    owner: "ACP process group", code: "process_termination_incomplete",
+                    instruction: "Reconcile the original run and repair its retained process group before sending again.", recovery: .repair)
+            }
             throw reportedError
         }
     }
@@ -314,6 +346,10 @@ public actor AgentACPClient {
                                     environment: environment, approvedExecutable: approvedExecutable, timeout: timeout)
             } onCancel: { Task { await self.cancel(error: CancellationError()) } }
             await close()
+            if let terminationFailure {
+                throw ToolFailureError(terminationFailure, effects: .unknown, owner: "ACP process group",
+                    code: "process_termination_incomplete", instruction: "Repair the retained process group before reconnecting.", recovery: .repair)
+            }
             return result
         } catch { await close(); throw error }
     }
@@ -345,9 +381,19 @@ public actor AgentACPClient {
     func close(_ error: Failure = .interrupted) async {
         cancel(error: error)
         shutdown()
-        await cleanup?.value
+        await retainCleanupResult()
         reader?.cancel()
         try? output.fileHandleForReading.close()
+    }
+
+    private func retainCleanupResult() async {
+        guard let detail = await cleanup?.value else { return }
+        terminationFailure = detail
+        await RepairOwed.owe(dataRoot,
+            id: "acp-termination:" + String(processID), kind: .act,
+            operation: "agent.acp.termination:" + String(processID), owner: "ACP process group " + String(processID),
+            words: detail,
+            lever: "Reconcile the original agent run and repair the retained process group before reconnecting or repeating its work.").value
     }
 
     private func request(_ method: String, _ params: [String: JSONValue]) async throws -> JSONValue {
@@ -357,12 +403,14 @@ public actor AgentACPClient {
         let id = nextID
         if method == "session/new" { newSessionRequestID = id }
         do {
-            return try await withCheckedThrowingContinuation { continuation in
-                pending[id] = continuation
-                do { try write(.object(["jsonrpc": .string("2.0"), "id": .int(id),
-                                       "method": .string(method), "params": .object(params)])) }
-                catch { fail(error) }
-            }
+            let request = PendingRequest()
+            pending[id] = request
+            do { try write(.object(["jsonrpc": .string("2.0"), "id": .int(id),
+                                   "method": .string(method), "params": .object(params)])) }
+            catch { fail(error) }
+            let done = request.done
+            await Task { await done.park() }.value
+            return try request.result!.get()
         } catch let refused as Mismatch { throw Mismatch(method: method, code: refused.code, detail: refused.detail) }
     }
 
@@ -428,7 +476,7 @@ public actor AgentACPClient {
                 }
                 return
             }
-            guard case .int(let id)? = object["id"], let continuation = pending.removeValue(forKey: id) else {
+            guard case .int(let id)? = object["id"], let request = pending.removeValue(forKey: id) else {
                 throw Failure.invalidResponse
             }
             if let error = object["error"] {
@@ -437,17 +485,17 @@ public actor AgentACPClient {
                 if !prompting {
                     let code: Int64? = if case .int(let code)? = error.objectValue?["code"] { code } else { nil }
                     let said: String = if case .string(let said)? = error.objectValue?["message"] { said } else { detail }
-                    continuation.resume(throwing: Mismatch(method: "", code: code, detail: said + (code.map { " (\($0))" } ?? "")))
+                    complete(request, .failure(Mismatch(method: "", code: code, detail: said + (code.map { " (\($0))" } ?? ""))))
                     return
                 }
-                continuation.resume(throwing: ProviderFailure.Report(cause: .wire(detail), work: .outcomeUnknown))
+                complete(request, .failure(ProviderFailure.Report(cause: .wire(detail), work: .outcomeUnknown)))
             } else if let result = object["result"], result.objectValue != nil {
                 if id == newSessionRequestID, case .string(let session)? = result.objectValue?["sessionId"] {
                     sessionID = session
                 }
-                continuation.resume(returning: result)
+                complete(request, .success(result))
             } else {
-                continuation.resume(throwing: Failure.invalidResponse)
+                complete(request, .failure(Failure.invalidResponse))
             }
         } catch { fail(error) }
     }
@@ -496,9 +544,19 @@ public actor AgentACPClient {
         }
         let request = JSONValue.object(preview)
         let task = Task { [weak self, permission] in
-            let approved = (try? await permission?(request)) == true
-            guard !Task.isCancelled else { return }
-            await self?.permissionResult(key: key, selection: approved ? allow : deny, allowed: approved && allow != nil)
+            do {
+                guard let permission else {
+                    throw ToolFailureError("The ACP permission service is not mounted.", effects: .unknown,
+                        owner: "ACP permission service", tap: "Open NativeAgent", code: "agent_acp_permission_owner_unavailable",
+                        instruction: "Repair the permission service before starting another peer turn.")
+                }
+                let approved = try await permission(request)
+                guard !Task.isCancelled else { return }
+                await self?.permissionResult(key: key, selection: approved ? allow : deny, allowed: approved && allow != nil)
+            } catch {
+                guard !Task.isCancelled else { return }
+                await self?.permissionUnavailable(key: key, cause: error)
+            }
         }
         permissions[key] = (id, task)
     }
@@ -507,6 +565,11 @@ public actor AgentACPClient {
         guard failure == nil, let (id, _) = permissions.removeValue(forKey: key) else { return }
         if !allowed { deniedPermission = true }
         do { try respondPermission(id: id, selection: selection) } catch { fail(error) }
+    }
+
+    private func permissionUnavailable(key: String, cause: any Error) {
+        guard failure == nil, permissions[key] != nil else { return }
+        cancel(error: PermissionUnavailable(cause: cause))
     }
 
     private func respondPermission(id: JSONValue, selection: JSONValue?) throws {
@@ -524,16 +587,25 @@ public actor AgentACPClient {
         return true
     }
 
-    private func cancelSession(notify: (JSONValue) throws -> Void) rethrows {
+    private func cancelSession(notify: (JSONValue) throws -> Void) throws {
+        var errors: [String] = []
         if let sessionID {
-            try notify(.object(["jsonrpc": .string("2.0"), "method": .string("session/cancel"),
-                                "params": .object(["sessionId": .string(sessionID)])]))
+            do {
+                try notify(.object(["jsonrpc": .string("2.0"), "method": .string("session/cancel"),
+                                    "params": .object(["sessionId": .string(sessionID)])]))
+            } catch { errors.append("session/cancel: " + error.localizedDescription) }
         }
         for (_, (id, task)) in permissions {
             task.cancel()
-            try? respondPermission(id: id, selection: nil)
+            do { try respondPermission(id: id, selection: nil) }
+            catch { errors.append("permission cancellation: " + error.localizedDescription) }
         }
         permissions.removeAll()
+        guard errors.isEmpty else {
+            throw ToolFailureError(errors.joined(separator: "; "), effects: .unknown,
+                owner: "ACP connection", tap: "Agents → open the contact's conversation",
+                code: "agent_acp_cancellation_unconfirmed", instruction: "Inspect the original peer turn before sending again.", recovery: .reconcile)
+        }
     }
 
     /// A timer whose sleep finished just as its phase answered must not kill
@@ -545,7 +617,18 @@ public actor AgentACPClient {
 
     private func cancel(error: any Error) {
         guard failure == nil else { return }
-        cancelSession { try? write($0) }
+        do { try cancelSession(notify: write) }
+        catch let settlementError {
+            if var unavailable = error as? PermissionUnavailable {
+                unavailable.settlementFailure = settlementError.localizedDescription
+                fail(unavailable)
+            } else {
+                fail(ToolFailureError(error.localizedDescription + " Peer cancellation was not confirmed: " + settlementError.localizedDescription,
+                    effects: .unknown, owner: "ACP connection", tap: "Agents → open the contact's conversation",
+                    code: "agent_acp_cancellation_unconfirmed", instruction: "Inspect the original peer turn before sending again.", recovery: .reconcile))
+            }
+            return
+        }
         fail(error)
     }
 
@@ -554,7 +637,7 @@ public actor AgentACPClient {
         failure = error
         let waiting = pending.values
         pending.removeAll()
-        for continuation in waiting { continuation.resume(throwing: error) }
+        for request in waiting { complete(request, .failure(error)) }
         shutdown()
     }
 
@@ -677,11 +760,11 @@ package actor AgentACPConnections {
     }
     private var entries: [String: Entry] = [:]
 
-    package func acquire(peer: String, conversation: String?, configuration: String) async throws -> Lease {
+    package func acquire(peer: String, conversation: String?, configuration: String, dataRoot: URL) async throws -> Lease {
         let key = peer + ":" + (conversation ?? UUID().uuidString)
         if let entry = entries[key] {
             guard !entry.busy else { throw AgentACPClient.Failure.busy }
-            if entry.configuration == configuration {
+            if entry.configuration == configuration, entry.client.dataRoot == dataRoot.standardizedFileURL {
                 entry.expiry?.cancel()
                 let generation = UUID()
                 entries[key]?.busy = true
@@ -709,7 +792,7 @@ package actor AgentACPConnections {
             }
         }
         guard entries.count < 8 else { throw AgentACPClient.Failure.busy }
-        let client = AgentACPClient()
+        let client = AgentACPClient(dataRoot: dataRoot)
         entries[key] = Entry(client: client, configuration: configuration, busy: true)
         return Lease(key: key, generation: entries[key]!.generation, client: client)
     }
@@ -731,11 +814,11 @@ package actor AgentACPConnections {
         return true
     }
 
-    /// The turn running for this contact's conversation (or its only running
-    /// turn, for a first message whose session id is not known yet).
+    /// A supplied conversation identifies exactly one running turn. A first
+    /// send without its session id is cancelled by its own running task/lease.
     package func cancelTurn(peer: String, conversation: String?) async -> Bool {
         let busy = entries.filter { $0.value.busy && $0.key.hasPrefix(peer + ":") }
-        guard let entry = conversation.flatMap({ busy[peer + ":" + $0] }) ?? (busy.count == 1 ? busy.first?.value : nil) else { return false }
+        guard let conversation, let entry = busy[peer + ":" + conversation] else { return false }
         return await entry.client.requestCancel()
     }
 

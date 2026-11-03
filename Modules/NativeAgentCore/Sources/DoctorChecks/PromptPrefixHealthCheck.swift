@@ -46,9 +46,6 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
     private let maximumDayFiles = 7
     /// How many offending turnIds to name before summarizing.
     private let maximumNamedTurns = 5
-    /// A non-first turn creating more than this many cache tokens did not
-    /// reuse the prefix — it rebuilt it.
-    private let creationBreakTokens = 3_000
     /// Tolerance: one violation per session per day is noise (a model swap, a
     /// provider-side eviction, a clock skew). More than that is drift.
     private let toleratedPerSessionDay = 1
@@ -84,10 +81,9 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         var at: Date
         var cacheRead: Int?
         var cacheCreation: Int?
-        var windowSlid: Bool
+        var historyContextWindow: String?
         var fingerprint: String?
-        /// One digest per cacheable-prefix message; empty on rows written
-        /// before the receipt existed, which fall back to the fingerprint rule.
+        /// One digest per cacheable-prefix message. Missing evidence is ungraded.
         var prefixDigests: [String] = []
         var volatileChars: Int?
         var toolFingerprint: String?
@@ -131,13 +127,16 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         var toolFingerprints: [String: String] = [:]        // turnId → tool schema sha
         var providerTokens: [String: ProviderTokens] = [:]  // provider → v2 token sums
         var v2CallCount = 0
-        var v1CallCount = 0
         var unshapedCallCount = 0
         var ignoredSurfaces = 0
         var ignoredSmallCalls = 0
 
         let moment = Date()
-        let window = DoctorWindowFloor.resolve(root: root, now: moment)
+        guard let window = DoctorWindowFloor.resolve(root: root, now: moment) else {
+            return CheckResult(source: root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename).path,
+                id: id, title: title, status: "unmeasured",
+                detail: "This launch's build stamp is unavailable or invalid. Repair build_launch.json through the app launch owner before measuring this build.")
+        }
         let summary = await TurnTraceWindowReader.scan(
             root: root,
             now: moment,
@@ -177,9 +176,6 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 switch shape {
                 case "v2Prefix":
                     v2CallCount += 1
-                case "v1Legacy":
-                    v1CallCount += 1
-                    return
                 default:
                     // Automatic-cache lanes need usage counters, not Anthropic's shape receipt.
                     unshapedCallCount += 1
@@ -193,7 +189,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     at: row.ts,
                     cacheRead: payload["cacheReadInputTokens"]?.intValue,
                     cacheCreation: payload["cacheCreationInputTokens"]?.intValue,
-                    windowSlid: payload["windowSlid"]?.boolValue ?? false,
+                    historyContextWindow: payload["historyContextWindow"]?.stringValue,
                     fingerprint: payload["prefixFingerprintSHA256"]?.stringValue,
                     prefixDigests: Self.stringArray(payload["prefixMessageDigests"]),
                     volatileChars: payload["volatileBlockChars"]?.intValue,
@@ -226,7 +222,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         let coverageDetail = summary.coverageDetail
 
         let shapeLine = shapeMixLine(
-            v2: v2CallCount, v1: v1CallCount, unshaped: unshapedCallCount
+            v2: v2CallCount, unshaped: unshapedCallCount
         ) + "; ignored \(ignoredSurfaces) calls outside chat and \(ignoredSmallCalls) chat calls"
             + " below \(minimumCacheInputTokens) input tokens (too small to judge cache reuse)"
 
@@ -307,6 +303,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         var driftExplainedByTools = 0
         var creationBreaks: [(turnId: String, tokens: Int)] = []
         var unjudgedFirstCalls = 0
+        var unmeasuredPrefixPairs = 0
         var exemptSlid = 0
         var exemptToolChange = 0
         // Cache expiry and changed stable blocks exempt rebuilt turns from drift.
@@ -326,6 +323,9 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 // Automatic prefix caching promises neither a hit on each turn nor a creation receipt.
                 guard turn.provider.lowercased().contains("anthropic") else { continue }
                 let previous = turns[index - 1]
+                let recollectionChanged = turn.historyContextWindow != nil
+                    && previous.historyContextWindow != nil
+                    && turn.historyContextWindow != previous.historyContextWindow
                 let toolsChanged: Bool = {
                     guard let now = turn.toolFingerprint, let before = previous.toolFingerprint
                     else { return false }
@@ -335,7 +335,9 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 var violated = false
                 // The previous turn's LAST request is what this one could read.
                 let previousLast = (callsByTurn[previous.turnId] ?? [previous]).max { $0.at < $1.at } ?? previous
-                let rebuilt = turn.cacheRead == 0 || (turn.cacheCreation ?? 0) > creationBreakTokens
+                // Rebuilt: read under the floor share of what the previous request cached. Creation alone is growth.
+                let cachedBefore = (previousLast.cacheRead ?? 0) + (previousLast.cacheCreation ?? 0)
+                let rebuilt = turn.cacheRead.map { $0 == 0 || Double($0) * 100 < Double(cachedBefore) * minimumAnthropicHitPercent } ?? false
                 // The longest breakpoint TTL is 1h; past it nothing is left to read.
                 if rebuilt, turn.at.timeIntervalSince(previousLast.at) > cacheTTLSeconds {
                     exemptExpired += 1
@@ -347,7 +349,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 }
 
                 // (a) cross-turn cache read.
-                if turn.windowSlid {
+                if recollectionChanged {
                     exemptSlid += 1
                 } else if toolsChanged {
                     exemptToolChange += 1
@@ -360,19 +362,16 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
 
                 // (b) prefix stability. The invariant is that this turn's
                 // cacheable prefix EXTENDS the previous turn's: the previous
-                // digest list is a prefix of this one. A whole-prefix hash
-                // moves every turn by construction (the last exchange is
-                // appended), so it is only consulted for rows written before
-                // the digest receipt existed.
-                let prefixMoved: Bool = {
+                // digest list is a prefix of this one. Missing receipts cannot
+                // establish whether a prefix moved.
+                let prefixMoved: Bool? = {
                     if !turn.prefixDigests.isEmpty, !previous.prefixDigests.isEmpty {
                         return !turn.prefixDigests.starts(with: previous.prefixDigests)
                     }
-                    guard let current = turn.fingerprint, let before = previous.fingerprint
-                    else { return false }
-                    return current != before
+                    return nil
                 }()
-                if prefixMoved, !turn.windowSlid {
+                if prefixMoved == nil { unmeasuredPrefixPairs += 1 }
+                if prefixMoved == true, !recollectionChanged {
                     if toolsChanged {
                         // A structured lane that legitimately reshaped its tool
                         // array reshapes the prefix with it. Counted and named,
@@ -384,9 +383,9 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     }
                 }
 
-                // (c) a non-first turn rebuilding the prefix.
-                if let created = turn.cacheCreation, created > creationBreakTokens {
-                    creationBreaks.append((turn.turnId, created))
+                // (c) a non-first turn rebuilding the prefix the previous request cached (cold reads are (a)'s).
+                if rebuilt, turn.cacheRead != 0, !recollectionChanged, !toolsChanged {
+                    creationBreaks.append((turn.turnId, cachedBefore - (turn.cacheRead ?? 0)))
                     violated = true
                 }
 
@@ -398,7 +397,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             $0 + max(0, $1 - toleratedPerSessionDay)
         }
 
-        // (e) per-provider hit rate, excluding the legacy Anthropic shape.
+        // (e) per-provider hit rate from admitted current observations.
         var providerLines: [String] = []
         var anthropicBelowFloor: [String] = []
         for (provider, tokens) in providerTokens.sorted(by: { $0.key < $1.key }) {
@@ -426,8 +425,8 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         )
         parts.append(
             driftTurns.isEmpty
-                ? "no unexplained Anthropic prefix fingerprint changes"
-                : "\(driftTurns.count) unexplained prefix fingerprint change(s)"
+                ? "no unexplained Anthropic prefix changes among measured receipt pairs"
+                : "\(driftTurns.count) unexplained prefix receipt change(s)"
                     + " (\(nameTurns(driftTurns)))"
         )
         if !creationBreaks.isEmpty {
@@ -438,8 +437,8 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                 .joined(separator: ", ")
             let overflow = creationBreaks.count - min(maximumNamedTurns, creationBreaks.count)
             parts.append(
-                "\(creationBreaks.count) non-first turn(s) created >\(creationBreakTokens)"
-                    + " cache tokens (\(named)\(overflow > 0 ? ", +\(overflow) more" : ""))"
+                "\(creationBreaks.count) non-first turn(s) read under \(Int(minimumAnthropicHitPercent))% of the prefix"
+                    + " the previous request cached (not reused: \(named)\(overflow > 0 ? ", +\(overflow) more" : ""))"
             )
         } else {
             parts.append("no non-first Anthropic turn rebuilt the prefix")
@@ -459,7 +458,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         }
         if exemptSlid > 0 || exemptToolChange > 0 || driftExplainedByTools > 0 || exemptExpired > 0 || exemptStableChange > 0 {
             parts.append(
-                "exempt: \(exemptSlid) windowSlid, \(exemptToolChange) tool-array change,"
+                "exempt: \(exemptSlid) recollection change, \(exemptToolChange) tool-array change,"
                     + " \(driftExplainedByTools) fingerprint change explained by a tool-array change,"
                     + " \(exemptExpired) after the 1h cache expired, \(exemptStableChange) after a changed stable system block"
             )
@@ -470,25 +469,28 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     + " and were UNJUDGED rather than counted as zero"
             )
         }
+        if unmeasuredPrefixPairs > 0 {
+            parts.append("\(unmeasuredPrefixPairs) Anthropic turn pair(s) lack prefix digest receipts; prefix stability is unmeasured for those pairs")
+        }
         parts.append(contentsOf: summary.coverageParts)
 
         var status = "ok"
-        var repair: String? = nil
+        var humanAction: String? = nil
         if excess > 0 {
             status = "fail"
             parts.append(
                 "\(excess) violation(s) above the tolerance of \(toleratedPerSessionDay)"
                     + " per session per day"
             )
-            repair = "Correct NativeAgent's prompt assembly so the identity block remains a strict prefix of the stable block and one cache breakpoint sits at the end of the stable mass (v2Prefix)."
+            humanAction = "Correct NativeAgent's prompt assembly so the identity block remains a strict prefix of the stable block and one cache breakpoint sits at the end of the stable mass (v2Prefix)."
         } else if !anthropicBelowFloor.isEmpty {
             status = "warn"
             parts.append(
                 "Anthropic lane(s) below the \(Int(minimumAnthropicHitPercent))% floor:"
                     + " \(anthropicBelowFloor.joined(separator: ", "))"
             )
-            repair = "Review NativeAgent's prompt assembly using volatileBlockChars and the stable mass for the affected Anthropic sessions to correct repeated prefix rebuilds."
-        } else if !summary.coverageParts.isEmpty || unjudgedFirstCalls > 0 {
+            humanAction = "Review NativeAgent's prompt assembly using volatileBlockChars and the stable mass for the affected Anthropic sessions to correct repeated prefix rebuilds."
+        } else if !summary.coverageParts.isEmpty || unjudgedFirstCalls > 0 || unmeasuredPrefixPairs > 0 {
             // Incomplete coverage or missing metrics cannot certify health.
             status = "unmeasured"
         }
@@ -497,7 +499,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             id: id, title: title, status: status,
             detail: parts.joined(separator: "; ") + ".",
             harm: DoctorSafeRepairPolicy.isAdverse(status) ? "Repeated prompt processing uses extra provider time and tokens." : nil,
-            repair: repair,
+            human_action: humanAction,
             // A measured miss is the prompt assembly's: the build fixes it.
             owner: DoctorSafeRepairPolicy.isAdverse(status) ? .builder : nil
         )
@@ -512,8 +514,8 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
     }
 
     /// Historical trace formats remain identifiable after the switch retires.
-    private func shapeMixLine(v2: Int, v1: Int, unshaped: Int) -> String {
-        return "shape mix over the window: v2Prefix=\(v2) call(s), v1Legacy=\(v1),"
+    private func shapeMixLine(v2: Int, unshaped: Int) -> String {
+        return "shape mix over the window: v2Prefix=\(v2) call(s),"
             + " no shapeVersion field=\(unshaped)"
     }
 

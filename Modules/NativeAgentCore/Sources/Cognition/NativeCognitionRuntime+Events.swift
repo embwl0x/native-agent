@@ -208,9 +208,9 @@ enum NativeCognitiveEventFactory {
            action.lowercased().contains("approval") {
             return CognitiveSubjectReference(type: "approval", id: id, label: action)
         }
-        if let executionId = firstValue(keys: ["missionId"], payload: payload, response: response) {
+        if let executionId = firstValue(keys: ["executionId"], payload: payload, response: response) {
             let stepId = firstValue(keys: ["stepId"], payload: payload, response: response)
-            return CognitiveSubjectReference(type: "mission_step", id: [executionId, stepId].compactMap { $0 }.joined(separator: ":"), label: action)
+            return CognitiveSubjectReference(type: "execution_step", id: [executionId, stepId].compactMap { $0 }.joined(separator: ":"), label: action)
         }
         if let proposalId = firstValue(keys: ["proposalId"], payload: payload, response: response) {
             return CognitiveSubjectReference(type: "memory_proposal", id: proposalId, label: action)
@@ -242,7 +242,7 @@ enum NativeCognitiveEventFactory {
         let keys = [
             "ok", "error", "code", "message", "detail",
             "provider_id", "providerId",
-            "approvalId", "missionId", "stepId",
+            "approvalId", "executionId", "stepId",
             "proposalId", "candidateId", "itemId", "actionId",
             "sessionId", "session_id", "sourceKey",
         ]

@@ -3,6 +3,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import Darwin
+import Experiences
 
 // Blueprint: | `AgentPeerReplayClaimStore.swift` | `AgentPeerReplayClaimStore`: principal/protocol/message digest claims and retained receipts; conflicting bytes refuse and prior-life unfinished claims do not resume |
 
@@ -67,13 +68,24 @@ public struct AgentPeerReplayClaimStore: Sendable {
     }
 
     /// A failed receipt write leaves the claim closed to another execution.
-    public func recordReceipt(key: String, digest: String, receipt: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys]),
-              let json = String(data: data, encoding: .utf8) else { return }
+    @discardableResult public func recordReceipt(key: String, digest: String, receipt: [String: Any]) -> String? {
         let url = fileURL(for: key)
-        try? withStoreLock {
-            guard let existing = try read(url), existing.digest == digest else { return }
-            try write(Record(lifeID: existing.lifeID, key: key, digest: digest, receipt: json, at: existing.at), to: url)
+        let root = directory.deletingLastPathComponent().deletingLastPathComponent()
+        let operation = "agent.claim.receipt:" + url.lastPathComponent
+        do {
+            let json = String(decoding: try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys]), as: UTF8.self)
+            try withStoreLock {
+                guard let existing = try read(url), existing.digest == digest else { throw CocoaError(.fileReadCorruptFile) }
+                try write(Record(lifeID: existing.lifeID, key: key, digest: digest, receipt: json, at: existing.at), to: url)
+            }
+            RepairOwed.settle(root, operation: operation, evidence: .init(source: url.path, id: digest))
+            return nil
+        } catch {
+            let detail = "The task was retained, but its replay locator could not be saved: \(error.localizedDescription). Repair the claim receipt from its retained task; do not repeat the work."
+            RepairOwed.owe(root, id: UUID().uuidString.lowercased(), kind: .message,
+                operation: operation, owner: url.path, words: detail,
+                lever: "Repair the exact claim receipt from retained task evidence.")
+            return detail
         }
     }
 

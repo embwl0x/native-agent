@@ -103,7 +103,7 @@ struct StandingBotsDisk: Sendable {
         switch bot.cadence {
         case .manual: return
         case .interval(let seconds):
-            let floor = validateCron ? BotRunLimits.minimumInterval : 60
+            let floor = validateCron ? try BotRunLimits.checkedMinimumInterval() : 60
             guard seconds.isFinite, seconds >= floor else {
                 throw ToolFailureError("The agent's bot cadence must be at least \(floor / 60) minutes.",
                     argumentPath: "$.cadence.interval.seconds", accepted: "A finite number of seconds at least \(floor).", effects: .none)
@@ -119,7 +119,8 @@ struct StandingBotsDisk: Sendable {
     /// scheduler's `nextRunEpochAfterNow(beyond:)`).
     static func nextOccurrence(_ bot: BotDefinition, after date: Date,
                                lastRunAt: Date? = nil, beyond due: Date? = nil,
-                               minimumInterval: TimeInterval = BotRunLimits.minimumInterval) throws -> Date {
+                               minimumInterval: TimeInterval? = nil) throws -> Date {
+        let minimumInterval = try minimumInterval ?? BotRunLimits.checkedMinimumInterval()
         switch bot.cadence {
         case .manual: return .distantFuture
         case .interval(let seconds): return date.addingTimeInterval(max(seconds, minimumInterval))

@@ -5,7 +5,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `AbilityCatalog.swift` | Checked inventory and redacted catalog projections |
+// Blueprint: | `AbilityCatalog.swift` | Checked inventory and redacted catalog projections; redacted accounting reuses the root's checked state identity without reserializing rows |
 extension AbilityStore {
     /// Presentation adapters share one checked inventory and accounting read.
     public func catalog() throws -> (files: [File], retained: [Slot: [String: File]], states: [String: JSONValue]) {
@@ -20,15 +20,16 @@ extension AbilityStore {
         try Self.withLock { try registry(catalog(), kind: kind) }
     }
     private func registry(_ catalog: (files: [File], retained: [Slot: [String: File]], states: [String: JSONValue]), kind: Kind?) throws -> JSONValue {
-        let bytes = try JSONValue.object(catalog.states).serializedData(pretty: false)
+        // catalog() just checked this root's identity under the same recursive lock.
+        let revision = Self.stateMemo[root.path]?.revision
         let stats: [String: JSONValue]
-        if let cached = Self.redactedAccounting, cached.bytes == bytes { stats = cached.rows }
+        if let revision, let cached = Self.redactedAccounting[root.path], cached.revision == revision { stats = cached.rows }
         else {
             guard case .object(let redacted) = Self.redactedEvidence(.object(catalog.states)) else {
                 throw Self.failure("Redacted ability accounting must remain an object.")
             }
             stats = redacted
-            Self.redactedAccounting = (bytes, stats)
+            if let revision { Self.redactedAccounting[root.path] = (revision, stats) }
         }
         // Typed registries retain their published-record selection; the
         // all-kind read also exposes unkept files, never as active records.

@@ -6,7 +6,7 @@ extension ChatStore {
     /// handoff. Receipts cover a crash between checkpoint and file deletion.
     func importSharedItems(controls: ChatRuntimeControls) {
         sharedInboxControls = controls
-        guard !isSwitchingSession, sharedInboxImportTask == nil else { return }
+        guard !isSwitchingSession, sharedInboxImportTask == nil, admitChatMutation() else { return }
         let generation = sessionSwitchGeneration
         sharedInboxImportTask = Task { [self] in
             defer {
@@ -25,9 +25,13 @@ extension ChatStore {
                     let retainedReceipt = receipts.contains(item.id.uuidString)
                     if !retainedReceipt {
                         if !queuedSends.contains(where: { $0.id == item.id }) {
+                            guard let pairing = item.pairingFingerprint else {
+                                errorBanner = "This shared item has no saved pairing. It remains in the shared inbox; share it again after connecting this iPhone."
+                                continue
+                            }
                             guard enqueueSend(QueuedChatSend(id: item.id, sessionID: selectedSessionID,
                                 text: item.text, controls: controls, attachments: item.attachments,
-                                createdAt: item.createdAt, pairingFingerprint: item.pairingFingerprint)) else { return }
+                                createdAt: item.createdAt, pairingFingerprint: pairing)) else { return }
                         }
                         receipts.insert(item.id.uuidString)
                         let savedReceipts = Array(receipts)

@@ -18,6 +18,7 @@ extension HazeColor {
     /// Its light shade, for light that travels on glass edges.
     var edgeLight: Color {
         switch self {
+        case .unavailable: .clear
         case .teal: Color(hex: 0xA0F0E4)
         case .blue: Color(hex: 0xAAC8FF)
         case .violet: Color(hex: 0xCDB9FF)

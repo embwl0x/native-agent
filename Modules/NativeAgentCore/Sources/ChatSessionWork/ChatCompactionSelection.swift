@@ -15,7 +15,7 @@ extension ChatSessionAutocompactor {
         trigger: String,
         thresholdTokensOverride: Int?,
         force: Bool
-    ) -> Begin {
+    ) async throws -> Begin {
         guard let sessionId = NativeAgentChatSessionID.normalizedPathComponent(rawSessionId) else {
             return .skip(skipped(
                 sessionId: rawSessionId,
@@ -24,7 +24,7 @@ extension ChatSessionAutocompactor {
             ))
         }
         let messagesPath = messagesPath(sessionId: sessionId)
-        let sourceBytesBefore = Self.fileSize(messagesPath)
+        let sourceBytesBefore = try Self.fileSize(messagesPath)
         guard sourceBytesBefore > 0 else {
             return .skip(skipped(
                 sessionId: sessionId,
@@ -32,19 +32,22 @@ extension ChatSessionAutocompactor {
                 trigger: trigger
             ))
         }
-        let modelThresholdTokens = config.effectiveThresholdTokens(
+        let modelThresholdTokens = try await config.effectiveThresholdTokens(
             forModel: model,
             providerID: providerID,
             dataRoot: dataRoot
         )
+        guard let window = config.effectiveWindowTokens(forModel: model, providerID: providerID, dataRoot: dataRoot) else {
+            throw ProviderRoutingError.configurationFailed("The selected model's context window is unavailable.")
+        }
         return .pass(Pass(
             sessionId: sessionId,
             messagesPath: messagesPath,
             sourceBytesBefore: sourceBytesBefore,
             thresholdTokens: thresholdTokensOverride
-                .map { max(1, min($0, modelThresholdTokens)) } ?? modelThresholdTokens,
-            windowTokens: modelThresholdTokens,
-            divisor: ContextBudgetPolicy.transcriptCharactersPerToken
+                .map { max(0, min($0, modelThresholdTokens)) } ?? modelThresholdTokens,
+            windowTokens: window,
+            model: model, providerID: providerID
         ))
     }
     /// One prefix replacement, split the way the durable write needs it.
@@ -56,21 +59,20 @@ extension ChatSessionAutocompactor {
         let pendingResults: [JSONValue]
         let preservedCards: [JSONValue]
         let removableRows: [JSONValue]
-        let preservedCount: Int
+        let preservedRows: Set<JSONValue>
         let rollsUpRecollections: Bool
-        init(rows: [JSONValue], replaceCount: Int, preserving preservedCount: Int = 0,
+        init(rows: [JSONValue], replaceCount: Int, preserving preservedRows: Set<JSONValue> = [],
              rollsUpRecollections: Bool = false) {
-            self.preservedCount = preservedCount
+            self.preservedRows = preservedRows
             self.rollsUpRecollections = rollsUpRecollections
             replaced = Array(rows.prefix(replaceCount))
             kept = Array(rows.suffix(rows.count - replaceCount))
             func retain(_ row: JSONValue) -> Bool {
-                ChatSessionAutocompactor.hasPendingDistillation(row)
+                preservedRows.contains(row) || ChatSessionAutocompactor.hasPendingDistillation(row)
                     || (!rollsUpRecollections && ChatSessionAutocompactor.isRecollection(row))
             }
-            retainedRows = Array(replaced.prefix(preservedCount))
-                + replaced.dropFirst(preservedCount).filter(retain)
-            foldingRows = replaced.dropFirst(preservedCount).filter { !retain($0) }
+            retainedRows = replaced.filter(retain)
+            foldingRows = replaced.filter { !retain($0) }
             // Preserve unanswered, retryable and resumable inline cards verbatim.
             let (results, compactible) = InlineInteractionCompactionRetention.splitPendingResults(foldingRows)
             let (cards, removable) = InlineInteractionCompactionRetention.split(compactible)
@@ -94,16 +96,25 @@ extension ChatSessionAutocompactor {
     /// What this pass would fold from `rows`, or why it folds nothing.
     func select(
         _ pass: Pass,
-        rows: [JSONValue],
+        rows storedRows: [JSONValue],
         trigger: String,
         force: Bool
-    ) throws -> Selection {
+    ) async throws -> Selection {
         let sessionId = pass.sessionId
-        let effectiveThresholdTokens = pass.thresholdTokens
-        let divisor = pass.divisor
-        let before = rows.count
-        let transcriptChars = Self.transcriptCharacterCount(rows)
-        let estimatedTokens = max(0, Int((Double(transcriptChars) / divisor).rounded()))
+        let before = storedRows.count
+        let transcriptChars = try Self.transcriptCharacterCount(storedRows)
+        let measurement = try await SessionContextMeasurement.read(rows: storedRows, sessionId: sessionId,
+            model: pass.model, providerID: pass.providerID, dataRoot: dataRoot, windowTokens: pass.windowTokens, requestBuilder: requestBuilder)
+        let effectiveThresholdTokens = min(pass.thresholdTokens, config.triggerTokens(in: pass.windowTokens, outputTokens: measurement.outputTokens))
+        let estimatedTokens = measurement.tokens
+        await emitContextSizeTrace(kind: "context.measurement", sessionId: sessionId,
+            payload: ["model": .string(pass.model), "source": .string(measurement.source),
+                "inputTokens": .int(Int64(estimatedTokens)), "outputTokens": .int(Int64(measurement.outputTokens)), "windowTokens": .int(Int64(pass.windowTokens)),
+                "thresholdTokens": .int(Int64(effectiveThresholdTokens)),
+                "targetTokens": .int(Int64(config.targetTokens(in: pass.windowTokens, outputTokens: measurement.outputTokens))),
+                "renderedCharacters": .int(Int64(measurement.renderedCharacters)),
+                "requestCharacters": .int(Int64(measurement.requestCharacters)),
+                "charactersPerToken": .double(measurement.charactersPerToken)])
         func skip(_ reason: String) -> Selection {
             .skip(skipped(
                 sessionId: sessionId,
@@ -117,20 +128,34 @@ extension ChatSessionAutocompactor {
                 sourceBytesBefore: pass.sourceBytesBefore
             ))
         }
+        guard force || requestBuilder != nil || measurement.hasReceipt else {
+            return skip("built request measurement unavailable; awaiting an admitted request")
+        }
         guard force || estimatedTokens >= effectiveThresholdTokens else {
             return skip("below threshold")
         }
         let mark = try ChatSessionRecollections.dreamConsolidationMark(dataRoot: dataRoot)
-        if let rollup = Self.recollectionRollup(rows: rows, pass: pass, mark: mark) {
-            return .fold(rollup)
+        // Select every kind of fold from the same replay-visible rows. Hidden
+        // raw rows must neither become source nor hide a later recollection.
+        let offsets = storedRows.indices.filter { measurement.characters(in: [storedRows[$0]]) > 0 }
+        let rows = offsets.map { storedRows[$0] }
+        func selected(_ candidate: Fold) -> Selection {
+            let end = offsets[candidate.replaced.count - 1] + 1
+            let source = Set(candidate.foldingRows)
+            let preserved = Set(storedRows.prefix(end).filter { !source.contains($0) })
+            return .fold(Fold(rows: storedRows, replaceCount: end, preserving: preserved,
+                              rollsUpRecollections: candidate.rollsUpRecollections))
         }
-        // At a 240k threshold, the first 85% crossing has about 204k raw
-        // tokens: fold about 72k and leave 132k verbatim. Earlier blocks do
-        // not spend this raw-history allowance. Turn/card and dream boundaries
-        // can leave more raw history; never shrink to a fixed recent row count.
-        let candidateReplaceCount = Self.rawHistoryReplacementCount(
-            rows: rows, windowTokens: pass.windowTokens, divisor: divisor, force: force
+        // Reduce raw history first. A recollection-only rollup cannot consume
+        // this pass while reducible raw history still keeps the request over target.
+        let visibleReplaceCount = try Self.rawHistoryReplacementCount(
+            rows: rows, targetTokens: config.targetTokens(in: pass.windowTokens, outputTokens: measurement.outputTokens), measurement: measurement, force: force
         )
+        // The full transcript still owns live-row barriers even when such a
+        // row is not part of replay. Bound the visible selection at that cut.
+        let storedEnd = visibleReplaceCount > 0 ? offsets[visibleReplaceCount - 1] + 1 : 0
+        let allowedEnd = Self.keepingLastUserRow(rows: storedRows, replaceCount: storedEnd)
+        let candidateReplaceCount = offsets.prefix { $0 < allowedEnd }.count
         // Earlier blocks are not source for this fold, even when their old
         // coverage straddles today's dream mark. Apply the mark to ONLY the
         // new material, then translate its cut back to transcript positions.
@@ -141,48 +166,50 @@ extension ChatSessionAutocompactor {
         let safeSourceCount = Self.markSafeReplacementCount(
             rows: sourceRows, replaceCount: sourceRows.count, mark: mark
         )
-        guard safeSourceCount > 0 else {
-            return skip("not enough new messages to compact")
+        if safeSourceCount > 0 {
+            let replaceCount = Self.keepingLastUserRow(
+                rows: rows,
+                replaceCount: safeSourceCount == sourceRows.count
+                    ? candidateReplaceCount : sourceOffsets[safeSourceCount]
+            )
+            if replaceCount > sourceOffsets[0] {
+                let fold = Fold(rows: rows, replaceCount: replaceCount)
+                if fold.worthCompacting, measurement.characters(in: fold.removableRows) > 0 { return selected(fold) }
+            }
         }
-        let replaceCount = Self.keepingLastUserRow(
-            rows: rows,
-            replaceCount: safeSourceCount == sourceRows.count
-                ? candidateReplaceCount : sourceOffsets[safeSourceCount]
-        )
-        guard replaceCount > 0 else {
-            return skip("not enough messages to compact")
+        let rollupEnd = Self.keepingLastUserRow(rows: storedRows, replaceCount: storedRows.count)
+        let rollupCount = offsets.prefix { $0 < rollupEnd }.count
+        if let rollup = try Self.recollectionRollup(rows: Array(rows.prefix(rollupCount)), pass: pass, mark: mark,
+                                                   divisor: measurement.charactersPerToken) {
+            return selected(rollup)
         }
-        let fold = Fold(rows: rows, replaceCount: replaceCount)
-        guard fold.worthCompacting else {
-            return skip("nothing compactible beside preserved inline cards")
-        }
-        return .fold(fold)
+        return skip("no reducible history beside protected turns/cards and the dream boundary")
     }
     /// Earlier blocks stay verbatim unless their own mass exceeds 10% of the
     /// effective window (and 8,000 characters). Roll up one side of the dream
     /// mark at a time; newer raw turns are never included in that rewrite.
-    private static func recollectionRollup(rows: [JSONValue], pass: Pass, mark: Date?) -> Fold? {
+    private static func recollectionRollup(rows: [JSONValue], pass: Pass, mark: Date?, divisor: Double) throws -> Fold? {
         let count = rows.prefix { isRecollection($0) && !hasPendingDistillation($0) }.count
         guard count > 0,
-              Double(transcriptCharacterCount(Array(rows.prefix(count))))
+              Double(try transcriptCharacterCount(Array(rows.prefix(count))))
                 > max(Double(minimumRollupSourceChars),
-                      Double(pass.windowTokens) * pass.divisor * recollectionWindowFraction)
+                      Double(pass.windowTokens) * divisor * recollectionWindowFraction)
         else { return nil }
         let safeCount = markSafeReplacementCount(rows: rows, replaceCount: count, mark: mark)
-        func fold(_ end: Int, preserving: Int = 0) -> Fold? {
+        func fold(_ end: Int, preserving: Int = 0) throws -> Fold? {
             guard end > preserving else { return nil }
-            let candidate = Fold(rows: rows, replaceCount: end, preserving: preserving,
+            let candidate = Fold(rows: rows, replaceCount: end, preserving: Set(rows.prefix(preserving)),
                                  rollsUpRecollections: true)
-            guard transcriptCharacterCount(candidate.removableRows)
+            guard try transcriptCharacterCount(candidate.removableRows)
                 > minimumRollupSourceChars else { return nil }
             return candidate
         }
-        if let beforeMark = fold(safeCount) { return beforeMark }
+        if let beforeMark = try fold(safeCount) { return beforeMark }
         guard safeCount > 0, safeCount < count else { return nil }
         // The small already-dreamed prefix stays; only the newer blocks fold.
         let newer = Array(rows.dropFirst(safeCount))
         let newerCount = markSafeReplacementCount(rows: newer, replaceCount: count - safeCount, mark: mark)
-        return fold(safeCount + newerCount, preserving: safeCount)
+        return try fold(safeCount + newerCount, preserving: safeCount)
     }
     /// The durable replacement, under the caller's transcript lock. With no
     /// `recollection` the summary row is written pending, for the caller to

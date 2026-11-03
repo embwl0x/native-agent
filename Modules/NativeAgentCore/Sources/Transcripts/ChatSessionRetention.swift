@@ -4,7 +4,7 @@ import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `ChatSessionRetention.swift` | Archive eligibility and protected conversations; manual/retention archive settlement and durable append before hot-row removal; index to transcript to archive lock order, exact acknowledged-version guard and retained chat storage |
+// Blueprint: | `ChatSessionRetention.swift` | Archive eligibility and protected conversations; manual/retention archive settlement and durable append before hot-row removal; index to transcript to archive lock order, exact acknowledged-version guard and retained chat storage; unavailable anchor protection halts automatic archive planning with its source fault |
 
 public struct ChatSessionRetentionPolicy: Sendable, Equatable {
     public var maxActiveSessions: Int
@@ -234,7 +234,7 @@ public enum ChatSessionRetention {
         }
         // The live anchor stays protected independently of pins on every surface.
         // Its publisher shares this caller's sessions lock, so the read is atomic.
-        protected.formUnion(ConversationAnchor.protectedSessionIds(dataRoot: dataRoot))
+        protected.formUnion(try ConversationAnchor.protectedSessionIds(dataRoot: dataRoot))
         // A session a door (Telegram chat, Slack channel/thread) is bound to is
         // where that door's next message lands; archiving it would restart
         // that door with an empty conversation.

@@ -1,6 +1,6 @@
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `SkillsToolsView.swift` | Combined catalog refresh/loading/error owner; tool renderer reads shared sync catalog and retains local search state |
+// Blueprint: | `SkillsToolsView.swift` | Combined catalog refresh/loading/error owner; Tools opens first and separates canonical abilities from native tools; shared sync catalog and local search state |
 
 enum ToolCatalogPresentation {
     enum ContentState: Equatable {
@@ -24,8 +24,8 @@ enum ToolCatalogPresentation {
 // MARK: - Skills & Tools
 
 private enum MobileSkillsToolsSection: String, CaseIterable, Identifiable {
-    case skills = "Skills"
     case tools = "Tools"
+    case skills = "Skills"
 
     var id: String { rawValue }
 }
@@ -34,7 +34,7 @@ private enum MobileSkillsToolsSection: String, CaseIterable, Identifiable {
 /// sync catalog; this destination owns their one refresh and visible page
 /// selection, inside its caller's navigation stack.
 struct SkillsToolsView: View {
-    @AppStorage("NativeAgentMobile.skillsToolsSection") private var selectedRawValue = MobileSkillsToolsSection.skills.rawValue
+    @State private var selectedRawValue = MobileSkillsToolsSection.tools.rawValue
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var isLoading = false
     @State private var error: String?
@@ -42,7 +42,7 @@ struct SkillsToolsView: View {
 
     private var selection: Binding<MobileSkillsToolsSection> {
         Binding(
-            get: { MobileSkillsToolsSection(rawValue: selectedRawValue) ?? .skills },
+            get: { MobileSkillsToolsSection(rawValue: selectedRawValue) ?? .tools },
             set: { selectedRawValue = $0.rawValue }
         )
     }
@@ -124,6 +124,9 @@ private struct MobileToolCatalogView: View {
         let visibleTools = visibleTools
         return AlivePage(title: "Skills & Tools", line: "What I can do, and how.",
                  freshnessGroup: "tools_snapshot", accessory: accessory) {
+            if !tools.isEmpty, let error {
+                AliveFootnote(error, systemImage: "wifi.slash")
+            }
             switch ToolCatalogPresentation.contentState(
                 isLoading: isLoading,
                 error: error,
@@ -146,10 +149,15 @@ private struct MobileToolCatalogView: View {
                 AliveCalmState(title: "No tools match",
                                line: "Try a different name or description.")
             case .content:
-                AliveSection("Tools") {
-                    ForEach(Array(visibleTools.enumerated()), id: \.element.id) { index, tool in
-                        if index > 0 { AliveDivider() }
-                        ToolCatalogRow(tool: tool)
+                ForEach(["Abilities", "Native tools"], id: \.self) { heading in
+                    let rows = visibleTools.filter { $0.id.hasPrefix("ability:") == (heading == "Abilities") }
+                    if !rows.isEmpty {
+                        AliveSection(heading) {
+                            ForEach(Array(rows.enumerated()), id: \.element.id) { index, tool in
+                                if index > 0 { AliveDivider() }
+                                ToolCatalogRow(tool: tool)
+                            }
+                        }
                     }
                 }
             }

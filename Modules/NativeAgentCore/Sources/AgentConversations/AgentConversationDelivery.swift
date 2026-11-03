@@ -9,7 +9,7 @@ import ApprovalInbox
 import ChatTurnContracts
 import Experiences
 import TurnTrace
-// Blueprint: | `AgentConversationDelivery.swift` | Conversation delivery and admitted context vocabulary from retained evidence |
+// Blueprint: | `AgentConversationDelivery.swift` | Conversation delivery and admitted context vocabulary from retained evidence; held unsent messages remain waiting rather than failed or delivered |
 
 extension AgentConversationRecord {
     /// An answer is owed unless explicitly waived; wording cannot waive it.
@@ -20,11 +20,15 @@ extension AgentConversationRecord {
 /// until its recorded reply deadline. `outcome_unknown` follows the session's hold; terminal unknowns fail without claiming non-delivery.
 public enum AgentConversationDelivery: String, Sendable {
     case sending, waiting, delivered, read, answered, failed, notDelivered
+    /// No answer came by the reply deadline. It claims nothing about delivery
+    /// (10-31: her delivered notes to Grok read `failed` once their deadline passed).
+    case unanswered
 
     /// `read`: the recipient's inbox marked this send read.
     public static func of(_ row: AgentConversationRecord, read: Bool) -> Self {
         if row.phase == "sending" { return .sending }
         if row.sendFailed { return .failed }
+        if row.sendStatus == "held" { return .waiting }
         if claudeInbox(row),
            row.exchanges?.last(where: { $0.id == row.operationID })?.reply == nil,
            case .object(let receipt)? = row.receipt,
@@ -32,7 +36,9 @@ public enum AgentConversationDelivery: String, Sendable {
             || AgentConversationSession.liveHandOff(row)) {
             return read || receipt["read"] == .bool(true) ? (row.awaitsReply ? .waiting : .read) : .waiting
         }
-        if row.phase != "sending", case .object(let receipt)? = row.receipt, receipt["reply_state"] == .string("no_reply_expired") { return .failed }
+        if row.phase != "sending", case .object(let receipt)? = row.receipt, receipt["reply_state"] == .string("no_reply_expired") {
+            return receipt["sent"] == .bool(false) ? .notDelivered : .unanswered
+        }
         if case .object(let receipt)? = row.receipt, receipt["sent"] == .bool(false) { return .notDelivered }
         if row.phase == "ready", row.exchanges?.last(where: { $0.id == row.operationID })?.reply != nil { return .answered }
         switch row.phase {
@@ -81,14 +87,14 @@ public enum AgentConversationDelivery: String, Sendable {
     }
 
     /// Only a saved who can carry an inbox door. A directory or installed program alone never establishes a recipient.
-    public static func lane(for agent: String, dataRoot: URL, bridgeConfigRoot: URL? = nil) -> String? {
-        door(for: agent, dataRoot: dataRoot, bridgeConfigRoot: bridgeConfigRoot)?.handle
+    public static func lane(for agent: String, dataRoot: URL, bridgeConfigRoot: URL? = nil) throws -> String? {
+        try door(for: agent, dataRoot: dataRoot, bridgeConfigRoot: bridgeConfigRoot)?.handle
     }
 
     /// A live inbox reader or a host's inbound bridge can answer during a send, as can command sessions and remote request/reply transports.
-    package static func answersLive(agent: String, peer: AgentPeerContact?, dataRoot: URL) -> Bool {
+    package static func answersLive(agent: String, peer: AgentPeerContact?, dataRoot: URL) throws -> Bool {
         guard let peer, peer.ability == nil else { return false }
-        if let door = door(for: agent, dataRoot: dataRoot) { return door.liveReader }
+        if let door = try door(for: agent, dataRoot: dataRoot) { return door.liveReader }
         switch peer.transport {
         case .acp, .nativeAgent, .a2a, .desktopChat: return true
         case .mcpHost: return !ChatGPTDotIPCTransport.owns(peer)
@@ -96,8 +102,12 @@ public enum AgentConversationDelivery: String, Sendable {
         }
     }
 
-    public static func door(for agent: String, dataRoot: URL, bridgeConfigRoot: URL? = nil, peers: [AgentPeerContact]? = nil) -> InboxDoor? {
-        let peers = peers ?? (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
+    public static func door(for agent: String, dataRoot: URL, bridgeConfigRoot: URL? = nil, peers: [AgentPeerContact]? = nil) throws -> InboxDoor? {
+        let peers = try peers ?? AgentPeerStore(dataRoot: dataRoot).list()
+        return door(for: agent, dataRoot: dataRoot, bridgeConfigRoot: bridgeConfigRoot, contacts: peers)
+    }
+
+    public static func door(for agent: String, dataRoot: URL, bridgeConfigRoot: URL? = nil, contacts peers: [AgentPeerContact]) -> InboxDoor? {
         guard let peer = peers.first(where: { "peer:" + $0.id == agent || ($0.handles ?? []).contains(agent) }) else { return nil }
         // An explicitly addressed associated door keeps its own recipe.
         guard !peers.contains(where: { $0.id == peer.who }) else { return nil }

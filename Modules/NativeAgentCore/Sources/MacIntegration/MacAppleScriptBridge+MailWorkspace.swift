@@ -1,7 +1,7 @@
 import Foundation
 import MacControl
 import PersistenceCore
-// Blueprint: | `MacAppleScriptBridge+MailWorkspace.swift` | `MacAppleScriptBridge`: bounded workspace-read orchestration and mailbox scope validation |
+// Blueprint: | `MacAppleScriptBridge+MailWorkspace.swift` | `MacAppleScriptBridge`: mailbox scope validation; list metadata feeds Envelope Index pages, exact body reads use checked local bytes without an Apple Event substitute |
 
 extension MacAppleScriptBridge {
     /// Bounded mailbox reads with opaque owner IDs. Transport fields are encoded
@@ -20,12 +20,8 @@ extension MacAppleScriptBridge {
                 "message": .string("Call mail_list_recent without message_id, then copy scope, message_id, expected_message_id, expected_account, expected_account_id and position from the same row to read it.")])
         }
         do {
-            let local = mailLocalRead(input)
-            if let mismatch = local.accountMismatch {
-                return .object(["status": .string("failed"), "integration": .string("mail"),
-                    "reason": .string("account_mismatch"), "message": .string(mismatch)])
-            }
-            if let row = local.row {
+            if input["message_id"] != nil {
+                let row = try mailFileRead(input: input)
                 return .object(["status": .string("completed"), "count": .int(1),
                     "messages": .array([.object(row)]), "scope": .string(scope), "detail": .bool(true)])
             }
@@ -37,16 +33,7 @@ extension MacAppleScriptBridge {
                     "reason": .string("message_changed_or_moved_refresh_inbox"),
                     "message": .string("The message no longer matches this mailbox locator. Call mail_list_recent without message_id in the same scope and use the identifiers from one fresh row; do not reuse its old position.")])
             }
-            if input["message_id"] == nil { return mailIndexPage(header: raw, input: input, query: query) }
-            let rows = parseMailWorkspaceRecords(raw)
-            if rows.isEmpty { return failedEnvelope(integration: "mail", reason: "message_not_in_inbox") }
-            return .object(["status": .string("completed"), "count": .int(Int64(rows.count)),
-                "messages": .array(rows.map { row in
-                    guard case .object(var object) = row else { return row }
-                    object["scope"] = .string(scope)
-                    object["attachments_status"] = .string(local.attachments)
-                    return .object(object)
-                }), "scope": .string(scope), "detail": .bool(true)])
+            return mailIndexPage(header: raw, input: input, query: query)
         } catch let AppleScriptError.permissionDenied(app) {
             return deniedEnvelope(integration: "mail", app: app)
         } catch let error as NSError where error.domain == "NativeAgentAppleScript" && [-1712, -1001, AppleScriptExecution.appleScriptOutcomeUnknownCode].contains(error.code) {

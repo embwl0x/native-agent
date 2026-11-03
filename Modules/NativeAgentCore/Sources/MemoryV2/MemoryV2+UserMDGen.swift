@@ -73,25 +73,9 @@ public actor UserMDGenerator {
         self.nowProvider = now
     }
 
-    /// Require the completion sentinel or complete legacy identity bundle; USER.md alone is insufficient.
-    /// Pending completion/reset manifests block regeneration to preserve their exact transaction bytes.
+    /// The shared completion owner blocks pending completion/reset and requires its sentinel.
     public nonisolated var onboardingHasCompleted: Bool {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: dataRoot.appendingPathComponent("onboarding/pending-completion.json").path)
-            || fm.fileExists(atPath: dataRoot.appendingPathComponent("onboarding/pending-reset.json").path) {
-            return false
-        }
-        if fm.fileExists(atPath: dataRoot.appendingPathComponent(".onboarded").path) {
-            return true
-        }
-        let root = personaRoot ?? dataRoot
-            .appendingPathComponent("persona", isDirectory: true)
-            .appendingPathComponent(MemoryV2Defaults.personaID, isDirectory: true)
-        return NativeAgentPublicSafety.hasLegacyCompletionAnchor(
-            personaRoot: root,
-            profileURL: dataRoot.appendingPathComponent("memory/profile.json"),
-            allowMissingProfile: true
-        )
+        NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot)
     }
 
     /// A resolved persona root names one document regardless of the requested storage partition.

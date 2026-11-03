@@ -14,12 +14,11 @@ import ToolExecution
 import Senses
 import PersonaEngine
 import AgentWorkspace
-// Blueprint: | `EngineTools.swift` | ToolsFacade owns authored tools, slash planning, full form descriptors and shared catalog status classification; `withPartDoor` gives native scheduled/UI owners and Tools Keep the ordinary gated chain and AppChatToolDispatcher host, with originating work identity, resident approval session and caller's file-access posture inherited by part thinking; native callers can supply their authenticated envelope and existing approval filer, preserving Telegram transport and Desk-click authority without another door; one checked skill inventory supplies metadata, source/revision and guidance detail from the same body read (phone metadata omits source). LatestRead orders slash, catalog, authored, skill and native-power reads; committed authored writes use write. Native actions derive from their registry; receipts and notification/browser status retain availability. |
+// Blueprint: | `EngineTools.swift` | ToolsFacade owns checked authored tools, full form descriptors, catalog buckets and shared status classification; `withPartDoor` gives native scheduled/UI owners and Tools Keep the ordinary gated chain and AppChatToolDispatcher host with authenticated origin, resident approval session and caller file-access posture. One checked skill inventory supplies metadata, source/revision and guidance from the same body read (phone metadata omits source). LatestRead orders catalog, authored, skill and native-power reads; committed Parts Keep/Off writes publish through write. Native actions derive from their registry; receipts and notification/browser status retain availability. |
 
 /// The catalog's one status classification for Mac and phone.
 public enum ToolCatalogStatus: String, Sendable {
     case locked, unavailable, blocked, approval, active, available
-    case onDemand = "on demand"
     case unknown = "status unavailable"
     public enum Tone { case positive, neutral, warning, danger }
     public var title: String { rawValue }
@@ -30,7 +29,6 @@ public enum ToolCatalogStatus: String, Sendable {
         case .blocked: "hand.raised"
         case .approval: "checkmark.shield"
         case .active: "circle.fill"
-        case .onDemand: "bolt.circle"
         case .available: "checkmark.circle"
         case .unknown: "questionmark.circle"
         }
@@ -40,7 +38,7 @@ public enum ToolCatalogStatus: String, Sendable {
         case .active: .positive
         case .blocked: .danger
         case .locked, .approval, .unknown: .warning
-        case .unavailable, .onDemand, .available: .neutral
+        case .unavailable, .available: .neutral
         }
     }
 }
@@ -51,22 +49,21 @@ extension ChatToolCatalogSnapshot {
         let name = normalized(tool.name)
         if !name.isEmpty, (builderPolicyLocked + macAppPolicyLocked).map(normalized).contains(name) { return .locked }
         if tool.availableNow == false { return .unavailable }
-        let autonomy = normalized(tool.effectiveAutonomy)
+        guard let recordedAutonomy = tool.effectiveAutonomy else { return .unknown }
+        let autonomy = normalized(recordedAutonomy)
         if autonomy == "blocked" { return .blocked }
-        guard tool.availableNow == true, ["", "auto", "confirm"].contains(autonomy) else { return .unknown }
+        guard tool.availableNow == true, ["auto", "confirm"].contains(autonomy) else { return .unknown }
         if autonomy == "confirm" { return .approval }
-        let loadState = normalized(tool.loadState)
-        if loadState == "loaded" || (!name.isEmpty && currentlyLoaded.map(normalized).contains(name)) { return .active }
-        if loadState == "discovery_only" { return .onDemand }
-        return loadState.isEmpty ? .available : .unknown
+        if !name.isEmpty, alwaysOnTools.map(normalized).contains(name) { return .active }
+        return tool.modelVisible == nil ? .unknown : .available
     }
 }
 
 /// `NativeAgentEngine.tools`: the tool catalog and the authored-tool
 /// registry for one data root, in core types. The Tools page renders
-/// `catalog` (every tool, its load state and its trust here) and `authored`;
-/// the phone snapshot and Doctor use the same owner. Registry writes (auto-run, promote, quarantine) read back through
-/// the same authored-field check.
+/// `catalog` (every tool, its model visibility and its trust here) and `authored`;
+/// the phone snapshot and Doctor use the same owner. Parts Keep/Off mutations
+/// read back through the same checked authored inventory.
 @MainActor
 @Observable
 public final class ToolsFacade {
@@ -197,6 +194,11 @@ public final class ToolsFacade {
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "Tool manifest returned an invalid envelope."]
             )
+        }
+        for tool in snapshot.tools {
+            guard let raw = tool.catalogBucket, ChatToolCatalogBucket(rawValue: raw) != nil else {
+                throw RuntimeReadError.unreadableFeed("Tool catalog bucket is unavailable for \(tool.name). Repair its registered catalog entry before reading Tools again.")
+            }
         }
         return snapshot
     }

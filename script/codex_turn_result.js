@@ -2,7 +2,7 @@
 
 // Project durable rollout and app-server evidence without starting or replaying work.
 const fs = require("fs");
-const { nowISO, redactDiagnosticText, unicodePrefix } = require("./wake_worker_common.js");
+const { redactDiagnosticText, unicodePrefix, readRolloutRows } = require("./wake_worker_common.js");
 
 const CONNECTOR_SCHEMA_MISMATCH_MARKER = "failed connector schema validation";
 
@@ -83,11 +83,9 @@ function summarizeConnectorDiagnostics(sink) {
 }
 
 function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
-  let text;
-  try {
-    text = fs.readFileSync(rolloutPath, "utf8");
-  } catch {
-    return null;
+  function timestamp(row) {
+    if (typeof row.timestamp !== "string" || !Number.isFinite(Date.parse(row.timestamp))) throw new Error(`Codex terminal timestamp is unreadable at ${rolloutPath}; repair this evidence before settling the turn.`);
+    return row.timestamp;
   }
 
   let currentTurnId = null;
@@ -116,7 +114,7 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
       : String(rawError.message || JSON.stringify(rawError) || "codex turn error");
     return {
       status: hasError ? "failed" : "completed",
-      completedAt: row.timestamp || nowISO(),
+      completedAt: timestamp(row),
       durationMs: payload.duration_ms || null,
       lastAgentMessage: typeof payload.last_agent_message === "string" ? payload.last_agent_message : "",
       errorMessage,
@@ -125,14 +123,8 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
         : null,
     };
   };
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    let row;
-    try {
-      row = JSON.parse(line);
-    } catch {
-      continue;
-    }
+  for (const { value: row } of readRolloutRows(rolloutPath)) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error(`Codex rollout row must be an object: ${rolloutPath}`);
     const payload = row && row.payload;
     if (row.type === "event_msg" && payload && payload.type === "task_started" && payload.turn_id) {
       currentTurnId = payload.turn_id;
@@ -154,7 +146,7 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
       } else if (payload.type === "turn_aborted" && payload.turn_id === turnId) {
         completed = {
           status: "aborted",
-          completedAt: row.timestamp || nowISO(),
+          completedAt: timestamp(row),
           durationMs: payload.duration_ms || null,
           lastAgentMessage: "",
         };
@@ -206,7 +198,7 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
       // fresh task_started re-arming the attributed branch.
       completed = {
         status: "aborted",
-        completedAt: row.timestamp || nowISO(),
+        completedAt: timestamp(row),
         durationMs: payload.duration_ms || null,
         lastAgentMessage: "",
       };
@@ -233,8 +225,8 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
   const connectorDiagnostics = summarizeConnectorDiagnostics(connectorSink);
   const lastAgentMessage = commentaryMessages.has(completed.lastAgentMessage.trim())
     ? "" : completed.lastAgentMessage;
-  const legacyAssistantMessage = commentaryMessages.has(assistantMessage.trim()) ? "" : assistantMessage;
-  const message = (finalAgentMessage || lastAgentMessage || legacyAssistantMessage || "").trim();
+  const unphasedAssistantMessage = commentaryMessages.has(assistantMessage.trim()) ? "" : assistantMessage;
+  const message = (finalAgentMessage || lastAgentMessage || unphasedAssistantMessage || "").trim();
   const measuredToolActivityCount = sawTurnStart ? toolActivityCount : null;
   const noWorkObserved = sawTurnStart ? toolActivityCount === 0 && !message && !observedAgentMessage.trim() : null;
   if (completed.status === "failed") {
@@ -264,47 +256,4 @@ function extractTurnResultFromRollout(rolloutPath, turnId, options = {}) {
   return { ...completed, message, rolloutPath, toolActivityCount: measuredToolActivityCount, noWorkObserved, connectorDiagnostics };
 }
 
-function extractTurnResultFromTurn(turn, turnId, rolloutPath = null) {
-  if (!turn || turn.id !== turnId || turn.status === "inProgress") return null;
-  const messages = Array.isArray(turn.items)
-    ? turn.items.filter((item) => item && item.type === "agentMessage"
-        && typeof item.text === "string" && item.text.trim() !== "")
-    : [];
-  const final = [...messages].reverse().find((item) => item.phase === "final_answer")
-    || [...messages].reverse().find((item) => item.phase == null);
-  const message = final ? final.text.trim() : "";
-  const completedAt = Number.isFinite(turn.completedAt)
-    ? new Date(Number(turn.completedAt) * 1000).toISOString()
-    : nowISO();
-  const base = {
-    completedAt,
-    durationMs: Number.isFinite(turn.durationMs) ? Number(turn.durationMs) : null,
-    message,
-    rolloutPath,
-  };
-  if (turn.status === "completed") {
-    return { ...base, status: message ? "completed" : "completed_without_reply" };
-  }
-  if (turn.status === "interrupted" || turn.status === "cancelled" || turn.status === "canceled") {
-    return { ...base, status: "aborted" };
-  }
-  return {
-    ...base,
-    status: "failed",
-    error: turn.error || null,
-  };
-}
-
-function extractTurnResultFromThread(thread, turnId, rolloutPath = null) {
-  const turns = thread && Array.isArray(thread.turns) ? thread.turns : [];
-  const turn = turns.find((candidate) => candidate && candidate.id === turnId);
-  // Another app-server can hydrate a still-running shared rollout as
-  // notLoaded/interrupted. That server does not own the live writer. Require
-  // a durable terminal event (or an exact turn/completed event) before the
-  // canonical reader settles this as aborted. Never infer permission to replay.
-  if (thread?.status?.type === "notLoaded"
-      && ["interrupted", "cancelled", "canceled"].includes(turn?.status)) return null;
-  return extractTurnResultFromTurn(turn, turnId, rolloutPath);
-}
-
-module.exports = { extractTurnResultFromRollout, extractTurnResultFromTurn, extractTurnResultFromThread };
+module.exports = { extractTurnResultFromRollout };

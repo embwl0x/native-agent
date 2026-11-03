@@ -6,7 +6,7 @@ import TrustCenter
 import MemoryV2
 import Privacy
 import SystemOps
-// Blueprint: | `TrustBackupOffDisk.swift` | TrustBackupPersistence off-disk copies; credential exclusions, SQLite journal conversion, landed integrity verification and automatic retention |
+// Blueprint: | `TrustBackupOffDisk.swift` | TrustBackupPersistence off-disk copies; credential exclusions, checked SQLite conversion inventory, landed integrity verification and automatic retention |
 
 extension TrustBackupPersistence {
     private static let offDiskBackupKeepCount = 14
@@ -76,26 +76,36 @@ extension TrustBackupPersistence {
         let staging = fm.temporaryDirectory
             .appendingPathComponent("NativeAgent-offdisk-\(UUID().uuidString.lowercased())", isDirectory: true)
         let partial = parent.appendingPathComponent(".\(name).partial", isDirectory: true)
-        defer { try? fm.removeItem(at: staging) }
-        do {
-            let files = try await Self.writeBackupSnapshot(
-                id: UUID().uuidString.lowercased(),
-                reason: reason,
-                createdAt: ISO8601DateFormatter().string(from: now),
-                dataRoot: root,
-                into: staging,
-                offDisk: true
-            ).files
-            try await VolumeIO.run {
-                try FileManager.default.copyItem(at: staging, to: partial)
-                guard try Self.backupIntegrityFiles(in: partial.appendingPathComponent("data", isDirectory: true)) == files else {
-                    throw Self.backupError(code: 500, "Off-disk backup copy does not match its manifest.")
+        // Once queued, VolumeIO owns the staged source until the physical copy
+        // exits, even when Stop/deadline has already released this caller.
+        var copyQueued = false
+        defer { if !copyQueued { try? fm.removeItem(at: staging) } }
+        let files = try await Self.writeBackupSnapshot(
+            id: UUID().uuidString.lowercased(),
+            reason: reason,
+            createdAt: ISO8601DateFormatter().string(from: now),
+            dataRoot: root,
+            into: staging,
+            offDisk: true
+        ).files
+        copyQueued = true
+        try await VolumeIO.run(onFinish: {
+            do { try FileManager.default.removeItem(at: staging) }
+            catch { NSLog("[OffDiskBackup] staging cleanup unavailable: %@", error.localizedDescription) }
+        }) {
+            var committed = false
+            defer {
+                if !committed, Self.pathEntryExists(partial) {
+                    do { try FileManager.default.removeItem(at: partial) }
+                    catch { NSLog("[OffDiskBackup] partial copy retained: %@", error.localizedDescription) }
                 }
-                try FileManager.default.moveItem(at: partial, to: destination)
             }
-        } catch {
-            _ = try? await VolumeIO.run { try FileManager.default.removeItem(at: partial) }
-            throw error
+            try FileManager.default.copyItem(at: staging, to: partial)
+            guard try Self.backupIntegrityFiles(in: partial.appendingPathComponent("data", isDirectory: true)) == files else {
+                throw Self.backupError(code: 500, "Off-disk backup copy does not match its manifest.")
+            }
+            try FileManager.default.moveItem(at: partial, to: destination)
+            committed = true
         }
         try await VolumeIO.run {
             for stale in try Self.offDiskAutomaticBackups(in: parent).dropFirst(Self.offDiskBackupKeepCount) {
@@ -108,16 +118,9 @@ extension TrustBackupPersistence {
     /// A WAL-mode SQLite file cannot be opened from iCloud Drive. Every SQLite copy in the staged snapshot is switched to a
     /// rollback journal (folding any copied `-wal` into the main file) before it is hashed and shipped.
     static func convertSQLiteCopiesToRollbackJournal(in dataDir: URL) throws {
-        guard let enumerator = FileManager.default.enumerator(
-            at: dataDir,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: []
-        ) else {
-            throw Self.backupError(code: 422, "Backup contents could not be enumerated.")
-        }
         var databases: [URL] = []
-        for case let item as URL in enumerator
-        where (try? item.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true {
+        for item in try Self.backupEntries(in: dataDir)
+        where try item.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true {
             if try Self.sqliteIsWALMode(item) != nil { databases.append(item) }
         }
         for database in databases {
@@ -172,6 +175,7 @@ extension TrustBackupPersistence {
         "evals", "traces", "turn_traces", "harness", "builder_audit", "memory/backups",
         "senses/ledger",
         "senses/news",
+        "ability_fetches",
     ]
 
     /// `providers/` holds API keys and OAuth tokens; only its model routing goes.

@@ -1,6 +1,6 @@
 /* NativeAgent ability
 {
-  "id":"presentation-copy", "kind":"tool", "version":1,
+  "id":"presentation-copy", "kind":"ability", "version":1,
   "reach":{"capabilities":[],"readPaths":[],"hosts":[],"apps":[]},
   "face":{"projection":true},
   "record":{"description":"My page subtitles, activity phrases and automated conversation titles, over sanitized native presentation facts.","actions":[],"inputSchema":{"type":"object","required":["kind"]}}

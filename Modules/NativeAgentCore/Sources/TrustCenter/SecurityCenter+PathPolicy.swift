@@ -1,7 +1,8 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `SecurityCenter+PathPolicy.swift` | Capability effects and Mac Control file admission use NativeAgentWorkspaceRoot's byte-exact path law; supported file mutations share execution's resolver and relative base; unknown relative capability paths count as outside; `capabilityWritesOutsideAppData`, `pathIsInsideRoots`, `pathLikeStrings` |
+// Blueprint: | `SecurityCenter+PathPolicy.swift` | Capability effects and Mac Control file admission use NativeAgentWorkspaceRoot's byte-exact path law; supported file mutations inspect declared I/O arguments only through execution's resolver; other capability paths retain conservative reach classification; `capabilityWritesOutsideAppData`, `pathIsInsideRoots`, `pathLikeStrings` |
 
 extension SwiftNativeSecurityCenter {
     /// Her line for the paths a call names: true when one lands beyond her
@@ -12,20 +13,21 @@ extension SwiftNativeSecurityCenter {
         input: [String: JSONValue],
         dataRoot: URL,
         trustedWorkspaceRoots: [URL] = []
-    ) -> Bool {
-        let binding = tool == "app" ? AppActionBinding.action(input: input) : nil
+    ) throws -> Bool {
+        let binding = tool == "app" ? try AppActionBinding.action(input: input) : nil
         let operation = ToolNameAliases.canonical(binding?.tool ?? tool)
-        var pathInput = input
+        let pathInput = input
         if ["write_file", "copy_file", "move_file", "trash_file"].contains(operation) {
-            var arguments = binding?.arguments(object(input["args"])) ?? input
+            let arguments = binding?.arguments(object(input["args"])) ?? input
             let keys = ["copy_file", "move_file"].contains(operation) ? ["path", "destination"] : ["path"]
             for key in keys {
-                if case .string(let raw)? = arguments[key] {
-                    arguments[key] = .string(NativeAgentWorkspaceRoot.resolveFileMutationPath(raw, dataRoot: dataRoot).path)
+                guard case .string(let raw)? = arguments[key], !raw.isEmpty else {
+                    throw ToolFailureError("\(operation) requires its declared I/O argument \(key).", argumentPath: key, effects: .none)
                 }
+                let resolved = NativeAgentWorkspaceRoot.resolveFileMutationPath(raw, dataRoot: dataRoot).path
+                if !pathIsInsideRoots(resolved, roots: [dataRoot] + trustedWorkspaceRoots) { return true }
             }
-            if binding != nil { pathInput["args"] = .object(arguments) }
-            else { pathInput = arguments }
+            return false
         }
         return pathLikeStrings(in: .object(pathInput)).contains { raw in
             let expanded = NativeAgentWorkspaceRoot.fileSpelling(raw)

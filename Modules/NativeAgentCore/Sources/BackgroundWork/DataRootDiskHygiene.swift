@@ -60,11 +60,15 @@ public struct MaintenanceBackgroundWork: Sendable {
     }
 
     public func fileDiskHygieneNotice(dataRoot: URL, report: DiskHygieneReport) async -> Bool {
-        guard !report.truncated, !report.depthTruncated, !report.readFailed else {
+        guard !report.readFailed else {
             nativeLog("Disk hygiene accounting incomplete; prior notice preserved: %@", report.readFailures.joined(separator: "; "))
             return false
         }
+        // A bound reached (a deep tree like a Python venv, a huge folder) is
+        // partial but true: what it found is published; it never clears a notice.
+        let partial = report.truncated || report.depthTruncated
         guard report.tripped else {
+            if partial { return true }
             do {
                 let now = Date()
                 _ = try await LiveNotificationInbox.live(dataRoot: dataRoot).archiveActive(
@@ -143,7 +147,7 @@ public struct MaintenanceBackgroundWork: Sendable {
                 "detail": .string(content.detail), "finding_identity": .string(finding),
                 "cleanup_plans": try JSONValue.fromEncodable(plans), "actions": .array(actions),
                 "related_paths": .array([]), "related_groups": .array([]),
-                "related_mission_id": .null, "related_approval_id": .null,
+                "related_execution_id": .null, "related_approval_id": .null,
                 "status": .string("unread"), "read_at": .null])
             guard let notify = await upsertDiskHygieneCard(dataRoot: dataRoot, card: card, preserveStatus: true,
                 scanStartedAt: report.startedAt) else { return false }
@@ -667,10 +671,13 @@ public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
             totalThreshold: totalThreshold,
             directoryThreshold: directoryThreshold
         )
-        guard !report.readFailed, !report.truncated, !report.depthTruncated else {
+        // Only a failed read can change by trying again. A bound reached is the
+        // same tomorrow (10-29/30: her chess venv sat past the depth bound and
+        // this re-scanned the whole data root every tick for two days), so the
+        // day is consumed and what was found still counts.
+        guard !report.readFailed else {
             await rollback()
             return .failed(error: "Disk accounting incomplete; prior notice preserved and day not consumed. "
-                + "file-budget truncated: \(report.truncated); depth truncated: \(report.depthTruncated). "
                 + report.readFailures.joined(separator: "; "))
         }
         // A complete report retires stale notices or publishes findings; failed publication releases the day.
@@ -679,7 +686,8 @@ public struct DataRootDiskHygieneCheck: EventDeadlineLoopRunner {
             return .failed(error: "disk hygiene notice delivery failed; reservation rolled back")
         }
         guard report.tripped else {
-            return .skipped(reason: "disk clean (\(DataRootDiskHygiene.humanSize(report.totalBytes)))")
+            return .skipped(reason: (report.truncated || report.depthTruncated ? "disk accounting partial (a bound was reached); prior notice kept; "
+                : "") + "disk clean (\(DataRootDiskHygiene.humanSize(report.totalBytes)))")
         }
         return .completed(result:
             "disk hygiene flagged \(report.largeFiles.count) large file(s), "

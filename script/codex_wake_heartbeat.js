@@ -5,22 +5,9 @@ function createCodexWakeHeartbeat({
   DRAINER_HEARTBEAT_PATH,
   stringSetting,
   numberSetting,
-  pidAlive,
-  withDirLock,
-  readJSONLines,
+  withWakeLock,
   appendJSONLineAtomicUnlocked,
 }) {
-function latestDrainerHeartbeat(file) {
-  const records = readJSONLines(file);
-  for (let index = records.length - 1; index >= 0; index -= 1) {
-    const row = records[index];
-    if (!row || row.action != null) continue;
-    if (!Number.isInteger(Number(row.pid)) || Number(row.pid) <= 0 || typeof row.timestamp !== "string") continue;
-    return row;
-  }
-  return null;
-}
-
 function createDrainerHeartbeat(config, options = {}) {
   const heartbeatPath = stringSetting(
     config,
@@ -34,22 +21,15 @@ function createDrainerHeartbeat(config, options = {}) {
     "NATIVE_AGENT_CODEX_DRAINER_HEARTBEAT_MS",
     60 * 1000
   );
-  const staleMs = numberSetting(
-    config,
-    "drainerHeartbeatStaleMs",
-    "NATIVE_AGENT_CODEX_DRAINER_HEARTBEAT_STALE_MS",
-    intervalMs * 3
-  );
   const currentPID = Number(options.pid ?? process.pid);
   const nowFn = options.now || Date.now;
-  const isPIDAlive = options.pidAlive || pidAlive;
   const setIntervalFn = options.setInterval || setInterval;
   const clearIntervalFn = options.clearInterval || clearInterval;
   const heartbeatLock = `${heartbeatPath}.lock`;
-  const withHeartbeatLock = options.withLock || ((body) => withDirLock(
+  const withHeartbeatLock = options.withLock || ((body) => withWakeLock(
     heartbeatLock,
     body,
-    { waitMs: 2000, staleMs: staleMs, preserveLiveOwner: true }
+    { waitMs: 2000 }
   ));
   let queueDepth = 0;
   let activeTurnId = null;
@@ -89,7 +69,6 @@ function createDrainerHeartbeat(config, options = {}) {
   return {
     heartbeatPath,
     intervalMs,
-    staleMs,
     update(nextQueueDepth, nextActiveTurnId = null) {
       const depth = Number(nextQueueDepth);
       queueDepth = Number.isInteger(depth) && depth >= 0 ? depth : queueDepth;
@@ -99,37 +78,17 @@ function createDrainerHeartbeat(config, options = {}) {
     },
     async start() {
       const decision = await withHeartbeatLock(async () => {
-        const prior = latestDrainerHeartbeat(heartbeatPath);
-        if (prior) {
-          const priorTimestamp = Date.parse(prior.timestamp);
-          const ageMs = Number.isFinite(priorTimestamp) ? Math.max(0, nowFn() - priorTimestamp) : Infinity;
-          if (ageMs < staleMs) {
-            const priorPID = Number(prior.pid);
-            if (isPIDAlive(priorPID)) {
-              const receipt = {
-                ...heartbeatRecord(),
-                action: "live_pid_refusal",
-                priorPid: priorPID,
-              };
-              appendJSONLineAtomicUnlocked(heartbeatPath, receipt);
-              return { status: "refused", reason: "live_drainer_heartbeat", prior, receipt };
-            }
-            appendJSONLineAtomicUnlocked(heartbeatPath, {
-              ...heartbeatRecord(),
-              action: "dead_pid_takeover",
-              priorPid: priorPID,
-            });
-          }
-        }
+        // The caller already holds the queue's kernel lock. Heartbeat rows
+        // describe that owner; stale timestamps and numeric PIDs grant nothing.
         const receipt = heartbeatRecord();
         appendJSONLineAtomicUnlocked(heartbeatPath, receipt);
-        return { status: "started", prior, receipt };
+        return { status: "started", receipt };
       });
       if (decision.status === "started") {
         timer = setIntervalFn(() => scheduleHeartbeat(), intervalMs);
         if (timer && typeof timer.unref === "function") timer.unref();
       }
-      return { ...decision, heartbeatPath, intervalMs, staleMs };
+      return { ...decision, heartbeatPath, intervalMs };
     },
     pulse: scheduleHeartbeat,
     async stop() {

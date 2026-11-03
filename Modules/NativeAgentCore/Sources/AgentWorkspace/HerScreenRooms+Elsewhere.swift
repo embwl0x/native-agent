@@ -3,9 +3,10 @@ import Foundation
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
+import StandingBots
 import Transcripts
 import NativeAgentShared
-// Blueprint: | `HerScreenRooms+Elsewhere.swift` | HerScreen door lines own completed other-room exchanges for the person's Mac/phone timeline and bounded words in home-turn context; peer turns never carry the person's words |
+// Blueprint: | `HerScreenRooms+Elsewhere.swift` | HerScreen's shared transcript index owns completed other-room exchanges for the person's Mac/phone timeline and bounded per-turn continuity, including the newest three helpers' replies; one read-only turn reading serves door lines, posts and exchanges beside history, with late peer disclosure and consumption; peer turns carry neither the person's words nor helper replies |
 
 /// Transcript message surfaces join person, bridge and wake exchanges into one read-only timeline.
 extension HerScreen {
@@ -39,21 +40,35 @@ extension HerScreen {
 
     /// Newest first: the 12 most recently written transcripts of the last week
     /// (no earlier than `since` when given); helpers' own sessions stay out.
-    static func doorLines(dataRoot: URL, now: Date, since: Date? = nil) -> [DoorLine] {
+    static func doorLines(dataRoot: URL, now: Date, since: Date? = nil) throws -> [DoorLine] {
         let dir = dataRoot.appendingPathComponent("chat/messages", isDirectory: true).path
-        let sessions = try? SessionConversation(dataRoot: dataRoot)
-        let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
-            .filter { $0.hasSuffix(".jsonl") && sessions?.isHelper(String($0.dropLast(6))) != true }
+        let sessions = try SessionConversation(dataRoot: dataRoot)
+        let entries: [String]
+        do { entries = try FileManager.default.contentsOfDirectory(atPath: dir) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { entries = [] }
+        let names = entries.filter { $0.hasSuffix(".jsonl") }
+        let helpers = Set(names.filter { sessions.isHelper(String($0.dropLast(6))) })
+        let files = try names.filter { !helpers.contains($0) }
             .compactMap { name -> (path: String, at: Int)? in
                 var info = stat()
-                guard lstat(dir + "/" + name, &info) == 0,
-                      Double(info.st_mtimespec.tv_sec) + 1 >= now.addingTimeInterval(-7 * 86_400).timeIntervalSince1970 else { return nil }
+                guard lstat(dir + "/" + name, &info) == 0 else {
+                    if errno == ENOENT { return nil }
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: dir + "/" + name])
+                }
+                guard Double(info.st_mtimespec.tv_sec) + 1 >= now.addingTimeInterval(-7 * 86_400).timeIntervalSince1970 else { return nil }
                 return (dir + "/" + name, info.st_mtimespec.tv_sec)
             }
             .sorted { ($0.at, $0.path) > ($1.at, $1.path) }.prefix(12)
-        DoorIndex.shared.keep(only: Set(files.map(\.path)), in: dir + "/")
-        return files.filter { Double($0.at) + 1 >= (since ?? .distantPast).timeIntervalSince1970 }
-            .flatMap { transcript(URL(fileURLWithPath: $0.path)).lines }.sorted { $0.at > $1.at }
+        DoorIndex.shared.keep(only: Set(files.map(\.path)).union(helpers.map { dir + "/" + $0 }), in: dir + "/")
+        return try files.filter { Double($0.at) + 1 >= (since ?? .distantPast).timeIntervalSince1970 }
+            .flatMap { file in
+                guard sessions.kind(URL(fileURLWithPath: file.path).deletingPathExtension().lastPathComponent) != nil else {
+                    throw ToolFailureError("Conversation classification is unavailable for " + file.path, effects: .none,
+                        owner: dataRoot.appendingPathComponent("chat/sessions.json").path,
+                        instruction: "Reconcile this transcript with its owning session index before projecting it into other rooms.", recovery: .repair)
+                }
+                return try transcript(URL(fileURLWithPath: file.path)).lines
+            }.sorted { $0.at > $1.at }
     }
 
     /// Each transcript's door lines and when she last answered
@@ -65,25 +80,30 @@ extension HerScreen {
         struct Entry {
             var inode: UInt64 = 0, offset: UInt64 = 0
             var lines: [DoorLine] = [], open = false
-            var mine: Date?
+            var mine: Date?, reply: String?
             var personSends: Set<String> = []
+            /// What she said first on one of his doors (a post of hers, not a
+            /// reply): kept apart from the lines, which are who spoke to her.
+            var posts: [DoorLine] = []
         }
         let lock = NSLock()
         var entries: [String: Entry] = [:]
 
-        /// Only this week's newest transcripts stay indexed.
+        /// Keep this week's newest door transcripts and helpers still on disk.
         func keep(only paths: Set<String>, in dir: String) {
             lock.withLock { entries = entries.filter { !$0.key.hasPrefix(dir) || paths.contains($0.key) } }
         }
     }
 
-    private static func transcript(_ url: URL) -> (lines: [DoorLine], mine: Date?) {
-        DoorIndex.shared.lock.withLock {
+    private static func transcript(_ url: URL) throws -> (lines: [DoorLine], mine: Date?, reply: String?) {
+        try DoorIndex.shared.lock.withLock {
             var info = stat()
-            guard lstat(url.path, &info) == 0, let handle = try? FileHandle(forReadingFrom: url) else {
+            guard lstat(url.path, &info) == 0 else {
                 DoorIndex.shared.entries[url.path] = nil
-                return ([], nil)
+                if errno == ENOENT { return ([], nil, nil) }
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: url.path])
             }
+            let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
             let size = UInt64(info.st_size), inode = UInt64(info.st_ino)
             var entry = DoorIndex.shared.entries[url.path] ?? .init()
@@ -95,31 +115,49 @@ extension HerScreen {
                 partial = entry.offset > 0
             }
             if size > entry.offset {
-                if let data = ContactThread.read(handle, from: entry.offset, bytes: Int(size - entry.offset)),
-                   let end = data.lastIndex(of: UInt8(ascii: "\n")) {
+                try handle.seek(toOffset: entry.offset)
+                let data = try handle.read(upToCount: Int(size - entry.offset)) ?? Data()
+                guard data.count == Int(size - entry.offset) else { throw CocoaError(.fileReadUnknown) }
+                if let end = data.lastIndex(of: UInt8(ascii: "\n")) {
                     // Whole rows only: a row still being written is read next time.
                     var rows = data[data.startIndex..<end].split(separator: UInt8(ascii: "\n"))
                     if partial, !rows.isEmpty { rows.removeFirst() }
                     entry.offset += UInt64(end - data.startIndex + 1)
-                    read(rows, session: url.deletingPathExtension().lastPathComponent,
+                    try read(rows, session: url.deletingPathExtension().lastPathComponent,
                          dataRoot: url.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent(), into: &entry)
                     if entry.lines.count > 30 { entry.lines.removeFirst(entry.lines.count - 30) }
                 }
             }
             DoorIndex.shared.entries[url.path] = entry
-            return (entry.lines, entry.mine)
+            return (entry.lines, entry.mine, entry.reply)
         }
     }
 
     /// Rows onto a transcript's index: the things said to her with a known
     /// door and her answer to each. Wake notices
     /// and other mechanical rows are not anyone speaking.
-    private static func read(_ rows: [Data.SubSequence], session: String, dataRoot: URL, into entry: inout DoorIndex.Entry) {
-        let wake = SessionConversation.kind(session, dataRoot: dataRoot)?.isOwnWork == true
+    private static func read(_ rows: [Data.SubSequence], session: String, dataRoot: URL, into entry: inout DoorIndex.Entry) throws {
+        guard let kind = try SessionConversation(dataRoot: dataRoot).kind(session) else {
+            throw ToolFailureError("Conversation classification is unavailable for " + session, effects: .none,
+                owner: dataRoot.appendingPathComponent("chat/sessions.json").path,
+                instruction: "Reconcile this transcript with its owning session index before projecting it into other rooms.", recovery: .repair)
+        }
+        let wake = kind.isOwnWork
         for raw in rows {
-            guard let speech = ContactThread.Line(jsonl: Data(raw)) else { continue }
+            guard case .object(let row) = try JSONValue.parse(Data(raw)) else { throw CocoaError(.fileReadCorruptFile) }
+            let speech = ContactThread.Line(row)
             let metadata = speech.metadata
-            guard let at = speech.date else { continue }
+            guard speech.role == "user" || speech.role == "assistant" else { continue }
+            if let failure = speech.provenanceFailure {
+                throw ToolFailureError(failure, effects: .none,
+                    owner: dataRoot.appendingPathComponent("chat/messages/\(session).jsonl").path,
+                    instruction: "Repair the retained row's provenance before reading this conversation.", recovery: .repair)
+            }
+            guard case .string? = row["id"], case .string? = row["content"], let at = speech.date else {
+                throw ToolFailureError("A complete transcript message has unreadable identity, content or time in " + session, effects: .none,
+                    owner: dataRoot.appendingPathComponent("chat/messages/\(session).jsonl").path,
+                    instruction: "Repair the complete message from retained transcript evidence; do not guess its timestamp or skip the corrupt row.", recovery: .repair)
+            }
             let content = speech.text
             switch speech.role {
             case "assistant":
@@ -128,9 +166,19 @@ extension HerScreen {
                     continue
                 }
                 guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                if !entry.open, !wake {
+                    let surface = (metadata["origin"]?.objectValue ?? [:])["surface"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })
+                        ?? (metadata["envelope"]?.objectValue ?? [:])["surface"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })
+                    if let door = surface.flatMap({ HerScreen.door($0) }), door != "bridge" {
+                        entry.posts.append(.init(id: speech.id, session: session, at: at, door: door,
+                            text: ChatSecretRedactor.redactText(content), user: false, stamp: speech.stamp, active: at))
+                        if entry.posts.count > 10 { entry.posts.removeFirst(entry.posts.count - 10) }
+                    }
+                }
                 entry.mine = at
+                entry.reply = ChatSecretRedactor.redactText(content)
                 if entry.open {
-                    entry.lines[entry.lines.count - 1].reply = ChatSecretRedactor.redactText(content)
+                    entry.lines[entry.lines.count - 1].reply = entry.reply
                     entry.lines[entry.lines.count - 1].active = at
                     if wake { entry.lines[entry.lines.count - 1].at = at }
                 }
@@ -169,9 +217,15 @@ extension HerScreen {
     }
 
     /// A reading copy only: never appended to the person's session or fed as chat.
-    package static func otherRoomExchanges(dataRoot: URL, identity: AgentContactIdentity, since: Date, now: Date = Date()) -> [OtherRoomExchange] {
+    package static func otherRoomExchanges(dataRoot: URL, identity: AgentContactIdentity, since: Date, now: Date = Date()) throws -> [OtherRoomExchange] {
+        try otherRoomExchanges(dataRoot: dataRoot, identity: identity, since: since, now: now,
+                           lines: doorLines(dataRoot: dataRoot, now: now, since: since))
+    }
+
+    private static func otherRoomExchanges(dataRoot: URL, identity: AgentContactIdentity, since: Date, now: Date,
+                                           lines: [DoorLine]) -> [OtherRoomExchange] {
         let named = identity.peerNames, profile = names(dataRoot)
-        return doorLines(dataRoot: dataRoot, now: now, since: since).compactMap { line in
+        return lines.compactMap { line in
             guard line.door == "bridge", !line.byPerson, let reply = line.reply,
                   line.active >= since, line.active <= now else { return nil }
             return OtherRoomExchange(id: line.session + ":" + line.id, sessionID: line.session,
@@ -199,7 +253,8 @@ extension HerScreen {
     /// out. The words open in the room, not here: home rides turns another
     /// agent steers too. Nothing when "Remember across conversations" is off.
     static func elsewhereRows(_ world: HerWorld, dataRoot: URL, scope: String, person: String, now: Date) -> [String] {
-        guard MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) else { return [] }
+        do { guard try MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) else { return [] } }
+        catch { return [nameFailure(error)] }
         var doors: Set<String> = []
         let peers = Dictionary(uniqueKeysWithValues: world.routes.map { ($0.id, $0.name) })
         let newest = world.doors.filter {
@@ -218,7 +273,12 @@ extension HerScreen {
     /// chat she is in left out; `elsewhere.N` opens one whole, with her reply
     /// (kept per chat). Closed when "Remember across conversations" is off.
     static func elsewhereRoom(dataRoot: URL, scope: String, now: Date = Date()) -> String {
-        guard MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) else {
+        do { return try checkedElsewhereRoom(dataRoot: dataRoot, scope: scope, now: now) }
+        catch { return nameFailure(error) }
+    }
+
+    private static func checkedElsewhereRoom(dataRoot: URL, scope: String, now: Date) throws -> String {
+        guard try MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) else {
             return screen(["ELSEWHERE", "closed"], [[failureFace(.object(["status": .string("refused"),
                 "reason": .string("cross_session_recall_disabled"), "effects": .string("none"),
                 "detail": .string("Remember across conversations is off; other conversations stay closed."),
@@ -226,9 +286,17 @@ extension HerScreen {
                     instruction: "Only the owner can enable Remember across conversations in Settings.")]))]], verbs: [])
         }
         let person = names(dataRoot).person
-        let lines = Array(doorLines(dataRoot: dataRoot, now: now).filter { $0.session != scope }.prefix(12))
+        let lines: [DoorLine]
+        do { lines = Array(try doorLines(dataRoot: dataRoot, now: now).filter { $0.session != scope }.prefix(12)) }
+        catch { return nameFailure(error) }
         var pages: [String: String] = [:], speech: [String: [ContactThread.Line]] = [:]
-        let named = AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot).peerNames
+        let named: [String: String]
+        do { named = try AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot).peerNames }
+        catch {
+            return screen(["ELSEWHERE", "Identity unavailable"], [[readFailure(error, reason: "contact_identity_unavailable",
+                remedy: Repair.remedy(owner: "agents/peers.json", nextCall: nil,
+                    tap: "Repair the contact address book before resolving conversation identities."))]], verbs: [])
+        }
         let chats = Result { try withNames(dataRoot) { book in
             lines.map { line in Result {
                 "chat.\(try book.number("chat", id: line.session) { Set(((try? FileManager.default.contentsOfDirectory(atPath: dataRoot.appendingPathComponent("chat/messages").path)) ?? []).map { ($0 as NSString).deletingPathExtension }) })"
@@ -280,27 +348,78 @@ extension HerScreen {
 
     // MARK: The per-turn line
 
+    /// Read-only inputs, gathered beside history. Disclosure and markConsumed
+    /// remain in elsewhere, after history has established this turn's taint.
+    package struct ElsewhereReading: Sendable {
+        fileprivate var failure: String? = nil
+        fileprivate let all: [DoorLine]
+        fileprivate let posts: [DoorLine]
+        fileprivate let helpers: [String]
+        fileprivate let exchanges: [OtherRoomExchange]
+    }
+
+    package static func readElsewhere(dataRoot: URL, scope: String, turn: Date) -> ElsewhereReading? {
+        do { return try checkedElsewhere(dataRoot: dataRoot, scope: scope, turn: turn) }
+        catch { return ElsewhereReading(failure: nameFailure(error), all: [], posts: [], helpers: [], exchanges: []) }
+    }
+
+    private static func checkedElsewhere(dataRoot: URL, scope: String, turn: Date) throws -> ElsewhereReading? {
+        guard try MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) else { return nil }
+        let mine: Date?
+        if NativeAgentChatSessionID.normalizedPathComponent(scope) == nil { mine = nil }
+        else { mine = try transcript(dataRoot.appendingPathComponent("chat/messages/\(scope).jsonl")).mine }
+        let identity = try AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot)
+        let since = mine ?? turn.addingTimeInterval(-3600)
+        let known = try doorLines(dataRoot: dataRoot, now: turn)
+        // doorLines refreshed the shared index once. Do not enumerate and
+        // reopen all twelve transcripts again for posts and bridge exchanges.
+        let sessions = try SessionConversation(dataRoot: dataRoot)
+        let directory = dataRoot.appendingPathComponent("chat/messages", isDirectory: true).standardizedFileURL.path + "/"
+        let posts = DoorIndex.shared.lock.withLock {
+            DoorIndex.shared.entries.filter { $0.key.hasPrefix(directory) }.values.flatMap(\.posts)
+        }
+            .filter { $0.at > since && $0.at <= turn && $0.session != scope && !sessions.isHelper($0.session) }
+            .sorted { $0.at > $1.at }
+        return try ElsewhereReading(all: known.filter { $0.session != scope && $0.at > since && $0.at <= turn },
+            posts: posts, helpers: helperLines(dataRoot: dataRoot, scope: scope, since: since, now: turn),
+            exchanges: otherRoomExchanges(dataRoot: dataRoot, identity: identity,
+                since: since, now: turn, lines: known))
+    }
+
     /// Since her last reply in this chat (or within the hour, in a chat she
     /// has not answered yet): one line when User said something on another of
     /// his doors, one when one of her own wakes concluded, and on a turn he
-    /// started, the newest five completed bridge exchanges with bounded words. Nil when
-    /// nothing is new, when "Remember across conversations" is off, or on an
-    /// unknown door. On a turn another agent steers (`peer`), User's door,
+    /// started, the newest five completed bridge exchanges and up to three
+    /// helpers' newest replies, with bounded words. Nil when nothing is new,
+    /// when "Remember across conversations" is off, or on an unknown door.
+    /// On a turn another agent steers (`peer`), User's door,
     /// count and time only: his words do not ride where she could relay them,
-    /// and no bridge line rides at all. Her wake is her own thought, so it
-    /// rides there too. Read from the transcripts' index (`transcript`), the
-    /// same line every iteration of a turn.
-    package static func elsewhere(dataRoot: URL, identity: AgentContactIdentity, scope: String, surface: String, peer: Bool, turn: Date?) async -> String? {
-        guard let here = door(surface), MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) else { return nil }
+    /// and neither bridge nor helper words ride. A wake's words ride only
+    /// when hers alone and not peer-steered. Read from the transcripts' index
+    /// (`transcript`), the same line every iteration of a turn.
+    package static func elsewhere(dataRoot: URL, scope: String, surface: String, peer: Bool, turn: Date?,
+                                  reading: ElsewhereReading? = nil) async -> String? {
+        guard let here = door(surface) else { return nil }
+        do { guard try MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) else { return nil } }
+        catch { return nameFailure(error) }
         let key = "elsewhere\u{0}" + dataRoot.standardizedFileURL.path + "\u{0}" + scope + "\u{0}" + (turn.map { String($0.timeIntervalSince1970) } ?? "-")
+            + (peer ? "\u{0}peer" : "\u{0}person")
         if turn != nil, let kept = HerMemo.shared.glance(key) { return kept }
         let now = turn ?? Date()
-        let mine: Date? = NativeAgentChatSessionID.normalizedPathComponent(scope) == nil ? nil
-            : transcript(dataRoot.appendingPathComponent("chat/messages/\(scope).jsonl")).mine
-        let since = mine ?? now.addingTimeInterval(-3600)
-        let known = doorLines(dataRoot: dataRoot, now: now)
-        let all = known.filter { $0.session != scope && $0.at > since && $0.at <= now }
+        guard let reading = reading ?? readElsewhere(dataRoot: dataRoot, scope: scope, turn: now) else { return nil }
+        if let failure = reading.failure { return failure }
+        let all = reading.all
         var lines = [userLine(all.filter { $0.user && $0.door != here }, dataRoot: dataRoot, peer: peer, now: now)].compactMap { $0 }
+        // What she told him elsewhere: on a turn a peer steers, door, count and
+        // time only — her words to him are his, as his are.
+        let posts = reading.posts
+        if let latest = posts.first {
+            let person = names(dataRoot).person
+            var line = "You posted to " + person + " on " + latest.door + " " + age(now.timeIntervalSince(latest.at)) + " ago"
+            if !peer { line += ": " + quoted(latest.text, 160) }
+            if posts.count > 1 { line += "; \(posts.count - 1) more since your last reply here" }
+            lines.append(line + ". app {item:\"elsewhere\"}")
+        }
         if let wake = all.first(where: { $0.door == wakeDoor && $0.reply != nil }), let reply = wake.reply {
             // Her words travel only from a wake that was hers alone, and never
             // into a turn a peer steers: a wake carrying an agent's words would
@@ -312,8 +431,8 @@ extension HerScreen {
                     : "") + ". app {item:\"elsewhere\"}")
         }
         if !peer {
-            for exchange in otherRoomExchanges(dataRoot: dataRoot, identity: identity, since: since, now: now).reversed()
-                .filter({ $0.sessionID != scope && $0.at > since }).prefix(5) {
+            lines += reading.helpers
+            for exchange in reading.exchanges.reversed().filter({ $0.sessionID != scope }).prefix(5) {
                 // Context assembly runs outside the app door: mark read where it is bound.
                 AgentWorkspacePorts.binding?.tools.markConsumed(peer: exchange.contactID)
                 lines.append(exchange.contact + " over the bridge since your last reply here:\n"
@@ -324,6 +443,22 @@ extension HerScreen {
         let text = lines.isEmpty ? nil : lines.joined(separator: "\n")
         if turn != nil { HerMemo.shared.keepGlance(key, text) }
         return text
+    }
+
+    private static func helperLines(dataRoot: URL, scope: String, since: Date, now: Date) throws -> [String] {
+        let sessions = try SessionConversation(dataRoot: dataRoot)
+        let helpers = try BotDefinitionStore(dataRoot: dataRoot).list()
+        return try helpers.compactMap { bot -> (name: String, session: String, at: Date, reply: String)? in
+            guard bot.sessionID != scope, sessions.isHelper(bot.sessionID) else { return nil }
+            let read = try transcript(dataRoot.appendingPathComponent("chat/messages/\(bot.sessionID).jsonl"))
+            guard let at = read.mine, at > since, at <= now, let reply = read.reply else { return nil }
+            return (bot.name, bot.sessionID, at, reply)
+        }.sorted { ($0.at, $0.session) > ($1.at, $1.session) }.prefix(3).map { helper in
+            let flat = plainLines(helper.reply).joined(separator: " ")
+            let end = flat.range(of: #"[.!?](\s|$)"#, options: .regularExpression)?.upperBound ?? flat.endIndex
+            let first = String(flat[..<end]).trimmingCharacters(in: .whitespaces)
+            return clip(helper.name, 80) + " (my helper) since your last reply here: " + quoted(first, 200)
+        }
     }
 
     private static func userLine(_ fresh: [DoorLine], dataRoot: URL, peer: Bool, now: Date) -> String? {

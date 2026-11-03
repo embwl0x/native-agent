@@ -7,6 +7,9 @@ import PersistenceCore
 
 /// Gate fields from `macControlPolicy`, with category flags keyed by saved policy keys.
 public struct MacControlPolicy: Sendable, Equatable {
+    /// Call-scoped origin admission, projected only by the checked Full Mac owner.
+    /// Never serialized as a saved policy field.
+    public var fullMacAdmitted = false
     /// master gate (`enabled`).
     public var enabled: Bool
     /// `remote_from_ios_allowed`.
@@ -17,23 +20,19 @@ public struct MacControlPolicy: Sendable, Equatable {
     public var trustPolicy: MacControlTrustPolicy?
     /// `_workspaceRoots` — paths inside these are always file-allowed.
     public var workspaceRoots: [String]
-    /// Receipt metadata; PermissionLaw owns approval decisions, and a missing list defaults to shell-only receipts.
-    public var approvalRequiredFor: [String]?
 
     public init(
         enabled: Bool = false,
         remoteFromIOSAllowed: Bool = false,
         categoryAllowed: [String: Bool] = [:],
         trustPolicy: MacControlTrustPolicy? = nil,
-        workspaceRoots: [String] = [],
-        approvalRequiredFor: [String]? = nil
+        workspaceRoots: [String] = []
     ) {
         self.enabled = enabled
         self.remoteFromIOSAllowed = remoteFromIOSAllowed
         self.categoryAllowed = categoryAllowed
         self.trustPolicy = trustPolicy
         self.workspaceRoots = workspaceRoots
-        self.approvalRequiredFor = approvalRequiredFor
     }
 
     /// The gate projection of TrustCenter's canonical Mac schema.
@@ -42,8 +41,7 @@ public struct MacControlPolicy: Sendable, Equatable {
         return MacControlPolicy(enabled: mac["enabled"] == .bool(true),
             remoteFromIOSAllowed: mac["remote_from_ios_allowed"] == .bool(true),
             categoryAllowed: mac.filter { $0.key.hasSuffix("_allowed") && $0.key != "remote_from_ios_allowed" }
-                .mapValues { $0 == .bool(true) },
-            approvalRequiredFor: SwiftNativeSecurityCenter.stringArray(mac["approval_required_for"]))
+                .mapValues { $0 == .bool(true) })
     }()
 }
 
@@ -112,6 +110,7 @@ public enum MacControlGate {
     ) -> MacControlPolicy {
         guard admitted, let trust = policy.trustPolicy, fullMacActive(trust) else { return policy }
         var effective = policy
+        effective.fullMacAdmitted = true
         effective.enabled = true
         effective.remoteFromIOSAllowed = true
         for key in MacControlPolicy.default.categoryAllowed.keys {
@@ -168,7 +167,6 @@ public enum MacControlGate {
         let outside = trust.outsideWorkspaceDefault.isEmpty ? "deny" : trust.outsideWorkspaceDefault
         let permission = trust.permissionLevel.isEmpty ? "balanced" : trust.permissionLevel
         return outside == "allow"
-            || permission == "wide_open_receipts"
             || permission == "full_mac_os"
     }
 
@@ -221,9 +219,8 @@ public extension MacControlPolicy {
             categoryAllowed[key] = mac[key]?.boolValue ?? categoryAllowed[key] ?? false
         }
 
-        let approvalRequiredFor = mac["approval_required_for"]?.arrayValue?.compactMap(\.stringValue) ?? defaults.approvalRequiredFor
         let workspaceRoots = SwiftNativeSecurityCenter.normalizedUniqueRoots([dataRoot]
-            + SwiftNativeSecurityCenter.trustedWorkspaceRoots(policy: root, filePolicy: filePolicy, dataRoot: dataRoot))
+            + SwiftNativeSecurityCenter.trustedWorkspaceRoots(filePolicy: filePolicy, dataRoot: dataRoot))
             .map(\.path)
 
         let trustPolicy = MacControlTrustPolicy(
@@ -236,8 +233,7 @@ public extension MacControlPolicy {
             remoteFromIOSAllowed: mac["remote_from_ios_allowed"]?.boolValue ?? defaults.remoteFromIOSAllowed,
             categoryAllowed: categoryAllowed,
             trustPolicy: trustPolicy,
-            workspaceRoots: workspaceRoots,
-            approvalRequiredFor: approvalRequiredFor
+            workspaceRoots: workspaceRoots
         )
     }
 }

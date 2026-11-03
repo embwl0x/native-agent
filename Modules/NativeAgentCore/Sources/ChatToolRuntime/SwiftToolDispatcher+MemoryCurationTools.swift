@@ -70,21 +70,27 @@ public struct MemoryCuration: Sendable {
     /// Every active memory, newest first by default, in pages. The walk
     /// starts at offset 0 and ends when `remaining` is 0.
     public func listMemories(input: [String: JSONValue], surface: String, persona: String?) async throws -> JSONValue {
+        for key in ["sort", "status", "after_id"] {
+            if let value = input[key], value != .null {
+                guard case .string(let raw) = value, !raw.isEmpty,
+                      raw == raw.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                    return curationRefusal("\(key) must be a nonempty current string; omit after_id to start a fresh page.")
+                }
+            }
+        }
         let offset = max(0, curationInt(input, "offset") ?? 0)
         let limit = min(100, max(1, curationInt(input, "limit") ?? 50))
-        let requestedSort = curationString(input, "sort")?.lowercased() ?? "newest_first"
-        let sort = ["newest": "newest_first", "latest": "newest_first", "oldest": "oldest_first"][requestedSort] ?? requestedSort
+        let sort = curationString(input, "sort") ?? "newest_first"
         guard ["newest_first", "oldest_first"].contains(sort) else {
             return curationRefusal("sort must be newest_first or oldest_first; keep the same sort when following next_after_id.")
         }
-        let requestedStatus = curationString(input, "status")?.lowercased() ?? "active"
-        let status = ["kept": "active", "saved": "active", "current": "active"][requestedStatus] ?? requestedStatus
+        let status = curationString(input, "status") ?? "active"
         guard ["active", "archived"].contains(status) else {
             return curationRefusal("status must be active or archived.")
         }
         let afterID = curationString(input, "after_id")
         let cursor = afterID.flatMap { Self.curationCursorKey($0) }
-        if let afterID, afterID.contains("|") {
+        if afterID != nil {
             guard let cursor else {
                 return curationRefusal("after_id is a legacy or invalid cursor without a recognized sort direction. Restart memory.list without after_id and with offset 0, choosing newest_first or oldest_first in sort.")
             }
@@ -96,7 +102,7 @@ public struct MemoryCuration: Sendable {
         do {
             listing = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot).curationPage(
                 archived: status == "archived", kind: curationString(input, "kind"), surface: surface, persona: persona,
-                newestFirst: sort == "newest_first", afterKey: cursor?.key, afterID: afterID, offset: offset, limit: limit
+                newestFirst: sort == "newest_first", afterKey: cursor?.key, offset: offset, limit: limit
             )
         } catch {
             return SwiftToolDispatcher.memoryFailure(error)
@@ -240,9 +246,6 @@ public struct MemoryCuration: Sendable {
             if !MemoryLifecycle.isRecallEligible(row.lifecycle) {
                 update["lifecycle"] = .string(MemoryLifecycle.confirmed)
             }
-            // The hygiene duplicate pass skips a row carrying this, so a
-            // restored merge is not merged again on the next pass.
-            update["owner_restored"] = .string(ISO8601DateFormatter().string(from: Date()))
             // Restore passes the text back through the gates a rewrite runs:
             // re-embedded, and refused when it matches something forgotten or
             // let go (an archived twin of a forgotten fact stays archived).

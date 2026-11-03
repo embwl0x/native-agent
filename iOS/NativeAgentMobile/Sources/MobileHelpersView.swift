@@ -1,6 +1,6 @@
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `MobileHelpersView.swift` | Helper list and ID-resolved details from the sync owner; local editable drafts and submission state |
+// Blueprint: | `MobileHelpersView.swift` | Helper list and ID-resolved details from the sync owner; local editable drafts and submission state; Follow Providers sends no dormant pinned settings and marks its hidden Fast control unsubmitted |
 
 struct MobileHelpersView: View {
     private let sync = iCloudSyncEngine.shared
@@ -163,7 +163,7 @@ struct MobileHelperEditorView: View {
             }
             Picker("Think", selection: $edit.think) {
                 Text("Choose").tag("")
-                ForEach(selectedModel?.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"], id: \.self) {
+                ForEach(selectedModel?.supported_reasoning_efforts ?? [], id: \.self) {
                     Text($0.capitalized).tag($0)
                 }
             }.aliveRow()
@@ -218,6 +218,11 @@ struct MobileHelperEditorView: View {
         defer { busy = false }
         do {
             var request = edit
+            request.fastIsSet = request.modelPinned != false
+            if request.modelPinned == false {
+                // Follow Providers submits no dormant per-helper controls.
+                request.provider = ""; request.model = ""; request.think = ""
+            }
             if ["daily", "weekdays", "weekly"].contains(request.timing) {
                 let parts = Calendar.current.dateComponents([.hour, .minute], from: clock)
                 let days = request.timing == "weekly" ? String(weekday) : request.timing == "weekdays" ? "1-5" : "*"

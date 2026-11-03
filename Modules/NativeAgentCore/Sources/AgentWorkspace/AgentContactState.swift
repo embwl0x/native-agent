@@ -1,7 +1,9 @@
 import Foundation
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `AgentContactState.swift` | Folds validated contact projections from `AgentPeerStore` into presentation identities; labels only ACP/MCP schemes as such. `AgentLocalHealth` owns 600-second freshness and 300-second refresh spacing; exact pull-reply read receipts. Authentication recovery requires structured failure evidence for the exact observed operation; reply prose cannot erase failures. |
+import Experiences
+import NativeAgentCore
+// Blueprint: | `AgentContactState.swift` | Folds validated contact projections from `AgentPeerStore` into presentation identities; labels only ACP/MCP schemes as such. `AgentLocalHealth` owns 600-second freshness and 300-second refresh spacing; `not_reached` retains unsent failure evidence without counting as broken; exact pull-reply read receipts. Authentication recovery requires structured failure evidence for the exact observed operation; reply prose cannot erase failures. |
 
 /// Who each saved contact is (docs/agent-communication.md, "Every agent is
 /// itself"): its own who, or the who it is explicitly associated with
@@ -127,7 +129,7 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [:] }
     }
     /// Said until a newer observation replaces it, not only while fresh.
-    public var sticky: Bool { brokenSince != nil || ["unverified", "interrupted", "stalled", "no_reply_by_deadline"].contains(observedStatus ?? "") }
+    public var sticky: Bool { brokenSince != nil || ["not_reached", "unverified", "interrupted", "stalled", "no_reply_by_deadline"].contains(observedStatus ?? "") }
     public var current: Bool { presenceStatus != nil || sticky || Self.isRecent(checkedAt) }
     public var word: String? {
         guard current else { return nil }
@@ -195,10 +197,13 @@ public struct AgentDiscoveryOffer: Codable, Sendable, Equatable {
     /// Empty only when the file is missing; nil when it is there but does not
     /// read, so a damaged file is never written over.
     public static func read(_ root: URL) -> [String: Self]? {
-        guard FileManager.default.fileExists(atPath: url(root).path) else { return [:] }
+        try? checkedRead(root)
+    }
+    public static func checkedRead(_ root: URL) throws -> [String: Self] {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return (try? Data(contentsOf: url(root))).flatMap { try? decoder.decode([String: Self].self, from: $0) }
+        do { return try decoder.decode([String: Self].self, from: Data(contentsOf: url(root))) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [:] }
     }
     public static func write(_ offers: [String: Self], _ root: URL) throws {
         let encoder = JSONEncoder()
@@ -225,21 +230,24 @@ public enum ContactReplyReads {
     }
     private static let lock = NSLock()
     public static func url(_ root: URL) -> URL { root.appendingPathComponent("agents/reply-reads.json") }
-    public static func read(_ root: URL) -> [Read] {
-        guard let data = try? Data(contentsOf: url(root)) else { return [] }
-        return (try? JSONDecoder().decode([Read].self, from: data)) ?? []
+    public static func read(_ root: URL) throws -> [Read] {
+        do { return try JSONDecoder().decode([Read].self, from: Data(contentsOf: url(root))) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
     }
     public static func record(dataRoot: URL, session: String, request: String, run: String) {
         guard !session.isEmpty, !request.isEmpty, !run.isEmpty else { return }
         lock.withLock {
             do {
                 let file = url(dataRoot)
-                var rows = FileManager.default.fileExists(atPath: file.path)
-                    ? try JSONDecoder().decode([Read].self, from: Data(contentsOf: file)) : []
+                var rows = try read(dataRoot)
                 guard !rows.contains(where: { $0.session == session && $0.request == request && $0.run == run }) else { return }
                 rows.append(Read(session: session, request: request, run: run, at: Date()))
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(Array(rows.suffix(2048))), to: file)
-            } catch { nativeLog("ContactReplyReads: could not retain fetch: %@", error.localizedDescription) }
+            } catch {
+                RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "contacts.reply_read", owner: url(dataRoot).path,
+                    words: "The reply was fetched, but its read record could not be saved: \(error.localizedDescription). Do not fetch it again to repair this record.",
+                    tap: ToolFailureError.fileRepairInstruction(url(dataRoot), shape: "Preserve the Read array and repair its read/write access."))
+            }
         }
     }
 }

@@ -22,7 +22,7 @@ import TurnTrace
 /// actually reads.  The digest cache is an optimization, never evidence that
 /// a file remains intact: a same-name file can be truncated or replaced by an
 /// out-of-process iCloud/crash-window event while its old digest still sits in
-/// memory. Exact file observation and a slow missed-event fallback share this check.
+/// memory. Exact file observation and explicit launch/repair reconciliation share this check.
 struct SnapshotFileDigest: Codable, Equatable, Sendable {
     let payload: String
     let wire: String
@@ -90,7 +90,7 @@ enum MacSyncSnapshotIntegrity {
                     unreadable.append(filename)
                     continue
                 }
-                let actualDigest = digest(try Data(contentsOf: url))
+                let actualDigest = digest(try VolumeIO.contents(of: url))
                 guard actualDigest == expectedDigest.wire else {
                     mismatched.append(filename)
                     continue
@@ -150,39 +150,18 @@ actor MobileSnapshotBuilder {
     }
 
     func status(group: NAMobileSnapshotGroup, directory: URL, committed: [String: Data]) async throws -> String? {
-        var files = try await VolumeIO.run {
+        let files = try await VolumeIO.run {
             var files = committed.filter { group.filenames.contains($0.key) }
             for filename in group.filenames where files[filename] == nil {
                 let url = directory.appendingPathComponent(filename)
                 // Missing is optional; unreadable must fail and retain retry demand.
                 guard FileManager.default.fileExists(atPath: url.path) else { continue }
-                files[filename] = try Data(contentsOf: url, options: [.mappedIfSafe])
+                files[filename] = try VolumeIO.contents(of: url, options: [.mappedIfSafe])
             }
             return files
         }
         guard !files.isEmpty else { return nil }
-        do {
-            return try NAMobileSnapshotStatusCodec.encode(group: group, files: files)
-        } catch DeviceSyncError.payloadTooLarge {
-            // Shed optional files to fit the shared envelope; retained phone copies keep their own capturedAt.
-            for filename in group.trimmableFilenames {
-                // Never shed the last file: an empty set is not a publishable
-                // group, and the caller is owed the size failure, not a
-                // different one.
-                guard files.count > 1, files.removeValue(forKey: filename) != nil else { continue }
-                nativeLog(
-                    "[MacSyncEngine] mobile snapshot %@ exceeded the status envelope — trimmed %@ so the rest still publishes",
-                    group.rawValue,
-                    filename
-                )
-                if let value = try? NAMobileSnapshotStatusCodec.encode(group: group, files: files) {
-                    return value
-                }
-            }
-            // Nothing trimmable left: the authoritative rows themselves do not
-            // fit, which is a real publication failure and keeps retry demand.
-            return try NAMobileSnapshotStatusCodec.encode(group: group, files: files)
-        }
+        return try NAMobileSnapshotStatusCodec.encode(group: group, files: files)
     }
 }
 

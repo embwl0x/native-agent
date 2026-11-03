@@ -36,7 +36,7 @@ extension SwiftToolDispatcher {
         )
         let store = deskStore()
         _ = try await store.setNotify(handle, policy: policy)
-        return deskConfirm(try? await store.liveState(), handle: handle, prefix: "notify \(level.rawValue)")
+        return await deskConfirm(store, handle: handle, prefix: "notify \(level.rawValue)")
     }
 
     /// Explicit notification controls never infer the person’s intent.
@@ -82,9 +82,10 @@ extension SwiftToolDispatcher {
                     throw deskInvalid("scope_id", reason: "desk_nag_control: scope_kind 'item' needs scope_id (the desk number or handle)")
                 }
                 // Resolve visible numbers to stable handles before persisting scope identity.
-                let handle = try resolveDeskRef(scopeIdRaw, in: try await deskStore().liveState(), field: "scope_id")
+                let state = try await deskStore().liveState()
+                let handle = try resolveDeskRef(scopeIdRaw, in: state, field: "scope_id")
                 let next = try await configStore.update { $0.settingScope(kind: .item, id: handle, enabled: on) }
-                let alias = (try? await deskStore().liveState())?.items.first { $0.handle == handle }?.alias
+                let alias = state.items.first { $0.handle == handle }?.alias
                 return .object([
                     "status": .string("ok"),
                     "handle": .string(handle),
@@ -139,7 +140,7 @@ extension SwiftToolDispatcher {
             ])
 
         case "status", "read":
-            let config = await configStore.load()
+            let config = try await configStore.loadChecked()
             let muted = config.isMuted(now: Date())
             var lines: [String] = ["nagging \(config.enabled ? "ON" : "OFF") globally · window \(config.windowId)"]
             if muted {

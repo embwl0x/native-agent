@@ -24,20 +24,19 @@ extension SwiftToolDispatcher {
     /// `app {find}`, and nothing is loaded.
     public func toolManifest(detail: String? = nil, surface: String = "chat") async throws -> JSONValue {
         let fullDetail = detail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "full"
-        let catalog = await catalogSnapshot(includeSchemas: fullDetail, surface: surface)
+        let catalog = try await catalogSnapshot(includeSchemas: fullDetail, surface: surface)
         let access = catalog.access
-        let trustedRoots = await trustedWorkspaceRoots()
+        let trustedRoots = try await trustedWorkspaceRoots()
         let modelNameSet = Self.modelVisibleCatalogToolNames(Set(catalog.names))
-        let currentlyLoaded = Self.alwaysOnCoreNames.intersection(modelNameSet).sorted()
-        let loadedSet = Set(currentlyLoaded)
+        let alwaysOnTools = Self.alwaysOnCoreNames.intersection(modelNameSet).sorted()
         let contributedBuckets = Dictionary((appTools?.descriptors ?? []).map { ($0.name, $0.bucket) }) { first, _ in first }
-        let rows: [JSONValue] = catalog.schemas.filter { modelNameSet.contains($0.name) }.sorted { $0.name < $1.name }.map { schema in
+        let rows: [JSONValue] = try catalog.schemas.filter { modelNameSet.contains($0.name) }.sorted { $0.name < $1.name }.map { schema in
             var row: [String: JSONValue] = [
                 "name": .string(schema.name),
                 "description": .string(schema.description),
                 "dispatchable_via": .string(contributedToolNames.contains(schema.name)
                     ? "nativeagent_app_tool_dispatcher" : "swift_tool_dispatcher"),
-                "load_state": .string(loadedSet.contains(schema.name) ? "loaded" : "hidden"),
+                "model_visible": .bool(true),
             ]
             // A registry-owned bucket makes the rendered catalog reflect the
             // dispatch table rather than a second UI-only name list. An
@@ -47,9 +46,19 @@ extension SwiftToolDispatcher {
                 (Self.catalogBucket(forRegisteredToolNamed: schema.name) ?? contributedBuckets[schema.name])?.rawValue
                     ?? ChatToolCatalogBucket.unclassified.rawValue
             )
-            if let parameters = try? JSONValue.parse(schema.parametersJSON) {
-                row["parameters"] = parameters
+            let parameters: JSONValue
+            do { parameters = try JSONValue.parse(schema.parametersJSON) }
+            catch {
+                throw ToolFailureError("The catalog's input schema for \(schema.name) could not be read: \(error.localizedDescription). Repair its registered schema before reading the catalog again.",
+                    effects: .none, owner: "Tool catalog", code: "tool_schema_unavailable",
+                    instruction: "Repair the registered input schema for \(schema.name).", recovery: .repair)
             }
+            guard case .object = parameters else {
+                throw ToolFailureError("The catalog's input schema for \(schema.name) must be an object. Repair its registered schema before reading the catalog again.",
+                    effects: .none, owner: "Tool catalog", code: "tool_schema_unavailable",
+                    instruction: "Repair the registered input schema for \(schema.name).", recovery: .repair)
+            }
+            row["parameters"] = parameters
             return .object(row)
         }
         // Folded into app: listed as the actions they are, available by the
@@ -113,7 +122,7 @@ extension SwiftToolDispatcher {
             "activity_policy_locked_tools": .array(lockedActivityTools.map { .string($0) }),
             "mac_accessibility_act_available_tools": .array(availableAXActTools.map { .string($0) }),
             "mac_accessibility_act_policy_locked_tools": .array(lockedAXActTools.map { .string($0) }),
-            "currently_loaded": .array(currentlyLoaded.map { .string($0) }),
+            "always_on_tools": .array(alwaysOnTools.map { .string($0) }),
             "available_tools": .array(modelNameSet.sorted().map { .string($0) }),
             "builder_available_tools": .array(availableBuilderTools.map { .string($0) }),
             "builder_policy_locked_tools": .array(lockedBuilderTools.map { .string($0) }),

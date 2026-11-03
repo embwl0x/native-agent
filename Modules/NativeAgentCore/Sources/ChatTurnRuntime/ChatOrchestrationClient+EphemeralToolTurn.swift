@@ -120,8 +120,9 @@ extension SwiftNativeChatOrchestrationClient {
         surface: String,
         providerAdmission: (@Sendable () async throws -> Void)? = nil
     ) async throws -> ChatResponse {
-        // Fold the surface before deriving identity, authority or provider routing.
-        let surface = WorkshopSurfaceVocabulary.foldLegacySpelling(surface)
+        guard surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "missions" else {
+            throw ToolFailureError("The routing surface is workshop. Correct the caller's surface before starting its turn.", effects: .none, recovery: .correctArguments)
+        }
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty && attachments.isEmpty {
             throw ChatOrchestrationError.emptyMessage
@@ -154,7 +155,7 @@ extension SwiftNativeChatOrchestrationClient {
                 imageBlocks: imageBlocks,
                 sessionID: nil
             )
-            let cognitiveProjection = await prepareCognitiveTurnProjection(
+            let cognitiveProjection = try await prepareCognitiveTurnProjection(
                 surface: surface,
                 userMessage: message,
                 sessionId: projectionSessionId,
@@ -188,7 +189,7 @@ extension SwiftNativeChatOrchestrationClient {
             try await prepare()
         }
         let requestTools = Set(projectedContext.toolSchemas.map(\.name))
-        // Restricted non-chat surfaces retain narrower trust without the first-conversation exemption; default callers keep it.
+        // Every surface uses ordinary Trust; successful chat writes settle exact-session progression.
         let gated = makeGatedToolDispatchClient(
             tools: tools,
             fileAccess: fileAccess,
@@ -196,8 +197,7 @@ extension SwiftNativeChatOrchestrationClient {
             approvalTimeoutSeconds: approvalTimeoutSeconds,
             dataRoot: dataRoot,
             verifiedSessionId: toolSessionId,
-            tracePeerTurn: true,
-            allowsFirstConversationExemption: true
+            tracePeerTurn: true
         )
         // Temporary workers still own a real execution identity. Bind their
         // own run rather than leaving traces unknown or inheriting the parent

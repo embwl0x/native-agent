@@ -15,12 +15,12 @@ import AgentWorkspace
 import Synchronization
 import Experiences
 import TelegramBot
-// Blueprint: | `EngineDoctorMeasurements.swift` | EngineDoctorRuntime reads live provider, search, Telegram, memory, tool, autonomy, bridge, contact, loop and organ health; shared memory/search caches retain their measurement bounds |
+// Blueprint: | `EngineDoctorMeasurements.swift` | EngineDoctorRuntime reads live provider, search, Telegram, memory, tool, autonomy, bridge, contact, loop and organ health; malformed search responses leave readiness unverified rather than asserting inability; shared memory/search caches retain their measurement bounds |
 
 /// Each live health read queries the store; integrity checks retain their own cache.
 private let liveMemoryQuickCheck = Mutex<(at: Date, rows: [String])?>(nil)
 private let liveMemoryQuickCheckMaxAge: TimeInterval = 600
-private let liveSearchReading = Mutex<(base: String, healthy: Bool, at: Date)?>(nil)
+private let liveSearchReading = Mutex<(base: String, result: Result<Bool, Error>, at: Date)?>(nil)
 
 extension EngineDoctorRuntime {
     /// Query the mounted memory owner; attachment retries use the same owner.
@@ -337,8 +337,10 @@ extension EngineDoctorRuntime {
     private func searchDoctorCoverageCheck(_ raw: String, probe: Bool) async -> CheckResult {
         let source = "research/config.json > searxng_base_url"
         if raw.isEmpty {
-            return CheckResult(source: source, id: "live.search", title: "Search", status: "ok",
-                               detail: "SearXNG is not set up, so her web searches go through the browser (Chrome when its extension is connected, else her own browser).")
+            return CheckResult(source: source, id: "live.search", title: "Search", status: "fail",
+                               detail: "Web search is unavailable because SearXNG is not configured.",
+                               harm: "She cannot search the web.",
+                               human_action: "Open Research → Search service, enter the SearXNG URL, then click Save.")
         }
         let validURL = URL(string: raw).map {
             ["http", "https"].contains($0.scheme?.lowercased() ?? "")
@@ -352,7 +354,10 @@ extension EngineDoctorRuntime {
         }
         // Doctor runs probe; the health pill reads the cached result.
         if probe {
-            let reading = (raw, await self.doctorProbeSearch(base: raw), Date())
+            let result: Result<Bool, Error>
+            do { result = .success(try await self.doctorProbeSearch(base: raw)) }
+            catch { result = .failure(error) }
+            let reading = (raw, result, Date())
             liveSearchReading.withLock { $0 = reading }
         }
         guard let reading = liveSearchReading.withLock({ $0 }), reading.base == raw,
@@ -360,16 +365,25 @@ extension EngineDoctorRuntime {
             return CheckResult(source: source, id: "live.search", title: "Search", status: "unmeasured",
                                detail: "Web search has no recent probe result; run Diagnostics → Health checks to check it.")
         }
-        if reading.healthy {
+        switch reading.result {
+        case .success(true):
             return CheckResult(source: source, id: "live.search", title: "Search", status: "ok",
                                detail: "SearXNG answered the bounded search probe.")
+        case .failure(let error):
+            let harm: String
+            if let failure = error as? ResearchClientError, case .malformedResponse = failure {
+                harm = "Search readiness is unverified because the probe response could not establish it."
+            } else {
+                harm = "She cannot search the web until the configured service answers."
+            }
+            return CheckResult(source: source, id: "live.search", title: "Search", status: "warn",
+                detail: "The configured SearXNG probe is unavailable: \(safeDoctorDetail(error.localizedDescription))",
+                harm: harm)
+        case .success(false):
+            return CheckResult(source: source, id: "live.search", title: "Search", status: "warn",
+                detail: "Connection refused at the configured SearXNG address \(safeDoctorDetail(raw)); no search response was received.",
+                harm: "She cannot search the web until the configured service answers.")
         }
-        let absent = self.doctorSearchBackendAbsent(base: raw)
-        return CheckResult(source: source, id: "live.search", title: "Search", status: "warn",
-            detail: (absent
-                ? "No SearXNG backend: nothing answers at \(safeDoctorDetail(raw)) and Docker holds no SearXNG container for it, so "
-                : "SearXNG at \(safeDoctorDetail(raw)) did not answer the bounded search probe, so ") + "her web searches fail until it does.",
-            harm: "She cannot search the web.")
     }
     /// Saved admission states are facts; a quarantine is not damage to undo.
     private func toolsDoctorCoverageCheck(_ tools: [DoctorToolSnapshot]) -> CheckResult {
@@ -416,7 +430,7 @@ extension EngineDoctorRuntime {
         return CheckResult(source: "Trust > Autonomy",
             id: "live.autonomy", title: "Autonomy",
             status: ["fail", "error"].contains(state) ? "fail" : state == "degraded" ? "warn" : "ok",
-            detail: "Autonomy is enabled in \(autonomy.mode ?? "supervised") mode; \(autonomy.runningImprovements ?? 0) improvements are active; reported state: \(autonomy.status).",
+            detail: "Autonomy is enabled in \(autonomy.mode ?? "supervised") mode; reported state: \(autonomy.status).",
             repair: nil
         )
     }
@@ -477,8 +491,8 @@ extension EngineDoctorRuntime {
         try SwiftNativeResearchClient.checkedSearxngBaseURL(root: dataRoot)
     }
 
-    public func doctorProbeSearch(base: String) async -> Bool {
-        await SwiftNativeResearchClient(dataRoot: dataRoot)
+    public func doctorProbeSearch(base: String) async throws -> Bool {
+        try await SwiftNativeResearchClient(dataRoot: dataRoot)
             .checkSearXNG(base: base, answering: true)
     }
 
@@ -490,7 +504,7 @@ extension EngineDoctorRuntime {
         let root = dataRoot
         let status = try await RuntimeReadouts.getAutonomyKernel(
             dataRoot: root)
-        return (status.enabled, status.disabledReason, status.status, status.mode, status.runningImprovements)
+        return (status.enabled, status.disabledReason, status.status, status.mode)
     }
 
     public func doctorBridgeSnapshots() async -> [DoctorBridgeSnapshot] {
@@ -507,7 +521,7 @@ extension EngineDoctorRuntime {
             _ = try AgentConversationStore(dataRoot: root).recordsUnlocked()
             source = "agents/local-health.json"
             _ = try AgentLocalHealth.checkedRead(root)
-            var problems: [String] = AgentContactHealth.read(dataRoot: root).sorted { $0.key < $1.key }.compactMap { agent, health in
+            var problems: [String] = try AgentContactHealth.read(dataRoot: root).sorted { $0.key < $1.key }.compactMap { agent, health in
                 guard health.isBroken else { return nil }
                 return health.problem.map { (peers.first { "peer:" + $0.id == agent }?.name ?? agent) + ": " + $0 }
             }
@@ -536,8 +550,15 @@ extension EngineDoctorRuntime {
 
     public func doctorBackgroundLoopsCheck() async -> CheckResult {
         let observations = await port.doctorManager.status()
-        let receipts = DoctorLoopHealth.recentFailureDates(
-            receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl"))
+        let receipts: [String: [DoctorLoopHealth.FailureIncident]]
+        do {
+            receipts = try DoctorLoopHealth.recentFailureDates(
+                receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl"))
+        } catch {
+            return CheckResult(source: "logs/background_loop_failures.jsonl",
+                id: "background_loops", title: "Background loops", status: "fail",
+                detail: "Loop failure history is unavailable: \(error.localizedDescription)")
+        }
         let now = Date()
         await MainActor.run {
             port.doctorEngine.doctor.loopVerdicts = DoctorLoopHealth.evaluate(

@@ -21,18 +21,14 @@ public struct KnowledgeGraphEdgeWireSnapshot: Decodable, Equatable, Sendable {
     public let weight: Double?
 
     private enum CodingKeys: String, CodingKey {
-        case from, to, kind, type, weight
+        case from, to, type, weight
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         from = try container.decode(String.self, forKey: .from)
         to = try container.decode(String.self, forKey: .to)
-        if let decodedKind = try? container.decode(String.self, forKey: .kind) {
-            kind = decodedKind
-        } else {
-            kind = try container.decode(String.self, forKey: .type)
-        }
-        weight = try? container.decode(Double.self, forKey: .weight)
+        kind = try container.decode(String.self, forKey: .type)
+        weight = try container.decodeIfPresent(Double.self, forKey: .weight)
     }
 }

@@ -5,7 +5,7 @@ import PersistenceCore
 import TrustCenter
 #if canImport(CoreGraphics)
 import CoreGraphics
-// Blueprint: | `MacControl+Client.swift` | `SwiftNativeMacControl` actor; `dispatch`, `dispatchApprovedInjection`; `MacObservationMode` carries passive read authority without motor binding, wake, capabilities or desktop effects |
+// Blueprint: | `MacControl+Client.swift` | `SwiftNativeMacControl` actor; `dispatch`, `dispatchApprovedInjection` share one inherited tool-call deadline including live reads; bounded result waits retain registry ownership until actual exit; arbitrary AppleScript excludes supplied/inherited background authority; `MacObservationMode` carries passive read authority without motor binding, wake, capabilities or desktop effects; declared app scripts retain foreground driver authority; dispatch carries the engine's consent root and permits looking without Write; structured switch refusals survive native result handling; passive reads carry no motor authority |
 #endif
 
 // MARK: - SwiftNative impl
@@ -25,12 +25,28 @@ public actor SwiftNativeMacControl: MacControlClient {
     let fileManagerAdapter = FileBytes()
     let appControlAdapter = MacApplications()
     let openTargetAdapter = OpenTarget()
-    /// Read-only accessibility perception; this source cannot emit input.
-    let accessibilitySource: any MacAXElementSource
+    /// Accessibility perception prepares advertised renderer modes but emits no UI input.
+    private let suppliedAccessibilitySource: any MacAXElementSource
+    var accessibilitySource: any MacAXElementSource { axSession?.read ?? suppliedAccessibilitySource }
     /// Physical input emission, separate from the read source.
     let eventSink: any MacEventSink
     /// Semantic AX mutation, separate from perception.
-    let accessibilityActSource: any MacAXActSource
+    private let suppliedAccessibilityActSource: any MacAXActSource
+    var accessibilityActSource: any MacAXActSource { axSession?.act ?? suppliedAccessibilityActSource }
+    /// Native reference tables belong to one dispatch, including its nested
+    /// reads/acts and actual settlement. They never accumulate on this client.
+    struct AXSession: Sendable {
+        let owner: ObjectIdentifier
+        let read: any MacAXElementSource
+        let act: any MacAXActSource
+    }
+    @TaskLocal private static var currentAXSession: AXSession?
+    private var axSession: AXSession? {
+        let owner = ObjectIdentifier(self)
+        guard let session = Self.currentAXSession ?? MacSightCaptureBinding.current?.axSession(for: owner),
+              session.owner == owner else { return nil }
+        return session
+    }
     /// Effect observation listens on the target pid without emitting input.
     let effectObserverSource: any MacAXEffectObserverSource
     /// Screen capture preflights its separate Screen Recording grant without prompting or toggling it.
@@ -51,9 +67,10 @@ public actor SwiftNativeMacControl: MacControlClient {
     let pasteboardSource: any MacPasteboardSource
     /// Production uses the live Swift TrustCenter policy. A nil provider lets direct library callers exercise handlers without policy preflight.
     let policyProvider: (any MacControlPolicyProvider)?
-    /// Optional refusal-audit path. Appends a stable legacy receipt under the shared file lock; nil disables auditing without changing the refusal.
+    /// Optional refusal-audit path. Appends the current receipt under the shared file lock; nil disables auditing without changing the refusal.
     let auditAppendPath: URL?
     let operationStore: MacControlOperationStore?
+    let permissionDataRoot: URL
 
     public init(
         now: @escaping @Sendable () -> Date = { Date() },
@@ -72,13 +89,14 @@ public actor SwiftNativeMacControl: MacControlClient {
         pasteboardSource: any MacPasteboardSource = defaultMacPasteboardSource(),
         policyProvider: (any MacControlPolicyProvider)? = nil,
         auditAppendPath: URL? = nil,
-        operationStore: MacControlOperationStore? = nil
+        operationStore: MacControlOperationStore? = nil,
+        permissionDataRoot: URL = defaultDataRoot()
     ) {
         self.now = now
         self.notificationCenterAdapter = notificationCenterAdapter
-        self.accessibilitySource = accessibilitySource
+        self.suppliedAccessibilitySource = accessibilitySource
         self.eventSink = DriverCheckedMacEventSink(base: eventSink)
-        self.accessibilityActSource = accessibilityActSource
+        self.suppliedAccessibilityActSource = accessibilityActSource
         self.effectObserverSource = effectObserverSource
         self.screenCaptureSource = screenCaptureSource
         self.screenImageRenderer = screenImageRenderer
@@ -91,11 +109,21 @@ public actor SwiftNativeMacControl: MacControlClient {
         self.policyProvider = policyProvider
         self.auditAppendPath = auditAppendPath
         self.operationStore = operationStore
+        self.permissionDataRoot = permissionDataRoot
     }
 
     /// Ordinary dispatch uses the canonical execution gates directly. No per-call human approval is required here. Policy, Full Mac, category, TCC and driver checks still apply; a JSON approval marker has no authority.
     public func dispatch(action: String, body: [String: JSONValue]) async throws -> MacControlResult {
-        try await dispatchCore(action: action, body: body, capability: nil)
+        // Releasing one captured session emits no input and needs no renewed
+        // work admission. Stop, expired authority or a disabled switch cannot
+        // prevent settlement; the store still compares the exact session id.
+        if action == "attention", body["mode"] == .string("stop"),
+           let session = body["session"]?.stringValue, !session.isEmpty {
+            return await handleAttention(body)
+        }
+        return try await MacAppActGate.$looking.withValue(Self.isLooking(action: action, body: body) || action == "hand" && MacAppActGate.looking) {
+            try await dispatchCore(action: action, body: body, capability: nil)
+        }
     }
 
     /// Dispatch with an explicit capability, including an approved replay. It must be live, unspent and bound to this exact action and body.  Policy, Full Mac, category, TCC and driver checks still apply.
@@ -104,7 +132,15 @@ public actor SwiftNativeMacControl: MacControlClient {
         body: [String: JSONValue],
         capability: MacInjectionCapability
     ) async throws -> MacControlResult {
-        try await dispatchCore(action: action, body: body, capability: capability)
+        try await MacAppActGate.$looking.withValue(Self.isLooking(action: action, body: body) || action == "hand" && MacAppActGate.looking) {
+            try await dispatchCore(action: action, body: body, capability: capability)
+        }
+    }
+
+    private static func isLooking(action: String, body: [String: JSONValue]) -> Bool {
+        ["look", "view", "read", "menu", "ax_tree", "ax_find", "scroll", "nudge", "wake", "focus_app", "open_target"].contains(action)
+            || action == "act" && body["verb"]?.stringValue == "scroll"
+            || action == "hand" && body["gesture"]?.stringValue == "scroll"
     }
 
     private func dispatchCore(
@@ -112,12 +148,46 @@ public actor SwiftNativeMacControl: MacControlClient {
         body rawBody: [String: JSONValue],
         capability: MacInjectionCapability?
     ) async throws -> MacControlResult {
+        if axSession == nil {
+            #if canImport(ApplicationServices) && os(macOS)
+            let read: any MacAXElementSource = suppliedAccessibilitySource is SystemMacAXElementSource
+                ? SystemMacAXElementSource() : suppliedAccessibilitySource
+            let act: any MacAXActSource = suppliedAccessibilityActSource is SystemMacAXActSource
+                ? SystemMacAXActSource() : suppliedAccessibilityActSource
+            #else
+            let read = suppliedAccessibilitySource
+            let act = suppliedAccessibilityActSource
+            #endif
+            let created = AXSession(owner: ObjectIdentifier(self), read: read, act: act)
+            // Look and its pixel supplement are separate dispatches of one
+            // observation. Its binding owns their shared references until exit.
+            let session = MacSightCaptureBinding.current?.retainAXSession(created) ?? created
+            return try await Self.$currentAXSession.withValue(session) {
+                try await dispatchCore(action: action, body: rawBody, capability: capability)
+            }
+        }
+        if TaskWaitDeadline.current == nil {
+            do {
+                return try await TaskWaitDeadline.withDeadline(
+                    seconds: Double(Self.operationTimeoutSeconds(action: action, body: rawBody))
+                ) { try await self.dispatchCore(action: action, body: rawBody, capability: capability) }
+            } catch is TaskWaitDeadline.Exceeded {
+                return Self.deadlineResult(action: action)
+            }
+        }
+        guard !TaskWaitDeadline.expired else { return Self.deadlineResult(action: action) }
+        try Task.checkCancellation()
+        if MacAppActGate.dataRoot != permissionDataRoot {
+            return try await MacAppActGate.$dataRoot.withValue(permissionDataRoot) {
+                try await dispatchCore(action: action, body: rawBody, capability: capability)
+            }
+        }
         if MacObservationMode.current == .passive {
             // No motor-driver binding or held-input cleanup for an observer.
             return try await dispatchBound(action: action, body: rawBody, capability: capability)
         }
         if MacDriverContext.binding == nil {
-            let binding = await attentionStore.bindDriver(eventSource: attentionEventSource)
+            let binding = try await attentionStore.bindDriver(eventSource: attentionEventSource)
             return try await withTaskCancellationHandler {
                 defer { binding.releaseHeldInputs() }
                 return try await MacDriverContext.$binding.withValue(binding) {
@@ -125,16 +195,22 @@ public actor SwiftNativeMacControl: MacControlClient {
                 }
             } onCancel: { binding.cancel() }
         }
-        // An act admitted to run in an app in the back stays there, and his input elsewhere does not stop it (MacDriverBinding).
-        let background = MacDriverContext.background || rawBody["background"] == .bool(true)
+        // App scripting can use his cursor, keys, focus or screen. A
+        // caller's label (including inherited background work) cannot exempt it
+        // from foreground takeover. Fixed-purpose background actions stay put.
+        let normalized = action.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let background = normalized != "applescript"
+            && (MacDriverContext.background || rawBody["background"] == .bool(true))
         return try await MacDriverContext.$background.withValue(background) {
             try await MacDriverContext.$inputStartCount.withValue(MacDriverContext.binding?.inputCount ?? 0) {
-                driverCheckedResult(try await dispatchBound(action: action, body: rawBody, capability: capability), action: action)
+                driverCheckedResult(try await dispatchBound(action: action, body: rawBody, capability: capability), action: normalized)
             }
         }
     }
 
     private func driverCheckedResult(_ reply: MacControlResult, action: String) -> MacControlResult {
+        if let refusal = MacDriverContext.binding?.takeAppActRefusal() { return refusal.result(action: action) }
         guard macControlTakeoverActions.contains(action), MacDriverContext.binding?.yieldedToPerson == true else { return reply }
         var output: [String: JSONValue] = [:]
         if case .object(let existing) = reply.output { output = existing }
@@ -210,9 +286,9 @@ public actor SwiftNativeMacControl: MacControlClient {
         let operationId = body["operationId"]?.stringValue
             ?? body["operation_id"]?.stringValue
             ?? UUID().uuidString
+        let executionKey = MacControlInFlightRegistry.Key(store: operationStore.registryIdentity, operationId: operationId)
         var operationBody = body
         operationBody["operationId"] = .string(operationId)
-        let timeoutSeconds = Self.operationTimeoutSeconds(action: normalized, body: body)
         let begin: MacControlOperationBeginOutcome
         do {
             let requestDigest = try MacControlOperationStore.requestDigest(
@@ -223,15 +299,23 @@ public actor SwiftNativeMacControl: MacControlClient {
                 operationId: operationId,
                 action: normalized,
                 requestDigest: requestDigest,
-                deadlineSeconds: timeoutSeconds
+                deadlineAt: TaskWaitDeadline.wallDate
             )
+        } catch let error as ToolFailureError {
+            throw error
         } catch {
             throw MacControlError.operation(error.localizedDescription)
         }
         switch begin {
         case .replay(let record):
+            if let retained = MacControlInFlightRegistry.shared.execution(key: executionKey)?.settledResult {
+                return try retained.get()
+            }
             return Self.replayResult(record)
         case .duplicateActive(let record):
+            if let retained = MacControlInFlightRegistry.shared.execution(key: executionKey)?.settledResult {
+                return try retained.get()
+            }
             return MacControlResult(
                 ok: false,
                 action: normalized,
@@ -250,7 +334,21 @@ public actor SwiftNativeMacControl: MacControlClient {
             break
         }
 
-        let outcome = await gatePreflightOutcome(action: normalized, body: operationBody)
+        let outcome: GatePreflightOutcome
+        do { outcome = try await gatePreflightOutcome(action: normalized, body: operationBody) }
+        catch {
+            // Discovery is read-only: cancellation before admission emitted no
+            // effect, but the accepted durable operation still owes settlement.
+            let saved: Result<MacControlOperationRecord, Error> = await settle {
+                do { return .success(try await operationStore.transition(
+                    operationId: operationId, to: .cancelAcknowledged,
+                    verification: .notRequired, outcomeCode: "cancelled_before_start",
+                    acknowledgePreStartCancellation: true)) }
+                catch { return .failure(error) }
+            }
+            _ = try saved.get()
+            throw error
+        }
         if case .refuse(let refused) = outcome {
             let saved: Result<MacControlOperationRecord, Error> = await settle {
                 do { return .success(try await operationStore.transition(
@@ -268,16 +366,31 @@ public actor SwiftNativeMacControl: MacControlClient {
         // Register before publishing started. The task cannot emit effects until the durable cancellation state has been reconciled below.
         let startGate = ContinuationOnce<Bool>()
         let task = Task<MacControlResult, Error> {
-            guard await startGate.wait() else { throw CancellationError() }
+            guard await startGate.wait(cancellingWith: false) else { throw TaskWaitDeadline.cancellationError }
             try Task.checkCancellation()
-            return try await self.executeAction(normalized, body: operationBody, gateAlreadyChecked: true)
+            guard case .proceed(let fullMacAdmitted) = outcome else { preconditionFailure("Refused operations return before execution") }
+            return try await MacAppActGate.$fullMacAdmitted.withValue(fullMacAdmitted) {
+                try await self.executeAction(normalized, body: operationBody, gateAlreadyChecked: true)
+            }
         }
         let execution = MacControlInFlightExecution(task: task)
-        MacControlInFlightRegistry.shared.insert(execution, operationId: operationId)
+        MacControlInFlightRegistry.shared.insert(execution, key: executionKey)
+        // Actual exit is the sole terminal settlement owner. Caller cancellation
+        // resolves only its response signal, never this retained body result.
+        Task {
+            let bodyResult = (await task.result).map { self.driverCheckedResult($0, action: normalized) }
+            let settled: Result<MacControlResult, Error> = await settle {
+                do { return .success(try await self.finishKnownOperationResult(bodyResult,
+                    action: normalized, operationId: operationId, trigger: .ordinary)) }
+                catch { return .success(Self.settlementFailure(error, body: bodyResult,
+                    action: normalized, operationId: operationId)) }
+            }
+            execution.finish(settled)
+            MacControlInFlightRegistry.shared.finished(key: executionKey)
+        }
         defer {
             task.cancel()
             startGate.resume(false)
-            MacControlInFlightRegistry.shared.remove(operationId: operationId)
         }
         let startResult: Result<MacControlOperationRecord, Error> = await settle {
             do { return .success(try await operationStore.transition(
@@ -293,13 +406,11 @@ public actor SwiftNativeMacControl: MacControlClient {
         catch {
             task.cancel()
             startGate.resume(false)
-            _ = await task.result
             throw error
         }
         if started.state == .cancelAcknowledged {
             task.cancel()
             startGate.resume(false)
-            _ = await task.result
             return Self.cancelledResult(action: normalized, record: started)
         }
         let current: MacControlOperationRecord?
@@ -307,50 +418,37 @@ public actor SwiftNativeMacControl: MacControlClient {
         catch {
             task.cancel()
             startGate.resume(false)
-            _ = await task.result
             throw error
         }
         if Task.isCancelled || current?.state == .cancelRequested {
             execution.requestCancellation()
         }
         startGate.resume(true)
-        Task { execution.finish(await task.result) }
-        let deadlineTask = Task<Void, Never> {
-            // Process-backed handlers own the exact timeout themselves. A short grace lets their typed `timedOut` result win. A deadline requests Stop; the execution stays owned until its body settles.
-            let nanos = UInt64(timeoutSeconds) * 1_000_000_000 + 250_000_000
-            do { try await Task.sleep(nanoseconds: nanos) } catch { return }
-            guard !Task.isCancelled else { return }
-            execution.reachDeadline()
-        }
-        defer {
-            deadlineTask.cancel()
-        }
         let signal = await withTaskCancellationHandler {
             await execution.wait()
         } onCancel: {
             execution.requestCancellation()
         }
-        let trigger: OperationSettlementTrigger
-        switch signal {
-        case .result: trigger = .ordinary
-        case .deadline: trigger = .deadline
-        case .cancellationRequested: trigger = .cancellation
+        if let result = execution.settledResult { return try result.get() }
+        // Only the response wait ended. Publish uncertainty without consuming
+        // the actual-exit result or authorizing another physical execution.
+        let timedOut = signal == .deadline
+        let pending: Result<MacControlOperationRecord, Error> = await settle {
+            do { return .success(try await operationStore.responseUnavailable(operationId: operationId,
+                timedOut: timedOut)) }
+            catch { return .failure(error) }
         }
-        // The original body is the only effect owner. Never retire it merely because a caller's reporting deadline or cancellation arrived first.
-        let result = (await task.result).map { driverCheckedResult($0, action: normalized) }
-        let settled: Result<MacControlResult, Error> = await settle {
-            do {
-                return .success(try await self.finishKnownOperationResult(result,
-                    action: normalized, operationId: operationId, trigger: trigger))
-            } catch { return .failure(error) }
-        }
-        return try settled.get()
+        let record = try pending.get()
+        // Actual settlement can win while the reporting record is written.
+        if let result = execution.settledResult { return try result.get() }
+        return Self.unknownResult(action: normalized, record: record)
     }
 
     public func cancel(operationId: String) async throws -> MacControlCancellationResult {
         guard let operationStore else {
             throw MacControlError.operation("mac_operation_store_unconfigured: No operation store is configured. Repair NativeAgent's MacControl assembly before requesting cancellation; inspect the affected app with mac.look for prior effects.")
         }
+        let executionKey = MacControlInFlightRegistry.Key(store: operationStore.registryIdentity, operationId: operationId)
         guard let current = try await operationStore.record(operationId: operationId) else {
             throw MacControlError.operation("mac_operation_not_found: No record exists for this operation_id. Check the original receipt's identity and inspect the affected app with mac.look before further action.")
         }
@@ -370,7 +468,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                 outcomeCode: "cancel_requested"
             )
         }
-        guard let execution = MacControlInFlightRegistry.shared.execution(operationId: operationId) else {
+        guard let execution = MacControlInFlightRegistry.shared.execution(key: executionKey) else {
             return MacControlCancellationResult(
                 operationId: operationId,
                 state: .cancelRequested,
@@ -405,7 +503,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         body: [String: JSONValue]
     ) async throws -> MacControlResult? {
         if MacObservationMode.current == .passive {
-            guard MacScreenLock.isCovered() else { return nil }
+            guard try MacScreenLock.isCovered() else { return nil }
             return MacControlResult(ok: false, action: action,
                 output: .object(["status": .string("display_obstructed"),
                     "message": .string(MacScreenLock.passiveReply)]),
@@ -441,12 +539,14 @@ public actor SwiftNativeMacControl: MacControlClient {
         }
         // Apply live policy before native execution; refusal preserves the structured 403 result and gate reason.
         if !gateAlreadyChecked {
-            let outcome = await gatePreflightOutcome(action: normalized, body: body)
+            let outcome = try await gatePreflightOutcome(action: normalized, body: body)
             switch outcome {
             case .refuse(let result):
                 return result
-            case .proceed:
-                break
+            case .proceed(let fullMacAdmitted):
+                return try await MacAppActGate.$fullMacAdmitted.withValue(fullMacAdmitted) {
+                    try await executeAction(normalized, body: body, gateAlreadyChecked: true)
+                }
             }
         }
         // An active attention session gives physical human input absolute priority. Check once at tool entry; handlers recheck at the exact effect boundary (and between multi-event gestures) so a mouse move arriving after this line still
@@ -457,7 +557,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         }
         // Perception, hands and any call that requires the front share the desktop-send wake: an inert nudge only while the saver covers the screen and the person is idle.
         if MacObservationMode.current == .passive,
-           ["look", "view", "ax_tree", "ax_find"].contains(normalized), MacScreenLock.isCovered() {
+           ["look", "view", "ax_tree", "ax_find"].contains(normalized), try MacScreenLock.isCovered() {
             return MacControlResult(ok: false, action: normalized,
                 output: .object(["status": .string("display_obstructed"), "message": .string(MacScreenLock.passiveReply)]),
                 error: "display_obstructed", durationMs: 0)
@@ -500,12 +600,12 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "ax_status":   return handleAXStatus()
         case "ax_tree":     return handleAXTree(body)
         case "ax_find":     return try handleAXFind(body)
-        // Compiled AX perception is read tier and changes no UI state.
+        // Compiled AX perception is read tier; its source may prepare renderer modes.
         case "look":
             return await MacAXLimits.$readDeadline.withValue(Date().addingTimeInterval(MacAXLimits.readSeconds)) {
                 await handleLook(body)
             }
-        // Fused AX/pixel perception is read tier because it changes no app state.
+        // Fused AX/pixel perception is read tier and emits no UI input.
         case "view":        return await handleView(body)
         case "attention":   return await handleAttention(body)
         // Injection has passed policy preflight and, when supplied, consumed its explicit replay capability before reaching a handler.
@@ -536,10 +636,12 @@ public actor SwiftNativeMacControl: MacControlClient {
         }
     }
 
-    private static func operationTimeoutSeconds(
+    public static func operationTimeoutSeconds(
         action: String,
         body: [String: JSONValue]
     ) -> Int {
+        let action = action.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         if case .int(let value) = body["timeout"] ?? .null {
             return max(1, min(Int(value), 120))
         }
@@ -577,6 +679,7 @@ public func makeMacControl(
         notificationCenterAdapter: notificationCenterAdapter,
         policyProvider: policyProvider,
         auditAppendPath: auditAppendPath,
-        operationStore: dataRoot.map { MacControlOperationStore(dataRoot: $0) }
+        operationStore: dataRoot.map { MacControlOperationStore(dataRoot: $0) },
+        permissionDataRoot: dataRoot ?? defaultDataRoot()
     )
 }

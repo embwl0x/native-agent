@@ -9,10 +9,10 @@ public struct DeskMissedBot: Identifiable, Equatable, Sendable {
     public let line: String
     public let dueAt: Date
 
-    public static func load(root: URL, timing: BotRunnerScheduler.BotSchedule) -> [DeskMissedBot] {
+    public static func load(root: URL, timing: BotRunnerScheduler.BotSchedule) throws -> [DeskMissedBot] {
         let missed = timing.missed
-        guard !missed.isEmpty,
-              let bots = try? BotDefinitionStore(dataRoot: root).list() else { return [] }
+        guard !missed.isEmpty else { return [] }
+        let bots = try BotDefinitionStore(dataRoot: root).list()
         return bots.compactMap { bot in
             guard bot.cadence != .manual, let run = missed[bot.id] else { return nil }
             return DeskMissedBot(id: bot.id, name: bot.name,
@@ -28,8 +28,8 @@ public struct DeskTimedBot: Identifiable, Equatable, Sendable {
     public let line: String
     public let nextRun: Date?
 
-    public static func load(root: URL, timing: BotRunnerScheduler.BotSchedule) -> [DeskTimedBot] {
-        guard let bots = try? BotDefinitionStore(dataRoot: root).list() else { return [] }
+    public static func load(root: URL, timing: BotRunnerScheduler.BotSchedule) throws -> [DeskTimedBot] {
+        let bots = try BotDefinitionStore(dataRoot: root).list()
         return bots.filter { !$0.paused && $0.cadence != .manual }.map { bot in
             DeskTimedBot(id: bot.id, name: bot.name, line: BotsShelfRecord.cadence(bot.cadence) + ".", nextRun: timing.dates[bot.id])
         }
@@ -79,7 +79,7 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         }
     }
     public var statusWord: String {
-        status == .paused ? definition.offReason ?? status.rawValue : status.rawValue
+        status.rawValue
     }
     /// "Missed Sep 12 at 9:00 AM · the Mac was asleep", or nothing to say.
     public var missedLine: String? {
@@ -128,7 +128,7 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     }
     public var scheduleLine: String {
         if needsModelChoice { return "Choose a model" }
-        if definition.paused { return definition.offReason ?? "Paused" }
+        if definition.paused { return "Paused" }
         // Unattended work off: the scheduler returns no deadline and the event
         // intake holds every event, so a time or a wake line would be a lie.
         if !unattendedAllowed, !runsWithUnattendedOff { return BotsShelfUnattended.cardLine }
@@ -183,18 +183,14 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     }
     public static func read(root: URL, timing: BotRunnerScheduler.BotSchedule, followingModel: String? = nil) throws -> [BotsShelfRecord] {
         let shelf = ShelfStore(dataRoot: root)
-        let events = (try? BotEventStore(dataRoot: root).lastEvents()) ?? [:]
+        let events = try BotEventStore(dataRoot: root).lastEvents()
         // One checked bulk read for the whole shelf, instead of paginating
         // every bot's history and then re-reading each row through `entry`
         // (each of which decoded and sorted every book of every bot).
         let stored = try shelf.entriesByBot()
-        let pending = ShelfStore.pendingApprovalIDs(dataRoot: root)
         let runs = try BotRunQueue(dataRoot: root).activeAndQueuedIDs()
         return try BotDefinitionStore(dataRoot: root).list().map { bot in
-            // The shared shelf-reading boundary, the same one shelf_read and
-            // shelf_entry go through: an approval resolved from Telegram or the
-            // iPhone settles the entry wherever it is read next, not only here.
-            let entries = shelf.reconciling(stored[bot.id] ?? [], pending: pending)
+            let entries = stored[bot.id] ?? []
             return BotsShelfRecord(definition: bot, entries: entries,
                                    nextRun: timing.dates[bot.id],
                                    missed: bot.cadence == .manual ? nil : timing.missed[bot.id], lastEvent: events[bot.id],

@@ -40,7 +40,7 @@ public struct ContextMemoryProvenance: Codable, Equatable, Sendable {
 /// time) and the calendar — time zone included — is passed in explicitly rather
 /// than read from the environment inside the renderer.
 ///
-/// `.unstamped` is the honest fallback for a caller with no turn in hand: it
+/// `.unstamped` is the explicit clock for a caller with no turn in hand: it
 /// renders NO age tag rather than one computed from a stray wall-clock read.
 public struct ContextRenderClock: Sendable, Equatable {
     /// nil → this render has no turn time, so it claims no age.
@@ -93,12 +93,7 @@ public struct ContextRenderClock: Sendable, Equatable {
 /// day, so the rendered lead is stable turn to turn.
 public enum ContextMemoryLead {
     public static func untrustedSources(for draft: ContextAtomDraft) -> [String] {
-        var sources = draft.entities.filter { $0.kind == "untrusted_source" }.map(\.label)
-        if let label = draft.entities.first(where: { $0.kind == "untrusted_sources" })?.label,
-           let saved = try? JSONDecoder().decode([String].self, from: Data(label.utf8)) {
-            for source in saved where !sources.contains(source) { sources.append(source) }
-        }
-        return sources.filter { !$0.isEmpty }
+        draft.entities.filter { $0.kind == "untrusted_source" && !$0.label.isEmpty }.map(\.label)
     }
 
     /// Entity kind the memory projection uses for a record's provenance blob.
@@ -119,37 +114,23 @@ public enum ContextMemoryLead {
         return draft.freshness.createdAt
     }
 
-    /// Provenance parsed out of the atom's provenance entity, if it has one.
-    ///
-    /// The label is the projection's `key=value;key=value` blob. Both shapes are
-    /// accepted: a bare/JSON-quoted kind (`provenance="told"` plus
-    /// `provenance_by="Claude"`) and a JSON object (`provenance={"by":…,
-    /// "kind":…}`), because the same field is written flat by the memory tool
-    /// and canonically encoded by the projection.
-    ///
-    /// FIRST occurrence of each key wins, deliberately. The label is assembled
-    /// from stored values, and a stored name containing `;provenance=verified`
-    /// would otherwise let a memory relabel how it was known — a display name
-    /// upgrading itself to "I checked this myself". Commit-time validation
-    /// rejects such a name; this makes the reader safe even if one is already
-    /// stored, since the projection always emits the real `provenance=` first.
-    /// The name is also re-validated here: anything with a delimiter, bracket,
-    /// or control character is dropped rather than shown.
+    /// Current atoms carry typed attribution. The single retained label reader
+    /// is needed by context.sqlite's existing delimited atoms until lead rebuild.
+    /// Evidence ends that retained metadata prefix; its text is never a field.
     public static func provenance(for draft: ContextAtomDraft) -> ContextMemoryProvenance? {
         guard draft.kind == .memory || draft.kind == .correction else { return nil }
+        if let provenance = draft.memoryProvenance {
+            return ContextMemoryProvenance(kind: provenance.kind, by: provenance.by.flatMap(validDisplayName))
+        }
         guard let label = draft.entities.first(where: { $0.kind == provenanceEntityKind })?.label,
               !label.isEmpty else { return nil }
         var rawKind: String?
         var rawBy: String?
         for component in label.split(separator: ";") {
             let piece = component.trimmingCharacters(in: .whitespaces)
+            if piece.hasPrefix("evidence=") { break }
             if let value = piece.dropPrefix("provenance=") {
-                if value.hasPrefix("{") {
-                    if rawKind == nil { rawKind = jsonField("kind", in: value) }
-                    if rawBy == nil { rawBy = jsonField("by", in: value) }
-                } else if rawKind == nil {
-                    rawKind = unquoted(value)
-                }
+                if rawKind == nil { rawKind = unquoted(value) }
             } else if let value = piece.dropPrefix("provenance_by="), rawBy == nil {
                 rawBy = unquoted(value)
             }
@@ -262,15 +243,6 @@ public enum ContextMemoryLead {
         return text
     }
 
-    /// One string field out of a small canonical JSON object, without decoding
-    /// a shape this module does not own.
-    private static func jsonField(_ key: String, in object: String) -> String? {
-        guard let data = object.data(using: .utf8),
-              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let value = parsed[key] as? String else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespaces)
-        return trimmed.isEmpty ? nil : trimmed
-    }
 }
 
 private extension String {

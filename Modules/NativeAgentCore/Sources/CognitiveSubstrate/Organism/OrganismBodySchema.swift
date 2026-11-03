@@ -50,11 +50,15 @@ public struct ProviderPathEvidence: Codable, Sendable, Equatable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let rawID = try container.decode(String.self, forKey: .evidenceID)
+        guard Self.isCanonicalDigest(rawID) else {
+            throw DecodingError.dataCorruptedError(forKey: .evidenceID, in: container,
+                debugDescription: "Provider evidence requires its canonical SHA-256 identity")
+        }
         let observedAt = try container.decode(Date.self, forKey: .observedAt)
         let outcome = try container.decode(ProviderPathEvidenceOutcome.self, forKey: .outcome)
         let reliability = try container.decode(Double.self, forKey: .sourceReliability)
         self.init(
-            canonicalEvidenceID: Self.isCanonicalDigest(rawID) ? rawID : BodyEvidenceReference.digest(rawID),
+            canonicalEvidenceID: rawID,
             observedAt: observedAt,
             outcome: outcome,
             sourceReliability: reliability
@@ -134,7 +138,7 @@ public struct ProviderPathEstimate: Codable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case generatedAt, estimate, freshness, uncertainty, evidenceCount
-        case newestEvidenceAt, state, bodySchemaProvidersHealthy
+        case newestEvidenceAt, state
     }
 
     public init(from decoder: Decoder) throws {
@@ -148,7 +152,6 @@ public struct ProviderPathEstimate: Codable, Sendable, Equatable {
             newestEvidenceAt: try container.decodeIfPresent(Date.self, forKey: .newestEvidenceAt)
         )
         _ = try container.decode(ProviderPathBeliefState.self, forKey: .state)
-        _ = try container.decodeIfPresent(Bool.self, forKey: .bodySchemaProvidersHealthy)
     }
 
     private static func clampFinite(_ value: Double, fallback: Double) -> Double {
@@ -358,8 +361,11 @@ public enum OrganismBodySchemaSampler {
                 body.approvalChannelsOpen = open
             }
         }
+        // No delivery evidence means unknown, even if persisted continuity or
+        // a peer-contact signal previously carried a compatibility value.
+        body.notificationDeliveryBelief = read.notificationDeliveryBelief
+        body.notificationPathHealthy = read.notificationDeliveryBelief?.compatibilityPathHealthy
         if let notificationDeliveryBelief = read.notificationDeliveryBelief {
-            body.notificationDeliveryBelief = notificationDeliveryBelief
             // Delivery freshness can describe a transport failure, not the device receipt.
             if notificationDeliveryBelief.deviceReceived,
                notificationDeliveryBelief.metrics.evidence.contains(where: {
@@ -368,14 +374,6 @@ public enum OrganismBodySchemaSampler {
                        && now.timeIntervalSince($0.receivedAt) <= read.iPhoneStaleAfter
                }) {
                 body.iPhoneReachable = true
-            }
-            if let healthy = notificationDeliveryBelief.compatibilityPathHealthy {
-                body.notificationPathHealthy = healthy
-            } else if notificationDeliveryBelief.transportConfigured {
-                // APNS acceptance is exact transport truth, not proof that the
-                // app displayed the notification. A fresh authenticated peer
-                // contact can still establish that the peripheral path is live.
-                body.notificationPathHealthy = body.iPhoneReachable
             }
         }
         if let resourcePressureReading = read.resourcePressureReading {

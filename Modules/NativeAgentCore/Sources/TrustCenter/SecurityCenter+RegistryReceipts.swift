@@ -13,17 +13,13 @@ extension SwiftNativeSecurityCenter {
         // Security panel. Keep the projection fail-closed like the stores that
         // produced it: every identity/display field must be present and
         // non-blank before it becomes UI state.
-        func required(_ key: String, aliases: [String] = []) -> String? {
-            for candidate in [key] + aliases {
-                if let value = obj[candidate]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !value.isEmpty {
-                    return value
-                }
-            }
-            return nil
+        func required(_ key: String) -> String? {
+            guard let value = obj[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty else { return nil }
+            return value
         }
         guard let id = required("id"),
-              let at = required("created_at", aliases: ["at"]),
+              let at = required("created_at"),
               let tool = required("tool"),
               let surface = required("surface"),
               let decision = required("decision"),

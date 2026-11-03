@@ -34,27 +34,29 @@ struct NativeAgentPushTokenSyncCache {
 
     var defaults: UserDefaults = .standard
 
-    func load() -> Record? {
-        guard let data = defaults.data(forKey: Self.defaultsKey) else { return nil }
-        return try? JSONDecoder().decode(Record.self, from: data)
+    func load() throws -> Record? {
+        guard let stored = defaults.object(forKey: Self.defaultsKey) else { return nil }
+        guard let data = stored as? Data else {
+            throw SyncError.persistence("The saved APNS registration cache is not data. Repair NativeAgentMobile.lastSyncedAPNSToken in the phone's preferences; its value is retained.")
+        }
+        return try JSONDecoder().decode(Record.self, from: data)
     }
 
     func shouldSync(
         _ fingerprint: Fingerprint,
         now: Date = Date(),
         refreshInterval: TimeInterval = Self.tokenSyncRefreshInterval
-    ) -> Bool {
-        guard let record = load() else { return true }
+    ) throws -> Bool {
+        guard let record = try load() else { return true }
         guard record.fingerprint == fingerprint else { return true }
         guard now.timeIntervalSince(record.syncedAt) >= 0 else { return true }
         return now.timeIntervalSince(record.syncedAt) >= refreshInterval
     }
 
-    func markSynced(_ fingerprint: Fingerprint, now: Date = Date()) {
+    func markSynced(_ fingerprint: Fingerprint, now: Date = Date()) throws {
         let record = Record(fingerprint: fingerprint, registeredAt: now, syncedAt: now)
-        if let data = try? JSONEncoder().encode(record) {
-            defaults.set(data, forKey: Self.defaultsKey)
-        }
+        let data = try JSONEncoder().encode(record)
+        defaults.set(data, forKey: Self.defaultsKey)
     }
 
     static func pairingIdentity(secret: Data?, secretVersion: Int64) -> PairingIdentity {
@@ -208,20 +210,21 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
                 deviceId: deviceId,
                 pairing: pairing
             )
-            if !cache.shouldSync(fingerprint) {
-                NSLog("[NativeAgentMobile] APNS token sync skipped recently refreshed suffix=%@", String(token.suffix(8)))
-                return
-            }
             do {
+                if try !cache.shouldSync(fingerprint) {
+                    NSLog("[NativeAgentMobile] APNS token sync skipped recently refreshed suffix=%@", String(token.suffix(8)))
+                    return
+                }
                 _ = try await iCloudSyncEngine.shared.registerPushToken(
                     token: token,
                     environment: environment,
                     bundleId: bundleId,
                     deviceId: deviceId
                 )
-                cache.markSynced(fingerprint)
+                try cache.markSynced(fingerprint)
                 NSLog("[NativeAgentMobile] APNS token synced to Mac")
             } catch {
+                iCloudSyncEngine.shared.syncError = "APNS token sync: \(error.localizedDescription)"
                 NSLog("[NativeAgentMobile] APNS token sync failed: %@", error.localizedDescription)
             }
         }
@@ -232,6 +235,8 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
         didFailToRegisterForRemoteNotificationsWithError error: Error
     ) {
         NSLog("[NativeAgentMobile] APNS registration failed: %@", error.localizedDescription)
+        let detail = error.localizedDescription
+        Task { @MainActor in iCloudSyncEngine.shared.syncError = "APNS registration failed: \(detail)" }
     }
 
     func application(
@@ -252,22 +257,11 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
         Task { @MainActor in
             await NADeviceSyncRecoveryBudget.$deadline.withValue(deadline) {
                 await NADeviceSyncRecoveryBudget.$didApplyData.withValue({ completionGate.noteAppliedData() }) {
-                    let receipt = PushReceiptLedger.record(userInfo: userInfo)
+                    PushReceiptLedger.record(userInfo: userInfo)
+                    PhoneSenses.shared.wake()
                     if NADeviceSyncRecoveryBudget.hasTime,
                        await iCloudBridge.shared.drainIfDeviceSyncPush(userInfo) {
                         completionGate.noteAppliedData()
-                    }
-                    // Visible reply pushes nudge signed transport and its transcript backstop.
-                    if NADeviceSyncRecoveryBudget.hasTime,
-                       ["icloud_chat_reply", "requested_result"].contains(userInfo["source"] as? String ?? ""),
-                       (userInfo["screen"] as? String) == "chat" {
-                        if await iCloudBridge.shared.pollIncomingNow() { completionGate.noteAppliedData() }
-                        if NADeviceSyncRecoveryBudget.hasTime {
-                            _ = await withCKTimeout("NativeAgentMobile.push.chatSnapshot", seconds: max(0, deadline.timeIntervalSinceNow)) {
-                                guard deadline.timeIntervalSinceNow > 0 else { return }
-                                await iCloudSyncEngine.shared.refreshChatTranscriptsSnapshot()
-                            }
-                        }
                     }
                     // Activity publishes Inbox independently and reports its acceptance to the gate.
                     if NADeviceSyncRecoveryBudget.hasTime {
@@ -278,13 +272,6 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
                                     _ = await iCloudSyncEngine.shared.refreshActivitySnapshot()
                                 }
                             }
-                        }
-                    }
-                    if NADeviceSyncRecoveryBudget.hasTime, let eventID = receipt.eventId {
-                        let remaining = deadline.timeIntervalSinceNow - 1
-                        guard remaining > 0 else { return }
-                        _ = await withCKTimeout("NativeAgentMobile.push.notificationReceipt", seconds: remaining) {
-                            await iCloudSyncEngine.shared.sendNotificationReceipt(eventID: eventID, channel: "apns")
                         }
                     }
                 }
@@ -302,12 +289,13 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        // Suppress the alert when its reply is already displayed in the current chat.
+        // The visible conversation owns its reply, even if its chat record
+        // arrives after this notification. Other conversations keep their alert.
         let keys = ChatReplyNotificationKeys(userInfo: notification.request.content.userInfo)
         nonisolated(unsafe) let done = completionHandler
         Task { @MainActor in
-            let shown = ChatReplyNotificationPresentation.isAlreadyDisplayed(keys: keys)
-            done(shown ? [] : NativeAgentNotificationDelegatePresentation.foregroundPresentationOptions)
+            let visible = ChatReplyNotificationPresentation.ownsVisibleConversation(keys: keys)
+            done(visible ? [] : NativeAgentNotificationDelegatePresentation.foregroundPresentationOptions)
         }
     }
 
@@ -369,6 +357,13 @@ enum NativeAgentNotificationDelegatePresentation {
 }
 
 enum NativeAgentNotificationEventGate {
+    static func requireAuthorization(center: UNUserNotificationCenter) async throws {
+        let granted = try await center.requestAuthorization(options: [.alert, .sound, .badge])
+        guard granted else {
+            throw SyncError.persistence("iPhone notifications are not allowed. Enable NativeAgent notifications in iPhone Settings, then refresh.")
+        }
+    }
+
     static func add(
         content: UNNotificationContent,
         eventID: String,
@@ -390,12 +385,7 @@ enum NativeAgentNotificationEventGate {
             return false
         }
         let categorized = try MobileNotificationRouting.categorized(content)
-        let alert: UNNotificationContent
-        do { alert = try await CommunicationNotification.decorate(categorized) }
-        catch {
-            NSLog("[NativeAgentMobile] Communication notification unavailable: %@", error.localizedDescription)
-            alert = categorized
-        }
+        let alert = try await CommunicationNotification.decorate(categorized)
         try await center.add(UNNotificationRequest(
             identifier: eventID,
             content: alert,
@@ -412,18 +402,10 @@ enum NativeAgentNotificationEventGate {
 enum NativeAgentBridgeNotificationScheduler {
     static func schedule(_ msg: BridgeMessage) async -> Bool {
         let metadata = msg.metadata ?? [:]
-        let deviceID = await MainActor.run {
-            UIDevice.current.identifierForVendor?.uuidString ?? UIDevice.current.name
+        guard let title = nonEmpty(metadata["title"]), let body = nonEmpty(metadata["body"]) else {
+            await reportFailure("The Mac's notification has no title or body. Refresh Activity on the Mac to repair its notification publication.")
+            return false
         }
-        let acceptedDeviceIDs = metadata["directAlertDeviceIDs"].flatMap {
-            try? JSONDecoder().decode([String].self, from: Data($0.utf8))
-        } ?? []
-        guard !acceptedDeviceIDs.contains(deviceID) else { return true }
-        let agentName = await MainActor.run { iCloudSyncEngine.shared.agentDisplayName }
-        let title = nonEmpty(metadata["title"]) ?? agentName
-        let body = nonEmpty(metadata["body"])
-            ?? nonEmpty(msg.text)
-            ?? "New activity from Mac."
         var userInfo: [String: Any] = [:]
         for (key, value) in metadata where key.hasPrefix("userInfo.") {
             let cleanKey = String(key.dropFirst("userInfo.".count))
@@ -433,19 +415,37 @@ enum NativeAgentBridgeNotificationScheduler {
         if userInfo["screen"] == nil {
             userInfo["screen"] = "activity"
         }
-        let eventInfo = userInfo.compactMapValues { $0 as? String }
-        let eventID = NativeAgentDeviceEventIdentity.notification(
-            userInfo: eventInfo,
-            fallback: msg.id
-        )
-        userInfo["eventId"] = eventID
+        guard let eventID = userInfo["eventId"] as? String,
+              NativeAgentDeviceEventIdentity.isCanonical(eventID) else {
+            await reportFailure("The Mac's notification has no canonical event identity. Refresh Activity on the Mac to repair its notification publication.")
+            return false
+        }
         userInfo["messageId"] = msg.id
         userInfo["source"] = userInfo["source"] ?? "mac_icloud_bridge"
+
+        // Ordinary notifications render through CloudKit's visible subscription.
+        // Their signed record acknowledges receipt, regardless of transport
+        // outcome, never posting a local alert. Requested results own that renderer.
+        if userInfo["source"] as? String != "requested_result" {
+            await iCloudSyncEngine.shared.sendNotificationReceipt(eventID: eventID, channel: "icloud_bridge_record")
+            return true
+        }
 
         let center = UNUserNotificationCenter.current()
         let settings = await center.notificationSettings()
         if settings.authorizationStatus == .notDetermined {
-            _ = try? await center.requestAuthorization(options: [.alert, .badge, .sound])
+            do {
+                guard try await center.requestAuthorization(options: [.alert, .badge, .sound]) else {
+                    await reportFailure("iPhone notifications are not allowed. Enable notifications for NativeAgent in iPhone Settings to receive this retained alert.")
+                    return false
+                }
+            } catch {
+                await reportFailure("iPhone notification permission could not be requested: \(error.localizedDescription). Check Notifications in iPhone Settings.")
+                return false
+            }
+        } else if settings.authorizationStatus == .denied {
+            await reportFailure("iPhone notifications are disabled. Enable notifications for NativeAgent in iPhone Settings to receive this retained alert.")
+            return false
         }
 
         let content = UNMutableNotificationContent()
@@ -474,8 +474,13 @@ enum NativeAgentBridgeNotificationScheduler {
             return true
         } catch {
             NSLog("[NativeAgentMobile] bridge notification failed id=%@: %@", msg.id, error.localizedDescription)
+            await reportFailure("The iPhone could not prepare this notification: \(error.localizedDescription). Check Notifications in iPhone Settings, then refresh Activity.")
             return false
         }
+    }
+
+    private static func reportFailure(_ message: String) async {
+        await MainActor.run { iCloudSyncEngine.shared.syncError = message }
     }
 
     private static func nonEmpty(_ value: String?) -> String? {

@@ -150,8 +150,8 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ),
         ConnectorActionDescriptor(
             id: "scheduler.schedule_job", connectorId: "scheduler", connector: "scheduler",
-            name: "Schedule Any Job",
-            description: "The agent's general scheduler. Create one-shot or recurring app-owned jobs for any supported job kind on once/every/hourly/daily/weekly/monthly/cron schedules. Notify jobs can choose delivery channels: push, telegram, mac, chat, inbox, activity.",
+            name: "Schedule Body Rhythm",
+            description: "Create one-shot or recurring body rhythms on once/every/hourly/daily/weekly/monthly/cron schedules. Intentions, check-ins and reminders use queue.add {text, when, until?, say?}.",
             risk: "medium", dryRunAvailable: true, requiresApproval: false,
             category: "scheduler",
             inputSchema: schema([
@@ -159,10 +159,11 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("kind", .object([
                     "type": .string("string"),
                     "enum": .array([
-                        .string("notify"), .string("connector_action"),
+                        .string("connector_action"), .string("part"),
                         .string("dream"), .string("rem"),
                         .string("harness_benchmark"), .string("proactive_scan"),
                     ]),
+                    "description": .string("Body rhythms only. Intentions, check-ins and reminders use queue.add."),
                 ])),
                 ("schedule", .object([
                     "type": .string("object"),
@@ -170,14 +171,14 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ])),
                 ("payload", .object([
                     "type": .string("object"),
-                    "description": .string("Job payload. notify: title/message plus delivery:['push','telegram','mac','chat','inbox','activity'] and optional deliveryOptions per channel. connector_action: actionId/input. dream/rem: objective. proactive_scan: reason/limit/surfaceLimit."),
+                    "description": .string("Rhythm payload. connector_action: actionId/input. dream/rem: objective. part: part/signal (schedule:<cron>). proactive_scan: reason/limit/surfaceLimit. For fixed reminder words use queue.add with say."),
                 ])),
             ], required: ["name", "kind", "schedule"])
         ),
         ConnectorActionDescriptor(
             id: "scheduler.create_job", connectorId: "scheduler", connector: "scheduler",
-            name: "Create Scheduled Job",
-            description: "Create a lightweight app-owned recurring or one-shot job. Use for reminders, recurring iPhone notifications, safe connector checks, dreams, REM cycles, or proactive idea scans.",
+            name: "Create Body Rhythm",
+            description: "Create a recurring or one-shot body rhythm for connector reads, parts, dreams, REM, benchmarks or proactive scans. Intentions, check-ins and reminders use queue.add {text, when, until?, say?}.",
             risk: "medium", dryRunAvailable: true, requiresApproval: false,
             category: "scheduler",
             inputSchema: schema([
@@ -185,17 +186,18 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
                 ("kind", .object([
                     "type": .string("string"),
                     "enum": .array([
-                        .string("notify"), .string("connector_action"),
+                        .string("connector_action"), .string("part"),
                         .string("dream"), .string("rem"),
                         .string("harness_benchmark"), .string("proactive_scan"),
                     ]),
+                    "description": .string("Body rhythms only. Intentions, check-ins and reminders use queue.add."),
                 ])),
-                ("interval_seconds", prop("integer", description: "Repeat interval in seconds. Minimum 60 for notify/connector jobs.")),
+                ("interval_seconds", prop("integer", description: "Repeat interval in seconds. Minimum 60.")),
                 ("run_at", prop("string", description: "Optional ISO-8601 first run time.")),
                 ("one_shot", prop("boolean")),
                 ("payload", .object([
                     "type": .string("object"),
-                    "description": .string("For notify: title/message. For connector_action: actionId/input. For dream/rem: objective. For proactive_scan: reason/limit/surfaceLimit."),
+                    "description": .string("For connector_action: actionId/input. For dream/rem: objective. For part: part/signal (schedule:<cron>). For proactive_scan: reason/limit/surfaceLimit. Intentions use queue.add."),
                 ])),
             ], required: ["name", "kind"])
         ),
@@ -252,7 +254,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.reminders_list_due_today", connectorId: "mac", connector: "mac",
             name: "Mac Reminders Due Today",
-            description: "Read Reminders.app items in today and overdue parts, each with its full count and independently capped reminders/has_more, plus total, summary and the legacy reminders union. Read-only and scheduleable.",
+            description: "Read Reminders.app items in today and overdue parts, each with its full count and independently capped reminders/has_more, plus total and summary. Read-only and scheduleable.",
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "mac_pim",
             inputSchema: schema([
@@ -299,7 +301,7 @@ public func connectorActionDescriptors() -> [ConnectorActionDescriptor] {
         ConnectorActionDescriptor(
             id: "mac.contacts_search", connectorId: "mac", connector: "mac",
             name: "Mac Contacts Search",
-            description: "Search Contacts.app by name substring through the unified dispatcher. Read-only.",
+            description: "Search Contacts.app with query: @ selects email, phone-shaped text selects phone, otherwise name. The selected lookup runs once. Read-only.",
             risk: "low", dryRunAvailable: true, requiresApproval: false,
             category: "mac_pim",
             inputSchema: schema([

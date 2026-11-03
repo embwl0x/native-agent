@@ -9,7 +9,7 @@ import DeviceSync
 import NotificationInbox
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `ChatSurfaceBackgroundWork.swift` | `ChatSurfaceBackgroundWork` enum; `makeTelegramChatHandler`; `fileSystemPermissionNotice` passes native Speech Recognition facts to maintenance-assistance, retaining permission checks, retirement, sticky-status publication and delivery |
+// Blueprint: | `ChatSurfaceBackgroundWork.swift` | `ChatSurfaceBackgroundWork` enum; `makeTelegramChatHandler` retains streamed pre-tool words in final delivery; `fileSystemPermissionNotice` passes native Speech Recognition facts to maintenance-assistance, retaining permission checks, retirement, sticky-status publication and delivery |
 
 public enum ChatSurfaceBackgroundWork {
     private static func withChatTranscriptCompletionSignal<T>(
@@ -28,7 +28,7 @@ public enum ChatSurfaceBackgroundWork {
         turnCompleted: @escaping @Sendable (String) -> Void
     ) -> TelegramProgressChatHandlerWithAttachments {
         // Telegram images use the same MultimodalAttachment shape as Mac chat.
-        let handler: TelegramProgressChatHandlerWithAttachments = { chatId, text, mediaAttachments, progress, context in
+        let handler: TelegramProgressChatHandlerWithAttachments = { chatId, text, mediaAttachments, context in
             // Approval continuations stay in the interrupted turn's session.
             // Forum topics key sessions by (chat, topic); nil topics retain chat-only keys.
             let destination = TelegramDestination(chatId: chatId, threadId: context.threadId)
@@ -92,45 +92,16 @@ public enum ChatSurfaceBackgroundWork {
                 replyRoute: replyRoute,
                 pinnedRunID: context.runId
             )
-            // Telegram's activity line reads an app call as the action it ran.
-            let shown = ShownToolNames()
             // One turn at a time in this session across every door. Only the
             // model turn holds it; Telegram delivery runs after it is released.
             let response = try await withChatTranscriptCompletionSignal(sessionID: sessionId, turnCompleted: turnCompleted) {
-                try await TurnAdmission.shared.run(sessionID: sessionId) {
-                try await request.chat(
-                    on: client,
-                    progress: { event in
-                        switch event {
-                        case .toolUse(let name, let input):
-                            let call = shown.use(name, input: input)
-                            await progress(.toolUse(name: call.name, input: call.input))
-                        case .toolResult(let name, let output):
-                            await progress(.toolResult(name: shown.result(name).name, output: output))
-                        case .notice(let kind, let text):
-                            // invoke_claude start/heartbeat/timeout — surface on
-                            // Telegram so the user sees live progress instead of a silent
-                            // multi-minute hang. Carry `kind` so the bot throttles
-                            // heartbeats but always delivers the terminal timeout.
-                            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if !trimmed.isEmpty {
-                                await progress(.notice(kind: kind, text: trimmed))
-                            }
-                        case .final, .error:
-                            break
-                        default:
-                            await progress(event)
-                        }
-                    }
-                )
+                try await TurnAdmission.shared.run(dataRoot: dataRoot, sessionID: sessionId) {
+                try await request.chat(on: client)
                 }
             }
-            // The streamed draft showed her working; the settled message is the
-            // answer, with the images she chose.
-            return (ChatTurnRuntime.ChatResponse.answerOnly(
-                response.output,
-                workingCommentaryCharacters: response.workingCommentaryCharacters
-            ), TelegramPollLoop.replyImagePaths(response))
+            // Every word shown in the draft belongs to the delivered reply,
+            // including what she said before using tools.
+            return (response.output, TelegramPollLoop.replyImagePaths(response))
         }
         return handler
     }
@@ -192,7 +163,7 @@ public enum ChatSurfaceBackgroundWork {
             "title": .string(content.title),
             "summary": .string(String(content.summary.prefix(500))),
             "detail": .string(content.detail),
-            "related_mission_id": .null,
+            "related_execution_id": .null,
             "related_approval_id": .null,
             "related_paths": .array(settingsLink.map { [.string($0)] } ?? []),
             "related_groups": .array([]),

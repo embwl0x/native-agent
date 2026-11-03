@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacFourVerbs+MenuCommands.swift` | `MacFourVerbs`: menu lookup, command receipts and popup selection; menu paths retain foreground targeting, ambiguity and declared-effect verification |
+// Blueprint: | `MacFourVerbs+MenuCommands.swift` | `MacFourVerbs`: menu lookup, command receipts and popup selection; menu paths retain foreground targeting, ambiguity and declared-effect verification; bare-name misses retain auxiliary menu-read failure text and detail |
 
 extension MacFourVerbs {
     /// Resolve explicit menu paths through menu reads; foreground acts press the command, background acts report its location and key equivalent.
@@ -117,28 +117,42 @@ extension MacFourVerbs {
             return MacFourVerbsReply(ok: false, text: unseen.text,
                                      detail: reply.detail.merging(["status": .string("acted_unobserved")]) { _, new in new })
         }
+        guard let pid = open.pid, pid == before.pid else {
+            return fail("The popup's app changed during observation; no selection or cleanup key was sent.",
+                "popup_owner_changed", screen: open.render)
+        }
         let items = open.targets.filter { $0.kind == "menu item" }
-        guard case .hit(let item) = Self.resolve(option, among: items), Self.answers(option, item, exact: true), item.enabled else {
-            let dismissed = try? await host.dispatch(action: "hand", body: ["gesture": .string("key"), "keys": .string("escape")])
-            let offered = items.compactMap { $0.enabled ? $0.label : nil }.filter { !$0.isEmpty }
+        guard case .hit(let item) = Self.resolve(option, among: items), Self.answers(option, item, exact: true), item.enabled == true else {
+            var cleanup: [String: JSONValue] = ["gesture": .string("key"), "keys": .string("escape"),
+                                               "require_frame_id": .string(open.frameId)]
+            Self.addAttention(attention, to: &cleanup)
+            let dismissed = await Self.$requiredFrontPid.withValue(open.pid) {
+                await performHand(body: cleanup, description: "Sent Escape to the observed popup.",
+                    attention: attention, before: open, confirm: false)
+            }
+            func cleanupResult(_ reply: MacFourVerbsReply) -> MacFourVerbsReply {
+                MacFourVerbsReply(ok: reply.ok, text: reply.text + (dismissed.ok ? "" : " Cleanup: " + dismissed.text),
+                    detail: reply.detail.merging(["popup_cleanup": .object(dismissed.detail)]) { _, new in new })
+            }
+            let offered = items.compactMap { $0.enabled == true ? $0.label : nil }.filter { !$0.isEmpty }
             let words = "\(Self.name(popup)) has no \"\(option)\" to choose"
                 + (offered.isEmpty ? "." : "; it offers: " + offered.joined(separator: ", ") + ".")
             switch await sight(part: nil) {
             case .blind(let reply):
-                return fail(words + " I couldn't confirm that the popup closed. " + reply.text,
-                            "popup_dismissal_unverified", screen: "")
+                return cleanupResult(fail(words + " I couldn't confirm that the popup closed. " + reply.text,
+                            "popup_dismissal_unverified", screen: ""))
             case .seen(let after):
-                let closed = dismissed?.ok == true && after.pid == open.pid
+                let closed = dismissed.ok && after.pid == open.pid && after.percept?.truncated == false
                     && !after.targets.contains { $0.kind == "menu item" }
                     && after.targets.contains {
                         $0.handle == popup.handle
                             || (popup.sourceAXPath != nil && $0.sourceAXPath == popup.sourceAXPath)
                     }
-                return fail(
+                return cleanupResult(fail(
                     words + (closed ? " The popup is closed; I didn't select an option."
                                     : " I couldn't confirm that the popup closed; I didn't select an option."),
                     closed ? "option_not_offered" : "popup_dismissal_unverified", screen: after.render
-                )
+                ))
             }
         }
         let picked = await performSupplementalSemantic(
@@ -181,56 +195,63 @@ extension MacFourVerbs {
             ok: false,
             text: "More than one menu command matches \"\(target)\""
                 + (lookup.candidates.isEmpty ? "." : ": " + lookup.candidates.joined(separator: "; ") + ".")
-                + " Use an explicit menu path. No command was pressed." + (screen.map { "\n" + $0 } ?? ""),
+                + " Use a displayed path including its [first]/[second] suffix when shown, or the command's key chord. No command was pressed." + (screen.map { "\n" + $0 } ?? ""),
             detail: ["error": .string("menu_path_ambiguous"),
                      "target": .string(target), "candidates": .array(lookup.candidates.map(JSONValue.string))]
         )
     }
 
-    /// A bare name targets the window; the menus are reached by path. When
-    /// the menus hold a name the window lacks, its miss says where.
-    func menuHint(_ target: String, verb: MacActVerb, app: String?) async -> String {
-        guard [.click, .open, .select, .toggle].contains(verb) else { return "" }
-        let lookup = await menuLookup(target, app: app)
-        let paths = lookup.row.flatMap { Self.string($0["path"]) }.map { [$0] } ?? lookup.candidates
-        guard !paths.isEmpty else { return "" }
-        return " The menus have it at " + paths.joined(separator: "; ")
-            + (paths.count == 1 ? "; pass that path." : "; pass the path you mean.")
+    struct MenuHint {
+        var text: String = ""
+        var detail: [String: JSONValue] = [:]
     }
 
-    /// Menu titles are literal: try the name as said, then without a trailing
-    /// role word. A repeated name is not a hit; a walk the caps cut is read
-    /// for what it found, and finding nothing there is a miss.
+    /// A bare name targets the window; the menus are reached by path. A
+    /// failed menu read is evidence of unreadability, never of a missing item.
+    func menuHint(_ target: String, verb: MacActVerb, app: String?) async -> MenuHint {
+        guard [.click, .open, .select, .toggle].contains(verb) else { return MenuHint() }
+        let lookup = await menuLookup(target, app: app)
+        let paths = lookup.row.flatMap { Self.string($0["path"]) }.map { [$0] } ?? lookup.candidates
+        guard !paths.isEmpty else {
+            guard let failure = lookup.failure else { return MenuHint() }
+            return MenuHint(text: " " + failure.text,
+                            detail: ["menu_lookup_failure": .object(failure.detail)])
+        }
+        return MenuHint(text: " The menus have it at " + paths.joined(separator: "; ")
+            + (paths.count == 1 ? "; pass that path." : "; pass the path you mean."))
+    }
+
+    /// Parse the accepted name/role grammar once, then ask the menu owner once.
+    /// A source failure is returned whole and never retried under another name.
     func menuLookup(_ target: String, app: String?, frontPid: Int32? = nil) async -> MenuLookup {
         let said = target.trimmingCharacters(in: .whitespacesAndNewlines)
-        let stripped = Self.stripRoleWords(said)
-        let names = MacMenuBar.isPath(said) || stripped == Self.normalize(said) ? [said] : [said, stripped]
-        var failure: MacFourVerbsReply?
-        for name in names {
-            var body: [String: JSONValue] = ["find": .string(name)]
-            if let app { body["app"] = .string(app) }
-            if let frontPid { body["require_front_pid"] = .int(Int64(frontPid)) }
-            let found: MacControlResult
-            do { found = try await host.dispatch(action: "menu", body: body) } catch {
-                failure = MacFourVerbsReply(ok: false, text: "I couldn't read the menus: \(error).",
-                                            detail: ["error": .string("menu_unavailable"), "message": .string("\(error)")])
-                continue
-            }
-            let output = Self.object(found.output)
-            guard found.ok else {
-                failure = MacFourVerbsReply(ok: false, text: "I couldn't read the menus: "
-                    + (Self.string(output["message"]) ?? found.error ?? "the Mac refused the read") + ".",
-                    detail: Self.operationDetail(found))
-                continue
-            }
-            let hits = Self.array(output["found"]).map(Self.object)
-            if hits.count > 1 {
-                return MenuLookup(row: nil,
-                                  candidates: hits.compactMap { Self.string($0["path"]) }, ambiguous: true)
-            }
-            if let first = hits.first { return MenuLookup(row: first) }
+        let roleName = MacMenuBar.isPath(said) ? nil : Self.stripRoleWords(said)
+        var body: [String: JSONValue] = ["find": .string(said)]
+        if let roleName, roleName != Self.normalize(said), !roleName.isEmpty { body["role_name"] = .string(roleName) }
+        if let app { body["app"] = .string(app) }
+        if let frontPid { body["require_front_pid"] = .int(Int64(frontPid)) }
+        let found: MacControlResult
+        do { found = try await host.dispatch(action: "menu", body: body) } catch {
+            return MenuLookup(row: nil, failure: MacFourVerbsReply(ok: false,
+                text: "I couldn't read the menus: \(error).",
+                detail: ["error": .string("menu_unavailable"), "message": .string("\(error)")]))
         }
-        return MenuLookup(row: nil, failure: failure)
+        let output = Self.object(found.output)
+        guard found.ok else {
+            return MenuLookup(row: nil, failure: MacFourVerbsReply(ok: false,
+                text: "I couldn't read the menus: "
+                    + (Self.string(output["message"]) ?? found.error ?? "the Mac refused the read") + ".",
+                detail: Self.operationDetail(found)))
+        }
+        let hits = Self.array(output["found"]).map(Self.object)
+        if hits.count > 1 {
+            return MenuLookup(row: nil, candidates: hits.compactMap { row in
+                Self.string(row["path"]).map { path in
+                    path + (Self.string(row["chord"]).map { " (key: \($0))" } ?? "")
+                }
+            }, ambiguous: true)
+        }
+        return MenuLookup(row: hits.first)
     }
 
     /// "Format › Make Plain Text": an explicit menu path, never a window name.

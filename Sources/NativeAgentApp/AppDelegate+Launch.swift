@@ -137,11 +137,10 @@ extension AppDelegate {
                 alert.runModal()
             },
             registerBackgroundTasks: Self.registerBackgroundTaskHandlers,
-            waitForSenses: { try await SensesAssembly.waitUntilReady() },
             resumeMacTurn: { checkpoint, runtime in
                 guard let model = await ApplicationLifetime.shared.appModel else { throw MacChatTurnLifecycleStoreError.invalidRecord }
-                try await model.resumeMacChatTurn(checkpoint) { progress in
-                    try await runtime.resumeTurn(checkpoint, progress: progress)
+                try await model.resumeMacChatTurn(checkpoint) {
+                    try await runtime.resumeTurn(checkpoint)
                 }
             },
             approvals: .app())

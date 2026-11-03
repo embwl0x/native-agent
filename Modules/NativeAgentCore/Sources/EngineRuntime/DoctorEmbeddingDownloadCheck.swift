@@ -24,12 +24,15 @@ public enum DoctorEmbeddingDownloadCheck {
             return (CheckResult(source: "extras/coreml and extras/.coreml-download", id: id, title: title, status: "not needed",
                                detail: "No separate download is configured; the bundled model is checked by Core ML Embedder."), false, false)
         }
-        guard let length = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue,
-              length <= 8_192,
-              let data = try? Data(contentsOf: url),
-              let descriptor = try? EmbeddingModelDownload.Descriptor.parse(data) else {
+        let descriptor: EmbeddingModelDownload.Descriptor
+        do {
+            guard let configured = try EmbeddingModelDownload.configuredDescriptor(at: url) else {
+                throw EmbeddingModelDownload.Failure.invalidRelease
+            }
+            descriptor = configured
+        } catch {
             return (CheckResult(source: "NativeAgent.app/Contents/Resources/embedding-download.json", id: id, title: title, status: "fail",
-                               detail: "The bundled memory model download descriptor is unreadable or invalid.",
+                               detail: error.localizedDescription,
                                harm: "The required memory model cannot be downloaded.",
                                human_action: "Tell the person: this copy of NativeAgent has an unreadable or invalid embedding-download.json; preserve the reported descriptor error.", owner: .builder), false, false)
         }
@@ -38,17 +41,31 @@ public enum DoctorEmbeddingDownloadCheck {
                                detail: "The model is bundled; no separate transfer is required."), false, false)
         }
         let target = dataRoot.appendingPathComponent("extras/coreml")
-        // Installed means the current release: the owner stamps release.sha256 on install.
-        let installedRelease = (try? String(contentsOf: target.appendingPathComponent("release.sha256"), encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if FileManager.default.fileExists(atPath: target.path), installedRelease == descriptor.sha256 {
+        let download = await EmbeddingModelDownloadController.shared.doctorSnapshot()
+        let installation: EmbeddingModelDownload.Installation
+        do { installation = try EmbeddingModelDownload.inspectInstallation(at: target) }
+        catch {
+            return (CheckResult(source: target.path, id: id, title: title, status: "unmeasured",
+                               detail: "Installation could not be inspected: \(error.localizedDescription)"), false, false)
+        }
+        if case .unknown(let reason) = installation.ownership {
+            return (CheckResult(source: target.path, id: id, title: title, status: "unmeasured",
+                               detail: "Installation is unverified: ownership is unknown; bytes are preserved. \(reason) \(installation.modelFailure ?? "The manifest and model artifacts passed inspection; Core ML Embedder checks loading.")",
+                               human_action: EmbeddingModelDownload.ownershipRepairInstruction(at: target)), false, false)
+        }
+        if case .downloader(let installedRelease) = installation.ownership, installedRelease == descriptor.sha256 {
+            if let failure = installation.modelFailure {
+                return (CheckResult(source: target.path, id: id, title: title, status: "fail",
+                                   detail: "Downloader ownership is checked, but the model is unusable: \(failure)",
+                                   human_action: "Choose Check / resume on the Memory model download row to repair this installation."), false, false)
+            }
             do {
                 let state = try await SwiftNativeMemoryV2.shared.memoryEmbeddingEpochState()
                 guard let epoch = await SwiftNativeMemoryV2.shared.embeddingEpoch() else {
                     return (CheckResult(source: "extras/coreml and memory/memory.sqlite: embedding epoch", id: id, title: title, status: "unmeasured",
                                        detail: "The installed memory model's embedding epoch is unavailable."), false, false)
                 }
-                if state.activeEpoch != epoch.rawValue {
+                if state.activeEpoch != epoch.rawValue || state.dimensions != runtime.dimensions {
                     return (CheckResult(source: "extras/coreml and memory/memory.sqlite: embedding epoch", id: id, title: title, status: "warn",
                                        detail: "The installed memory model and memory search have different embedding epochs.",
                                        harm: "She cannot reliably find memories using the installed model.",
@@ -58,10 +75,13 @@ public enum DoctorEmbeddingDownloadCheck {
                 return (CheckResult(source: "extras/coreml and memory/memory.sqlite: embedding epoch", id: id, title: title, status: "unmeasured",
                                    detail: "The installed memory model's memory search epoch could not be checked: \(error.localizedDescription)"), false, false)
             }
+            if let failure = download.cleanupFailure {
+                return (CheckResult(source: "extras/.coreml-download", id: id, title: title, status: "warn",
+                                   detail: "The model target was installed and memory search uses its epoch; staging cleanup failed independently: \(failure)."), false, false)
+            }
             return (CheckResult(source: "extras/coreml and extras/.coreml-download", id: id, title: title, status: "ok",
                                detail: "An installed model is present and memory search uses its embedding epoch; Core ML Embedder checks loadability."), false, false)
         }
-        let download = await EmbeddingModelDownloadController.shared.doctorSnapshot()
         let phase = download.phase
         if download.running {
             return (CheckResult(source: "extras/coreml and extras/.coreml-download", id: id, title: title, status: "ok",
@@ -78,27 +98,29 @@ public enum DoctorEmbeddingDownloadCheck {
                                    "These downloaded memory model parts failed the release digest and the download refuses them while they sit here. "
                                    + "Move this whole directory intact to a sibling recovery name, never deleting a part, so app embeddings.resume downloads the release model again.")), false, false)
         }
-        let userPaused = await EmbeddingModelDownloadController.shared.doctorUserPaused()
+        let userPaused: Bool
+        do { userPaused = try await EmbeddingModelDownloadController.shared.doctorUserPaused() }
+        catch {
+            return (CheckResult(source: "extras/.coreml-download", id: id, title: title, status: "unmeasured",
+                               detail: "Download pause state could not be read: \(error.localizedDescription)"), false, false)
+        }
         if phase == "Download paused" || userPaused {
             return (CheckResult(source: "extras/coreml and extras/.coreml-download", id: id, title: title, status: "off",
                                detail: "The memory model transfer was paused by the user."), false, false)
         }
         let ranges = EmbeddingModelDownload.ranges(size: descriptor.byteLength)
         var bytes: Int64 = 0
-        var invalid = false
         for (index, range) in ranges.enumerated() {
             let part = work.appendingPathComponent("part-\(index)")
-            guard FileManager.default.fileExists(atPath: part.path) else { continue }
-            guard let size = (try? FileManager.default.attributesOfItem(atPath: part.path)[.size] as? NSNumber)?.int64Value,
-                  size > 0, size <= range.count else { invalid = true; break }
-            bytes += size
-        }
-        if invalid {
-            return (CheckResult(source: "extras/.coreml-download/\(descriptor.sha256)",
-                               nextCall: ToolFailureError.call("app", ["action": .string("embeddings.resume"), "args": .object([:])]),
-                               id: id, title: title, status: "fail",
-                               detail: "A saved memory model part has an invalid byte length; the download owner must reacquire it before installation.",
-                               harm: "The required memory model cannot be installed from these saved parts."), false, false)
+            do {
+                let size = try EmbeddingModelDownload.partByteLength(at: part)
+                guard size <= range.count else { throw EmbeddingModelDownload.Failure.invalidRange }
+                bytes += size
+            } catch {
+                return (CheckResult(source: part.path, id: id, title: title, status: "fail",
+                                   detail: "Saved part cannot be resumed: \(error.localizedDescription)",
+                                   harm: "The required memory model cannot be installed until this part is repaired."), false, false)
+            }
         }
         if bytes > 0, bytes < descriptor.byteLength {
             return (CheckResult(source: "extras/.coreml-download/\(descriptor.sha256)", id: id, title: title, status: "warn",
@@ -134,12 +156,9 @@ public enum DoctorEmbeddingDownloadCheck {
                     ? .completed("Completed: memory search now uses the installed model's embedding epoch.")
                     : .unverified("Memory search reconciliation did not complete; the prior corpus was retained.")
             }
-            let reconcile = scope == .button
-            let completed = await EmbeddingModelDownloadController.shared.resumeForDoctor(reconcile: reconcile)
+            let completed = await EmbeddingModelDownloadController.shared.resumeForDoctor()
             return completed
-                ? .completed(reconcile
-                    ? "Completed: resumed the verified-range transfer and reconciled memory search."
-                    : "Completed: resumed the verified-range transfer and installed the memory model.")
+                ? .completed("Completed: resumed the verified-range transfer and reconciled memory search.")
                 : .unverified("Resume did not complete; the download owner retained its saved parts and reported the current phase.")
         }
     }

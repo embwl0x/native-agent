@@ -35,6 +35,12 @@ Raw source callbacks re-enter the existing gates with the invoking turn's
 surface, verified session and file-access task locals; background reads borrow
 no chat session or write permission.
 
+A named-app look can successfully observe absence: `status:"ok"`, `app:<name>`,
+`running:false`, or `running:true` with `windows:0` and cheaply readable `menus`.
+The sense door returns that observation without asking for window material or
+an authored page, and forgets old served views for that app in this conversation.
+It does not launch an app or create a window. Acts retain their own preconditions.
+
 `find` discovers corners by `app:<bundle id>`, `file:<extension>` or `site:<host>`. Read with `page` set to the corner key and `item` to the file path or site URL; an app corner needs no item.
 A served thing offers `sense.<id>.<verb>(address, args?)`, invoked with its address and optional verb arguments, only in their turn through the normal Trust gate.
 
@@ -48,6 +54,9 @@ descriptor; a pathname swap cannot substitute classification bytes. Failed
 preflight admission stays on the native route to report the read error.
 Basic and Full Mac file reads share one SenseDoor and presentation pipeline;
 their admitted raw readers retain their own authority and failure handling.
+A sense that cannot serve its page returns its own failure and repair remedy;
+nothing reads the place a second way behind it. `raw:true` is the explicit raw
+view and skips sense selection, so it works even when the registry cannot be read.
 
 ## Making a sense
 
@@ -80,11 +89,38 @@ removed fixed response-head timer are documented in
 [Turn Resilience](TURN_RESILIENCE.md#4-provider-timeouts).
 
 Built-in records say `origin:"built in"` and omit `createdAt`; there is no
-invented birth date. Old `built_in` records still decode, and their Unix-zero
-creation/enable placeholders are not shown or re-encoded. Real enable and
+invented birth date. Only the current `built in` origin spelling is accepted.
+Authored senses are JavaScript with sealed candidates; source-only and authored
+Swift adapters are removed. A sense read with an uninstalled live registry reports
+`registry_unavailable`; only an explicit `raw:true` bypasses selection.
+Action discovery projects the checked file registry even before the live hub is
+wired at launch; serving a sense still requires that hub. Inventory checks each
+retained version's source and proof independently. Candidate lookup checks each
+slot independently too: a failed current candidate cannot block reading, proving
+or explicitly selecting a healthy previous candidate by its exact identity. No
+version is selected automatically after a failure. A failed selected on-version
+appears unavailable with its named source error; a failed previous version is
+reported in retained-version reads and as a note on the current row, without
+disabling a healthy current version. Other senses still load. Unknown source
+membership is never an empty manifest. These errors are read projections, so
+publishing a sibling does not write them into lifecycle or authority. Export
+and explicit version selection refuse the affected version until repaired;
+unreadable required catalog/accounting or bundled defaults still fail the read.
+Real enable and
 last-use dates remain. Provenance says “built in” without an age. Retained
 version receipts add `corner_name` beside the stable machine-readable corner;
 for example, the `web` stream is “Web pages (read_page / web.read)”.
+
+The bundle's `Senses/builtin.json` has one object shape: `schemaVersion:1`
+and a `senses` array. Every entry requires `id`, string `corner`, positive
+`version`, `mode`, `entry` and `verbs`. Missing fields, another schema or an
+alternate shape fail registration. Optional `enabledAt` encodes directly;
+there is no epoch sentinel.
+
+Authored programs' rooted `host.files.list` resolves `app_data`/`workspace`
+before calling the door and returns the same paged object (`path`, `entries`, optional `next`)
+contract as an unrooted call. It neither assembles a path array nor consumes
+continuations; the caller follows `next` explicitly.
 
 ## The plug protocol (helper ⇄ app)
 
@@ -146,6 +182,58 @@ path/size contract; its app-side wire conversion supplies the bytes.
 File continuations carry this exact byte hash; a changed file refuses the old
 cursor and asks for a read from the start. Binary/package material uses the
 existing metadata-only file admission, before the helper receives bytes.
+That admission also accepts ordinary directory paths for the shared
+part/intention file-change watch, under the same root and sensitive-path
+checks; it reads no file contents. Directory watch membership and change
+identities use `ExistingCornersSourceProvider.packageManifest`'s existing
+8,000-member bound and symlink/type refusals. [Body-signal intentions](INTENTIONS.md#as-built-10-30)
+join that existing watcher.
+
+The senses source owns file observation, including absent paths, failed reads,
+bounded membership re-arming and repair edges. It emits `SenseSourceChange`:
+checked material with file identities, a checked absent root, or an explicit
+unavailable reading. Only the gated reader's ENOENT establishes root absence;
+permission and I/O failures remain unavailable. A checked absent root removes
+previously admitted members and becomes an empty membership baseline, so a
+later creation is added. It supplies no invented file material to a helper;
+the owning sense reports the absent path in news and keeps observing.
+An unavailable reading preserves the last admitted identity; it cannot imply
+removed members. The same root/parent subscription waits for a source change
+before reading again. If observation itself ends, its consumer retires that
+exact task generation, keeps unavailable news visible, and a later canonical
+part/catalog change can register the same source again. `EnginePartWake`
+constructs no substitute watcher and does no independent identity read.
+With no repair edge the watch stays unavailable; stop cancels it.
+A repaired admitted reading, including a checked absent root, delivers
+`available:true` for the watch through the declared file signal even if no
+previous identity was readable; `changed:[]` asserts
+no invented member additions or removals.
+
+Senses installation owns readiness; it is never a global loop-launch gate.
+Every registered loop, reply-delivery owner and continuation observer starts
+independently of registration. Sense selection at `SenseDoor.selectedRecord`,
+a sense's header/source wake, and each declared file subscription await the
+same installation task at their own read. An explicit run of a stopped loop
+uses those same read owners. Native day/front-app observations and part
+arrivals feed the cognition crossing installed before residents start; they
+do not read the registered senses and need no registration wait.
+
+Each readiness read waits at most four seconds, capped by its caller's
+earlier deadline. Missing installation or an unfinished registration returns
+`source_unavailable`, never an empty registry or permission to read raw.
+Expiry says only that this read did not run, not that installation failed.
+`ScopedWaiter` releases only that cancelled/deadline-expired waiter; it never
+cancels installation or marks it ready. File subscriptions arm the installer's
+`NativeAgent.sensesReady` success edge before reading readiness, publish their
+own unavailable news on failure, then wait for that edge to recheck the same
+owner. No edge means the subscription stays unavailable until repair or Stop;
+other part wakes and loops continue. Stop cancels and joins these subscriptions.
+
+Failed registration still publishes `launch.senses` with its source repair
+and waits for a canonical ability change or the observed resource/memory-file
+repair edge before attempting registration again. Only successful registration
+publishes the readiness edge. Ordinary reads and sense wakes that returned
+unavailable can be invoked again after repair; they are not silently replayed.
 
 `timeoutSeconds` is a finite, positive stall window (default 30 seconds), never
 a total run deadline. An entry may run indefinitely while it advances. Progress
@@ -181,7 +269,23 @@ marks that version unavailable with a reason and news. Missing, non-executable
 or launch-blocked helpers are unavailable immediately. Repair and switch on to retry.
 All source subscriptions share detached, generation-bound delivery, retain only
 their newest material and signal the existing part-wake owner. App content
-comparison excludes frame bookkeeping. `EnginePartWake` admits interpretation under
+comparison excludes frame bookkeeping and `ax_watch_coverage` on both the
+initial baseline and later events; observer metadata alone is not a content
+change. Native app AX subscriptions install and
+renew under their own five-second/1,200-node budget, with ranged child copies.
+An element's subscription or topology failure is its named gap; readable siblings
+and supported notifications keep working. Budget exhaustion keeps the bounded
+coverage already installed and reports unseen descendants as unknown. Partial
+renewal retains prior subscriptions; only complete traversal prunes missing ones.
+`ax_watch_coverage` on app watch material, cold-renderer seams and desktop
+observation receipts reports `partial`, `visited`, `gap_count` and up to twenty
+element/operation gaps. Notifications prompt fresh reads; partial coverage never
+certifies that every change will be heard. No installed notification is an
+unavailable channel; only a complete unsupported inventory establishes
+`source_unsupported`. Observer loss, revoked Accessibility, cancellation or app
+termination ends the stream through its existing failure/retirement owner.
+A quiescent watch waits for events until its owner retires it; cold renderer
+reads keep their existing bounded content-stall deadline. `EnginePartWake` admits interpretation under
 Autonomy, serially with that part's other wakes; capture and transport stay with
 the source. While Autonomy is off, the wake waits on the existing trust-policy
 change path with its source slot and helper generation intact, including senses
@@ -272,6 +376,25 @@ waits have no timer and are excluded from the entry's no-progress window.
   subscription changes invalidate presentation without polling.
 - Visible Senses/Work surfaces refresh from ability-file/accounting changes and the news/view owners' invalidations. Presentation reads one checked catalog without helper-retirement reconciliation; an unchanged visible page performs no periodic registry scan.
 - Live news: the runner posts every `notify` to `SenseNewsBoard.shared`.
+  `post` and non-waking `keep` accept only after the board's checked durable
+  write; an unbound or failed store refuses acceptance and restores its prior
+  news. `home.arrive` reports a rejected keep as `not_kept`, never as filed.
+  Accepted non-waking part arrivals also enter ResidentWake's same durable
+  identity ledger as waking arrivals, under its existing retention policy,
+  without pending a wake or adding a second home line. The board remains
+  their presentation owner. If that identity write fails after news was kept,
+  the action reports `identity_not_kept` with partial effects and the ledger's
+  existing repair is owed; it does not claim nothing was filed.
+  A sense's notify throws a rejected delivery out of its request worker;
+  termination follows the existing worker join, never a join of itself.
+  Cancellation before news admission remains cancellation in sense and
+  scheduled-read callers; it is not a storage-failure verdict. A cancelled
+  Chrome watch retains its pending change without reporting a capture failure.
+  Only accepted notify advances the request's news-generation receipt.
+  A successful multi-effect act and an interrupted act both retain all
+  `returned_actions`; the receipt owner folds their effects with unknown,
+  partial and occurred precedence. An interrupted helper retains unknown
+  effects because an unanswered call may have run.
   A scheduled read (`connector_action` job) posts to the same board: the rows
   new since its last read, one notice per job (`docs/AUTOMATED_SYSTEMS.md`).
   W9: the board keeps one unread notice per sense/version/observed source
@@ -312,6 +435,10 @@ waits have no timer and are excluded from the entry's no-progress window.
   their idle deadline cannot retire them. Chrome capture failures are status
   diagnostics per tab, never news; they preserve the last successful baseline
   and observation so the next successful navigation/change is still news.
+  A failed board delivery retains the exact pending notice and captured
+  snapshot; the next source edge offers that notice before processing newer
+  material. The delivery baseline moves only after board acceptance. With no
+  further source edge, the rejected notice remains pending until retirement.
   Chrome observes from owned-tab navigation/opening and captures navigation after the
   exact document/frame's page-ready or completed edge, without retry timers.
   A turn selects published news and verifies it is still unread;
@@ -347,6 +474,11 @@ waits have no timer and are excluded from the entry's no-progress window.
 
 ## Memory provenance
 
+Current `SenseProvenance` requires its recorded origin; every constructor
+stamps it from the selected `SenseRecord`. There is no nil-origin renderer or
+inferred origin for imported data. Memory's `sense_versions` references below
+are their own identity-only contract, not serialized `SenseProvenance`.
+
 Memories committed from sense-served reads retain `sense_versions` entries
 with `sense_id` and `version`; duplicate admission unions these references,
 and metadata rewrites preserve them and any `sense_version_later_wrong` warning.
@@ -359,8 +491,9 @@ The warning changes no remembered text, lifecycle, confidence or status and
 deletes nothing. Served-version evidence is local to each turn and shared by
 its parallel tool calls; more than 128 distinct sense/version references
 explicitly refuse a memory commit with `provenance_limit`.
-An explicit sense rollback marks the withdrawn version wrong, not the restored
-version; `wrong:true` on a read returns repair guidance as described below.
+Senses are revised forward; previous versions remain readable history, with no
+version-swap action. `wrong:true` on a read marks the served version wrong and
+returns repair guidance as described below.
 
 ## Wrong-view lever (W19)
 

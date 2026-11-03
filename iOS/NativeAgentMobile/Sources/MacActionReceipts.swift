@@ -10,10 +10,14 @@ enum RemoteActionState: String, Equatable {
     case approvalResolved = "approval resolved"
     case ranOnMac = "ran on Mac"
     case failed = "failed"
+    case unconfirmed = "not confirmed"
 
     static func forError(_ error: Error) -> Self {
         if case SyncError.approvalRequired = error {
             return .waitingApproval
+        }
+        if case SyncError.responseUnconfirmed = error {
+            return .unconfirmed
         }
         return .failed
     }

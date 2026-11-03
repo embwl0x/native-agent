@@ -62,14 +62,6 @@ struct KnowledgeGraphView: View {
         displayEntities.map(\.id).sorted().joined(separator: "|")
     }
 
-    /// The canvas removes blank and duplicate identifiers before it enters its
-    /// quadratic layout. Route the safety fallback using that same canonical
-    /// participant count, so malformed duplicate rows cannot unnecessarily
-    /// block a safe graph and every actual canvas participant is still capped.
-    var renderableGraphEntityCount: Int {
-        KGGraphCanvasLayout.canonicalEntities(displayEntities).count
-    }
-
     @AppStorage("knowledgeGraphViewMode") private var persistedViewMode = KGViewMode.list.rawValue
     @State var selectedKinds: Set<String> = []  // empty = all
     @State var timeWindow: KGTimeWindow = .all
@@ -121,11 +113,12 @@ struct KnowledgeGraphView: View {
         )
     }
 
-    var viewModeNotice: String? {
-        KGViewModePickerPresentation.pickerNotice(
-            requested: viewMode,
-            displayedEntityCount: renderableGraphEntityCount
-        )
+    var recencyNotice: String? {
+        _ = displayEntities
+        let count = filterProjection.unavailableRecencyCount
+        guard count > 0 else { return nil }
+        return "Recency unavailable for \(count) entities (last-seen timestamp missing or invalid)." +
+            (timeWindow == .all ? "" : " These entities are excluded from this time filter; choose All time to see them.")
     }
 
     var body: some View {
@@ -143,8 +136,8 @@ struct KnowledgeGraphView: View {
             AliveGroupCard {
                 KGNativeStackHeader(
                     memory: memory,
-                    totalEntities: totalEntities,
-                    totalEdges: totalEdges ?? 0
+                    totalEntities: memory.graphSnapshot?.canvasEntities.count,
+                    totalEdges: totalEdges
                 )
                 HStack(spacing: 8) {
                     Menu {
@@ -198,7 +191,7 @@ struct KnowledgeGraphView: View {
                     .fixedSize()
                     .accessibilityLabel("Knowledge Graph view mode")
                     .accessibilityValue(viewMode.rawValue)
-                    .help(viewModeNotice ?? "Choose whether to browse the graph as a list or a graph.")
+                    .help("Choose whether to browse the graph as a list or a graph.")
                 }
 
                 // Entity search; the kind menu owns type filtering.
@@ -212,8 +205,8 @@ struct KnowledgeGraphView: View {
                 }
             }
 
-            if let viewModeNotice {
-                Text(viewModeNotice)
+            if let recencyNotice {
+                Text(recencyNotice)
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.trouble)
                     .fixedSize(horizontal: false, vertical: true)
@@ -271,7 +264,6 @@ struct KnowledgeGraphView: View {
                 error: shownError,
                 entityCount: entities.count,
                 displayedEntityCount: displayEntities.count,
-                renderableGraphEntityCount: renderableGraphEntityCount,
                 isEnabled: knowledgeGraphEnabled,
                 viewMode: viewMode,
                 policyReadError: policyReadError
@@ -335,15 +327,6 @@ struct KnowledgeGraphView: View {
                 )
             case .list:
                 splitListAndDetail
-            case let .graphSafetyNet(count):
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Graph too large (\(count) entities) — showing the list. Tighten the filters above to render as a graph.")
-                        .font(ShellType.label)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    splitListAndDetail
-                }
             case .graph:
                 // The 200-node limit applies only to the quadratic graph layout, never list mode.
                 HSplitView {

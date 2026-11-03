@@ -66,6 +66,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
         let stampsMayAdvance = read.allStoresReadable
         let unreadableStoreError = "a delegation store (directory, job file, or delivery "
             + "ledger line) could not be read this tick; repair its storage and retry outcome reconciliation"
+        guard stampsMayAdvance else { return .failed(error: read.availabilityError ?? unreadableStoreError) }
         let terminal = jobs.filter { $0.isTerminal }
         let wasSeeded: Bool
         let seedResult: String?
@@ -110,25 +111,6 @@ public struct DelegationOutcomeLoop: LoopRunner {
             } catch {
                 return .failed(error: "delegation outcome cursor unavailable and preserved; restore readable cursor or canonical notifications before retrying: \(error.localizedDescription)")
             }
-        }
-        if stampsMayAdvance {
-            for job in terminal {
-                guard let boundary = cursor.store(job.source).legacyLastSeen,
-                      let completed = job.completionStamp, completed <= boundary else { continue }
-                // A reply arriving after the old completion boundary is new evidence.
-                if let version = job.deliveryReceiptVersion {
-                    guard let arrival = DelegationOutcomeCursor.parseISO(String(version.prefix { $0 != "|" })),
-                          arrival <= boundary else { continue }
-                }
-                if !cursor.store(job.source).cardedIDs.contains(job.id) {
-                    cursor.record(source: job.source, id: job.id, outcome: job.terminalOutcome,
-                                  deliveryReceiptVersion: job.deliveryReceiptVersion)
-                } else if let version = job.deliveryReceiptVersion,
-                          cursor.store(job.source).deliveryReceiptVersions[job.id] == nil {
-                    cursor.stores[job.source]?.deliveryReceiptVersions[job.id] = version
-                }
-            }
-            for source in cursor.stores.keys { cursor.stores[source]?.legacyLastSeen = nil }
         }
         // Stuck liveness is not a terminal outcome. It gets its own reversible
         // cursor bit so the first real stall speaks once, recovered liveness
@@ -203,7 +185,7 @@ public struct DelegationOutcomeLoop: LoopRunner {
         for job in batch {
             // These dispositions need only cursor acknowledgement here, without
             // an outcome card or downstream delegation settlement.
-            if ["delivered", "owed", "sent_unconfirmed", "failed_before_answer", "legacy_before_receipts", "let_go", "dry_run"].contains(job.deliveryOutcome ?? "") {
+            if ["delivered", "owed", "sent_unconfirmed", "failed_before_answer", "let_go", "dry_run"].contains(job.deliveryOutcome ?? "") {
                 guard await observeTransition(job) else {
                     failed += 1
                     break

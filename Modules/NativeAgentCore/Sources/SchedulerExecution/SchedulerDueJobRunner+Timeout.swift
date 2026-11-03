@@ -21,7 +21,7 @@ extension SchedulerDueJobRunner {
 
     static func jobTimeoutSeconds(forKind kind: String) -> Double {
         switch kind {
-        case "dream", "rem", "harness_benchmark", "turn":
+        case "dream", "rem", "harness_benchmark":
             return longJobTimeoutSeconds
         default:
             return defaultJobTimeoutSeconds
@@ -37,7 +37,6 @@ extension SchedulerDueJobRunner {
     /// The manager may bound its own wait, but retains this body and prevents
     /// another scheduled effect from overlapping it until settlement completes.
     func executeWithTimeout(job: DueJob) async -> JobResult {
-        defer { notificationOutcomes.removeValue(forKey: job.occurrenceKey) }
         let seconds = Self.jobTimeoutSeconds(forKind: job.kind)
         // The race selects the terminal reason; this task owns the actual body
         // and keeps a result returned after cancellation wins that race.
@@ -105,15 +104,12 @@ extension SchedulerDueJobRunner {
             ])
             seen = result.seen
         case .failure(let error):
-            finalDetail = detail + " Body exited with error: \(error.localizedDescription). Confirmed channel receipts are retained; other effects remain unknown. Inspect its receipts before resuming."
+            finalDetail = detail + " Body exited with error: \(error.localizedDescription). Effects remain unknown. Inspect its receipts before resuming."
             output["bodyError"] = .string(error.localizedDescription)
             output["effects"] = .string("unknown")
             seen = nil
         }
         output["error"] = .string(finalDetail)
-        if case .object(let receipts)? = notificationOutcomes[job.occurrenceKey] {
-            output.merge(receipts) { _, receipt in receipt }
-        }
         return JobResult(status: "error", detail: finalDetail, output: .object(output), seen: seen)
     }
 

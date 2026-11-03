@@ -3,118 +3,93 @@ import NativeAgentCore
 
 // Blueprint: | `ContextTurnRuntime.swift` | `ContextPreparedTurn`, request and embedding ticket: generation lease, bounded query-vector handoff (the query, its other voice and a follow-up's own words) and turn feedback/delivery accounting |
 
-/// One-shot, RAM-only handoff for an optional query embedding. A turn waits a
-/// bounded moment for it (`value(within:)`); a vector that cannot come says
-/// why (`unavailable`), so the turn knows it ranks by words alone.
-///
-/// The primary reading lands first (`publish(…, readingsFollow: true)`)
-/// and the message's further readings attach after it (`attachReadings`), so
-/// the query vector never waits on them. A waiter takes the value once every
-/// reading has landed, or, at its deadline, whatever has: the primary alone
-/// when the others are late, and the selector's bar counts only the readings
-/// it got.
+/// One-shot handoff for all requested semantic readings. A deadline ends
+/// only the wait: the runtime retains the embedding task until settlement.
+/// A missing or late result is unavailable, never permission to rank by words.
 public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
     private let lock = NSLock()
-    private var value: ContextQueryEmbeddingValue?
-    /// False between a primary published with readings to follow and their
-    /// arrival (or their failure).
-    private var readingsComplete = true
-    private var failure: String?
+    private var result: Result<ContextQueryEmbeddingValue, NativeSemanticQueryError>?
     private let ready = ScopedWaiter()
 
     public init() {}
 
-    /// A ticket that already knows no vector is coming, and why.
     public convenience init(unavailable cause: String) {
         self.init()
         fail(cause)
     }
 
-    /// The vector once it lands, or nil when none is coming or `nanoseconds`
-    /// pass first. Read at the start of a turn, a vector still on its way
-    /// would always miss it.
     public func value(within nanoseconds: UInt64) async -> ContextQueryEmbeddingValue? {
-        guard !Task.isCancelled else { return nil }
-        let initial = lock.withLock { (failure != nil || (value != nil && readingsComplete) || nanoseconds == 0, value) }
-        if initial.0 { return initial.1 }
-        return await withTaskGroup(of: ContextQueryEmbeddingValue?.self) { group in
+        do { return try await checkedValue(within: nanoseconds) }
+        catch { return nil }
+    }
+
+    /// Checked turn preparation retains failure versus deadline versus cancellation.
+    public func checkedValue(within nanoseconds: UInt64) async throws -> ContextQueryEmbeddingValue {
+        try Task.checkCancellation()
+        if let settled = lock.withLock({ result }) { return try settled.get() }
+        let waited = await withTaskGroup(of: Result<ContextQueryEmbeddingValue, NativeSemanticQueryError>.self) { group in
             group.addTask {
                 await self.ready.park()
-                return self.lock.withLock { Task.isCancelled ? nil : self.value }
+                return self.lock.withLock {
+                    self.result ?? .failure(NativeSemanticQueryError(detail: "The semantic wait ended without complete readings."))
+                }
             }
             group.addTask {
                 do { try await Task.sleep(nanoseconds: nanoseconds) }
-                catch { return nil }
-                // Capture at the deadline, before the race joins either branch.
-                return self.lock.withLock { Task.isCancelled ? nil : self.value }
+                catch { return .failure(NativeSemanticQueryError(detail: "The semantic wait was cancelled.")) }
+                // Snapshot at expiry; joining the cancelled parker cannot admit a late value.
+                return self.lock.withLock {
+                    self.result ?? .failure(NativeSemanticQueryError(detail:
+                        "The semantic read is still pending after its bounded wait; no recall selection was made."))
+                }
             }
-            let first = await group.next() ?? nil
+            let first = await group.next()!
             group.cancelAll()
-            return Task.isCancelled ? nil : first
+            return first
+        }
+        try Task.checkCancellation()
+        return try waited.get()
+    }
+
+    public var unavailable: String? {
+        lock.withLock {
+            if case .failure(let error) = result { return error.detail }
+            return nil
         }
     }
 
-    /// Why no vector is coming; nil while one may still land.
-    public var unavailable: String? { lock.withLock { failure } }
-
-    /// Nothing more is coming. Before the primary reading: no vector, and
-    /// why. After it, with readings still to follow: the primary alone.
     public func fail(_ cause: String) {
-        let completed = lock.withLock {
-            if value != nil {
-                guard !readingsComplete else { return false }
-                readingsComplete = true
-            } else {
-                guard failure == nil else { return false }
-                failure = cause
-            }
+        let settled = lock.withLock {
+            guard result == nil else { return false }
+            result = .failure(NativeSemanticQueryError(detail: cause))
             return true
         }
-        if completed { ready.resume() }
+        if settled { ready.resume() }
     }
 
     public func publish(
         _ embedding: [Float],
         alternate: [Float]? = nil,
         ownWords: [[Float]] = [],
-        modelFingerprint: String = "legacy-unverified",
-        modelID: String,
-        readingsFollow: Bool = false
+        modelFingerprint: String,
+        modelID: String
     ) {
-        guard !embedding.isEmpty, embedding.allSatisfy(\.isFinite) else { return }
-        let fingerprint = modelFingerprint.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !fingerprint.isEmpty else { return }
-        let completed = lock.withLock {
-            guard value == nil, failure == nil else { return false }
-            value = ContextQueryEmbeddingValue(
-                values: embedding,
-                alternateValues: alternate,
-                ownWordsValues: ownWords,
-                modelFingerprint: fingerprint,
-                modelID: modelID
-            )
-            readingsComplete = !readingsFollow
-            return readingsComplete
-        }
-        if completed { ready.resume() }
-    }
-
-    /// The further readings of a primary published with `readingsFollow`.
-    /// Malformed ones drop out; empty (they failed) completes the value with
-    /// the primary alone. Either way, every waiter is released.
-    public func attachReadings(_ readings: ContextQueryEmbeddingValue) {
-        let completed = lock.withLock {
-            guard var current = value, !readingsComplete else { return false }
-            if readings.values.count == current.values.count {
-                current.alternateValues = current.alternateValues ?? readings.alternateValues
-                current.ownWordsValues += readings.ownWordsValues
-            }
-            value = current
-            readingsComplete = true
+        let value = ContextQueryEmbeddingValue(values: embedding, alternateValues: alternate,
+            ownWordsValues: ownWords, modelFingerprint: modelFingerprint, modelID: modelID)
+        guard value.isUsable else { fail("The semantic reader returned malformed readings."); return }
+        let settled = lock.withLock {
+            guard result == nil else { return false }
+            result = .success(value)
             return true
         }
-        if completed { ready.resume() }
+        if settled { ready.resume() }
     }
+}
+
+public struct NativeSemanticQueryError: Error, LocalizedError, Sendable {
+    public let detail: String
+    public init(detail: String) { self.detail = detail }
+    public var errorDescription: String? { "Context semantic read unavailable: " + detail }
 }
 
 public struct ContextQueryEmbeddingValue: Sendable, Equatable {
@@ -144,14 +119,18 @@ public struct ContextQueryEmbeddingValue: Sendable, Equatable {
         modelID: String
     ) {
         self.values = values
-        // Malformed enrichment never costs the primary reading.
-        func usable(_ vector: [Float]) -> Bool {
-            !vector.isEmpty && vector.allSatisfy(\.isFinite) && vector.count == values.count
-        }
-        self.alternateValues = alternateValues.flatMap { usable($0) ? $0 : nil }
-        self.ownWordsValues = ownWordsValues.filter(usable)
+        self.alternateValues = alternateValues
+        self.ownWordsValues = ownWordsValues
         self.modelFingerprint = modelFingerprint
         self.modelID = modelID
+    }
+
+    public var isUsable: Bool {
+        !modelFingerprint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !values.isEmpty
+            && ([values] + (alternateValues.map { [$0] } ?? []) + ownWordsValues)
+                .allSatisfy { $0.count == values.count && $0.allSatisfy(\.isFinite) }
     }
 }
 
@@ -162,6 +141,9 @@ public struct ContextTurnRequest: Sendable, Equatable {
     public let personaIDHint: String?
     public let sessionID: String?
     public let recentTurns: [String]
+    /// Retained transcript exchanges, oldest first; each holds its user words.
+    /// Empty exchanges still count toward rest, independently of delivery.
+    public let recentExchanges: [[String]]
     public let activeTask: String?
     public let unresolvedQuestion: String?
     public let goal: String?
@@ -187,12 +169,9 @@ public struct ContextTurnRequest: Sendable, Equatable {
     /// required documents verbatim, so the packet must not mirror them a second
     /// time into the per-turn (dynamic, uncached) block.
     ///
-    /// Default `false` keeps every other call site — harnesses, evals, direct
-    /// context callers — byte-identical to today, where only the kernel's own
-    /// documents (SOUL/VOICE + surface guidance) are precovered and the rest of
-    /// the persona rides the packet.
+    /// Every caller explicitly states its document contract.
     public let stableSegmentCarriesRequiredDocuments: Bool
-    /// Nil is the pre-pin transition; [] withholds all generated USER facts.
+    /// Nil means the USER memory projection is unavailable; [] withholds all generated facts.
     public let userMemoryCore: [String]?
     /// Automatic memory disclosure, including correction/identity atoms.
     public let memoryRecallEnabled: Bool
@@ -203,10 +182,8 @@ public struct ContextTurnRequest: Sendable, Equatable {
     /// means the caller renders atoms whole and no truncation pointers are
     /// published — today's behavior.
     public let packetAtomExpandThresholdChars: Int
-    /// One owner for how many `.memory` atoms the packet may carry. `nil`
-    /// (default) leaves the selector's own per-kind quota in charge, which is
-    /// what every pre-existing caller got. Identity, correction and instruction
-    /// atoms are never counted against it.
+    /// Shared quota for nonmandatory memory and correction atoms. `nil` uses
+    /// the selector's quota. Mandatory atoms bypass it; other kinds do not count.
     public let memoryAtomRowLimit: Int?
 
     public init(
@@ -216,6 +193,7 @@ public struct ContextTurnRequest: Sendable, Equatable {
         personaIDHint: String? = nil,
         sessionID: String? = nil,
         recentTurns: [String] = [],
+        recentExchanges: [[String]] = [],
         activeTask: String? = nil,
         unresolvedQuestion: String? = nil,
         goal: String? = nil,
@@ -229,8 +207,8 @@ public struct ContextTurnRequest: Sendable, Equatable {
         characterBudget: Int = 6_000,
         maximumCharacterBudget: Int? = nil,
         postMandatoryCharacterReserve: Int = 0,
-        stableSegmentCarriesRequiredDocuments: Bool = false,
-        userMemoryCore: [String]? = nil,
+        stableSegmentCarriesRequiredDocuments: Bool,
+        userMemoryCore: [String]?,
         memoryRecallEnabled: Bool = true,
         packetAtomExpandThresholdChars: Int = 0,
         memoryAtomRowLimit: Int? = nil
@@ -241,6 +219,7 @@ public struct ContextTurnRequest: Sendable, Equatable {
         self.personaIDHint = personaIDHint
         self.sessionID = sessionID
         self.recentTurns = recentTurns
+        self.recentExchanges = recentExchanges
         self.activeTask = activeTask
         self.unresolvedQuestion = unresolvedQuestion
         self.goal = goal
@@ -419,7 +398,7 @@ public final class ContextPreparedTurn: @unchecked Sendable {
 }
 
 public protocol ContextTurnPreparing: Sendable {
-    func contextFlowMode() async -> ContextFlowMode
+    func contextFlowMode() async throws -> ContextFlowMode
     /// `ownWords`: the message alone when `text` is it in the context of the
     /// recent turns (a follow-up); nil when `text` is the message.
     func beginQueryEmbedding(_ text: String, ownWords: String?) async -> ContextQueryEmbeddingTicket?

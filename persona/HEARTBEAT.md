@@ -1,14 +1,12 @@
 # HEARTBEAT — periodic self-check
 
-Reply exactly `HEARTBEAT_OK` if, and only if, every item below checks out
-against the live signals. Anything off — even slightly — describe what and
-why instead.
+This file is an enable gate for the native heartbeat. Any nonempty content
+enables its deterministic assessment; these words are not an interpreted
+checklist or a reply protocol. A missing, unreadable or whitespace-only file
+turns the heartbeat off without claiming health.
 
-- Doctor: no failing checks.
-- Workshop executions: nothing stuck (no execution running or blocked far
-  longer than its kind should take).
-- Evolution: no pending self-evolution run sitting unverified past a restart.
-- Full Mac: it's a persistent on/off grant, not a timed one. If it's on, the
-  saved grant is healthy: it reads back as Full Mac and matches what the
-  Trust page shows.
-- Errors: no unusual error burst in the recent log window.
+`HeartbeatBackgroundWork.gatherHeartbeatAssessment` owns the checks: Doctor's
+snapshot, stuck Workshop executions, recent error bursts, stale tasks and
+durable residue. Clean assessments complete without a model call or a chat
+reply. Anomalies surface stable notice cards; a failure to stage a notice is
+reported as a failed tick. Changing this text does not configure the checks.

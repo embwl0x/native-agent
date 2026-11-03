@@ -203,6 +203,7 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 "toolSchemaCount", "toolSchemaParameterBytes",
                 "toolSchemaMaterialBytes", "toolSchemaFingerprintSHA256",
                 "promptFingerprintSHA256", "systemTotalBytes",
+                "snapshotBoundary", "wireMessageCount",
                 "stableBytes", "dynamicBytes", "userMessageBytes",
                 "userBlockBytes", "preparationMs",
                 "promptTextBytes", "imagePayloadBytes", "segmented",
@@ -210,12 +211,12 @@ public struct TurnTraceEvent: Sendable, Equatable {
                 // memoryRecall object when snapshot previews are summarized.
                 "historyMessageBytes", "historyMessageCount",
                 "volatileBlockBytes", "personaSourceBytes", "memoryRecall",
-                "toolCatalogSystemBytes", "toolCatalogBriefBytes",
+                "toolCatalogSystemBytes", "toolCatalogBriefBytes", "toolCatalogMeasurementError",
             ]
             for key in stableKeys {
                 guard let field = object[key],
                       let bytes = try? field.serializedData(pretty: false),
-                      bytes.count <= (key == "receipt" ? 8_192 : 1_024) else { continue }
+                      bytes.count <= (["receipt", "toolCatalogMeasurementError"].contains(key) ? 8_192 : 1_024) else { continue }
                 summary[key] = field
             }
         }

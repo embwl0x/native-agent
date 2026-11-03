@@ -35,7 +35,8 @@ public enum NativeOAuthFlow {
             let now = ISO8601DateFormatter().string(from: Date())
             let payload: [String: Any] = [
                 "access_token": t,
-                "auth_mode": "setup_token",
+                // The sign-in method is the sheet's (oauth); a setup token is how it was signed in.
+                "auth_mode": "oauth",
                 "saved_at": now,
             ]
             try OAuthGrantOperations.writeJSONObject(payload, to: path)
@@ -161,12 +162,6 @@ public enum NativeOAuthFlow {
                 error: "Token exchange failed: \(OAuthGrantOperations.redact(error.localizedDescription))")
         }
 
-        guard let accessToken = tokens["access_token"] as? String,
-              !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return OAuthFlowResult(ok: false,
-                error: "Token exchange did not return an access token.")
-        }
-
         // Persist tokens to disk in the shape the read-side adapters expect.
         do {
             try signInAttempts.commit(attempt) {
@@ -182,7 +177,7 @@ public enum NativeOAuthFlow {
 
     public static func normalizedOAuthProviderId(_ providerId: String) -> String {
         switch providerId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth":
+        case "xai_oauth_direct":
             return "xai_oauth_direct"
         default:
             return providerId

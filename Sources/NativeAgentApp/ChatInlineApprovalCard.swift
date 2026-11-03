@@ -4,7 +4,7 @@ import SwiftUI
 import ApprovalInbox
 import PersistenceCore
 import NativeAgentShared
-// Blueprint: | `ChatInlineApprovalCard.swift` | mounted approval card, transient interaction state and facade-owned decisions |
+// Blueprint: | `ChatInlineApprovalCard.swift` | mounted approval card; record-owned verb and recipient scope, transient interaction state and facade-owned decisions |
 
 struct InlineApprovalCard: View {
     var message: ChatMessage
@@ -73,18 +73,18 @@ struct InlineApprovalCard: View {
     private var cardModel: InlineCardModel {
         let title = ChatShellApprovalCopy.title(displayContent)
         let why = ChatShellApprovalCopy.why(displayContent)
-        let primary = ChatShellApprovalCopy.approve(for: message.content)
+        let presentation = externalApproval.map(ApprovalCardPresentation.init(record:))
         var model = InlineCardModel(
             id: approvalId.isEmpty ? message.id : approvalId,
             kind: .confirm,
             title: title,
             why: why,
-            primaryLabel: primary,
+            primaryLabel: presentation?.primaryLabel ?? "Go ahead",
             secondaryLabel: ChatShellApprovalCopy.decline,
-            consequence: ChatShellApprovalCopy.consequence(for: message.content),
+            consequence: "Not now → this request won't be approved.",
             state: .pending,
-            scopeLines: ChatShellApprovalCopy.recipient(displayContent).map { [$0] } ?? [],
-            detailsLabel: primary == "Send it" ? ChatShellApprovalCopy.showDraft : "Details",
+            scopeLines: presentation?.scopeLines ?? [],
+            detailsLabel: "Details",
             detailsBody: ChatShellApprovalCopy.details(displayContent)
         )
         let approval = self.approval
@@ -124,53 +124,9 @@ struct InlineApprovalCard: View {
     }
 }
 
-/// The approval card's words.
-///
-/// The mockup's card is an email, and its primary button reads "Send it". A
-/// button that says "Send it" over an approval to DELETE something would be a
-/// lie the person acts on, so the verb is chosen from the request rather than
-/// hard-coded: send-shaped requests get "Send it", everything else gets the
-/// neutral "Go ahead". "Not now" is constant; the fold reads "Show me the
-/// draft" over a send and "Details" over everything else.
+/// Prose is displayed as filed; it never determines the action or recipient.
 enum ChatShellApprovalCopy {
     static let decline = "Not now"
-    static let showDraft = "Show me the draft"
-
-    static func approve(for content: String) -> String {
-        // The verb is read from the request's opening word only. A delete
-        // that mentions an email in passing must never be labelled "Send it".
-        let firstLine = content.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true)
-            .first.map(String.init) ?? ""
-        let firstWord = firstLine.lowercased()
-            .split(whereSeparator: { !$0.isLetter && $0 != "-" }).first.map(String.init) ?? ""
-        let sendVerbs: Set<String> = ["send", "email", "e-mail", "mail", "message", "reply", "post", "text"]
-        let destructive = ["delete", "remove", "erase", "wipe", "drop", "overwrite"]
-        let lowered = content.lowercased()
-        // The primary names the OUTCOME. "Connect" is the one the universal
-        // agent bridge's setup card asks for by name, and it is read from the
-        // opening word like every other verb here, so a request that merely
-        // mentions connecting cannot claim it.
-        if firstWord == "connect" { return "Connect" }
-        if destructive.contains(where: lowered.contains) { return "Go ahead" }
-        return sendVerbs.contains(firstWord) ? "Send it" : "Go ahead"
-    }
-
-    /// What taking the quiet option costs, in the request's own terms. A
-    /// decline that does not state its consequence
-    /// makes the person guess what they just refused. "→" is used here and
-    /// nowhere else in the card grammar.
-    static func consequence(for content: String) -> String {
-        let lowered = content.lowercased()
-        let destructive = ["delete", "remove", "erase", "wipe", "drop", "overwrite"]
-        if destructive.contains(where: lowered.contains) {
-            return "\(decline) → nothing is changed or removed."
-        }
-        let sendVerbs = ["send", "email", "e-mail", "mail", "message", "reply", "post", "text"]
-        if sendVerbs.contains(where: { lowered.hasPrefix($0) }) {
-            return "\(decline) → nothing leaves this Mac; I'll keep the draft."
-        }
-        return "\(decline) → I'll leave it alone and carry on without it."
-    }
 
     /// The card's plain title: the first line of the request, no decoration.
     static func title(_ content: String) -> String {
@@ -199,7 +155,7 @@ enum ChatShellApprovalCopy {
     /// Everything after the title and the why, each sentence once, one piece
     /// per line; nil when nothing is left. What was filed stays intact.
     static func details(_ content: String) -> String? {
-        var seen = Set(sentences(why(content)) + [recipient(content)].compactMap { $0 })
+        var seen = Set(sentences(why(content)))
         let rest = lines(content).flatMap { $0.components(separatedBy: " · ") }.compactMap { piece -> String? in
             let kept = piece.hasPrefix("{") || piece.hasPrefix("[")
                 ? (seen.insert(piece).inserted ? [piece] : [])
@@ -207,20 +163,6 @@ enum ChatShellApprovalCopy {
             return kept.isEmpty ? nil : kept.joined(separator: " ")
         }
         return rest.isEmpty ? nil : rest.joined(separator: "\n")
-    }
-
-    /// Who a send goes to, on the face: a filed "To:" line, else the first
-    /// `to` / `recipient(s)` / `expected_participants` / `chat_id` / `channel` value in the filed
-    /// arguments (read as text, so a clipped preview still yields it).
-    static func recipient(_ content: String) -> String? {
-        if let line = lines(content).first(where: { $0.lowercased().hasPrefix("to: ") }) {
-            return String(line.prefix(160))
-        }
-        let pattern = #""(?:to|recipients?|expected_participants|chat_id|channel)"\s*:\s*(\[[^\]]*\]|"[^"]*"|-?\d+)"#
-        guard let regex = try? Regex(pattern), let match = content.firstMatch(of: regex),
-              let value = match.output[1].substring else { return nil }
-        let who = value.filter { !"[]\"".contains($0) }.trimmingCharacters(in: .whitespaces)
-        return who.isEmpty ? nil : "To: " + who.prefix(160)
     }
 
     private static func lines(_ content: String) -> [String] {

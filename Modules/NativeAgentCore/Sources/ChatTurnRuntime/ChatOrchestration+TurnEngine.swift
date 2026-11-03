@@ -22,7 +22,8 @@ public actor SwiftNativeTurnEngine {
     let memoryPromoter: AdaptiveMemoryPromoter?
     let turnTraceBus: TurnTraceBus
     internal let contextFlow: (any ContextTurnPreparing)?
-    /// Optional runtime data root; nil omits REM-approved persona pins.
+    /// Owning runtime root for pins, memory policy and fed-context persistence.
+    /// Nil omits root-scoped work; it never redirects a write to the live root.
     let remPinsDataRoot: URL?
     /// Bounded, read-only attention source for ContextTurnRequest; nil supplies no signals.
     internal let cognitiveRuntime: (any CognitiveRuntimeProviding)?
@@ -30,7 +31,7 @@ public actor SwiftNativeTurnEngine {
     /// Nil drops memory-keyed activation while terms and intent still flow.
     internal let memoryAtomTranslator: (@Sendable (String) -> ContextAtomID?)?
     /// Upper bound on the attention-signal read. A slow substrate must never
-    /// stall the turn: on expiry we proceed with no signals and flag the trace.
+    /// stall preparation: expiry fails this read with its repair cause.
     internal static let attentionSignalsTimeoutNanos: UInt64 = 250_000_000
     internal static let queryEmbeddingWaitNanos: UInt64 = 500_000_000
 
@@ -63,7 +64,7 @@ public actor SwiftNativeTurnEngine {
         self.cognitiveRuntime = cognitiveRuntime
         self.memoryAtomTranslator = memoryAtomTranslator
     }
-    func readTurnQuietHours() -> TurnQuietHoursWindow? {
-        remPinsDataRoot.flatMap { TurnQuietHoursWindow.read(dataRoot: $0) }
+    func readTurnQuietHours() throws -> TurnQuietHoursWindow? {
+        try remPinsDataRoot.flatMap { try TurnQuietHoursWindow.checkedRead(dataRoot: $0) }
     }
 }

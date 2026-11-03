@@ -296,7 +296,7 @@ public enum MacDocumentRead {
                 previousFrame = frame
                 return false
             }
-            // 1. The frame is byte-identical to the last one: nothing moved.
+            // 1. Identical text adds nothing; it says nothing about scroll position.
             if frame == previousFrame {
                 previousFrame = frame
                 return true
@@ -394,6 +394,7 @@ public enum MacDocumentRead {
     public enum ExtractionFailure: String, Sendable, Equatable, Error {
         case fileTooLarge = "file_too_large"
         case unreadableDocument = "unreadable_document"
+        case unreadableTextEncoding = "unreadable_text_encoding"
         case fileNotFound = "file_not_found"
         case encryptedDocument = "encrypted_document"
         case noTextInDocument = "no_text_in_document"
@@ -414,7 +415,7 @@ public enum MacDocumentRead {
         case .unsupported:
             return .failure(.unsupportedType)
         case .text:
-            guard let decoded = decodeText(data) else { return .failure(.unreadableDocument) }
+            guard let decoded = decodeText(data) else { return .failure(.unreadableTextEncoding) }
             let cut = String(decoded.prefix(maxAccumulatedChars))
             guard !cut.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return .failure(.noTextInDocument)
@@ -429,19 +430,21 @@ public enum MacDocumentRead {
         }
     }
 
-    /// Recognize UTF-16 byte order before rejecting binary NULs. A file that
-    /// decodes to a run of NULs is a binary that happened to have a text
-    /// extension, and saying so beats returning mojibake as a document.
+    /// Document extraction is strict UTF-8, or UTF-16 with a byte-order mark.
+    /// Reject invalid sequences and decoded NULs; never guess another encoding
+    /// or manufacture replacement characters. Validate the entire byte slice.
     static func decodeText(_ data: Data) -> String? {
         let bom = Array(data.prefix(2))
-        if bom == [0xff, 0xfe] || bom == [0xfe, 0xff] {
-            guard let utf16 = String(data: data, encoding: .utf16), !utf16.contains("\0") else { return nil }
-            return utf16
+        let decoded: String?
+        if bom == [0xff, 0xfe] {
+            decoded = String(data: data.dropFirst(2), encoding: .utf16LittleEndian)
+        } else if bom == [0xfe, 0xff] {
+            decoded = String(data: data.dropFirst(2), encoding: .utf16BigEndian)
+        } else {
+            decoded = String(data: data, encoding: .utf8)
         }
-        let head = data.prefix(4096)
-        if head.contains(0) { return nil }
-        if let utf8 = String(data: data, encoding: .utf8) { return utf8 }
-        return String(data: data, encoding: .isoLatin1)
+        guard let decoded, !decoded.contains("\0") else { return nil }
+        return decoded
     }
 
     static func extractPDF(_ data: Data) -> Result<Extracted, ExtractionFailure> {
@@ -502,6 +505,9 @@ public enum MacDocumentRead {
         case .unreadableDocument:
             return "I can open \"\(name)\" but I cannot make text out of it — "
                 + "it is damaged or it is not the kind of file its name claims."
+        case .unreadableTextEncoding:
+            return "The bytes read from \"\(name)\" are not valid UTF-8 or BOM-marked UTF-16 text without NUL characters. "
+                + "No text was returned. The encoding may be unsupported, the bytes damaged, or the read limit may split a character."
         case .encryptedDocument:
             return "\"\(name)\" is password-protected, so I cannot read it. "
                 + "Open it yourself and I will read what is on screen."
@@ -594,6 +600,8 @@ final class MacDocumentScrollRestoration: @unchecked Sendable {
         // Avoid even a no-op write when the downward end probe never moved.
         if isRestored { return true }
         guard MacDriverContext.binding?.allowsAction == true else { return false }
+        guard (try? SystemMacAXElementSource.ensureRenderer(scrollbar, refresh: true)) != nil else { return false }
+        guard MacDriverContext.binding?.allowsAction == true else { return false }
         return AXUIElementSetAttributeValue(scrollbar, kAXValueAttribute as CFString, value) == .success
         #else
         return false
@@ -608,6 +616,28 @@ final class MacDocumentScrollRestoration: @unchecked Sendable {
         return observed == value
         #else
         return false
+        #endif
+    }
+
+    /// Read the same scrollbar that owns restoration. Missing/invalid boundary
+    /// evidence stays unknown; an unchanged position alone never proves the end.
+    var observedPosition: (value: Double, atEnd: Bool?)? {
+        #if canImport(ApplicationServices) && os(macOS)
+        guard let current = MacAXAttributeRead.copyElement(owner, kAXVerticalScrollBarAttribute),
+              CFEqual(current, scrollbar),
+              let observed = MacAXAttributeRead.copyRaw(scrollbar, kAXValueAttribute) as? NSNumber,
+              observed.doubleValue.isFinite else { return nil }
+        let position = observed.doubleValue
+        guard let minimum = MacAXAttributeRead.copyRaw(scrollbar, kAXMinValueAttribute) as? NSNumber,
+              let maximum = MacAXAttributeRead.copyRaw(scrollbar, kAXMaxValueAttribute) as? NSNumber,
+              minimum.doubleValue.isFinite, maximum.doubleValue.isFinite,
+              minimum.doubleValue < maximum.doubleValue,
+              position >= minimum.doubleValue, position <= maximum.doubleValue else {
+            return (position, nil)
+        }
+        return (position, position == maximum.doubleValue)
+        #else
+        return nil
         #endif
     }
 

@@ -3,21 +3,23 @@ import Foundation
 import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ProviderFailure.swift` | Typed provider failure classification and `Diagnostic` wrapper preserving redacted wire evidence and the owner's `ToolFailureError` repair through normalization; `repair` decides once whether a failed call owes repair (sign-in, account, model choice) or is a correction that owes nothing |
+// Blueprint: | `ProviderFailure.swift` | Typed provider failure classification and `Diagnostic` wrapper preserving redacted wire evidence and the owner's `ToolFailureError` repair through normalization; `repair` decides once whether a failed call owes repair (sign-in, account, model choice) or is a correction that owes nothing; preview preserves the returned failure without filing repair |
 
 /// Adapters translate wire evidence once for recovery and surfaces; cancellation is not a failure.
 public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable {
     case authExpired
     case codexCLISessionExpired
     case rateLimited(retryAfter: Int?)
+    case quotaExceeded(retryAfter: Int?)
     case overloaded
     case contextTooLong
     case network
+    case offline
     /// The stream guard cut a request after `seconds` of waiting. `events`
     /// counts wire activity; `account` is the guard's sentence for which cut
-    /// it was and on what evidence (absent from older peers). Admission rides
+    /// it was and on what evidence. Admission rides
     /// on the `Diagnostic`.
-    case noReply(provider: String, seconds: Int, events: Int, account: String? = nil)
+    case noReply(provider: String, seconds: Int, events: Int, account: String)
     case outputLimit
     case refused
     case requestRejected
@@ -31,11 +33,14 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         case .codexCLISessionExpired: return "Your Codex CLI sign-in needs updating. Run codex once, or sign in in NativeAgent."
         case .rateLimited(let seconds?): return "The usage limit was reached; wait \(seconds) seconds before another request."
         case .rateLimited(nil): return "The usage limit was reached; the provider gave no wait time. Check the account's usage allowance."
+        case .quotaExceeded(let seconds?): return "The account's allowance or billing limit was reached; the provider supplied a wait of \(seconds) seconds. Check its usage and billing."
+        case .quotaExceeded(nil): return "The account's allowance or billing limit was reached; no reset time was supplied. Check its usage and billing before another request."
         case .overloaded: return "The model is busy; try again in a moment."
         case .contextTooLong: return "The conversation is too long; start a new chat or shorten your message."
         case .network: return "The connection was interrupted; check your internet connection and try again."
-        case .noReply(let provider, let seconds, let events, let account):
-            return account ?? "No reply from \(provider) in \(seconds) s (\(events) events)."
+        case .offline: return "The network is down. Keep any output already received and check the request's progress before trying again."
+        case .noReply(_, _, _, let account):
+            return account
         case .outputLimit: return "The model reached its output limit. Keep any partial output and request only the missing portion."
         case .refused: return "The model refused this request. Read the refusal and stop if it is disallowed."
         case .requestRejected: return "The provider rejected this request. Correct the reported request error."
@@ -49,7 +54,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     public static func http(status: Int, detail: String = "", retryAfter: Int? = nil) -> Self {
         switch status {
         case 401: return .authExpired
-        case 429: return .rateLimited(retryAfter: retryAfter == nil && quotaExceeded(detail) && !rateLimitWording(detail) ? quotaRetryAfter : retryAfter)
+        case 429: return quotaExceeded(detail) ? .quotaExceeded(retryAfter: retryAfter) : .rateLimited(retryAfter: retryAfter)
         case 413: return .contextTooLong
         case 408: return .network
         case 409, 425, 500...599: return .overloaded
@@ -57,8 +62,8 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         default:
             if contextOverflow(detail) { return .contextTooLong }
             // Quota responses can use 403 as well as 429.
+            if quotaExceeded(detail) { return .quotaExceeded(retryAfter: retryAfter) }
             if rateLimitWording(detail) { return .rateLimited(retryAfter: retryAfter) }
-            if quotaExceeded(detail) { return .rateLimited(retryAfter: retryAfter ?? quotaRetryAfter) }
             if modelUnavailable(detail) { return .modelUnavailable }
             if modelRefusal(detail) { return .refused }
             if status == 403 { return .authExpired }
@@ -88,10 +93,14 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         if ["invalid_api_key", "invalid authentication", "authentication_error", "unauthorized", "token expired", "expired token", "invalid token"].contains(where: text.contains) {
             return .authExpired
         }
+        if quotaExceeded(text) { return .quotaExceeded(retryAfter: nil) }
         if rateLimitWording(text) { return .rateLimited(retryAfter: nil) }
-        if quotaExceeded(text) { return .rateLimited(retryAfter: quotaRetryAfter) }
         if modelUnavailable(text) { return .modelUnavailable }
-        if ["overloaded", "unavailable", "server_error", "try again later"].contains(where: text.contains) {
+        // A provider's own transient server failure: Anthropic's api_error is its
+        // documented 500 ("Internal server error"), as overloaded_error is its 529;
+        // gateways say it in words. Each redials before any of the answer arrives.
+        if ["overloaded", "unavailable", "server_error", "try again later", "api_error",
+            "internal server error", "internal_server_error", "bad gateway", "gateway timeout"].contains(where: text.contains) {
             return .overloaded
         }
         if ["llm: transient", "connection refused", "cannot connect", "network connection was lost", "code=-1001", "timed out", "upstream connect", "disconnect/reset", "transport failure"].contains(where: text.contains) {
@@ -107,9 +116,6 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         return text == "refusal" || text.hasPrefix("refusal ")
             || ["stop_reason=refusal", "content_filter", "content_policy_violation"].contains(where: text.contains)
     }
-
-    // A quota response without Retry-After asks for an hour before retrying.
-    private static let quotaRetryAfter = 3600
 
     private static func quotaExceeded(_ detail: String) -> Bool {
         let text = detail.lowercased()
@@ -344,6 +350,10 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                 case .rateLimited(nil)?:
                     code = "provider_rate_limited"
                     instruction = "Check the account's usage allowance before another request; no wait time was supplied. Inspect its model choice with setting.get \(group)_model."
+                case .quotaExceeded(let seconds)?:
+                    code = "provider_quota_exceeded"
+                    let wait = seconds.map { "The provider supplied a wait of \($0) seconds. " } ?? "No reset time was supplied. "
+                    instruction = wait + "Check this account's allowance and billing before another request; inspect the selected account with setting.get \(group)_account."
                 case .outputLimit?:
                     code = "provider_output_limit"
                     instruction = "Keep any partial output and request only the missing portion; inspect model choices with setting.get \(group)_model."
@@ -356,6 +366,9 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                 case .network?:
                     code = "provider_network_interrupted"
                     instruction = "Check this Mac's internet connection in System Settings → Network; preserve any output already received."
+                case .offline?:
+                    code = "provider_offline"
+                    instruction = "Wait for this Mac's network to return before another request."
                 case .noReply?:
                     code = "provider_no_reply"
                     instruction = "Inspect the deadline evidence and preserve any output already received; inspect the selected model with setting.get \(group)_model."
@@ -369,13 +382,13 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                 return ToolFailureError(
                     "\(code): \(provider) · \(model) response stopped: \(detail). \(instruction)",
                     effects: .unknown,
-                    nextCall: cause == .network ? nil : ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string(group + "_model")])]),
-                    tap: cause == .network ? "System Settings → Network" : nil,
+                    nextCall: cause == .network || cause == .offline ? nil : ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string(group + "_model")])]),
+                    tap: cause == .network || cause == .offline ? "System Settings → Network" : nil,
                     code: code, status: status,
                     instruction: instruction, recovery: .inspect)
             }
         }
-        if let owner = failure.owner, !failure.personDecides {
+        if !LLMCallContext.preview, let owner = failure.owner, !failure.personDecides {
             RepairOwed.owe(dataRoot, id: id, kind: .act, evidence: evidence, operation: "model.call:" + provider + ":" + model,
                 owner: owner, words: failure.message, lever: lever, nextCall: failure.nextCall, tap: failure.tap)
         }
@@ -440,7 +453,7 @@ extension ProviderFailure {
         }
         return Report(
             cause: cause,
-            work: work ?? observed(error) ?? (cause == .network ? .outcomeUnknown : .nothingRan)
+            work: work ?? observed(error) ?? .outcomeUnknown
         )
     }
 }

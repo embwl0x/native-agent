@@ -19,23 +19,34 @@ struct ActivityCapturePermissionsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             AdvancedSection(title: "Activity capture") {
-                masterToggle
+                if controller.isPolicyAvailable {
+                    masterToggle
+                } else {
+                    Text("Saved activity settings are unavailable. Recording and settings changes are paused until the policy can be read; the last checked choices are preserved.")
+                        .foregroundStyle(NativeAgentShell.trouble)
+                }
                 recordedFacts
                 if !controller.issues.isEmpty {
                     issuesRow
                 }
             }
-            AdvancedSection(title: "Window titles") {
-                titleControls
-            }
-            AdvancedSection(title: "My access") {
-                modelAccessControl
-            }
-            AdvancedSection(title: "Excluded apps") {
-                exclusionList
+            if controller.isPolicyAvailable {
+                AdvancedSection(title: "Window titles") {
+                    titleControls
+                }
+                AdvancedSection(title: "My access") {
+                    modelAccessControl
+                }
+                AdvancedSection(title: "Excluded apps") {
+                    exclusionList
+                }
             }
             AdvancedSection(title: "Keep history for") {
-                retentionAndWipe
+                if controller.isPolicyAvailable {
+                    retentionControls
+                }
+                // Deleting recorded activity never depends on readable settings.
+                deleteAllControl
             }
             Text("Changes here apply right away.")
                 .font(ShellType.rowDetail)
@@ -311,8 +322,7 @@ struct ActivityCapturePermissionsView: View {
 
     // MARK: - Retention + wipe
 
-    @ViewBuilder
-    private var retentionAndWipe: some View {
+    private var retentionControls: some View {
         VStack(alignment: .leading, spacing: 8) {
             Picker("Keep history for", selection: Binding(
                 get: { controller.policy.retentionDays },
@@ -331,7 +341,9 @@ struct ActivityCapturePermissionsView: View {
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
 
+    private var deleteAllControl: some View {
         HStack {
             Button("Delete all recorded activity", systemImage: "trash", role: .destructive) {
                 showWipeConfirm = true

@@ -19,7 +19,7 @@ final class ChatTranscriptLineCountCache: @unchecked Sendable {
 
     /// Current line count for `path`, recomputing only when the file on disk is
     /// not the one this cache last measured.
-    func count(at path: URL, recount: (URL) -> Int) -> Int {
+    func count(at path: URL, recount: (URL) throws -> Int) throws -> Int {
         let key = path.path
         let before = SnapshotTailOpLog.fileStamp(path)
         if let before, before != .absent {
@@ -30,7 +30,7 @@ final class ChatTranscriptLineCountCache: @unchecked Sendable {
                 return cached.count
             }
         }
-        let counted = recount(path)
+        let counted = try recount(path)
         lock.lock()
         // Only cache when the file did not move under the read. If it did, the
         // pairing of (count, stamp) would be a lie — drop it and let the next

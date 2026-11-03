@@ -8,7 +8,7 @@ import TrustCenter
 import ApprovalInbox
 import MemoryV2
 import Research
-// Blueprint: | `CapabilitiesView.swift` | `CapabilitiesView`: capability inventory, catalogs and saved workflows |
+// Blueprint: | `CapabilitiesView.swift` | `CapabilitiesView`: current capability inventory, saved catalog source editor and workflows; no retired pack availability list |
 
 /// Counts and availability come from the same engine owners on every route.
 enum CapabilitiesRefreshPresentation {
@@ -273,7 +273,6 @@ struct CapabilitiesView: View {
                         .controlSize(.small)
                     }
                     Spacer()
-                    AdvancedMeta("\(appModel.engine.trust.capabilityPackInstalls.count) installed")
                 }
 
                 HStack(spacing: 8) {
@@ -304,7 +303,7 @@ struct CapabilitiesView: View {
                 if !appModel.engine.trust.capabilityCatalogSources.isEmpty || appModel.engine.trust.capabilityNetwork != nil {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 16)], spacing: 16) {
                         AdvancedStat(title: "Sources", value: "\(appModel.engine.trust.capabilityCatalogSources.count)", detail: appModel.engine.trust.capabilityCatalogSources.first?.status ?? "not checked")
-                        AdvancedStat(title: "Trusted", value: "\(appModel.engine.trust.capabilityNetwork?.summary?.trusted ?? 0)", detail: "\(appModel.engine.trust.capabilityNetwork?.summary?.review ?? 0) to review")
+                        AdvancedStat(title: "Trusted", value: appModel.engine.trust.capabilityNetwork?.summary.map { String($0.trusted) } ?? "Unavailable", detail: appModel.engine.trust.capabilityNetwork?.summary.map { "\($0.review) to review" } ?? "Review count unavailable")
                     }
                 }
 
@@ -312,34 +311,6 @@ struct CapabilitiesView: View {
                     CapabilityDetailRow(title: trust.name ?? trust.id, detail: trust.reasons.prefix(2).joined(separator: " "), status: trust.trustTier)
                 }
 
-                if appModel.engine.trust.capabilityCatalog.isEmpty {
-                    AdvancedEmptyState(
-                        title: "No items yet",
-                        detail: "Adding a source, or installing a signed pack, fills this list."
-                    )
-                } else {
-                    ForEach(appModel.engine.trust.capabilityCatalog) { item in
-                        CatalogRow(item: item)
-                    }
-                }
-
-                if !appModel.engine.trust.capabilityPackInstalls.isEmpty {
-                    ForEach(appModel.engine.trust.capabilityPackInstalls.prefix(4)) { install in
-                            HStack(alignment: .top, spacing: 8) {
-                                CapabilityDetailRow(
-                                    title: install.name ?? install.packId,
-                                    detail: "\(install.version ?? "unknown") · \(install.signature?.prefix(12) ?? "unsigned")",
-                                    status: install.status
-                                )
-                                Spacer()
-                                Button("Roll back") {
-                                    Task { await appModel.rollbackCapabilityPack(install) }
-                                }
-                                .controlSize(.small)
-                                .disabled(install.status == "rolled_back")
-                            }
-                    }
-                }
             }
         }
     }
@@ -372,9 +343,11 @@ struct CapabilityRow: View {
                     .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
                 Spacer()
-                // Working is the norm; only an exception gets a word.
+                // An absent status cannot certify the normal working state.
                 if let status = capability.status, !["active", "ok", "ready"].contains(status.lowercased()) {
                     AdvancedStatusWord(status: status, text: status)
+                } else if capability.status == nil {
+                    AdvancedStatusWord(status: "unknown", text: "Status unavailable")
                 }
             }
             HStack(spacing: 8) {
@@ -441,7 +414,7 @@ struct WorkflowRow: View {
                     .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
                 Spacer()
-                AdvancedStatusWord(status: workflow.status ?? "ok", text: workflow.status ?? "active")
+                AdvancedStatusWord(status: workflow.status ?? "unknown", text: workflow.status ?? "Status unavailable")
             }
             if let description = workflow.description, !description.isEmpty {
                 Text(description)
@@ -454,44 +427,6 @@ struct WorkflowRow: View {
                 if let trigger = workflow.trigger, !trigger.isEmpty {
                     AdvancedMeta(AdvancedStatusWords.label(trigger))
                 }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .textSelection(.enabled)
-    }
-}
-
-struct CatalogRow: View {
-    var item: CapabilityCatalogItem
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 8) {
-                Text(item.name)
-                    .font(ShellType.bodySemibold)
-                    .foregroundStyle(NativeAgentShell.text)
-                    .lineLimit(1)
-                Spacer()
-                AdvancedStatusWord(
-                    status: item.installed == true ? "ok" : nil,
-                    text: item.status ?? "available"
-                )
-            }
-            if let description = item.description, !description.isEmpty {
-                Text(description)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .lineLimit(2)
-            }
-            HStack(spacing: 8) {
-                if let kind = item.kind {
-                    AdvancedMeta(AdvancedStatusWords.label(kind))
-                }
-                if let risk = item.riskClass {
-                    AdvancedMeta(AdvancedStatusWords.label(risk))
-                }
-                Spacer()
-                AdvancedMeta(item.installed == true ? "Installed by a verified pack" : "Listed, not installed")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

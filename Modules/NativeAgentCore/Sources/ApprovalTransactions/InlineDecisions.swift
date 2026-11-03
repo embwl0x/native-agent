@@ -593,7 +593,7 @@ public enum InlineCards {
             let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
             return (counted(trimmed.isEmpty ? "It didn't go through." : trimmed), nil)
         case .unknown:
-            return (counted(interaction.title), "Outcome unknown.")
+            return (counted(interaction.title), interaction.kind == .unknown ? interaction.why : "Outcome unknown.")
         case .pending, .running:
             return (nil, nil)
         }

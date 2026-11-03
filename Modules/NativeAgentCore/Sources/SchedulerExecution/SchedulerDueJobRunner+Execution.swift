@@ -8,7 +8,7 @@ import PersistenceCore
 import TelegramBot
 import TriggerScheduler
 import DeviceSync
-// Blueprint: | `SchedulerDueJobRunner+Execution.swift` | `SchedulerDueJobRunner`: `execute` (a `part` job fires its part's `schedule:` signal), `watch` (a `connector_action` read posts the rows new since its last read as one news per job), `channelIsSwitchedOn`, `disabledDreamResult` |
+// Blueprint: | `SchedulerDueJobRunner+Execution.swift` | `SchedulerDueJobRunner`: body-rhythm-only `execute` (a `part` job fires its part's `schedule:` signal), `watch` (a `connector_action` read posts the rows new since its last read as one news per job), `disabledDreamResult`; scheduled intention runners are retired |
 
 extension SchedulerDueJobRunner {
     func execute(job: DueJob) async throws -> JobResult {
@@ -21,12 +21,10 @@ extension SchedulerDueJobRunner {
         guard isLiveDataRoot else {
             throw NSError(domain: "NativeAgentScheduler", code: -403, userInfo: [
                 NSLocalizedDescriptionKey:
-                    "schedule_root_not_live: Scheduled effects are refused for \(root.path). Use schedule.create in NativeAgent's running app to schedule this Desk task in its active data folder."
+                    "schedule_root_not_live: Scheduled effects are refused for \(root.path). In NativeAgent's running app, use queue.add for intentions or schedule.create for body rhythms in its active data folder."
             ])
         }
         switch kind {
-        case .notify:
-            return try await executeNotify(job: job)
         case .connectorAction:
             return try await executeConnectorAction(job: job)
         case .dream:
@@ -66,211 +64,11 @@ extension SchedulerDueJobRunner {
             AbilityStore(dataRoot: root).signal(signal, part: part)
             return JobResult(status: "completed", detail: "\(signal) posted for \(part); its run is recorded on the ability: app ability.read {id:\"\(part)\"}",
                              output: .object(["part": .string(part), "delivery": .string("posted")]))
-        case .turn:
-            return try await executeTurn(job: job)
-        case .workshop:
-            let title = string(job.payload["title"]) ?? job.name
-            let objective = string(job.payload["objective"]) ?? ""
-            guard !objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw NSError(domain: "NativeAgentScheduler", code: -400, userInfo: [
-                    NSLocalizedDescriptionKey: "schedule_objective_missing: Scheduled Desk task has no objective. Set payload.objective through schedule.update."
-                ])
-            }
-            let execution = try await platform.createWorkshopTask(
-                title: title,
-                objective: objective,
-                projectSpaceId: string(job.payload["projectSpaceId"])
-            )
-            return JobResult(
-                status: "completed",
-                detail: "Desk execution \(execution.id) queued",
-                output: .object([
-                    "executionId": .string(execution.id),
-                    "status": .string(execution.status),
-                    "expectedEvidence": job.payload["expectedEvidence"] ?? .string("canonical Desk completion receipt"),
-                ])
-            )
-        }
-    }
-
-    /// A scheduled turn: the job's prompt runs as one turn of hers; the reply is
-    /// the job's record and an inbox card under the job's name.
-    private func executeTurn(job: DueJob) async throws -> JobResult {
-        let prompt = (string(job.payload["prompt"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else {
-            throw NSError(domain: "NativeAgentScheduler", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "schedule_prompt_missing: Scheduled turn has no prompt. Set payload.prompt through schedule.update."
-            ])
-        }
-        let title = string(job.payload["title"]) ?? job.name
-        let turn = try await platform.runScheduledTurn(name: title, prompt: prompt)
-        let reply = String(turn.output.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4000))
-        try await appendNotificationInbox(
-            title: title,
-            message: reply.isEmpty ? "The turn ended without a reply." : reply,
-            source: "scheduled_turn",
-            severity: "info",
-            jobId: job.id,
-            itemId: Self.notificationItemId(job: job, channel: "inbox")
-        )
-        return JobResult(
-            status: "completed",
-            detail: "turn ran on \(turn.model)",
-            output: .object(["model": .string(turn.model), "reply": .string(reply)])
-        )
-    }
-
-    private func executeNotify(job: DueJob) async throws -> JobResult {
-        let overdue = Date().timeIntervalSince1970 - job.dueEpoch
-        if overdue > 2 * 60 * 60 {
-            return JobResult(
-                status: "skipped",
-                detail: "missed notification delivery window by \(overdue / 60) minute(s)",
-                output: .object(["overdueSeconds": .double(overdue)])
-            )
-        }
-
-        let title = NativeAgentNotificationDefaults.title(string(job.payload["title"]), dataRoot: root)
-        let message = string(job.payload["message"]) ?? string(job.payload["body"]) ?? ""
-        guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw NSError(domain: "NativeAgentScheduler", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "schedule_message_missing: Scheduled Desk task has no notification text. Set payload.message through schedule.update."
-            ])
-        }
-
-        let channels = try SchedulerJobNormalizer.deliveryChannels(job.payload)
-        var delivered: [String] = []
-        var errors: [String] = []
-        var skipped: [String] = []
-        for channel in channels {
-            defer {
-                notificationOutcomes[job.occurrenceKey] = .object([
-                    "delivered": .array(delivered.map(JSONValue.string)),
-                    "errors": .array(errors.map(JSONValue.string)),
-                    "switchedOff": .array(skipped.map(JSONValue.string)),
-                ])
-            }
-            try Task.checkCancellation()
-            guard Date().timeIntervalSince1970 - job.dueEpoch <= 2 * 60 * 60 else {
-                skipped.append(channel + ": notification delivery window expired")
-                continue
-            }
-            let channelText = deliveryText(channel: channel, payload: job.payload, fallbackTitle: title, fallbackMessage: message)
-            // A channel the person switched off is not delivered and not an
-            // error: the job ran, this way out is closed. It is reported
-            // separately from `delivered` so the run record never claims a
-            // notification reached someone it did not.
-            guard Self.channelIsSwitchedOn(channel) else {
-                skipped.append(channel)
-                continue
-            }
-            do {
-                switch channel {
-                case "mac":
-                    let result = await platform.postNotification(
-                        title: channelText.title,
-                        body: channelText.message
-                    )
-                    if result.posted {
-                        delivered.append(channel)
-                    } else {
-                        errors.append("\(channel): \(result.error ?? result.delivery)")
-                    }
-                case "push":
-                    // Explicit push delivery stays pinned to the phone.
-                    let outcome = try await platform.attentionRouter.route(
-                        eventId: "scheduler:\(job.id):\(job.occurrenceKey)",
-                        importance: .ownerWaiting,
-                        title: channelText.title,
-                        body: channelText.message,
-                        userInfo: [
-                            "screen": "inbox",
-                            "source": "scheduler",
-                            "jobId": job.id,
-                            "occurrenceKey": job.occurrenceKey,
-                        ],
-                        pinnedTo: .phone
-                    )
-                    if outcome.deliveryProjection.reachedAChannel {
-                        delivered.append(channel)
-                    } else if outcome.deliveryProjection == .noChannel {
-                        errors.append("\(channel): no notification channel is available; check phone notification setup")
-                    } else {
-                        errors.append("\(channel): notification was not delivered")
-                    }
-                case "telegram":
-                    try await platform.sendTelegramMessage(message: channelText.message)
-                    delivered.append(channel)
-                case "inbox", "chat":
-                    try await appendNotificationInbox(
-                        title: channelText.title,
-                        message: channelText.message,
-                        source: string(job.payload["source"]) ?? "scheduled_job",
-                        severity: channel == "chat" ? "important" : "info",
-                        jobId: job.id,
-                        itemId: Self.notificationItemId(job: job, channel: channel)
-                    )
-                    delivered.append(channel)
-                case "activity":
-                    try await appendActivity(
-                        jobId: job.id,
-                        title: channelText.title,
-                        detail: channelText.message,
-                        status: "ok",
-                        payload: .object([
-                            "jobId": .string(job.id),
-                            "jobName": .string(job.name),
-                            "deliveryChannel": .string("activity"),
-                            "occurrenceKey": .string(job.occurrenceKey),
-                        ])
-                    )
-                    delivered.append(channel)
-                default:
-                    errors.append("\(channel): unsupported delivery channel")
-                }
-            } catch is CancellationError {
-                errors.append("\(channel): delivery unconfirmed after cancellation")
-                throw CancellationError()
-            } catch {
-                errors.append("\(channel): \(error.localizedDescription)")
-                try Task.checkCancellation()
-            }
-        }
-
-        let status = delivered.isEmpty ? (errors.isEmpty ? "skipped" : "error") : (errors.isEmpty ? "completed" : "warn")
-        var detail = !errors.isEmpty
-            ? "notification_delivery_failed: confirmed delivered: \(delivered.isEmpty ? "none" : delivered.joined(separator: ",")); failed or unconfirmed: \(errors.joined(separator: "; ")). Inspect these channel receipts before resuming this scheduled Desk task."
-            : delivered.isEmpty ? "notification_channels_off: No notification was delivered. Enable a chosen channel in Notifications settings for future scheduled Desk task notices."
-            : "delivered via \(delivered.joined(separator: ","))"
-        if !skipped.isEmpty {
-            detail += "; switched off: \(skipped.joined(separator: ","))"
-        }
-        return JobResult(
-            status: status,
-            detail: detail,
-            output: .object([
-                "delivered": .array(delivered.map { .string($0) }),
-                "errors": .array(errors.map { .string($0) }),
-                "switchedOff": .array(skipped.map { .string($0) }),
-            ])
-        )
-    }
-
-    /// The person's delivery switches, for the channels a scheduled job can
-    /// name. Records — the inbox card, the activity row — are NOT switchable:
-    /// they are how the app remembers a thing happened, not a way it reaches
-    /// out. Only the channels that actually interrupt someone are.
-    static func channelIsSwitchedOn(_ channel: String) -> Bool {
-        switch channel {
-        case "mac": return NotificationChannelPreference.inApp()
-        case "push": return NotificationChannelPreference.push()
-        case "telegram": return NotificationChannelPreference.telegram()
-        default: return true
         }
     }
 
     private func executeConnectorAction(job: DueJob) async throws -> JobResult {
-        let actionId = string(job.payload["actionId"]) ?? string(job.payload["action_id"]) ?? ""
+        let actionId = string(job.payload["actionId"]) ?? ""
         guard !actionId.isEmpty else {
             throw NSError(domain: "NativeAgentScheduler", code: -400, userInfo: [
                 NSLocalizedDescriptionKey: "schedule_action_missing: Scheduled read has no action to read. Set payload.actionId through schedule.update."
@@ -345,9 +143,9 @@ extension SchedulerDueJobRunner {
         }
         let rows = try project(payload)
         func identifier(_ key: String) -> Bool { key == "id" || key.hasSuffix("Id") || key.hasSuffix("_id") || key.hasSuffix("ID") }
-        let keys = rows.map { row in
+        let keys = try rows.map { row in
             let ids = row.filter { identifier($0.key) }
-            return JSONValue.object(ids.isEmpty ? row : ids).digest
+            return try JSONValue.object(ids.isEmpty ? row : ids).digest
         }
         guard let last = job.row.objectValue?["lastSeen"]?.arrayValue else { return (keys, 0) }
         var seen = Set(last.compactMap(\.stringValue))
@@ -375,21 +173,12 @@ extension SchedulerDueJobRunner {
             summary: "\(fresh.count) new since the last read:\n" + context + lines.map { "• " + $0 }.joined(separator: "\n") + more,
             at: Date(), observationID: job.id, changeID: fresh.map { keys[$0] }.joined(separator: ",")))
         guard accepted else {
+            try Task.checkCancellation()
             throw NSError(domain: "NativeAgentScheduler", code: -411, userInfo: [
                 NSLocalizedDescriptionKey: "watch_news_not_saved: unread news was not durably accepted; the previous observation baseline is retained."
             ])
         }
         return (keys, fresh.count)
-    }
-
-    private static func notificationItemId(job: DueJob, channel: String) -> String {
-        let raw = "\(job.occurrenceKey).\(channel)"
-        let safe = raw.map { character -> Character in
-            character.isLetter || character.isNumber || character == "-" || character == "_"
-                ? character
-                : "-"
-        }
-        return "scheduled-\(String(safe).prefix(180))"
     }
 
     private func executeDream(job: DueJob) async throws -> JobResult {
@@ -407,7 +196,7 @@ extension SchedulerDueJobRunner {
         let entries = Self.anyInt(response["entriesWritten"])
         let sessions = Self.anyInt(response["sessionsProcessed"])
         let disabled = Self.anyBool(response["disabled"])
-        let errors = Self.anyStringArray(response["errors"])
+        var errors = Self.anyStringArray(response["errors"])
         let failedWithoutEntry = entries <= 0 && !errors.isEmpty
         let output = Self.jsonValue(from: response)
 
@@ -438,7 +227,14 @@ extension SchedulerDueJobRunner {
         }
 
         let dateKey = NativeAgentDreamCycleSchedule.dreamEntryDateKey(Date())
-        let entriesForToday = Self.dreamEntriesForToday(dataRoot: root, dateKey: dateKey)
+        let entriesForToday: [DreamDiarySnippet]
+        do { entriesForToday = try Self.dreamEntriesForToday(dataRoot: root, dateKey: dateKey) }
+        catch {
+            // The cycle already ran. Keep its result and name the separate
+            // presentation failure; never rerun a dream to reconstruct a card.
+            entriesForToday = []
+            errors.append("The dream result is retained, but its diary presentation is unavailable: \(error.localizedDescription)")
+        }
         let paths = entriesForToday.map { $0.path }
         let agentName = NativeAgentNotificationDefaults.agentDisplayName(dataRoot: root)
         let title = failedWithoutEntry ? "\(agentName) dream needs repair" : "\(agentName) dreamed"
@@ -500,21 +296,29 @@ extension SchedulerDueJobRunner {
     private func executeREM(job: DueJob) async throws -> JobResult {
         // Scheduled REM honors the weekly claim to avoid duplicate proposals.
         let response = try await platform.runRem(force: false)
-        let proposals = Self.anyInt(response["proposalsGenerated"])
-        let archived = Self.anyInt(response["archivedEntries"])
-        let tombstones = Self.anyInt(response["tombstoneSkips"])
-        let evicted = Self.anyBool(response["growthMDEvicted"])
         let output = Self.jsonValue(from: response)
-
-        // Reservation loss is not a completed pass.
-        if (response["skipReason"] as? String) == "already_running" {
-            let retryObj = Self.object(output)
+        guard let rawOutcome = response["outcome"] as? String,
+              let outcome = REMRunReportPayload.Outcome(rawValue: rawOutcome) else {
+            throw PersistenceCoreError.ioFailure("REM returned no typed outcome; completion is unavailable.")
+        }
+        if outcome == .skipped {
+            guard let reason = response["skipReason"] as? String, !reason.isEmpty else {
+                throw PersistenceCoreError.ioFailure("REM skipped without its reason; completion is unavailable.")
+            }
             return JobResult(
                 status: "skipped",
-                detail: "another REM pass holds the reservation; its work is still running",
-                output: .object(retryObj)
+                detail: "REM pass skipped: \(reason)",
+                output: output
             )
         }
+        guard outcome == .completed else {
+            throw PersistenceCoreError.ioFailure("REM did not complete: \(rawOutcome)")
+        }
+        let completion = try REMRunReportPayload.validatedManualCompletion(response: response).get()
+        let proposals = completion.proposals
+        let archived = completion.archivedEntries
+        let tombstones = Self.anyInt(response["tombstoneSkips"])
+        let evicted = Self.anyBool(response["growthMDEvicted"])
 
         if proposals <= 0 {
             var outputObj = Self.object(output)

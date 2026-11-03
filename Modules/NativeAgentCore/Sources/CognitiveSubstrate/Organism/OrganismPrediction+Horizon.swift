@@ -5,12 +5,10 @@ import PersistenceCore
 
 // Horizons use bounded real-store pointers and semantic-expectation rows; projected anticipation never changes stored chemistry.
 
-/// Where a horizon expectation came from. Five real sources, closed set.
+/// Where a horizon expectation came from. Four real sources, closed set.
 public enum OrganismHorizonSourceKind: String, Codable, Sendable, Equatable, CaseIterable {
     /// A named Desk deferral or an unnamed dated memory atom — a stated plan.
     case statedPlan
-    /// Persisted scheduled horizons settle; the composer creates no new ones.
-    case scheduledJob
     /// An approval she staged and User has not walked through yet.
     case stagedApproval
     /// Her own completed turn with no reaction yet (`pendingCompletion`) — the
@@ -62,21 +60,9 @@ public struct OrganismTowardRead: Sendable, Equatable {
 /// payload-free wire the runtime mints across, and the reads.
 public enum OrganismHorizonRegister {
     /// Metadata key on the mint signal. Its value is an ARRAY of encoded source
-    /// tokens (see `encodeSource`) describing the COMPLETE current source set —
-    /// not a delta. That completeness is what lets a row whose source has
-    /// disappeared settle as "it landed" instead of hanging until its horizon.
+    /// tokens (see `encodeSource`) describing the current source inventory.
+    /// Inventory absence never proves an outcome.
     public static let metadataKey = "horizonExpectations"
-    /// Companion key on the same signal: an ARRAY of
-    /// `OrganismHorizonSourceKind` raw values the composer read to COMPLETION.
-    ///
-    /// It exists because absence is load-bearing here. A missing source means
-    /// "it landed" and opens the relief door — but a reader that threw also
-    /// produces no tokens, and a Desk file that briefly could not be read must
-    /// never tell her that everything she was waiting for came true. Only kinds
-    /// named here may have their absences read as answers; a kind that is
-    /// missing from this list has its rows left exactly as they are, to expire
-    /// on their own horizons if nothing ever comes back.
-    public static let completeKindsKey = "horizonComplete"
     /// The organ a mint signal comes from; also the row `sourceOrgan` prefix.
     public static let sourceOrgan = "horizon"
     /// HARD CAP on open horizon rows. Eight is a forward register; more is a
@@ -147,15 +133,6 @@ public enum OrganismHorizonRegister {
             word += String(format: " %02d:%02d", time.hour ?? 0, time.minute ?? 0)
         }
         return String(word.prefix(statedPlanLabelCharacterCap))
-    }
-
-    /// Recognize only the canonical time-word shapes this formatter produces.
-    /// Used to recover unnamed atoms from registers that stored display words.
-    static func isStatedPlanTimeLabel(_ label: String) -> Bool {
-        label.range(
-            of: #"^(today|tomorrow|sunday|monday|tuesday|wednesday|thursday|friday|saturday|[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01]))(-([01][0-9]|2[0-3])-[0-5][0-9])?$"#,
-            options: .regularExpression
-        ) != nil
     }
 
     /// Named plans keep their source's words; unnamed plans derive time words
@@ -287,8 +264,7 @@ extension OrganismPredictiveBody {
         at now: Date
     ) -> (ledger: OrganismPredictionLedger, chemicalState: ChemicalState) {
         var nextLedger = ledger
-        var nextChemistry = chemicalState
-        applyHorizonSources(signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
+        applyHorizonSources(signal: signal, ledger: &nextLedger)
         for id in nextLedger.predictions.keys.sorted() {
             guard var row = nextLedger.predictions[id],
                   row.horizon != nil,
@@ -300,36 +276,16 @@ extension OrganismPredictiveBody {
             nextLedger.expiredCount = min(nextLedger.expiredCount, Int.max - 1) + 1
         }
         nextLedger.lastUpdatedAt = max(nextLedger.lastUpdatedAt ?? .distantPast, now)
-        return (nextLedger, nextChemistry)
+        return (nextLedger, chemicalState)
     }
 
-    /// One refresh of the forward register from the COMPLETE current source
-    /// set. Three things happen, in this order:
-    ///
-    ///   1. **Prune.** Horizon rows that already went terminal are removed. The
-    ///      runtime has just read them out of the pre-signal ledger to announce
-    ///      relief / disappointment / waiting; leaving them would announce the
-    ///      same moment on every later refresh.
-    ///   2. **Settle the absent.** A row whose source is GONE while its horizon
-    ///      is still ahead is a thing that landed early — the approval was
-    ///      given, the peer wrote back, he answered. That is the relief door.
-    ///      A row whose horizon has already passed is left alone: the sweep
-    ///      below owns it, and it becomes `waiting`.
-    ///   3. **Refresh or mint the present.** An existing row keeps its identity
-    ///      and takes the current label, valence and due time. Named plans keep
-    ///      their identity when deferred to another day. A new source opens a row.
-    ///
-    /// Bounded: ≤`maximumOpen` open rows (overflow drops the FARTHEST — the
-    /// nearest horizon is the one she is actually facing), ≤`maximumHorizon`
-    /// out, and a due time already in the past never mints.
-    ///
-    /// Absent metadata ⇒ nothing happens at all. An EMPTY array is meaningful
-    /// and different: it says "there are no sources right now", and settles or
-    /// expires everything she was holding.
+    /// Prune announced terminals, then refresh or mint present sources.
+    /// Missing sources retain uncertainty until their real due instant. Neither
+    /// a complete inventory nor an empty one establishes an outcome.
+    /// At most eight open rows remain; overflow evicts the farthest without a verdict.
     private static func applyHorizonSources(
         signal: SomaticSignal,
-        ledger: inout OrganismPredictionLedger,
-        chemicalState: inout ChemicalState
+        ledger: inout OrganismPredictionLedger
     ) {
         guard case .array(let rawSources)? = signal.metadata[OrganismHorizonRegister.metadataKey] else {
             return
@@ -341,29 +297,13 @@ extension OrganismPredictiveBody {
             ledger.predictions.removeValue(forKey: row.id)
         }
 
-        // Which source kinds the composer could read COMPLETELY. A reader that
-        // threw contributes zero tokens, which is indistinguishable at this
-        // layer from "that source went away" — and "went away" is the relief
-        // door. So absence is only ever read as an answer for a kind the
-        // composer explicitly vouched for. An unreadable Desk does not tell her
-        // her plans came true.
-        var completeKinds: Set<OrganismHorizonSourceKind> = []
-        if case .array(let rawComplete)? = signal.metadata[OrganismHorizonRegister.completeKindsKey] {
-            for raw in rawComplete {
-                guard case .string(let value) = raw,
-                      let kind = OrganismHorizonSourceKind(rawValue: value) else { continue }
-                completeKinds.insert(kind)
-            }
-        }
-
         // Decode. Two buckets, because "already overdue" is a real state and it
         // is NOT a new expectation:
         //   · MINTABLE — a horizon still ahead and inside the week. These open
         //     and refresh rows.
         //   · OVERDUE — a source that is still there but whose moment has
         //     passed. It refreshes a row she already holds (so the sweep can
-        //     turn it into `waiting`) and it counts as PRESENT, so its absence
-        //     is never mistaken for an answer. It never opens a new row: a
+        //     turn it into `waiting`). It never opens a new row: a
         //     source first seen already-late is a stale read, not a thing she
         //     was ever looking toward, and minting one would manufacture an
         //     anticipation she never had and then immediately break it.
@@ -398,30 +338,7 @@ extension OrganismPredictiveBody {
         // The cap belongs to the things she can still look toward. An overdue
         // entry costs no slot — it is presence, not expectation.
         mintable = Array(mintable.prefix(OrganismHorizonRegister.maximumOpen))
-        let present = Set(mintable.map(\.id)).union(overdue.map(\.id))
-
-        // 2. Settle rows whose source is gone but whose horizon has not passed.
-        //
-        // Three ways a row can be absent from the offered set, and only ONE of
-        // them is an answer:
-        //   · the composer could not read that source  → leave it entirely;
-        //   · it was crowded out of a full set          → evict, no feeling;
-        //   · the source is genuinely gone              → it landed. Relief.
-        let farthestOffered = mintable.last?.dueAt
-        let setIsFull = mintable.count >= OrganismHorizonRegister.maximumOpen
-        for row in OrganismHorizonRegister.open(in: ledger) where !present.contains(row.id) {
-            guard row.dueAt > now else { continue }
-            guard let kind = row.horizon?.sourceKind, completeKinds.contains(kind) else { continue }
-            if setIsFull, let farthestOffered, row.dueAt > farthestOffered {
-                ledger.predictions.removeValue(forKey: row.id)
-                continue
-            }
-            settleHorizonExpectation(
-                row, at: now, ledger: &ledger, chemicalState: &chemicalState
-            )
-        }
-
-        // 3a. An overdue source only ever updates a row she already holds.
+        // An overdue source only ever updates a row she already holds.
         for source in overdue {
             guard var existing = ledger.predictions[source.id],
                   existing.status == .pending,
@@ -432,7 +349,7 @@ extension OrganismPredictiveBody {
             ledger.predictions[source.id] = existing
         }
 
-        // 3b. Refresh or mint.
+        // Refresh or mint.
         for source in mintable {
             if var existing = ledger.predictions[source.id], existing.status == .pending {
                 guard now >= existing.lastUpdatedAt else { continue }
@@ -483,40 +400,5 @@ extension OrganismPredictiveBody {
 
     private static func horizonUncertainty(for horizon: OrganismHorizonExpectation) -> Double {
         OrganismBodyConfidence.clamp(0.5 - 0.25 * abs(horizon.valence))
-    }
-
-    /// A horizon that landed before its due time. The chemistry release is the
-    /// SHARED satisfied effect (the relief door), but NO per-kind outcome is
-    /// recorded: `.semanticExpectation`'s cumulative counts are the evidence
-    /// behind "how do my claims land", and a peer writing back is not evidence
-    /// about that. The felt half is composed by the runtime's horizon lane, not
-    /// by `OrganismResolutionFelt` — see that file's exclusion.
-    private static func settleHorizonExpectation(
-        _ prediction: OrganismPrediction,
-        at date: Date,
-        ledger: inout OrganismPredictionLedger,
-        chemicalState: inout ChemicalState
-    ) {
-        var row = prediction
-        // Size the exhale to the held breath, exactly as `satisfy` does — the
-        // dread this row applied to the projection is the dread it releases.
-        let bracing = min(
-            1,
-            OrganismProspectiveAffect.horizonContribution(row, at: date).dread
-        )
-        row.status = .satisfied
-        row.confidence = OrganismBodyConfidence.clamp(row.confidence + 0.10)
-        row.uncertainty = OrganismBodyConfidence.clamp(row.uncertainty - 0.10)
-        row.evidenceCount = min(row.evidenceCount, Int.max - 1) + 1
-        row.lastUpdatedAt = date
-        ledger.predictions[row.id] = row
-        ledger.satisfiedCount = min(ledger.satisfiedCount, Int.max - 1) + 1
-        applySatisfiedEffect(
-            kind: .semanticExpectation,
-            intensity: 0.4,
-            bracing: bracing,
-            ledger: &ledger,
-            chemicalState: &chemicalState
-        )
     }
 }

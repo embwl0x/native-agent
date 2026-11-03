@@ -90,9 +90,6 @@ internal struct AuthoredToolsSection: View {
                 if tool.autoCreated == true {
                     Text("Written by me")
                 }
-                if tool.autoRun == true {
-                    Text("Legacy auto-run flag (unused)")
-                }
                 Text(tool.validationStatus ?? "untested")
                 Text("Used \(tool.useCount ?? 0) times")
             }

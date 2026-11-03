@@ -148,7 +148,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 let type = Self.studioClean(row["type"] ?? "").lowercased()
                 guard !from.isEmpty, !to.isEmpty, !type.isEmpty else { continue }
                 let key = StudioEdgeKey(from: from, to: to, type: type)
-                result[key, default: []].formUnion(Self.studioParseEntryIDs(row["entry_ids"]))
+                result[key, default: []].formUnion(try Self.studioParseEntryIDs(row["entry_ids"]))
             }
             return result
         }
@@ -296,15 +296,16 @@ extension SwiftNativeKnowledgeGraphIndexer {
         )
     }
 
-    static func studioParseEntryIDs(_ raw: String?) -> Set<String> {
-        guard let raw, !raw.isEmpty, let data = raw.data(using: .utf8),
-              let parsed = try? JSONValue.parse(data),
-              case .array(let items) = parsed else { return [] }
+    static func studioParseEntryIDs(_ raw: String?) throws -> Set<String> {
+        guard let raw else { return [] }
+        let items = try JSONDecoder().decode([String].self, from: Data(raw.utf8))
         var result = Set<String>()
         for item in items {
-            guard case .string(let value) = item else { continue }
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { result.insert(trimmed) }
+            let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                throw MemoryStorageError.databaseUnavailable("Knowledge graph studio_entry_ids contains an empty citation; repair the relation's provenance.")
+            }
+            result.insert(trimmed)
         }
         return result
     }

@@ -1,6 +1,6 @@
 import Foundation
 import Darwin
-// Blueprint: | `ConnectorInputValue.swift` | Connector input scalars and secret-free TransportAllowlist: canonical Slack auth.json policy only, strict alias unions within that object and Telegram integer IDs shared by ingress and SecurityCenter; unreadable or malformed saved policy throws |
+// Blueprint: | `ConnectorInputValue.swift` | Connector input scalars and secret-free TransportAllowlist: typed canonical Slack auth.json policy and Telegram integer IDs shared by ingress and SecurityCenter; unreadable or malformed saved policy throws |
 
 /// Scalar conversion shared by action and request inputs.
 public enum ConnectorInputValue {
@@ -47,30 +47,51 @@ public struct TransportAllowlist: Sendable {
     }
 
     public static func slack(dataRoot: URL) throws -> Self {
-        try slack(fields: slackPolicy(dataRoot: dataRoot))
+        try slackPolicy(dataRoot: dataRoot).allowlist
     }
 
     /// One checked metadata read for both ingress options and allowlist admission.
-    public static func slackPolicy(dataRoot: URL) throws -> [String: JSONValue] {
-        try read(slackMetadataPath(dataRoot: dataRoot), transport: "Slack")
+    public static func slackPolicy(dataRoot: URL) throws -> SlackPolicy {
+        try slackPolicy(fields: read(slackMetadataPath(dataRoot: dataRoot), transport: "Slack"))
     }
 
-    public static func slack(fields: [String: JSONValue]) throws -> Self {
-        func ids(_ keys: [String]) throws -> Set<String> {
-            var result: Set<String> = []
-            for key in keys {
-                guard let value = fields[key] else { continue }
-                guard case .array(let values) = value else { throw failure("Slack") }
-                for value in values {
-                    guard case .string(let id) = value else { throw failure("Slack") }
-                    let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty { result.insert(trimmed) }
-                }
-            }
-            return result
+    public struct SlackPolicy: Sendable {
+        public let allowlist: TransportAllowlist
+        public let requireMention: Bool
+        public let socketModeEnabled: Bool
+        public let botUserId: String?
+        public let teamId: String?
+    }
+
+    /// Missing options use the setup defaults; a present malformed value is
+    /// unavailable authority. Only the current writer's field names are read.
+    public static func slackPolicy(fields: [String: JSONValue]) throws -> SlackPolicy {
+        func ids(_ key: String) throws -> Set<String> {
+            guard let value = fields[key] else { return [] }
+            guard case .array(let values) = value else { throw failure("Slack") }
+            return Set(try values.map { value in
+                guard case .string(let id) = value else { throw failure("Slack") }
+                let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { throw failure("Slack") }
+                return trimmed
+            })
         }
-        return try Self(chatIds: ids(["allowed_channel_ids", "allowedChannelIds", "allowed_chat_ids", "allowedChatIds"]),
-            userIds: ids(["allowed_user_ids", "allowedUserIds"]))
+        func flag(_ key: String) throws -> Bool {
+            guard let value = fields[key] else { return true }
+            guard case .bool(let flag) = value else { throw failure("Slack") }
+            return flag
+        }
+        func identity(_ key: String) throws -> String? {
+            guard let value = fields[key] else { return nil }
+            guard case .string(let raw) = value else { throw failure("Slack") }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { throw failure("Slack") }
+            return trimmed
+        }
+        return try SlackPolicy(
+            allowlist: Self(chatIds: ids("allowed_channel_ids"), userIds: ids("allowed_user_ids")),
+            requireMention: flag("require_mention"), socketModeEnabled: flag("socket_mode_enabled"),
+            botUserId: identity("user_id"), teamId: identity("team_id"))
     }
 
     public static func slackMetadataPath(dataRoot: URL) -> URL {

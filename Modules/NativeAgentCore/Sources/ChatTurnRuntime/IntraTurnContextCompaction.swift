@@ -64,8 +64,10 @@ public enum IntraTurnContextCompaction {
 
     /// Characters the in-flight conversation contributes to the request body.
     /// Text, tool-use (id + name + input JSON) and tool-result (id + body)
-    /// blocks only: image blocks ride the CURRENT user message, are never
-    /// re-sent, and so are not part of the mass that grows round over round.
+    /// blocks only. Current-turn images remain in the conversation and are
+    /// resent on subsequent requests until LocalToolImage bounding evicts
+    /// them. This text-only pressure estimate excludes their cost; actual
+    /// request admission measures the complete provider request separately.
     static func estimatedChars(_ conversation: [LLMMessage]) -> Int {
         conversation.reduce(0) { total, message in
             total + message.content.reduce(0) { blockTotal, block in
@@ -242,7 +244,7 @@ public enum IntraTurnContextCompaction {
         }
         // Rendered from the PRE-STUB messages (step A only replaced bodies in
         // place, so the indices are the same array positions).
-        let rendered = render(preStub[spanStart..<keepTailStart])
+        let rendered = try render(preStub[spanStart..<keepTailStart])
         // Empty source must not distill a note from itself; overflow handling can widen the fold span to include real steps.
         guard !rendered.isEmpty else {
             return try await overflowFallback(
@@ -358,7 +360,7 @@ public enum IntraTurnContextCompaction {
 
     /// The folded span as plain text: role, assistant prose, and each tool call
     /// with its input and the head of what it returned, for the distiller.
-    static func render(_ messages: ArraySlice<LLMMessage>) -> String {
+    static func render(_ messages: ArraySlice<LLMMessage>) throws -> String {
         var lines: [String] = []
         for message in messages {
             for block in message.content {
@@ -368,7 +370,9 @@ public enum IntraTurnContextCompaction {
                     guard !trimmed.isEmpty else { continue }
                     lines.append("\(message.role.rawValue): \(trimmed)")
                 case .toolUse(_, let name, let inputJSON):
-                    let input = String(data: inputJSON, encoding: .utf8) ?? ""
+                    guard let input = String(data: inputJSON, encoding: .utf8) else {
+                        throw ToolFailureError("The retained \(name) call input is not UTF-8. Repair its saved call evidence before distilling working notes.", effects: .none, recovery: .repair)
+                    }
                     lines.append("tool \(name)(\(input.prefix(renderToolInputChars)))")
                 case .toolResult(_, let content, let isError):
                     let label = isError ? "result (error)" : "result"

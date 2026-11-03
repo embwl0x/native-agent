@@ -79,7 +79,7 @@ actor TelegramTurnCardLedger {
     private let maximumRecords: Int
     private var loadedRecords: [TelegramPersistedTurnCard]?
     private var storageOwned = false
-    private var storageWaiters: [CheckedContinuation<Void, Never>] = []
+    private var storageWaiters: [ScopedWaiter] = []
 
     init(fileURL: URL, maximumRecords: Int = 64) {
         self.fileURL = fileURL
@@ -148,7 +148,9 @@ actor TelegramTurnCardLedger {
             storageOwned = true
             return
         }
-        await withCheckedContinuation { storageWaiters.append($0) }
+        let done = ScopedWaiter()
+        storageWaiters.append(done)
+        await Task { await done.park() }.value
     }
 
     private func releaseStorage() {

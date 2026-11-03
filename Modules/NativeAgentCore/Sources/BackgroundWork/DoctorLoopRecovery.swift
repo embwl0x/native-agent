@@ -25,9 +25,16 @@ public enum DoctorLoopRecovery {
         let configured = await manager.configuredIntervals()
         let byID = Dictionary(uniqueKeysWithValues: statuses.map { ($0.name, $0) })
         let now = Date()
-        let receipts = DoctorLoopHealth.recentFailureDates(
-            receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl")
-        )
+        let receipts: [String: [DoctorLoopHealth.FailureIncident]]
+        do {
+            receipts = try DoctorLoopHealth.recentFailureDates(
+                receiptsFile: dataRoot.appendingPathComponent("logs/background_loop_failures.jsonl"))
+        } catch {
+            return [CheckResult(source: "logs/background_loop_failures.jsonl", id: DoctorLoopHealth.doctorCheckID,
+                title: "Background Loops", status: "unmeasured",
+                detail: "Loop failure history is unavailable: \(error.localizedDescription)",
+                human_action: "Preserve and repair the background loop failure ledger, then run Doctor again.")]
+        }
         let verdicts = DoctorLoopHealth.evaluate(
             observations: statuses,
             recentFailureDates: receipts,

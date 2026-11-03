@@ -1,7 +1,8 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate.swift` | `CognitiveSubstrate` actor; `waitForMaintenanceTransition`, `beginMaintenanceTransition` |
+import Experiences
+// Blueprint: | `CognitiveSubstrate.swift` | `CognitiveSubstrate` actor; `waitForMaintenanceTransition`, `beginMaintenanceTransition`; checked profile dynamics owe source repair and withhold trait-dependent outputs until the current source reads successfully |
 
 public actor CognitiveSubstrate {
     var configuration: CognitiveConfiguration
@@ -34,13 +35,19 @@ public actor CognitiveSubstrate {
     /// What she cares about, one artifact each (see +Cares.swift), the
     /// one-time seed/migration marker, the one-time marker for converting the
     /// retired views and thought seeds, and the embedder's vectors for the
-    /// cares, keyed by id and the exact text that produced the vector.
+    /// cares, keyed by id, exact text and the memory owner's embedding epoch.
     var cares: [UUID: CognitiveCare] = [:]
     var careMigration: CognitiveCareMigration?
     var careRetiredMigration: JSONValue?
-    var careVectors: [UUID: (text: String, vector: [Float])] = [:]
+    var careVectors: [UUID: (text: String, epoch: String, vector: [Float])] = [:]
+    var carePersonAliases: [String: String] = [:]
+    var carePeopleReadFailure: String?
+    var selfKnowledge: CognitiveSelfKnowledge?
+    var selfPersonLines: [String: String] = [:]
+    var selfKnowledgeReadFailure: String?
     var developmentalTimeline: [UUID: CognitiveDevelopmentalTimelineEvent] = [:]
     var replayEvidenceIds: Set<String> = []
+    var reflectionDispositionClaims: Set<UUID> = []
     var reflectionReceipts: [UUID: CognitiveReflectionReceipt] = [:]
     /// A planned reflection already owns the next daily budget slot until its
     /// result (success/failure/cancel) is recorded. Manual and scheduled callers
@@ -79,8 +86,9 @@ public actor CognitiveSubstrate {
     /// "path|kind" → day bucket: at most one nudge per key per day; pruned to the current day.
     /// Claims persist with disposition so a same-day restart cannot re-nudge.
     var resolutionPatternNudgeDay: [String: String] = [:]
-    /// The night's claim persists with its disposition value so retries cannot apply the tone twice.
-    var dreamDispositionNight: String?
+    /// Every integrated night persists with its effect; a later night cannot
+    /// erase an older journal's proof after a failed checkpoint.
+    var dreamDispositionNights: Set<String> = []
     var dreamIntegrations: [String: Task<Bool, Never>] = [:]
     /// Bounded transitions record source, before, after-decay and after-contribution to distinguish fading from experience.
     var dispositionTransitions: [CognitiveDispositionTransition] = []
@@ -94,7 +102,7 @@ public actor CognitiveSubstrate {
     /// Persists with its claim key in `dream_residue` so a restart neither loses nor re-mints it.
     var dreamResidue: CognitiveDreamResidue?
     /// One residue per night, keyed by committed dream id or local calendar day.
-    var dreamResidueClaimKey: String?
+    var dreamResidueClaims: Set<String> = []
     /// Transient recall nudges: one per node per hour, pruned by the recall owner.
     var lastRefeltAt: [UUID: Date] = [:]
     /// Per-RECORD re-feel refractory beside the per-node one: every recall turn
@@ -113,35 +121,32 @@ public actor CognitiveSubstrate {
     /// Microcycles wait for maintenance; maintenance skips an active microcycle commit.
     /// Resident ingest waits only for maintenance, never for this commit hold.
     var maintenanceCommitInFlight = false
-    var microcycleWaiters: [CheckedContinuation<Void, Never>] = []
+    var microcycleWaiters: [ScopedWaiter] = []
 
-    private var maintenanceTransitionWaiters: [CheckedContinuation<Void, Never>] = []
-    private var lifecycleHoldWaiters: [CheckedContinuation<Void, Never>] = []
+    private var maintenanceTransitionDone = ScopedWaiter()
+    private var lifecycleHoldDone = ScopedWaiter()
 
     /// Restore and Clear are mutually exclusive under one hold: each waits
     /// while the other (or another of itself) is in flight.
     func waitForLifecycleHold() async {
         while restoreInFlight || forgettingInFlight {
-            await withCheckedContinuation { continuation in
-                lifecycleHoldWaiters.append(continuation)
-            }
+            let done = lifecycleHoldDone
+            await Task { await done.park() }.value
         }
     }
 
     /// Wake every waiter once; each re-checks the hold.
     func releaseLifecycleHold() {
-        let waiters = lifecycleHoldWaiters
-        lifecycleHoldWaiters.removeAll()
-        for waiter in waiters { waiter.resume() }
+        lifecycleHoldDone.resume()
+        lifecycleHoldDone = ScopedWaiter()
     }
 
     /// Mutations wait for the whole durable transition, even when cancelled.
     /// Read-only snapshots remain available while the store is suspended.
     func waitForMaintenanceTransition() async {
         while maintenanceRunInFlight {
-            await withCheckedContinuation { continuation in
-                maintenanceTransitionWaiters.append(continuation)
-            }
+            let done = maintenanceTransitionDone
+            await Task { await done.park() }.value
         }
     }
 
@@ -152,16 +157,11 @@ public actor CognitiveSubstrate {
     }
 
     /// Close the maintenance transition window and resume every parked waiter
-    /// exactly once. The array is drained before any resume, so a waiter that
-    /// parks after this point is not in the released set.
+    /// exactly once. The next transition gets its own unresolved waiter.
     func endMaintenanceTransition() {
         maintenanceRunInFlight = false
-        guard !maintenanceTransitionWaiters.isEmpty else { return }
-        let released = maintenanceTransitionWaiters
-        maintenanceTransitionWaiters.removeAll(keepingCapacity: false)
-        for waiter in released {
-            waiter.resume()
-        }
+        maintenanceTransitionDone.resume()
+        maintenanceTransitionDone = ScopedWaiter()
     }
 
     var lastUserPresenceAt: Date?
@@ -231,17 +231,67 @@ public actor CognitiveSubstrate {
         landingScores = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
     }
 
-    /// Felt-layer reads resolve the persona's current dynamics through this property.
-    var dynamics: PersonalityDynamicsConfiguration { dependencies.dynamics() }
+    /// Only successful checked reads change these derived parameters. This
+    /// synchronous actor-owned calculation cannot publish out of read order.
+    private var dynamicsReadFailure: String?
+    /// A repair while the app was closed leaves the persisted debt owed; the
+    /// first healthy read of each launch settles it (10-31 review).
+    private var dynamicsSettledThisLaunch = false
+    var dynamics: PersonalityDynamicsConfiguration {
+        do {
+            let current = try dependencies.dynamics()
+            if dynamicsReadFailure != nil || !dynamicsSettledThisLaunch {
+                dynamicsReadFailure = nil
+                dynamicsSettledThisLaunch = true
+                RepairOwed.settle(conversationDataRoot, operation: "persona.profile.dynamics",
+                    evidence: .init(source: "memory/profile.json", id: "checked-read"))
+            }
+            return current
+        } catch {
+            let why = error.localizedDescription
+            if dynamicsReadFailure != why {
+                dynamicsReadFailure = why
+                RepairOwed.owe(conversationDataRoot, id: "profile-dynamics:" + UUID().uuidString, kind: .run,
+                    operation: "persona.profile.dynamics", owner: "memory/profile.json",
+                    words: "Personality dynamics source unavailable: \(why) Trait-dependent felt signals and voice echoes are unavailable. Fixed decay rates remain available.",
+                    tap: "Restore read access or repair memory/profile.json, preserving its content. A successful checked profile read settles this fault.")
+            }
+            return .unavailable
+        }
+    }
 
-    /// "watch|care id" → when that watch woke her about that care.
-    var careWatchWoke: [String: Date] = [:]
+    /// "watch|care id" → last wake and consecutive readings that moved nothing.
+    struct CareWatchRest {
+        var at: Date
+        var streak = 0
+        /// The journal's fold watermark: refolding never counts a reading twice.
+        var lived: UInt64 = 0
+    }
+    var careWatchWoke: [String: CareWatchRest] = [:]
 
-    /// How the agent names the user in her inner voice — resolved from the
-    /// configured persona, never hardcoded. Falls back to grammar-safe "you".
+    /// All name-dependent projections share the checked profile owner.
+    func oweUserNameRead(_ error: Error) {
+        RepairOwed.owe(conversationDataRoot, id: "profile-name:" + UUID().uuidString, kind: .run,
+            operation: "persona.profile.name", owner: "memory/profile.json",
+            words: "The person's saved name is unavailable: \(error.localizedDescription)",
+            tap: "Repair memory/profile.json, preserving its content, then refresh the inner life.")
+    }
+
+    func oweCareEmbedding(_ error: Error) {
+        RepairOwed.owe(conversationDataRoot, id: "care-embedding:" + UUID().uuidString, kind: .run,
+            operation: "cognition.cares.embedding", owner: "memory/embedding",
+            words: "Care interpretation is unavailable because the resident embedder failed: \(error.localizedDescription)",
+            tap: "Repair the embedding source in Settings → Memory before interpreting these cares again.")
+    }
+
+    func checkedUserName() -> String? {
+        do { return try dependencies.userName().trimmingCharacters(in: .whitespacesAndNewlines) }
+        catch { oweUserNameRead(error); return nil }
+    }
+
     var userAddress: String {
-        let n = dependencies.userName().trimmingCharacters(in: .whitespacesAndNewlines)
-        return n.isEmpty ? "you" : n
+        guard let name = checkedUserName() else { return "the person (saved name unavailable)" }
+        return name.isEmpty ? "you" : name
     }
     public init(
         configuration: CognitiveConfiguration = .disabled,
@@ -286,6 +336,7 @@ public actor CognitiveSubstrate {
             persistenceHealth = CognitivePersistenceHealth(
                 status: persistenceRestored ? .healthy : .ready, writesBlocked: !persistenceRestored)
         }
+        if persistenceRestored { await restoreSelfKnowledge() }
         publishAttentionProjection(at: dependencies.now())
     }
 
@@ -305,17 +356,6 @@ public actor CognitiveSubstrate {
             nodes: nodes,
             persistenceHealth: persistenceHealth
         )
-    }
-
-    public func associationSnapshot() async -> [CognitiveAssociationEdge] {
-        guard configuration.enabled else { return [] }
-        return field.associationEdges(at: dependencies.now(), configuration: configuration)
-    }
-
-    public func doctorAssociationSnapshot(at date: Date) -> [CognitiveAssociationEdge] {
-        guard configuration.enabled else { return [] }
-        var copy = field
-        return copy.associationEdges(at: date, configuration: configuration)
     }
 
     public func clearTransientState() async {
@@ -338,20 +378,24 @@ public actor CognitiveSubstrate {
         careMigration = nil
         careRetiredMigration = nil
         careVectors.removeAll(keepingCapacity: false)
+        selfKnowledge = nil
+        selfPersonLines = [:]
+        selfKnowledgeReadFailure = nil
         developmentalTimeline.removeAll(keepingCapacity: false)
         replayEvidenceIds.removeAll(keepingCapacity: false)
         reflectionReceipts.removeAll(keepingCapacity: false)
+        reflectionDispositionClaims.removeAll(keepingCapacity: false)
         reflectionReservation = nil
         affect = CognitiveAffectState(updatedAt: dependencies.now())
         disposition = CognitiveDisposition()
         // Clear day claims with the disposition so they cannot suppress post-clear nudges.
         resolutionPatternNudgeDay.removeAll(keepingCapacity: false)
-        dreamDispositionNight = nil
+        dreamDispositionNights = []
         dispositionTransitions.removeAll(keepingCapacity: false)
         dispositionUndo = nil
         associationSuppressions.removeAll(keepingCapacity: false)
         dreamResidue = nil
-        dreamResidueClaimKey = nil
+        dreamResidueClaims = []
         lastRefeltAt.removeAll(keepingCapacity: false)
         lastRefeltRecordAt.removeAll(keepingCapacity: false)
         ablations.removeAll(keepingCapacity: false)
@@ -395,14 +439,28 @@ public actor CognitiveSubstrate {
         await waitForMaintenanceTransition()
         beginMaintenanceTransition()
         if maintenanceCommitInFlight {
-            await withCheckedContinuation { microcycleWaiters.append($0) }
+            let done = ScopedWaiter()
+            microcycleWaiters.append(done)
+            await Task { await done.park() }.value
         } else {
             maintenanceCommitInFlight = true
         }
         forgettingInFlight = true
         forgettingDiscarded.removeAll()
+        var supersededStages = unsavedStages.subtracting(["mind.self", "mind.self.read"])
         let epoch: UInt64
         do {
+            // Repair claims survive relaunch; RAM is not their owner. Read
+            // before deleting anything, so an unavailable ledger cannot leave
+            // a successful Clear with debts it never learned about.
+            let repairs = try await ExperienceStore.at(conversationDataRoot).projection()
+            for repair in repairs where RepairOwed.isOwed(repair)
+                && RepairOwed.claim(repair, "owner") == "cognition" {
+                guard let operation = RepairOwed.claim(repair, "operation"),
+                      operation.hasPrefix("cognition.persist:") else { continue }
+                let stage = String(operation.dropFirst("cognition.persist:".count))
+                if stage != "mind.self", stage != "mind.self.read", stage != "clear" { supersededStages.insert(stage) }
+            }
             epoch = try await store.clear()
         } catch {
             // The clear did not happen, and a failed Clear writes nothing
@@ -418,18 +476,31 @@ public actor CognitiveSubstrate {
         }
         clearResidentState()
         mindEpoch = epoch
-        endForgetting()
-        forgettingDiscarded.removeAll()
+        for stage in supersededStages {
+            unsavedStages.remove(stage)
+            RepairOwed.settle(conversationDataRoot, operation: "cognition.persist:" + stage,
+                evidence: .init(source: "cognition/cognition.sqlite", id: "clear:mind:\(epoch)"))
+        }
+        RepairOwed.settle(conversationDataRoot, operation: "cognition.persist:clear",
+            evidence: .init(source: "cognition/cognition.sqlite", id: "clear:mind:\(epoch)"))
         if configuration.persistenceEnabled {
             persistenceRestored = true
-            if persistenceHealth.writesBlocked {
-                let now = dependencies.now()
-                persistenceHealth = CognitivePersistenceHealth(
-                    status: .healthy, writesBlocked: false,
-                    lastRestoreAttemptAt: persistenceHealth.lastRestoreAttemptAt,
-                    lastSuccessfulRestoreAt: now)
-            }
+            persistenceHealth = CognitivePersistenceHealth(
+                status: unsavedStages.isEmpty ? .healthy : .degraded, writesBlocked: false,
+                lastRestoreAttemptAt: persistenceHealth.lastRestoreAttemptAt,
+                lastSuccessfulRestoreAt: dependencies.now(),
+                failureStage: unsavedStages.isEmpty ? nil : "unsaved",
+                failureDetail: unsavedStages.isEmpty ? nil : "unsaved: " + unsavedStages.sorted().joined(separator: ", "))
         }
+        await notingPersistence("mind.self") {
+            let path = CognitiveSelfKnowledge.path(conversationDataRoot)
+            if FileManager.default.fileExists(atPath: path.path) { try FileManager.default.removeItem(at: path) }
+            // Checked deletion retires the old file's read debt as well; a
+            // read of an older valid file cannot retire a failed nightly save.
+            await notingPersistence("mind.self.read") { }
+        }
+        endForgetting()
+        forgettingDiscarded.removeAll()
         await saveResidentAfterForgetting()
     }
 

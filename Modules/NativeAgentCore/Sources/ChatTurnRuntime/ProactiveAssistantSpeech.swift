@@ -3,11 +3,12 @@ import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `ProactiveAssistantSpeech.swift` | `speakProactively` owns proactive transcript writes, claims, quota and destination reconciliation; Reach and chat.post share reachOut, inbox Act uses morningBrief |
+// Blueprint: | `ProactiveAssistantSpeech.swift` | `speakProactively` owns proactive transcript writes, claims, quota and destination reconciliation; Reach, chat.post and fixed intention words share reachOut, inbox Act uses morningBrief; intention speech bypasses the hourly quota |
 
 // One owner for assistant speech outside a user turn. Inbox-card Act uses
-// morningBrief/userRequested; Reach and app chat.post share reachOut/scheduled.
-// Only userRequested skips the persisted hourly quota. All callers share the
+// morningBrief/userRequested; Reach and app chat.post share reachOut/scheduled;
+// an intention's fixed words or turn speak as intention. Only scheduled waits
+// on the persisted hourly quota. All callers share the
 // durable idempotency claim and destination reconciliation: duplicates never
 // write again. Claim, reconciliation and append share one lock; only a
 // committed transcript row proves posting, and only clean absence permits recovery.
@@ -16,8 +17,8 @@ import PersistenceCore
 /// Adding a case here is the review gate for widening the seam.
 public enum ProactiveSpeechCaller: String, Sendable, CaseIterable, Equatable {
     case morningBrief = "morning_brief"
-    /// Her own speech, from Reach or chat.post. Both use the scheduled route
-    /// and the same hourly quota; Reach also retains its own initiative gates.
+    /// Her speech, from Reach, chat.post or a fixed-word intention. Scheduled
+    /// initiative shares the hourly quota; Reach also keeps its own gates.
     case reachOut = "reach_out"
 }
 
@@ -29,6 +30,14 @@ public enum ProactiveSpeechInitiative: String, Sendable, Equatable {
     /// User pressed a button that means "say this to me". Not rate limited,
     /// still deduplicated.
     case userRequested
+    /// An intention's fixed words or own turn (or a scheduled job's): its
+    /// moment is its pacing, so it neither waits on nor spends the hourly quota (User 10-29:
+    /// the 4 PM check-in he set up was refused). Still deduplicated.
+    case intention
+
+    /// Who asked for what this task says: bound around an intention's turn,
+    /// so everything that turn says is the intention's.
+    @TaskLocal public static var current: ProactiveSpeechInitiative = .scheduled
 }
 
 /// What a `speakProactively` attempt actually did. Never `Void` — a caller that
@@ -70,13 +79,8 @@ struct ProactiveSpeechClaim: Sendable, Equatable {
     struct Destination: Sendable, Equatable {
         let sessionId: String
         let runId: String
-        /// Older claims released the claim lock before append. Absence cannot
-        /// establish that one of those appenders has finished.
-        var appendSerialized = false
-
         var jsonValue: JSONValue {
-            .object(["sessionId": .string(sessionId), "runId": .string(runId),
-                     "appendSerialized": .bool(appendSerialized)])
+            .object(["sessionId": .string(sessionId), "runId": .string(runId)])
         }
     }
 
@@ -117,19 +121,16 @@ struct ProactiveSpeechClaim: Sendable, Equatable {
         }
         guard Set(recentKeys).count == recentKeys.count else { throw ProactiveSpeechError.damagedState }
         self.destinations = [:]
-        if let value = object["destinations"] {
-            guard case .object(let rows) = value else { throw ProactiveSpeechError.damagedState }
+        guard case .object(let rows)? = object["destinations"], Set(rows.keys) == Set(recentKeys) else {
+            throw ProactiveSpeechError.damagedState
+        }
+        do {
             for (key, value) in rows {
                 guard recentKeys.contains(key), case .object(let row) = value,
                       case .string(let sessionId)? = row["sessionId"],
                       NativeAgentChatSessionID.normalizedPathComponent(sessionId) == sessionId,
                       case .string(let runId)? = row["runId"], !runId.isEmpty else { throw ProactiveSpeechError.damagedState }
-                let serialized: Bool
-                if let value = row["appendSerialized"] {
-                    guard case .bool(let flag) = value else { throw ProactiveSpeechError.damagedState }
-                    serialized = flag
-                } else { serialized = false }
-                destinations[key] = Destination(sessionId: sessionId, runId: runId, appendSerialized: serialized)
+                destinations[key] = Destination(sessionId: sessionId, runId: runId)
             }
         }
     }
@@ -141,7 +142,7 @@ struct ProactiveSpeechClaim: Sendable, Equatable {
             keys.removeFirst(keys.count - Self.recentKeyCap)
         }
         var destinations = destinations.filter { keys.contains($0.key) }
-        destinations[key] = Destination(sessionId: sessionId, runId: runId, appendSerialized: true)
+        destinations[key] = Destination(sessionId: sessionId, runId: runId)
         return ProactiveSpeechClaim(lastProactivePostAt: lastProactivePostAt, recentKeys: keys, destinations: destinations)
     }
 }
@@ -194,7 +195,7 @@ extension SwiftNativeChatOrchestrationClient {
         caller: ProactiveSpeechCaller,
         idempotencyKey: String,
         sessionId: String,
-        initiative: ProactiveSpeechInitiative = .scheduled,
+        initiative: ProactiveSpeechInitiative = .current,
         persona: String? = nil
     ) async throws -> ProactiveSpeechOutcome {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -210,20 +211,7 @@ extension SwiftNativeChatOrchestrationClient {
         return try await SwiftNativePersistenceCore.withFileLock(statePath) {
             let existing = try await SwiftNativePersistenceCore.readJSON(statePath, ifMissing: .object([:]))
             var rows = try ProactiveSpeechState.rows(existing)
-            var previous = try rows[caller.rawValue].map { try ProactiveSpeechClaim($0) }
-            if let legacy = previous, legacy.recentKeys.contains(idempotencyKey),
-               legacy.destinations[idempotencyKey] == nil {
-                do {
-                    let reconciled = try await reconcileProactiveSpeechDestinations(legacy, caller: caller)
-                    if reconciled != legacy {
-                        rows[caller.rawValue] = reconciled.jsonValue
-                        try await SwiftNativePersistenceCore.writeJSON(.object(rows), to: statePath)
-                        previous = reconciled
-                    }
-                } catch {
-                    throw ProactiveSpeechError.duplicateDestinationUnavailable
-                }
-            }
+            let previous = try rows[caller.rawValue].map { try ProactiveSpeechClaim($0) }
             let destination: ProactiveSpeechClaim.Destination
             if let previous, previous.recentKeys.contains(idempotencyKey) {
                 guard let recorded = previous.destinations[idempotencyKey] else {
@@ -238,9 +226,6 @@ extension SwiftNativeChatOrchestrationClient {
                         && metadata["proactiveSpeechIdempotencyKey"] == .string(idempotencyKey)
                 }
                 if committed { return .duplicate(sessionId: recorded.sessionId) }
-                guard recorded.appendSerialized else {
-                    throw ChatOrchestrationError.underlying("This older proactive claim has no committed row. Its append may still be in flight; the outcome remains unknown.")
-                }
                 // Clean absence under the same lock proves the prior append
                 // ended without this row. Complete that claim at its original destination.
                 destination = recorded
@@ -278,52 +263,6 @@ extension SwiftNativeChatOrchestrationClient {
             // commitment or clean absence before doing anything else.
             return .posted(sessionId: destination.sessionId, messageRunId: destination.runId)
         }
-    }
-
-    /// Recover destinations only from independently recorded exact keys.
-    /// Content alone cannot identify an inbox item; unstamped rows stay unresolved.
-    private func reconcileProactiveSpeechDestinations(
-        _ claim: ProactiveSpeechClaim,
-        caller: ProactiveSpeechCaller
-    ) async throws -> ProactiveSpeechClaim {
-        let missing = claim.recentKeys.filter { claim.destinations[$0] == nil }
-        let directory = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
-        let paths: [URL]
-        do {
-            paths = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
-            return claim
-        }
-        var recovered: [String: ProactiveSpeechClaim.Destination] = [:]
-        var ambiguous: Set<String> = []
-        for path in paths where path.pathExtension == "jsonl" {
-            let sessionId = path.deletingPathExtension().lastPathComponent
-            guard NativeAgentChatSessionID.normalizedPathComponent(sessionId) == sessionId else { continue }
-            let transcript = try await SwiftNativePersistenceCore.withFileLock(path) {
-                try await SwiftNativePersistenceCore.readJSONLReporting(path).rows
-            }
-            for row in transcript {
-                guard case .object(let object) = row,
-                      object["role"] == .string("assistant"),
-                      object["source"] == .string(caller.rawValue),
-                      object["sessionId"] == .string(sessionId),
-                      case .object(let metadata)? = object["metadata"],
-                      case .string(let key)? = metadata["proactiveSpeechIdempotencyKey"],
-                      missing.contains(key),
-                      case .string(let runId)? = object["runId"], !runId.isEmpty else { continue }
-                let destination = ProactiveSpeechClaim.Destination(sessionId: sessionId, runId: runId)
-                if let existing = recovered[key], existing != destination {
-                    ambiguous.insert(key)
-                } else {
-                    recovered[key] = destination
-                }
-            }
-        }
-        var reconciled = claim
-        for (key, destination) in recovered where !ambiguous.contains(key) {
-            reconciled.destinations[key] = destination
-        }
-        return reconciled
     }
 
     /// Exact offer scope, as stamped by this owner. A claim alone is not a

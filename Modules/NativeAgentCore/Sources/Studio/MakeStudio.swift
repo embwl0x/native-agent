@@ -152,6 +152,7 @@ extension MakeStudio {
         public let revision: Int
         public let titleFaces: PartFaces?
         public let image: NSImage?
+        public let imageFailure: String?
     }
 
     public static let webTypes: Set = ["html", "htm", "xhtml", "svg"]
@@ -172,19 +173,56 @@ extension MakeStudio {
         return (project, target)
     }
 
-    public static func export(_ file: URL, to target: URL, prompt: String) throws -> String {
-        // The same file by identity (a hard link or symlink too), not by path.
-        let identity = { (url: URL) in
-            try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier
+    public struct ExportResult: Sendable {
+        public enum Output: Sendable {
+            case saved(URL)
+            /// An atomic write threw; its final effect has not been established.
+            case unconfirmed(URL, String)
+            case notAttempted(URL)
+
+            var message: String {
+                switch self {
+                case .saved(let path): "Saved to \(path.path)."
+                case .unconfirmed(let path, let cause): "Save outcome unconfirmed at \(path.path): \(cause). Inspect this file before repeating the export."
+                case .notAttempted(let path): "Not attempted at \(path.path)."
+                }
+            }
         }
-        guard identity(target).map({ $0.isEqual(identity(file)) }) != true else {
-            return "That is the studio's own file, so nothing was saved. Pick another place."
+        public let work: Output
+        public let prompt: Output
+        public var message: String { "Work: \(work.message) Prompt: \(prompt.message)" }
+    }
+
+    /// One owner prepares both outputs before replacing either, then reports
+    /// each replacement independently. Two file replacements are not a transaction.
+    public static func export(_ file: URL, to target: URL, prompt: String) throws -> ExportResult {
+        // The same file by identity (a hard link or symlink too), not by path.
+        func identity(_ url: URL) throws -> (system: NSNumber, file: NSNumber)? {
+            let attributes: [FileAttributeKey: Any]
+            do { attributes = try FileManager.default.attributesOfItem(atPath: url.resolvingSymlinksInPath().path) }
+            catch CocoaError.fileReadNoSuchFile { return nil }
+            guard let system = attributes[.systemNumber] as? NSNumber,
+                  let file = attributes[.systemFileNumber] as? NSNumber else {
+                throw Refusal(reason: "export_identity_unavailable", message: "Could not establish file identity at \(url.path). Nothing was exported.")
+            }
+            return (system, file)
         }
         let sidecar = target.deletingPathExtension().appendingPathExtension("prompt.txt")
-        // Written beside the target and swapped in: a failed save leaves what was there.
-        try Data(contentsOf: file).write(to: target, options: .atomic)
-        try prompt.write(to: sidecar, atomically: true, encoding: .utf8)
-        return "Saved to \(target.path)"
+        guard let source = try identity(file) else {
+            throw Refusal(reason: "export_source_unavailable", message: "The studio's source file is missing. Nothing was exported.")
+        }
+        for output in [target, sidecar] {
+            if let existing = try identity(output), existing.system == source.system, existing.file == source.file {
+                throw Refusal(reason: "export_is_source", message: "An export output is the studio's own file. Pick another place; nothing was exported.")
+            }
+        }
+        let bytes = try Data(contentsOf: file)
+        let promptBytes = Data(prompt.utf8)
+        do { try bytes.write(to: target, options: .atomic) }
+        catch { return ExportResult(work: .unconfirmed(target, error.localizedDescription), prompt: .notAttempted(sidecar)) }
+        do { try promptBytes.write(to: sidecar, options: .atomic) }
+        catch { return ExportResult(work: .saved(target), prompt: .unconfirmed(sidecar, error.localizedDescription)) }
+        return ExportResult(work: .saved(target), prompt: .saved(sidecar))
     }
 
     /// One event-driven index serves the visible shelf and the auto-open signal.
@@ -220,7 +258,7 @@ extension MakeStudio {
         public nonisolated func folder(_ ref: String) -> URL { studio.folder(ref) }
 
         public func preview(_ ref: String, _ version: Version, revision: Int) async -> Preview {
-            if stopped || Task.isCancelled { return Preview(file: file(ref, version), revision: revision, titleFaces: nil, image: nil) }
+            if stopped || Task.isCancelled { return Preview(file: file(ref, version), revision: revision, titleFaces: nil, image: nil, imageFailure: "Image preview preparation stopped.") }
             let id = UUID()
             let read = Task { await preparePreview(ref, version, revision: revision) }
             previewReads[id] = read
@@ -230,19 +268,30 @@ extension MakeStudio {
 
         private func preparePreview(_ ref: String, _ version: Version, revision: Int) async -> Preview {
             let file = file(ref, version)
-            let read = Task.detached(priority: .userInitiated) { () -> (JSONValue, String?, NSImage?) in
+            let read = Task.detached(priority: .userInitiated) { () -> (JSONValue, String?, NSImage?, String?) in
                 var html: JSONValue = .object(["state": .string("not_applicable")])
                 var unavailable: String?
                 if MakeStudio.webTypes.contains(file.pathExtension.lowercased()) {
                     do { html = .object(["state": .string("available"), "text": .string(try String(contentsOf: file, encoding: .utf8))]) }
                     catch { unavailable = "\(file.lastPathComponent) could not be decoded: \(error.localizedDescription)" }
                 }
+                var image: NSImage?
+                var imageFailure: String?
+                if MakeStudio.imageTypes.contains(file.pathExtension.lowercased()) {
+                    do {
+                        let bytes = try Data(contentsOf: file)
+                        guard let decoded = NSImage(data: bytes) else {
+                            throw Refusal(reason: "image_decode_failed", message: "AppKit could not decode image bytes at \(file.path).")
+                        }
+                        image = decoded
+                    } catch { imageFailure = "Image preview unavailable: \(error.localizedDescription)" }
+                }
                 return (.object(["file": .string(file.path), "revision": .int(Int64(revision)),
                     "filename": .string(file.lastPathComponent), "html": html,
                     "prompt": version.prompt.map(JSONValue.string) ?? .null]), unavailable,
-                    MakeStudio.imageTypes.contains(file.pathExtension.lowercased()) ? NSImage(contentsOf: file) : nil)
+                    image, imageFailure)
             }
-            let (input, unavailable, image) = await withTaskCancellationHandler { await read.value } onCancel: { read.cancel() }
+            let (input, unavailable, image, imageFailure) = await withTaskCancellationHandler { await read.value } onCancel: { read.cancel() }
             // Each file/revision has its own source, including concurrent page renders.
             let key = "\(file.path) \(revision)"
             let faces = titleProjections[key]?.faces ?? PartFaces(dataRoot: studio.dataRoot, call: project)
@@ -261,7 +310,7 @@ extension MakeStudio {
                     if let gone = titleProjections.removeValue(forKey: titleOrder.removeFirst()) { gone.task.cancel(); _ = gone.faces.stop() }
                 }
             }
-            return Preview(file: file, revision: revision, titleFaces: faces, image: image)
+            return Preview(file: file, revision: revision, titleFaces: faces, image: image, imageFailure: imageFailure)
         }
 
         public func meta(_ ref: String?) -> MakeStudio.Meta? {

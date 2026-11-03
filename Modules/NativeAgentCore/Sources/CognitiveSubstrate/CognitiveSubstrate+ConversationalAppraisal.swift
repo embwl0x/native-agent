@@ -70,9 +70,16 @@ extension CognitiveSubstrate {
     }
 
     public struct AffectAppraisal: Sendable, Codable {
+        /// A judgment about the supplied prior statement, independent of feeling.
+        public struct BeliefReaction: Sendable, Codable {
+            public enum Kind: String, Sendable, Codable { case pushback, confirmed }
+            public var kind: Kind
+            public var statement: String
+            public var evidence: String
+        }
         public init() {}
         enum CodingKeys: String, CodingKey {
-            case valence, warmth, tension, pressure, arousal, affection, warmthBoost
+            case valence, warmth, tension, pressure, arousal, affection, warmthBoost, beliefReaction
         }
 
         public init(from decoder: any Decoder) throws {
@@ -91,6 +98,8 @@ extension CognitiveSubstrate {
             arousal = try delta(.arousal)
             affection = try values.decode(Bool.self, forKey: .affection)
             warmthBoost = try delta(.warmthBoost, low: 0, high: 0.18)
+            // No reaction is optional; a supplied malformed judgment is not.
+            beliefReaction = try values.decodeIfPresent(BeliefReaction.self, forKey: .beliefReaction)
             if valence < 0 { affection = false }
         }
         var valence = 0.0   // → node valence (emotionTag)
@@ -105,9 +114,10 @@ extension CognitiveSubstrate {
         var warmthBoost = 0.0
         /// The affection floor scales by relational source, with the user's weight fixed at 1.0.
         var affectionWeight = 1.0
+        public var beliefReaction: BeliefReaction?
         var isActive: Bool { valence != 0 || warmth != 0 || tension != 0 || pressure != 0 || arousal != 0 }
-        /// Nothing beyond noise: no delta, no affection, no warmth boost.
-        public var isNoOp: Bool { !isActive && !affection && warmthBoost == 0 }
+        /// No affect change and no explicit belief evidence to live.
+        public var isNoOp: Bool { !isActive && !affection && warmthBoost == 0 && beliefReaction == nil }
     }
 
     nonisolated func studioValence(in text: String) -> Double {

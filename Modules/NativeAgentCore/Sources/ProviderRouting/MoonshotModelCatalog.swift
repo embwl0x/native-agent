@@ -2,7 +2,7 @@ import Foundation
 import PersistenceCore
 import NativeAgentShared
 
-// Blueprint: | `MoonshotModelCatalog.swift` | `MoonshotModelCatalog`: authenticated model parsing/capabilities and checked offline cache, using shared TTL state machinery |
+// Blueprint: | `MoonshotModelCatalog.swift` | `MoonshotModelCatalog`: authenticated model parsing/capabilities and credential-bound cache through shared TTL state machinery; models without a declared adapter reasoning contract retain unknown controls and a row-owned limitation note |
 
 /// Authenticated Moonshot/Kimi model discovery with a bounded offline cache.
 /// Capability flags come from Moonshot's `/v1/models` response; NativeAgent's
@@ -52,23 +52,28 @@ public enum MoonshotModelCatalog {
 
     static func parseModelsResponse(_ data: Data) throws -> [ProviderModelInfo] {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let rows = root["data"] as? [[String: Any]] else { return [] }
+              let rows = root["data"] as? [[String: Any]] else { throw LLMError.providerError(message: "Moonshot returned an invalid model catalog envelope.") }
         var byID: [String: ProviderModelInfo] = [:]
         for row in rows {
-            guard let rawID = row["id"] as? String else { continue }
+            guard let rawID = row["id"] as? String else { throw LLMError.providerError(message: "Moonshot model row has no ID.") }
             let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !id.isEmpty else { continue }
-            let context = positiveInt(row["context_length"])
-                ?? FirstPartyModelCatalog.moonshotModels.first(where: { $0.id == id })?.contextLength
-                ?? 0
+            guard !id.isEmpty else { throw LLMError.providerError(message: "Moonshot model row has an empty ID.") }
+            guard let context = positiveInt(row["context_length"]),
+                  let vision = boolean(row["supports_image_in"]) else {
+                throw LLMError.providerError(message: "Moonshot did not establish the context window or image capability of \(id). Refresh its model catalog before selecting it.")
+            }
             byID[id] = ProviderModelInfo(
                 id: id,
                 name: displayName(for: id),
                 context_length: context,
                 supports_streaming: true,
-                supports_vision: (row["supports_image_in"] as? Bool) ?? false,
+                supports_vision: vision,
                 supports_tools: true,
-                supports_json_mode: true
+                supports_json_mode: true,
+                default_reasoning_effort: defaultReasoningEffort(for: id),
+                supported_reasoning_efforts: supportedReasoningEfforts(for: id),
+                supports_fast: false,
+                controls_note: controlsNote(for: id)
             )
         }
         // Declared rows first in their declared order, then the rest by name.
@@ -82,13 +87,18 @@ public enum MoonshotModelCatalog {
     }
 
     /// The live catalog states no reasoning contract: a model's controls are
-    /// its declared row's, and an id with no row takes none.
-    public static func defaultReasoningEffort(for modelID: String) -> String {
-        FirstPartyModelCatalog.descriptor(for: modelID, providerID: "moonshot")?.defaultReasoningEffort ?? "none"
+    /// its declared row's. An id with no row has unknown controls.
+    public static func defaultReasoningEffort(for modelID: String) -> String? {
+        FirstPartyModelCatalog.descriptor(for: modelID, providerID: "moonshot")?.defaultReasoningEffort
     }
 
-    public static func supportedReasoningEfforts(for modelID: String) -> [String] {
-        FirstPartyModelCatalog.descriptor(for: modelID, providerID: "moonshot")?.supportedReasoningEfforts ?? ["none"]
+    public static func supportedReasoningEfforts(for modelID: String) -> [String]? {
+        FirstPartyModelCatalog.descriptor(for: modelID, providerID: "moonshot")?.supportedReasoningEfforts
+    }
+
+    private static func controlsNote(for modelID: String) -> String? {
+        supportedReasoningEfforts(for: modelID) == nil
+            ? "Think controls are unknown for this Moonshot model; NativeAgent needs a declared adapter contract before it can be selected." : nil
     }
 
     private static func fetchLiveModels(key: String?, session: URLSession) async throws -> [ProviderModelInfo] {
@@ -113,11 +123,15 @@ public enum MoonshotModelCatalog {
     }
 
     static func cacheFault(dataRoot: URL) -> String? {
-        modelCatalogFault(at: cachePath(dataRoot: dataRoot), read: readCache(dataRoot: dataRoot) != nil, owner: "Moonshot")
+        do {
+            return try ttlCache.currentCache(dataRoot: dataRoot) == nil
+                ? "Moonshot model catalog is not available. Refresh its models in Providers." : nil
+        } catch { return error.localizedDescription }
     }
 
     static func readCache(dataRoot: URL) -> [ProviderModelInfo]? {
-        readDecodedCache(dataRoot: dataRoot)?.models
+        do { return try ttlCache.currentCache(dataRoot: dataRoot)?.models }
+        catch { return nil } // cacheFault carries the unavailable cause.
     }
 
     private static let decodedCache = ModelCatalogDecodeCache()
@@ -130,19 +144,31 @@ public enum MoonshotModelCatalog {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rows = root["models"] as? [[String: Any]] else { return nil }
         let models = rows.compactMap { row -> ProviderModelInfo? in
-            guard let id = row["id"] as? String, !id.isEmpty else { return nil }
+            guard let id = row["id"] as? String, !id.isEmpty,
+                  let name = row["name"] as? String,
+                  let context = positiveInt(row["context_length"]),
+                  let streaming = boolean(row["supports_streaming"]),
+                  let vision = boolean(row["supports_vision"]),
+                  let tools = boolean(row["supports_tools"]),
+                  let json = boolean(row["supports_json_mode"]) else { return nil }
             return ProviderModelInfo(
                 id: id,
-                name: (row["name"] as? String) ?? displayName(for: id),
-                context_length: positiveInt(row["context_length"]) ?? 0,
-                supports_streaming: (row["supports_streaming"] as? Bool) ?? true,
-                supports_vision: (row["supports_vision"] as? Bool) ?? false,
-                supports_tools: (row["supports_tools"] as? Bool) ?? true,
-                supports_json_mode: (row["supports_json_mode"] as? Bool) ?? true
+                name: name,
+                context_length: context,
+                supports_streaming: streaming,
+                supports_vision: vision,
+                supports_tools: tools,
+                supports_json_mode: json,
+                default_reasoning_effort: defaultReasoningEffort(for: id),
+                supported_reasoning_efforts: supportedReasoningEfforts(for: id),
+                supports_fast: false,
+                controls_note: controlsNote(for: id)
             )
         }
+        guard models.count == rows.count else { return nil }
         let fetchedAt = (root["updated_at"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
-        return DecodedModelCatalog(models: models, isComplete: root["complete"] as? Bool, fetchedAt: fetchedAt)
+        return DecodedModelCatalog(models: models, isComplete: root["complete"] as? Bool, fetchedAt: fetchedAt,
+                                   credentialBinding: root["credential_binding"] as? String)
     }
 
     private static func displayName(for id: String) -> String {
@@ -157,9 +183,17 @@ public enum MoonshotModelCatalog {
     }
 
     private static func positiveInt(_ value: Any?) -> Int? {
-        if let value = value as? Int, value > 0 { return value }
-        if let value = value as? NSNumber, value.intValue > 0 { return value.intValue }
-        if let value = value as? String, let parsed = Int(value), parsed > 0 { return parsed }
-        return nil
+        guard let value else { return nil }
+        switch JSONValue(fromFoundation: value) {
+        case .int(let number) where number > 0: return Int(exactly: number)
+        case .double(let number) where number > 0: return Int(exactly: number)
+        case .string(let number): return Int(number).flatMap { $0 > 0 ? $0 : nil }
+        default: return nil
+        }
+    }
+
+    private static func boolean(_ value: Any?) -> Bool? {
+        guard let value, case .bool(let flag) = JSONValue(fromFoundation: value) else { return nil }
+        return flag
     }
 }

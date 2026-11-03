@@ -4,7 +4,7 @@ import NativeAgentCore
 import os
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `LLMCallTelemetry.swift` | `LLMCallTraceRecorder`; successful/failed call receipts with full/delta context byte sizes, keyframe status, purpose, timing, provider identity and redacted underlying failure detail; memory, digest and probe telemetry retain their own surfaces when routing inherits Chat; a bound `spent` tally adds each row's usage (their turn's own rounds) |
+// Blueprint: | `LLMCallTelemetry.swift` | `LLMCallTraceRecorder`; successful/failed call receipts with full/delta context byte sizes, keyframe status, purpose, timing, provider identity and redacted underlying failure detail; whole-reply partial receipts save redacted output and cause through settle at the selected root; memory, digest and probe telemetry retain their own surfaces when routing inherits Chat; a bound `spent` tally adds each row's usage (their turn's own rounds); explicit preview generation emits no usage or call evidence for behavioral readers |
 
 public extension Notification.Name {
     /// Posted after the exact per-session provider usage receipt is durable.
@@ -27,13 +27,21 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
     @TaskLocal public static var requestRecorded: OSAllocatedUnfairLock<Receipt>?
     /// What her turn's own model rounds read and wrote, in tokens: the stem
     /// binds it around its calls, and each row's usage adds to it.
-    @TaskLocal public static var spent: OSAllocatedUnfairLock<Int>?
+    public struct Spend: Sendable {
+        public var knownTokens = 0
+        public var complete = true
+        public var total: Int? { complete ? knownTokens : nil }
+        public init() {}
+    }
+    @TaskLocal public static var spent: OSAllocatedUnfairLock<Spend>?
 
     public struct Receipt: Sendable {
         public var recorded = false
         public var ttftMs: Int?
         /// What the request asked the provider to read, set before it is sent.
         public var requestBytes: Int?
+        public var requestCharacters: Int?
+        public var requestPlan: Data?
         public init() {}
     }
 
@@ -42,6 +50,12 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
 
     public init(dataRootOverride: URL? = nil) {
         self.dataRootOverride = dataRootOverride
+    }
+
+    /// Diagnostics from this adapter belong to the same selected body. The
+    /// request-scoped override is resolved at use, never captured from another call.
+    var diagnosticDataRoot: URL {
+        LLMCallContext.traceDataRootOverride ?? dataRootOverride ?? PersistenceCore.defaultDataRoot()
     }
 
     private struct SessionUsageReceiptWrite: Sendable {
@@ -99,6 +113,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
                case .string(let existingModel)? = existingObject["model"],
                case .string(let pendingModel)? = pendingObject["model"],
                existingModel.caseInsensitiveCompare(pendingModel) == .orderedSame,
+               existingObject["provider"] == pendingObject["provider"],
                case .int(let existingTokens)? = existingObject["lastRequestInputTokens"],
                case .int(let pendingTokens)? = pendingObject["lastRequestInputTokens"] {
                 var nextObject = pendingObject
@@ -165,21 +180,30 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         stopReason: String? = nil,
         errorDetail: String? = nil
     ) async {
+        guard !LLMCallContext.preview else { return }
         if let claim = Self.requestRecorded, claim.withLock({ receipt in
             defer { receipt.recorded = true }
             if !receipt.recorded { receipt.ttftMs = ttftMs }
             return receipt.recorded
         }) { return }
-        var accountingOverflow = false
-        if let usage, let spent = Self.spent {
-            let (tokens, callOverflow) = (usage.logicalInputTokens(provider: provider) ?? 0)
-                .addingReportingOverflow(max(0, usage.outputTokens ?? 0))
+        let accountingOverflow: Bool
+        let measuredInput = usage?.logicalInputTokens(provider: provider)
+        let measuredOutput = usage?.outputTokens
+        let usageComplete = measuredInput != nil && measuredOutput != nil
+        if let spent = Self.spent {
             accountingOverflow = spent.withLock { total in
-                let (sum, aggregateOverflow) = total.addingReportingOverflow(callOverflow ? Int.max : tokens)
-                total = aggregateOverflow ? Int.max : sum
-                return callOverflow || aggregateOverflow
+                guard let input = measuredInput, let output = measuredOutput, output >= 0 else {
+                    total.complete = false
+                    return false
+                }
+                let (tokens, callOverflow) = input.addingReportingOverflow(output)
+                let (sum, aggregateOverflow) = total.knownTokens.addingReportingOverflow(tokens)
+                let overflow = callOverflow || aggregateOverflow
+                if overflow { total.complete = false }
+                else { total.knownTokens = sum }
+                return overflow
             }
-        }
+        } else { accountingOverflow = false }
         let purpose = LLMCallContext.purpose
         let routedSurface = LLMCallContext.surface ?? "unknown"
         let surface: String = {
@@ -206,14 +230,17 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         ]
         if let ttftMs { payload["ttftMs"] = .int(Int64(ttftMs)) }
         if accountingOverflow { payload["tokenAccountingOverflow"] = .bool(true) }
+        payload["tokenAccounting"] = .string(usageComplete && !accountingOverflow ? "complete" : "unavailable")
         if let bytes = Self.requestRecorded?.withLock({ $0.requestBytes }) { payload["requestBytes"] = .int(Int64(bytes)) }
+        if let characters = Self.requestRecorded?.withLock({ $0.requestCharacters }) { payload["requestCharacters"] = .int(Int64(characters)) }
         // How the adapter's streamMessages delivered this call; absent on
         // calls that did not come through streamMessages.
         if let streamKind = LLMMessagesStreamKind.current {
             payload["streamKind"] = .string(streamKind.rawValue)
         }
         // Unbound callers omit prefix receipts; secondary calls explicitly report their shape as unmeasured.
-        if let prefix = ConversationPrefixTelemetry.current {
+        let prefix = await ConversationPrefixTelemetry.sink?.resolved()
+        if let prefix {
             for (key, value) in prefix.payload { payload[key] = value }
         } else if ConversationPrefixTelemetry.requestShapeUnmeasured {
             payload["requestShape"] = .string("unmeasured")
@@ -232,7 +259,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
             payload["tools.appendedSchemaBytes"] = .int(Int64(weight.appendedBytes))
             payload["tools.wireSchemaBytes"] = .int(Int64(weight.wireBytes))
         }
-        if let requestBody, let prefix = ConversationPrefixTelemetry.current {
+        if let requestBody, let prefix {
             do {
                 payload.merge(try RequestPrefixReceipt.payload(requestBody, prefix: prefix)) { _, actual in actual }
             } catch {
@@ -270,6 +297,10 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         ) : nil
         let usageReceipt: SessionUsageReceiptWrite? = {
             guard status == "ok",
+                  !ConversationPrefixTelemetry.requestShapeUnmeasured,
+                  let request = Self.requestRecorded?.withLock({ $0 }),
+                  let requestCharacters = request.requestCharacters,
+                  let requestPlan = request.requestPlan,
                   let usage,
                   let logicalInputTokens = usage.logicalInputTokens(provider: provider),
                   let rawSessionID = LLMCallContext.sessionId,
@@ -291,6 +322,8 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
                 "model": .string(model),
                 "additiveInputCounters": .bool(usage.additiveInputCounters),
                 "lastRequestInputTokens": .int(Int64(logicalInputTokens)),
+                "requestCharacters": .int(Int64(requestCharacters)),
+                "requestPlan": .string(requestPlan.base64EncodedString()),
                 "recordedAt": .string(recordedAtISO),
                 "recordedAtEpochMicros": .int(receiptOrder),
             ]
@@ -318,6 +351,7 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
 
     /// Record `provider.noReply` once: the bound turn's daily trace or a standalone receipt.
     public func recordNoReply(provider: String, seconds: Int, events: Int, surface: String) async {
+        guard !LLMCallContext.preview else { return }
         let payload: [String: JSONValue] = [
             "provider": .string(provider), "seconds": .int(Int64(seconds)), "events": .int(Int64(events)),
             "surface": .string(surface), "turnId": .string(TurnTraceContext.turnId ?? "unknown"),
@@ -326,6 +360,29 @@ public final class LLMCallTraceRecorder: @unchecked Sendable {
         guard TurnTraceContext.turnId == nil else { return }
         await write(TurnTraceEvent(kind: "provider.noReply", title: provider, status: "failed",
             payload: .object(payload), createdAt: ISO8601DateFormatter().string(from: Date())), usageReceipt: nil)
+    }
+
+    /// Every whole-reply consumer records incomplete output before handing its
+    /// original error to the caller. This is evidence, never a successful reply.
+    func recordPartialReply(output: String, error: Error) async {
+        guard !LLMCallContext.preview else { return }
+        let cancelled = error is CancellationError || (error as? URLError)?.code == .cancelled
+        let row = TurnTraceEvent(
+            kind: "llm.reply.partial", title: "Incomplete model reply",
+            status: cancelled ? "cancelled" : "failed",
+            payload: .object([
+                "purpose": .string(LLMCallContext.purpose),
+                "output": .string(TurnTraceRedactor.redactText(output)),
+                "outputBytes": .int(Int64(output.utf8.count)),
+                "error": .string(ProviderFailure.diagnosticDescription(error)),
+                "cancelled": .bool(cancelled),
+            ]), createdAt: ISO8601DateFormatter().string(from: Date()),
+            turnId: TurnTraceContext.turnId
+        )
+        let root = diagnosticDataRoot
+        // Stop cancels the request, not saving what it produced. Use the trace
+        // owner's selected root even when this caller has no bound trace bus.
+        await settle { await TurnTracePersistLane(dataRootOverride: root).append(row) }
     }
 
     private func write(_ row: TurnTraceEvent?,

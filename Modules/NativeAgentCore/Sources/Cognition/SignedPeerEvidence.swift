@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import Experiences
 // Blueprint: | `SignedPeerEvidence.swift` | `SignedPeerEvidence` struct |
 
 /// Latest authenticated observation of the paired iOS peer: the one record of
@@ -32,12 +33,14 @@ public enum SignedPeerEvidenceStore {
             .appendingPathComponent("signed_peer_evidence.json")
     }
 
-    public static func load(dataRoot: URL) -> SignedPeerEvidence? {
+    public static func load(dataRoot: URL) throws -> SignedPeerEvidence? {
         let url = path(dataRoot: dataRoot)
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        let data: Data
+        do { data = try Data(contentsOf: url) }
+        catch CocoaError.fileReadNoSuchFile, CocoaError.fileNoSuchFile { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(SignedPeerEvidence.self, from: data)
+        return try decoder.decode(SignedPeerEvidence.self, from: data)
     }
 
     public static func record(
@@ -48,7 +51,9 @@ public enum SignedPeerEvidenceStore {
         dataRoot: URL
     ) async throws {
         let cleanID = eventID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanID.isEmpty, cleanID.utf8.count <= 128 else { return }
+        guard !cleanID.isEmpty, cleanID.utf8.count <= 128 else {
+            throw PersistenceCoreError.ioFailure("Signed phone evidence needs its authenticated event ID (1–128 UTF-8 bytes).")
+        }
         let url = path(dataRoot: dataRoot)
         let candidate = SignedPeerEvidence(
             eventID: cleanID,
@@ -56,15 +61,23 @@ public enum SignedPeerEvidenceStore {
             peerCreatedAt: peerCreatedAt,
             observedAt: observedAt
         )
-        try await SwiftNativePersistenceCore.withFileLock(url) {
-            if let current = load(dataRoot: dataRoot), current.contactAt > candidate.contactAt {
-                return
+        do {
+            try await SwiftNativePersistenceCore.withFileLock(url) {
+                if let current = try load(dataRoot: dataRoot), current.contactAt > candidate.contactAt {
+                    return
+                }
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                encoder.outputFormatting = [.sortedKeys]
+                let data = try encoder.encode(candidate)
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
             }
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.sortedKeys]
-            let data = try encoder.encode(candidate)
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
+        } catch {
+            RepairOwed.owe(dataRoot, id: "signed-peer:" + cleanID, kind: .run,
+                operation: "mobile.signed_peer_evidence", owner: url.path,
+                words: "The authenticated phone contact could not be saved: " + error.localizedDescription,
+                tap: "Repair mobile/signed_peer_evidence.json and its access, preserving existing evidence, then reconnect.")
+            throw error
         }
     }
 }

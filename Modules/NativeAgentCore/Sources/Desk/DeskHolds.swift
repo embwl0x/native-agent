@@ -30,7 +30,7 @@ extension SwiftNativeDeskStore {
     /// kept and it younger than `runHoldLimit`. One whose step was closed or
     /// never came is void, and its checkpoint goes with it, here: no closing
     /// path has to remember the hold.
-    func isLive(_ hold: DeskHold, now: Date, state: DeskState) -> Bool {
+    func isLive(_ hold: DeskHold, now: Date, state: DeskState) throws -> Bool {
         guard hold.by.hasPrefix("run ") else { return now.timeIntervalSince(hold.at) < Self.holdLease }
         let run = String(hold.by.dropFirst(4))
         let age = now.timeIntervalSince(hold.at)
@@ -41,8 +41,8 @@ extension SwiftNativeDeskStore {
                 && item.refs.contains { if case .step(let step) = $0.kind { MyQueue.skillRun(in: step.words) == run } else { false } }
         }
         let bound = steps.isEmpty ? age < Self.holdLease : steps.contains { !$0.status.isTerminal }
-        guard PartRunStore.exists(run, root: dataRoot), age < Self.runHoldLimit, bound else {
-            PartRunStore.discard(run, root: dataRoot)
+        guard try PartRunStore.exists(run, root: dataRoot), age < Self.runHoldLimit, bound else {
+            try PartRunStore.discard(run, root: dataRoot)
             return false
         }
         return true
@@ -57,7 +57,7 @@ extension SwiftNativeDeskStore {
     public func heldBy(_ ref: String, session: String, now: Date = Date()) async throws -> String? {
         try await editHolds(now: now) { holds, state in
             guard let item = Self.holdItem(ref, state), let held = holds[item.handle],
-                  isLive(held, now: now, state: state), held.session != session else { return nil }
+                  try isLive(held, now: now, state: state), held.session != session else { return nil }
             return held.by
         }
     }
@@ -66,12 +66,12 @@ extension SwiftNativeDeskStore {
         try await editHolds(now: now) { holds, state in
             let items = refs.compactMap { Self.holdItem($0, state) }
             for item in items {
-                if let held = holds[item.handle], isLive(held, now: now, state: state), held.session != session {
+                if let held = holds[item.handle], try isLive(held, now: now, state: state), held.session != session {
                     return held.by
                 }
             }
             for item in items {
-                if let held = holds[item.handle], isLive(held, now: now, state: state), held.by.hasPrefix("run ") { continue }
+                if let held = holds[item.handle], try isLive(held, now: now, state: state), held.by.hasPrefix("run ") { continue }
                 holds[item.handle] = DeskHold(by: "conversation " + session, session: session, at: now)
             }
             return nil
@@ -84,7 +84,7 @@ extension SwiftNativeDeskStore {
             var names: [String] = []
             for ref in refs {
                 guard let item = Self.holdItem(ref, state), !names.contains("desk." + item.alias) else { continue }
-                if let held = holds[item.handle], isLive(held, now: now, state: state), held.session != session { continue }
+                if let held = holds[item.handle], try isLive(held, now: now, state: state), held.session != session { continue }
                 holds[item.handle] = DeskHold(by: "run " + run, session: session, at: now)
                 names.append("desk." + item.alias)
             }
@@ -118,7 +118,7 @@ extension SwiftNativeDeskStore {
     }
     /// One compare-and-set under the ops flock; what no longer binds (lapsed,
     /// or on an item closed or gone) is dropped as it is written.
-    private func editHolds<T: Sendable>(now: Date, _ edit: @Sendable (inout [String: DeskHold], DeskState) -> T) async throws -> T {
+    private func editHolds<T: Sendable>(now: Date, _ edit: @Sendable (inout [String: DeskHold], DeskState) throws -> T) async throws -> T {
         try await SwiftNativePersistenceCore.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
             let state = Self.compact(base: feed.base, feed.ops)
@@ -132,9 +132,9 @@ extension SwiftNativeDeskStore {
                 throw PersistenceCoreError.ioFailure("Desk holds at \(holdsPath.path) are unavailable: \(error.localizedDescription). Existing bytes were preserved.")
             }
             let before = holds
-            let result = edit(&holds, state)
+            let result = try edit(&holds, state)
             let open = Set(state.items.filter { !$0.status.isTerminal }.map(\.handle))
-            holds = holds.filter { open.contains($0.key) && isLive($0.value, now: now, state: state) }
+            holds = try holds.filter { try open.contains($0.key) && isLive($0.value, now: now, state: state) }
             if holds != before {
                 try SwiftNativePersistenceCore.writeDataAtomicDurable(try JSONEncoder().encode(holds), to: holdsPath)
             }

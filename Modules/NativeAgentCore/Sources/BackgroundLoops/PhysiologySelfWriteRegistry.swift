@@ -33,6 +33,12 @@ public final class PhysiologySelfWriteRegistry: @unchecked Sendable {
 
     public init() {}
 
+    /// One carried work identity across its reflex and model turn, independent
+    /// of whichever authored part it calls.
+    public static func intentionWriteID(_ work: String, _ url: URL) -> String {
+        "intention:" + work + ":" + url.standardizedFileURL.path
+    }
+
     /// Arm suppression for `loopId` over `paths`. Called by the event stream as
     /// it builds its watcher. Re-arming (a listener restart) drops any previous
     /// stamp: a rebuilt listener must not inherit a suppression decision taken

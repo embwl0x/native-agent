@@ -17,8 +17,10 @@ A complete proposition may have a one-word object. Historical automatic-source
 facts such as “user likes coffee” are not rejected for object length when read;
 source metadata does not make that complete thought disappear from recall or
 derived context. New writing still follows the naming standard below.
-MemoryV2's `MemoryCandidateQuality` prepares source eligibility, kind and preference
-payload once, then applies the ordered rejection rules for writes and derived reads.
+MemoryV2's `MemoryCandidateQuality` rejects empty content, transient session state
+and tool noise for every source. The retired automatic-source fragment/vapor word
+lists are removed after checking retained memories and proposals for their source
+labels; current semantic eligibility belongs to the shared interpretation.
 
 **It names who.** The person by name, the agent by name; "the user" and "the assistant" are
 not people.
@@ -37,4 +39,6 @@ Settings: the app knows those; the store does not need them.
 
 **The graph follows the text.** Entities are people, places and organisations the tagger is
 sure of, plus the project's known terms and code identifiers written in backticks. A capital
-letter is not an entity.
+letter is not an entity. An undetected language stays unknown. The writer's
+declared kind establishes a typed primary-user relation; other facts are
+`remembers`, without guessing preferences, goals or decisions from their words.

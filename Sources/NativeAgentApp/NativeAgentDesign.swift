@@ -187,29 +187,27 @@ struct PulsingDot: View {
     var size: CGFloat = 8
     var animates: Bool = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var pulse = false
 
     var body: some View {
         let shouldAnimate = animates && !reduceMotion
 
         ZStack {
             if shouldAnimate {
-                Circle().fill(color.opacity(0.35))
-                    .frame(width: size * 2.2, height: size * 2.2)
-                    .scaleEffect(pulse ? 1 : 0.5)
-                    .opacity(pulse ? 0 : 0.6)
+                // Drawn from the clock: SwiftUI's repeatForever trapped in layout (10-31 crash).
+                TimelineView(.animation(minimumInterval: 1.0 / 30)) { context in
+                    let t = NativeAgentMotion.loopPhase(at: context.date, period: NativeAgentMotion.breatheDuration)
+                    let eased = t * t * (3 - 2 * t)
+                    Circle().fill(color.opacity(0.35))
+                        .frame(width: size * 2.2, height: size * 2.2)
+                        .scaleEffect(0.5 + 0.5 * eased)
+                        .opacity(0.6 * (1 - eased))
+                }
             }
             Circle().fill(color)
                 .frame(width: size, height: size)
                 .shadow(color: shouldAnimate ? color.opacity(0.45) : .clear, radius: shouldAnimate ? 2 : 0)
         }
         .frame(width: size, height: size)
-        .onAppear {
-            guard shouldAnimate else { return }
-            withAnimation(NativeAgentMotion.pulse) {
-                pulse = true
-            }
-        }
     }
 }
 

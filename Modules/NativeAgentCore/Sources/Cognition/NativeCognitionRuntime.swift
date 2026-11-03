@@ -2,6 +2,7 @@ import Foundation
 import ApprovalInbox
 import ChatToolRuntime
 import AgentConversations
+import AgentWorkspace
 import CognitiveSubstrate
 import Context
 import ContextFlow
@@ -19,7 +20,7 @@ import BackgroundLoops
 import ChatTurnRuntime
 import DreamREMCycle
 import ProviderRouting
-// Blueprint: | `NativeCognitionRuntime.swift` | `NativeCognitionRuntime` actor composition, retained state and sensory admission; run-scoped turn classification and live-turn latches |
+// Blueprint: | `NativeCognitionRuntime.swift` | `NativeCognitionRuntime` actor composition, retained state and sensory admission; run-scoped turn classification; a live turn is read from ChatTurnSteering's open windows, never mirrored from events |
 
 public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     public let dataRoot: URL
@@ -49,8 +50,14 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     /// Reentrant launch callers join one bootstrap task.
     var bootstrapTask: Task<Void, Never>?
     var bootstrapChoresTask: Task<Void, Never>?
-    var recentLifeTask: Task<Void, Never>?
     var bootstrapFailure: String?
+    let cognitiveStoreOpeningFailure: String?
+    let caringReceiptLog: CaringReceiptLog
+    var eventReplayTask: Task<LoopTickOutcome, Never>?
+    var eventReplayAgain = false
+    var replayTask: Task<LoopTickOutcome, Never>?
+    /// nil means no automatic reflection is requested (dream work owns it).
+    var replayReflectionMaterial: [String: CognitiveReflectionCause]?
     /// One process-local subscription to the canonical ApprovalInbox owner.
     /// It turns durable request/resolution edges into correlated body evidence.
     var approvalLifecycleObservationTask: Task<Void, Never>?
@@ -88,6 +95,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     var horizonRefreshTask: Task<Void, Never>?
     var reachTask: Task<Void, Never>?
     var sourceWakes = CognitiveSourceWakes()
+    var rhythm = RhythmRuntimeState()
     var lastStudioCanonTendingAt: Date?
     var lastStudioRelationAuditVerdict: String?
     public static let eventDrivenReplayDeadlineSeconds: TimeInterval = 10
@@ -129,8 +137,11 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     var pursuitRefreshQueued = false
     var pursuitObservationTask: Task<Void, Never>?
     var carriedExperienceObservationTask: Task<Void, Never>?
+    var turnIdleObservationTask: Task<Void, Never>?
     var carriedReleaseRunning = false
     var carriedReleaseAgain = false
+    /// Direct intention speech and its Desk/wake-ledger settlement share one flight.
+    var carriedSayInFlight = false
     var pursuitRefreshTask: Task<Void, Never>?
     var organismContinuityRestored = false
     /// True once the body's restore has FINISHED (decoded, absent, or failed
@@ -141,7 +152,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     /// THE DOOR: one fold at a time, exclusive with Clear, Reset Body and
     /// restore (`enterDoor` / `leaveDoor`, +Door).
     var doorHeld = false
-    var doorWaiters: [CheckedContinuation<Void, Never>] = []
+    var doorDone = ScopedWaiter()
     /// A failed organism decode freezes continuity persistence.
     var organismRestoreFailedHard = false
     /// Organism continuity writes are serialized through one coalescing drain.
@@ -152,7 +163,11 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     var organismPersistenceCompletedGeneration: UInt64 = 0
     var organismPersistenceLatestReason = "bootstrap"
     var organismPersistenceDrainTask: Task<Void, Never>?
-    var organismPersistenceWaiters: [UInt64: [CheckedContinuation<Bool, Never>]] = [:]
+    struct OrganismPersistenceWait {
+        let done: ScopedWaiter
+        var result: Bool?
+    }
+    var organismPersistenceWaiters: [UInt64: [UUID: OrganismPersistenceWait]] = [:]
     var organismPersistenceLastResult = true
     var organismPersistenceLastWriteAt: ContinuousClock.Instant?
     var organismPersistenceDebounceTask: Task<Void, Never>?
@@ -181,42 +196,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
         nonLiveTurnKindRunOrder.removeAll { $0 == runId }
     }
 
-    /// Unique admitted runs in admission order, independent of microcycles.
-    private var liveTurnRunOrder: [String] = []
-    static let maximumLiveTurnRuns = 64
-    /// Admission edge. The user's message row is persisted and observed BEFORE
-    /// the provider call begins, so this is the earliest honest "a turn is
-    /// running" moment the runtime is given.
-    func noteTurnStarted(runId: String) {
-        let key = runId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else { return }
-        if !liveTurnRunOrder.contains(key) {
-            liveTurnRunOrder.append(key)
-        }
-        while liveTurnRunOrder.count > Self.maximumLiveTurnRuns {
-            liveTurnRunOrder.removeFirst()
-        }
-    }
-
-    /// Terminal settlement edge: the assistant reply (or the run's provider
-    /// failure) has been persisted. Cancelled turns still append their assistant
-    /// row, so they release the latch too.
-    func noteTurnFinished(runId: String) {
-        let key = runId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty else { return }
-        liveTurnRunOrder.removeAll { $0 == key }
-    }
-
-    /// Latch the admission edge off the event the runtime already receives.
-    func noteChatTurnAdmission(_ event: CognitiveEvent) {
-        guard event.kind == .userMessageReceived,
-              case .string(let runId)? = event.metadata["runId"] else { return }
-        noteTurnStarted(runId: runId)
-    }
-
-    /// Turns admitted and not yet terminal, including long-running work.
-    func liveTurnLatchCount() -> Int { liveTurnRunOrder.count }
-
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         host: any CognitionHost,
@@ -244,7 +223,15 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
             dataRoot: dataRoot,
             defaults: preferenceDefaults
         )
-        let store = try? CognitiveSQLiteStore(dataRoot: dataRoot)
+        let store: CognitiveSQLiteStore?
+        do {
+            store = try CognitiveSQLiteStore(dataRoot: dataRoot)
+            self.cognitiveStoreOpeningFailure = nil
+        } catch {
+            store = nil
+            self.cognitiveStoreOpeningFailure = "cognitive store open failed: \(error.localizedDescription)"
+        }
+        self.caringReceiptLog = CaringReceiptLog(dataRoot: dataRoot)
         self.cognitiveStore = store
         let attentionProjection = ResidentAttention()
         self.attentionProjection = attentionProjection
@@ -264,18 +251,16 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
         )
         let growthProjection = GrowthWeekFace(dataRoot: root, host: host)
         self.substrate = CognitiveSubstrate(
-            configuration: store == nil
-                ? Self.configurationWithoutPersistence(configuration)
-                : configuration,
+            configuration: configuration,
             dependencies: CognitiveSubstrateDependencies(
                 now: now,
-                userName: { NativeCognitionRuntime.resolveUserName(dataRoot: root) },
+                userName: { try NativeCognitionRuntime.resolveUserName(dataRoot: root) },
                 attentionProjectionSink: { signals in
                     attentionProjection.replaceSubstrate(signals)
                 },
                 // Resolve traits once per calculation so edits take effect on its next read.
                 dynamics: {
-                    let traits = PersonaCompiler.loadProfile(dataRoot: root).traits
+                    let traits = try PersonaCompiler.compileProfile(dataRoot: root).traits
                     return .derived(warmth: traits.warmth, humor: traits.humor)
                 },
                 // Last night's dream residue and what happened in a
@@ -296,11 +281,16 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
                 },
                 // Warm only. `mind.reflect` can run this inside a
                 // live turn, so it never loads the model or takes its load
-                // lock; cold means the lexical match alone.
+                // lock. A resident inference failure remains unavailable.
                 embedTexts: { texts in
-                    await SwiftNativeMemoryV2.resolvedOwner(dataRoot: root).embedIfWarm(texts)
+                    guard let batch = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: root).embedIfWarmWithEpoch(texts) else { return nil }
+                    return CognitiveEmbeddingBatch(epoch: batch.epoch.rawValue, vectors: batch.vectors)
                 },
+                embeddingEpoch: { await SwiftNativeMemoryV2.resolvedOwner(dataRoot: root).warmEmbeddingEpoch() },
                 peerTrusted: { PeerTrust.ownerTrusts($0, dataRoot: root) },
+                carePersonAliases: {
+                    try AgentContactIdentity(dataRoot: root, peers: AgentPeerStore(dataRoot: root).list()).aliases
+                },
                 surfaceIsPrivate: {
                     MemoryRecordDisclosurePolicy.localPrivateSurfaces.contains(
                         MemoryRecordDisclosurePolicy.canonicalSurface($0))
@@ -310,12 +300,20 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
                 },
                 decisions: {
                     do {
-                        return try await SwiftNativeApprovalInbox(root: root)
-                            .decisionsForREM()
+                        return CognitiveCueRead(try await SwiftNativeApprovalInbox(root: root)
+                            .decisionsForREM())
                     } catch {
-                        nativeLog("[cognition] decision unavailable: \(error)")
-                        return [:]
+                        return CognitiveCueRead([:], unreadable: ["Approval decisions unavailable: \(error.localizedDescription). Repair the approval store before reading proposal outcomes."])
                     }
+                },
+                remReplacements: {
+                    let read = REMProposalStore(dataRoot: root).loadAllChecked()
+                    guard read.unreadable.isEmpty else {
+                        return CognitiveCueRead<[String: String]>([:], unreadable: read.unreadable)
+                    }
+                    var descriptions: [String: String] = [:]
+                    for row in read.rows { descriptions[row.id] = REMReplacement.describe(row.replaced) }
+                    return CognitiveCueRead(descriptions, unreadable: read.unreadable)
                 },
                 growthProjection: { await growthProjection.read($0) }
             ),
@@ -330,9 +328,12 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
 
     deinit {
         sourceWakes.cancelObservations()
+        rhythm.observation?.cancel()
+        rhythm.refresh?.cancel()
         approvalLifecycleObservationTask?.cancel()
         pursuitObservationTask?.cancel()
         carriedExperienceObservationTask?.cancel()
+        turnIdleObservationTask?.cancel()
         pursuitRefreshTask?.cancel()
         organismPersistenceDrainTask?.cancel()
     }
@@ -340,9 +341,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     public func observe(_ event: CognitiveEvent) async {
         await bootstrap()
         let inherited = inheritNonLiveTurnKind(for: event)
-        // Chat-turn lifecycle latch opens at admission, BEFORE the provider
-        // call this event's run is about to make (see `noteTurnStarted`).
-        noteChatTurnAdmission(inherited.event)
         let admission = await substrate.ingestResident(inherited.event)
         // Semantic consequences arrive with the admission that produced them.
         var enriched = inherited.event
@@ -357,7 +355,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
         }
         if let completedRunId = inherited.completedRunId {
             finishNonLiveTurn(runId: completedRunId)
-            noteTurnFinished(runId: completedRunId)
         }
         // Exact replay is inert across both resident owners. It must not create
         // settlement work, invalidations, or telemetry.
@@ -493,10 +490,10 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
         return concern
     }
 
-    /// True from chat-turn admission through terminal settlement, counted by
-    /// runId. Internal microcycles are not turns and do not hold her free time.
+    /// True while a turn of hers is open: ChatTurnSteering's windows, the one
+    /// owner. Internal microcycles are not turns and do not hold her free time.
     public var liveTurnInFlight: Bool {
-        liveTurnLatchCount() > 0
+        ChatTurnSteering.hasOpenResidentTurn(dataRoot: dataRoot)
     }
 
 }

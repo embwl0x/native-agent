@@ -84,9 +84,12 @@ import TrustPersistence
             case .failed(_, let detail): return (false, "\(support ? "Support bundle" : "Export") failed: \(detail)." + retry, [:])
             }
         case "backup_now":
-            let backup = await appModel.createBackup(reason: "upkeep backup_now")
-            return backup.map { (true, appModel.statusForAgent, ["id": .string($0.id), "created_at": .string($0.createdAt)]) }
-                ?? (false, appModel.statusForAgent, [:])
+            let result = await appModel.createBackup(reason: "upkeep backup_now")
+            switch result {
+            case .created(let backup, let message):
+                return (true, message, ["id": .string(backup.id), "created_at": .string(backup.createdAt)])
+            case .failed(let message): return (false, message, [:])
+            }
         case "embeddings_pause":
             let download = EmbeddingModelDownloadController.shared
             guard download.status.running else {
@@ -99,7 +102,7 @@ import TrustPersistence
             guard !download.status.running, !download.activating else {
                 return (true, "Already running: \(download.status.phase).", ["changed": .bool(false)])
             }
-            download.start(createOnly: false, reconcile: true)
+            download.start(createOnly: false)
             return (true, "Checking and resuming the memory-search model download. \(AppToolExecutor.doorDoctor) shows its progress.", ["changed": .bool(true)])
         case "spotlight_reindex":
             let outcome = await MemorySpotlightReindexOperation.run(dataRoot: appModel.engine.dataRoot)
@@ -112,13 +115,16 @@ import TrustPersistence
             case .success(let target): backup = target
             case .failure(let failure): return (false, failure.detail, failure.fields.merging(["effects": .string("none")]) { $1 })
             }
-            await appModel.restoreBackup(backup)
-            guard case .saved? = appModel.trustCenterActionOutcome else { return (false, appModel.statusForAgent + retry, [:]) }
+            let message: String
+            switch await appModel.restoreBackup(backup) {
+            case .saved(let detail): message = detail
+            case .failed(let detail): return (false, detail + retry, [:])
+            }
             // Awaited: a restore that stages restarts the app once this turn ends.
             _ = await HarnessDecidedRow.record(requester: "Full Mac", tool: "backup.restore \(backup.id)",
                                                sessionID: input["__session_id"]?.scalarText,
                                                dataRoot: appModel.engine.dataRoot)
-            return (true, appModel.statusForAgent, ["id": .string(backup.id)])
+            return (true, message, ["id": .string(backup.id)])
         case "activity_wipe":
             let activity = appModel.engine.activityWatch
             let removed: Int
@@ -143,13 +149,13 @@ import TrustPersistence
 extension AppQuietToolHost: QuietInboxHost {
     var inboxDataRoot: URL { appModel.engine.inbox.dataRoot }
     var interactionSource: String { InlineInteractionDelivery.source }
-    func interactionForInboxItem(_ id: String, dataRoot: URL) async -> InlineInteraction? {
-        guard let pointer = try? await InlineInteractionDelivery.pointer(id: id, dataRoot: dataRoot) else { return nil }
-        return await InlineInteractionResolver.interaction(id: pointer.interactionID, sessionID: pointer.sessionID, dataRoot: dataRoot)
+    func interactionForInboxItem(_ id: String, dataRoot: URL) async throws -> InlineInteraction? {
+        let pointer = try await InlineInteractionDelivery.pointer(id: id, dataRoot: dataRoot)
+        return try await InlineInteractionResolver.interaction(id: pointer.interactionID, sessionID: pointer.sessionID, dataRoot: dataRoot)
     }
     func readInbox() async throws -> [InboxItemRecord] { try await appModel.engine.inbox.list() }
     func inboxPresentation(_ item: InboxItemRecord) -> (hidden: Bool, linkedApproval: Bool, actions: [InboxActionRecord]) {
-        (item.isHiddenFromDefaultInbox, item.hasLinkedApproval, item.effectiveActions)
+        (item.isHiddenFromDefaultInbox, item.hasLinkedApproval, item.actions)
     }
     func performInboxAction(_ id: String, action: String, metadata: [String: JSONValue], quiet: Bool, dataRootOverride: URL?) async throws {
         try await InboxCardActions.perform(id, action: action, metadata: metadata, quiet: quiet,
@@ -176,7 +182,7 @@ extension AppQuietToolHost: QuietInboxHost {
             switch action {
             case "reject", "deny": return "Declined the card (Not now)."
             case "act": return "Opened the card's conversation on the Mac."
-            default: return "Selected the card's choice: \(item.effectiveActions.first { $0.id == action }?.label ?? action)."
+            default: return "Selected the card's choice: \(item.actions.first { $0.id == action }?.label ?? action)."
             }
         }
         switch InboxCardActions.resolvePrimaryAction(for: item) {
@@ -205,7 +211,7 @@ extension AppQuietToolHost {
             test: { try await appModel.engine.providers.testProvider($0) },
             authMode: {
                 let mode = ProvidersFacade.authModePickerState(
-                    advertisedModes: $0.auth_modes, savedMode: $0.auth_mode, providerIsReady: true)
+                    advertisedModes: $0.auth_modes, savedMode: $0.auth_mode)
                 return (mode.canSave, mode.selectedMode)
             },
             configure: { try await appModel.engine.configureProvider($0, apiKey: nil, authMode: $1, defaultModel: $2) },

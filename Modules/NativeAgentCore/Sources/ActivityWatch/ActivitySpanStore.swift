@@ -1,6 +1,6 @@
 import Foundation
 import GRDB
-// Blueprint: | `ActivitySpanStore.swift` | `ActivitySpanStore`; asynchronous per-root store acquisition shared by capture, retention and queries |
+// Blueprint: | `ActivitySpanStore.swift` | `ActivitySpanStore`; asynchronous per-root store acquisition shared by capture, retention and queries; retention deletes atomically owe durable compaction until VACUUM and both checkpoints succeed |
 
 /// Single-writer SQLite store for activity spans.
 ///
@@ -8,7 +8,8 @@ import GRDB
 /// `Configuration` + `DatabaseMigrator`). Own DB file, mode 0600, inside
 /// `<dataRoot>/activity_watch/activity_spans.sqlite`.
 ///
-/// One table; `title_redacted` holds redacted window titles.
+/// `activity_span.title_redacted` holds redacted window titles; a separate
+/// singleton row records physical compaction still owed by retention.
 public actor ActivitySpanStore {
     private actor Stores {
         var stores: [URL: (store: ActivitySpanStore, identity: NSObject)] = [:]
@@ -52,6 +53,11 @@ public actor ActivitySpanStore {
     let dbQueue: DatabaseQueue
 
     public init(databaseURL: URL) throws {
+        let newStore: Bool
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: databaseURL.path)
+            newStore = false
+        } catch CocoaError.fileReadNoSuchFile { newStore = true }
         let directory = databaseURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         self.databaseURL = databaseURL
@@ -64,7 +70,25 @@ public actor ActivitySpanStore {
             try db.execute(sql: "PRAGMA journal_size_limit = 4194304")
         }
         self.dbQueue = try DatabaseQueue(path: databaseURL.path, configuration: configuration)
-        try Self.migrator.migrate(dbQueue)
+        try dbQueue.write { db in
+            if try db.tableExists("activity_span") {
+                let columns = Set(try db.columns(in: "activity_span").map(\.name))
+                guard columns.isSuperset(of: ["id", "started_at", "ended_at", "last_seen_at", "bundle_id", "app_name", "event_count", "close_reason", "tz_offset_min", "title_redacted"]) else {
+                    throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: databaseURL.path])
+                }
+            } else {
+                guard newStore else {
+                    throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: databaseURL.path])
+                }
+                try Self.createSchema(db)
+            }
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS activity_compaction_owed (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    since DOUBLE NOT NULL
+                )
+                """)
+        }
 
         // Owner-only. This file is a record of where the human was; a
         // group/world-readable mode would be a privacy defect on its own.
@@ -155,26 +179,41 @@ public actor ActivitySpanStore {
 
     /// Deletes spans whose end (or last-seen, for still-open rows) predates the
     /// retention window, then VACUUMs so the bytes actually leave the file.
+    /// Deletion and its compaction debt commit together. A later pass retries
+    /// that debt even if no more rows expire, including after a process exit.
     @discardableResult
     public func prune(
         olderThan retention: TimeInterval = ActivitySpanStore.defaultRetention,
         now: Double = Date().timeIntervalSince1970
     ) throws -> Int {
         let cutoff = now - retention
-        let deleted = try dbQueue.write { db -> Int in
+        let result = try dbQueue.write { db -> (deleted: Int, compactionOwed: Bool) in
             try db.execute(
                 sql: "DELETE FROM activity_span WHERE COALESCE(ended_at, last_seen_at) < ?",
                 arguments: [cutoff]
             )
-            return db.changesCount
+            let deleted = db.changesCount
+            if deleted > 0 {
+                // Keep the first unpaid deletion's time until physical cleanup
+                // succeeds; subsequent deletions join the same obligation.
+                try db.execute(
+                    sql: "INSERT INTO activity_compaction_owed (id, since) VALUES (1, ?) ON CONFLICT(id) DO NOTHING",
+                    arguments: [now]
+                )
+            }
+            let since = try Double.fetchOne(db, sql: "SELECT since FROM activity_compaction_owed WHERE id = 1")
+            if let since, !since.isFinite {
+                throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: databaseURL.path])
+            }
+            return (deleted, since != nil)
         }
-        if deleted > 0 {
+        if result.compactionOwed {
             try checkpointAndVacuum()
         } else {
             // Retention checkpoints the WAL even when no rows expire.
             try checkpointWAL()
         }
-        return deleted
+        return result.deleted
     }
 
     @discardableResult
@@ -278,6 +317,9 @@ public actor ActivitySpanStore {
             try checkpoint()
             try db.execute(sql: "VACUUM")
             try checkpoint()
+            // A crash or failure before this commit leaves the obligation for
+            // the next pass. Clearing it never precedes physical cleanup.
+            try db.execute(sql: "DELETE FROM activity_compaction_owed WHERE id = 1")
         }
     }
 
@@ -310,40 +352,19 @@ public actor ActivitySpanStore {
         )
     }
 
-    // MARK: - Migration
+    // MARK: - Current schema
 
-    /// Migrations are append-only: GRDB records identifiers, not SQL, so changing
-    /// an applied migration would leave existing databases with divergent schemas.
-    static var migrator: DatabaseMigrator {
-        var migrator = DatabaseMigrator()
-        // The original schema has no title column; only redacted titles may be stored.
-        migrator.registerMigration("activity_span_v0") { db in
-            try db.execute(sql: """
-                CREATE TABLE activity_span (
-                    id TEXT PRIMARY KEY,
-                    started_at DOUBLE NOT NULL,
-                    ended_at DOUBLE NULL,
-                    last_seen_at DOUBLE NOT NULL,
-                    bundle_id TEXT NOT NULL,
-                    app_name TEXT NOT NULL,
-                    event_count INTEGER NOT NULL,
-                    close_reason TEXT NULL,
-                    tz_offset_min INTEGER NOT NULL
-                );
-
-                CREATE INDEX idx_activity_span_started_at
-                    ON activity_span (started_at);
-
-                CREATE INDEX idx_activity_span_bundle_started
-                    ON activity_span (bundle_id, started_at);
-                """)
-        }
-        // Add nullable `title_redacted` in place, preserving existing measurements.
-        migrator.registerMigration("activity_span_v1_title_redacted") { db in
-            try db.execute(sql: """
-                ALTER TABLE activity_span ADD COLUMN title_redacted TEXT NULL;
-                """)
-        }
-        return migrator
+    static func createSchema(_ db: Database) throws {
+        try db.execute(sql: """
+            CREATE TABLE activity_span (
+                id TEXT PRIMARY KEY, started_at DOUBLE NOT NULL,
+                ended_at DOUBLE NULL, last_seen_at DOUBLE NOT NULL,
+                bundle_id TEXT NOT NULL, app_name TEXT NOT NULL,
+                event_count INTEGER NOT NULL, close_reason TEXT NULL,
+                tz_offset_min INTEGER NOT NULL, title_redacted TEXT NULL
+            );
+            CREATE INDEX idx_activity_span_started_at ON activity_span (started_at);
+            CREATE INDEX idx_activity_span_bundle_started ON activity_span (bundle_id, started_at);
+            """)
     }
 }

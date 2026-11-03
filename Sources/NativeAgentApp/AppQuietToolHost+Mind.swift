@@ -4,7 +4,7 @@ import Foundation
 import NativeAgentShared
 import PersistenceCore
 import ToolExecution
-// Blueprint: | `AppQuietToolHost+Mind.swift` | `AppQuietToolHost`: `runMind`, `managePart` |
+// Blueprint: | `AppQuietToolHost+Mind.swift` | `AppQuietToolHost`: runMind wires real and preview dream callbacks separately; preview failures retain inert mind.run_now evidence; managePart |
 
 extension AppQuietToolHost {
     // MARK: - mind_run
@@ -30,10 +30,19 @@ extension AppQuietToolHost {
         return await AppToolExecutor.runQuietMind(
             verb: verb, input: input, runtime: NativeAgentEngine.liveCognition,
             dataRoot: appModel.engine.dataRoot, remPolicy: trustPolicy,
-            dreamEnabled: { await dreamEnabled() },
+            dreamEnabled: { try await dreamEnabled() },
             runDream: {
                 let succeeded = await appModel.runDreamPassForDreams()
                 return (succeeded, appModel.statusForAgent, appModel.dreamError)
+            }, previewDream: {
+                do {
+                    let result = try await NativeAgentEngine.previewDream(dataRoot: appModel.engine.dataRoot)
+                    return (result.ok, result.why, result.json)
+                } catch {
+                    let result = NativeCognitionRuntime.recordClockRun("dream", .init("unavailable", error.localizedDescription,
+                        fields: ["preview": .bool(true), "effects": .string("none"), "execution": .string("preview")]))
+                    return (false, result.why, result.json)
+                }
             }, runREM: {
                 let feedback = await appModel.runRemPass()
                 return (feedback.isSuccess, feedback.message)

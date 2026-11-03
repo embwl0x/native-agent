@@ -58,18 +58,23 @@ func productionFiles(repo: URL) throws -> [URL] {
         throw TimerInventoryError.invalidRule("blueprint must contain exactly one closed architecture-policy JSON block")
     }
     let roots = try JSONDecoder().decode(Scope.self, from: Data(json.utf8)).sourceRoots
+    guard !roots.isEmpty else { throw TimerInventoryError.invalidRule("production source roots are empty") }
     let fm = FileManager.default
-    return roots.flatMap { relative -> [URL] in
+    return try roots.flatMap { relative -> [URL] in
         let root = repo.appendingPathComponent(relative, isDirectory: true)
+        var enumerationError: Error?
         guard let enumerator = fm.enumerator(
             at: root,
             includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
-        return enumerator.compactMap { item -> URL? in
+            options: [.skipsHiddenFiles],
+            errorHandler: { _, error in enumerationError = error; return false }
+        ) else { throw TimerInventoryError.invalidRule("cannot enumerate production root: \(relative)") }
+        let files = enumerator.compactMap { item -> URL? in
             guard let url = item as? URL, url.pathExtension == "swift" else { return nil }
             return url
         }
+        if let enumerationError { throw enumerationError }
+        return files
     }.sorted { $0.path < $1.path }
 }
 
@@ -79,9 +84,11 @@ func occurrences(repo: URL) throws -> [(path: String, line: Int, source: String)
         ? canonicalRepo.path
         : canonicalRepo.path + "/"
     return try productionFiles(repo: repo).flatMap { file -> [(String, Int, String)] in
-        guard let body = try? String(contentsOf: file, encoding: .utf8) else { return [] }
+        let body = try String(contentsOf: file, encoding: .utf8)
         let canonicalFile = file.resolvingSymlinksInPath().standardizedFileURL.path
-        guard canonicalFile.hasPrefix(repoPrefix) else { return [] }
+        guard canonicalFile.hasPrefix(repoPrefix) else {
+            throw TimerInventoryError.invalidRule("production source escapes repository: \(file.path)")
+        }
         let relative = String(canonicalFile.dropFirst(repoPrefix.count))
         return body.split(separator: "\n", omittingEmptySubsequences: false)
             .enumerated()

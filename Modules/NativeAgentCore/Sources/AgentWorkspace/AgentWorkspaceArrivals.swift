@@ -150,9 +150,9 @@ package enum AgentWorkspaceArrivals {
         return await AgentWorkspaceNavigation.shared.arrivalNotice(dataRoot: dataRoot, scope: scope, announce: announce)
     }
 
-    static func hash(_ value: JSONValue) -> String {
+    static func hash(_ value: JSONValue) throws -> String {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
-        let bytes = (try? encoder.encode(value)) ?? Data()
+        let bytes = try encoder.encode(value)
         return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
@@ -196,7 +196,7 @@ package enum AgentWorkspaceArrivals {
                 input = exact.filter { ["agent", "message_id"].contains($0.key) }
             } else if !row.agent.hasPrefix("bot:") { input["conversation"] = .string(row.label) }
             let location = AgentWorkspaceLocation.record(tool: "agent_read", input: input, title: row.name + " — " + row.label)
-            let fingerprint = AgentWorkspaceChanges.workspaceChangeObservation(row, location: location, previous: nil)?.nextStamp?.fingerprint
+            let fingerprint = try AgentWorkspaceChanges.workspaceChangeObservation(row, location: location, previous: nil)?.nextStamp?.fingerprint
                 ?? hash(.object(receipt.filter { !["updated_at", "read_at", "polled_at"].contains($0.key) }))
             return .init(source: "agents:" + row.id,
                 revision: row.operationID + ":" + row.phase + ":" + fingerprint,
@@ -242,13 +242,13 @@ final class AgentWorkspaceArrivalMonitor: @unchecked Sendable {
 }
 
 extension AgentWorkspaceNavigation {
-    func refreshArrivals(key: String, scope: String, dataRoot: URL) async {
+    func refreshArrivals(key: String, scope: String, dataRoot: URL, retryUnavailable: Bool = false) async {
         guard sessions[key] != nil else { return }
         if sessions[key]?.arrivals == nil {
             sessions[key]?.arrivals = .init(monitor: AgentWorkspaceArrivalMonitor(dataRoot: dataRoot))
         }
         guard var state = sessions[key]?.arrivals, !state.refreshing else { return }
-        let changed = state.monitor.takeChanged()
+        let changed = state.monitor.takeChanged().union(retryUnavailable ? state.unavailable : [])
         guard !changed.isEmpty else { return }
         let previousIDs = Set(state.pending.map(\.id))
         state.refreshing = true; sessions[key]?.arrivals = state
@@ -266,16 +266,19 @@ extension AgentWorkspaceNavigation {
         if !humanIDs.isEmpty, changed.contains("human") {
             do {
                 let rows = try HumanConversationIndex.rows(dataRoot: dataRoot)
-                let candidates = rows.compactMap { row -> AgentWorkspaceArrivals.Candidate? in
+                let candidates = try rows.compactMap { row -> AgentWorkspaceArrivals.Candidate? in
                     guard let id = row["id"]?.stringValue, humanIDs.contains(id) else { return nil }
-                    let generation: String
-                    if case .int(let value)? = row["lastConversationGeneration"] { generation = String(value) }
-                    else { generation = "legacy" }
+                    guard case .int(let current)? = row["lastConversationGeneration"] else {
+                        throw ToolFailureError("Conversation revision is unavailable for " + id, effects: .none,
+                            owner: dataRoot.appendingPathComponent("chat/sessions.json").path,
+                            instruction: "Refresh the conversation index from its transcript owner; do not invent a revision or preview stamp.", recovery: .repair)
+                    }
+                    let generation = String(current)
                     let title = row["title"]?.stringValue ?? "Conversation"
                     // The preview travels with the stamp the index kept beside it; one with none is not shown.
                     let stamp = HumanConversationIndex.previewStamp(row)
                     return .init(source: "human:" + id, revision: generation, title: title,
-                        kind: generation == "legacy" ? nil : .activity,
+                        kind: .activity,
                         location: .record(tool: "chat_conversations", input: ["conversation_session_id": .string(id)], title: title),
                         preview: stamp == nil ? nil : AgentWorkspaceArrivals.preview(row["lastMessagePreview"]?.stringValue,
                             source: "Conversation index preview", alreadyTruncated: true),
@@ -296,9 +299,9 @@ extension AgentWorkspaceNavigation {
                 // suspended; only this refresh owns baseline replacement.
                 let retained = Set(current.pending.map(\.id))
                 state.pending.removeAll { previousIDs.contains($0.id) && !retained.contains($0.id) }
-                let candidates = rows.filter { taskIDs.contains($0.taskId) }.map { row in
+                let candidates = try rows.filter { taskIDs.contains($0.taskId) }.map { row in
                     AgentWorkspaceArrivals.Candidate(source: "work:" + row.taskId,
-                        revision: AgentWorkspaceArrivals.hash(.object((row.toJSON().objectValue ?? [:])
+                        revision: try AgentWorkspaceArrivals.hash(.object((row.toJSON().objectValue ?? [:])
                             .filter { !["createdTs", "updatedTs"].contains($0.key) })), title: row.title ?? "Shared work",
                         kind: row.status == .done ? .finished : row.status == .blocked ? .decision : row.status == .cancelled ? .failure : nil,
                         location: .record(tool: "task_ledger_list", input: ["task_id": .string(row.taskId)], title: row.title ?? "Shared work"),
@@ -349,7 +352,9 @@ extension AgentWorkspaceNavigation {
             "meaning": .string("Observed owner changes since this resident workspace began. Opening is not resolving. Clear removes only the notice, never the work or its approval."),
             "pending": .int(Int64(items.count)), "more_at_sources": .bool(state?.overflow ?? false),
             "unavailable_sources": .array((state?.unavailable ?? []).sorted().map(JSONValue.string))
-        ]), items: items, actions: [])
+        ]), items: items, actions: [
+            .init(label: "Refresh arrivals", action: .open(.arrivals))
+        ])
     }
 
     func openArrival(_ id: String, key: String) throws -> AgentWorkspaceLocation {
@@ -396,7 +401,14 @@ extension AgentWorkspaceNavigation {
     func arrivalNotice(dataRoot: URL, scope: String, announce: Bool = true) async -> JSONValue? {
         let key = dataRoot.standardizedFileURL.path + "\u{0}" + scope
         if sessions[key] == nil {
-            guard let operation = try? begin(key: key, dataRoot: dataRoot, scope: scope) else { return nil }
+            let operation: UUID
+            do { operation = try begin(key: key, dataRoot: dataRoot, scope: scope) }
+            catch { return .object(["status": .string("unavailable"), "reason": .string("arrival_initialization_failed"),
+                "error": .string(error.localizedDescription), "effects": .string("none"),
+                "remedy": Repair.remedy(owner: AgentWorkspaceDesktopStore(dataRoot: dataRoot, scope: scope).fileURL.path, nextCall: nil,
+                    tap: ToolFailureError.fileRepairInstruction(AgentWorkspaceDesktopStore(dataRoot: dataRoot, scope: scope).fileURL,
+                        shape: "Preserve the saved desktop's references and drafts and restore its read access."),
+                    instruction: "Repair the saved desktop's reported read failure, then read home again; no arrivals were consumed.")]) }
             end(key: key, operation: operation)
         }
         await refreshArrivals(key: key, scope: scope, dataRoot: dataRoot)

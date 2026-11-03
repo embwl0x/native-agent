@@ -1,15 +1,15 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceActivity.swift` | Native Calendar/Reminders, shelf and shared-ledger adapters; ledger tasks and timelines carry More actions from the owner's next_offset; Today supplies checked reads and bound item/action keys to `workspace-readout.js`, including separate due-today and overdue count rows; helper selection/copy is owned by that part, not a Swift bot projection. Today starts independent Calendar and Reminders reads together in the requesting context. |
+// Blueprint: | `AgentWorkspaceActivity.swift` | Native Calendar/Reminders, shelf and shared-ledger adapters; ledger tasks and timelines carry More actions from the owner's next_offset; Today and Calendar share checked event collection availability; Today requires due-today/overdue groups and preserves each row's group identity; helper selection/copy is owned by workspace-readout.js. Today starts independent Calendar and Reminders reads together. |
 
 /// Native views over work, helpers and communication owners. Only typed fields
 /// at known owner boundaries create actions; prose and embedded recipes do not.
 enum AgentWorkspaceActivity {
     static let destinations: [AgentWorkspaceDestination] = [
-        .init(id: "ongoing", title: "Ongoing work", summary: "The live Desk and shared work in progress.", tool: "desk_read", input: ["structured": .bool(true)], tools: ["task_ledger_list", "delegation_status", "desk_add_item"]),
+        .init(id: "ongoing", title: "Ongoing work", summary: "The live Desk and shared work in progress.", tool: "desk_read", input: [:], tools: ["task_ledger_list", "delegation_status", "desk_add_item"]),
         .init(id: "today", title: "Today", summary: "Today's appointments and reminders, with overdue work clearly marked.", tool: nil, tools: ["mac_calendar_list_upcoming", "mac_reminders_list_due_today"]),
         .init(id: "helpers", title: "My helpers", summary: "Talk to a helper, run its job, or adjust its settings.", tool: "bot_list", tools: ["bot_create", "shelf_read"]),
-        .init(id: "replies", title: "Saved replies", summary: "Read helpers' newest saved answers and actual outcomes, including answers already read.", tool: "shelf_read", input: ["limit": .int(16), "include_read": .bool(true), "newest_first": .bool(true)]),
+        .init(id: "replies", title: "Saved replies", summary: "Read helpers' newest saved answers and actual outcomes, including answers already read.", tool: "shelf_read", input: ["limit": .int(16), "include_read": .bool(true), "sort": .string("newest_first")]),
         .init(id: "calendar", title: "Calendar", summary: "Upcoming events and appointments.", tool: "mac_calendar_list_upcoming", input: ["limit": .int(16)], tools: ["mac_calendar_create_event"]),
         .init(id: "reminders", title: "Reminders", summary: "Open tasks across all dates, including undated reminders.", tool: "mac_reminders_query", input: ["limit": .int(16)], tools: ["mac_reminders_create", "mac_reminders_query"]),
         .init(id: "mail", title: "Mail", summary: "Recent email, search, and compose.", tool: "mail_list_recent", input: ["limit": .int(16)], tools: ["mail_search", "mail_send"]),
@@ -70,19 +70,9 @@ enum AgentWorkspaceActivity {
         async let reminders = read(remindersSource.1, remindersSource.2)
         let values = try await [calendar, reminders]
         for ((area, tool, input), result) in zip([calendarSource, remindersSource], values) {
-            var value = result
-            let field = area == "Calendar" ? "events" : "reminders"
-            if value.objectValue?[field]?.arrayValue == nil {
-                value = .object(["status": .string("unavailable"),
-                    "detail": .string(area + " source did not supply its " + field + " array."), "source": value])
-            }
-            if area == "Reminders", ["completed", "ok"].contains(value.objectValue?["status"]?.stringValue ?? ""),
-               ["today", "overdue"].contains(where: { value.objectValue?[$0]?.objectValue?["reminders"]?.arrayValue == nil }) {
-                value = .object(["status": .string("unavailable"),
-                    "detail": .string("Reminders source did not supply its today and overdue parts."), "source": value])
-            }
-            let available = ["completed", "ok"].contains(value.objectValue?["status"]?.stringValue ?? "")
+            let value = result
             if let view = project(tool:tool,input:input,result:value) {
+                let available = ["completed", "ok"].contains(view.content.objectValue?["status"]?.stringValue ?? "")
                 let state = available ? (view.items.isEmpty ? "empty" : "available") : "unavailable"
                 sections.append(.object(["area":.string(area),"state":.string(state),"result":view.content,"shown":.int(Int64(view.items.count))]))
                 if area == "Reminders", available {
@@ -106,7 +96,8 @@ enum AgentWorkspaceActivity {
                     let month=DateFormatter()
                     month.dateFormat=due.map { Calendar.current.isDate($0,equalTo:Date(),toGranularity:.year) } == true ? "MMMM" : "MMMM yyyy"
                     facts.append(.object(["key":.string(key),"area":.string(area),"title":.string(item.title),
-                        "overdue":.bool(row["due_status"] == .string("overdue")),
+                        "overdue":["overdue", "due_today"].contains(row["due_status"]?.stringValue ?? "")
+                            ? .bool(row["due_status"] == .string("overdue")) : .null,
                         "due":due.map { .double($0.timeIntervalSince1970) } ?? .null,
                         "month":due.map { .string(month.string(from:$0)) } ?? .null,"actions":.array(keys)]))
                 }
@@ -125,11 +116,8 @@ enum AgentWorkspaceActivity {
     private static func replies(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
         var actions: [AgentWorkspaceButton] = []
         if let cursor = (result.objectValue ?? [:])["nextCursor"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) {
-            let allowed: Set<String> = ["id", "since", "topic", "limit", "include_read", "sort", "newest_first"]
+            let allowed: Set<String> = ["id", "since", "topic", "limit", "include_read", "sort"]
             var next = input.filter { allowed.contains($0.key) }
-            // A successful read has already checked that supplied references agree.
-            next["id"] = ["id", "bot_id", "bot", "name"].compactMap { input[$0] }
-                .first { $0 != .null && $0 != .string("") }
             next["cursor"] = .string(cursor)
             actions.append(read("More saved replies", tool: "shelf_read", input: next))
         }
@@ -191,6 +179,18 @@ enum AgentWorkspaceActivity {
     }
 
     private static func calendar(_ result: JSONValue) -> WorkspacePage {
+        if ["completed", "ok"].contains(result.objectValue?["status"]?.stringValue ?? "") {
+            guard let events = result.objectValue?["events"]?.arrayValue,
+                  events.allSatisfy({ $0.objectValue != nil }) else {
+                return .init(title: "Calendar", content: .object([
+                    "status": .string("unavailable"), "reason": .string("calendar_events_unavailable"),
+                    "detail": .string("Calendar did not supply a complete events collection."),
+                    "effects": .string("none"), "source": result,
+                    "remedy": Repair.remedy(owner: "mac_calendar_list_upcoming", nextCall: nil, tap: nil,
+                        instruction: "Repair the Calendar source's events collection, then refresh Calendar.")
+                ]), items: [], actions: [])
+            }
+        }
         // A day by name in one call (the old "choose" form ran the default read).
         let day = AgentWorkspaceButton(label: "One day", action: .perform(tool: "mac_calendar_list_upcoming", input: ["limit": .int(16)],
             title: "One day", textField: "day", isEffect: false), needsText: true)
@@ -205,7 +205,7 @@ enum AgentWorkspaceActivity {
             return .init(title: title, content: .object(row), actions: actions)
         }
         // An empty read says it read fine, so it is not taken for no access.
-        if projection.items.isEmpty, (result.objectValue ?? [:])["status"] == .string("completed"), case .object(var content) = projection.content {
+        if projection.items.isEmpty, ["completed", "ok"].contains(result.objectValue?["status"]?.stringValue ?? ""), case .object(var content) = projection.content {
             let hours: Int64 = if case .int(let n)? = (result.objectValue ?? [:])["hoursAhead"] { n } else { 24 }
             let span = (result.objectValue ?? [:])["day"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) ?? "in the next \(hours)h"
             content["message"] = .string("no events \(span) (calendar access ok)")
@@ -225,18 +225,14 @@ enum AgentWorkspaceActivity {
             arguments["offset"] = .int(next)
             buttons.append(read("Next page", tool: tool, input: arguments))
         }
-        var projection = list(title: "Reminders", result: .object(source), key: "reminders", actions: buttons) { row in
+        func item(_ row: [String: JSONValue]) -> AgentWorkspaceItem {
             var row = row
             let title = row["title"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }) ?? "Reminder"
-            if tool == "mac_reminders_list_due_today" {
-                // Use the part's frozen local day, including across a midnight read.
-                let dueToday = source["today"]?.objectValue?["reminders"]?.arrayValue ?? []
-                row["due_status"] = .string(dueToday.contains(.object(row)) ? "due_today" : "overdue")
-            } else if let due = row["dueAt"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }), let date = ISO8601DateFormatter().date(from: due) {
-                let today = Calendar.current.startOfDay(for: Date())
-                row["due_status"] = .string(date < today ? "overdue" : Calendar.current.isDateInToday(date) ? "due_today" : "future")
-            } else {
-                row["due_status"] = .string("undated")
+            if tool != "mac_reminders_list_due_today" {
+                if let due = row["dueAt"]?.stringValue.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }), let date = ISO8601DateFormatter().date(from: due) {
+                    let today = Calendar.current.startOfDay(for: Date())
+                    row["due_status"] = .string(date < today ? "overdue" : Calendar.current.isDateInToday(date) ? "due_today" : "future")
+                } else { row["due_status"] = .string("undated") }
             }
             var actions: [AgentWorkspaceButton] = []
             // Some owner versions omit the identifier. Never guess it from a title.
@@ -250,6 +246,35 @@ enum AgentWorkspaceActivity {
                 }
             }
             return .init(title: title, content: .object(row), actions: actions)
+        }
+        var projection: WorkspacePage
+        if tool == "mac_reminders_list_due_today" {
+            guard ["completed", "ok"].contains(source["status"]?.stringValue ?? "") else {
+                return .init(title: "Reminders", content: result, items: [], actions: buttons)
+            }
+            guard let overdue = source["overdue"]?.objectValue?["reminders"]?.arrayValue,
+                  let today = source["today"]?.objectValue?["reminders"]?.arrayValue,
+                  (overdue + today).allSatisfy({ $0.objectValue != nil }) else {
+                return .init(title: "Reminders", content: .object(["status": .string("unavailable"),
+                    "reason": .string("reminder_parts_unavailable"),
+                    "detail": .string("Reminders did not return readable today and overdue groups. Repair the due-reminders part's grouped result."),
+                    "effects": .string("none"), "source": result]), items: [], actions: buttons)
+            }
+            // Each row keeps the group from the part's frozen local day,
+            // including across midnight. No equality/name/date inference.
+            var items: [AgentWorkspaceItem] = []
+            for (rows, status) in [(overdue, "overdue"), (today, "due_today")] {
+                for value in rows {
+                    guard var row = value.objectValue else { continue } // Validated above.
+                    row["due_status"] = .string(status)
+                    items.append(item(row))
+                }
+            }
+            source.removeValue(forKey: "reminders")
+            source["returned_count"] = .int(Int64(items.count))
+            projection = .init(title: "Reminders", content: .object(source), items: items, actions: buttons)
+        } else {
+            projection = list(title: "Reminders", result: .object(source), key: "reminders", actions: buttons, item: item)
         }
         if projection.items.isEmpty, (result.objectValue ?? [:])["status"] == .string("completed"), case .object(var content) = projection.content {
             content["message"] = .string(tool == "mac_reminders_list_due_today"

@@ -73,13 +73,7 @@ public struct ProviderOAuthConfig: Sendable {
         ],
         tokenBodyFormat: .form,
         persistTokens: { tokens, dataRoot in
-            guard let accessToken = tokens["access_token"] as? String,
-                  !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw NSError(
-                    domain: "NativeOAuthFlow", code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "Token endpoint did not return an access token."]
-                )
-            }
+            let answer = try OAuthGrantOperations.validateTokenResponse(tokens, requiringRefreshToken: true)
             // Sign-in writes the app-owned path, which precedes the shared CLI session in resolution.
             let authPath = NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: dataRoot)
             guard !ChatGPTTransport.isUserCodexPath(authPath) else {
@@ -88,15 +82,15 @@ public struct ProviderOAuthConfig: Sendable {
                     userInfo: [NSLocalizedDescriptionKey: "ChatGPT sign-in cannot write to the shared Codex CLI folder."]
                 )
             }
-            try ProviderStateValidation.credential(tokens)
             try OAuthGrantOperations.updateProviderCredential(at: authPath) { existing in
                 if existing["auth_mode"] == nil { existing["auth_mode"] = "chatgpt" }
                 if existing["OPENAI_API_KEY"] == nil { existing["OPENAI_API_KEY"] = NSNull() }
                 // Sign-in replaces identity without borrowing missing fields from the previous account.
-                var merged: [String: Any] = [:]
-                for key in ["access_token", "refresh_token", "id_token"] {
-                    if let v = tokens[key] { merged[key] = v }
-                }
+                var merged: [String: Any] = ["access_token": answer.accessToken]
+                merged["refresh_token"] = answer.refreshToken
+                // Optional response metadata is kept only when supplied as a
+                // string; JSON null must not become a malformed saved field.
+                merged["id_token"] = tokens["id_token"] as? String
                 if let access = tokens["access_token"] as? String,
                    let payload = jwtPayload(access),
                    let auth = payload["https://api.openai.com/auth"] as? [String: Any],
@@ -106,23 +100,8 @@ public struct ProviderOAuthConfig: Sendable {
                 OAuthRefreshBinding.bindSignIn(&merged, provider: "openai_oauth_direct")
                 existing["tokens"] = merged
                 existing["last_refresh"] = NativeTimestampFormat.plainZulu(Date())
-                // Sign-in replaces expires_at, removing it when the response has no expiry.
-                if let seconds = (tokens["expires_in"] as? Int)
-                    ?? (tokens["expires_in"] as? Double).flatMap({ Int(exactly: $0.rounded(.towardZero)) }) {
-                    let formatter = ISO8601DateFormatter()
-                    formatter.formatOptions = [.withInternetDateTime]
-                    existing["expires_at"] = formatter.string(
-                        from: Date().addingTimeInterval(TimeInterval(seconds))
-                    )
-                } else if let access = tokens["access_token"] as? String,
-                          let payload = jwtPayload(access),
-                          let exp = (payload["exp"] as? Double) ?? (payload["exp"] as? Int).map(Double.init) {
-                    let formatter = ISO8601DateFormatter()
-                    formatter.formatOptions = [.withInternetDateTime]
-                    existing["expires_at"] = formatter.string(from: Date(timeIntervalSince1970: exp))
-                } else {
-                    existing.removeValue(forKey: "expires_at")
-                }
+                existing.removeValue(forKey: "expires_in")
+                existing["expires_at"] = answer.expiresIn.map { NativeTimestampFormat.plainZulu(Date().addingTimeInterval($0)) }
             }
             // The sign-in is saved; a failed child copy is re-synced (and
             // reported) by the next Codex spawn.

@@ -1,4 +1,5 @@
 import Experiences
+import Cognition
 import AgentWorkspace
 import Agents
 import TurnTrace
@@ -21,7 +22,7 @@ import TrustCenter
 import Senses
 import PersonaEngine
 import Desk
-// Blueprint: | `AppDoorActions.swift` | App action execution, version recovery and result handling |
+// Blueprint: | `AppDoorActions.swift` | App action execution, checked schema admission through ToolArguments, version recovery and result handling; one argument-name correction owner shared by runtime and static call-fit inspection, without inspection traces; files.look refuses with the exact existing files.read pixel call; ability.save admits original params/reach/face declarations and queue.update admits explicit action/say/until/when clears without optional-null normalization; Contacts retains raw caller arguments for owner admission; Desk blocker/defer clear-set fields retain caller types for admission; explicit mind previews reach the owner before generic preflight and change receipts |
 extension AppToolExecutor {
     @MainActor
     func doorUndo(input: [String: JSONValue]) async throws -> JSONValue {
@@ -72,30 +73,7 @@ extension AppToolExecutor {
     }
     @MainActor
     func doorDo(_ id: String, resolved: (action: AppAction, discovery: [String: JSONValue])?, input: [String: JSONValue], surface: String, inProcess: Bool) async throws -> JSONValue {
-        if id.lowercased() == "find", let find = input["find"], !Self.doorText(find).isEmpty {
-            return Self.doorRefusal("action_route", "find is an app key, not an action. Nothing ran.",
-                remedy: "correct_route", "Make next_call to discover matching actions.",
-                next: ["find": find])
-        }
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        // An older door answers through the one form and names the new call.
-        if let alias = Self.partAlias(id, Self.partFields(input["args"]), root: root) {
-            let result = try await doorDo(alias.id, resolved: await AppActions.resolvedAction(alias.id, dataRoot: root), input: input.merging(["args": .object(alias.args)]) { $1 }, surface: surface, inProcess: inProcess)
-            guard case .object(var fields) = result else { return result }
-            fields["alias"] = .string("\(id) is \(alias.id) now; call \(alias.id) directly.")
-            // A skill.read's answer also in the shape its readers learned:
-            // params, script {source, params} and selected_version.
-            if id.lowercased() == "skill.read", case .object(var read)? = fields["result"] {
-                let declares = Self.partFields(read["declares"])
-                let params = declares["params"].flatMap { $0 == .null ? nil : $0 } ?? .object([:])
-                read["params"] = params
-                read["script"] = .object(["source": Self.partFields(read["source"])["code"] ?? .null, "params": params,
-                                          "actions": declares["actions"] ?? .array([])])
-                read["selected_version"] = Self.partFields(read["versions"])["current"] ?? .null
-                fields["result"] = .object(read)
-            }
-            return .object(fields)
-        }
         guard let action = resolved?.action else {
             if let partID = ToolNameAliases.authoredTool(id), let row = try Parts(root: root).row(partID),
                let status = row["status"]?.scalarText, status != "active" {
@@ -128,15 +106,15 @@ extension AppToolExecutor {
                     extra: ["requested": .string(id), "id": .string(partID)])
             }
             let qualified = Self.doorText(input["page"]) + "." + id
-            if let correction = await Self.doorActionCorrection(qualified, input: input) {
+            if let correction = try await Self.doorActionCorrection(qualified, input: input) {
                 return try await runCorrectedRead(correction, input: input, surface: surface, inProcess: inProcess)
             }
-            if let correction = await Self.doorActionCorrection(id, input: input) {
+            if let correction = try await Self.doorActionCorrection(id, input: input) {
                 return try await runCorrectedRead(correction, input: input, surface: surface, inProcess: inProcess)
             }
             let requestedPage = Self.doorText(input["page"])
             let nearestPage = AppDoorNames.resolve(requestedPage.isEmpty ? String(id.split(separator: ".").first ?? "") : requestedPage)
-            let ownActions = await Self.doorPageActions(nearestPage, hasSettings: false, dataRoot: root)
+            let ownActions = try await Self.doorPageActions(nearestPage, hasSettings: false, dataRoot: root)
                 .filter { $0.page == nearestPage && !$0.isItemRead }
             let nearest: [AppAction]
             if ownActions.isEmpty {
@@ -157,7 +135,7 @@ extension AppToolExecutor {
             "owner": .string(action.isHis && !fullMac ? "his" : "hers"), "execution": .string("not_run"),
         ]
         // What refuses or previews a folded tool points to its guide, never carries it.
-        if !action.partAction, action.page != "*", AppActions.about(action) != nil {
+        if !action.partAction, action.page != "*", try AppActions.about(action) != nil {
             receipt["guide"] = .object(["page": .string(action.page), "item": .string("guide:" + action.id)])
         }
         let discovery = resolved?.discovery ?? [:]
@@ -178,36 +156,31 @@ extension AppToolExecutor {
         let args: [String: JSONValue]
         switch input["args"] {
         case .object(let given)?:
-            if action.id == "desk.close" { args = given }
-            else if let schema = discovery["args_schema"] {
-                args = ToolArguments.normalized(given, schema: schema,
-                    preserving: ["ability.save", "sense.make"].contains(action.id) ? ["learned", "choices"] : [])
-            } else { args = given.filter { $0.value != .null } }
+            args = Self.normalizedCallArguments(action, given, schema: discovery["args_schema"])
         case nil, .null?: args = [:]
         default: return badArgs("invalid_args", "args is an object of the action's arguments by name: \(action.line)", "args")
         }
         let read = action.readOnly(args: args)
-        let specs = action.argSpecs
-        let known = Set(specs.flatMap(\.names))
-        // An authored tool whose schema lists no arguments takes what it is given.
-        let open = specs.isEmpty && (action.partAction || ToolNameAliases.authoredTool(action.id) != nil)
-        if !open, let stray = args.keys.sorted().first(where: { !known.contains($0) }) {
-            return badArgs("unknown_arg", "\(action.id) takes no \(stray): \(action.line)", "args.\(stray)")
-        }
         let validationArgs = Self.doorValidationArgs(action, args)
         // A wake gives a part none of its call's arguments (what woke it rides
         // as input.wake), so what a call requires never refuses it.
-        let woken = OwnedProgramRunner.wake != nil
-        if !woken, let missing = specs.first(where: { spec in !spec.optional && !spec.names.contains { validationArgs[$0] != nil } }) {
-            return badArgs("missing_arg", "\(action.id) needs \(missing.names.joined(separator: " or ")): \(action.line)",
-                           "args.\(missing.names[0])")
+        let woken = action.authored && OwnedProgramRunner.wake != nil
+        guard let schema = discovery["args_schema"] else {
+            throw ToolFailureError("\(action.id)'s input schema is unavailable. Nothing ran.", effects: .none,
+                owner: "Tool catalog", code: "tool_schema_unavailable",
+                instruction: "Repair this action's registered schema before calling it again.", recovery: .repair)
         }
-        if !woken, let schema = discovery["args_schema"],
-           let problem = JSONValue.object(validationArgs).schemaProblem(schema: schema, path: "args") {
-            return badArgs("bad_input", "\(problem.path) must be \(problem.expected): \(action.line)", problem.path)
+        if !woken {
+            do { try ToolArguments.admit(validationArgs, schema: schema, path: "args") }
+            catch let error as ToolFailureError {
+                if error.code == "tool_schema_unavailable" { throw error }
+                return badArgs("bad_input", error.localizedDescription, error.argumentPath ?? "args")
+            }
         }
         // Validate before an owner-only preview can claim a callable target.
         let ownerRemedy: JSONValue = {
+            // These are different current action contracts: provider actions
+            // name provider; inbox/connector actions name id.
             let target = Self.doorText(args["id"] ?? args["provider"])
             let tap: String
             switch action.id {
@@ -327,6 +300,14 @@ extension AppToolExecutor {
                 remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
         }
         if input["preview"] == .bool(true) {
+            if !Self.argumentPreflightOnly, action.tool == "mind_run",
+               let verb = call["verb"]?.stringValue,
+               verb == "dream" || MindClockVerb(rawValue: verb) != nil {
+                call["preview"] = .bool(true)
+                // Return before door notes, page versions and change receipts.
+                // The owner names its actual decision or why it cannot preview.
+                return try await runFolded(action, input: call, surface: surface)
+            }
             receipt["status"] = .string("preview")
             receipt["checks_not_run"] = .array([
                 "Live target existence, identity and eligibility unless explicitly checked below",
@@ -346,7 +327,7 @@ extension AppToolExecutor {
                 refusal = Self.foldedResult(ChatToolOutcome.normalizedFailure(refused, tool: action.tool), guide: nil, tool: action.tool)
             }
             guard case .object(let refused)? = refusal, refused["status"] != .string("would") else {
-                receipt["would_card"] = .bool(await doorWouldCard(action, call: call, input: input, surface: surface))
+                receipt["would_card"] = .bool(try await doorWouldCard(action, call: call, input: input, surface: surface))
                 receipt["detail"] = .string("Arguments and available preflight checks passed. See checks_not_run; this does not prove the action can run. Nothing was done.")
                 // A lifecycle preview says what the call would leave, in its own words.
                 if case .object(let would)? = refusal {
@@ -377,10 +358,8 @@ extension AppToolExecutor {
                                           browser: action.tool.hasPrefix("browser."), tool: action.tool)
             let folded = Self.actionResult(result, action: action, args: args, root: root)
             // A versioned write says the version it left, as the app's own buttons do.
-            guard returnsVersion, case .object(var fields) = folded,
-                  let after = try? await doorCurrentVersion(scope: scope) else { return folded }
-            fields["page_version"] = .string(after)
-            return .object(fields)
+            guard returnsVersion, case .object(let fields) = folded else { return folded }
+            return .object(await attachPageVersion(to: fields, scope: scope))
         }
         // In a script, one call's after is the next one's before: one inbox
         // read per action. A read raises nothing, so none is read around it.
@@ -469,30 +448,51 @@ extension AppToolExecutor {
             "not_observed": .string("A turn a card's answer wakes on its own (one handed back to this call is "
                 + "result.continuation), and anything the app does after this call returns."),
         ]) }
-        if returnsVersion, let after = try? await doorCurrentVersion(scope: scope) {
-            receipt["page_version"] = .string(after)
-        }
+        if returnsVersion { receipt = await attachPageVersion(to: receipt, scope: scope) }
         if watch { receipt["decided_by"] = .string("agent") }
         return .object(receipt)
     }
+
+    /// Effects have already settled. A missing readback cannot turn into a
+    /// missing field, and must never invite replaying the write.
+    @MainActor
+    private func attachPageVersion(to receipt: [String: JSONValue], scope: String) async -> [String: JSONValue] {
+        var fields = receipt
+        do {
+            guard let version = try await doorCurrentVersion(scope: scope) else {
+                throw ToolFailureError("The page owner returned no current version for \(scope).", effects: .none, code: "page_version_unavailable")
+            }
+            fields["page_version"] = .string(version)
+        } catch {
+            fields["readback_failure"] = ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none)
+            fields["readback_note"] = .string("The action returned, but its page version could not be read. Read \(scope) to reconcile the result before continuing; do not repeat the action.")
+        }
+        return fields
+    }
+    /// The same protocol normalization for runtime and read-only inspection.
+    static func normalizedCallArguments(_ action: AppAction, _ given: [String: JSONValue], schema: JSONValue?, recordShims: Bool = true) -> [String: JSONValue] {
+        if action.id == "desk.close" || MacContactsExecutor.parameters(for: action.tool) != nil { return given }
+        guard let schema else { return given.filter { $0.value != .null } }
+        var normalized = ToolArguments.normalized(given, schema: schema,
+            preserving: ["ability.save", "sense.make"].contains(action.id) ? ["learned", "choices"] : [], recordShims: recordShims)
+        if action.id == "ability.save" {
+            // Null clears params; malformed headers must reach their owner.
+            for key in ["params", "reach", "face"] { normalized[key] = given[key] }
+        }
+        if action.id == "queue.update" {
+            // Omission keeps a field; explicit null clears it.
+            for key in ["action", "say", "until", "when"] { normalized[key] = given[key] }
+        }
+        // Desk clear/set admission judges the caller's string, not a coerced
+        // number. Keep the same raw value for door validation and re-entry.
+        if action.id == "desk.blocked_on" { normalized["blocked_on"] = given["blocked_on"] }
+        if action.id == "desk.defer" { normalized["until"] = given["until"] }
+        return normalized
+    }
+
     /// Setting request evidence has its own refusal and applies only to model turns.
     static func doorValidationArgs(_ action: AppAction, _ args: [String: JSONValue]) -> [String: JSONValue] {
         action.id == "setting.set" ? args.merging(["because": .string("")]) { _, check in check } : args
-    }
-    /// The argument a stray obviously means: the only accepted name the call
-    /// leaves out that its value fits as given (validation coerces it after).
-    /// Anything else stays the refusal that names them all. Validation supplies
-    /// the setting evidence, which a stray never means.
-    static func doorMeantArg(_ value: JSONValue, of action: AppAction, given args: [String: JSONValue], schema: JSONValue) -> String? {
-        // A flag carries no content: its name is its meaning, so a stray boolean
-        // is never obviously another flag (background:true is not front:true).
-        if case .bool = value { return nil }
-        guard case .object(let root) = schema, case .object(let properties)? = root["properties"] else { return nil }
-        let supplied = doorValidationArgs(action, args)
-        let fits = action.argSpecs.filter { spec in !spec.names.contains { supplied[$0] != nil } }.flatMap(\.names).filter { name in
-            properties[name].map { value.schemaProblem(schema: $0) == nil } ?? false
-        }
-        return fits.count == 1 ? fits[0] : nil
     }
     private static func readRecovery(_ action: AppAction, read: Bool = true) -> JSONValue {
         .object(["kind": .string("inspect"), "owner": .string(action.id),
@@ -509,11 +509,15 @@ extension AppToolExecutor {
            ["unknown_arg", "bad_input"].contains(doorText(fields["reason"])), fields["next_call"] == nil {
             if case .object(let remedy)? = fields["remedy"], case .object? = remedy["next_call"] {
                 fields["next_call"] = remedy["next_call"]
-            } else if case .object(let discovery) = AppActions.discovery(action), let example = discovery["example"] {
+            } else {
+                do {
+                if case .object(let discovery) = try AppActions.discovery(action), let example = discovery["example"] {
                 let next: JSONValue = .object(["tool": .string("app"), "input": example])
                 fields["next_call"] = next
                 fields["remedy"] = .object(["kind": .string("correct_arguments"),
                     "instruction": .string("Use this call shape with your intended values. Nothing ran."), "next_call": next])
+                }
+                } catch { fields["schema_failure"] = ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none) }
             }
         }
         // Authoring is a road: each step that lands hands back the next call.
@@ -587,7 +591,7 @@ extension AppToolExecutor {
         case (.success(let before), .success(let after)):
             return .int(Int64(after.filter { before[$0.key] != $0.value }.count))
         case (.failure(let error), _), (_, .failure(let error)):
-            return ownedFailure(error, code: "attention_ledger_unreadable", owner: "notify/attention_router.json",
+            return ownedFailure(error, code: "attention_ledger_unreadable", owner: "notify/deliveries.json",
                 instruction: "Read notification delivery evidence before deciding whether another notification is needed; the unread ledger proves no count.",
                 next: ["page": .string("notifications")], effects: .unknown)
         }

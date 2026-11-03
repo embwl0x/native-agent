@@ -44,9 +44,12 @@ enum MobileNotificationActions {
                 open(screen: "chat", sessionID: session)
                 let store = ChatStore.shared
                 await store.restorationTask?.value
+                guard let pairing = AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) else {
+                    throw MobileIntentRuntime.failure("Connect this iPhone to a Mac before submitting a reply.")
+                }
                 let queued = QueuedChatSend(id: UUID(), sessionID: session, text: text,
                                             controls: .defaults, attachments: [], createdAt: Date(),
-                                            pairingFingerprint: AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests))
+                                            pairingFingerprint: pairing)
                 guard store.enqueueSend(queued) else {
                     throw MobileIntentRuntime.failure(store.errorBanner ?? "The chat queue is full.")
                 }

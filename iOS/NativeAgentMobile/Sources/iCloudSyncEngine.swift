@@ -96,7 +96,7 @@ final class iCloudSyncEngine {
     var helperDetails: [UUID: MobileHelperEdit] = [:]
     var agentThreads: [String: MobileAgentThread] = [:]
     /// What the Mac's Desk bounds dropped, as the Mac reported it. nil means no
-    /// report was delivered (an older Mac), never "nothing was dropped".
+    /// report has arrived, never "nothing was dropped".
     var deskBounds: MobileDeskProjectionReport?
     /// Complete reading copies of the priority Desk items, carried
     /// automatically beside the compact board so the text that matters can be
@@ -112,6 +112,7 @@ final class iCloudSyncEngine {
     var trustPolicy: TrustPolicy?
     // Mac personality.json decodes as the shared PersonalityProfile.
     private(set) var personality: PersonalityProfile?
+    var voicePreference: MobileVoicePreference?
     private var personalityPairing: String?
     private var snapshotPairing: String?
 
@@ -142,8 +143,6 @@ final class iCloudSyncEngine {
         lifecycleGeneration &+= 1
         refreshInFlight = false
         refreshQueued = false
-        fullRefreshQueued = false
-        transportDeliveryQueued = false
         if prefersCloudKitSnapshotCache {
             snapshotDir = cloudKitSnapshotCacheDirectory(pairing: secret)
         } else if let driveSnapshotRoot {
@@ -170,9 +169,10 @@ final class iCloudSyncEngine {
         snapshotReadRevisions = [:]
         snapshotHealth = [:]
         recordReadbackRevisions = [:]
-        trustPolicy = nil
+        trustRead.write { trustPolicy = nil }
         personalityPairing = nil
         personality = nil
+        voicePreference = nil
         sessions = []
         helpersSnapshot = nil
         surfaceLayout = nil
@@ -181,6 +181,7 @@ final class iCloudSyncEngine {
         health = nil
         organismLivingStatus = nil
         runs = []
+        runsSnapshotLoaded = false
         connectors = []
         telegram = nil
         providers = []
@@ -193,6 +194,8 @@ final class iCloudSyncEngine {
         lastSyncAt = nil
         groupTransportDeliveryAt = Self.loadGroupDeliveryClocks(pairing: fingerprint)
         staleSnapshotGroups = [:]
+        cloudKitCatchUpIncomplete = false
+        cloudKitCatchUpFailed = false
         syncError = nil
         inboxSnapshotLoaded = false
         approvalsSnapshotLoaded = false
@@ -202,7 +205,7 @@ final class iCloudSyncEngine {
     var sessions: [ChatSession] = []
     var helpersSnapshot: MobileHelpersSnapshot?
     /// The Mac's layout (ui/layout.json, in the core snapshot); More draws its sections from it.
-    var surfaceLayout: SurfaceLayout?
+    var surfaceLayout: SurfaceLayoutAvailability?
     var sessionNavigation: ChatSessionNavigation?
     var pinnedChatSessions: [ChatSession] { sessionNavigation?.rows.filter(\.isPinned).map(\.session) ?? [] }
     var chatAnchor: ConversationAnchorPin? { sessionNavigation?.anchor }
@@ -211,6 +214,7 @@ final class iCloudSyncEngine {
     var organismLivingStatus: OrganismLivingStatusFile?
     // Mac heavy snapshots publish the newest 50 runs in runs.json.
     var runs: [RunRecord] = []
+    var runsSnapshotLoaded = false
     var connectors: [MobileConnectorSnapshot] = []
     var telegram: MobileTelegramSnapshot?
     // MacSyncEngine publishes providers.json.
@@ -230,7 +234,6 @@ final class iCloudSyncEngine {
 
     private static let groupDeliveryDefaultsKey = "na.sync.groupTransportDeliveryAt.v1"
     private static let groupDeliveryPairingDefaultsKey = "na.sync.groupTransportDeliveryAt.pairing"
-    private static let legacyDeliveryDefaultsKey = "na.sync.lastTransportDeliveryAt"
 
     private static func loadGroupDeliveryClocks(pairing: String?) -> [String: Date] {
         guard let pairing,
@@ -248,7 +251,6 @@ final class iCloudSyncEngine {
         groupTransportDeliveryAt = [:]
         UserDefaults.standard.removeObject(forKey: Self.groupDeliveryDefaultsKey)
         UserDefaults.standard.removeObject(forKey: Self.groupDeliveryPairingDefaultsKey)
-        UserDefaults.standard.removeObject(forKey: Self.legacyDeliveryDefaultsKey)
     }
 
     /// Record a real delivery of these groups. Call ONLY from the transport's
@@ -285,7 +287,22 @@ final class iCloudSyncEngine {
     }
     /// Group → reason the Mac could not rebuild it; these rows remain stale regardless of sync time.
     var staleSnapshotGroups: [String: String] = [:]
-    var syncError: String?
+    /// A requested or partial catch-up stays owed across coalesced drains.
+    /// Only a complete remote pull followed by a successful cache refresh clears it.
+    var cloudKitCatchUpIncomplete = false
+    /// What the warning claims: a catch-up read finished and failed. A read that
+    /// merged into the 0.75 s foreground receive (skipped) or is still running is
+    /// owed work, not stale data (User 11-01: the warning kept popping up while chat worked).
+    var cloudKitCatchUpFailed = false
+    private var snapshotSyncError: String?
+    var syncError: String? {
+        get {
+            snapshotSyncError ?? (cloudKitCatchUpFailed
+                ? "Mac updates are still catching up. Showing the last received data. Open Connection in Settings to check the Mac link."
+                : nil)
+        }
+        set { snapshotSyncError = newValue }
+    }
     var inboxSnapshotLoaded = false
     /// Per-queue arrival, for the same reason the inbox flag exists: a
     /// provider-catalog update alone sets `lastSyncAt`, so a shared timestamp
@@ -315,11 +332,10 @@ final class iCloudSyncEngine {
     var isSetUp = false
     var refreshInFlight = false
     var refreshQueued = false
-    var fullRefreshQueued = false
-    var transportDeliveryQueued = false
     /// Invalidates reads/cache writes across teardown or transport root changes.
     var lifecycleGeneration: UInt64 = 0
     @ObservationIgnored let snapshotRead = LatestRead()
+    @ObservationIgnored let trustRead = LatestRead()
     var snapshotHealth: [String: SnapshotReadHealth] = [:]
     @ObservationIgnored let workshopRead = LatestRead()
     @ObservationIgnored let memoryRead = LatestRead()
@@ -362,8 +378,8 @@ enum SyncError: LocalizedError {
     case approvalRequired(String, approvalID: String? = nil)
     case unsupported(String)
     case macRejected(String)
-    /// The action never reached the Mac: a definite failure, unlike the
-    /// unconfirmed outcome `.responseUnconfirmed` stands for.
+    /// This submission was refused before dispatch. It does not settle any
+    /// earlier retained request; `.responseUnconfirmed` preserves that uncertainty.
     case sendFailed(String)
 
     var errorDescription: String? {

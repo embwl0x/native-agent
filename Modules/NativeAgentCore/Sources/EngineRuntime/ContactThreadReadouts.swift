@@ -14,7 +14,7 @@ import BackgroundLoops
 import DoctorChecks
 import BackgroundWork
 import Synchronization
-// Blueprint: | `ContactThreadReadouts.swift` | ContactThreadReadouts and ContactFlightReadout own mounted contact/helper/crew observation and LatestRead publication; live-only ticks update isolated flight slots |
+// Blueprint: | `ContactThreadReadouts.swift` | ContactThreadReadouts and ContactFlightReadout own mounted contact/helper/crew observation and LatestRead publication; contact and crew sources retain independent availability, combined for display; live-only ticks update isolated flight slots |
 
 @MainActor @Observable
 final class ContactFlightReadout {
@@ -98,8 +98,14 @@ public final class ContactThreadReadouts {
     public private(set) var helperRuns: [UUID: AgentContactThreads.HelperResults] = [:]
     /// False until the first read lands, so an empty list isn't claimed early.
     public private(set) var loaded = false
-    /// A failed refresh keeps the last proven conversation snapshot visible.
-    public private(set) var refreshError: String?
+    /// Each checked source retains its own failure until that source reads successfully.
+    public private(set) var contactRefreshError: String?
+    public private(set) var crewRefreshError: String?
+    /// A failed refresh keeps the last proven snapshot visible.
+    public var refreshError: String? {
+        let errors = [contactRefreshError, crewRefreshError].compactMap { $0 }
+        return errors.isEmpty ? nil : errors.joined(separator: "\n")
+    }
     /// Helpers with a run queued or under way now.
     public private(set) var running: Set<UUID> = []
     /// Crews at work now, then the few most recently finished.
@@ -176,7 +182,7 @@ public final class ContactThreadReadouts {
                 if owner.loaded { try? await Task.sleep(for: .milliseconds(150)) }
                 guard !Task.isCancelled else { break }
                 let first = !owner.loaded
-                let retry = owner.refreshError != nil
+                let retry = owner.contactRefreshError != nil
                 let full = pending.withLock { state in
                     defer { state = (false, false) }
                     return state.full || first || retry
@@ -184,7 +190,7 @@ public final class ContactThreadReadouts {
                 let result = await owner.contactRead.read {
                     do { return Result<ContactRead, Error>.success(try await Task.detached(priority: .userInitiated) { [last, contactOwner = owner.contactOwner] in
                         // A records change that rode in on the live file's tick still gets its full read.
-                        if !full, let flights = AgentContactThreads.readFlights(root: root, last: last) {
+                        if !full, let flights = try AgentContactThreads.readFlights(root: root, last: last) {
                             var next = last
                             next.flights = flights
                             return (next, AgentContactThreads.changes(from: last, to: next), Optional<[UUID: AgentContactThreads.HelperResults]>.none)
@@ -223,9 +229,9 @@ public final class ContactThreadReadouts {
                     }
                     if let runs, owner.helperRuns != runs { owner.helperRuns = runs }
                     if !owner.loaded { owner.loaded = true }
-                    owner.refreshError = nil
+                    owner.contactRefreshError = nil
                     case .failure(let error):
-                        owner.refreshError = UserFacingError.message(error, action: "refresh conversations")
+                        owner.contactRefreshError = UserFacingError.message(error, action: "refresh conversations")
                     }
                 }
                 if case .success(let (next, _, _)) = result {
@@ -257,8 +263,10 @@ public final class ContactThreadReadouts {
                     catch { return Result<[SwarmCrew], Error>.failure(error) }
                 } publish: { result in
                     switch result {
-                    case .success(let next): if owner.crews != next { owner.crews = next }
-                    case .failure(let error): owner.refreshError = UserFacingError.message(error, action: "refresh crews")
+                    case .success(let next):
+                        if owner.crews != next { owner.crews = next }
+                        owner.crewRefreshError = nil
+                    case .failure(let error): owner.crewRefreshError = UserFacingError.message(error, action: "refresh crews")
                     }
                 }
             }

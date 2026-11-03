@@ -102,8 +102,17 @@ extension CognitiveSubstrate {
             + (capsule.combined.isEmpty ? [] : [capsule.sourcePeerIds]))
         // Her cares, closest first: the reflection names the one its thought
         // belongs to, or a new one. The embedding only orders the list.
-        let shownCares = await caresShown(
-            for: ([reason] + causes.keys.sorted().compactMap { causes[$0]?.text }).joined(separator: "\n"))
+        let shownCares: [CognitiveCareLine]
+        do {
+            shownCares = try await caresShown(
+                for: ([reason] + causes.keys.sorted().compactMap { causes[$0]?.text }).joined(separator: "\n"))
+        } catch {
+            oweCareEmbedding(error)
+            var refused = admission
+            refused.admitted = false
+            refused.reason = "Reflection care evidence unavailable: \(error.localizedDescription)"
+            return .refused(refused)
+        }
         let prompt: String
         do {
             let careKey = try (shownCares.isEmpty ? "" : completionPolicy("reflection", section: "care-key"))
@@ -176,7 +185,8 @@ extension CognitiveSubstrate {
         resultSummary: String,
         provider: String,
         cancelled: Bool = false,
-        judgment: CognitiveReflectionJudgment? = nil
+        judgment: CognitiveReflectionJudgment? = nil,
+        journalPending: Bool = false
     ) async -> CognitiveReflectionReceipt? {
         await waitForMaintenanceTransition()
         let integrationEnabled = configuration.enabled && configuration.reflectiveCallsEnabled
@@ -200,70 +210,130 @@ extension CognitiveSubstrate {
             estimatedCostUnits: reflectionCostUnits(prompt: request.prompt, result: resultSummary),
             judgment: judgment
         )
+        receipt.journalPending = journalPending
+        // Retain the judgment before any effect. Errors are observations, never
+        // gates; the pending flags below name work, not the last attempt.
         if integrationEnabled, !cancelled, let judgment {
-            receipt.proposalIds = await parseReflectionProposals(receipt: receipt, source: judgment.reflection)
-            guard ownsReflectionReservation(request) else { return nil }
-            if let tone = judgment.affect {
-                receipt.dispositionSaveFailed = !(await integrateDisposition(
-                    tone: tone, at: dependencies.now(), source: "reflection", undoable: true,
-                    reflectionRequest: request))
-                guard ownsReflectionReservation(request) else { return nil }
-            }
+            receipt.careIntegrationPending = true
+            receipt.dispositionSaveFailed = judgment.affect != nil
+            receipt.integrationEpoch = mindEpoch
+        } else if cancelled || !integrationEnabled {
+            receipt.integrationSkipped = cancelled ? "cancelled" : "reflection disabled"
         }
-        if integrationEnabled, !cancelled, let takeaway = judgment?.takeaway {
-            // A takeaway with a view lands in the care the view went to, unless
-            // that care cannot hold a question.
-            receipt.proposalIds += await applyReflectionCare(takeaway, open: takeaway,
-                                                             joining: receipt.proposalIds.first, receipt: receipt)
-            receipt.proposalIds = unique(receipt.proposalIds)
-            guard ownsReflectionReservation(request) else { return nil }
-        }
-        receipt.proposalYieldScore = reflectionYieldScore(
-            proposalCount: receipt.proposalIds.count,
-            costUnits: receipt.estimatedCostUnits,
-            cancelled: cancelled
-        )
         reflectionReceipts[receipt.id] = receipt
         enforceReflectionReceiptCap()
         return receipt
     }
 
-    /// Scheduled-runtime durability confirmation for a reflection that already
-    /// completed integration in memory. Affected cares save before its receipt.
-    public func persistReflectionResultChecked(_ receipt: CognitiveReflectionReceipt) async throws {
+    /// Checkpoint the provider's input and judgment before any care or mood
+    /// mutation. The dream journal also retains this receipt as its step input.
+    public func checkpointReflectionResultChecked(_ receipt: CognitiveReflectionReceipt, requirePersistence: Bool = false) async throws {
         try requireIntegratedReflectionReceipt(receipt)
-        guard !receipt.dispositionSaveFailed else {
-            throw CognitivePersistenceError.artifactWriteFailed(
-                family: "reflection_disposition",
-                detail: "produced affect failed to save; the reflection judgment is retained in its resident receipt"
-            )
+        let durable = requirePersistence || receipt.journalPending == true
+        if durable, !configuration.persistenceEnabled { throw CognitivePersistenceError.storeUnavailable }
+        if durable, !persistenceRestored || persistenceHealth.writesBlocked {
+            throw CognitivePersistenceError.artifactWriteFailed(family: "reflection_receipt", detail: "cognition/cognition.sqlite is unavailable")
         }
-        for careId in receipt.proposalIds {
-            try requireIntegratedReflectionReceipt(receipt)
-            guard cares[careId] != nil else {
-                throw CognitivePersistenceError.artifactWriteFailed(
-                    family: "reflection_care",
-                    detail: "missing in-memory care \(careId.uuidString)"
-                )
+        try await persistArtifactTransition(artifacts: reflectionEffectArtifacts(receipt, at: dependencies.now()),
+            deletedArtifactIDs: [], at: dependencies.now())
+        if durable, !configuration.persistenceEnabled { throw CognitivePersistenceError.storeUnavailable }
+    }
+
+    /// Resume only the effects of a retained judgment. Prefer the live owner:
+    /// the journal's receipt is input, never a second progress authority.
+    public func persistReflectionResultChecked(_ input: CognitiveReflectionReceipt) async throws {
+        await waitForMaintenanceTransition()
+        if input.journalPending == true, !persistenceRestored || persistenceHealth.writesBlocked {
+            throw CognitivePersistenceError.artifactWriteFailed(family: "reflection_receipt", detail: "cognition/cognition.sqlite is unavailable")
+        }
+        if reflectionReceipts[input.id] == nil {
+            guard input.integrationEpoch == mindEpoch else { throw CognitiveWriteDiscarded() }
+            reflectionReceipts[input.id] = input
+        }
+        guard var receipt = reflectionReceipts[input.id] else { throw CognitiveWriteDiscarded() }
+        if receipt.journalPending == true, !configuration.persistenceEnabled { throw CognitivePersistenceError.storeUnavailable }
+        if let epoch = receipt.integrationEpoch, epoch != mindEpoch { throw CognitiveWriteDiscarded() }
+        if receipt.careIntegrationPending == true, configuration.enabled, configuration.reflectiveCallsEnabled {
+            try await applyReflectionCares(receipt: receipt)
+            guard let current = reflectionReceipts[input.id] else { throw CognitiveWriteDiscarded() }
+            receipt = current
+        } else if receipt.careIntegrationPending == true {
+            receipt.careIntegrationPending = false
+            receipt.dispositionSaveFailed = false
+            receipt.integrationSkipped = "reflection disabled"
+            reflectionReceipts[receipt.id] = receipt
+        }
+        let at = dependencies.now()
+        let previous = disposition
+        var nudged = false
+        if receipt.dispositionSaveFailed {
+            if !configuration.enabled || !configuration.reflectiveCallsEnabled {
+                receipt.integrationSkipped = "reflection disabled"
+            } else {
+                guard let tone = receipt.judgment?.affect else {
+                    throw CognitivePersistenceError.artifactWriteFailed(family: "reflection_disposition", detail: "retained affect input is missing")
+                }
+                if !reflectionDispositionClaims.contains(receipt.id) {
+                    if tone != 0 {
+                        integrateDispositionInMemory(tone: tone, at: at, source: "reflection")
+                        nudged = true
+                    }
+                    reflectionDispositionClaims.insert(receipt.id)
+                }
             }
-            try await saveCares([careId], at: dependencies.now()).get()
+            receipt.dispositionSaveFailed = false
+            reflectionReceipts[receipt.id] = receipt
+            dirtyRevision &+= 1
         }
+        let artifacts = try reflectionEffectArtifacts(receipt, at: at)
+        let written = disposition
+        // On failure the resident values and done flags stay together. The
+        // next attempt writes them; it does not apply them again. On restart
+        // their atomic receipt is the witness that the effects already landed.
+        try await persistArtifactTransition(artifacts: artifacts, deletedArtifactIDs: [], at: at)
+        if receipt.journalPending == true, !configuration.persistenceEnabled { throw CognitivePersistenceError.storeUnavailable }
         try requireIntegratedReflectionReceipt(receipt)
-        try await persistArtifactChecked(
-            kind: "reflection_receipt",
-            id: receipt.id,
-            status: receipt.cancelled ? "cancelled" : "recorded",
-            score: 0,
-            payload: receipt.toJSON()
-        )
+        if nudged {
+            await recordDispositionUndo(what: "undertone nudge: reflection", previous: .object([
+                "valence": .double(previous.valence), "updatedAt": .double(previous.updatedAt.timeIntervalSince1970)
+            ]), stamp: Self.undoStamp(written))
+        }
+    }
+
+    private func reflectionEffectArtifacts(_ receipt: CognitiveReflectionReceipt, at: Date) throws -> [CognitiveArtifactWrite] {
+        var artifacts = try receipt.affectedCareIDs.map { id -> CognitiveArtifactWrite in
+            guard let care = cares[id] else {
+                throw CognitiveCareNotSaved(detail: "retained reflection care missing: " + id.uuidString)
+            }
+            return CognitiveArtifactWrite(kind: "care", id: id, status: care.fadedAt == nil ? "live" : "faded",
+                score: min(1, abs(care.charge(at: at))), payload: try Self.careJSON(care))
+        }
+        artifacts.append(CognitiveArtifactWrite(kind: "reflection_receipt", id: receipt.id,
+            status: receipt.persistenceStatus, score: 0, payload: receipt.toJSON()))
+        if reflectionDispositionClaims.contains(receipt.id) {
+            artifacts.append(CognitiveArtifactWrite(kind: "disposition", id: stableArtifactID("disposition"),
+                status: "current", score: (disposition.valence + 1) / 2, payload: dispositionArtifactPayload(at: at)))
+        }
+        return artifacts
+    }
+
+    public func acknowledgeDreamReflection(_ id: UUID) async throws {
+        await waitForMaintenanceTransition()
+        // A repeated acknowledgment after its journal checkpoint failed may
+        // find a pruned, already settled receipt; no effect is owed here.
+        guard var receipt = reflectionReceipts[id] else { return }
+        guard receipt.careIntegrationPending != true, !receipt.dispositionSaveFailed else {
+            throw CognitivePersistenceError.artifactWriteFailed(family: "reflection_receipt", detail: "reflection effects remain owed")
+        }
+        receipt.journalPending = false
+        reflectionReceipts[id] = receipt
+        try await checkpointReflectionResultChecked(receipt, requirePersistence: true)
     }
 
     private func requireIntegratedReflectionReceipt(_ receipt: CognitiveReflectionReceipt) throws {
         guard reflectionReceipts[receipt.id] == receipt else {
-            throw CognitivePersistenceError.artifactWriteFailed(
-                family: "reflection_receipt",
-                detail: "receipt was not integrated through the reservation-owned substrate path"
-            )
+            throw CognitivePersistenceError.artifactWriteFailed(family: "reflection_receipt",
+                detail: "receipt is not the substrate's retained judgment")
         }
     }
 
@@ -363,14 +433,19 @@ extension CognitiveSubstrate {
         return session.flatMap { peerIdentity(session: $0, dataRoot: dataRoot) }
     }
 
-    private func parseReflectionProposals(
-        receipt: CognitiveReflectionReceipt,
-        source: String? = nil
-    ) async -> [UUID] {
-        guard ownsReflectionReservation(receipt.request), !reflectionIsTainted(receipt.request),
-              let judgment = receipt.judgment, !judgment.sources.isEmpty else { return [] }
+    private func applyReflectionCares(receipt: CognitiveReflectionReceipt) async throws {
+        guard let judgment = receipt.judgment else {
+            throw CognitivePersistenceError.artifactWriteFailed(family: "reflection_care", detail: "retained judgment input is missing")
+        }
+        if reflectionIsTainted(receipt.request) {
+            var skipped = receipt
+            skipped.careIntegrationPending = false
+            reflectionReceipts[receipt.id] = skipped
+            return
+        }
+        let generation = caringAppraisalGeneration
         var view: String?, because = "", unless = ""
-        for raw in (source ?? receipt.resultSummary).split(whereSeparator: \.isNewline) {
+        for raw in judgment.reflection.split(whereSeparator: \.isNewline) {
             let line = Self.normalizedProposalLine(raw).replacingOccurrences(of: "**", with: "")
             let lower = line.lowercased()
             func rest(_ prefix: String) -> String {
@@ -380,48 +455,41 @@ extension CognitiveSubstrate {
             else if lower.hasPrefix("because:") { because = rest("because:") }
             else if lower.hasPrefix("unless:") { unless = rest("unless:") }
         }
-        guard let view, !view.isEmpty else { return [] }
-        return await applyReflectionCare(
-            view, stance: .init(text: view, because: because, wouldChangeMind: unless), receipt: receipt)
-    }
-
-    /// The reflection's thought, in the care it named (`judgment.care`, a key
-    /// it was shown), else in `made` (the care its view just went to), else in
-    /// a new care of hers. An open takeaway goes only to a care that can hold
-    /// a question, never a life root.
-    func applyReflectionCare(_ text: String, stance: CognitiveCare.Stance? = nil,
-                             open: String? = nil, joining made: UUID? = nil,
-                             receipt: CognitiveReflectionReceipt) async -> [UUID] {
-        guard ownsReflectionReservation(receipt.request), !reflectionIsTainted(receipt.request) else { return [] }
-        let generation = caringAppraisalGeneration
-        func holds(_ id: UUID) -> Bool { cares[id].map { open == nil || $0.origin != .seed } ?? false }
+        // Both judgments are prepared before applying either. A takeaway joins
+        // the view's care inside the synchronous mutation, unless it is a root.
         let key = receipt.judgment?.care?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let named = key.flatMap { key in receipt.request.cares.first { $0.key.lowercased() == key }?.id }
-        let target: CognitiveCareJudgment.Target
-        if let named, holds(named) {
-            target = .existing(named)
-        } else if let made, holds(made) {
-            target = .existing(made)
-        } else {
-            target = .new(about: careTitle(from: text), between: false)
+        var judgments: [CognitiveCareJudgment] = []
+        let stance = view.flatMap { text -> CognitiveCare.Stance? in
+            guard !text.isEmpty, !judgment.sources.isEmpty else { return nil }
+            return .init(text: text, because: because, wouldChangeMind: unless)
         }
-        do {
-            return try await applyCares([
-                CognitiveCareJudgment(target: target, moved: 0, by: .her, felt: "reflected",
-                                      note: "my reflection", open: open, stance: stance)
-            ], provenance: .init(speaker: CognitiveCare.ownerKey, trusted: true, appAuthored: true,
-                                source: "reflection:" + receipt.id.uuidString, at: receipt.createdAt),
-               generation: generation)
-        } catch let error as CognitiveCareNotSaved {
-            // Keep the care identity with the produced judgment. Terminal
-            // settlement saves these resident changes before its receipt;
-            // it must never judge or apply the reflection a second time.
-            nativeLog("reflection: care durability owed: %@", error.description)
-            return error.ids
-        } catch {
-            nativeLog("reflection: care was not saved: %@", String(describing: error))
-            return []
+        var candidates: [(String, CognitiveCare.Stance?, String?)] = []
+        if let stance { candidates.append((stance.text, stance, nil)) }
+        if let takeaway = judgment.takeaway { candidates.append((takeaway, nil, takeaway)) }
+        for (text, stance, open) in candidates {
+            let target: CognitiveCareJudgment.Target
+            if let key, key != "new" {
+                guard let named, let care = cares[named], care.fadedAt == nil,
+                      open == nil || care.origin != .seed else {
+                    await recordReceipt(kind: "reflection.care_refused", payload: .object([
+                        "reflectionId": .string(receipt.id.uuidString), "care": .string(key),
+                        "cause": .string(named == nil ? "target was not offered" : "target is absent, faded or cannot hold an open question"),
+                    ]))
+                    continue
+                }
+                target = .existing(named)
+            } else {
+                target = .new(about: careTitle(from: text), between: false)
+            }
+            judgments.append(CognitiveCareJudgment(target: target, moved: 0, by: .her, felt: "reflected",
+                note: "my reflection", open: open, stance: stance))
         }
+        _ = try await applyCareJudgments(judgments,
+            provenance: .init(speaker: CognitiveCare.ownerKey, trusted: true, appAuthored: true,
+                            source: "reflection:" + receipt.id.uuidString, at: receipt.createdAt),
+            generation: generation, reflectionReceipt: receipt,
+            joinReflectionTakeaway: key == nil || key == "new")
     }
 
     static func normalizedProposalLine(_ rawLine: Substring) -> String {
@@ -438,15 +506,6 @@ extension CognitiveSubstrate {
         let promptUnits = Double(estimatedTokens(prompt))
         let resultUnits = Double(estimatedTokens(result)) * 3
         return (promptUnits + resultUnits) / 1_000
-    }
-
-    private func reflectionYieldScore(
-        proposalCount: Int,
-        costUnits: Double,
-        cancelled: Bool
-    ) -> Double {
-        guard !cancelled, proposalCount > 0 else { return 0 }
-        return (Double(proposalCount) / max(1, costUnits * 4)).clamped01()
     }
 
 }

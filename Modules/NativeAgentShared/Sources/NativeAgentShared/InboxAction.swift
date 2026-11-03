@@ -3,8 +3,11 @@ import Foundation
 
 /// The device signature and inner HMAC travel in this same envelope on both platforms.
 public struct InboxAction: Codable, Sendable {
-    /// Normalize historical string responses at the signed response boundary.
+    /// Classify current Mac string responses at the signed response boundary.
     public static func responseResultClass(_ response: [String: String]) -> String {
+        // Ledger replay can report uncertainty as an error without result_class.
+        // That code is evidence of an unknown outcome, never confirmed failure.
+        if response["code"] == "unknown_outcome" { return "unknown" }
         if let verdict = response["result_class"] { return verdict }
         let status = (response["status"] ?? "").lowercased()
         if ["pending_approval", "approval_required", "pending", "queued", "running", "outcome_unknown"].contains(status) { return "unknown" }

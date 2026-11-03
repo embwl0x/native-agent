@@ -139,9 +139,8 @@ private struct MobileSchedulerCreateView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var name = ""
-    @State private var kind = "notify"
+    @State private var kind = "dream"
     @State private var interval = "3600"
-    @State private var message = ""
     @State private var saving = false
     @State private var failure: String?
 
@@ -149,7 +148,7 @@ private struct MobileSchedulerCreateView: View {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed.count <= 160,
               let seconds = Int64(interval), (60...315_360_000).contains(seconds) else { return false }
-        return kind != "notify" || (!message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && message.count <= 1000)
+        return true
     }
 
     var body: some View {
@@ -157,7 +156,6 @@ private struct MobileSchedulerCreateView: View {
             AliveSection("Job") {
                 TextField("Name", text: $name).aliveRow()
                 Picker("Kind", selection: $kind) {
-                    Text("Notification").tag("notify")
                     Text("Reflection").tag("dream")
                     Text("REM consolidation").tag("rem")
                 }
@@ -165,9 +163,7 @@ private struct MobileSchedulerCreateView: View {
                 TextField("Interval (seconds)", text: $interval)
                     .keyboardType(.numberPad)
                     .aliveRow()
-                if kind == "notify" {
-                    TextField("Notification message", text: $message, axis: .vertical).aliveRow()
-                }
+                Text("For reminders or check-ins, say what and when in Chat.").aliveRow()
             }
             if let failure {
                 AliveSection("Could not create job") { Text(failure).aliveRow() }
@@ -192,7 +188,7 @@ private struct MobileSchedulerCreateView: View {
             do {
                 _ = try await iCloudSyncEngine.shared.changeSchedulerJob(
                     action: "create_scheduler_job",
-                    payload: ["name": name, "kind": kind, "interval_seconds": interval, "message": message]
+                    payload: ["name": name, "kind": kind, "interval_seconds": interval]
                 )
                 dismiss()
             } catch {

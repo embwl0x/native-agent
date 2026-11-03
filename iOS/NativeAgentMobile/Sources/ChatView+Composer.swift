@@ -4,7 +4,7 @@ import Speech
 import PhotosUI
 import NativeAgentShared
 import UniformTypeIdentifiers
-// Blueprint: | `ChatView+Composer.swift` | Session-bound drafts, dictation controls and attachment preparation on ChatView |
+// Blueprint: | `ChatView+Composer.swift` | Session-bound drafts, dictation, talk entry and attachment preparation on ChatView |
 
 extension ChatView {
     struct SessionComposer {
@@ -23,7 +23,7 @@ extension ChatView {
         if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleExtras") {
             return ["Also remind me to call Sam", "And pick a walking route"].map {
                 QueuedChatSend(id: UUID(), sessionID: nil, text: $0, controls: runtimeControls,
-                               attachments: [], createdAt: Date())
+                               attachments: [], createdAt: Date(), pairingFingerprint: "chat-sample")
             }
         }
         #endif
@@ -32,28 +32,14 @@ extension ChatView {
 
     var composerBar: some View {
         VStack(spacing: 8) {
-            if voiceInput.isListening || voiceInput.isStarting {
-                HStack(spacing: 8) {
-                    Image(systemName: "mic.fill")
-                        .foregroundStyle(NativeAgentPalette.agentAccent)
-                    // Every word as it is heard: the line grows with the talk, and a
-                    // long one keeps its newest words in view.
-                    Text(voiceInput.transcript.isEmpty ? (voiceInput.statusText ?? "Listening") : voiceInput.transcript)
-                        .font(AppFont.body.italic())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1...8)
-                        .truncationMode(.head)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer()
-                }
-                .frame(minHeight: 28)
-                .padding(.horizontal, 4)
-            }
             if !pendingPhotos.isEmpty || !pendingFiles.isEmpty || isLoadingPhotos {
                 pendingPhotoStrip
             }
             if !queuedTurns.isEmpty {
                 queuedSendStrip
+            }
+            if isRecordingVoice {
+                DictationTranscript(input: voiceInput)
             }
 
             let a11y = dynamicTypeSize.isAccessibilitySize
@@ -61,17 +47,32 @@ extension ChatView {
                 ? AnyLayout(VStackLayout(alignment: .leading, spacing: 4))
                 : AnyLayout(HStackLayout(alignment: .bottom, spacing: 2))
             layout {
-                if !a11y { photosPickerButton }
-                MobileChatComposerField(draft: draft, placeholder: composerPlaceholder,
+                if !a11y { leadingButtons }
+                if isRecordingVoice {
+                    recordingStrip
+                } else {
+                    MobileChatComposerField(draft: draft, placeholder: composerPlaceholder,
                     focused: $composerIsFocused, accessibilitySize: a11y,
                     isSwitchingSession: store.isSwitchingSession, onSubmit: submitMessage)
+                }
 
             HStack(spacing: 2) {
-                if a11y { photosPickerButton; Spacer(minLength: 8) }
+                if a11y { leadingButtons; Spacer(minLength: 8) }
                 micButton
                     .disabled(store.isSwitchingSession)
+                Button {
+                    composerIsFocused = false
+                    voiceInput.cancel(); voiceOutput.stop()
+                    TalkModeController.shared.begin(client: bridgeClient, controls: runtimeControls)
+                } label: {
+                    Image(systemName: "phone.arrow.up.right")
+                        .font(.system(size: 18)).frame(width: 44, height: 44)
+                }
+                .disabled(store.isSwitchingSession || voiceInput.isFinalizing)
+                .accessibilityLabel("Talk to \(agentDisplayName)")
+                .accessibilityHint("Start a hands-free conversation in this chat")
 
-                if !store.activeTurnRunIDs.isEmpty || (isChatSample && visibleMessages.last?.isStreaming == true) {
+                if !voiceInput.isListening && !voiceInput.isStarting && (!store.activeTurnRunIDs.isEmpty || (isChatSample && visibleMessages.last?.isStreaming == true)) {
                     Button {
                         guard !isChatSample else { return }
                         store.stop(client: bridgeClient)
@@ -111,7 +112,7 @@ extension ChatView {
                         }
                         .frame(width: 44, height: 44)
                 }
-                .disabled(!(canSend || voiceInput.isListening || voiceInput.isStarting) || store.isSwitchingSession)
+                .disabled(!(canSend || voiceInput.isListening || voiceInput.isStarting) || store.isSwitchingSession || voiceInput.isFinalizing)
                 .accessibilityLabel("Send message")
                 }
             }
@@ -127,6 +128,9 @@ extension ChatView {
             PhoneThinkingLight(correlationIDs: Set(store.pendingICloudPlaceholders.keys))
         }
         .frame(maxWidth: NativeAgentMobileTheme.Layout.roomColumn)
+        #if DEBUG
+        .task { voiceInput.showDictationSample() }
+        #endif
     }
 
     private var canSend: Bool {
@@ -324,43 +328,59 @@ extension ChatView {
     }
 
     private var micButton: some View {
-        let micActive = voiceInput.isListening || voiceInput.isStarting
-        return Button {
-            if micActive {
-                voiceInput.stop()
-            } else {
-                // Stop playback before opening the microphone.
-                voiceOutput.stop()
-                dictationSessionKey = store.queueSessionKey(store.selectedSessionID)
-                Task { await voiceInput.start() }
-            }
-        } label: {
-            let haze = HazeColor(stored: hazeColorRaw).control(dark: true, labelled: true)
-            ZStack {
-                if micActive {
-                    Circle()
-                        .strokeBorder(haze.opacity(0.5), lineWidth: 2)
-                        .frame(width: 42, height: 42)
-                        .scaleEffect(1.08)
-                        .animation(AppMotion.pulse, value: micActive)
-                }
+        ComposerVoiceMicrophone(input: voiceInput, begin: { note in
+            voiceOutput.stop()
+            VoiceNoteBubble.stopPlayback()
+            composerIsFocused = false
+            sendWhenDictationLands = false
+            dictationSessionKey = store.queueSessionKey(store.selectedSessionID)
+            let names = [agentDisplayName, sync.personality?.userName ?? ""].filter { !$0.isEmpty }
+            voiceInput.begin(voiceNote: note, names: names)
+        }, release: {
+            sendWhenDictationLands = true
+            voiceInput.stop()
+        }, cancel: cancelVoiceInput)
+    }
 
-                Circle()
-                    .fill(micActive ? haze : Color.clear)
+    private func cancelVoiceInput() {
+        sendWhenDictationLands = false
+        dictationSessionKey = nil
+        voiceInput.cancel()
+    }
+
+    private var isRecordingVoice: Bool {
+        voiceInput.isListening || voiceInput.isStarting || voiceInput.isFinalizing
+    }
+
+    /// Attachments, or while recording the cancel in their place (the mic never moves under a held finger).
+    @ViewBuilder private var leadingButtons: some View {
+        if isRecordingVoice {
+            Button(action: cancelVoiceInput) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(AlivePalette.text)
                     .frame(width: 36, height: 36)
-                    .overlay {
-                        Image(systemName: "mic")
-                            .font(.system(size: 17, weight: micActive ? .semibold : .regular))
-                            .symbolVariant(micActive ? .fill : .none)
-                            .foregroundStyle(micActive ? Color.white : AlivePalette.secondary)
-                    }
-                    .animation(AppMotion.snappy, value: micActive)
+                    .background(NativeAgentMobileTheme.Colors.softFill, in: Circle())
+                    .frame(width: 44, height: 44)
             }
-            .frame(width: 44, height: 44)
-            .contentShape(Circle())
+            .buttonStyle(.plain)
+            .accessibilityLabel("Cancel recording")
+        } else {
+            photosPickerButton
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(micActive ? "Stop dictation" : "Start dictation")
+    }
+
+    /// The words show above, full width; this row keeps the clock and the live waveform.
+    private var recordingStrip: some View {
+        HStack(spacing: 8) {
+            if voiceInput.isLocked { Image(systemName: "lock.fill").font(.footnote) }
+            if let start = voiceInput.startedAt {
+                Text(start, style: .timer).monospacedDigit().font(.subheadline)
+            }
+            DictationWaveform(input: voiceInput)
+        }
+        .frame(maxWidth: .infinity, minHeight: 44)
+        .padding(.horizontal, 4)
     }
 
     func invalidateAttachmentPreparation() {

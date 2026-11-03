@@ -20,7 +20,7 @@ import TelegramBot
 import ToolExecution
 import TriggerScheduler
 import WorkshopExecution
-// Blueprint: | `EngineScheduledWork.swift` | NativeAgentEngine trigger scheduler and Workshop composition; SchedulerDueJobRunner native effects; scheduled reads enter withPartDoor and watchRefusal before dispatch |
+// Blueprint: | `EngineScheduledWork.swift` | NativeAgentEngine trigger scheduler and Workshop composition; SchedulerDueJobRunner body-rhythm effects, with scheduled-turn and Workshop job doors retired; scheduled reads enter withPartDoor and watchRefusal before dispatch |
 
 // User schedules stay canonical in scheduler/jobs.json and the trigger stores.
 // BackgroundLoopLifetimes owns lifecycle, single-flight execution and deadlines.
@@ -239,10 +239,6 @@ struct EngineSchedulerExecutionPlatform: SchedulerExecutionPlatform {
         await NativeAgentEngine.live.ports.backgroundWork.postMacNotification(title: title, body: body, userInfo: [:], soundName: nil)
     }
 
-    func sendTelegramMessage(message: String) async throws {
-        _ = try await SwiftNativeTelegramBot().sendTestMessage(message: message, chatId: nil)
-    }
-
     func notifyInboxIfAttentionWorthy(
         dataRoot: URL, itemId: String, title: String, summary: String,
         source: String, severity: String
@@ -291,23 +287,4 @@ struct EngineSchedulerExecutionPlatform: SchedulerExecutionPlatform {
         return (run.id, run.status)
     }
 
-    func createWorkshopTask(
-        title: String, objective: String, projectSpaceId: String?
-    ) async throws -> (id: String, status: String) {
-        let execution = try await NativeAgentEngine.submitDeskTask(
-            title: title, objective: objective, projectSpaceId: projectSpaceId
-        ).execution
-        return (execution.id, execution.status)
-    }
-
-    func runScheduledTurn(name: String, prompt: String) async throws -> (model: String, output: String) {
-        let root = PersistenceCore.defaultDataRoot()
-        let tools = EngineWorkshopSessionEffects().makeToolDispatcher(dataRoot: root)
-        let client = NativeAgentEngine.live.chatClient(tools: tools)
-        let response = try await LLMCallContext.$purpose.withValue("scheduled_turn") {
-            try await client.runEphemeralToolTurn(
-                message: prompt, fileAccess: "auto", requireCompleted: true, surface: "chat")
-        }
-        return (response.model, response.output)
-    }
 }

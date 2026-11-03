@@ -18,7 +18,7 @@ public enum CognitiveSomaticSignals {
              .providerStarted, .providerSucceeded, .providerFailed, .providerCancelled, .providerRecovered,
              .iPhoneReachable, .iPhoneStale,
              .phoneDeliveryStarted, .phoneDeliveryReceived, .phoneDeliveryFailed,
-             .memoryCommitted, .memoryHygieneCompleted,
+             .memoryCommitted,
              .appWake, .appSleep, .resourcePressureChanged:
             return false
         default:
@@ -32,7 +32,7 @@ public enum CognitiveSomaticSignals {
     /// satisfied`), an effectful tool call of hers that succeeded (a canonical
     /// outcome whose risk class is above a read, or that says `effects:
     /// occurred` — a Desk item closed, a message sent, a file written), a
-    /// clean skill run, finished Workshop work. Her own work failing lowers
+    /// clean skill run. Her own work failing lowers
     /// confidence a little. Reads, pings and transport results are nil.
     public static func ownOutcomeDose(_ event: CognitiveEvent) -> (agency: Double, confidence: Double)? {
         guard event.turnKind.contributesToLivedState else { return nil }
@@ -48,9 +48,6 @@ public enum CognitiveSomaticSignals {
             return effectful ? (0.04, 0.03) : nil
         case .toolFailed:
             return verification == "failed" || effectful || (skill && risk != nil) ? (0, -0.03) : nil
-        case .workshopExecutionCompleted:
-            if event.isPositiveTerminalOutcome { return (0.05, 0.04) }
-            return event.isNegativeTerminalOutcome ? (0, -0.03) : nil
         default:
             return nil
         }
@@ -115,8 +112,6 @@ public enum CognitiveSomaticSignals {
             // kind, no new capsule slot — sluggishness is a value on an axis the
             // body already feels.
             return providerVitalsSignalKind(from: event)
-        case .workshopExecutionCompleted:
-            return workshopExecutionSignalKind(from: event)
         case .appWake:
             return .appWake
         case .appSleep:
@@ -136,15 +131,6 @@ public enum CognitiveSomaticSignals {
             return .providerRecovered
         default:
             return .providerFailed
-        }
-    }
-
-    private static func workshopExecutionSignalKind(from event: CognitiveEvent) -> SomaticSignalKind {
-        switch stringValue(event.metadata["status"])?.lowercased() {
-        case "failed", "cancelled", "blocked":
-            return .deskItemBlocked
-        default:
-            return .deskItemClosed
         }
     }
 
@@ -180,8 +166,6 @@ public enum CognitiveSomaticSignals {
                 return "provider.\(providerId)"
             }
             return "provider"
-        case .workshopExecutionCompleted:
-            return "desk"
         case .userCorrection:
             return "correction"
         case .appWake, .appSleep:
@@ -226,6 +210,8 @@ public enum CognitiveSomaticSignals {
         }
         if let identity = event.metadata["motorActionIdentity"] {
             metadata["predictionCorrelationId"] = identity
+        } else if let identity = event.metadata["toolInvocationId"] {
+            metadata["predictionCorrelationId"] = identity
         }
         return metadata
     }
@@ -244,7 +230,7 @@ public enum CognitiveSomaticSignals {
         "provider_id",
         "providerId",
         "approvalId",
-        "missionId",
+        "executionId",
         "stepId",
         "itemId",
         "sourceKey",

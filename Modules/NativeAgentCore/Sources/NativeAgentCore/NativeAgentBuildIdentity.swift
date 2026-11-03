@@ -1,6 +1,7 @@
 import Foundation
+import CoreFoundation
 import NativeAgentShared
-// Blueprint: | `NativeAgentBuildIdentity.swift` | process-cached current identity, injectable `from`, `writeLaunchStamp` |
+// Blueprint: | `NativeAgentBuildIdentity.swift` | checked process-cached current app stamps; incomplete identity unavailable; `writeLaunchStamp` refuses it |
 
 /// Exact identity of the bytes currently running inside the app bundle.
 ///
@@ -11,18 +12,37 @@ import NativeAgentShared
 ///
 /// All surfaces read the same process-cached running-binary identity.
 public struct NativeAgentBuildIdentity: Sendable, Equatable {
+    /// Display labels. Unavailable processes say so explicitly; the payload
+    /// and launch writer never present these labels as stamped metadata.
     public let version: String
     public let build: String
     public let sourceRevision: String?
-    public let sourceDirty: Bool
+    public let sourceDirty: Bool?
     public let sourceContentID: String?
+    public let unavailableReason: String?
 
-    public init(version: String, build: String, sourceRevision: String?, sourceDirty: Bool, sourceContentID: String? = nil) {
+    private init(version: String, build: String, sourceRevision: String, sourceDirty: Bool, sourceContentID: String) {
         self.version = version
         self.build = build
         self.sourceRevision = sourceRevision
         self.sourceDirty = sourceDirty
         self.sourceContentID = sourceContentID
+        self.unavailableReason = nil
+    }
+
+    private init(unavailable reason: String) {
+        version = "unavailable"
+        build = "unavailable"
+        sourceRevision = nil
+        sourceDirty = nil
+        sourceContentID = nil
+        unavailableReason = reason
+    }
+
+    /// Presentation only; never reconstructs an identity from incomplete stamps.
+    public var description: String {
+        if let unavailableReason { return "Build identity unavailable: \(unavailableReason)" }
+        return "\(version) (\(build))"
     }
 
     public static let current: NativeAgentBuildIdentity = {
@@ -33,34 +53,32 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
         infoDictionary: [String: Any],
         resourcesURL: URL?
     ) -> NativeAgentBuildIdentity {
-        let version = nonempty(infoDictionary["CFBundleShortVersionString"] as? String) ?? "dev"
-        let build = nonempty(infoDictionary["CFBundleVersion"] as? String) ?? version
-        let plistRevision = nonempty(infoDictionary["NativeAgentSourceRevision"] as? String)
-        let resourceRevision: String? = resourcesURL.flatMap { root in
-            try? String(contentsOf: root.appendingPathComponent("VERSION_SHA"), encoding: .utf8)
-        }.flatMap(nonempty)
-        let revisionStampsAgree = plistRevision == nil
-            || resourceRevision == nil
-            || plistRevision?.lowercased() == resourceRevision?.lowercased()
-        let stampedDirty = infoDictionary["NativeAgentSourceDirty"] as? Bool ?? true
-        return NativeAgentBuildIdentity(
-            version: version,
-            build: build,
-            sourceRevision: plistRevision ?? resourceRevision,
-            // Older bundles did not stamp dirty-source truth. Treat that
-            // absence as unknown/dirty so a full-looking resource SHA cannot
-            // be promoted into exact byte identity accidentally. Likewise,
-            // both builder stamps must agree when both are present; a copied
-            // or partially restamped bundle is never exact proof.
-            sourceDirty: stampedDirty || !revisionStampsAgree,
-            sourceContentID: nonempty(infoDictionary["NativeAgentSourceContentID"] as? String).flatMap {
-                Self.isFullGitObjectID($0) ? $0.lowercased() : nil
+        guard let version = nonempty(infoDictionary["CFBundleShortVersionString"] as? String),
+              let build = nonempty(infoDictionary["CFBundleVersion"] as? String),
+              let revision = nonempty(infoDictionary["NativeAgentSourceRevision"] as? String),
+              Self.isFullGitObjectID(revision),
+              let dirty = infoDictionary["NativeAgentSourceDirty"] as? NSNumber,
+              CFGetTypeID(dirty) == CFBooleanGetTypeID(),
+              let contentID = nonempty(infoDictionary["NativeAgentSourceContentID"] as? String),
+              Self.isFullGitObjectID(contentID),
+              let resourcesURL else {
+            return Self(unavailable: "This process has no complete current app stamp. Rebuild and install the app; command-line processes have no app identity.")
+        }
+        do {
+            let resourceRevision = try String(contentsOf: resourcesURL.appendingPathComponent("VERSION_SHA"), encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard resourceRevision.lowercased() == revision.lowercased() else {
+                return Self(unavailable: "Info.plist and VERSION_SHA disagree. Rebuild and install the app.")
             }
-        )
+        } catch {
+            return Self(unavailable: "VERSION_SHA could not be read: \(error.localizedDescription). Rebuild and install the app.")
+        }
+        return Self(version: version, build: build, sourceRevision: revision.lowercased(),
+                    sourceDirty: dirty.boolValue, sourceContentID: contentID.lowercased())
     }
 
     public var exactSourceRevision: String? {
-        guard !sourceDirty,
+        guard sourceDirty == false,
               let sourceRevision,
               Self.isFullGitObjectID(sourceRevision) else {
             return nil
@@ -70,12 +88,13 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
 
     public var bridgePayload: [String: Any] {
         [
-            "version": version,
-            "build": build,
+            "version": unavailableReason == nil ? version as Any : NSNull(),
+            "build": unavailableReason == nil ? build as Any : NSNull(),
             "sourceRevision": sourceRevision ?? NSNull(),
-            "sourceDirty": sourceDirty,
+            "sourceDirty": sourceDirty.map { $0 as Any } ?? NSNull(),
             "sourceContentID": sourceContentID ?? NSNull(),
             "exactSourceRevision": exactSourceRevision ?? NSNull(),
+            "unavailableReason": unavailableReason ?? NSNull(),
         ]
     }
 
@@ -83,11 +102,15 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
 
     /// Public build metadata only; independent of optional control bridges.
     public func writeLaunchStamp(root: URL, at: Date = Date()) throws {
+        if let unavailableReason {
+            throw NSError(domain: "NativeAgentBuildIdentity", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: unavailableReason])
+        }
         let payload: [String: Any] = [
             "version": version,
             "build": build,
             "sourceRevision": sourceRevision ?? NSNull(),
-            "sourceDirty": sourceDirty,
+            "sourceDirty": sourceDirty.map { $0 as Any } ?? NSNull(),
             "sourceContentID": sourceContentID ?? NSNull(),
             "writtenAt": NativeTimestampFormat.plainZulu(at),
             // Which process this launch is: the same build relaunched is a new window.

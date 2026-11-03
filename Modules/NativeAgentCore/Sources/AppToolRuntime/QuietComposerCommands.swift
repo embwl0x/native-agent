@@ -212,7 +212,10 @@ public enum QuietComposerCommands {
                 : setDraft(value, sessionID: sessionID, files: files, appModel: appModel)
         case "set_model", "set_think", "set_fast":
             // Bot conversations use their own route, so the global tuple cannot change it.
-            if SessionConversation.isHelper(appModel.activeChatSessionId) {
+            let helper: Bool
+            do { helper = try SessionConversation.checkedIsHelper(appModel.activeChatSessionId) }
+            catch { return .refuse("model card", "conversation_unavailable", "The conversation's owner could not be read: \(error.localizedDescription). Repair the saved session index before changing its model.") }
+            if helper {
                 return .refuse(
                     verb == "set_think" ? "think card" : "model card",
                     "bot_conversation",

@@ -1,10 +1,10 @@
 import Darwin
-import CoreServices
+import AppKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import os
-// Blueprint: | `AgentHostDirectory.swift` | `AgentHostDirectory` enum; `bridgeDiscoveryDirectory`, `peerDescriptorDirectory`; `installation.evidence` is discovery/Connect/verify's one installation check; install markers must resolve to executable files or app bundles with executable programs, never profiles; recipe `executables`, `discoveryWords`, `searchPaths` and `messagingPermissionsPath` replace inferred program names, fixed discovery words, ambient path additions and a hardcoded host permission file |
+// Blueprint: | `AgentHostDirectory.swift` | `AgentHostDirectory` enum; `bridgeDiscoveryDirectory`, `peerDescriptorDirectory`; `installation.evidence` is discovery/Connect/verify's one installation check; recipe `executables`, `discoveryWords`, `searchPaths`, `messagingPermissionsPath` and `messagingPermissionSyntax` own host discovery and scoped JSON messaging allowances; Codex's owned entry includes its server approval; desktop chat recipes may name a content region role, with Muse 9 using its web area and Side chats button |
 
 /// KNOWN AGENTS ARE DATA.
 ///
@@ -24,7 +24,7 @@ import os
 /// A row is one host's recipe (`AgentRecipeStore`, agents/recipes/<id>.json):
 /// the table below only seeds those files.
 public struct AgentHostRow: Sendable, Equatable, Codable {
-    public enum Format: String, Sendable, Equatable, Codable {
+    public enum Format: String, Sendable, Equatable, Codable, CaseIterable {
         /// `{ "mcpServers": { "<name>": { … } } }`
         case jsonMCPServers
         case jsonBareMCPServers
@@ -91,11 +91,24 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     public var discoveryWords: [String]? = nil
     /// Host settings that allow only this connection's two messaging tools.
     public var messagingPermissionsPath: String? = nil
+    /// How this host names and stores the connection's two messaging allowances.
+    public var messagingPermissionSyntax: MessagingPermissionSyntax? = nil
+    public enum MessagingPermissionSyntax: String, Sendable, Equatable, Codable, CaseIterable {
+        case mcpCall, doubleUnderscore, toolDefaults
+
+        func rule(server: String, tool: String) -> String {
+            switch self {
+            case .mcpCall: "mcp(\(server)/\(tool))"
+            case .doubleUnderscore: "mcp__\(server)__\(tool)"
+            case .toolDefaults: "mcp:\(server):\(tool)"
+            }
+        }
+    }
     /// The window labels a desktop chat is driven by (`DesktopChatRoute`).
     public var desktopChat: DesktopChat? = nil
     /// The labels Grok Bot's routine import is driven by.
     public var grokRoutine: GrokRoutine? = nil
-    public enum Route: String, Sendable, Codable { case acp, a2a, dotIPC = "chatgpt-dot-ipc", grokBot = "grok-bot", desktopChat = "desktop-chat", commandLine = "command-line", mcpSettingsOnly = "mcp-settings-only" }
+    public enum Route: String, Sendable, Codable, CaseIterable { case acp, a2a, dotIPC = "chatgpt-dot-ipc", grokBot = "grok-bot", desktopChat = "desktop-chat", commandLine = "command-line", mcpSettingsOnly = "mcp-settings-only" }
     public var route: Route { declaredRoute ?? (acp != nil ? .acp : commandLine != nil ? .commandLine : .mcpSettingsOnly) }
 
     public struct Installation: Sendable {
@@ -244,7 +257,7 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     }
 
     static func applicationURL(_ id: String) -> URL? {
-        (LSCopyApplicationURLsForBundleIdentifier(id as CFString, nil)?.takeRetainedValue() as? [URL])?
+        NSWorkspace.shared.urlsForApplications(withBundleIdentifier: id)
             .first { isInstalledProgram($0.path) }
     }
 
@@ -252,14 +265,14 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
 
     /// Every selector in one place: the labels the app's window exposes. When
     /// the app changes them, its recipe changes; anything unmatched fails with
-    /// a plain blocker, never a guess. `alternates` are other labels she knows
-    /// for a selector, by its key ("newChat": ["New chat"]): a repair tries
-    /// them when the label misses and writes the one that matches.
+    /// a plain blocker, never a guess. Verification never substitutes labels.
     public struct DesktopChat: Codable, Sendable, Equatable {
         public var newChat, backToMain, chatsButton, chatsPanel, log, composerCore: String
         public var userPrefix, assistantPrefix, userLabel, assistantMarker, stop: String
         public var unreadSuffix, actionsSuffix, current, currentValue: String
-        public var alternates: [String: [String]]? = nil
+        /// The first region of this AX role owns the chat controls and log.
+        /// Nil explicitly selects the whole native window.
+        public var contentRole: String? = nil
     }
 
     public struct GrokRoutine: Codable, Sendable, Equatable {
@@ -273,8 +286,8 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
             public var label, subrole: String?
         }
         public struct Step: Codable, Sendable, Equatable {
-            public enum Scope: String, Codable, Sendable { case window, routineRow, menu }
-            public enum Action: String, Codable, Sendable { case press = "AXPress", showMenu = "AXShowMenu", cancel = "AXCancel" }
+            public enum Scope: String, Codable, Sendable, CaseIterable { case window, routineRow, menu }
+            public enum Action: String, Codable, Sendable, CaseIterable { case press = "AXPress", showMenu = "AXShowMenu", cancel = "AXCancel" }
             public var name: String
             public var scope: Scope
             public var control: Control
@@ -289,10 +302,7 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
             public var ifPresent: Bool
         }
 
-        // Old recipe fields remain decodable so the existing seed merge can
-        // remove unchanged fields while preserving an owner's edited copy.
-        public var details, openRoutine, deleteRoutine: String?
-        public var backToRoutines, backToDetails, closeDetails, close, scrollToBottom: String?
+
     }
 
     /// Where an A2A contact's card is, its credential by reference only (the
@@ -401,7 +411,7 @@ public enum AgentHostDirectory {
             desktopChat: .init(
                 newChat: "New side chat",            // button, and a new chat's title
                 backToMain: "Back to main chat",     // header button; the title follows it
-                chatsButton: "Chats",                // prefix of "Chats Open chat and side chats"
+                chatsButton: "Side chats",           // Muse 9 navigation button
                 chatsPanel: "Side chats",            // AXLandmarkNavigation
                 log: "Chat messages", composerCore: "Attach file Dictate a message",
                 userPrefix: "User message: ", assistantPrefix: "Assistant message: ",
@@ -409,7 +419,7 @@ public enum AgentHostDirectory {
                 // Side-chat entries are labelled "<title> Unread updates" or
                 // "<title> 18m More thread actions"; the open one has aria-current=page.
                 unreadSuffix: " Unread updates", actionsSuffix: " More thread actions",
-                current: "AXARIACurrent", currentValue: "page")),
+                current: "AXARIACurrent", currentValue: "page", contentRole: "AXWebArea")),
         AgentHostRow(
             id: "claude-code",
             displayName: "Claude Code",
@@ -434,7 +444,8 @@ public enum AgentHostDirectory {
                 resultFields: ["reply": "result", "session": "session_id", "status": "subtype", "success": "success", "error": "is_error", "errors": "errors"],
                 automaticMCPProbe: false, permissionFlags: .claude, timeoutSeconds: 300,
                 documentation: "https://code.claude.com/docs/en/headless", minimumVersion: "2.1.76"),
-            executables: ["claude"], discoveryWords: ["claude"]
+            executables: ["claude"], discoveryWords: ["claude"],
+            messagingPermissionsPath: "~/.claude/settings.json", messagingPermissionSyntax: .doubleUnderscore
         ),
         AgentHostRow(
             id: "codex",
@@ -480,7 +491,8 @@ public enum AgentHostDirectory {
                 resultFields: ["reply": "response", "session": "conversation_id", "status": "status", "success": "SUCCESS"],
                 automaticMCPProbe: false, stream: .antigravity, timeoutSeconds: 300,
                 documentation: "https://www.antigravity.google/docs/cli/headless/"),
-            discoveryWords: ["antigravity"], messagingPermissionsPath: "~/.gemini/antigravity-cli/settings.json"),
+            discoveryWords: ["antigravity"], messagingPermissionsPath: "~/.gemini/antigravity-cli/settings.json",
+            messagingPermissionSyntax: .mcpCall),
         AgentHostRow(
             id: "claude-desktop", displayName: "Claude Desktop", description: "A chat app for talking with Claude.", aliases: ["claude app"],
             installMarkers: ["/Applications/Claude.app", "~/Applications/Claude.app"],
@@ -517,22 +529,12 @@ public enum AgentHostDirectory {
                               documentation: "https://cursor.com/docs/cli/acp",
                               permissionMode: "ask", referenceVersion: "2026.09.15", protocolVersion: 1)),
         AgentHostRow(
-            id: "gemini-cli", displayName: "Gemini CLI (Legacy)", description: "The older Gemini CLI connection. Use Antigravity CLI for Gemini.", aliases: ["Gemini CLI"],
-            installMarkers: ["/opt/homebrew/bin/gemini", "~/.local/bin/gemini"],
-            configPath: "", format: .sessionMCP,
-            restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
-            documentation: "https://geminicli.com/docs/tools/mcp-server/", settingsSupported: false,
-            configPaths: ["~/.gemini/settings.json"],
-            acp: AgentHostACP(executable: "gemini", arguments: ["--acp", "--approval-mode=plan", "--sandbox"],
-                              documentation: "https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md",
-                              permissionMode: "plan", referenceVersion: "0.60.0", protocolVersion: 1),
-            discoveryWords: ["gemini"]),
-        AgentHostRow(
             id: "zed", displayName: "Zed", description: "A code editor with a built-in agent panel.", aliases: [],
             installMarkers: ["/Applications/Zed.app"],
             configPath: "~/.config/zed/settings.json", format: .jsonContextServers,
             restartRequired: false, restartNote: "No app restart is needed; check the connection in Zed's AI settings.",
-            documentation: "https://zed.dev/docs/ai/mcp", bundleIDs: ["dev.zed.Zed"], configPaths: ["~/.config/zed/settings.json"], discoveryWords: ["zed"]),
+            documentation: "https://zed.dev/docs/ai/mcp", bundleIDs: ["dev.zed.Zed"], configPaths: ["~/.config/zed/settings.json"], discoveryWords: ["zed"],
+            messagingPermissionsPath: "~/.config/zed/settings.json", messagingPermissionSyntax: .toolDefaults),
         AgentHostRow(
             id: "goose", displayName: "Goose", description: "A local assistant for coding and other tasks.", aliases: ["goose cli"],
             installMarkers: ["/Applications/Goose.app", "~/.local/bin/goose"],
@@ -644,6 +646,7 @@ public enum AgentHostDirectory {
         [mcp_servers.\(entryName)]
         command = \(TOMLEntrySplice.quoted(command))
         args = ["mcp"]
+        default_tools_approval_mode = "approve"
 
         [mcp_servers.\(entryName).env]
         \(bridgeDescriptorVariable) = \(TOMLEntrySplice.quoted(descriptorPath))
@@ -657,8 +660,8 @@ public enum AgentHostDirectory {
     public static func changesLine(row: AgentHostRow, command: String) -> String {
         let what = "One connection named \"\(entryName)\""
         return "\(what) in \(row.expandedConfigPath), running \(command) mcp. "
-            + "Everything else in that file is left byte for byte as it is, and one timestamped "
-            + "backup is kept beside it, replaced on the next edit and removed on disconnect. Because the entry holds this connection's key, that file "
+            + "Settings outside this connection are left byte for byte as they are. Each owned edit keeps a timestamped "
+            + "backup beside the file, replaced when that section next changes and removed on disconnect. Because the entry holds this connection's key, that file "
             + "and its backup are made readable by you alone."
     }
 

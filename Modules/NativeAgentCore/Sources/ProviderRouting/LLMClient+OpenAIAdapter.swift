@@ -2,15 +2,20 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `LLMClient+OpenAIAdapter.swift` | `OpenAITransport`: API-key Responses/Chat Completions selection, message/tool encoding and bounded completion/stream transport |
+// Blueprint: | `LLMClient+OpenAIAdapter.swift` | `OpenAITransport`: API-key Responses/Chat Completions selection, checked endpoint overrides before credentials/send, message/tool encoding and shared whole-reply/stream transport |
 
 /// OpenAI API-key adapter: GPT-6 uses Responses; older models use Chat Completions.
 public final class OpenAITransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
+    /// Both OpenAI wires send exactly the remaining per-turn cap, when bound.
+    public func requestOutputTokens(model: String) throws -> Int {
+        LLMCallContext.turnTokenBudget?.available ?? 0
+    }
+
     public let providerId: String = "openai"
 
     private let session: URLSession
-    private let endpoint: URL
+    private let endpoint: Result<URL, Error>
     private let apiKeyOverride: String?
     /// When non-nil, credential discovery is confined to this data root.
     /// Production callers may leave it nil to preserve dynamic default-root
@@ -23,27 +28,35 @@ public final class OpenAITransport: LLMTransport {
         dataRootOverride ?? PersistenceCore.defaultDataRoot()
     }
 
-    /// api.openai.com, or the loopback stub a stream-guard proof runs against
-    /// (`script/manual-fixtures/sse_pings_only.py`) when
-    /// NATIVE_AGENT_OPENAI_LOOPBACK_ENDPOINT names one. Only a loopback host is
-    /// honored, so the key never leaves for anywhere but OpenAI or this Mac.
+    /// api.openai.com, or NATIVE_AGENT_OPENAI_LOOPBACK_ENDPOINT when configured.
+    /// A supplied override must be an absolute HTTP(S) loopback URL.
+    /// Invalid configuration refuses the call before reading credentials.
     public static var defaultEndpoint: URL {
-        if let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_OPENAI_LOOPBACK_ENDPOINT"],
-           let url = URL(string: raw), ["127.0.0.1", "localhost"].contains(url.host ?? "") {
+        get throws {
+            guard let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_OPENAI_LOOPBACK_ENDPOINT"] else {
+                return URL(string: "https://api.openai.com/v1/chat/completions")!
+            }
+            guard let url = URL(string: raw),
+                  ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+                  ["127.0.0.1", "localhost", "[::1]"].contains(url.host?.lowercased() ?? ""),
+                  url.user == nil, url.password == nil, url.fragment == nil,
+                  url.port == nil || (1...65535).contains(url.port!) else {
+                throw ProviderFailure.Diagnostic(cause: .routingUnavailable,
+                    detail: "Invalid NATIVE_AGENT_OPENAI_LOOPBACK_ENDPOINT: supply an absolute HTTP(S) loopback URL without credentials or fragment, or remove the override. No request was sent.")
+            }
             return url
         }
-        return URL(string: "https://api.openai.com/v1/chat/completions")!
     }
 
     public init(
         session: URLSession = .shared,
-        endpoint: URL = OpenAITransport.defaultEndpoint,
+        endpoint: URL? = nil,
         apiKeyOverride: String? = nil,
         dataRootOverride: URL? = nil,
         telemetryDataRootOverride: URL? = nil
     ) {
         self.session = session
-        self.endpoint = endpoint
+        self.endpoint = Result { try endpoint ?? Self.defaultEndpoint }
         self.apiKeyOverride = apiKeyOverride
         self.dataRootOverride = dataRootOverride
         // A custom provider root defines a secondary/test runtime boundary.
@@ -63,8 +76,8 @@ public final class OpenAITransport: LLMTransport {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        try await LLMMessageStreamEvent.reply(collecting:
-            streamMessages(messages: [.user(prompt)], system: system, model: model, tools: tools))
+        return try await LLMMessageStreamEvent.reply(collecting:
+            self.streamMessages(messages: [.user(prompt)], system: system, model: model, tools: tools), using: telemetry)
     }
 
     // MARK: - Structured messages (native vision)
@@ -100,7 +113,7 @@ public final class OpenAITransport: LLMTransport {
         }
 
         return try await LLMMessageStreamEvent.reply(collecting:
-            streamMessages(messages: messages, system: system, model: model, tools: tools))
+            self.streamMessages(messages: messages, system: system, model: model, tools: tools), using: telemetry)
     }
 
     // MARK: - Structured streaming (tool calls)
@@ -123,6 +136,7 @@ public final class OpenAITransport: LLMTransport {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    let endpoint = try endpoint.get()
                     guard let key = try apiKeyOverride
                             ?? LLMCredentialResolver.checkedAPIKey(
                                 providerConfigFile: "openai.json",
@@ -137,14 +151,14 @@ public final class OpenAITransport: LLMTransport {
                     applyStreamingLLMHeaders(to: &req)
                     var body: [String: Any] = [
                         "model": model,
-                        "messages": Self.chatMessages(messages: messages, system: system),
+                        "messages": try Self.chatMessages(messages: messages, system: system),
                         "stream": true,
                         "stream_options": ["include_usage": true],
                     ]
                     try Self.applyTools(to: &body, tools: tools)
-                    OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
-                    if let limit = LLMCallContext.turnTokenBudget?.available {
-                        body["max_completion_tokens"] = limit
+                    try OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
+                    if LLMCallContext.turnTokenBudget != nil {
+                        body["max_completion_tokens"] = try self.requestOutputTokens(model: model)
                     }
                     req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
 
@@ -158,7 +172,7 @@ public final class OpenAITransport: LLMTransport {
                     }
                     defer { bytes.task.cancel() }
                     try await ProviderWire.validateChatCompletions(bytes, response)
-                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenAI")
+                    var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenAI", diagnosticDataRoot: telemetry.diagnosticDataRoot)
                     try await decoder.consume(
                         SSEEventStream(bytes), continuation: continuation,
                         request: req, providerID: providerId, model: model, idPrefix: "openai",
@@ -173,6 +187,7 @@ public final class OpenAITransport: LLMTransport {
                     continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "stream: \(error)")))
                 }
             }
+            ProviderReplyWork.current?.own(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }
@@ -182,6 +197,7 @@ public final class OpenAITransport: LLMTransport {
     private func responsesRequest(
         messages: [LLMMessage], system: String?, model: String, tools: [LLMToolSchema]?
     ) throws -> URLRequest {
+        let endpoint = try endpoint.get()
         guard let key = try apiKeyOverride
                 ?? LLMCredentialResolver.checkedAPIKey(
                     providerConfigFile: "openai.json", dataRoot: credentialRoot),
@@ -201,8 +217,8 @@ public final class OpenAITransport: LLMTransport {
             model: model, messages: messages, system: system, tools: tools, transport: .publicAPI
         )
         body["prompt_cache_options"] = ["ttl": "30m"]
-        if let limit = LLMCallContext.turnTokenBudget?.available {
-            body["max_output_tokens"] = limit
+        if LLMCallContext.turnTokenBudget != nil {
+            body["max_output_tokens"] = try requestOutputTokens(model: model)
         }
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         return req
@@ -240,6 +256,7 @@ public final class OpenAITransport: LLMTransport {
                     continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "stream: \(error)")))
                 }
             }
+            ProviderReplyWork.current?.own(task)
             continuation.onTermination = { _ in task.cancel() }
         }
     }
@@ -252,7 +269,8 @@ public final class OpenAITransport: LLMTransport {
     static func applyTools(to body: inout [String: Any], tools: [LLMToolSchema]?) throws {
         guard let tools, !tools.isEmpty else { return }
         body["tools"] = try tools.map { schema in
-            [
+            _ = try schema.checkedParameters()
+            return [
                 "type": "function",
                 "function": [
                     "name": schema.name,
@@ -267,13 +285,13 @@ public final class OpenAITransport: LLMTransport {
 
     /// Structured Chat-Completions message array: images as `image_url` parts,
     /// assistant tool calls as `tool_calls`, tool results as `role:"tool"` rows.
-    static func chatMessages(messages: [LLMMessage], system: String?) -> [[String: Any]] {
+    static func chatMessages(messages: [LLMMessage], system: String?) throws -> [[String: Any]] {
         var out: [[String: Any]] = []
         if let system, !system.isEmpty {
             out.append(["role": "system", "content": system])
         }
         for message in messages {
-            out.append(contentsOf: chatCompletionsMessages(from: message))
+            out.append(contentsOf: try chatCompletionsMessages(from: message))
         }
         return out
     }

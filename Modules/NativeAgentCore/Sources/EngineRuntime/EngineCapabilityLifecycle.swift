@@ -59,20 +59,24 @@ public struct CapabilityLifecycleCommands: Sendable {
         let parts = Parts(root: dataRoot)
         let id = input["id"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let preview = input["preview"] == .bool(true)
-        if preview, !["enable", "restore", "rollback", "drop"].contains(verb) {
-            return CapabilityCommandOutcome(false, "Only enable, restore, rollback and drop preview here; nothing was done.", [:])
+        if preview, !["enable", "restore", "drop"].contains(verb) {
+            return CapabilityCommandOutcome(false, "Only enable, restore and drop preview here; nothing was done.", [:])
         }
         let outcome: Parts.Outcome
         switch verb {
         case "save":
-            if (try? parts.row(id)) == nil, !SwiftToolDispatcher.isAuthorableToolName(Parts.id(id)) {
+            let existing = try? parts.row(id)
+            if existing == nil, !SwiftToolDispatcher.isAuthorableToolName(Parts.id(id)) {
                 return CapabilityCommandOutcome(false, "\(id) is a built-in tool's name. Pick another id; nothing was saved.", ["id": .string(id)])
             }
+            // What it was before this save: a new ability is a draft kept now; a
+            // revision of one already on stays a re-enable, as the Inbox says.
+            let before = existing.flatMap { $0["status"] } ?? .string("draft")
             do {
                 let receipt = try await parts.save(input, steer: steer, fullMac: fullMac)
                 let detail = receipt["detail"]?.scalarText ?? ""
                 guard receipt["status"] == .string("kept") else { return CapabilityCommandOutcome(receipt["status"] != .string("failed"), detail, receipt) }
-                return await decided(CapabilityCommandOutcome(true, detail, receipt.merging(["state_before": .string("draft")]) { $1 }), input: input, id: id)
+                return await decided(CapabilityCommandOutcome(true, detail, receipt.merging(["state_before": before]) { $1 }), input: input, id: id)
             } catch PartError.stagedButFailed(let digest, let committed, let why) {
                 return CapabilityCommandOutcome(false, committed
                     ? "\(id) is saved as a draft but the call did not complete: \(why). Fix it and ability.save again."
@@ -97,8 +101,6 @@ public struct CapabilityLifecycleCommands: Sendable {
             outcome = await parts.enable(id, version: input["version"]?.scalarText,
                                          fullMac: fullMac, ownerAuthorized: owner, preview: preview)
         case "disable": outcome = parts.disable(id, reason: input["reason"]?.scalarText, steer: steer, fullMac: fullMac, ownerAuthorized: owner)
-        case "rollback":
-            outcome = await parts.rollback(id, version: input["version"]?.scalarText, fullMac: fullMac, ownerAuthorized: owner, preview: preview)
         case "drop": outcome = parts.drop(id, pending: input["pending"] == .bool(true), fullMac: fullMac, ownerAuthorized: owner, preview: preview)
         default: return CapabilityCommandOutcome(false, "No ability verb is called \(verb).", [:])
         }

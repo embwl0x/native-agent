@@ -20,31 +20,24 @@ extension SwiftNativeSecurityCenter {
     }
 
     package static func trustedWorkspaceRoots(
-        policy: [String: JSONValue],
         filePolicy: [String: JSONValue],
         dataRoot: URL = defaultDataRoot()
     ) -> [URL] {
         var roots = TrustCenterDefaultWorkspaceRoots.defaultRoots(dataRoot: dataRoot)
 
-        func appendRoots(from obj: [String: JSONValue]) {
-            for key in ["workspaceRoots", "workspace_roots", "trustedWorkspaceRoots", "trustedRoots"] {
-                guard case .array(let values)? = obj[key] else { continue }
-                for value in values {
-                    guard case .string(let raw) = value else { continue }
-                    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !trimmed.isEmpty else { continue }
-                    // Only current-user shorthand expands; relative roots retain URL's process-directory interpretation.
-                    let home = FileManager.default.homeDirectoryForCurrentUser
-                    var expanded = trimmed
-                    if trimmed == "~" { expanded = home.path }
-                    else if trimmed.hasPrefix("~/") { expanded = home.appendingPathComponent(String(trimmed.dropFirst(2))).path }
-                    roots.append(URL(fileURLWithPath: expanded))
-                }
+        if case .array(let values)? = filePolicy["workspaceRoots"] {
+            for value in values {
+                guard case .string(let raw) = value else { continue }
+                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                // Only current-user shorthand expands; relative roots retain URL's process-directory interpretation.
+                let home = FileManager.default.homeDirectoryForCurrentUser
+                var expanded = trimmed
+                if trimmed == "~" { expanded = home.path }
+                else if trimmed.hasPrefix("~/") { expanded = home.appendingPathComponent(String(trimmed.dropFirst(2))).path }
+                roots.append(URL(fileURLWithPath: expanded))
             }
         }
-
-        appendRoots(from: policy)
-        appendRoots(from: filePolicy)
         return normalizedUniqueRoots(roots)
     }
 
@@ -64,7 +57,7 @@ extension SwiftNativeSecurityCenter {
     public static func isInsideTrustedWorkspace(
         _ file: URL, policy: [String: JSONValue], dataRoot: URL
     ) -> Bool {
-        trustedWorkspaceRoots(policy: policy, filePolicy: object(policy["filePolicy"]), dataRoot: dataRoot)
+        trustedWorkspaceRoots(filePolicy: object(policy["filePolicy"]), dataRoot: dataRoot)
             .contains { isSelfOrAncestor(root: $0, of: file) }
     }
 

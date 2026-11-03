@@ -12,9 +12,20 @@ extension MacFourVerbs {
     /// original generation still yields to takeover and explicit handback.
     func settlementDispatch(action: String, body: [String: JSONValue]) async -> MacControlResult? {
         let driver = MacDriverContext.binding?.settlementBinding()
+        // `settle` detaches: carry the exact foreground lease through the
+        // whole dispatch, including its inherited native execution task.
+        let restoration = MacForegroundSnapshot.restoring
         return await settle {
-            await MacDriverContext.$binding.withValue(driver) {
-                try? await host.dispatch(action: action, body: body)
+            await MacForegroundSnapshot.$restoring.withValue(restoration) {
+                await MacDriverContext.$binding.withValue(driver) {
+                    do { return try await host.dispatch(action: action, body: body) }
+                    catch {
+                        return MacControlResult(ok: false, action: action,
+                            output: .object(["status": .string("settlement_failed"),
+                                             "message": .string(error.localizedDescription)]),
+                            error: error.localizedDescription, durationMs: 0)
+                    }
+                }
             }
         }
     }
@@ -31,13 +42,14 @@ extension MacFourVerbs {
     ) async -> MacFourVerbsReply {
         var anchored: Sighting?
         var windowless: MacFourVerbsReply?
-        switch await sight(part: nil, app: app, seek: seek) {
+        let capture = MacSightCaptureBinding(frameID: UUID().uuidString)
+        switch await sight(part: nil, app: app, seek: seek, observed: capture) {
         case .blind(let reply):
             let front = Self.object(reply.detail["frontmost_app"])
             let frontName = Self.string(front["name"])
             let inFront = frontName != nil && frontName == Self.string(reply.detail["requested_app"])
             guard raise || inFront else { return await inBack(nil) }
-            guard menuOrKey, Self.string(reply.detail["error"]) == "no_window_in_app" else { return reply }
+            guard menuOrKey, Self.windowlessApp(reply.detail) else { return reply }
             if let miss = await missBefore(nil) { return miss }
             // Already in front with no window: act there, refused at each event
             // if the front moves. Only a permitted raise activates anything.
@@ -68,11 +80,7 @@ extension MacFourVerbs {
                     || Self.string(reply.detail["error"]) == "owner_changed_apps"
             )])
         }
-        let front = Self.object(windowless?.detail["frontmost_app"])
-        let previous = anchored?.frontmostApp ?? Self.int(front["pid"]).flatMap(Int32.init(exactly:)).map {
-            (name: Self.string(front["name"]) ?? "the previous app", pid: $0, window: front["window"].flatMap { $0 == .null ? nil : $0 })
-        }
-        guard let previous else {
+        guard let lease = capture.foreground else {
             if let windowless { return windowless }
             return MacFourVerbsReply(
                 ok: false,
@@ -80,26 +88,29 @@ extension MacFourVerbs {
                 detail: ["error": .string("front_unknown"), "owner_front_changed": .bool(false)]
             )
         }
+        let previous = (name: lease.app.name, pid: lease.app.processIdentifier)
         if let anchored, let miss = await missBefore(anchored) { return miss }
-        /// Restore the exact previous pid and key window; confirm its pid is frontmost.
-        func restore() async -> (restored: Bool, gone: Bool) {
-            var body: [String: JSONValue] = ["pid": .int(Int64(previous.pid))]
-            if let window = previous.window { body["window"] = window }
-            let result = await settlementDispatch(action: "focus_app", body: body)
+        /// Restore once through the typed lease; the handler confirms its native window too.
+        func restore() async -> (restored: Bool, gone: Bool, receipt: JSONValue?) {
+            let result = await MacForegroundSnapshot.$restoring.withValue(lease) {
+                await settlementDispatch(action: "focus_app", body: ["pid": .int(Int64(previous.pid))])
+            }
             let output = Self.object(result?.output)
             return (
                 result?.ok == true && Self.bool(output["frontmost_pid_matches"]) == true,
-                Self.string(output["status"]) == "app_gone"
+                Self.string(output["status"]) == "app_gone",
+                result?.toJSON()
             )
         }
-        func restoreWords(_ restore: (restored: Bool, gone: Bool)) -> (String, [String: JSONValue]) {
+        func restoreWords(_ restore: (restored: Bool, gone: Bool, receipt: JSONValue?)) -> (String, [String: JSONValue]) {
             let extra: [String: JSONValue] = [
                 "owner_front_restored": .bool(restore.restored),
                 "restored_app": .string(previous.name),
+                "foreground_restore": restore.receipt ?? .null,
             ].merging(restore.gone ? ["error_restore": .string("owner_front_gone")] : [:]) { _, new in new }
             if restore.restored { return ("\(previous.name) is back in front", extra) }
             if restore.gone { return ("\(previous.name) has quit since, so there was nothing to put back (owner_front_gone)", extra) }
-            return ("I couldn't put \(previous.name) back, so \(appName) is still in front", extra)
+            return ("I couldn't restore \(previous.name)'s prior foreground; inspect the current screen", extra)
         }
         let startedAt = clock.monotonicSeconds()
         // Raise and verify the observed window, never another window of the same app.
@@ -140,17 +151,11 @@ extension MacFourVerbs {
             ])
         }
         let wasFront = targetPid == previous.pid
-        var restored = wasFront ? (restored: true, gone: false) : await restore()
-        // The raised app can still be settling its own activation; one more
-        // try after it has, so the person's app always comes back.
-        if anchored != nil, !restored.restored, !restored.gone {
-            await settle { await clock.sleep(seconds: 0.3) }
-            restored = await restore()
-        }
+        let restored = wasFront ? (restored: true, gone: false, receipt: Optional<JSONValue>.none) : await restore()
         if windowless != nil {
             return stamped(reply, note: wasFront ? "\(app) had no window, so I used its menu bar."
                 : "\(app) had no window, so I brought it forward to use its menu bar, then "
-                    + (restored.restored ? "put \(previous.name) back." : "couldn't put \(previous.name) back, so \(app) is still in front."),
+                    + (restored.restored ? "put \(previous.name) back." : "couldn't restore \(previous.name)'s prior foreground."),
                 ["brought_forward": .string(app), "owner_front_changed": .bool(true), "owner_front_restored": .bool(restored.restored)])
         }
         let (words, extra) = restoreWords(restored)
@@ -177,7 +182,7 @@ extension MacFourVerbs {
               !target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let clickish = [MacActVerb.click, .open, .select, .toggle].contains(verb)
         if !(clickish && Self.isMenuPath(target)) {
-            switch verb == .scroll ? Self.resolveScrollTarget(target, among: seen.targets) : Self.resolve(target, among: seen.targets) {
+            switch verb == .scroll ? Self.resolveScrollTarget(target, among: seen.targets, viewport: seen.visibleFrame ?? seen.windowFrame) : Self.resolve(target, among: seen.targets) {
             case .ambiguous: return nil
             case .hit(let candidate) where candidate.regionOnly || Self.answers(target, candidate): return nil
             default: break
@@ -195,11 +200,14 @@ extension MacFourVerbs {
         // restores if the item really isn't there.
         if clickish, Self.isMenuPath(target) { return nil }
         let name = seen.appName ?? "that app"
+        let hint = await menuHint(target, verb: verb, app: seen.appName)
         return MacFourVerbsReply(
             ok: false,
             text: "Nothing in \(name)'s window is called \"\(target)\", so I didn't bring \(name) forward. Nothing moved."
-                + (await menuHint(target, verb: verb, app: seen.appName)) + "\n" + seen.render,
-            detail: ["error": .string("no_match"), "target": .string(target), "owner_front_changed": .bool(false)]
+                + hint.text + "\n" + seen.render,
+            detail: hint.detail.merging([
+                "error": .string("no_match"), "target": .string(target), "owner_front_changed": .bool(false)
+            ]) { _, new in new }
         )
     }
 }

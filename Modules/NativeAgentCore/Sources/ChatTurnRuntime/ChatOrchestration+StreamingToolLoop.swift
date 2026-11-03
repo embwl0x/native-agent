@@ -1,4 +1,5 @@
 import AuthoredCapabilities
+import AgentWorkspace
 import ChatToolParsing
 import ChatTurnContracts
 import Experiences
@@ -20,7 +21,7 @@ import Senses
 import TrustCenter
 import os
 import NativeAgentShared
-// Blueprint: | `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody` (the stem's loop: runs their turn part's effects, hands it each event with each result's declared effect, logs at every host-call boundary; the turn returns at `reply.end` and `after`, and effects after them run privately on the same turn id, never streamed, saved to the conversation or checkpointed), `joinedProse`; round-scoped OAuth provider-event capture through the existing cutoff writer for suspicious cleaned replies and malformed streams; a `provider_failure` event carries the failure's work state and whether repair is owed; the person's turn is measured as it goes (model rounds, its own calls' tokens, minutes, the longest stretch of one round's calls repeated, on the closing `model` event as `repeated`): `took` is the after-turn line, and each part called records its rounds |
+// Blueprint: | `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody` (the stem's loop: runs their turn part's effects, hands it each event with each result's declared effect, logs at every host-call boundary; the turn returns at `reply.end` and `after`, and effects after them run privately on the same turn id, never streamed, saved to the conversation or checkpointed); before a fresh message’s opening model call, mind/authority practice may supply one gated standing read as `already_looked`; the first private keep records only landed hand-work action ids (or one call repeated 3+ rounds) through `FamiliarLines` (`practice: `), opens on a later meeting unless an active ability's recorded route covers it, traces `practice.keep`, and lets later rounds finish that keep; `joinedProse`; `provider.roundOutput` counts safe prose and tool calls per parsed person-facing round; round-scoped OAuth provider-event capture through the existing cutoff writer for suspicious cleaned replies and malformed streams; a `provider_failure` event carries the failure's work state and whether repair is owed; the person's turn is measured as it goes (model rounds, its own calls' tokens, minutes, the longest stretch of one round's calls repeated for `took`, and the longest single-call stretch on the closing `model` event as `repeated`): `took` is the after-turn line, and each part called records its rounds |
 
 extension SwiftNativeTurnEngine {
     /// The structured tool loop builds the tool conversation and forwards
@@ -45,8 +46,9 @@ extension SwiftNativeTurnEngine {
     ) async throws -> TurnEngineResult {
         return try await ChatToolSessionContext.$userText.withValue(userMessage) {
         try await SenseTurnReads.$current.withValue(SenseTurnReads.current ?? SenseTurnReads()) {
-        // Fold the Workshop surface once so the whole loop threads one vocabulary.
-        let surface = WorkshopSurfaceVocabulary.foldLegacySpelling(surface)
+        guard surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() != "missions" else {
+            throw ToolFailureError("The routing surface is workshop. Correct the caller's surface before starting its turn.", effects: .none, recovery: .correctArguments)
+        }
         // Nothing her part does after the person's reply reaches the person (`drive`).
         var progress = progress
         // Prepared document text and image-only turns need no caption.
@@ -65,6 +67,7 @@ extension SwiftNativeTurnEngine {
             }
         }
         let startNs = DispatchTime.now().uptimeNanoseconds
+        var dispatchTrace = ContextStageTrace()
         let gathered = preBuiltContext
         // Her turn part runs the turn's decisions; this loop runs its effects.
         // The message goes in first; a turn resumed after a relaunch rebuilds
@@ -92,29 +95,24 @@ extension SwiftNativeTurnEngine {
         guard let system = part.system else {
             throw TurnEngineError.turnPartFailed("Its log opened with no model.call naming the system.")
         }
-        let resolvedTurnContext = gathered.composing(system, tools: part.offeredTools)
-        let traceSessionId = Self.fireContextSnapshotEvent(
-            surface: surface, context: resolvedTurnContext, sessionId: sessionId, runId: runId)
-        // The request milestone belongs to the dispatch it names: the transport
-        // calls this once routing is validated and the adapter chosen, and the
-        // turn's first such call is its request start.
-        let requestStarted = OSAllocatedUnfairLock(initialState: false)
-        let requestDispatched: @Sendable () -> Void = {
-            guard requestStarted.withLock({ started in defer { started = true }; return !started }) else { return }
-            TurnLifecycleTelemetry.emit(.providerRequestStarted, surface: surface, sessionId: traceSessionId,
-                                        observedBy: "transport.dispatch", flags: ["initialRequest": true])
-        }
-        Self.fireAssemblyStageEvent(surface: surface, context: resolvedTurnContext)
-        var commitInstructionDelivery = pendingInstructionDelivery(in: resolvedTurnContext, sessionID: sessionId)
+        var resolvedTurnContext = gathered.composing(system, tools: part.offeredTools)
+        dispatchTrace.record(.turnPart, since: startNs)
+        Self.fireContextReady(surface: surface, context: resolvedTurnContext, sessionId: sessionId)
+        var commitInstructionDelivery = try pendingInstructionDelivery(in: resolvedTurnContext, sessionID: sessionId)
         // Steered messages reach the queue owner as delivered at the same
         // moment instructions do: the round carrying them produced output.
         var steeringOffers: [ChatTurnSteering.Offer] = []
         var arrivedItems: [ResidentWake.Item] = []
         var contextDeliveryOwed = true
+        var commitPartsDelivery = resolvedTurnContext.partsDelivery
         // Memories a moment brought to mind this turn (what she read, while working).
         var cameToMindHeld: Set<ContextAtomID> = []
         func commitDelivery() async throws {
-            commitInstructionDelivery?()
+            if let acknowledge = commitPartsDelivery {
+                commitPartsDelivery = nil
+                acknowledge(Self.deliveredInput(resolvedTurnContext))
+            }
+            try commitInstructionDelivery?()
             commitInstructionDelivery = nil
             if contextDeliveryOwed {
                 contextDeliveryOwed = false
@@ -139,51 +137,64 @@ extension SwiftNativeTurnEngine {
 
         // Offer and read calls using the provider resolved under this turn's
         // bindings: its admitted route or the surface's pick when none is carried.
-        let toolCallCodec = ToolCallCodec.forProvider(
-            await LLMCallContext.$admittedModel.withValue(resolvedTurnContext.modelId) {
-                await LLMCallContext.$providerId.withValue(resolvedTurnContext.providerId ?? LLMCallContext.providerId) {
-                    await llm.servingProviderID(model: resolvedTurnContext.modelId, surface: surface)
+        let codecStart = DispatchTime.now().uptimeNanoseconds
+        let toolCallCodec = try ToolCallCodec.forProvider(
+            try await LLMCallContext.$admittedModel.withValue(resolvedTurnContext.modelId) {
+                try await LLMCallContext.$providerId.withValue(resolvedTurnContext.providerId ?? LLMCallContext.providerId) {
+                    try await llm.servingProviderID(model: resolvedTurnContext.modelId, surface: surface)
                 }
             }
         )
+        dispatchTrace.record(.toolCodec, since: codecStart)
         /// The request her part's opening model.call names, seeded as the turn's
         /// prefix; seeded again when a heal brings a version that names another.
-        func seeded(_ composed: TurnContext) -> (ConversationPrefixSeeding.Seed, (prompt: String?, segments: SystemPromptSegments?)) {
-            let seed = ConversationPrefixSeeding.seed(
-                composed,
-                // The marker catalog's session-loaded run rides the volatile block
-                // on v2, so a mid-session tool_load cannot move the cached prefix.
-                textToolCatalogAppendix: toolCallCodec == .textMarkers
-                    ? TextMarkerCodec.volatileCatalogAppendix(for: composed)
-                    : nil
-            )
-            let ctx = seed.context
-            guard toolCallCodec == .textMarkers else { return (seed, (ctx.systemPrompt, ctx.systemSegments)) }
-            let layout = TextMarkerCodec.systemLayout(baseSystem: ctx.systemPrompt, segments: ctx.systemSegments, context: ctx)
-            return (seed, (layout.system, layout.segments))
+        func seeded(_ composed: TurnContext) throws -> (ConversationPrefixSeeding.Seed, (prompt: String?, segments: SystemPromptSegments?)) {
+            let request = try ConversationPrefixSeeding.request(composed, codec: toolCallCodec)
+            return (request.seed, (request.system, request.segments))
         }
-        var (prefixSeed, wireSystem) = seeded(resolvedTurnContext)
+        let seedStart = DispatchTime.now().uptimeNanoseconds
+        var (prefixSeed, wireSystem) = try seeded(resolvedTurnContext)
         var composed = (system: system, tools: part.offeredTools)
         var ctx = prefixSeed.context
         // The provider-name map is built from the array and then held still
         // until a heal names other tools.
         var providerTools = ProviderToolNameMap(ctx.toolSchemas)
-        if let sessionId, !sessionId.isEmpty, let runId, !runId.isEmpty {
-            // Keeping the sent block is what lets the next request extend this
-            // one; a failed save never fails her turn (the next turn finds the
-            // paragraphs absent from its history and sends them in full).
-            await prefixSeed.sentContext.persist(sessionID: sessionId, runID: runId,
-                userMessageID: ChatPersistenceContext.replacementUserMessageID, dataRoot: remPinsDataRoot)
+        dispatchTrace.record(.prefixSeed, since: seedStart)
+        // Capture immutable request values: later healing may replace the seed.
+        // None of these diagnostics or the optional replay write builds the wire
+        // request. Join before tool reads, reply settlement, or any throwing exit.
+        let initialSeed = prefixSeed
+        let prefixTelemetry = Task { await Self.preparePrefixTelemetry(initialSeed) }
+        let prefixSnapshot = Task { let result = await prefixTelemetry.value; return result.snapshot }
+        let prefixSink = ConversationPrefixTelemetry.sink
+        prefixSink?.setPending(prefixSnapshot)
+        let replacementUserMessageID = ChatPersistenceContext.replacementUserMessageID
+            ?? resolvedTurnContext.historyReplaySpec?.replacementUserMessageID
+        var bookkeeping = Task { [remPinsDataRoot] in
+            await Self.recordDispatchBookkeeping(seed: initialSeed,
+                telemetry: prefixTelemetry, sink: prefixSink, surface: surface, sessionId: sessionId, runId: runId,
+                userMessageID: replacementUserMessageID, dataRoot: remPinsDataRoot)
         }
-        ConversationPrefixTelemetry.sink?.set(ConversationPrefixSeeding.telemetry(
-            prefixSeed,
-            toolSchemaFingerprint: Self.toolSchemaFingerprint(ctx.toolSchemas)
-        ))
+        do {
+        dispatchTrace.setFlag("bookkeepingParallel", true)
+        let preparedDispatchTrace = dispatchTrace
+        let remainderStart = DispatchTime.now().uptimeNanoseconds
+        // Dispatch is route/adapter admission, before HTTP body assembly. The
+        // ProviderWire event separately names the URLSession send boundary.
+        let requestStarted = OSAllocatedUnfairLock(initialState: false)
+        let requestDispatched: @Sendable () -> Void = {
+            guard requestStarted.withLock({ started in defer { started = true }; return !started }) else { return }
+            var trace = preparedDispatchTrace
+            trace.record(.dispatchRemainder, since: remainderStart)
+            trace.emit(kind: "turn.dispatch.summary", surface: surface)
+            TurnLifecycleTelemetry.emit(.providerRequestStarted, surface: surface, sessionId: sessionId,
+                                        observedBy: "transport.dispatch", flags: ["initialRequest": true])
+        }
         var conversation: [LLMMessage] = prefixSeed.messages
         // What happened since her last turn primes this one: her own turns hear what it brought to mind.
-        if let root = remPinsDataRoot, let sessionId, !SessionConversation.isHelper(sessionId, dataRoot: root),
+        if let root = remPinsDataRoot, let sessionId, try !SessionConversation.checkedIsHelper(sessionId, dataRoot: root),
            PeerDataTaint.current?.isTainted != true, [nil, "self"].contains(ChatToolSessionContext.envelope?.agent) {
-            let moments = PrimedMoments.take(dataRoot: root)
+            let moments = try PrimedMoments.take(dataRoot: root)
             if !moments.isEmpty, let primed = await primedSinceLastTurn(
                 moments, turn: resolvedTurnContext.fluidContextTurn, held: &cameToMindHeld,
                 sessionId: sessionId, surface: surface) {
@@ -233,9 +244,10 @@ extension SwiftNativeTurnEngine {
         // What the person's turn takes, measured as it goes: its model rounds'
         // tokens, the rounds each of her parts was called in, and the longest
         // stretch of one round's calls made again round after round.
-        let spent = OSAllocatedUnfairLock(initialState: 0)
+        let spent = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Spend())
         var partRounds: [String: Int] = [:]
         var repeated = (calls: [JSONValue](), call: "", count: 0), longest = (call: "", count: 0)
+        var loopPractice = (calls: [JSONValue](), call: "", count: 0)
         func observed(_ result: TurnEngineResult, reason: TurnEngineResult.TerminalReason) -> TurnEngineResult {
             cleanFinish = reason == .replyCompleted || reason == .incomplete
             return result.observingTerminal(reason: reason, counters: counters)
@@ -246,6 +258,9 @@ extension SwiftNativeTurnEngine {
         var retainedAnswerProse = ""
         var emittedProviderFirstDelta = false
         var providerCallCount = 0
+        var openingAdditionalCharacters = 0
+        // Relaunches resume their recorded work; retries keep the one opening read.
+        var openingReadOwed = restarted == nil
         var replyTextSettled = false
         var providerFailurePending = part.log.reversed().compactMap { row -> String? in
             guard case .object(let entry) = row, case .object(let event)? = entry["event"],
@@ -256,7 +271,7 @@ extension SwiftNativeTurnEngine {
         if let restarted {
             let rows = TurnCheckpointScope.resumedRows
             let receipts = rows.filter { SessionHistoryPromptRenderer.renderable($0)?.isTool == true }
-            dispatches = receipts.map { row in
+            dispatches = try receipts.map { row in
                 var metadata: [String: JSONValue] = [:]
                 if case .object(let fields)? = row.extras, case .object(let saved)? = fields["metadata"] { metadata = saved }
                 let name = if case .string(let saved)? = metadata["toolName"] { saved } else { "unknown" }
@@ -282,8 +297,7 @@ extension SwiftNativeTurnEngine {
                    case .string(let tool)? = saved["tool"], case .object(let args)? = saved["input"] {
                     ranCall = (tool, args)
                 } else {
-                    // Legacy receipts only prove their saved name/input, never a current binding.
-                    ranCall = (metadata["generatedImages"] == nil ? name : "image_generate", input)
+                    throw ChatOrchestrationError.underlying("The resumed turn's saved tool receipt has no execution-time ranCall identity. Repair the checkpoint's receipt; no tool binding was inferred.")
                 }
                 return TurnEngineResult.ToolDispatchRecord(
                     name: ranCall.tool == "image_generate" && metadata["generatedImages"] != nil ? "image_generate" : name, input: input,
@@ -297,7 +311,7 @@ extension SwiftNativeTurnEngine {
             guard let user = rows.first(where: { $0.role == "user" }) else {
                 throw ChatOrchestrationError.underlying("The resumed turn's saved user message is missing; repair its transcript.")
             }
-            let replay = SessionHistoryMessages.project(messages: [user] + receipts,
+            let replay = try SessionHistoryMessages.project(messages: [user] + receipts,
                 historyLimit: max(1, receipts.count + 1), windowTokens: turnWindowTokens)
             visibleText = restarted.keptProse
             // Held in joined shape, as a live one is, so its count is the offset.
@@ -396,6 +410,7 @@ extension SwiftNativeTurnEngine {
 
         /// The person's turn, delivered when it ends; set, the loop runs her part's private work.
         var replied: TurnEngineResult?
+        var keepStarted = false
         /// The loop. Her reply ends; she doesn't: run again after the person
         /// has it, it runs what her part returned after reply.end, privately,
         /// on the same turn id, through the same gates, with nothing streamed,
@@ -409,6 +424,7 @@ extension SwiftNativeTurnEngine {
             // or with a card still waiting on the person, leaves it incomplete; a
             // door that cannot draw the card also hears it said.
             if replied == nil, part.replied {
+                await bookkeeping.value
                 let reply = Self.joinedProse(turnInterstitialProse, Self.joinedProse(retainedAnswerProse, part.answered))
                 let store = AbilityStore(dataRoot: remPinsDataRoot ?? defaultDataRoot())
                 for (id, rounds) in partRounds.sorted(by: { $0.key < $1.key }) {
@@ -452,7 +468,7 @@ extension SwiftNativeTurnEngine {
                     workingCommentaryCharacters: turnInterstitialProse.isEmpty ? nil : turnInterstitialProse.count,
                     completionState: providerFailurePending || waiting ? .incomplete : .completed,
                     afterTurn: !PartToolThinkingContext.active && (providerFailurePending || part.afterTurn),
-                    took: counters.toolRoundCount == 0 ? nil : Self.took(rounds: counters.providerRoundCount, tokens: spent.withLock { $0 },
+                    took: counters.toolRoundCount == 0 ? nil : Self.took(rounds: counters.providerRoundCount, tokens: spent.withLock { $0.total },
                         seconds: Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000_000), repeated: longest),
                     afterReply: held)
                 let result = observed(completed, reason: providerFailurePending
@@ -475,6 +491,7 @@ extension SwiftNativeTurnEngine {
                 try await capture()
                 continue
             case .string("app"):
+                await bookkeeping.value
                 // The part names calls of this model round; they run verbatim.
                 var batch = [effect]
                 while part.nextIsApp, let more = try await part.next() { batch.append(more) }
@@ -539,43 +556,61 @@ extension SwiftNativeTurnEngine {
                 })
                 continue
             case .string("model.call"):
+                if replied != nil, effect["purpose"] == .string("keep"), !keepStarted {
+                    guard try Self.practiceShouldKeep(dispatches, repeated: loopPractice, dataRoot: remPinsDataRoot ?? defaultDataRoot()) else { return replied }
+                    keepStarted = true
+                }
                 // A heal brought a version that names another system or tools.
                 if let system = part.system, system != composed.system || part.offeredTools != composed.tools {
+                    // Preserve write order: the opening seed cannot overwrite
+                    // the healed seed after its request has been prepared.
+                    await bookkeeping.value
                     let seededCount = prefixSeed.messages.count
-                    (prefixSeed, wireSystem) = seeded(gathered.composing(system, tools: part.offeredTools))
+                    resolvedTurnContext = gathered.composing(system, tools: part.offeredTools)
+                    (prefixSeed, wireSystem) = try seeded(resolvedTurnContext)
                     ctx = prefixSeed.context
-                    if let sessionId, !sessionId.isEmpty, let runId, !runId.isEmpty {
-                        await prefixSeed.sentContext.persist(sessionID: sessionId, runID: runId,
-                            userMessageID: ChatPersistenceContext.replacementUserMessageID, dataRoot: remPinsDataRoot)
-                    }
                     providerTools = ProviderToolNameMap(ctx.toolSchemas)
+                    let healedSeed = prefixSeed
+                    let healedTelemetry = Task { await Self.preparePrefixTelemetry(healedSeed) }
+                    prefixSink?.setPending(Task { let result = await healedTelemetry.value; return result.snapshot })
+                    bookkeeping = Task { [remPinsDataRoot] in
+                        await Self.recordDispatchBookkeeping(seed: healedSeed,
+                            telemetry: healedTelemetry, sink: prefixSink, surface: surface, sessionId: sessionId,
+                            runId: runId, userMessageID: replacementUserMessageID, dataRoot: remPinsDataRoot)
+                    }
                     conversation = prefixSeed.messages + conversation.dropFirst(seededCount)
                     compactionTurnStart = prefixSeed.messages.count - 1
                     composed = (system, part.offeredTools)
                 }
                 // Words of her own the part adds to the conversation before this call.
                 if case .string(let note)? = effect["note"], !note.isEmpty { Self.appendStructuredUserNudge(note, to: &conversation) }
+                if openingReadOwed {
+                    openingReadOwed = false
+                    if ctx.toolSchemas.contains(where: { $0.name == "app" }), let expansion = tools as? ExpansionDispatcher {
+                        let looked = await LLMCallContext.$admittedModel.withValue(ctx.modelId) {
+                        await FluidContextToolScope.$current.withValue(ctx.fluidContextTurn) {
+                        await ChatTurnRuntimeContext.$current.withValue(.init(
+                            model: ctx.modelId, surface: surface, personaID: ctx.personaID,
+                            providerID: ctx.providerId ?? LLMCallContext.providerId)) {
+                            await expansion.readAhead(surface: surface, session: toolSessionId ?? sessionId)
+                        } } }
+                        if let looked {
+                            // The same {call,result} already_looked entry a tool result carries.
+                            let text = try ChatSecretRedactor.redactValue(looked).serialize(pretty: false)
+                            Self.appendStructuredUserNudge(text, to: &conversation)
+                        }
+                    }
+                }
             default:
                 // reply.end and after: the part's own bookkeeping, checkpointed like any effect.
                 try await capture()
                 continue
             }
+            if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) { throw stopCarryingPartial() }
             if replyTextSettled {
                 replyTextSettled = false
                 await progress?(.replyTextSettled(false))
             }
-            let pressure = try await IntraTurnContextCompaction.compactProactivelyIfNeeded(
-                conversation: &conversation,
-                turnStartIndex: compactionTurnStart,
-                windowTokens: turnWindowTokens,
-                distill: distillWorkingNotes,
-                surface: surface,
-                progress: progress
-            )
-            if let failure = pressure?.failure {
-                TurnObservation.apply(.notesUnwritten(why: failure.message), to: &conversation, surface: surface)
-            }
-            try await capture()
             var iterAccumulated = ""
             var iterEmittedProse = ""
             var streamedCalls: [ParsedToolCall] = []
@@ -615,13 +650,91 @@ extension SwiftNativeTurnEngine {
                         Self.appendStructuredUserNudge(
                             ChatTurnSteering.deliveryText(offer.text), to: &conversation)
                     }
-                    if let root = remPinsDataRoot, !SessionConversation.isHelper(sessionId, dataRoot: root), PeerDataTaint.current?.isTainted != true,
+                    if let root = remPinsDataRoot, try !SessionConversation.checkedIsHelper(sessionId, dataRoot: root), PeerDataTaint.current?.isTainted != true,
                        [nil, "self"].contains(ChatToolSessionContext.envelope?.agent),
                        let arrived = ResidentWake.shared.take(dataRoot: root) {
                         arrivedItems += arrived.items
                         Self.appendStructuredUserNudge(arrived.text, to: &conversation)
                     }
                 }
+                if providerCallCount == 0, sessionId != nil,
+                   !ConversationPrefixTelemetry.requestShapeUnmeasured {
+                    // This is the actual opening request, including text that
+                    // arrived after seeding. Slice its appended blocks here,
+                    // never rows from a second transcript reconstruction.
+                    let index = prefixSeed.currentUserIndex
+                    guard conversation.indices.contains(index), prefixSeed.messages.indices.contains(index),
+                          conversation[index].content.count >= prefixSeed.messages[index].content.count else {
+                        throw ProviderRoutingError.configurationFailed("The opening request no longer contains its built user block.")
+                    }
+                    let added = Array(conversation[index].content.dropFirst(prefixSeed.messages[index].content.count))
+                    var additional: [LLMMessage] = added.isEmpty ? [] : [LLMMessage(role: .user, content: added)]
+                    additional.append(contentsOf: conversation.dropFirst(index + 1))
+                    openingAdditionalCharacters = LLMMessage.inputCharacters(additional, system: nil, tools: [])
+                    if let fit = SessionRequestFit.current {
+                        await bookkeeping.value
+                        resolvedTurnContext = try await fit(resolvedTurnContext, toolCallCodec, additional)
+                        (prefixSeed, wireSystem) = try seeded(resolvedTurnContext)
+                        ctx = prefixSeed.context
+                        providerTools = ProviderToolNameMap(ctx.toolSchemas)
+                        conversation = ConversationPrefixSeeding.Request(seed: prefixSeed,
+                            system: wireSystem.prompt, segments: wireSystem.segments,
+                            tools: toolCallCodec.requestTools(providerTools.schemas)).appending(additional).messages
+                        compactionTurnStart = prefixSeed.messages.count - 1
+                        let fittedSeed = prefixSeed
+                        let fittedTelemetry = Task { await Self.preparePrefixTelemetry(fittedSeed) }
+                        prefixSink?.setPending(Task {
+                            let result = await fittedTelemetry.value
+                            return result.snapshot
+                        })
+                        bookkeeping = Task { [remPinsDataRoot] in
+                            await Self.recordDispatchBookkeeping(seed: fittedSeed,
+                                telemetry: fittedTelemetry, sink: prefixSink, surface: surface, sessionId: sessionId,
+                                runId: runId, userMessageID: replacementUserMessageID, dataRoot: remPinsDataRoot)
+                        }
+                    }
+                }
+                let pressure = try await IntraTurnContextCompaction.compactProactivelyIfNeeded(
+                    conversation: &conversation,
+                    turnStartIndex: compactionTurnStart,
+                    windowTokens: turnWindowTokens,
+                    distill: distillWorkingNotes,
+                    surface: surface,
+                    progress: progress
+                )
+                if let failure = pressure?.failure {
+                    TurnObservation.apply(.notesUnwritten(why: failure.message), to: &conversation, surface: surface)
+                }
+                if let sessionId, !ConversationPrefixTelemetry.requestShapeUnmeasured {
+                    guard let root = remPinsDataRoot else {
+                        throw ProviderRoutingError.configurationFailed("The conversation's data root is unavailable; its request cannot be checked before sending.")
+                    }
+                    let request = try SessionContextRequest(messages: conversation,
+                        system: wireSystem.prompt, tools: toolCallCodec.requestTools(providerTools.schemas) ?? [],
+                        historyCharacters: 0, rowCharacters: [:])
+                    try await SessionContextMeasurement.requireFits(request, sessionId: sessionId,
+                        model: ctx.modelId, providerID: ctx.providerId, dataRoot: root,
+                        windowTokens: turnWindowTokens)
+                }
+                // Capture only after fit, opening reads and compaction have
+                // produced the exact first request passed to streamMessages.
+                // The accepted publication is reserved here, before its task.
+                if providerCallCount == 0 {
+                    let snapshotRequest = ConversationPrefixSeeding.Request(seed: prefixSeed,
+                        system: wireSystem.prompt, segments: wireSystem.segments,
+                        tools: toolCallCodec.requestTools(providerTools.schemas))
+                    let snapshotMessages = conversation
+                    let publication = remPinsDataRoot.flatMap { root in
+                        sessionId.map { ContextFedRecord.begin(sessionId: $0, dataRoot: root) }
+                    }
+                    let preceding = bookkeeping
+                    bookkeeping = Task {
+                        await preceding.value
+                        await Self.recordWireSnapshot(request: snapshotRequest, messages: snapshotMessages,
+                            publication: publication, surface: surface, sessionId: sessionId, runId: runId)
+                    }
+                }
+                try await capture()
                 providerCallCount += 1
                 counters.providerAttemptCount += 1
                 counters.providerRoundCount += 1
@@ -640,10 +753,20 @@ extension SwiftNativeTurnEngine {
                         raw += "data: " + event.data.replacingOccurrences(of: "\n", with: "\ndata: ") + "\n\n"
                     }
                 }
+                let requestPlan: Data?
+                if LLMCallContext.conversationRequest, !ConversationPrefixTelemetry.requestShapeUnmeasured,
+                   let runId, sessionId != nil {
+                    requestPlan = try ConversationPrefixSeeding.Request(seed: prefixSeed,
+                        system: wireSystem.prompt, segments: wireSystem.segments,
+                        tools: toolCallCodec.requestTools(providerTools.schemas))
+                        .plan(runID: runId, userMessageID: replacementUserMessageID,
+                            additionalCharacters: openingAdditionalCharacters).encoded
+                } else { requestPlan = nil }
                 let consumeStream: () async throws -> Void = {
                     try await ProviderStreamContext.$diagnosticEvent.withValue(captureEvents) {
                     try await ProviderStreamContext.$dispatched.withValue(requestDispatched) {
                     try await LLMCallContext.$purpose.withValue(purpose) {
+                    try await LLMCallContext.$sessionRequestPlan.withValue(requestPlan) {
                     let stream = llm.streamMessages(
                         messages: conversation,
                         system: wireSystem.prompt,
@@ -707,6 +830,7 @@ extension SwiftNativeTurnEngine {
                     }
                     }
                     }
+                    }
                 }
                 try await ConversationPrefixBoundary.$currentUserIndex.withValue(prefixSeed.currentUserIndex) {
                 try await LLMCallContext.$admittedModel.withValue(ctx.modelId) {
@@ -734,9 +858,20 @@ extension SwiftNativeTurnEngine {
                 if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) || error is CancellationError {
                     throw stopCarryingPartial()
                 }
+                if let failure = error as? ToolFailureError,
+                   failure.code == "context_window_exceeded" || failure.code == "recollection_unavailable" {
+                    // A local admission refusal is terminal for this request;
+                    // provider-overflow recovery must never truncate around it.
+                    throw failure
+                }
+                if sessionId != nil, !ConversationPrefixTelemetry.requestShapeUnmeasured,
+                   ProviderRecoveryPolicy.isContextOverflow(error) {
+                    throw ToolFailureError("The provider refused this request's context window after fitting: \(error.localizedDescription). Retained history was not truncated. Repair the model-window/token measurement or reduce the current input before continuing.",
+                        effects: .none, owner: ctx.modelId, code: "context_window_exceeded", status: .refused, recovery: .repair)
+                }
                 if ProviderFailure.classify(error) == .malformedResponse {
                     let raw = rawProviderEvents.withLock { $0 }
-                    if !raw.isEmpty { RunawayOutputDetector.writeDiagnostic(raw, reason: "malformed_stream") }
+                    if !raw.isEmpty { RunawayOutputDetector.writeDiagnostic(raw, reason: "malformed_stream", dataRoot: remPinsDataRoot) }
                 }
                 counters.failedProviderAttemptCount += 1
                 // A spent budget's partial is the whole run's ledger, not this round's words.
@@ -747,7 +882,7 @@ extension SwiftNativeTurnEngine {
                 // A cut after her words or calls is the round's boundary: complete
                 // calls run, and she continues after what she said.
                 if ProviderRecoveryPolicy.isRecoverable(error) || ProviderFailure.classify(error) == .malformedResponse,
-                   !toolCallCodec.roundCalls(streamed: streamedCalls, text: iterAccumulated, schemas: ctx.toolSchemas, recordShims: false).isEmpty
+                   try !toolCallCodec.roundCalls(streamed: streamedCalls, text: iterAccumulated, schemas: ctx.toolSchemas, recordShims: false).isEmpty
                     || !toolCallCodec.visiblePrefix(in: iterAccumulated).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     toolBoundaryReason = .interrupted
                     break providerStream
@@ -796,7 +931,7 @@ extension SwiftNativeTurnEngine {
                 guard visible.split(whereSeparator: { $0.isWhitespace }).count < 2
                     || (visible.count < 12 && iterProse.contains(where: { "<=>".contains($0) })) else { return }
                 let raw = rawProviderEvents.withLock { $0 }
-                if !raw.isEmpty { RunawayOutputDetector.writeDiagnostic(raw, reason: "suspicious_reply") }
+                if !raw.isEmpty { RunawayOutputDetector.writeDiagnostic(raw, reason: "suspicious_reply", dataRoot: remPinsDataRoot) }
             }
             if toolBoundaryReason == nil, streamedCalls.isEmpty && !answerText.contains(where: { !$0.isWhitespace }) {
                 saveSuspiciousReply()
@@ -810,17 +945,11 @@ extension SwiftNativeTurnEngine {
                 ? TextMarkerCodec(schemas: ctx.toolSchemas,
                     turnActiveTools: LLMCallContext.turnActiveTools ?? [], catalogNames: Set(ctx.toolsAvailable))
                 : nil
-            var violation: ToolCallProtocolViolation?
+            let violation: ToolCallProtocolViolation?
             if let markerCodec {
                 violation = markerCodec.malformedCall(in: iterProse)
             } else {
                 violation = ToolCallParser.formattedToolCallViolation(in: iterProse, toolNames: Set(ctx.toolsAvailable))
-            }
-            if violation?.traceType == "malformedToolUseMarker", markerCodec != nil, streamedCalls.isEmpty,
-               let repaired = ToolCallParser.repairMalformedRegion(
-                in: iterAccumulated, toolNames: Set(ctx.toolSchemas.map(\.name))) {
-                iterAccumulated = repaired
-                violation = nil
             }
             if let violation {
                 counters.protocolViolationRoundCount += 1
@@ -831,15 +960,30 @@ extension SwiftNativeTurnEngine {
                     "sha256": .string(SHA256.hash(data: rejectedBytes).map { String(format: "%02x", $0) }.joined()),
                 ]
                 do {
-                    diagnostic["path"] = .string(try RunawayOutputDetector.writeDiagnostic(iterAccumulated, reason: violation.traceType).get().path)
+                    if let file = try RunawayOutputDetector.writeDiagnostic(iterAccumulated, reason: violation.traceType, dataRoot: remPinsDataRoot).get() {
+                        diagnostic["path"] = .string(file.path)
+                    }
                 } catch { diagnostic["file_error"] = .string(error.localizedDescription) }
                 TurnTraceBus.fireFromContext(kind: "tool.protocol_violation", surface: surface, payload: .object(diagnostic))
                 let kept = await keepPartial()
                 try await observe(.malformedCall(why: violation.modelFeedback), kept: kept)
                 continue
             }
-            let providerCalls = toolCallCodec.roundCalls(
+            let providerCalls = try toolCallCodec.roundCalls(
                 streamed: streamedCalls, text: iterAccumulated, schemas: ctx.toolSchemas)
+            if replied == nil {
+                // Counts only: distinguish a silent tool round from words
+                // delivered before tools, without retaining provider text.
+                let tail = providerCalls.isEmpty
+                    ? toolCallCodec.visiblePrefix(in: pendingProtocolDelta)
+                    : (toolBoundaryReason == .fabricatedResult ? "" : toolCallCodec.proseReleasedAtDispatch(pendingProtocolDelta))
+                let prose = (iterEmittedProse + tail).trimmingCharacters(in: .whitespacesAndNewlines)
+                TurnTraceBus.fireFromContext(kind: "provider.roundOutput", surface: surface, payload: .object([
+                    "round": .int(Int64(providerCallCount)),
+                    "proseCharacters": .int(Int64(prose.count)),
+                    "toolCallCount": .int(Int64(providerCalls.count)),
+                ]))
+            }
             if providerCalls.isEmpty {
                 saveSuspiciousReply()
                 if let toolBoundaryReason {
@@ -856,10 +1000,10 @@ extension SwiftNativeTurnEngine {
                 }
                 // Her answer stays in the conversation for whatever her part does next.
                 conversation.append(.assistantText(iterProse))
-                // The longest stretch rides the closing event, so her part can read the loop.
+                // A single call's longest stretch offers a loop practice to her part.
                 var closing: [String: JSONValue] = ["type": .string("model"), "text": .string(iterProse), "calls": .array([])]
-                if replied == nil, longest.count > 1 {
-                    closing["repeated"] = .object(["call": .string(longest.call), "count": .int(Int64(longest.count))])
+                if replied == nil, loopPractice.count > 1 {
+                    closing["repeated"] = .object(["call": .string(loopPractice.call), "count": .int(Int64(loopPractice.count))])
                 }
                 try await part.deliver([.object(closing)])
                 continue
@@ -880,6 +1024,7 @@ extension SwiftNativeTurnEngine {
                     if case .string(let action)? = call.input["action"] { action } else { call.name }
                 }.joined(separator: ", "), 1)
                 if repeated.count > longest.count { longest = (repeated.call, repeated.count) }
+                if made.count == 1, repeated.count > loopPractice.count { loopPractice = repeated }
             }
             try await part.deliver([.object(["type": .string("model"), "text": .string(iterEmittedProse),
                 "calls": .array(providerCalls.enumerated().map {
@@ -891,16 +1036,106 @@ extension SwiftNativeTurnEngine {
         guard let result = try await drive() else {
             throw TurnEngineError.turnPartFailed("Its steps ended the turn without a reply.end.")
         }
+        await bookkeeping.value
         return result
+        } catch {
+            await bookkeeping.value
+            throw error
+        }
         }
         }
     }
 
+    /// Meet only the hand work that offered this keep, never incidental reads,
+    /// arguments or the keep's later work. First meeting records it; a later
+    /// meeting opens the keep unless an active ability's recorded route covers it.
+    nonisolated private static func practiceShouldKeep(_ dispatches: [TurnEngineResult.ToolDispatchRecord],
+                                                       repeated: (calls: [JSONValue], call: String, count: Int), dataRoot: URL) throws -> Bool {
+        func identity(_ name: String, _ input: [String: JSONValue]) -> JSONValue {
+            var ids = [JSONValue.string(name)]
+            if name == "app", case .string(let action)? = input["action"] { ids.append(.string(action)) }
+            return .array(ids)
+        }
+        // A batch or a script is its landed steps, each by its own action id,
+        // never one opaque "app" (two unrelated batches are not a repeat).
+        func steps(_ record: TurnEngineResult.ToolDispatchRecord) -> [JSONValue] {
+            if record.name != "app" || record.input["action"]?.stringValue?.isEmpty == false {
+                return [identity(record.name, record.input)]
+            }
+            let fields = record.result.objectValue ?? [:]
+            let rows = fields["receipts"]?.arrayValue ?? fields["calls"]?.arrayValue ?? []
+            return rows.compactMap { row -> JSONValue? in
+                guard let step = row.objectValue,
+                      Self.landedEffect(row).map({ ["write", "irreversible"].contains($0) }) == true,
+                      let id = step["action"]?.stringValue ?? step["call"]?.stringValue, !id.isEmpty,
+                      ToolNameAliases.authoredTool(id) == nil else { return nil }
+                return .array([.string("app"), .string(id)])
+            }
+        }
+        var sequence = dispatches.filter { record in
+            let action = record.name == "app" ? record.input["action"]?.stringValue ?? "" : ""
+            guard ToolNameAliases.authoredTool(record.ranCall.tool) == nil,
+                  ToolNameAliases.authoredTool(action) == nil else { return false }
+            return Self.landedEffect(record.result).map { ["write", "irreversible"].contains($0) } ?? false
+        }.flatMap(steps)
+        if sequence.isEmpty, repeated.count >= 3, repeated.calls.count == 1,
+           let call = repeated.calls.first?.objectValue, let name = call["name"]?.stringValue,
+           let input = call["input"]?.objectValue {
+            sequence = [identity(name, input)]
+        }
+        // An ability is worth keeping when it would replace more than one call:
+        // a lone write, however often she makes it, is just using the tool.
+        let looped = sequence.count == 1 && repeated.count >= 3 && repeated.calls.count == 1
+        guard sequence.count >= 2 || looped else { return false }
+        let signature = try JSONValue.array(sequence).serialize(pretty: false)
+        let first = try !FamiliarLines.firstMet(["practice: " + signature], dataRoot: dataRoot).isEmpty
+        var kept = false
+        defer {
+            TurnTraceBus.fireFromContext(kind: "practice.keep", payload: .object([
+                "practice": .string(signature), "met": .string(first ? "first" : "again"), "kept": .bool(kept),
+            ]))
+        }
+        guard !first else { return false }
+        guard case .array(let abilities) = try AbilityStore(dataRoot: dataRoot).registry(kind: .part) else {
+            throw TurnEngineError.turnPartFailed("The ability index did not return rows for practice.")
+        }
+        var hasAbility = false
+        abilityRoutes: for ability in abilities {
+            guard let row = ability.objectValue, row["status"] == .string("active") else { continue }
+            let use = row["learned"]?.objectValue?["use"]?.objectValue
+            let operations = use?["operations"]?.objectValue?.values.map { $0 } ?? []
+            let learned = operations.compactMap { $0.objectValue?["scope"]?.objectValue?["calls"]?.arrayValue }
+            let validated = (row["validation_evidence"]?.objectValue?["runs"]?.arrayValue ?? [])
+                .compactMap { $0.objectValue?["calls"]?.arrayValue }
+            for calls in learned + validated {
+                let route = calls.map { call -> JSONValue in
+                    guard let label = call.objectValue?["call"]?.stringValue else { return .null }
+                    // Read/find labels carry their arguments; only the app
+                    // door's identity belongs in a practice signature.
+                    if label.hasPrefix("read ") || label.hasPrefix("find ") { return .array([.string("app")]) }
+                    return .array([.string("app"), .string(label)])
+                }
+                // The practice omits reads; a recorded route may include them.
+                // Match its hand work in order, including repeated action ids.
+                var matched = 0
+                for call in route where matched < sequence.count {
+                    if call == sequence[matched] { matched += 1 }
+                }
+                if matched == sequence.count { hasAbility = true; break abilityRoutes }
+            }
+        }
+        kept = !hasAbility
+        return kept
+    }
+
     /// What a turn took, in one plain line for her after-turn mind.
-    nonisolated static func took(rounds: Int, tokens: Int, seconds: Int, repeated: (call: String, count: Int)) -> String {
-        let amount = tokens >= 1_000_000 ? String(format: "%.1fM", Double(tokens) / 1_000_000)
-            : tokens >= 1_000 ? "\(tokens / 1_000)k" : "\(tokens)"
-        var line = "This took \(rounds) round\(rounds == 1 ? "" : "s")" + (tokens > 0 ? ", \(amount) tokens" : "")
+    nonisolated static func took(rounds: Int, tokens: Int?, seconds: Int, repeated: (call: String, count: Int)) -> String {
+        let amount: String
+        if let tokens {
+            amount = tokens >= 1_000_000 ? String(format: "%.1fM", Double(tokens) / 1_000_000)
+                : tokens >= 1_000 ? "\(tokens / 1_000)k" : "\(tokens)"
+        } else { amount = "unavailable" }
+        var line = "This took \(rounds) round\(rounds == 1 ? "" : "s")" + (tokens == nil ? ", token usage unavailable" : ", \(amount) tokens")
             + (seconds < 90 ? ", \(seconds) seconds" : ", \(Int((Double(seconds) / 60).rounded())) minutes")
         if repeated.count > 1 { line += "; \(repeated.count) rounds in a row called \(repeated.call)" }
         return line + "."

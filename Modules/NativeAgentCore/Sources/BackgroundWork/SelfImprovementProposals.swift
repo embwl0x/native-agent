@@ -71,9 +71,10 @@ extension MaintenanceBackgroundWork {
                 }
                 // Only a pending card for this finding and exact enable version suppresses a duplicate.
                 let findingId = proposal.findingId
-                if let existing = try? await inbox.list(
+                let existing = try await inbox.list(
                     filter: ApprovalFilter(status: "pending", action: "self_improvement.apply")
-                ), let card = existing.first(where: { record in
+                )
+                if let card = existing.first(where: { record in
                     guard case .object(let payload) = record.payload,
                           case .string(let staged)? = payload["findingId"] else { return false }
                     guard staged == findingId else { return false }
@@ -125,18 +126,22 @@ extension MaintenanceBackgroundWork {
             learning: { previousCards in
                 var sections: [String] = []
                 let weeks = [MemoryRecoveryReadout.isoWeek(), MemoryRecoveryReadout.isoWeek(ago: 1)]
+                let missesHeading = "## Misses by lesson (corrections this week, last week in brackets)\n"
                 do {
                     let lessons = try await MemoryRecoveryReadout.misses(dataRoot: dataRoot, weeks: weeks)
-                    sections.append("## Misses by lesson (corrections this week, last week in brackets)\n" + (lessons.isEmpty ? "(none)"
+                    sections.append(missesHeading + (lessons.isEmpty ? "(none)"
                         : lessons.map { "- \($0.lesson): \($0.count(week: weeks[0])) (\($0.count(week: weeks[1])))" }.joined(separator: "\n")))
-                } catch { sections.append("## Misses by lesson\n(unreadable: \(error))") }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    try Task.checkCancellation()
+                    // Counts are a readout, not a prerequisite for analyzing the other evidence.
+                    sections.append(missesHeading + "Counts unavailable: \(error.localizedDescription)")
+                }
                 if let previousCards {
-                    sections.append(await Self.passOutcomes(cards: previousCards, inbox: inbox, dataRoot: dataRoot))
+                    sections.append(try await Self.passOutcomes(cards: previousCards, inbox: inbox, dataRoot: dataRoot))
                 }
-                var standing: [String: String] = [:]
-                do { standing = try await Self.standingLessons(dataRoot: dataRoot) } catch {
-                    FileHandle.standardError.write(Data("WeeklySelfImprovement: standing lessons unreadable: \(error)\n".utf8))
-                }
+                let standing = try await Self.standingLessons(dataRoot: dataRoot)
                 return SelfImprovementLearning(signals: sections.joined(separator: "\n\n"), standing: standing)
             },
             // REM stages standing lessons by memory and wording; tombstones
@@ -154,7 +159,8 @@ extension MaintenanceBackgroundWork {
                         targetDoc: "GROWTH.md", proposalText: line, evidenceDates: [],
                         confidence: 1, createdAt: ISO8601DateFormatter().string(from: Date()),
                         supportingPassages: [REMSupportingPassage(dreamDate: "", quote: memory.content, sourceRefs: ["memory:" + id])],
-                        support: .standing)
+                        support: .standing,
+                        replaced: REMReplacement(source: "memory:" + id, text: memory.content))
                     proposals.append(proposal)
                 }
                 proposals = try await tombstones.filterTombstoned(proposals)

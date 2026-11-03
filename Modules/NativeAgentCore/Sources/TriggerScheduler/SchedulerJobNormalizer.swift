@@ -9,91 +9,120 @@ import WorkshopExecution
 import Experiences
 import NotificationInbox
 import Darwin
-// Blueprint: | `SchedulerJobNormalizer.swift` | SchedulerJobNormalizer canonical job input normalization, delivery channels, saved scalar coercion and timing decoration |
+// Blueprint: | `SchedulerJobNormalizer.swift` | Checked canonical job normalization; ProactiveScanArguments shares strict creation/update/execution admission, with unsupported input refused at its field |
+
+/// One checked argument shape at job creation, update, and scan execution.
+public struct ProactiveScanArguments: Sendable {
+    public let reason: String
+    public let limit: Int
+    public let surfaceLimit: Int
+    public let staleDays: Int
+
+    public init(_ input: [String: JSONValue]) throws {
+        let keys: Set<String> = ["reason", "limit", "surfaceLimit", "staleDays"]
+        for key in input.keys.sorted() where !keys.contains(key) {
+            throw TriggerSchedulerError.schedulerInvalid("Unknown proactive_scan parameter \(key)", path: "$.payload." + key)
+        }
+        func integer(_ key: String, default initial: Int, range: ClosedRange<Int>) throws -> Int {
+            guard let raw = input[key] else { return initial }
+            guard case .int(let number) = raw, let value = Int(exactly: number), range.contains(value) else {
+                throw TriggerSchedulerError.schedulerInvalid("\(key) must be an integer in \(range)", path: "$.payload." + key)
+            }
+            return value
+        }
+        if let raw = input["reason"] {
+            guard case .string(let text) = raw, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  text.count <= 120 else {
+                throw TriggerSchedulerError.schedulerInvalid("reason must be nonempty text of at most 120 characters", path: "$.payload.reason")
+            }
+            reason = text
+        } else { reason = "scheduled_proactive_scan" }
+        limit = try integer("limit", default: 10, range: 1...50)
+        surfaceLimit = try integer("surfaceLimit", default: 4, range: 0...12)
+        staleDays = try integer("staleDays", default: 5, range: 1...Int.max)
+    }
+
+    public var payload: [String: JSONValue] {
+        ["reason": .string(reason), "limit": .int(Int64(limit)),
+         "surfaceLimit": .int(Int64(surfaceLimit)), "staleDays": .int(Int64(staleDays))]
+    }
+}
 
 public enum SchedulerJobNormalizer {
     static let allowedKinds: Set<String> = [
-        "notify", "connector_action", "dream", "rem", "harness_benchmark", "proactive_scan", "workshop", "turn",
+        "connector_action", "dream", "rem", "part", "harness_benchmark", "proactive_scan",
     ]
 
     // MARK: top-level normalize
 
-    static func normalize(
+    public static func normalize(
         body: [String: JSONValue],
         now: @Sendable () -> Date,
-        uuid: @Sendable () -> String,
-        displayNameFallback: String
+        uuid: @Sendable () -> String
     ) throws -> JSONValue {
         let payload: [String: JSONValue]
-        if case .object(let p)? = body["payload"] { payload = p } else { payload = [:] }
-
-        let kind = (string(pyOr(body["kind"], .string("notify"))) ?? "notify")
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard allowedKinds.contains(kind) else {
-            throw TriggerSchedulerError.schedulerInvalid("Unsupported scheduled Desk task kind: \(kind)")
+        if let value = body["payload"], value != .null {
+            guard case .object(let fields) = value else {
+                throw TriggerSchedulerError.schedulerInvalid("payload must be an object")
+            }
+            payload = fields
+        } else { payload = [:] }
+        guard let kind = string(body["kind"]), allowedKinds.contains(kind) else {
+            throw TriggerSchedulerError.schedulerInvalid("Unsupported scheduled Desk task kind. Use queue.add {text, when, until?, say?} for intentions, check-ins and reminders.")
         }
-
-        var interval = try max(60, pyIntOr(
-            body["interval_seconds"], body["intervalSeconds"], payload["interval_seconds"],
-            default: 3600
-        ))
-
-        // schedule resolution.
+        if kind == "proactive_scan" {
+            for key in ["reason", "limit", "surfaceLimit", "surface_limit", "staleDays", "stale_days", "sources"] where body[key] != nil {
+                throw TriggerSchedulerError.schedulerInvalid("proactive_scan parameters belong in payload", path: "$." + key)
+            }
+        }
+        try validatePayload(kind: kind, payload: payload)
+        for key in ["id", "name", "createdBy"] where body[key] != nil {
+            guard let value = string(body[key]), !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw TriggerSchedulerError.schedulerInvalid("\(key) must be a nonblank string")
+            }
+        }
+        if let enabled = body["enabled"], case .bool = enabled {} else if body["enabled"] != nil {
+            throw TriggerSchedulerError.schedulerInvalid("enabled must be Boolean")
+        }
+        // The public units meet here once. Saved rows always carry a schedule.
+        let supplied = ["in_minutes", "interval_seconds", "schedule"].filter { body[$0] != nil && body[$0] != .null }
+        guard supplied.count == 1 else {
+            throw TriggerSchedulerError.schedulerInvalid("Supply exactly one of schedule, in_minutes or interval_seconds")
+        }
         var schedule: [String: JSONValue]
-        let scheduleShapes = "schedule accepts an ISO-8601 time, 'in N minutes', or an object: type once with at, every with an interval, or hourly/daily/weekly/monthly/cron; alternatively in_minutes, interval_seconds or run_at"
-        switch (body["in_minutes"], body["schedule"]) {
-        case (let minutes?, _) where minutes != .null:
-            guard [body["schedule"], body["interval_seconds"], body["intervalSeconds"],
-                   payload["interval_seconds"], body["run_at"], body["runAt"], body["nextRunAt"]]
-                .allSatisfy({ $0 == nil || $0 == .null }) else {
-                throw TriggerSchedulerError.schedulerInvalid("Supply in_minutes alone, not with another schedule, interval or run time.")
-            }
+        if let minutes = body["in_minutes"], minutes != .null {
             schedule = try onceInMinutes(minutes, now: now)
-        case (_, .object(let raw)):
-            schedule = raw
-            // An object without a type is named by its own fields: a time is once, an interval is every,
-            // a cron is cron. Anything else is refused; a bare {at} must never become hourly
-            // (10-29: {at} saved as a 3600 s repeat that would have posted to the user every hour).
-            // Named the way the runner reads it (SchedulerRecurrence: type, then kind).
-            if (string(raw["type"]) ?? string(raw["kind"]))?.trimmingCharacters(in: .whitespaces).isEmpty ?? true {
-                if [raw["at"], raw["run_at"], raw["runAt"]].contains(where: { $0?.isTruthy == true }) {
-                    schedule["type"] = .string("once")
-                } else if [raw["seconds"], raw["minutes"], raw["hours"], raw["days"], raw["interval_seconds"], raw["intervalSeconds"]]
-                            .contains(where: { $0?.isTruthy == true }) {
-                    schedule["type"] = .string("every")
-                } else if raw["cron"]?.isTruthy == true || raw["expression"]?.isTruthy == true {
-                    schedule["type"] = .string("cron")
+        } else if let seconds = body["interval_seconds"], seconds != .null {
+            guard case .int(let count) = seconds, count >= 60 else {
+                throw TriggerSchedulerError.schedulerInvalid("interval_seconds must be an integer of at least 60")
+            }
+            schedule = ["type": .string("every"), "seconds": seconds]
+        } else {
+            switch body["schedule"] {
+            case .object(let fields)?: schedule = fields
+            case .string(let raw)?:
+                let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                let words = text.lowercased().split(whereSeparator: { $0.isWhitespace })
+                if words.first == "in" {
+                    guard words.count == 3, ["minute", "minutes"].contains(words[2]), let count = Double(words[1]) else {
+                        throw TriggerSchedulerError.schedulerInvalid("Relative schedule must say in N minutes")
+                    }
+                    schedule = try onceInMinutes(.double(count), now: now)
                 } else {
-                    throw TriggerSchedulerError.schedulerInvalid(scheduleShapes)
+                    guard parseISO(text) != nil else { throw TriggerSchedulerError.schedulerInvalid("schedule must name an ISO-8601 time") }
+                    schedule = ["type": .string("once"), "at": .string(text)]
                 }
+            default: throw TriggerSchedulerError.schedulerInvalid("schedule must be an object or time string")
             }
-        case (_, .string(let raw)):
-            let at = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            let words = at.lowercased().split(whereSeparator: { $0.isWhitespace })
-            if words.first == "in" {
-                guard words.count == 3, ["minute", "minutes"].contains(words[2]),
-                      let minutes = Double(words[1]) else {
-                    throw TriggerSchedulerError.schedulerInvalid("Relative schedule must say 'in N minutes', with a positive number of minutes.")
-                }
-                schedule = try onceInMinutes(.double(minutes), now: now)
-            } else {
-                guard parseISO(at) != nil else { throw TriggerSchedulerError.schedulerInvalid(scheduleShapes) }
-                schedule = ["type": .string("once"), "at": .string(at)]
-            }
-        case (_, nil), (_, .null?):
-            let hasInterval = [body["interval_seconds"], body["intervalSeconds"], payload["interval_seconds"]]
-                .contains(where: { $0?.isTruthy == true })
-            let hasRunAt = [body["run_at"], body["runAt"], body["nextRunAt"]]
-                .contains(where: { $0?.isTruthy == true })
-            // No schedule at all must not silently become hourly.
-            guard hasInterval || hasRunAt else {
-                throw TriggerSchedulerError.schedulerInvalid(scheduleShapes)
-            }
-            schedule = scheduleFromLegacyBody(body, interval: interval)
-        default:
-            throw TriggerSchedulerError.schedulerInvalid(scheduleShapes)
         }
-
+        if scheduleType(schedule) == "cron", let expression = schedule.removeValue(forKey: "cron") {
+            guard schedule["expression"] == nil else {
+                throw TriggerSchedulerError.schedulerInvalid("Supply schedule.expression or schedule.cron, not both")
+            }
+            schedule["expression"] = expression
+        }
+        try validateSchedule(schedule)
+        var interval = 0
         let typeLower = scheduleType(schedule)
         // Schedules follow the Mac's local clock and zone; local/system selectors are accepted without storing a zone.
         for key in ["timezone", "tz"] {
@@ -102,154 +131,38 @@ public enum SchedulerJobNormalizer {
             throw TriggerSchedulerError.schedulerInvalid("Schedules run on this Mac's local clock and follow it when it changes zone; remove \(key) \(zone). For one moment elsewhere, give an ISO-8601 time with its offset.")
         }
         if typeLower == "every" {
-            interval = try everyInterval(schedule, default: interval)
+            interval = try everyInterval(schedule)
             schedule["seconds"] = .int(Int64(interval))
             for key in ["minutes", "hours", "days", "interval_seconds", "intervalSeconds"] {
                 schedule.removeValue(forKey: key)
             }
         }
 
-        let oneShot = isOneShot(body, schedule: schedule)
-
-        // First-run aliases select the first truthy value.
-        let firstRun = pyOr(schedule["firstRunAt"], body["run_at"], body["runAt"])
-        let scheduledRun = try nextFromSchedule(schedule, afterEpoch: nil, now: now)
-        let nextRun: Double
-        if let fr = firstRun, fr.isTruthy {
-            nextRun = try epochFromValue(fr, zone: .autoupdatingCurrent, now: now)
-            schedule["firstRunAt"] = fr
-        } else {
-            nextRun = scheduledRun
-        }
-
-        let nameRaw = string(pyOr(
-            body["name"], payload["name"],
-            // A job without a name is called by its own title before its kind.
-            body["title"], payload["title"],
-            .string(titleCased(kind.replacingOccurrences(of: "_", with: " "))),
-            .string("Scheduled Desk task")
-        )) ?? "Scheduled Desk task"
-        let name = nameRaw.prefixString(160)
-
-        // per-kind payload normalization.
-        var outPayload: [String: JSONValue]
+        let oneShot = typeLower == "once"
+        let nextRun = try nextFromSchedule(schedule, afterEpoch: nil, now: now)
+        let name = (string(body["name"]) ?? titleCased(kind.replacingOccurrences(of: "_", with: " "))).prefixString(160)
+        var outPayload = payload
         switch kind {
-        case "notify":
-            let title = (string(pyOr(
-                payload["title"], body["title"],
-                .string(name), .string(displayNameFallback)
-            )) ?? displayNameFallback).prefixString(120)
-            let message = (string(pyOr(
-                payload["message"], payload["body"], body["message"], .string("")
-            )) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if message.isEmpty {
-                throw TriggerSchedulerError.schedulerInvalid("notify scheduled Desk tasks require payload.message")
-            }
-            let delivery = try deliveryChannels(payload)
-            outPayload = [
-                "title": .string(title),
-                "message": .string(message.prefixString(1000)),
-                "source": .string(string(pyOr(payload["source"], .string("scheduled_job"))) ?? "scheduled_job"),
-                "delivery": .array(delivery.map { .string($0) }),
-            ]
-            if case .string(let projectSpaceId)? = payload["projectSpaceId"], !projectSpaceId.isEmpty {
-                outPayload["projectSpaceId"] = .string(projectSpaceId.prefixString(160))
-            }
-            let rawOpts = pyOr(payload["deliveryOptions"], payload["delivery_options"], .object([:]))
-            if case .object(let opts)? = rawOpts {
-                outPayload["deliveryOptions"] = .object(opts)
-            }
         case "dream", "rem":
-            var objective = (string(pyOr(payload["objective"], body["objective"], .string(""))) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if objective.isEmpty {
-                objective = kind == "rem" ? "Scheduled REM consolidation" : "Scheduled reflection"
+            if payload["objective"] == nil {
+                outPayload["objective"] = .string(kind == "rem" ? "Scheduled REM consolidation" : "Scheduled reflection")
             }
-            outPayload = ["objective": .string(objective.prefixString(2000))]
-        case "workshop":
-            let objective = (string(pyOr(payload["objective"], body["objective"], .string(""))) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !objective.isEmpty else {
-                throw TriggerSchedulerError.schedulerInvalid("workshop scheduled Desk tasks require payload.objective")
-            }
-            let title = (string(pyOr(payload["title"], body["title"], .string(name))) ?? name)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let expectedEvidence = (string(pyOr(
-                payload["expectedEvidence"], payload["expected_evidence"], .string("canonical Workshop completion receipt")
-            )) ?? "canonical Workshop completion receipt")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            // Its result is the Desk task's own completion receipt; a workshop job
-            // carries no delivery of its own, so none is stored to promise one.
-            outPayload = [
-                "title": .string((title.isEmpty ? name : title).prefixString(160)),
-                "objective": .string(objective.prefixString(2000)),
-                "expectedEvidence": .string(expectedEvidence.prefixString(500)),
-            ]
-        case "turn":
-            let prompt = (string(pyOr(payload["prompt"], body["prompt"], .string(""))) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !prompt.isEmpty else {
-                throw TriggerSchedulerError.schedulerInvalid("turn jobs require payload.prompt")
-            }
-            let title = (string(pyOr(payload["title"], body["title"], .string(name))) ?? name)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            outPayload = [
-                "prompt": .string(prompt.prefixString(4000)),
-                "title": .string((title.isEmpty ? name : title).prefixString(160)),
-            ]
         case "proactive_scan":
-            let reason = (string(pyOr(
-                payload["reason"], body["reason"], .string("scheduled_proactive_scan")
-            )) ?? "scheduled_proactive_scan").prefixString(120)
-            let limit = try max(1, min(pyIntOr(payload["limit"], body["limit"], default: 10), 50))
-            let surfaceLimit = try max(0, min(pyIntOr(
-                payload["surfaceLimit"], payload["surface_limit"], body["surfaceLimit"],
-                default: 4
-            ), 12))
-            outPayload = [
-                "reason": .string(reason),
-                "limit": .int(Int64(limit)),
-                "surfaceLimit": .int(Int64(surfaceLimit)),
-            ]
-            // Source aliases select the first truthy value, otherwise [].
-            let rawSources = pyOr(payload["sources"], body["sources"], .array([]))
-            if case .array(let arr)? = rawSources {
-                let sources = arr.prefix(8).compactMap { v -> JSONValue? in
-                    let s = string(v) ?? ""
-                    guard !s.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-                    return .string(s.prefixString(80))
-                }
-                outPayload["sources"] = .array(sources)
-            }
+            outPayload = try ProactiveScanArguments(payload).payload
         case "connector_action":
-            let actionId = (string(pyOr(
-                payload["actionId"], payload["action_id"], payload["id"],
-                body["actionId"], body["action_id"], body["action"]
-            )) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !actionId.isEmpty else {
-                throw TriggerSchedulerError.schedulerInvalid("connector_action scheduled Desk tasks require payload.actionId")
+            guard let actionId = string(payload["actionId"]) else {
+                throw TriggerSchedulerError.schedulerInvalid("connector_action requires payload.actionId")
             }
-            let rawInput = pyOr(payload["input"], body["input"], .object([:]))
-            let input: [String: JSONValue]
-            if case .object(let obj)? = rawInput {
-                input = obj
-            } else {
-                throw TriggerSchedulerError.schedulerInvalid("connector_action scheduled Desk tasks require payload.input to be an object when provided")
-            }
+            let input = payload["input"]?.objectValue ?? [:] // input is optional and checked above.
             if let refusal = SwiftNativeTriggerScheduler.watchRefusal(action: actionId, input: input) {
                 throw TriggerSchedulerError.schedulerInvalid(refusal)
             }
-            outPayload = [
-                "actionId": .string(actionId),
-                "input": .object(input),
-            ]
-        default:
-            outPayload = payload
+            outPayload["input"] = .object(input)
+        default: break
         }
-
-        let id = string(pyOr(body["id"], .string(uuid()))) ?? uuid()
-        let enabled = boolValue(body["enabled"], default: true)
-        let createdBy = string(pyOr(body["createdBy"], .string("agent"))) ?? "agent"
+        let id = string(body["id"]) ?? uuid()
+        let enabled = body["enabled"] == nil || body["enabled"] == .bool(true)
+        let createdBy = string(body["createdBy"]) ?? "agent"
 
         var job: [String: JSONValue] = [
             "id": .string(id),
@@ -258,7 +171,7 @@ public enum SchedulerJobNormalizer {
             "intervalSeconds": !oneShot && typeLower == "every" ? .int(Int64(interval)) : .null,
             "enabled": .bool(enabled),
             "oneShot": .bool(oneShot),
-            "nextRunAt": .string(pyFloatString(nextRun)),
+            "nextRunAt": .string(floatString(nextRun)),
             "nextRunAtEpoch": .int(try checkedEpoch(nextRun)),
             "lastRunAt": .null,
             "schedule": .object(schedule),
@@ -273,116 +186,102 @@ public enum SchedulerJobNormalizer {
         return .object(job)
     }
 
-    /// Omitted or explicitly empty delivery is push; invalid destinations refuse.
-    public static func deliveryChannels(_ payload: [String: JSONValue]) throws -> [String] {
-        let raw = payload["delivery"] ?? payload["deliveries"] ?? payload["channels"] ?? payload["notifyVia"]
-        let values: [String]
-        switch raw {
-        case .some(.array(let arr)):
-            if arr.isEmpty { return ["push"] }
-            values = try arr.map {
-                guard case .string(let value) = $0 else {
-                    throw TriggerSchedulerError.schedulerInvalid("delivery must contain only channel names.")
+    // MARK: checked scalar and payload fields
+
+    static func string(_ value: JSONValue?) -> String? {
+        if case .string(let text)? = value { return text }; return nil
+    }
+
+    /// Current documented units may use numeric strings; booleans and fractions
+    /// are never integers. Absence is handled only by the field's own default.
+    static func integer(_ value: JSONValue?) throws -> Int {
+        switch value {
+        case .int(let count)?:
+            guard let count = Int(exactly: count) else { break }; return count
+        case .double(let count)?:
+            guard count.isFinite, let count = Int(exactly: count) else { break }; return count
+        case .string(let text)?:
+            guard let count = Int(text.trimmingCharacters(in: .whitespaces)) else { break }; return count
+        default: break
+        }
+        throw TriggerSchedulerError.schedulerInvalid("expected a whole integer")
+    }
+
+    static func firstPresent(_ values: JSONValue?...) -> JSONValue? { values.first { $0 != nil } ?? nil }
+
+    static func integerOr(_ values: JSONValue?..., default value: Int) throws -> Int {
+        for field in values { if let field { return try integer(field) } }
+        return value
+    }
+
+    static func boolValue(_ value: JSONValue?, default defaultValue: Bool) -> Bool {
+        if case .bool(let flag)? = value { return flag }
+        return value == nil ? defaultValue : false // saved authority is checked before this projection.
+    }
+
+    static func validatePayload(kind: String, payload: [String: JSONValue]) throws {
+        func text(_ key: String, required: Bool = false) throws {
+            guard let value = payload[key] else {
+                if required { throw TriggerSchedulerError.schedulerInvalid("payload.\(key) is required") }; return
+            }
+            guard let value = string(value), !required || !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw TriggerSchedulerError.schedulerInvalid("payload.\(key) must be a string")
+            }
+        }
+        switch kind {
+        case "connector_action":
+            try text("actionId", required: true)
+            if let input = payload["input"], case .object = input {} else if payload["input"] != nil {
+                throw TriggerSchedulerError.schedulerInvalid("payload.input must be an object")
+            }
+        case "part":
+            try text("part", required: true); try text("signal", required: true)
+            guard string(payload["signal"])?.hasPrefix("schedule:") == true else {
+                throw TriggerSchedulerError.schedulerInvalid("payload.signal must be schedule:<cron>")
+            }
+        case "dream", "rem": try text("objective")
+        case "proactive_scan":
+            _ = try ProactiveScanArguments(payload)
+        default: break
+        }
+    }
+
+    /// Shape validation never advances a clock or searches a year of cron minutes.
+    static func validateSchedule(_ fields: [String: JSONValue]) throws {
+        guard let type = string(fields["type"]), rhythmKinds.union(["once"]).contains(type) else {
+            throw TriggerSchedulerError.schedulerInvalid("schedule.type must name once, every, hourly, daily, weekly, monthly or cron")
+        }
+        for key in ["timezone", "tz"] {
+            if let raw = fields[key] {
+                guard let zone = string(raw), ["", "local", "system"].contains(zone.lowercased()) else {
+                    throw TriggerSchedulerError.schedulerInvalid("\(key) must use this Mac's local clock; remove the saved selector")
                 }
-                return value
-            }
-        case .some(.string(let s)):
-            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            if t.isEmpty { return ["push"] }
-            values = s.replacingOccurrences(of: ",", with: " ")
-                .split(separator: " ").map(String.init)
-        case nil:
-            return ["push"]
-        default:
-            throw TriggerSchedulerError.schedulerInvalid("delivery must be a channel name or an array of channel names.")
-        }
-        let aliases: [String: String] = [
-            "iphone": "push", "ios": "push", "apns": "push", "mobile": "push", "phone": "push",
-            "telegram": "telegram", "tg": "telegram",
-            "macos": "mac", "desktop": "mac", "mac": "mac",
-            "chat": "chat", "session": "chat",
-            "inbox": "inbox",
-            "activity": "activity", "log": "activity",
-        ]
-        let canonical: Set<String> = ["push", "telegram", "mac", "chat", "inbox", "activity"]
-        var channels: [String] = []
-        for value in values {
-            let lower = value.trimmingCharacters(in: .whitespaces).lowercased()
-            let channel = aliases[lower] ?? lower
-            guard canonical.contains(channel) else {
-                throw TriggerSchedulerError.schedulerInvalid("Unsupported delivery channel '\(value)'. Use push, telegram, mac, chat, inbox, or activity.")
-            }
-            if !channels.contains(channel) {
-                channels.append(channel)
             }
         }
-        guard !channels.isEmpty else {
-            throw TriggerSchedulerError.schedulerInvalid("delivery must name a channel. Use push, telegram, mac, chat, inbox, or activity.")
+        for key in ["hour", "minute", "day", "monthday", "monthDay", "seconds", "minutes", "hours", "days", "interval_seconds", "intervalSeconds"] {
+            if let value = fields[key] { _ = try integer(value) }
         }
-        return channels
-    }
-
-    // MARK: scalar helpers
-    //
-    // Saved-schema coercion distinguishes truthiness, absence and strict integer parsing; Swift nil-coalescing is not equivalent.
-
-    /// Saved scalar text uses True/False booleans and float formatting; collections/null/absence return nil.
-    static func string(_ v: JSONValue?) -> String? {
-        switch v {
-        case .some(.string(let s)): return s
-        case .some(.int(let i)): return String(i)
-        case .some(.double(let d)): return pyFloatString(d)
-        case .some(.bool(let b)): return b ? "True" : "False"
-        default: return nil
-        }
-    }
-
-    /// ID comparison stringifies scalars, maps absent/null to literal "None",
-    /// and maps containers to a nonscalar sentinel.
-    static func pyStrForId(_ v: JSONValue?) -> String {
-        switch v {
-        case .some(.array), .some(.object):
-            return "\u{0}__nonscalar_id__"
-        default: return string(v) ?? "None"
-        }
-    }
-
-    /// Return the first truthy operand, or the final operand when all are falsey.
-    static func pyOr(_ values: JSONValue?...) -> JSONValue? {
-        for v in values where v?.isTruthy == true { return v }
-        return values.last ?? nil
-    }
-
-    /// Parse integers, truncate finite representable floats and map booleans to 0/1; non-integer strings and other values throw.
-    static func pyInt(_ v: JSONValue?) throws -> Int {
-        switch v {
-        case .some(.int(let i)): return Int(i)
-        case .some(.double(let d)):
-            guard let value = Int(exactly: d.rounded(.towardZero)) else {
-                throw TriggerSchedulerError.schedulerInvalid("expected an integer")
+        switch type {
+        case "once":
+            guard let at = fields["at"], floatEpochForDecoration(at) != nil || string(at).flatMap({ parseISO($0) }) != nil else {
+                throw TriggerSchedulerError.schedulerInvalid("once requires schedule.at as an epoch or ISO-8601 time")
             }
-            return value
-        case .some(.bool(let b)): return b ? 1 : 0
-        case .some(.string(let s)):
-            let t = s.trimmingCharacters(in: .whitespaces)
-            if let i = Int(t) { return i }
-            throw TriggerSchedulerError.schedulerInvalid("invalid integer literal: \(s)")
-        case .some(.array), .some(.object), .some(.null), .none:
-            throw TriggerSchedulerError.schedulerInvalid("expected an integer")
+        case "every": _ = try everyInterval(fields)
+        case "hourly":
+            let minute = try fields["minute"].map { try integer($0) } ?? 0
+            guard (0...59).contains(minute) else { throw TriggerSchedulerError.schedulerInvalid("minute out of range") }
+        case "daily", "weekly", "monthly":
+            _ = try timeParts(fields)
+            if type == "weekly" { _ = try weekdaySet(fields["weekdays"]) }
+            if type == "monthly" {
+                let day = try integerOr(fields["day"], fields["monthday"], fields["monthDay"], default: 1)
+                guard (1...31).contains(day) else { throw TriggerSchedulerError.schedulerInvalid("monthly day must be 1 through 31") }
+            }
+        case "cron":
+            guard let expression = string(fields["expression"]) else { throw TriggerSchedulerError.schedulerInvalid("cron requires expression") }
+            _ = try cronFields(expression)
+        default: break
         }
-    }
-
-    /// Strictly parse the first truthy operand, or use the supplied default.
-    static func pyIntOr(_ values: JSONValue?..., default def: Int) throws -> Int {
-        for v in values where v?.isTruthy == true { return try pyInt(v) }
-        return def
-    }
-
-    /// `bool(d.get(k, default))` — present-with-null is FALSEY; absent uses the
-    /// stored default; present values follow saved truthiness.
-    static func boolValue(_ v: JSONValue?, default def: Bool) -> Bool {
-        guard let v else { return def }   // key absent → Python default
-        return v.isTruthy
     }
 
     /// Empty weekday inputs are exactly null, "" or [].
@@ -395,7 +294,7 @@ public enum SchedulerJobNormalizer {
         }
     }
 
-    /// Python `str.title()` — capitalize first letter of each word.
+    /// Capitalize the display name's words.
     static func titleCased(_ s: String) -> String {
         s.split(separator: " ", omittingEmptySubsequences: false)
             .map { word -> String in
@@ -405,8 +304,8 @@ public enum SchedulerJobNormalizer {
             .joined(separator: " ")
     }
 
-    /// Python `str(float)` — integral floats render as "N.0".
-    static func pyFloatString(_ d: Double) -> String {
+    /// Stable numeric text for the canonical saved occurrence instant.
+    static func floatString(_ d: Double) -> String {
         if d.isFinite, d == d.rounded(), abs(d) < 1e16 {
             return String(format: "%.1f", d)
         }
@@ -422,19 +321,20 @@ public enum SchedulerJobNormalizer {
 
     /// Project timing through `SchedulerJobRuntime.scheduledEpoch`, then format
     /// the epoch as ISO. Ambiguous wall-clock timing is nulled with a warning.
-    /// Non-object rows and other metadata pass through; one-offs omit the interval.
+    /// Omit the unmaintained duplicate timestamp; one-offs omit the interval.
+    /// Non-object rows and other metadata pass through.
     static func decorateNextRunAt(_ row: JSONValue) -> JSONValue {
         guard case .object(var d) = row else { return row }
+        d.removeValue(forKey: "nextRunAtISO")
         if case .object? = d["schedule"] {
             d["mac_timezone"] = .string(TimeZone.autoupdatingCurrent.identifier)
             if let due = SchedulerJobRuntime.scheduledEpoch(for: d) {
-                d["nextRunAt"] = .string(pyFloatString(due))
+                d["nextRunAt"] = .string(floatString(due))
                 d["timezone_detail"] = .string("Follows the Mac: \(TimeZone.autoupdatingCurrent.identifier).")
             } else if SchedulerJobRuntime.wallClockSchedule(d) != nil {
                 d["timezone_warning"] = .string("Wall-clock occurrence is ambiguous. Review and save this schedule before it can run.")
                 d["nextRunAt"] = .null
                 d["nextRunAtEpoch"] = .null
-                d["nextRunAtISO"] = .null
             }
         }
         // Older one-off and calendar rows retained the default hourly interval.
@@ -454,7 +354,6 @@ public enum SchedulerJobNormalizer {
             // nextRunAtEpoch is a JSON number, including for integral epochs.
             d["nextRunAtEpoch"] = .double(epoch)
             d["nextRunAt"] = .string(iso)
-            d["nextRunAtISO"] = .string(iso)
         }
         return .object(d)
     }

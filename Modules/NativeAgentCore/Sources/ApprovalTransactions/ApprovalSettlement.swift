@@ -27,26 +27,23 @@ import MacIntegration
 import ProviderRouting
 import MacControl
 import Transcripts
-// Blueprint: | `ApprovalSettlement.swift` | Chat tool execution and receipt settlement |
+// Blueprint: | `ApprovalSettlement.swift` | Chat tool execution and receipt settlement; checked carried provenance before approval spend or continuation queue consumption |
 extension ApprovalExecution {
     /// The returned outcome and the execution slot settle together. Failed
     /// storage keeps the exact outcome with its owner for receipt-only repair.
     func settleApprovalExecution(_ id: String, dataRoot: URL,
-        settlement: ChatToolApprovalExecutionOwners.Settlement) async -> Result<ApprovalRecord, Error> {
-        await settle {
-            let owners = ChatToolApprovalExecutionOwners.shared
-            owners.retain(settlement, root: dataRoot, approvalID: id)
-            defer { owners.release(root: dataRoot, approvalID: id) }
-            do {
-                let record = try await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
-                    id, executedAction: settlement.action, detail: settlement.detail, result: settlement.result)
-                owners.retain(nil, root: dataRoot, approvalID: id)
-                return Result<ApprovalRecord, Error>.success(record)
-            } catch {
-                nativeLog("[approvals] execution receipt save failed for \(id): \(error); returned outcome retained by the execution owner for receipt-only repair")
-                return .failure(error)
-            }
-        }
+        settlement: ApprovalExecutionOwners.Settlement) async -> Result<ApprovalRecord, Error> {
+        await Self.settleRecordedApprovalExecution(id, dataRoot: dataRoot, settlement: settlement)
+    }
+    static func settleRecordedApprovalExecution(_ id: String, dataRoot: URL,
+        settlement: ApprovalExecutionOwners.Settlement) async -> Result<ApprovalRecord, Error> {
+        await ApprovalExecutionOwners.settleExecution(id, dataRoot: dataRoot, settlement: settlement)
+    }
+    static func performDomainApprovalExecution(_ record: ApprovalRecord, dataRoot: URL,
+        isolation: isolated (any Actor)? = #isolation,
+        operation: () async throws -> ApprovalExecutionOwners.Settlement?
+    ) async {
+        await ApprovalExecutionOwners.perform(record, dataRoot: dataRoot, operation: operation)
     }
     public func applyResolvedChatToolApproval(
         from rec: ApprovalRecord,
@@ -59,7 +56,7 @@ extension ApprovalExecution {
         }
         // Recovery may annotate an abandoned durable spend, but must never
         // annotate a spend whose executor is still awaiting its verifier.
-        let owners = ChatToolApprovalExecutionOwners.shared
+        let owners = ApprovalExecutionOwners.shared
         guard owners.acquire(root: dataRoot, approvalID: rec.id) else { return }
         var receiptOwnsRelease = false
         defer { if !receiptOwnsRelease { owners.release(root: dataRoot, approvalID: rec.id) } }
@@ -95,6 +92,15 @@ extension ApprovalExecution {
                 ])),
                 detail: outcome.sentence())
             await ensureChatToolApprovalOutcomeReceipt(approvalID: rec.id, dataRoot: dataRoot, continuation: continuation)
+            return
+        }
+        let payload: [String: JSONValue] = if case .object(let fields) = rec.payload { fields } else { [:] }
+        let carried: (sources: [String], elevated: [String])
+        do { carried = try PeerDataTaint.steer(in: payload["peer"]) }
+        catch {
+            RepairOwed.owe(dataRoot, id: "approval.provenance:" + rec.id, kind: .run,
+                operation: "approval.provenance:" + rec.id, owner: "Approval " + rec.id,
+                words: error.localizedDescription, lever: "Preserve the unspent approval and repair its recorded provenance before replay.")
             return
         }
         // Injection approvals have their own capability-specific durable spend
@@ -147,7 +153,7 @@ extension ApprovalExecution {
                 return
             }
         }
-        let settlement: ChatToolApprovalExecutionOwners.Settlement
+        let settlement: ApprovalExecutionOwners.Settlement
         do {
             let tools = effects.toolDispatchClient(
                 enforceAppAutonomy: false
@@ -169,8 +175,6 @@ extension ApprovalExecution {
                 )
             )
             // Verified approval carries the card's steer through all calls in this command.
-            let payload: [String: JSONValue] = if case .object(let fields) = rec.payload { fields } else { [:] }
-            let carried = PeerDataTaint.steer(in: payload["peer"])
             // Approval replay is a fresh detached dispatch, not the original
             // provider turn. Rehydrate only the approved lazy tool for this
             // dispatch so the lazy gate cannot answer `not_loaded`, while no
@@ -179,6 +183,8 @@ extension ApprovalExecution {
             try await LLMCallContext.$turnActiveTools.withValue([replay.toolName]) {
                 try await ChatToolSessionContext.$commandSignatureVerified.withValue(true) {
                     try await TurnRequest(message: "", sessionID: replay.sessionId, surface: replay.surface,
+                        envelope: TurnEnvelope(surface: replay.surface, verifiedChatId: replay.telegramChatId,
+                            verifiedUserId: replay.verifiedUserId, commandSignatureVerified: true, deliveryRoute: replay.replyRoute),
                         verifiedSessionID: .some(replay.sessionId),
                         verifiedChatID: .some(replay.telegramChatId), verifiedUserID: .some(replay.verifiedUserId),
                         replyRoute: replay.replyRoute, threadKind: ChatPersistenceContext.threadKind,
@@ -194,11 +200,8 @@ extension ApprovalExecution {
                         if replay.toolName == "agent_message" {
                             // The waiting call still owns its conversation exchange.
                             let hostReply = await ApprovalLifecycleBus.shared.awaitsHostReply(rec)
-                            let exactProtocol = if case .object(let payload) = rec.payload {
-                                payload["agentExactProtocol"] == .bool(true)
-                            } else { false }
                             return try await AgentConversationApproval.replay(id: rec.id, dataRoot: dataRoot,
-                                exactProtocol: exactProtocol || hostReply, dispatch: { tool, input in
+                                awaitingHostReply: hostReply, dispatch: { tool, input in
                                     try await gated.dispatch(tool: tool, input: input, surface: replay.surface)
                                 }, perform: send)
                         }
@@ -243,7 +246,7 @@ extension ApprovalExecution {
         }
         // Hold ownership through delivery and settlement. A concurrent scan
         // must not retire a live claim and make its row evictable mid-turn.
-        let owners = ChatToolApprovalExecutionOwners.continuations
+        let owners = ApprovalExecutionOwners.continuations
         guard owners.acquire(root: dataRoot, approvalID: approvalID) else { return true }
         defer { owners.release(root: dataRoot, approvalID: approvalID) }
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
@@ -256,13 +259,9 @@ extension ApprovalExecution {
         }
         guard rec.status == "resolved",
               let decision = rec.decision,
-              let replay = Self.chatToolApprovalReplay(from: rec, reportingOnly: true),
+              let replay = Self.chatToolApprovalReplay(from: rec),
               let safeSessionID = NativeAgentChatSessionID.normalizedPathComponent(replay.sessionId)
         else { return true }
-        // Telegram's send driver still owns already-produced legacy words.
-        // Never generate another answer while that retained one is owed.
-        if case .object(let state)? = rec.chatContinuation,
-           state["done"] != .bool(true), state["assistantDelivery"] != nil { return true }
         let executedAction: JSONValue
         if let saved = rec.executedAction { executedAction = saved }
         else if decision != "approved" {
@@ -296,19 +295,25 @@ extension ApprovalExecution {
         let failureDetail = JSONValue.string(resultPreview ?? outcomeDescription)
         envelope.merge(resultClass.receiptFields(recordedStatus: recordedStatus, failureDetail: failureDetail)) { _, value in value }
         let summary = (try? JSONValue.object(envelope).serialize(pretty: false)) ?? prose
-        // Read the card's queued steps and carried steer fresh; decline drops the steps.
+        let payload: [String: JSONValue] = if case .object(let fields) = rec.payload { fields } else { [:] }
+        let carried: (sources: [String], elevated: [String])
+        do { carried = try PeerDataTaint.steer(in: payload["peer"]) }
+        catch {
+            RepairOwed.owe(dataRoot, id: "approval.provenance:" + rec.id, kind: .run,
+                operation: "approval.provenance:" + rec.id, owner: "Approval " + rec.id,
+                words: error.localizedDescription, lever: "Preserve the approval and repair its recorded provenance before continuation.")
+            return false
+        }
+        // Validate provenance before queued steps can be consumed or released.
         let resume = await HerScreen.resume(card: rec.id, decision: decision, completed: resultClass == .succeeded,
                                             dataRoot: dataRoot)
-        let payload: [String: JSONValue] = if case .object(let fields) = rec.payload { fields } else { [:] }
-        // No record at all: a card filed before cards kept one (`unrecorded`).
-        let carried = PeerDataTaint.steer(in: payload["peer"])
         let steer = PeerDataTaint(restoring: carried.sources + resume.sources, elevated: carried.elevated + resume.elevated)
         // Approval elevates the carried peers for the rest of this command.
         if decision == "approved" { steer.checkpointSources.forEach(steer.elevate) }
         // The filing turn's file access; nil for an older card (the host's chat default).
         let fileAccess: String? = if case .string(let mode)? = payload["fileAccess"] { mode } else { nil }
         do {
-            let legacyStartedAt = try await inbox.writeChatReceipt(
+            try await inbox.writeChatReceipt(
                 approvalID: rec.id, sessionID: safeSessionID, toolName: replay.toolName,
                 surface: replay.surface, summary: summary, resultClass: resultClass.rawValue,
                 resultStatus: executedAction.objectValue?["resultStatus"]?.stringValue, ok: ok, resultPreview: resultPreview,
@@ -321,15 +326,11 @@ extension ApprovalExecution {
             }()
             // The receipt is durable before any claim becomes evictable. A
             // prior process may have delivered already, so never resend it.
-            if abandonedClaim || legacyStartedAt != nil {
-                if legacyStartedAt != nil {
-                    _ = try await inbox.annotateChatContinuation(
-                        rec.id, done: false, legacyStartedAt: legacyStartedAt)
-                }
+            if abandonedClaim {
                 _ = try await inbox.annotateChatContinuation(rec.id, done: true, settlement: "interrupted")
             } else if continueConversation,
                try await inbox.annotateChatContinuation(
-                rec.id, done: false, clearQueuedDelivery: true) {
+                rec.id, done: false) {
                 var settlement = "completed"
                 do {
                     try await PeerDataTaint.$current.withValue(steer) {

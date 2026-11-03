@@ -6,34 +6,11 @@ import Privacy
 import ChatToolParsing
 import ToolRegistry
 import TrustCenter
-// Blueprint: | `Expansion+Practice.swift` | `Expansion`: exact template/argument-flow inference, call shapes, confidence/cost law, persisted record types and diagnostics |
+// Blueprint: | `Expansion+Practice.swift` | `Expansion`: exact template/argument-flow inference, field-independent situations, measured costs under shared `Expectation` standing, v3 per-mind/authority record fold and diagnostics |
 
 extension Expansion {
-    /// Statistical law and resource bounds for one mind’s practice.
+    /// Measured practice costs and resource bounds; `Expectation` owns standing.
     enum Law {
-        /// The chance, across every prediction a mind's record is testing at
-        /// once, that one stands by luck alone: a stated policy, not a fit.
-        static let alpha = 0.05
-
-        /// Union-bound Gaussian confidence over simultaneous independent predictions; not an anytime guarantee.
-        static func z(among predictions: Int) -> Double {
-            (2 * log(Double(max(1, predictions)) / alpha)).squareRoot()
-        }
-
-        /// Wilson's lower bound of the hit rate.
-        static func lowerBound(hits: Int, tries: Int, z: Double) -> Double {
-            guard tries > 0 else { return 0 }
-            let n = Double(tries), p = Double(hits) / n, z2 = z * z
-            let center = p + z2 / (2 * n)
-            let margin = z * (p * (1 - p) / n + z2 / (4 * n * n)).squareRoot()
-            return max(0, (center - margin) / (1 + z2 / n))
-        }
-
-        /// Withhold at the rule-of-succession miss rate to keep measuring unshown counterfactuals.
-        static func withholding(tries: Int, hits: Int) -> Double {
-            (Double(tries - hits) + 1) / (Double(tries) + 2)
-        }
-
         static func median(_ values: [Double]) -> Double? {
             let sorted = values.filter(\.isFinite).sorted()
             guard !sorted.isEmpty else { return nil }
@@ -47,10 +24,9 @@ extension Expansion {
             -> (stands: Bool, lower: Double, bar: Double?, cHit: Double?, cMiss: Double?) {
             let cHit = median(template.gaps)
             let cMiss = median(record.costs.isEmpty ? template.runs : record.costs)
-            let lower = lowerBound(hits: record.hits, tries: record.tries, z: z(among: among ?? 1))
-            guard let cHit, let cMiss, cHit > 0 else { return (false, lower, nil, cHit, cMiss) }
-            let bar = cMiss / (cMiss + cHit)
-            return (lower > bar, lower, bar, cHit, cMiss)
+            let standing = Expectation.stands(hits: record.hits, tries: record.tries,
+                cHit: cHit, cMiss: cMiss, among: among ?? 1)
+            return (standing.stands, standing.lower, standing.bar, cHit, cMiss)
         }
 
         // Resource bounds: they bound memory and work, and decide nothing.
@@ -107,6 +83,8 @@ extension Expansion {
         let lower: Double
         let bar: Double?
         let known: Set<String>
+        /// An opening claim is labelled by the actual first call, shown or not.
+        var firstCall = false
         var planned = false
         var delivered = false
         var withheld = false
@@ -149,16 +127,69 @@ extension Expansion {
     }
 
     struct Book: Codable, Sendable {
-        static let current = 2
+        /// v3 folds model-separated practices and field-qualified situations.
+        static let current = 3
         var version = Book.current
-        /// Per mind, model and authority (`agent`, `model`, `own` or
+        /// Per mind and authority (`agent`, `own` or
         /// `steered:<principals>`, joined by U+0001).
         var practices: [String: Practice] = [:]
+
+        mutating func fold() throws {
+            guard version == 2 else { return }
+            var folded: [String: Practice] = [:]
+            var histories: [(key: String, signature: String, record: Record)] = []
+            for (_, old) in practices.sorted(by: { $0.key < $1.key }) {
+                var practice = folded[old.key] ?? Practice(agent: old.agent, steered: old.steered, at: old.lastAt)
+                practice.lastAt = max(practice.lastAt, old.lastAt)
+                for (key, situation) in old.situations.sorted(by: { $0.key < $1.key }) {
+                    // The field list preceded woke; never edit the wake's text.
+                    let name: String
+                    if let fields = key.range(of: " fields:") {
+                        let woke = key.range(of: " woke:", range: fields.upperBound..<key.endIndex)
+                        name = String(key[..<fields.lowerBound]) + (woke.map { String(key[$0.lowerBound...]) } ?? "")
+                    } else { name = key }
+                    var place = practice.situations[name] ?? Situation(at: situation.lastAt)
+                    place.lastAt = max(place.lastAt, situation.lastAt)
+                    place.examples = Array((place.examples + situation.examples).sorted { $0.at < $1.at }.suffix(Law.examplesPerSituation))
+                    practice.situations[name] = place
+                }
+                for (signature, record) in old.records.sorted(by: { $0.key < $1.key }) {
+                    histories.append((old.key, signature, record))
+                }
+                folded[old.key] = practice
+            }
+            for history in histories.sorted(by: { $0.record.lastAt < $1.record.lastAt }) {
+                guard var practice = folded[history.key] else { continue }
+                if var held = practice.records[history.signature] {
+                    guard held.situation == history.record.situation, held.form == history.record.form else {
+                        throw Record.invalid("practices." + history.key + ".records." + history.signature + ".identity")
+                    }
+                    try held.merge(history.record)
+                    practice.records[history.signature] = held
+                } else { practice.records[history.signature] = history.record }
+                folded[history.key] = practice
+            }
+            // Field-qualified claims keep their exact historical signatures;
+            // a broader situation cannot borrow standing from a narrower one.
+            for key in folded.keys.sorted() {
+                guard var practice = folded[key] else { continue }
+                practice.situations = Dictionary(uniqueKeysWithValues: practice.situations.sorted {
+                    $0.value.lastAt == $1.value.lastAt ? $0.key < $1.key : $0.value.lastAt > $1.value.lastAt
+                }.prefix(Law.situationCap).map { ($0.key, $0.value) })
+                practice.records = Dictionary(uniqueKeysWithValues: practice.records.sorted {
+                    $0.value.lastAt == $1.value.lastAt ? $0.key < $1.key : $0.value.lastAt > $1.value.lastAt
+                }.prefix(Law.recordCap).map { ($0.key, $0.value) })
+                folded[key] = practice
+            }
+            practices = Dictionary(uniqueKeysWithValues: folded.sorted {
+                $0.value.lastAt == $1.value.lastAt ? $0.key < $1.key : $0.value.lastAt > $1.value.lastAt
+            }.prefix(Law.practiceCap).map { ($0.key, $0.value) })
+            version = Self.current
+        }
     }
 
     struct Practice: Codable, Sendable {
         var agent: String
-        var model: String
         /// The untrusted principals that steered every turn this practice
         /// learned from; empty for the mind's own turns.
         var steered: [String]
@@ -167,12 +198,13 @@ extension Expansion {
         var records: [String: Record] = [:]
         var lastAt: Date
 
-        init(agent: String, model: String, steered: [String], at: Date) {
+        init(agent: String, steered: [String], at: Date) {
             self.agent = agent
-            self.model = model
             self.steered = steered
             lastAt = at
         }
+
+        var key: String { [agent, steered.isEmpty ? "own" : "steered:" + steered.joined(separator: ",")].joined(separator: "\u{1}") }
     }
 
     struct Situation: Codable, Sendable {
@@ -242,6 +274,25 @@ extension Expansion {
             guard costs.allSatisfy({ $0.isFinite && $0 >= 0 }) else { throw Self.invalid(path + ".costs") }
         }
 
+        /// Only identical signatures may pool trials. Streak order across
+        /// models is not recorded: retain the newest record's trailing streak.
+        mutating func merge(_ other: Record) throws {
+            for key in [\Record.tries, \.hits, \.lifetimeTries, \.lifetimeHits, \.unknown,
+                        \.changes, \.delivered, \.prepared, \.withheld] {
+                let (sum, overflow) = self[keyPath: key].addingReportingOverflow(other[keyPath: key])
+                guard !overflow, sum < Int.max else { throw Self.invalid(situation + "." + form + ".fold") }
+                self[keyPath: key] = sum
+            }
+            if other.lastAt >= lastAt {
+                misses = other.misses
+                costs = Array((costs + other.costs).suffix(Law.costCap))
+            } else {
+                costs = Array((other.costs + costs).suffix(Law.costCap))
+            }
+            lastAt = max(lastAt, other.lastAt)
+            try validate(at: situation + "." + form)
+        }
+
         mutating func note(_ outcome: Outcome, z: Double) throws {
             switch outcome {
             case .unknown:
@@ -255,7 +306,7 @@ extension Expansion {
                 try increment(\.misses, "misses")
                 let before = tries - misses
                 guard before > 0 else { return }
-                let missing = 1 - Law.lowerBound(hits: hits, tries: before, z: z)
+                let missing = 1 - Expectation.lowerBound(hits: hits, tries: before, z: z)
                 if pow(missing, Double(misses)) < 1 / Double(tries) {
                     tries = misses
                     hits = 0
@@ -276,7 +327,7 @@ extension Expansion {
             guard let matched = same(stripped(next), attempt.call) else { return .unknown }
             again = matched
         } else { again = false }
-        guard attempt.delivered, attempt.nature != .act else { return again ? .hit : .miss }
+        guard !attempt.firstCall, attempt.delivered, attempt.nature != .act else { return again ? .hit : .miss }
         if again { return .miss }
         guard let next else { return .unknown }
         var flat: [(path: String, value: JSONValue)] = []
@@ -289,15 +340,15 @@ extension Expansion {
     }
 
     /// A call carrying a key or token (`:secret` args) is never kept.
-    static func carriesSecret(_ call: [String: JSONValue]) -> Bool {
+    static func carriesSecret(_ call: [String: JSONValue]) throws -> Bool {
         if NativeAgentSecretRedactor.secretPath(.object(call), at: "call") != nil { return true }
-        guard let binding = AppActionBinding.action(input: call), !binding.secretArgs.isEmpty else { return false }
+        guard let binding = try AppActionBinding.action(input: call), !binding.secretArgs.isEmpty else { return false }
         guard case .object(let args)? = call["args"] else { return false }
         return binding.secretArgs.contains { args[$0] != nil }
     }
 
     /// Predict repeated forms only when every argument has a shared exact source or structural constant.
-    static func templateEvidence(_ examples: [Example]) -> (templates: [Template], rejected: [String: Int]) {
+    static func templateEvidence(_ examples: [Example]) throws -> (templates: [Template], rejected: [String: Int]) {
         var rejected: [String: Int] = [:]
         var groups: [String: [(example: Example, values: [String: JSONValue], paths: [String])]] = [:]
         var order: [String] = []
@@ -322,7 +373,7 @@ extension Expansion {
             }
             var slots: [Leaf] = []
             var judged = false
-            let binding = AppActionBinding.action(input: latest.example.call)
+            let binding = try AppActionBinding.action(input: latest.example.call)
             let properties: [String: JSONValue]? = {
                 guard let descriptor = binding?.descriptor,
                       let parsed = try? JSONValue.parse(descriptor.schema.parametersJSON),
@@ -428,25 +479,29 @@ extension Expansion {
     }
 
     /// The situation a result makes: the call's verb and argument names, the
-    /// result's status word and top-level fields, and for a turn's first call
+    /// result's status word, and for a turn's first call
     /// what woke the turn.
     static func situation(tool: String, input: [String: JSONValue], result: JSONValue, woke: String?) -> String {
         var parts = [verb(tool: tool, input: input)]
         if case .object(let args)? = input["args"] { parts.append("args:" + args.keys.sorted().joined(separator: ",")) }
         parts.append("status:" + ChatToolOutcome.statusWord(result))
-        if case .object(let fields) = result { parts.append("fields:" + fields.keys.sorted().joined(separator: ",")) }
         if let woke { parts.append("woke:" + woke) }
         return parts.joined(separator: " ")
     }
 
+    /// Opening perception neither acts nor prepares an act's preview.
+    static func openingRead(_ call: [String: JSONValue]) throws -> Bool {
+        try call["preview"] != .bool(true) && nature(call) == .read
+    }
+
     /// Reads run, acts preview; batches, scripts and home items cannot be predictions.
-    static func nature(_ call: [String: JSONValue]) -> Nature? {
+    static func nature(_ call: [String: JSONValue]) throws -> Nature? {
         if call["actions"] != nil || call["script"] != nil { return nil }
         if case .string(let id)? = call["action"], !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            guard let binding = AppActionBinding.action(input: call) else { return nil }
+            guard let binding = try AppActionBinding.action(input: call) else { return nil }
             // A preview runs nothing: the door's posture, and Trust's reading of it.
             if call["preview"] == .bool(true) { return .read }
-            return enforcedRead(call, binding) ? .read : .act
+            return try enforcedRead(call, binding) ? .read : .act
         }
         func text(_ key: String) -> String { if case .string(let value)? = call[key] { value } else { "" } }
         let place = AppDoorNames.place(page: text("page"), item: text("item"))
@@ -455,10 +510,10 @@ extension Expansion {
     }
 
     /// A read needs both Trust’s argument-sensitive class and an enforced read-only declaration.
-    static func enforcedRead(_ call: [String: JSONValue], _ binding: AppActionBinding) -> Bool {
+    static func enforcedRead(_ call: [String: JSONValue], _ binding: AppActionBinding) throws -> Bool {
         guard binding.read, binding.capabilities.isSubset(of: readCapabilities) else { return false }
         let ran = ToolNameAliases.ranCall("app", input: call)
-        guard PermissionLaw.toolClass(ran.tool, input: ran.input) == .read else { return false }
+        guard try PermissionLaw.toolClass(ran.tool, input: ran.input) == .read else { return false }
         return binding.toolClass == .read || (!binding.readWhen.isEmpty && AppActionBinding.builtInToolName(binding.tool))
     }
 
@@ -518,18 +573,20 @@ extension Expansion {
     public func summary(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> String {
         let root = dataRoot.standardizedFileURL.path
         load(root)
-        if let reason = unavailable[root] { return "Expansion record unavailable; original bytes preserved: " + reason }
-        var lines = ["A prediction rides inside the result before it while the lower bound of its hit rate (Wilson, one-sided, z = √(2 ln(m/0.05)) for the m predictions this mind's record is testing) beats c_miss / (c_miss + c_hit): c_hit is the median time this mind took to make the follow-up after the result came back, c_miss the median time the follow-up takes to run. Reads run; acts are only previewed."]
+        if let reason = unavailable[root] { return "Expansion record unavailable: " + reason }
+        var lines = ["A prediction reaches the opening thought or rides inside the result before it while the lower bound of its hit rate (Wilson, one-sided, z = √(2 ln(m/0.05)) for the m predictions this mind's record is testing) beats c_miss / (c_miss + c_hit): c_hit is the median time this mind took to make the call after the turn started or the result came back, c_miss the median time that call takes to run. Only reads run at turn start; follow-up acts are only previewed."]
+        if savePending(root) { lines.append("Practice has changes awaiting a durable save.") }
         let practices = (books[root]?.practices.values.map { $0 } ?? []).sorted { $0.lastAt > $1.lastAt }
         if practices.isEmpty { lines.append("No mind has made a call through the door yet.") }
         for practice in practices {
             let among = max(1, practice.records.values.filter { $0.lifetimeTries > 0 }.count)
             lines.append("")
             var head = practice.agent
-            if !practice.model.isEmpty { head += " on " + practice.model }
             if !practice.steered.isEmpty { head += ", in turns steered by " + practice.steered.joined(separator: ", ") }
             lines.append(head + ": \(practice.situations.count) situations, \(practice.records.count) predictions")
-            let evidence = practice.situations.mapValues { Self.templateEvidence($0.examples) }
+            let evidence: [String: (templates: [Template], rejected: [String: Int])]
+            do { evidence = try practice.situations.mapValues { try Self.templateEvidence($0.examples) } }
+            catch { return "Expansion action catalog unavailable: " + error.localizedDescription + ". Repair the catalog before reading predictions." }
             let rejected = evidence.values.reduce(into: [String: Int]()) { counts, item in
                 for (reason, count) in item.rejected { counts[reason, default: 0] += count }
             }
@@ -541,7 +598,7 @@ extension Expansion {
             for record in records {
                 let template = evidence[record.situation]?.templates.first { $0.form == record.form }
                 let measure = template.map { Law.measure(record, $0, among: among) }
-                var parts = ["after " + record.situation + " -> " + record.form,
+                var parts = [(record.situation.hasPrefix("start woke:") ? "at " : "after ") + record.situation + " -> " + record.form,
                              "\(record.hits)/\(record.tries) since its last change (\(record.lifetimeHits)/\(record.lifetimeTries) in all, \(record.unknown) unknown, \(record.changes) changes)"]
                 if let measure {
                     parts.append(String(format: "lower %.2f", measure.lower)

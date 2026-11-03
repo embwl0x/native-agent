@@ -44,46 +44,57 @@ private struct MobileAppSettingRow: View {
 
     var body: some View {
         Group {
-            if !row.writable {
-                AliveValueRow(label: row.label,
-                              value: row.value.isEmpty ? "—" : row.value.replacingOccurrences(of: "\n", with: ", "))
-            } else if row.type == "boolean" {
-                Toggle(row.label, isOn: Binding(get: { row.value == "true" }, set: { send($0 ? "true" : "false") }))
-                    .aliveRow()
-            } else if row.type == "choice" {
-                MobileAdaptiveRow(spacing: 12) {
-                    Text(row.label).foregroundStyle(AlivePalette.text)
-                    Spacer(minLength: 8)
-                    Picker(row.label, selection: Binding(get: { row.value }, set: { send($0) })) {
-                        ForEach(row.choices.contains(row.value) ? row.choices : [row.value] + row.choices, id: \.self) {
-                            Text(Self.label(forChoice: $0)).tag($0)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                }
-                .aliveRow()
+            if let reason = row.unavailableReason {
+                AliveValueRow(label: row.label, value: "Unavailable: \(reason)")
+            } else if let value = row.value {
+                control(value: value)
             } else {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(row.label).foregroundStyle(AlivePalette.text)
-                    TextField(row.type == "list" ? "One per line" : row.label, text: $draft,
-                              axis: row.type == "list" ? .vertical : .horizontal)
-                        .keyboardType(row.type == "number" ? .numberPad : .default)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .foregroundStyle(AlivePalette.secondary)
-                        .onSubmit { send(draft) }
-                    if draft != row.value {
-                        Button("Save") { send(draft) }.aliveSecondaryButton()
-                    }
-                }
-                .aliveRow()
-                .onAppear { draft = row.value }
-                .onChange(of: row.value) { _, value in draft = value }
+                AliveValueRow(label: row.label, value: "Unavailable: the Mac did not supply a value.")
             }
         }
         // The Mac's read-back moves the control; submission only stops taps.
         .allowsHitTesting(!sync.appSettingsSaving.contains(row.id))
+    }
+
+    @ViewBuilder
+    private func control(value: String) -> some View {
+        if !row.writable {
+            AliveValueRow(label: row.label,
+                          value: value.isEmpty ? "—" : value.replacingOccurrences(of: "\n", with: ", "))
+        } else if row.type == "boolean" {
+            Toggle(row.label, isOn: Binding(get: { value == "true" }, set: { send($0 ? "true" : "false") }))
+                .aliveRow()
+        } else if row.type == "choice" {
+            MobileAdaptiveRow(spacing: 12) {
+                Text(row.label).foregroundStyle(AlivePalette.text)
+                Spacer(minLength: 8)
+                Picker(row.label, selection: Binding(get: { value }, set: { send($0) })) {
+                    ForEach(row.choices.contains(value) ? row.choices : [value] + row.choices, id: \.self) {
+                        Text(Self.label(forChoice: $0)).tag($0)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+            }
+            .aliveRow()
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(row.label).foregroundStyle(AlivePalette.text)
+                TextField(row.type == "list" ? "One per line" : row.label, text: $draft,
+                          axis: row.type == "list" ? .vertical : .horizontal)
+                    .keyboardType(row.type == "number" ? .numberPad : .default)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .foregroundStyle(AlivePalette.secondary)
+                    .onSubmit { send(draft) }
+                if draft != value {
+                    Button("Save") { send(draft) }.aliveSecondaryButton()
+                }
+            }
+            .aliveRow()
+            .onAppear { draft = value }
+            .onChange(of: value) { _, value in draft = value }
+        }
     }
 
     /// A word id the Mac stores (`read_only`, `low_memory`) reads as words;

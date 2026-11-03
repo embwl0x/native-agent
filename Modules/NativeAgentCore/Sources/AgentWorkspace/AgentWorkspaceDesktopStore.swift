@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 import Darwin
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceDesktopStore.swift` | `AgentWorkspaceDesktopStore` struct; `load`, `save` |
+// Blueprint: | `AgentWorkspaceDesktopStore.swift` | `AgentWorkspaceDesktopStore`: `load` and `save` use one version-2 shape with required path, drafts, observations, kept places, focus and action collections; saved desktops require their structural fields too. Missing or damaged current fields refuse the read and preserve existing bytes. |
 
 struct AgentWorkspaceSavedDesktop: Sendable, Equatable {
     var id: String = UUID().uuidString
@@ -120,7 +120,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "read_chat_message": keys = ["message_id", "session_id"]; required = keys
             case "recall_memory", "recall_search": keys = ["memory_id", "query"]; required = []
             case "shelf_entry": keys = ["id", "bot_id"]; required = keys
-            case "shelf_read": keys = ["bot_id", "include_read", "newest_first"]; required = []
+            case "shelf_read": keys = ["id", "since", "topic", "include_read", "sort"]; required = []
             case "task_ledger_list": keys = ["task_id"]; required = []
             case "delegation_status": keys = ["task_id"]; required = []
             case "mail_search": keys = ["query", "scope", "mailbox", "unread", "sort", "from", "since", "category", "attachment"]; required = []
@@ -139,7 +139,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             var arguments: [String: JSONValue] = [:]
             for key in keys {
                 guard let value = input[key], value != .null else { continue }
-                if (tool == "shelf_read" && ["include_read", "newest_first"].contains(key))
+                if (tool == "shelf_read" && key == "include_read")
                     || (["mail_list_recent", "mail_search"].contains(tool) && ["all_categories", "unread"].contains(key))
                     || (tool == "mail_search" && key == "attachment" && value == .bool(true))
                     || (tool == "messages_recent_threads" && ["unread_only", "from_me"].contains(key))
@@ -182,6 +182,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "recall_memory", "recall_search": numericKeys = arguments["memory_id"] != nil ? ["offset", "max_characters"] : ["offset", "k", "limit"]
             case "desk_read": numericKeys = ["offset", "notes_offset", "refs_offset", "detail_offset", "limit"]
             case "work_context": numericKeys = ["desk_offset", "history_offset", "limit"]
+            case "shelf_read": numericKeys = ["limit"]
             case "mail_list_recent": numericKeys = ["body_offset", "offset", "position"]
             case "mail_search": numericKeys = ["offset"]
             case "messages_recent_threads": numericKeys = ["before_message_id", "limit", "offset"]
@@ -215,10 +216,6 @@ struct AgentWorkspaceDesktopStore: Sendable {
                 arguments.removeValue(forKey: "offset")
             }
             if tool == "screen" { arguments["structured"] = .bool(true) }
-            if tool == "desk_read", input["structured"] != nil {
-                guard case .bool = input["structured"] else { return nil }
-                arguments["structured"] = input["structured"]
-            }
             if tool == "desk_read", let version = input["detail_version"] {
                 guard case .string(let text) = version, text.count == 64,
                       text.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
@@ -321,16 +318,16 @@ struct AgentWorkspaceDesktopStore: Sendable {
               after.st_mtimespec.tv_sec == info.st_mtimespec.tv_sec,
               after.st_mtimespec.tv_nsec == info.st_mtimespec.tv_nsec else { throw Failure.invalid }
         let wire = try JSONDecoder().decode(WireState.self, from: data)
-        guard [1, 2].contains(wire.version), wire.scope == scopeHash, wire.places.count <= 24, wire.saved.count <= 12,
-              (wire.drafts?.count ?? 0) <= 4, (wire.path?.count ?? 0) <= 8 else { throw Failure.invalid }
-        let drafts = try (wire.drafts ?? []).map { try $0.restored() }
+        guard wire.version == 2, wire.scope == scopeHash, wire.places.count <= 24, wire.saved.count <= 12,
+              wire.drafts.count <= 4, wire.path.count <= 8 else { throw Failure.invalid }
+        let drafts = try wire.drafts.map { try $0.restored() }
         guard Set(drafts.map(\.draftID)).count == drafts.count else { throw Failure.invalid }
         let state = try AgentWorkspaceDesktopState(current: wire.current.location(drafts: drafts), places: wire.places.map { try $0.location(drafts: drafts) },
             workAnchor: wire.workAnchor?.location(drafts: drafts), workTopic: wire.workTopic, saved: wire.saved.map { try $0.desktop(drafts: drafts) },
-            selectedWorkspaceID: wire.selectedWorkspaceID, observations: wire.observations ?? [],
-            path: (wire.path ?? []).map { try $0.location(drafts: drafts) }, drafts: drafts,
-            workNote: wire.workNote, keptPlaces: (wire.keptPlaces ?? []).map { try $0.location(drafts: drafts) },
-            focusedWork: wire.focusedWork ?? false, lastWorkAction: wire.lastWorkAction, placeActions: wire.placeActions ?? [:])
+            selectedWorkspaceID: wire.selectedWorkspaceID, observations: wire.observations,
+            path: wire.path.map { try $0.location(drafts: drafts) }, drafts: drafts,
+            workNote: wire.workNote, keptPlaces: wire.keptPlaces.map { try $0.location(drafts: drafts) },
+            focusedWork: wire.focusedWork, lastWorkAction: wire.lastWorkAction, placeActions: wire.placeActions)
         guard try Self.normalized(state) == state else { throw Failure.invalid }
         return state
     }
@@ -379,25 +376,25 @@ struct AgentWorkspaceDesktopStore: Sendable {
         var workTopic: String?
         var saved: [WireSaved]
         var selectedWorkspaceID: String?
-        var observations: [AgentWorkspaceChanges.Stamp]?
-        var path: [WireLocation]?
-        var drafts: [AgentWorkspaceForm.Stored]?
+        var observations: [AgentWorkspaceChanges.Stamp]
+        var path: [WireLocation]
+        var drafts: [AgentWorkspaceForm.Stored]
         var workNote: String?
-        var keptPlaces: [WireLocation]?
-        var focusedWork: Bool?
+        var keptPlaces: [WireLocation]
+        var focusedWork: Bool
         var lastWorkAction: AgentWorkspaceWorkReceipt?
-        var placeActions: [String: AgentWorkspaceWorkReceipt]?
+        var placeActions: [String: AgentWorkspaceWorkReceipt]
     }
 
     private struct WireSaved: Codable {
         var id: String; var name: String; var current: WireLocation; var places: [WireLocation]
         var workAnchor: WireLocation?; var workTopic: String?
-        var path: [WireLocation]?
+        var path: [WireLocation]
         var workNote: String?
-        var keptPlaces: [WireLocation]?
-        var focusedWork: Bool?
+        var keptPlaces: [WireLocation]
+        var focusedWork: Bool
         var lastWorkAction: AgentWorkspaceWorkReceipt?
-        var placeActions: [String: AgentWorkspaceWorkReceipt]?
+        var placeActions: [String: AgentWorkspaceWorkReceipt]
         init(_ value: AgentWorkspaceSavedDesktop) {
             id = value.id; name = value.name; current = .init(value.current); places = value.places.map(WireLocation.init)
             workAnchor = value.workAnchor.map(WireLocation.init); workTopic = value.workTopic
@@ -407,12 +404,12 @@ struct AgentWorkspaceDesktopStore: Sendable {
             placeActions = value.placeActions
         }
         func desktop(drafts: [AgentWorkspaceForm]) throws -> AgentWorkspaceSavedDesktop {
-            guard places.count <= 24, (path?.count ?? 0) <= 8 else { throw Failure.invalid }
+            guard places.count <= 24, path.count <= 8 else { throw Failure.invalid }
             return try .init(id: id, name: name, current: current.location(drafts: drafts), places: places.map { try $0.location(drafts: drafts) },
                 workAnchor: workAnchor?.location(drafts: drafts), workTopic: workTopic,
-                path: (path ?? []).map { try $0.location(drafts: drafts) }, workNote: workNote,
-                keptPlaces: (keptPlaces ?? []).map { try $0.location(drafts: drafts) },
-                focusedWork: focusedWork ?? false, lastWorkAction: lastWorkAction, placeActions: placeActions ?? [:])
+                path: path.map { try $0.location(drafts: drafts) }, workNote: workNote,
+                keptPlaces: keptPlaces.map { try $0.location(drafts: drafts) },
+                focusedWork: focusedWork, lastWorkAction: lastWorkAction, placeActions: placeActions)
         }
     }
 

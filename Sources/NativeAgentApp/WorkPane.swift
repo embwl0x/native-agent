@@ -503,7 +503,7 @@ struct ShellViewCommands: Commands {
             Button(ShotgunController.shared.isShown ? "Hide Shotgun" : "Show Shotgun") {
                 ShotgunController.shared.toggle()
             }
-            .keyboardShortcut((ShotgunShortcut(rawValue: shotgunShortcut) ?? .optionSpace).menuModifiers
+            .keyboardShortcut(ShotgunShortcut(rawValue: shotgunShortcut)?.menuModifiers
                 .map { KeyboardShortcut(.space, modifiers: $0) })
             // The warmth only lands in dark mode (MoodTintGate), so it is
             // offered only there.

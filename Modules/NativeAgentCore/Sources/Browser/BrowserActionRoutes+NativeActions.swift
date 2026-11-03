@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `BrowserActionRoutes+NativeActions.swift` | `BrowserActionRoutes`: `runBrowserNativeAction`, `stringInput` |
+// Blueprint: | `BrowserActionRoutes+NativeActions.swift` | `runBrowserNativeAction` and `stringInput`; open/read/screenshot previews return in memory before any receipt, capture or history command |
 
 extension BrowserActionRoutes {
     public func runBrowserNativeAction(
@@ -51,13 +51,9 @@ extension BrowserActionRoutes {
 
         case "browser.read_text", "browser.read_links", "browser.screenshot":
             if dryRun {
-                return try await effects.appendNativeActionReceipt(
-                    action: action,
-                    status: "dry_run",
-                    dryRun: true,
-                    output: .object(["actionId": .string(action.id), "status": .string("dry_run")]),
-                    dataRoot: dataRoot
-                )
+                return NativeActionReceipt(id: UUID().uuidString.lowercased(), actionId: action.id,
+                    name: action.name, kind: action.kind, status: "dry_run", dryRun: true,
+                    createdAt: SwiftNativeBrowserClient.nowISO(Date()))
             }
             let capture = try await captureCurrentVisibleBrowser(
                 readText: action.id == "browser.read_text",

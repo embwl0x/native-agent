@@ -8,9 +8,9 @@ import StandingBots
 /// Per-request schema construction; descriptions and parameters stay lazy.
 package struct BuiltInToolSchemaFactory {
     let requestedNames: Set<String>?
-    let standingBotMinimumInterval: TimeInterval
+    let standingBotMinimumInterval: TimeInterval?
 
-    package init(requestedNames: Set<String>?, standingBotMinimumInterval: TimeInterval = BotRunLimits.minimumInterval) {
+    package init(requestedNames: Set<String>?, standingBotMinimumInterval: TimeInterval? = BotRunLimits.minimumInterval) {
         self.requestedNames = requestedNames
         self.standingBotMinimumInterval = standingBotMinimumInterval
     }
@@ -130,7 +130,7 @@ package struct BuiltInToolSchemaFactory {
     func conversationModeSchema() -> JSONValue {
         ToolSchema.enumStringSchema(
             ["new", "resume"],
-            "Choose new for unrelated work and omit conversation_id. Choose resume only for a contextual follow-up and pass the exact conversationId returned by this same tool. Omit this field for backward-compatible inference."
+            "Choose new for unrelated work and omit conversation_id. Choose resume only for a contextual follow-up and pass the exact conversationId returned by this same tool. The mode is required."
         )
     }
     func conversationReferenceSchema(_ agent: String, _ tool: String) -> JSONValue {

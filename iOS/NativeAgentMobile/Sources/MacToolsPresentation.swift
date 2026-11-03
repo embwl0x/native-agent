@@ -84,11 +84,13 @@ enum MacNotificationSendPresentation {
     enum Feedback: Equatable {
         case sent
         case failed(String)
+        case unconfirmed(String)
 
         var text: String {
             switch self {
             case .sent: "Notification sent to the Mac."
             case .failed(let detail): "Couldn’t send notification: \(detail)"
+            case .unconfirmed(let detail): "Notification outcome is not confirmed: \(detail)"
             }
         }
     }

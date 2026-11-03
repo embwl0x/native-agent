@@ -23,6 +23,7 @@ struct CommandPaletteView: View {
     @State private var preparedPool: [PaletteItem] = []
     /// The settings registry's controls — read once per opening.
     @State private var settingThings: [PaletteItem] = []
+    @State private var settingsFailure: String?
     /// Conversations whose words hold the query, from the message index.
     @State private var messageHits: [PaletteItem] = []
     /// The query `messageHits` answer; another query shows none of them.
@@ -54,6 +55,7 @@ struct CommandPaletteView: View {
     @FocusState private var fieldFocused: Bool
 
     var body: some View {
+        SurfaceLayoutContent(appModel.engine.layout.availability) { _ in
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
@@ -103,7 +105,7 @@ struct CommandPaletteView: View {
                 Divider()
             }
 
-            if let error = appModel.engine.transcripts.savedSearchError ?? appModel.engine.cognitionView.diaryError ?? appModel.engine.desk.board.deskError {
+            if let error = settingsFailure ?? appModel.engine.transcripts.savedSearchError ?? appModel.engine.cognitionView.diaryError ?? appModel.engine.desk.board.deskError {
                 Text(error).font(ShellType.label).foregroundStyle(NativeAgentShell.trouble)
                     .padding(.horizontal, 14).padding(.vertical, 8)
             }
@@ -192,12 +194,13 @@ struct CommandPaletteView: View {
             }
         }
         .task {
-            settingThings = CommandPalettePresentation.settingItems(appModel: appModel)
+            do { settingThings = try CommandPalettePresentation.settingItems(appModel: appModel) }
+            catch { settingsFailure = "Settings could not be read: " + error.localizedDescription + ". Repair the reported source and reopen search." }
             preparePool()
             _ = await appModel.engine.desk.loadBoard()
             await appModel.engine.cognitionView.refreshDiary()
         }
-        .onChange(of: appModel.engine.layout.layout) { _, _ in preparePool() }
+        .onChange(of: appModel.engine.layout.availability) { _, _ in preparePool() }
         .onChange(of: appModel.engine.transcripts.sessions) { _, _ in preparePool() }
         .onChange(of: appModel.engine.desk.board.items) { _, _ in preparePool() }
         .onChange(of: appModel.engine.cognitionView.diary) { _, _ in preparePool() }
@@ -220,7 +223,7 @@ struct CommandPaletteView: View {
             try? await transcripts.openingLines.prepare(transcripts.sessions)
         }
         .task(id: matchRequest) {
-            let request = matchRequest
+            guard let request = matchRequest else { return }
             _ = await matchesRead.read({
             await Task.detached(priority: .userInitiated) {
                 CommandPalettePresentation.filteredItems(pool: request.pool, query: request.query,
@@ -249,6 +252,7 @@ struct CommandPaletteView: View {
                 messageHitsQuery = text
                 messageHits = hits
             })
+        }
         }
     }
 
@@ -297,9 +301,12 @@ struct CommandPaletteView: View {
         case .recentAction: return "Action"
         case .deskItem(let handle):
             return handle == desk?.selectedHandle ? "Selected" : "Desk"
-        case .bot: return "Bot"
-        case .dream: return "Dream"
-        case .memory: return "Memory"
+        case .saved(let destination):
+            switch destination {
+            case .botReply: return "Bot"
+            case .dream: return "Dream"
+            case .memory: return "Memory"
+            }
         }
     }
 
@@ -335,17 +342,17 @@ struct CommandPaletteView: View {
 
     private func preparePool() {
         preparedPool = CommandPalettePresentation.itemPool(
-            layout: appModel.engine.layout.layout,
+            layout: appModel.engine.layout.availability,
             sessions: appModel.engine.transcripts.sessions,
             settings: settingThings,
             saved: CommandPaletteSavedThings.shared(engine: appModel.engine)
         )
     }
 
-    private var matchRequest: MatchRequest {
-        MatchRequest(pool: preparedPool, query: query,
+    private var matchRequest: MatchRequest? {
+        return MatchRequest(pool: preparedPool, query: query,
                      confirmed: messageHitsQuery == query.trimmingCharacters(in: .whitespacesAndNewlines) ? messageHits : [],
-                     rail: CommandPalettePresentation.railItems(appModel.engine.layout.layout))
+                     rail: CommandPalettePresentation.railItems(appModel.engine.layout.availability))
     }
 
     private func deskMatches(_ desk: DeskPaletteScope, _ parsed: DeskPaletteQuery) -> [DeskPaletteRow] {
@@ -425,12 +432,8 @@ struct CommandPaletteView: View {
             // row is scrolled to and opened rather than merely on screen.
             appModel.pendingDeskHandle = handle
             ApplicationLifetime.shared.request(.sidebar(.desk))
-        case .bot:
-            ApplicationLifetime.shared.request(.sidebar(.bots))
-        case .dream:
-            ApplicationLifetime.shared.request(.sidebar(.dreams))
-        case .memory:
-            ApplicationLifetime.shared.request(.sidebar(.memories))
+        case .saved(let destination):
+            ApplicationLifetime.shared.request(.savedThing(destination))
         }
         isPresented = false
     }

@@ -2,8 +2,12 @@ import Foundation
 import PersistenceCore
 import PersonaEngine
 import TrustCenter
+import ChatSessionWork
+import NativeAgentCore
 import NativeAgentShared
-// Blueprint: | `FirstRunWelcomeTransaction.swift` | `FirstRunWelcomeTransaction` class; `hasConversationRows`, `isPersistedFailureRow` |
+// Blueprint: | `FirstRunWelcomeTransaction.swift` | First-run welcome transaction; checked name before claim/send; completed greeting receipt resumes checked token/directive/met settlement before retiring its claim |
+// Storage: .needs_welcome.receipt retains session/title locally and in off-disk
+// backup; local backup, production export and phone sync exclude it. PrivacyMap: welcome_receipt.
 
 /// The one-time greeting writer's outcome as observed by the onboarding route.
 /// A delivery accepted by the chat owner is distinct from a deferred or
@@ -34,7 +38,7 @@ public enum FirstRunGreetingOutcome: Equatable, Sendable {
         case .claimFailed:
             return "NativeAgent could not safely claim the first greeting"
         case .rejected(let message):
-            return "Chat rejected the first greeting: \(message)"
+            return "NativeAgent could not finish the first greeting: \(message)"
         }
     }
 }
@@ -70,7 +74,7 @@ public protocol FirstRunWelcomePort: AnyObject {
     var activeChatSessionId: String { get }
     var chatMessages: [FirstRunMessage] { get }
     var firstRunSessionIsBusy: Bool { get }
-    var firstConversationPersonName: String { get }
+    var firstConversationPersonName: String { get throws }
     var firstRunSyntheticErrorIDPrefix: String { get }
     func firstRunGreetingHasReadyProvider() async -> Bool
     func sendFirstRunGreeting(_ kickoff: String, sessionID: String) async -> MacChatTurnAcceptance
@@ -98,19 +102,6 @@ public final class FirstRunWelcomeTransaction {
     }
 
     // MARK: - The first conversation: fresh personas only
-
-    /// The durable "the agent has already introduced itself" marker, deliberately
-    /// a sibling of SOUL.md rather than of the data root.
-    ///
-    /// `.needs_welcome` answers "did the wizard finish"; this answers "has this
-    /// PERSONA been met". They come apart exactly where it matters: a data root
-    /// restored from a backup, or a persona directory carried across installs,
-    /// keeps its documents and therefore keeps this marker — so a person who
-    /// already named their agent is never asked who it should be a second time.
-    private func firstConversationMarkerURL(port: some FirstRunWelcomePort) -> URL {
-        PersonaRootResolver.resolveIsolated(dataRoot: port.firstRunDataRoot)
-            .appendingPathComponent(".first_conversation", isDirectory: false)
-    }
 
     /// Markers, live/spent write tokens, unreadable SOUL.md, a role heading or conversation rows exclude freshness.
     /// An absent SOUL.md remains fresh because the opener may precede its first append.
@@ -158,85 +149,70 @@ public final class FirstRunWelcomeTransaction {
         message.firstRunMechanicalKind == "systemRow"
     }
 
-    /// The section title this flow writes the "who I am to them" line under.
-    /// Shared with the write guard's exemption allowlist, so the two can never
-    /// drift into exempting a section the flow does not actually write.
-    static let firstConversationRoleSectionPrefix = "Who I am to "
-
-    /// Write and read back the durable marker that this persona has been met.
-    private func markFirstConversationDone(port: some FirstRunWelcomePort, sessionID: String) -> Bool {
-        let url = firstConversationMarkerURL(port: port)
-        let payload = ["session_id": sessionID, "met_at": ISO8601DateFormatter().string(from: Date())]
-        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return false }
-        do {
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
-        } catch {
-            nativeLog("[first-run-welcome] could not write the met marker: %@", error.localizedDescription)
-            return false
-        }
-        // Verify by reading back, not by trusting the write: this is the record
-        // that stops a second greeting forever.
-        guard let readBack = try? Data(contentsOf: url), !readBack.isEmpty else {
-            nativeLog("[first-run-welcome] met marker did not read back; keeping the in-flight marker")
-            return false
-        }
-        return true
+    /// A completed greeting's durable receipt lets settlement resume without another send.
+    private struct GreetingReceipt: Codable, Sendable {
+        let sessionID: String
+        let title: String
     }
 
-    /// After a real completed reply, verify the met marker, arm answer progression
-    /// and write its next-turn directive, then retire the in-flight marker.
-    /// A retained in-flight marker suppresses duplicate delivery after an unknown outcome.
-    @MainActor
-    private func completeFirstRunGreeting(port: some FirstRunWelcomePort, sessionID: String) {
-        guard markFirstConversationDone(port: port, sessionID: sessionID) else { return }
+    private static func receiptURL(dataRoot: URL) -> URL {
+        dataRoot.appendingPathComponent(".needs_welcome.receipt")
+    }
 
-        let root = port.firstRunDataRoot
-        let title = FirstConversationPersonaProgression.roleSectionTitle(
-            personName: port.firstConversationPersonName
-        )
+    private static func loadGreetingReceipt(dataRoot: URL) throws -> GreetingReceipt? {
+        let data: Data
+        do { data = try Data(contentsOf: receiptURL(dataRoot: dataRoot)) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile { return nil }
+        let receipt = try JSONDecoder().decode(GreetingReceipt.self, from: data)
+        guard NativeAgentChatSessionID.normalizedPathComponent(receipt.sessionID) == receipt.sessionID,
+              receipt.title.hasPrefix(FirstConversationPersonaProgression.roleSectionPrefix),
+              !receipt.title.dropFirst(FirstConversationPersonaProgression.roleSectionPrefix.count)
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !receipt.title.contains("\n"), !receipt.title.contains("\r") else {
+            throw ToolFailureError("The greeting receipt has an invalid session or title. Repair it before settling progression.", effects: .unknown)
+        }
+        return receipt
+    }
 
-        // Arm answer progression only after the opener has settled.
-        FirstConversationPersonaProgression.armWriteToken(
-            dataRoot: root, sessionID: sessionID, title: title,
+    /// Every required next-step record must read back before retiring the claim.
+    /// Matching saved records make repair idempotent without resetting delivery.
+    private static func completeFirstRunGreeting(dataRoot: URL, receipt: GreetingReceipt) throws -> FirstRunGreetingOutcome {
+        try FirstConversationPersonaProgression.armWriteToken(
+            dataRoot: dataRoot, sessionID: receipt.sessionID, title: receipt.title,
             token: FirstConversationPersonaProgression.writeTokenFilename,
-            spent: FirstConversationPersonaProgression.spentTokenFilename
-        )
-
-        // The hidden kickoff is not persisted; the answer turn needs its own write directive.
-        ChatSessionDirective.write(
-            ChatSessionDirectiveRecord(
-                createdAt: ISO8601DateFormatter().string(from: Date()),
-                directive: Self.firstConversationNextTurnDirective(title: title)
-            ),
-            dataRoot: root,
-            sessionID: sessionID
-        )
-
-        finishFirstRunWelcomeMarker(port: port)
+            spent: FirstConversationPersonaProgression.spentTokenFilename)
+        let directive = FirstConversationPersonaProgression.nextTurnDirective(title: receipt.title)
+        if let saved = try ChatSessionDirective.load(dataRoot: dataRoot, sessionID: receipt.sessionID) {
+            guard saved.directive == directive else {
+                throw ToolFailureError("The greeting's next-turn directive belongs to other work. Preserve it and reconcile the receipt; nothing was overwritten.", effects: .unknown)
+            }
+        } else {
+            let record = ChatSessionDirectiveRecord(
+                createdAt: ISO8601DateFormatter().string(from: Date()), directive: directive)
+            guard ChatSessionDirective.write(record, dataRoot: dataRoot, sessionID: receipt.sessionID),
+                  try ChatSessionDirective.load(dataRoot: dataRoot, sessionID: receipt.sessionID) == record else {
+                throw ToolFailureError("The greeting's next-turn directive could not be saved and verified. Its receipt and in-flight claim remain for repair.", effects: .unknown)
+            }
+        }
+        let marker = PersonaRootResolver.resolveIsolated(dataRoot: dataRoot)
+            .appendingPathComponent(FirstConversationPersonaProgression.metMarkerFilename)
+        let payload = ["session_id": receipt.sessionID, "met_at": ISO8601DateFormatter().string(from: Date())]
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: marker)
+        guard try Data(contentsOf: marker) == data else {
+            throw ToolFailureError("The greeting's met marker did not read back. Its in-flight claim remains for repair.", effects: .unknown)
+        }
+        try FileManager.default.removeItem(at: dataRoot.appendingPathComponent(".needs_welcome.inflight"))
+        try SwiftNativePersistenceCore.syncDirectory(dataRoot)
+        return .delivered(sessionId: receipt.sessionID)
     }
 
-    /// What the answer turn needs to know, and nothing else. Short on purpose:
-    /// it rides in the volatile dynamic segment of a real conversation turn,
-    /// not in a setup script.
-    static func firstConversationNextTurnDirective(title: String) -> String {
-        """
-        [First conversation. You have just asked this person what they want you to be. \
-        When they answer, repeat it back in THEIR words — no praise, no label — and write \
-        ONE line with app {action: "persona.append", args: {kind: "soul", title: "\(title)", content}}: a single \
-        first-person sentence, on one line, built only from what they actually said. Use \
-        that title exactly. Then, in the same reply, ask the natural next thing: \
-        \(firstConversationVoiceQuestion) \
-        If they skipped or asked something else, answer them and write nothing; do not \
-        raise either question again. Never mention this note.]
-        """
+    private static func settleGreeting(dataRoot: URL, receipt: GreetingReceipt) -> FirstRunGreetingOutcome {
+        do { return try completeFirstRunGreeting(dataRoot: dataRoot, receipt: receipt) }
+        catch {
+            return .rejected(message: "The greeting completed, but its saved next step needs repair: \(error.localizedDescription). Recheck setup after repair; the greeting will not be sent again.")
+        }
     }
-
-    /// The second answer writes VOICE.md under the voice token armed when FirstConversationPersonaProgression grants the soul line.
-    static let firstConversationVoiceQuestion = """
-    Ask how they would like you to sound with them, close to: "And how would you like me \
-    to sound? Energetic, calm, serious, playful, joking, sarcastic, warm, blunt — or name \
-    someone you'd like me to sound like."
-    """
 
     private enum FirstRunWelcomeMarkerState {
         case absent
@@ -286,10 +262,6 @@ public final class FirstRunWelcomeTransaction {
         }
     }
 
-    private func finishFirstRunWelcomeMarker(port: some FirstRunWelcomePort) {
-        try? FileManager.default.removeItem(at: firstRunWelcomeInFlightMarkerURL(port: port))
-    }
-
     /// A rejected handoff has a known "not sent" outcome, so it is safe to
     /// make the marker pending again for a later provider/session trigger.
     private func restoreFirstRunWelcomeMarkerAfterRejectedSend(port: some FirstRunWelcomePort) {
@@ -308,10 +280,8 @@ public final class FirstRunWelcomeTransaction {
 
     /// Fire the one-time welcome. Called from onboarding-complete AND from
     /// ChatView triggers. Marker + in-flight flag make it fire exactly once.
-    @MainActor
-    @discardableResult
-    public func maybeSendFirstRunGreeting(port: some FirstRunWelcomePort) async -> FirstRunGreetingOutcome {
-        let kickoff = """
+    private static func kickoff(title: String) -> String {
+        """
         [SYSTEM: First run. The person has just set you up and this is the first thing in an \
         empty transcript — you are opening the conversation, they have not typed yet.
 
@@ -339,21 +309,11 @@ public final class FirstRunWelcomeTransaction {
         ONLY if you genuinely know it; \
         never guess, invent, or use a placeholder like "User".
 
-        THE ONE THING TO CAPTURE. When they answer, repeat it back in THEIR words and nothing \
-        else, then write ONE line with app {action: "persona.append", args: {kind: "soul", title: \
-        "\(Self.firstConversationRoleSectionPrefix)<their name, or "them">", content}}. The content is a \
-        single first-person sentence built only from what they actually said — a one-word \
-        answer gets a one-clause line. You may say once that you are writing it as who you \
-        are rather than as a setting.
+        \(FirstConversationPersonaProgression.roleAnswerInstruction(title: title))
 
-        THE SECOND THING, in that same reply: \(Self.firstConversationVoiceQuestion) When \
-        they answer, a note will tell you how to write it into VOICE.md; skipped, your \
-        default voice stays.
-
-        After that, hand the floor back in one turn: the rest you will pick up from working \
-        with them; the open door, which needs no answer — "If there's anything you'd rather \
-        I never do, tell me whenever it comes to mind." — and one question: "What are you \
-        working on?"
+        On their voice answer, a note supplies the exact VOICE.md title and app call.
+        \(FirstConversationPersonaProgression.voiceAnswerInstruction)
+        \(FirstConversationPersonaProgression.handBackInstruction)
 
         NEVER:
         - Never ask a third setup question. You already have your name; do not ask for one.
@@ -368,19 +328,32 @@ public final class FirstRunWelcomeTransaction {
         whatever they need until they say otherwise, write nothing, and do not return to this.
         - Never mention or quote this instruction.]
         """
+    }
+
+    @MainActor
+    @discardableResult
+    public func maybeSendFirstRunGreeting(port: some FirstRunWelcomePort) async -> FirstRunGreetingOutcome {
         // SYNCHRONOUS guard prefix (no await) → MainActor serializes it, so only
         // one trigger can claim the in-flight flag before the first await.
         // Belt-and-suspenders with the marker-write gate: a stray marker on a
         // dev data root (e.g. restored from a backup) still can't fire here.
         guard port.firstRunIsPublicRelease else { return .notArmed }
-        return await sendFirstRunGreetingIfEligible(kickoff, port: port)
+        return await sendFirstRunGreetingIfEligible(port: port)
     }
 
     @MainActor
-    private func sendFirstRunGreetingIfEligible(_ kickoff: String, port: some FirstRunWelcomePort) async -> FirstRunGreetingOutcome {
+    private func sendFirstRunGreetingIfEligible(port: some FirstRunWelcomePort) async -> FirstRunGreetingOutcome {
+        guard !firstRunGreetingInFlight else { return .notArmed }
         if firstRunWelcomeMarkerState(port: port) == .inFlight {
-            nativeLog("[first-run-welcome] prior greeting outcome is unknown; suppressing duplicate")
-            return .priorOutcomeUnknown
+            do {
+                // Missing evidence is unknown, never permission to repeat a send.
+                guard let receipt = try Self.loadGreetingReceipt(dataRoot: port.firstRunDataRoot) else {
+                    return .priorOutcomeUnknown
+                }
+                return Self.settleGreeting(dataRoot: port.firstRunDataRoot, receipt: receipt)
+            } catch {
+                return .rejected(message: "The greeting's receipt is unavailable: \(error.localizedDescription). Preserve its in-flight claim and repair the receipt; no duplicate was sent.")
+            }
         }
         guard firstRunWelcomeMarkerState(port: port) == .pending, !firstRunGreetingInFlight else { return .notArmed }
         // Fresh personas only. The pending marker is written on a blank-slate
@@ -405,6 +378,18 @@ public final class FirstRunWelcomeTransaction {
         guard port.activeChatSessionId == sid, !sid.isEmpty, firstConversationSessionIsIdleAndEmpty(port: port) else {
             return .noActiveSession
         }
+        let personName: String
+        do { personName = try port.firstConversationPersonName }
+        catch {
+            return .rejected(message: "The saved profile could not be read: \(error.localizedDescription). Repair memory/profile.json before the first greeting can be sent.")
+        }
+        guard !personName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .rejected(message: "The saved person's name is empty. Repair memory/profile.json.userName before sending the greeting.")
+        }
+        let title = FirstConversationPersonaProgression.roleSectionTitle(personName: personName)
+        guard !title.contains("\n"), !title.contains("\r") else {
+            return .rejected(message: "The saved person's name must fit on one line before sending the greeting.")
+        }
         guard claimFirstRunWelcomeMarker(port: port) else { return .claimFailed }
 
         nativeLog("[first-run-welcome] firing greeting into session %@", sid)
@@ -412,18 +397,31 @@ public final class FirstRunWelcomeTransaction {
         // The pending marker moved to the durable in-flight marker before this
         // handoff. A crash during delivery therefore leaves an honest unknown
         // state on disk and suppresses a duplicate greeting after restart.
-        let acceptance = await port.sendFirstRunGreeting(kickoff, sessionID: sid)
+        let acceptance = await port.sendFirstRunGreeting(Self.kickoff(title: title), sessionID: sid)
         switch acceptance {
         case .accepted(let acceptedSessionID):
             // sendChat awaits its task, so its completion notification has
             // already fired by the time an accepted handoff returns.
             if firstRunGreetingTurnSucceeded(port: port, sessionID: acceptedSessionID) {
-                completeFirstRunGreeting(port: port, sessionID: acceptedSessionID)
-                return .delivered(sessionId: acceptedSessionID)
+                let dataRoot = port.firstRunDataRoot
+                let receipt = GreetingReceipt(sessionID: acceptedSessionID, title: title)
+                return await settle { @MainActor in
+                    do {
+                        try SwiftNativePersistenceCore.writeDataAtomicDurable(
+                            JSONEncoder().encode(receipt), to: Self.receiptURL(dataRoot: dataRoot))
+                        guard let saved = try Self.loadGreetingReceipt(dataRoot: dataRoot),
+                              saved.sessionID == receipt.sessionID, saved.title == receipt.title else {
+                            throw ToolFailureError("The completed greeting receipt did not read back.", effects: .unknown)
+                        }
+                        return Self.settleGreeting(dataRoot: dataRoot, receipt: receipt)
+                    } catch {
+                        return .rejected(message: "The greeting completed, but its receipt could not be retained: \(error.localizedDescription). Its in-flight claim remains; inspect the transcript before repairing progression. Do not send the greeting again.")
+                    }
+                }
             }
-            // An accepted handoff is not proof of a completed greeting.
-            restoreFirstRunWelcomeMarkerAfterRejectedSend(port: port)
-            return .rejected(message: "the first greeting did not complete")
+            // Missing completion evidence leaves delivery unknown, never permission
+            // to repeat an accepted handoff. Preserve the durable claim.
+            return .priorOutcomeUnknown
         case .queued:
             return .queued(sessionId: sid)
         case .rejected(let message):
