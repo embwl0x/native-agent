@@ -953,7 +953,7 @@ extension SwiftNativeChatOrchestrationClient {
     private nonisolated static func countJSONLLines(at path: URL) throws -> Int {
         let handle: FileHandle
         do { handle = try FileHandle(forReadingFrom: path) }
-        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return 0 }
+        catch let error as CocoaError where error.isFileAbsent { return 0 }
         defer { try? handle.close() }
         var count = 0
         var lineHasContent = false
