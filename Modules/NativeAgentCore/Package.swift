@@ -178,7 +178,7 @@ let extraDeps: [String: [String]] = [
     "ToolExecution": ["Experiences", "AuthoredCapabilities", "Senses", "PersonaEngine", "PersistenceCore", "TrustCenter", "ToolRegistry", "Desk", "MacControl",
         "ProviderRouting", "Privacy"],
     "Research": ["PersistenceCore", "Privacy", "MacControl", "ProviderRouting", "TurnTrace"],
-    "TriggerScheduler": ["Experiences", "PersistenceCore", "Desk", "ActivityWatch", "Privacy", "NotificationInbox", "TrustCenter"],
+    "TriggerScheduler": ["Experiences", "PersistenceCore", "Desk", "ActivityWatch", "Privacy", "NotificationInbox", "TrustCenter", "ChatTurnContracts"],
     // Due-job execution composes owners that already depend on TriggerScheduler.
     "SchedulerExecution": ["Experiences", "AuthoredCapabilities", "PersistenceCore", "TriggerScheduler", "AttentionRouting", "DeviceSync", "DreamREMCycle",
         "TelegramBot", "NotificationInbox", "Privacy", "BackgroundWork", "AppToolRuntime", "Senses"],
@@ -195,7 +195,7 @@ let extraDeps: [String: [String]] = [
         "ApprovalTransactions", "SlackBot", "TriggerScheduler", "MacControl", "AppToolRuntime", "DeviceSync", "AttentionRouting", "TelegramBot",
         "ChatToolRuntime", "ToolExecution"],
     "SwarmRuns": ["Experiences", "PersistenceCore", "TurnTrace", "ToolExecution", "Privacy", "ProviderRouting", "ChatTurnContracts"],
-    "Browser": ["PersistenceCore", "Privacy", "ApprovalInbox", "TurnTrace"],
+    "Browser": ["PersistenceCore", "Privacy", "ApprovalInbox", "TurnTrace", "Dispatcher"],
     "Context": ["PersistenceCore", "TrustCenter", "PersonaEngine"],
     // The engine owns ContextFlow and its projections; reverse imports would create a cycle.
     "ContextFlow": ["PersistenceCore", "Context", "MemoryV2", "PersonaEngine", "DreamREMCycle", "TurnTrace", "Studio", "Desk", "Senses"],
