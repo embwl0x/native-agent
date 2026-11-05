@@ -896,11 +896,11 @@ final class TranscriptDocumentController: NSObject, NSTextViewDelegate {
         var seatsRight = false
         if case .user = shown.blocks[hit.block].kind { seatsRight = true }
         let bottom = fragment.layoutFragmentFrame.maxY + origin.y
-        let hang = NativeAgentShellLayout.hoverBarStrip - NativeAgentShellLayout.hoverBarOverlap
         let x = origin.x + (seatsRight ? containerWidth - TranscriptMetrics.gutter : TranscriptMetrics.gutter)
-        let anchor = hostPoint(NSPoint(x: x, y: bottom + hang))
+        // The bar's top sits just under the message's last line, so it never covers the words it acts on.
+        let anchor = hostPoint(NSPoint(x: x, y: bottom + 2))
         setHover(TranscriptHover(message: message, isLastAssistant: canRegenerate(message), seatsRight: seatsRight, anchor: anchor), code: code)
-        hoverReach = bottom...(bottom + hang)
+        hoverReach = bottom...(bottom + NativeAgentShellLayout.hoverBarStrip)
     }
 
     /// The pointer left the hover bar: hover whatever is under it now.

@@ -113,7 +113,7 @@ final class TranscriptDocumentModel {
     }
 }
 
-/// The hovered message and where its bar hangs: `anchor` is the bar's bottom at the message's leading (or, seated right, trailing) edge.
+/// The hovered message and where its bar hangs: `anchor` is the bar's top at the message's leading (or, seated right, trailing) edge.
 struct TranscriptHover: Equatable {
     var message: ChatMessage
     var isLastAssistant: Bool
@@ -130,7 +130,15 @@ struct TranscriptCodeCopy: Equatable {
 private struct TranscriptHoverLayer: View {
     let model: TranscriptDocumentModel
 
+    // A guide places a view against its siblings: the full-size clear sibling is the transcript's origin the bar and copy button hang from.
     var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear.frame(maxWidth: .infinity, maxHeight: .infinity).allowsHitTesting(false)
+            layers
+        }
+    }
+
+    @ViewBuilder private var layers: some View {
         if let hover = model.hover {
             HStack(spacing: NativeAgentSpacing.sm) {
                 if hover.seatsRight { stamp(hover) }
@@ -149,7 +157,7 @@ private struct TranscriptHoverLayer: View {
             }
             .fixedSize()
             .alignmentGuide(.leading) { size in hover.seatsRight ? size.width - hover.anchor.x : -hover.anchor.x }
-            .alignmentGuide(.top) { size in size.height - hover.anchor.y }
+            .alignmentGuide(.top) { _ in -hover.anchor.y }
             .accessibilityHidden(true)
             .transition(.opacity)
         }

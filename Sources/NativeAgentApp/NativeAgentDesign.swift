@@ -351,7 +351,6 @@ enum NativeAgentShellLayout {
     static let railPlateInset: CGFloat = 10
     static let replyLineSpacing: CGFloat = 8
     static let hoverBarStrip: CGFloat = 30
-    static let hoverBarOverlap: CGFloat = 6
     static let transcriptGap: CGFloat = 16
     static let composerClearanceMargin: CGFloat = 12
     static let userBubbleCorners = RectangleCornerRadii(
